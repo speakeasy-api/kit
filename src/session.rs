@@ -282,6 +282,7 @@ pub(crate) fn open_in(
 pub(crate) fn open_uncommitted(
     root: &Path,
     session_id: &str,
+    force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
     open_with_initial_timestamps_in(
@@ -289,7 +290,7 @@ pub(crate) fn open_uncommitted(
         &default_directory()?,
         session_id,
         false,
-        false,
+        force,
         initial,
         InitialTranscriptOptions {
             stamp_items: true,

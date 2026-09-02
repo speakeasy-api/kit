@@ -57,6 +57,60 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
+const AUTH_REQUIRED_KIND: &str = "authentication_required";
+
+pub(crate) struct AuthenticationRequiredData<'a> {
+    pub(crate) method_id: &'a str,
+    pub(crate) detail: &'a str,
+}
+
+impl<'a> AuthenticationRequiredData<'a> {
+    pub(crate) fn new(method_id: &'a str, detail: &'a str) -> Self {
+        Self { method_id, detail }
+    }
+
+    pub(crate) fn from_value(value: &'a serde_json::Value) -> Option<Self> {
+        let data = value.as_object()?;
+        (data.get("kind")?.as_str()? == AUTH_REQUIRED_KIND).then_some(Self {
+            method_id: data.get("methodId")?.as_str()?,
+            detail: data.get("detail")?.as_str()?,
+        })
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": AUTH_REQUIRED_KIND,
+            "methodId": self.method_id,
+            "detail": self.detail,
+        })
+    }
+}
+
+pub(crate) struct TerminalAuthMethodSpec {
+    pub(crate) method_id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) args: &'static [&'static str],
+}
+
+const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
+    TerminalAuthMethodSpec {
+        method_id: "openai",
+        name: "Sign in with ChatGPT",
+        description: "Authenticate Kit with a ChatGPT subscription",
+        args: &["serve", "--terminal-auth-login", "openai"],
+    },
+    TerminalAuthMethodSpec {
+        method_id: "openrouter",
+        name: "Sign in with OpenRouter",
+        description: "Authenticate Kit with OpenRouter",
+        args: &["serve", "--terminal-auth-login", "openrouter"],
+    },
+];
+
+pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] {
+    TERMINAL_AUTH_METHODS
+}
 
 fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec<AuthMethod> {
     let supports_terminal_auth = capabilities.auth.terminal
@@ -70,18 +124,16 @@ fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec
         return Vec::new();
     }
 
-    vec![
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
-                .description("Authenticate Kit with a ChatGPT subscription")
-                .args(vec!["--terminal-auth-login".into(), "openai".into()]),
-        ),
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
-                .description("Authenticate Kit with OpenRouter")
-                .args(vec!["--terminal-auth-login".into(), "openrouter".into()]),
-        ),
-    ]
+    terminal_auth_method_specs()
+        .iter()
+        .map(|method| {
+            AuthMethod::Terminal(
+                AuthMethodTerminal::new(method.method_id, method.name)
+                    .description(method.description)
+                    .args(method.args.iter().map(|arg| (*arg).into()).collect()),
+            )
+        })
+        .collect()
 }
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
@@ -2170,13 +2222,13 @@ pub(super) mod tests {
             &methods[0],
             AuthMethod::Terminal(method)
                 if method.id.0.as_ref() == "openai"
-                    && method.args == ["--terminal-auth-login", "openai"]
+                    && method.args == ["serve", "--terminal-auth-login", "openai"]
         ));
         assert!(matches!(
             &methods[1],
             AuthMethod::Terminal(method)
                 if method.id.0.as_ref() == "openrouter"
-                    && method.args == ["--terminal-auth-login", "openrouter"]
+                    && method.args == ["serve", "--terminal-auth-login", "openrouter"]
         ));
     }
 

@@ -278,14 +278,14 @@ fn configured_session_is_consumed_only_after_successful_start() {
     let (first, configured) = selection.claim();
     assert_eq!(first.id, "selected");
     assert!(configured);
-    selection.finish_new(&first, configured, false, true);
+    selection.finish_new(&first, configured, false, true, false);
     let (retry, configured) = selection.claim();
     assert_eq!(retry.id, "selected");
     assert!(
         retry.resume,
         "a transcript opened before failure is resumed"
     );
-    selection.finish_new(&retry, configured, true, false);
+    selection.finish_new(&retry, configured, true, false, false);
     assert!(selection.configured.is_none());
 }
 
@@ -355,6 +355,30 @@ fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
 }
 
 #[test]
+fn dropped_uncommitted_session_claim_retries_as_new() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+    drop(failed);
+
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+    assert!(!retry.request.resume);
+}
+
+#[test]
 fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -364,10 +388,11 @@ fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    failed.guard_fork_transcript(&opened.observer);
+    failed.guard_uncommitted_transcript(&opened.observer);
     drop(opened);
     assert!(crate::session::load(root.path(), &session_id).is_ok());
 
@@ -386,10 +411,11 @@ fn dropped_deferred_fork_creation_removes_transcript_before_response() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    claim.guard_fork_transcript(&opened.observer);
+    claim.guard_uncommitted_transcript(&opened.observer);
     let creation = claim.defer_fork_commit();
     drop(opened);
     drop(creation);
@@ -1420,6 +1446,55 @@ fn cancel_all_covers_running_and_late_background_registration() {
     jobs.register_foreground_for_test("next-turn");
     assert!(!jobs.is_cancelled_for_test("next-turn"));
     jobs.finish_for_test("next-turn");
+}
+
+#[tokio::test]
+async fn persistent_startup_failure_does_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+        root.path(),
+        "test/model",
+        crate::provider::ProviderKind::OpenRouter,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+        None,
+        Some(crate::provider::OpenRouterApiKey::new("")),
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(
+        error.contains("--openrouter-api-key cannot be empty"),
+        "{error}"
+    );
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+}
+
+#[tokio::test]
+async fn persistent_missing_openai_credentials_do_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::provider::ProviderKind::OpenAiSubscription,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(error.contains("openai_auth_required:"), "{error}");
+    assert!(crate::session::load(root.path(), &session_id).is_err());
 }
 
 #[tokio::test]

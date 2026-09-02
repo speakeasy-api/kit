@@ -182,6 +182,9 @@ fn detach_from_controlling_terminal(_command: &mut tokio::process::Command) {}
 fn error_detail(error: &agent_client_protocol::Error) -> &str {
     match error.data.as_ref() {
         Some(Value::String(detail)) => detail,
+        Some(data) => crate::protocols::acp::AuthenticationRequiredData::from_value(data)
+            .map(|required| required.detail)
+            .unwrap_or(&error.message),
         _ => &error.message,
     }
 }
@@ -190,11 +193,16 @@ fn authentication_required(
     error: &agent_client_protocol::Error,
     methods: &[wire::AuthMethodTerminal],
 ) -> bool {
-    let detail = error_detail(error).to_ascii_lowercase();
-    methods.iter().any(|method| {
-        let method_id = method.method_id.0.to_ascii_lowercase();
-        !method_id.is_empty() && detail.contains(method_id.as_str())
-    })
+    let Some(required) = error
+        .data
+        .as_ref()
+        .and_then(crate::protocols::acp::AuthenticationRequiredData::from_value)
+    else {
+        return false;
+    };
+    methods
+        .iter()
+        .any(|method| method.method_id.0.as_ref() == required.method_id)
 }
 
 fn credential_storage_for_launch(
@@ -2159,10 +2167,10 @@ mod tests {
         ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
         attachments_from_paste, authentication_required, client_capabilities, command,
         credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
-        durable_session_id, effort_state, handle, message_of, osc52, previous_session_for_resume,
-        prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, terminal_auth_command, transition_route, translate,
-        translate_for_session, usable_terminal_auth_methods, user_message_of, wire,
+        durable_session_id, effort_state, error_detail, handle, message_of, osc52,
+        previous_session_for_resume, prompt_blocks, readable, refresh_config_state,
+        save_effort_default_to, save_model_defaults_to, terminal_auth_command, transition_route,
+        translate, translate_for_session, usable_terminal_auth_methods, user_message_of, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -2178,15 +2186,31 @@ mod tests {
                 "openrouter".into(),
             ]),
         ];
-        assert!(authentication_required(
-            &agent_client_protocol::util::internal_error(
+        let required = agent_client_protocol::Error::internal_error().data(
+            crate::protocols::acp::AuthenticationRequiredData::new(
+                "openrouter",
                 "run `kit auth login openrouter` before using OpenRouter",
+            )
+            .into_value(),
+        );
+        assert!(authentication_required(&required, &methods));
+        assert_eq!(
+            error_detail(&required),
+            "run `kit auth login openrouter` before using OpenRouter"
+        );
+        assert!(!authentication_required(
+            &agent_client_protocol::util::internal_error(
+                "stored OpenRouter credentials cannot be used with a noncanonical endpoint",
             ),
             &methods,
         ));
         assert!(!authentication_required(
-            &agent_client_protocol::util::internal_error(
-                "run `kit auth login speakeasy` before using Speakeasy",
+            &agent_client_protocol::Error::internal_error().data(
+                crate::protocols::acp::AuthenticationRequiredData::new(
+                    "speakeasy",
+                    "authentication required",
+                )
+                .into_value(),
             ),
             &methods,
         ));

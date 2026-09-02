@@ -28,6 +28,16 @@ use super::{
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_SELECTOR_MODELS: usize = 2_000;
+const OPENROUTER_AUTH_REQUIRED: &str = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
+
+pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
+    [
+        ("openai_auth_required:", "openai"),
+        ("openrouter_auth_required:", "openrouter"),
+    ]
+    .into_iter()
+    .find_map(|(code, method_id)| detail.contains(code).then_some(method_id))
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
 pub enum ProviderKind {
@@ -579,9 +589,7 @@ fn openrouter_config_from_env(
             _ => (
                 super::openrouter_auth::load(credential_storage)?
                     .map(|record| record.api_key.clone())
-                    .ok_or_else(|| {
-                        "set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider".to_string()
-                    })?,
+                    .ok_or_else(|| OPENROUTER_AUTH_REQUIRED.to_string())?,
                 ResolvedOpenRouterApiKeySource::Stored,
             ),
         },

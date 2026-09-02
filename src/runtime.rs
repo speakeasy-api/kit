@@ -109,6 +109,7 @@ impl SessionSelection {
         configured: bool,
         succeeded: bool,
         opened_new: bool,
+        opened_uncommitted: bool,
     ) {
         if configured {
             if succeeded {
@@ -119,9 +120,9 @@ impl SessionSelection {
                 request.resume = true;
             }
             self.configured_claimed = false;
-        } else if !succeeded && (request.resume || opened_new) {
+        } else if !succeeded && (request.resume || opened_new || opened_uncommitted) {
             let mut request = request.clone();
-            request.resume = true;
+            request.resume = request.resume || opened_new;
             self.generated_retries.push_back(request);
         }
     }
@@ -167,7 +168,7 @@ pub(crate) struct SessionClaim {
     runtime: Arc<Runtime>,
     request: SessionRequest,
     kind: SessionClaimKind,
-    fork_observer: Option<crate::session::SessionObserver>,
+    uncommitted_observer: Option<crate::session::SessionObserver>,
     committed: bool,
 }
 
@@ -191,10 +192,8 @@ impl SessionClaim {
         }
     }
 
-    fn guard_fork_transcript(&mut self, observer: &crate::session::SessionObserver) {
-        if matches!(self.kind, SessionClaimKind::Fork) {
-            self.fork_observer = Some(observer.clone());
-        }
+    fn guard_uncommitted_transcript(&mut self, observer: &crate::session::SessionObserver) {
+        self.uncommitted_observer = Some(observer.clone());
     }
 
     pub(crate) fn is_fork(&self) -> bool {
@@ -204,19 +203,20 @@ impl SessionClaim {
     pub(crate) fn defer_fork_commit(mut self) -> crate::session::SessionObserver {
         debug_assert!(self.is_fork());
         self.committed = true;
-        self.fork_observer
+        self.uncommitted_observer
             .take()
             .expect("an opened fork claim must retain its transcript observer")
     }
 
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
         if matches!(self.kind, SessionClaimKind::Fork) {
-            if let Some(observer) = self.fork_observer.take() {
+            if let Some(observer) = self.uncommitted_observer.take() {
                 observer.commit_creation();
             }
             self.committed = true;
             return Ok(());
         }
+        self.mark_opened();
         let mut selection =
             self.runtime.session.lock().map_err(|_| {
                 AcpRuntimeError::Loop("runtime session selection is poisoned".into())
@@ -225,11 +225,14 @@ impl SessionClaim {
             SessionClaimKind::New {
                 configured,
                 opened_new,
-            } => selection.finish_new(&self.request, configured, true, opened_new),
+            } => selection.finish_new(&self.request, configured, true, opened_new, false),
             SessionClaimKind::Load { configured } => {
                 selection.finish_load(&self.request, configured, true)
             }
             SessionClaimKind::Fork => unreachable!("fork claims commit before locking selection"),
+        }
+        if let Some(observer) = self.uncommitted_observer.take() {
+            observer.commit_creation();
         }
         self.committed = true;
         Ok(())
@@ -238,6 +241,7 @@ impl SessionClaim {
 
 impl Drop for SessionClaim {
     fn drop(&mut self) {
+        let opened_uncommitted = self.uncommitted_observer.is_some();
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -245,7 +249,13 @@ impl Drop for SessionClaim {
                 SessionClaimKind::New {
                     configured,
                     opened_new,
-                } => selection.finish_new(&self.request, configured, false, opened_new),
+                } => selection.finish_new(
+                    &self.request,
+                    configured,
+                    false,
+                    opened_new,
+                    opened_uncommitted,
+                ),
                 SessionClaimKind::Load { configured } => {
                     selection.finish_load(&self.request, configured, false)
                 }
@@ -966,13 +976,11 @@ impl Runtime {
                 )
             })?
         };
-        let opened = crate::session::open(
-            &self.root,
-            &request.id,
-            request.resume,
-            request.force,
-            initial,
-        )
+        let opened = if request.resume {
+            crate::session::open(&self.root, &request.id, true, request.force, initial)
+        } else {
+            crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
+        }
         .map_err(|error| {
             record_runtime_failure(
                 &session_id,
@@ -981,6 +989,7 @@ impl Runtime {
                 error,
             )
         })?;
+        let pending_creation = (!request.resume).then(|| opened.observer.clone());
         let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
@@ -1024,7 +1033,12 @@ impl Runtime {
             .start(SessionConfig::new(session_id.clone()).without_cache())
             .await
         {
-            Ok(driver) => driver,
+            Ok(driver) => {
+                if let Some(observer) = pending_creation {
+                    observer.commit_creation();
+                }
+                driver
+            }
             Err(error) => {
                 return Err(record_loop_failure(
                     &session_id,
@@ -1127,7 +1141,7 @@ impl Runtime {
                 configured,
                 opened_new: false,
             },
-            fork_observer: None,
+            uncommitted_observer: None,
             committed: false,
         })
     }
@@ -1141,7 +1155,7 @@ impl Runtime {
                 force: false,
             },
             kind: SessionClaimKind::Fork,
-            fork_observer: None,
+            uncommitted_observer: None,
             committed: false,
         })
     }
@@ -1159,7 +1173,7 @@ impl Runtime {
             runtime: Arc::clone(self),
             request,
             kind: SessionClaimKind::Load { configured },
-            fork_observer: None,
+            uncommitted_observer: None,
             committed: false,
         })
     }
@@ -1195,7 +1209,7 @@ impl Runtime {
                 self.root.display()
             )));
         }
-        let request = &claim.request;
+        let request = claim.request.clone();
         let session_id = request.id.clone();
         let (forked_transcript, selected, parent_context) = match forked {
             Some(forked) => (
@@ -1224,20 +1238,15 @@ impl Runtime {
                 .map_err(AcpRuntimeError::Loop)?
         };
         let opened = if is_fork {
-            crate::session::open_uncommitted(&self.root, &request.id, initial)
+            crate::session::open_uncommitted(&self.root, &request.id, false, initial)
+        } else if request.resume {
+            crate::session::open(&self.root, &request.id, true, request.force, initial)
         } else {
-            crate::session::open(
-                &self.root,
-                &request.id,
-                request.resume,
-                request.force,
-                initial,
-            )
+            crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
         }
         .map_err(AcpRuntimeError::Loop)?;
-        claim.mark_opened();
-        if is_fork {
-            claim.guard_fork_transcript(&opened.observer);
+        if is_fork || !request.resume {
+            claim.guard_uncommitted_transcript(&opened.observer);
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.

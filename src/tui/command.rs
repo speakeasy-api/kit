@@ -135,7 +135,9 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
         Kind::Effort => Parsed::Effort { value: prompt },
         Kind::Agents if prompt.is_none() => Parsed::Agents,
         Kind::Agents => Parsed::Prompt(input),
-        Kind::Login => Parsed::Login { method_id: prompt },
+        Kind::Login => Parsed::Login {
+            method_id: prompt.map(str::trim),
+        },
     }
 }
 
@@ -309,10 +311,18 @@ mod tests {
         assert_eq!(known_token("/login", &[]), None);
         assert!(completions("/log", 4, &[]).is_empty());
 
+        for input in ["/login openai", "/login openai ", "/login openai\t"] {
+            assert_eq!(
+                parse_command(input, true),
+                Parsed::Login {
+                    method_id: Some("openai")
+                }
+            );
+        }
         assert_eq!(
-            parse_command("/login openai", true),
-            Parsed::Login {
-                method_id: Some("openai")
+            parse_command("/new keep trailing ", true),
+            Parsed::New {
+                prompt: Some("keep trailing ")
             }
         );
         assert_eq!(find_known_token("/login", &[], true), Some(0..6));

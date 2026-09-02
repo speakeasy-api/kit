@@ -4,6 +4,7 @@ mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
 
+pub(crate) use adapter::authentication_method_id;
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,

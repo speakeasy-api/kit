@@ -28,13 +28,14 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    provider::{SelectableAdapter, model_catalog},
+    provider::{SelectableAdapter, authentication_method_id, model_catalog},
     runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
 use super::{
-    CancelBackgroundRequest, CancelBackgroundResponse, DetachComposeRequest, DetachComposeResponse,
-    FileSearchRequest, FileSearchResponse, SessionRegistry, skill_catalog,
+    AuthenticationRequiredData, CancelBackgroundRequest, CancelBackgroundResponse,
+    DetachComposeRequest, DetachComposeResponse, FileSearchRequest, FileSearchResponse,
+    SessionRegistry, skill_catalog, terminal_auth_method_specs,
 };
 
 const PAGE_SIZE: usize = 100;
@@ -64,7 +65,40 @@ fn complete_new_session<E>(
 }
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
-    agent_client_protocol::util::internal_error(error.to_string())
+    let detail = error.to_string();
+    match authentication_method_id(&detail) {
+        Some(method_id) => agent_client_protocol::Error::internal_error()
+            .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
+        None => agent_client_protocol::util::internal_error(detail),
+    }
+}
+
+fn terminal_auth_methods(capabilities: &wire::ClientCapabilities) -> Vec<wire::AuthMethod> {
+    let supports_terminal_auth = capabilities
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.terminal.as_ref())
+        .is_some()
+        || capabilities
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("terminal-auth"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if !supports_terminal_auth {
+        return Vec::new();
+    }
+
+    terminal_auth_method_specs()
+        .iter()
+        .map(|method| {
+            wire::AuthMethod::Terminal(
+                wire::AuthMethodTerminal::new(method.method_id, method.name)
+                    .description(method.description)
+                    .args(method.args.iter().map(|arg| (*arg).into()).collect()),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -513,7 +547,8 @@ impl Server {
             wire::ProtocolVersion::V2,
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
-        .capabilities(agentkit_acp::v2::agent_capabilities()))
+        .capabilities(agentkit_acp::v2::agent_capabilities())
+        .auth_methods(terminal_auth_methods(&request.capabilities)))
     }
 
     async fn new_session(
@@ -3222,7 +3257,22 @@ mod tests {
     }
 
     #[test]
-    fn initialize_negotiates_v2_and_advertises_injection() {
+    fn sdk_error_marks_only_missing_credentials_as_authentication_required() {
+        let missing_detail = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
+        let missing = sdk_error(AcpRuntimeError::Loop(missing_detail.into()));
+        let data = missing.data.unwrap();
+        let required = AuthenticationRequiredData::from_value(&data).unwrap();
+        assert_eq!(required.method_id, "openrouter");
+        assert_eq!(required.detail, format!("loop error: {missing_detail}"));
+
+        let unrelated = sdk_error(AcpRuntimeError::Loop(
+            "stored OpenRouter credentials cannot be used with a noncanonical endpoint".into(),
+        ));
+        assert!(matches!(unrelated.data, Some(serde_json::Value::String(_))));
+    }
+
+    #[test]
+    fn initialize_negotiates_v2_and_advertises_injection_and_authentication() {
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let server = Server::new(runtime, SessionRegistry::new());
@@ -3239,7 +3289,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
-        assert!(response.auth_methods.is_empty());
+        assert_eq!(response.auth_methods.len(), 2);
+        assert!(matches!(
+            &response.auth_methods[0],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "openai"
+                    && method.args == ["serve", "--terminal-auth-login", "openai"]
+        ));
+        assert!(matches!(
+            &response.auth_methods[1],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "openrouter"
+                    && method.args == ["serve", "--terminal-auth-login", "openrouter"]
+        ));
+        let unsupported = server
+            .initialize(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("unsupported-client", "0"),
+            ))
+            .unwrap();
+        assert!(unsupported.auth_methods.is_empty());
         let mut newer = wire::InitializeRequest::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("newer-client", "0"),
