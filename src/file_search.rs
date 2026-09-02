@@ -1,14 +1,20 @@
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, ParserConfig,
     QueryParser, SharedFilePicker, SharedFrecency,
 };
+use serde::{Deserialize, Serialize};
 
 const INDEX_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESULTS: usize = 100;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FileMatch {
     pub relative_path: String,
     pub match_byte_offsets: Vec<Range<usize>>,
@@ -136,6 +142,28 @@ impl WorkspaceFileSearch {
             })
             .collect())
     }
+}
+
+pub async fn search_workspace(
+    state: Arc<Mutex<Option<WorkspaceFileSearch>>>,
+    root: PathBuf,
+    query: String,
+) -> Result<Vec<FileMatch>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut state = state
+            .lock()
+            .map_err(|error| format!("file search state is unavailable: {error}"))?;
+        if state.is_none() {
+            *state = Some(WorkspaceFileSearch::start(root)?);
+        }
+        let result = state.as_ref().expect("initialized above").search(&query);
+        if result.is_err() {
+            *state = None;
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("file search worker failed: {error}"))?
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ mod credentials;
 pub mod docs;
 pub mod events;
 mod fatal;
+mod file_search;
 pub mod plugins;
 pub(crate) mod process_tree;
 pub mod protocols;

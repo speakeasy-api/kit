@@ -1983,11 +1983,11 @@ mod tests {
     };
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
+        file_search::FileMatch,
         tui::app::{
             Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog,
             FilePickerDialog, FilePickerStatus, ModelDialog, Phase, Update, UserImage, UserMessage,
         },
-        tui::file_search::FileMatch,
     };
 
     fn test_agent(

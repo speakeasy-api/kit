@@ -9,7 +9,6 @@
 mod app;
 mod command;
 mod editor;
-mod file_search;
 mod image;
 mod markdown;
 mod plan;
@@ -58,6 +57,7 @@ use wire::{
 
 use crate::{
     events::{self, EVENTS_ENV},
+    protocols::acp::FileSearchRequest,
     tools::mcp::CredentialStorage,
 };
 
@@ -65,7 +65,6 @@ use app::{
     Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
     UserImage,
 };
-use file_search::WorkspaceFileSearch;
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
@@ -146,6 +145,7 @@ struct DetachComposeRequest {
 struct DetachComposeResponse {
     detached: bool,
 }
+
 /// How long the agent gets to answer the ACP handshake before the client gives
 /// up. Nothing in it waits on a model, so a slow answer means a wedged agent.
 const HANDSHAKE: Duration = Duration::from_secs(30);
@@ -546,8 +546,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id);
-            let file_search: Arc<Mutex<Option<WorkspaceFileSearch>>> =
-                Arc::new(Mutex::new(None));
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -867,32 +865,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     }
                                 }
                                 Action::SearchFiles { query, revision } => {
-                                    let state = Arc::clone(&file_search);
-                                    let search_root = root.clone();
+                                    let connection = connection.clone();
                                     let updates = updates_tx.clone();
                                     tokio::spawn(async move {
-                                        let result = tokio::task::spawn_blocking(move || {
-                                            let mut state = state.lock().map_err(|error| {
-                                                format!("file search state is unavailable: {error}")
-                                            })?;
-                                            if state.is_none() {
-                                                *state =
-                                                    Some(WorkspaceFileSearch::start(search_root)?);
-                                            }
-                                            let result = state
-                                                .as_ref()
-                                                .expect("initialized above")
-                                                .search(&query);
-                                            if result.is_err() {
-                                                *state = None;
-                                            }
-                                            result
-                                        })
-                                        .await
-                                        .map_err(|error| {
-                                            format!("file search worker failed: {error}")
-                                        })
-                                        .and_then(|result| result);
+                                        let result = connection
+                                            .send_request(FileSearchRequest { query })
+                                            .block_task()
+                                            .await
+                                            .map(|response| response.matches)
+                                            .map_err(|error| error.message.to_string());
                                         let _ = updates.send(QueuedUpdate::global(
                                             Update::FileMatches { revision, result },
                                         ));

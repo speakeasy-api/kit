@@ -24,6 +24,7 @@ use ratatui::{layout::Rect, text::Line};
 #[cfg(test)]
 use crate::compaction::is_compaction_summary;
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
+use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
@@ -33,7 +34,6 @@ const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
-    file_search::FileMatch,
     plan::{PlanNode, parse as parse_plan},
     wrap::LinkHit,
 };
@@ -3222,10 +3222,7 @@ mod tests {
         Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
         MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
     };
-    use crate::{
-        events::RuntimeEvent,
-        tui::{file_search::FileMatch, wrap::LinkHit},
-    };
+    use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
     fn press(code: KeyCode) -> KeyEvent {
         modified_press(code, KeyModifiers::NONE)
