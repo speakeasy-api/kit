@@ -570,6 +570,7 @@ pub struct App {
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
     cleaned_agent_ids: HashSet<String>,
+    cleaned_agent_ancestors: HashSet<String>,
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
@@ -854,6 +855,7 @@ impl App {
             agents: HashMap::new(),
             agent_versions: HashMap::new(),
             cleaned_agent_ids: HashSet::new(),
+            cleaned_agent_ancestors: HashSet::new(),
             agents_scroll: 0,
             agents_viewport: 0,
             agents_area: Rect::default(),
@@ -2022,6 +2024,7 @@ impl App {
         self.agents.clear();
         self.agent_versions.clear();
         self.cleaned_agent_ids.clear();
+        self.cleaned_agent_ancestors.clear();
         self.agents_scroll = 0;
         self.agents_viewport = 0;
         self.agents_area = Rect::default();
@@ -2136,10 +2139,10 @@ impl App {
                     }
                     return;
                 }
-                if parent_id
-                    .as_ref()
-                    .is_some_and(|parent| self.cleaned_agent_ids.contains(parent))
-                {
+                if parent_id.as_ref().is_some_and(|parent| {
+                    self.cleaned_agent_ancestors.contains(parent)
+                        || self.cleaned_agent_ids.contains(parent)
+                }) {
                     self.cleaned_agent_ids.insert(id.clone());
                     self.agents.remove(&id);
                     return;
@@ -2199,7 +2202,7 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
-                self.cleaned_agent_ids.insert(ancestor_id);
+                self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
             }
             _ => unreachable!("only subagent runtime events reach the roster reducer"),
@@ -3246,17 +3249,20 @@ mod tests {
             100,
         );
         app.cleaned_agent_ids.insert("cleaned".into());
+        app.cleaned_agent_ancestors.insert("ancestor".into());
         app.set_agents_viewport(Rect::new(20, 5, 10, 4), 2);
 
         assert!(!app.agents.is_empty());
         assert!(!app.agent_versions.is_empty());
         assert!(!app.cleaned_agent_ids.is_empty());
+        assert!(!app.cleaned_agent_ancestors.is_empty());
 
         app.start_session("replacement".into());
 
         assert!(app.agents.is_empty());
         assert!(app.agent_versions.is_empty());
         assert!(app.cleaned_agent_ids.is_empty());
+        assert!(app.cleaned_agent_ancestors.is_empty());
         assert_eq!(app.agents_scroll, 0);
         assert_eq!(app.agents_viewport, 0);
         assert_eq!(app.agents_area, Rect::default());
@@ -4984,6 +4990,73 @@ mod tests {
             100,
         );
         assert!(app.agents().iter().all(|row| row.id != "closed"));
+    }
+
+    #[test]
+    fn descendant_cleanup_suppresses_late_children_but_not_ancestor_updates() {
+        use crate::events::SubagentStatus;
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 1, Some(2)),
+            ),
+            100,
+        );
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "root".into(),
+            },
+            100,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "root",
+                "Root",
+                SubagentStatus::Working,
+                None,
+                2,
+                None,
+                (1, 3, None),
+            ),
+            100,
+        );
+        for event in [
+            agent_event(
+                "late-child",
+                "Late child",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("root", "Root")),
+                (4, 4, None),
+            ),
+            agent_event(
+                "late-grand",
+                "Late grandchild",
+                SubagentStatus::Working,
+                None,
+                1,
+                Some(("late-child", "Late child")),
+                (5, 5, None),
+            ),
+        ] {
+            app.apply_runtime_at(event, 100);
+        }
+
+        assert!(app.agents().iter().any(|row| {
+            row.id == "root" && row.status == SubagentStatus::Working && row.generation == 2
+        }));
+        assert!(
+            app.agents()
+                .iter()
+                .all(|row| row.id != "late-child" && row.id != "late-grand")
+        );
     }
 
     #[test]
