@@ -292,12 +292,7 @@ impl AcpHarnesses {
         if let Some(path) = &config.mcp_config {
             command.arg("--mcp-config").arg(path);
         }
-        command
-            .arg("--credential-store")
-            .arg(config.credential_storage.cli_name());
-        if let Some(path) = config.credential_storage.directory() {
-            command.arg("--credential-dir").arg(path);
-        }
+        config.credential_storage.append_cli_args(&mut command);
         config.telemetry.append_cli_args(&mut command);
         if let Some(api_key) = &config.openrouter_api_key {
             command.env("OPENROUTER_API_KEY", api_key.as_str());

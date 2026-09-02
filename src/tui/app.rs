@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
+use agent_client_protocol::schema::v2::{AuthMethodTerminal, StopReason, ToolCallStatus, ToolKind};
 #[cfg(test)]
 use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
@@ -293,6 +293,7 @@ pub enum Action {
         effort: String,
         save_defaults: bool,
     },
+    Login(AuthMethodTerminal),
     Copy(String),
     Cancel,
     DetachCompose(String),
@@ -574,6 +575,7 @@ pub struct App {
     pub session_dialog: Option<SessionDialog>,
     pub file_picker: Option<FilePickerDialog>,
     session_catalog_pending: bool,
+    pub auth_methods: Vec<AuthMethodTerminal>,
     pub available_commands: Vec<SlashCommand>,
     pub command_completion_selected: usize,
     command_completion_query: Option<String>,
@@ -866,6 +868,7 @@ impl App {
             session_dialog: None,
             file_picker: None,
             session_catalog_pending: false,
+            auth_methods: Vec::new(),
             available_commands: Vec::new(),
             command_completion_selected: 0,
             command_completion_query: None,
@@ -947,6 +950,7 @@ impl App {
             self.editor.text(),
             self.editor.cursor(),
             &self.available_commands,
+            !self.auth_methods.is_empty(),
         )
     }
 
@@ -961,6 +965,7 @@ impl App {
             self.editor.text(),
             self.editor.cursor(),
             &self.available_commands,
+            !self.auth_methods.is_empty(),
         )
         .len();
         self.command_completion_selected = self
@@ -2937,8 +2942,15 @@ impl App {
                         return Action::None;
                     }
                     let input = self.editor.text();
-                    if !matches!(parse(input), Parsed::Prompt(_))
-                        || known_token(input, &self.available_commands).is_some()
+                    if !matches!(
+                        parse(input, !self.auth_methods.is_empty()),
+                        Parsed::Prompt(_)
+                    ) || known_token(
+                        input,
+                        &self.available_commands,
+                        !self.auth_methods.is_empty(),
+                    )
+                    .is_some()
                     {
                         self.toast("commands are available only while idle");
                         return Action::None;
@@ -2949,7 +2961,7 @@ impl App {
                     }
                 }
                 let input = self.editor.submit();
-                return match parse(&input) {
+                return match parse(&input, !self.auth_methods.is_empty()) {
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Resume {
                         session_id: Some(session_id),
@@ -2971,6 +2983,30 @@ impl App {
                     Parsed::Agents => {
                         self.toggle_agents();
                         Action::None
+                    }
+                    Parsed::Login { method_id } => {
+                        let method = method_id
+                            .and_then(|method_id| {
+                                self.auth_methods
+                                    .iter()
+                                    .find(|method| method.method_id.0.as_ref() == method_id)
+                            })
+                            .or_else(|| {
+                                (method_id.is_none() && self.auth_methods.len() == 1)
+                                    .then(|| &self.auth_methods[0])
+                            });
+                        if let Some(method) = method {
+                            Action::Login(method.clone())
+                        } else {
+                            let ids = self
+                                .auth_methods
+                                .iter()
+                                .map(|method| method.method_id.0.as_ref())
+                                .collect::<Vec<_>>()
+                                .join("|");
+                            self.toast(format!("usage: /login <{ids}>"));
+                            Action::None
+                        }
                     }
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
@@ -3396,7 +3432,9 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
+    use agent_client_protocol::schema::v2::{
+        AuthMethodTerminal, StopReason, ToolCallStatus, ToolKind,
+    };
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -4364,6 +4402,37 @@ mod tests {
             panic!("expected the prompt to be sent");
         };
         assert_eq!(prompt.text, "first line");
+    }
+
+    #[test]
+    fn login_is_exposed_only_for_advertised_terminal_auth_methods() {
+        let mut unavailable = app();
+        unavailable.paste("/login");
+        unavailable.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::Submit { prompt, .. } = unavailable.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected an ordinary prompt");
+        };
+        assert_eq!(prompt.text, "/login");
+
+        let mut available = app();
+        available.auth_methods = vec![
+            AuthMethodTerminal::new("openai", "ChatGPT").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openai".into(),
+            ]),
+            AuthMethodTerminal::new("openrouter", "OpenRouter").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openrouter".into(),
+            ]),
+        ];
+        available.paste("/login openrouter");
+        available.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            available.handle_key(press(KeyCode::Enter)),
+            Action::Login(method) if method.method_id.0.as_ref() == "openrouter"
+        ));
     }
 
     #[test]

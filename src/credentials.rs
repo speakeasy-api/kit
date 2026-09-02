@@ -77,6 +77,13 @@ impl CredentialStorage {
             Self::Memory | Self::Keychain => None,
         }
     }
+
+    pub(crate) fn append_cli_args(&self, command: &mut tokio::process::Command) {
+        command.arg("--credential-store").arg(self.cli_name());
+        if let Some(directory) = self.directory() {
+            command.arg("--credential-dir").arg(directory);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

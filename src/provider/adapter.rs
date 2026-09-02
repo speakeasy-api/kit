@@ -191,13 +191,6 @@ impl SelectableAdapter {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new_with_credentials_and_effort(
-            selection.provider,
-            selection.model.clone(),
-            credential_storage.clone(),
-            reasoning_effort,
-            openrouter_api_key.as_ref(),
-        )?;
         Ok(Self {
             selection: Arc::new(Mutex::new(SessionSelection {
                 model: selection,
@@ -1250,6 +1243,21 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn selectable_adapter_defers_openrouter_credentials_until_session_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+
+        SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "test/model",
+            storage,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

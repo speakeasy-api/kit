@@ -39,6 +39,7 @@ use crossterm::{
     },
     execute,
     style::Print,
+    terminal::EnterAlternateScreen,
 };
 use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
@@ -177,6 +178,154 @@ fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
 
 #[cfg(windows)]
 fn detach_from_controlling_terminal(_command: &mut tokio::process::Command) {}
+
+fn error_detail(error: &agent_client_protocol::Error) -> &str {
+    match error.data.as_ref() {
+        Some(Value::String(detail)) => detail,
+        _ => &error.message,
+    }
+}
+
+fn authentication_required(
+    error: &agent_client_protocol::Error,
+    methods: &[wire::AuthMethodTerminal],
+) -> bool {
+    let detail = error_detail(error).to_ascii_lowercase();
+    methods.iter().any(|method| {
+        let method_id = method.method_id.0.to_ascii_lowercase();
+        !method_id.is_empty() && detail.contains(method_id.as_str())
+    })
+}
+
+fn credential_storage_for_launch(
+    credential_storage: &CredentialStorage,
+    current_dir: &Path,
+) -> CredentialStorage {
+    match credential_storage {
+        CredentialStorage::Filesystem(directory) if directory.is_relative() => {
+            CredentialStorage::Filesystem(current_dir.join(directory))
+        }
+        credential_storage => credential_storage.clone(),
+    }
+}
+
+fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCapabilities {
+    let capabilities = wire::ClientCapabilities::new();
+    if credential_storage.is_persistent() {
+        capabilities
+            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()))
+    } else {
+        capabilities
+    }
+}
+
+fn usable_terminal_auth_methods(methods: &[wire::AuthMethod]) -> Vec<wire::AuthMethodTerminal> {
+    methods
+        .iter()
+        .filter_map(|method| match method {
+            wire::AuthMethod::Terminal(method)
+                if !method.method_id.0.is_empty() && !method.args.is_empty() =>
+            {
+                Some(method.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn terminal_auth_command(
+    program: &std::ffi::OsStr,
+    root: &Path,
+    credential_storage: &CredentialStorage,
+    method: &wire::AuthMethodTerminal,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(&method.args)
+        .current_dir(root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    credential_storage.append_cli_args(&mut command);
+    for variable in &method.env {
+        command.env(&variable.name, &variable.value);
+    }
+    command
+}
+
+async fn authenticate_in_terminal(
+    terminal: &mut DefaultTerminal,
+    program: &std::ffi::OsStr,
+    root: &Path,
+    credential_storage: &CredentialStorage,
+    method: &wire::AuthMethodTerminal,
+    stop: &mut Stop,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    leave(terminal);
+    println!("Starting {}…", method.name);
+    wait_for_terminal_auth(
+        terminal_auth_command(program, root, credential_storage, method),
+        stop,
+    )
+    .await
+}
+
+async fn wait_for_terminal_auth(
+    mut command: tokio::process::Command,
+    stop: &mut Stop,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let child = command.kill_on_drop(true).spawn();
+    let Ok(mut child) = child else {
+        return Some(child.map(|_| unreachable!()));
+    };
+    tokio::select! {
+        status = child.wait() => Some(status),
+        () = stop.requested() => {
+            let _ = child.kill().await;
+            None
+        }
+    }
+}
+
+async fn wait_for_initial_session(
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    resume_id: Option<&str>,
+    root: &Path,
+    stop: &mut Stop,
+) -> Option<Result<(wire::SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error>> {
+    tokio::select! {
+        session = request_initial_session(connection, resume_id, root) => Some(session),
+        () = stop.requested() => None,
+        () = tokio::time::sleep(HANDSHAKE) => Some(Err(
+            agent_client_protocol::Error::into_internal_error(std::io::Error::other(
+                format!("the agent did not start a session within {} seconds", HANDSHAKE.as_secs())
+            ))
+        )),
+    }
+}
+
+async fn request_initial_session(
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    resume_id: Option<&str>,
+    root: &Path,
+) -> Result<(wire::SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error> {
+    if let Some(resume_id) = resume_id {
+        let response = connection
+            .send_request(
+                wire::ResumeSessionRequest::new(resume_id, root.to_path_buf())
+                    .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+            )
+            .block_task()
+            .await?;
+        Ok((wire::SessionId::new(resume_id), response.config_options))
+    } else {
+        let response = connection
+            .send_request(wire::NewSessionRequest::new(root.to_path_buf()))
+            .block_task()
+            .await?;
+        Ok((response.session_id, response.config_options))
+    }
+}
 
 fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
     let current = options
@@ -339,6 +488,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let root = &root
         .canonicalize()
         .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
+    let credential_storage =
+        credential_storage_for_launch(credential_storage, &std::env::current_dir()?);
+    let credential_storage = &credential_storage;
     let resume_session_id = resume.map(str::to_string);
     let persisted_session_id = resume_session_id
         .clone()
@@ -363,15 +515,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         command.arg("--mcp-config").arg(path);
     }
     telemetry.append_cli_args(&mut command);
-    command
-        .arg("--credential-store")
-        .arg(credential_storage.cli_name());
-    if let Some(directory) = credential_storage.directory() {
-        command.arg("--credential-dir").arg(directory);
-    }
+    credential_storage.append_cli_args(&mut command);
     if force {
         command.arg("--force");
     }
+    let auth_program = command.as_std().get_program().to_owned();
     detach_from_controlling_terminal(&mut command);
     let mut child = command
         .env(EVENTS_ENV, "1")
@@ -424,7 +572,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
 
     // The child is watched from its own task, which also owns it: aborting that
     // task drops the handle, and `kill_on_drop` takes the process with it.
-    let (exit_tx, exit_rx) = oneshot::channel();
+    let (exit_tx, mut exit_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let watcher = tokio::spawn(async move {
         tokio::select! {
@@ -470,47 +618,21 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // credentials — leaves its half of the handshake unanswered, and
             // waiting on it forever shows the user nothing at all. Its exit and
             // its silence both end the wait with something to read.
-            let handshake = async {
-                let initialized = connection
-                    .send_request(wire::InitializeRequest::new(
+            let initialize = connection
+                .send_request(
+                    wire::InitializeRequest::new(
                         ProtocolVersion::V2,
-                        wire::Implementation::new("kit-tui", env!("CARGO_PKG_VERSION")),
-                    ))
-                    .block_task()
-                    .await?;
-                if initialized.protocol_version != ProtocolVersion::V2 {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other("the agent did not negotiate ACP v2"),
-                    ));
-                }
-                let can_steer = initialized.capabilities.session.as_ref()
-                    .and_then(|session| session.inject.as_ref())
-                    .is_some_and(|inject| {
-                        inject.modes.contains(&wire::SessionInjectMode::Steer)
-                            && inject.steer_in_stream.as_ref().is_some_and(|modes| {
-                                modes.contains(&wire::SessionInjectSteerInStream::Finish)
-                            })
-                    });
-                if let Some(resume_id) = resume_session_id.clone() {
-                    let response = connection
-                        .send_request(
-                            wire::ResumeSessionRequest::new(resume_id.clone(), root.clone())
-                                .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
-                        )
-                        .block_task()
-                        .await?;
-                    Ok((wire::SessionId::new(resume_id), response.config_options, can_steer))
-                } else {
-                    let response = connection
-                        .send_request(wire::NewSessionRequest::new(root.clone()))
-                        .block_task()
-                        .await?;
-                    Ok((response.session_id, response.config_options, can_steer))
-                }
-            };
-            let session = tokio::select! {
-                session = handshake => session?,
-                status = exit_rx => {
+                        wire::Implementation::new(
+                            "kit-tui",
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    )
+                    .capabilities(client_capabilities(credential_storage)),
+                )
+                .block_task();
+            let initialized = tokio::select! {
+                initialized = initialize => initialized?,
+                status = &mut exit_rx => {
                     return Err(agent_client_protocol::Error::into_internal_error(
                         std::io::Error::other(died(status.ok().and_then(Result::ok), stderr_task, &recent).await),
                     ));
@@ -524,10 +646,55 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     ));
                 }
             };
-            let (mut session_id, config_options, can_steer) = session;
-            let active_session_id = durable_session_id(&session_id).map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
-            })?;
+            if initialized.protocol_version != ProtocolVersion::V2 {
+                return Err(agent_client_protocol::Error::into_internal_error(
+                    std::io::Error::other("the agent did not negotiate ACP v2"),
+                ));
+            }
+            let auth_methods = usable_terminal_auth_methods(&initialized.auth_methods);
+            let can_steer = initialized.capabilities.session.as_ref()
+                .and_then(|session| session.inject.as_ref())
+                .is_some_and(|inject| {
+                    inject.modes.contains(&wire::SessionInjectMode::Steer)
+                        && inject.steer_in_stream.as_ref().is_some_and(|modes| {
+                            modes.contains(&wire::SessionInjectSteerInStream::Finish)
+                        })
+                });
+
+            let initial = tokio::select! {
+                session = request_initial_session(
+                    &connection,
+                    resume_session_id.as_deref(),
+                    &root,
+                ) => session,
+                status = &mut exit_rx => {
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(died(
+                            status.ok().and_then(Result::ok),
+                            stderr_task,
+                            &recent,
+                        ).await),
+                    ));
+                }
+                () = tokio::time::sleep(HANDSHAKE) => {
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(format!(
+                            "the agent did not start a session within {} seconds",
+                            HANDSHAKE.as_secs()
+                        )),
+                    ));
+                }
+            };
+            let initial = match initial {
+                Err(error)
+                    if auth_methods.is_empty()
+                        || !authentication_required(&error, &auth_methods) =>
+                {
+                    return Err(error);
+                }
+                result => result,
+            };
+
             // Install every fallible signal handler before changing terminal modes so
             // an installation failure cannot leave the caller's terminal altered.
             let mut stop =
@@ -540,15 +707,126 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 model,
                 a2a,
             );
-            refresh_config_state(&mut app, Some(&config_options));
             app.can_steer = can_steer;
-            if let Ok(mut active) = transition_session.lock() {
-                active.id = active_session_id.clone();
-            }
-            app.start_session(active_session_id);
+            app.auth_methods = auth_methods;
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let (mut session_id, config_options) = match initial {
+                Ok(session) => session,
+                Err(session_error) => {
+                    app.note(format!(
+                        "could not start the session: {}; use /login to authenticate",
+                        error_detail(&session_error)
+                    ));
+                    loop {
+                    if let Err(error) =
+                        terminal.draw(|frame| ui::draw(frame, &mut app, &mut images))
+                    {
+                        leave(&mut terminal);
+                        return Err(agent_client_protocol::Error::into_internal_error(error));
+                    }
+                    tokio::select! {
+                        event = events.next() => {
+                            let action = match event {
+                                Some(Ok(event)) => handle(&mut app, event),
+                                Some(Err(_)) | None => {
+                                    leave(&mut terminal);
+                                    return Ok(());
+                                }
+                            };
+                            match action {
+                                Action::Quit => {
+                                    leave(&mut terminal);
+                                    return Ok(());
+                                }
+                                Action::Login(method) => {
+                                    drop(events);
+                                    let authenticated = authenticate_in_terminal(
+                                        &mut terminal,
+                                        &auth_program,
+                                        &root,
+                                        credential_storage,
+                                        &method,
+                                        &mut stop,
+                                    )
+                                    .await;
+                                    let Some(outcome) = authenticated else {
+                                        return Ok(());
+                                    };
+                                    let mut started = None;
+                                    match outcome {
+                                        Ok(status) if status.success() => {
+                                            let session = wait_for_initial_session(
+                                                &connection,
+                                                resume_session_id.as_deref(),
+                                                &root,
+                                                &mut stop,
+                                            )
+                                            .await;
+                                            let Some(session) = session else {
+                                                return Ok(());
+                                            };
+                                            match session {
+                                                Ok(session) => started = Some(session),
+                                                Err(error) => app.note(format!(
+                                                    "authentication completed, but the session still could not start: {}",
+                                                    error_detail(&error)
+                                                )),
+                                            }
+                                        }
+                                        Ok(status) => app.note(format!(
+                                            "authentication with {} failed: {status}",
+                                            method.name
+                                        )),
+                                        Err(error) => app.note(format!(
+                                            "could not start authentication with {}: {error}",
+                                            method.name
+                                        )),
+                                    }
+                                    images = resume_terminal(&mut terminal).map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                    events = EventStream::new();
+                                    if let Some(session) = started {
+                                        break session;
+                                    }
+                                }
+                                Action::None | Action::Redraw => {}
+                                _ => app.note("authenticate before starting a session"),
+                            }
+                        }
+                        update = updates_rx.recv() => match update {
+                            Some(update) => app.apply(update.update),
+                            None => {
+                                leave(&mut terminal);
+                                return Ok(());
+                            }
+                        },
+                        _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
+                        () = stop.requested() => {
+                            leave(&mut terminal);
+                            return Ok(());
+                        }
+                    }
+                    }
+                },
+            };
+            let active_session_id = match durable_session_id(&session_id) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    leave(&mut terminal);
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(error),
+                    ));
+                }
+            };
+            refresh_config_state(&mut app, Some(&config_options));
+            if let Ok(mut active) = transition_session.lock() {
+                active.id = active_session_id.clone();
+            }
+            app.start_session(active_session_id.clone());
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
@@ -862,6 +1140,107 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         )),
                                     }
                                 }
+                                Action::Login(method) => {
+                                    drop(events);
+                                    let authenticated = authenticate_in_terminal(
+                                        &mut terminal,
+                                        &auth_program,
+                                        &root,
+                                        credential_storage,
+                                        &method,
+                                        &mut stop,
+                                    )
+                                    .await;
+                                    let Some(outcome) = authenticated else {
+                                        return Ok(());
+                                    };
+                                    let mut refreshed = None;
+                                    match outcome {
+                                        Ok(status) if status.success() => {
+                                            let refreshed_id = durable_session_id(&session_id)
+                                                .map_err(|error| {
+                                                    agent_client_protocol::Error::into_internal_error(
+                                                        std::io::Error::other(error),
+                                                    )
+                                                })?;
+                                            let closed = tokio::time::timeout(
+                                                CLOSE_SESSION,
+                                                connection
+                                                    .send_request(CloseSessionRequest::new(
+                                                        session_id.clone(),
+                                                    ))
+                                                    .block_task(),
+                                            )
+                                            .await;
+                                            match closed {
+                                                Ok(Ok(_)) => {
+                                                    transition_route(
+                                                        &transition_session,
+                                                        refreshed_id.clone(),
+                                                    );
+                                                    images.clear();
+                                                    app.start_session(refreshed_id.clone());
+                                                    let resumed = wait_for_initial_session(
+                                                        &connection,
+                                                        Some(&refreshed_id),
+                                                        &root,
+                                                        &mut stop,
+                                                    )
+                                                    .await;
+                                                    let Some(resumed) = resumed else {
+                                                        return Ok(());
+                                                    };
+                                                    match resumed {
+                                                        Ok(session) => refreshed = Some(session),
+                                                        Err(error) => {
+                                                            return Err(agent_client_protocol::Error::into_internal_error(
+                                                                std::io::Error::other(format!(
+                                                                    "authentication completed, but the session could not restart: {}",
+                                                                    error_detail(&error)
+                                                                )),
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                                Ok(Err(error)) => {
+                                                    return Err(agent_client_protocol::Error::into_internal_error(
+                                                        std::io::Error::other(format!(
+                                                            "authentication completed, but the session could not close for refresh: {}",
+                                                            error_detail(&error)
+                                                        )),
+                                                    ));
+                                                }
+                                                Err(_) => {
+                                                    return Err(agent_client_protocol::Error::into_internal_error(
+                                                        std::io::Error::other(
+                                                            "authentication completed, but session refresh timed out",
+                                                        ),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Ok(status) => app.note(format!(
+                                            "authentication with {} failed: {status}",
+                                            method.name
+                                        )),
+                                        Err(error) => app.note(format!(
+                                            "could not start authentication with {}: {error}",
+                                            method.name
+                                        )),
+                                    }
+                                    images = resume_terminal(&mut terminal).map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                    events = EventStream::new();
+                                    if let Some((resumed_id, options)) = refreshed {
+                                        session_id = resumed_id;
+                                        refresh_config_state(&mut app, Some(&options));
+                                        app.note(format!(
+                                            "authentication completed with {}",
+                                            method.name
+                                        ));
+                                    }
+                                }
                                 Action::Copy(text) => {
                                     execute!(terminal.backend_mut(), Print(osc52(&text)))
                                         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -951,7 +1330,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 }
             }
             .await;
-            leave(terminal);
+            leave(&mut terminal);
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -1264,18 +1643,9 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
     Ok(blocks)
 }
 
-fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
-    let terminal = ratatui::try_init()?;
-    // Query after entering the alternate screen but before the event stream owns
-    // terminal input, as required by ratatui-image. The query has a short bound.
-    let images = image::ImageRuntime::detect();
+fn enable_tui_modes() {
     let mut stdout = std::io::stdout();
-    // Bracketed paste is what keeps pasted text out of the key stream: without
-    // it every newline in a paste arrives as a return press, which submits the
-    // prompt part-way through.
     let _ = execute!(stdout, EnableBracketedPaste, EnableMouseCapture);
-    // Kitty-protocol terminals report `cmd`, `shift+enter`, and key release
-    // separately; the client falls back to control keys where they do not.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
@@ -1283,6 +1653,16 @@ fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
         );
         ENHANCED.store(true, Ordering::Relaxed);
     }
+}
+
+fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
+    let terminal = ratatui::try_init()?;
+    // Query after entering the alternate screen but before the event stream owns
+    // terminal input, as required by ratatui-image. The query has a short bound.
+    let images = image::ImageRuntime::detect();
+    // Bracketed paste keeps pasted newlines out of the key stream. Keyboard
+    // enhancement distinguishes command keys, shifted returns, and releases.
+    enable_tui_modes();
     // Ratatui's own hook restores raw mode and the alternate screen, but not
     // the modes turned on above: a panic would otherwise leave the shell
     // reporting every mouse move as text.
@@ -1292,6 +1672,22 @@ fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
         previous(info);
     }));
     Ok((terminal, images))
+}
+
+fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::ImageRuntime> {
+    let resumed = (|| {
+        crossterm::terminal::enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        let images = image::ImageRuntime::detect();
+        enable_tui_modes();
+        terminal.clear()?;
+        Ok(images)
+    })();
+    if resumed.is_err() {
+        restore_modes();
+        ratatui::restore();
+    }
+    resumed
 }
 
 /// Whether the keyboard enhancement flags were pushed and still need popping.
@@ -1369,9 +1765,9 @@ async fn bounded_graceful_close<T>(
     }
 }
 
-fn leave(terminal: DefaultTerminal) {
+fn leave(terminal: &mut DefaultTerminal) {
     restore_modes();
-    drop(terminal);
+    let _ = terminal.show_cursor();
     ratatui::restore();
 }
 
@@ -1750,10 +2146,10 @@ mod tests {
     };
 
     use agent_client_protocol::schema::v2::{
-        AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
-        IdleStateUpdate, RunningStateUpdate, SessionConfigOption, SessionConfigSelectGroup,
-        SessionConfigSelectOption, SessionUpdate, StateUpdate, TextContent,
-        UpdateSessionNotification, UserMessage,
+        AgentMessage, AgentThought, AuthMethod, AuthMethodTerminal, AvailableCommand,
+        AvailableCommandsUpdate, ContentBlock, EnvVariable, IdleStateUpdate, RunningStateUpdate,
+        SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption, SessionUpdate,
+        StateUpdate, TextContent, UpdateSessionNotification, UserMessage,
     };
     use crossterm::event::Event;
 
@@ -1761,13 +2157,115 @@ mod tests {
 
     use super::{
         ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
-        attachments_from_paste, command, current_model_choice, detach_from_controlling_terminal,
+        attachments_from_paste, authentication_required, client_capabilities, command,
+        credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
         durable_session_id, effort_state, handle, message_of, osc52, previous_session_for_resume,
         prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, transition_route, translate, translate_for_session,
-        user_message_of, wire,
+        save_model_defaults_to, terminal_auth_command, transition_route, translate,
+        translate_for_session, usable_terminal_auth_methods, user_message_of, wire,
     };
-    use crate::tui::app::{App, SessionDialog, SessionRename, SubmittedPrompt, Update};
+    use crate::{
+        tools::mcp::CredentialStorage,
+        tui::app::{App, SessionDialog, SessionRename, SubmittedPrompt, Update},
+    };
+
+    #[test]
+    fn only_authentication_failures_enter_login_recovery() {
+        let methods = [
+            AuthMethodTerminal::new("openrouter", "OpenRouter").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openrouter".into(),
+            ]),
+        ];
+        assert!(authentication_required(
+            &agent_client_protocol::util::internal_error(
+                "run `kit auth login openrouter` before using OpenRouter",
+            ),
+            &methods,
+        ));
+        assert!(!authentication_required(
+            &agent_client_protocol::util::internal_error(
+                "run `kit auth login speakeasy` before using Speakeasy",
+            ),
+            &methods,
+        ));
+    }
+
+    #[test]
+    fn relative_credential_storage_is_resolved_for_all_child_processes() {
+        assert!(matches!(
+            credential_storage_for_launch(
+                &CredentialStorage::Filesystem(PathBuf::from("credentials")),
+                std::path::Path::new("/caller"),
+            ),
+            CredentialStorage::Filesystem(path) if path == PathBuf::from("/caller/credentials")
+        ));
+    }
+
+    #[test]
+    fn terminal_auth_is_negotiated_and_only_usable_methods_are_exposed() {
+        assert!(
+            client_capabilities(&CredentialStorage::Keychain)
+                .auth
+                .and_then(|auth| auth.terminal)
+                .is_some()
+        );
+
+        assert!(
+            client_capabilities(&CredentialStorage::Memory)
+                .auth
+                .is_none()
+        );
+
+        let methods = vec![
+            AuthMethod::Terminal(AuthMethodTerminal::new("empty", "Empty")),
+            AuthMethod::Terminal(AuthMethodTerminal::new("openai", "ChatGPT").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openai".into(),
+            ])),
+        ];
+        let usable = usable_terminal_auth_methods(&methods);
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].method_id.0.as_ref(), "openai");
+    }
+
+    #[test]
+    fn terminal_auth_command_uses_advertised_args_env_and_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = root.path().join("credentials");
+        let method = AuthMethodTerminal::new("openai", "ChatGPT")
+            .args(vec!["auth".into(), "login".into(), "openai".into()])
+            .env(vec![EnvVariable::new("KIT_AUTH_TEST", "set")]);
+        let command = terminal_auth_command(
+            std::ffi::OsStr::new("kit-agent"),
+            root.path(),
+            &CredentialStorage::Filesystem(credentials.clone()),
+            &method,
+        );
+        let command = command.as_std();
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("kit-agent"));
+        assert_eq!(command.get_current_dir(), Some(root.path()));
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "auth",
+                "login",
+                "openai",
+                "--credential-store",
+                "file",
+                "--credential-dir",
+                credentials.to_str().unwrap(),
+            ]
+        );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "KIT_AUTH_TEST" && value == Some(std::ffi::OsStr::new("set"))
+        }));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
