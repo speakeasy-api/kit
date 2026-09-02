@@ -570,6 +570,7 @@ struct AttachedSession {
     config_options: Vec<SessionConfigOption>,
     canonical_transcript: Vec<Item>,
     activation: oneshot::Sender<()>,
+    pending_fork_creation: Option<crate::session::SessionObserver>,
 }
 
 struct PreparedLoad {
@@ -581,6 +582,7 @@ struct PreparedLoad {
 struct PreparedFork {
     response: ForkSessionResponse,
     activation: oneshot::Sender<()>,
+    creation: crate::session::SessionObserver,
 }
 
 /// Owns an ACP integration binding for an in-flight request or live actor.
@@ -831,6 +833,9 @@ impl Server {
             response: ForkSessionResponse::new(attached.session_id)
                 .config_options(Some(attached.config_options)),
             activation: attached.activation,
+            creation: attached
+                .pending_fork_creation
+                .expect("fork attachment must defer transcript creation"),
         })
     }
 
@@ -962,14 +967,19 @@ impl Server {
         self.registry
             .register(registered)
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
-        if let Err(error) = claim.commit() {
-            self.registry.remove(token);
-            return Err(record_acp_runtime_failure(
-                &session_id,
-                "session_commit",
-                error,
-            ));
-        }
+        let pending_fork_creation = if claim.is_fork() {
+            Some(claim.defer_fork_commit())
+        } else {
+            if let Err(error) = claim.commit() {
+                self.registry.remove(token);
+                return Err(record_acp_runtime_failure(
+                    &session_id,
+                    "session_commit",
+                    error,
+                ));
+            }
+            None
+        };
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
             session_id: session_id.to_string(),
         });
@@ -989,6 +999,7 @@ impl Server {
             config_options,
             canonical_transcript,
             activation,
+            pending_fork_creation,
         })
     }
 
@@ -1853,6 +1864,7 @@ fn component(
                             Ok(prepared) => {
                                 let session_id = prepared.response.session_id.clone();
                                 responder.respond(prepared.response)?;
+                                prepared.creation.commit_creation();
                                 let _ = prepared.activation.send(());
                                 connection.send_notification(available_commands_update(session_id))
                             }

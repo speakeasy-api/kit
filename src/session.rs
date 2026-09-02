@@ -76,6 +76,7 @@ struct Writer {
     workspace_root: PathBuf,
     file: File,
     lock: SessionLock,
+    created: Option<CreatedTranscript>,
 }
 
 struct SessionLock {
@@ -90,6 +91,12 @@ struct SessionLock {
 struct CreatedTranscript {
     path: PathBuf,
     keep: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InitialTranscriptOptions {
+    stamp_items: bool,
+    commit_creation: bool,
 }
 
 impl CreatedTranscript {
@@ -169,7 +176,10 @@ pub(crate) fn clone_completed_in(
         false,
         false,
         transcript,
-        false,
+        InitialTranscriptOptions {
+            stamp_items: false,
+            commit_creation: true,
+        },
     )?;
     drop(opened);
     Ok(())
@@ -247,7 +257,37 @@ pub(crate) fn open_in(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
-    open_with_initial_timestamps_in(root, directory, session_id, resume, force, initial, true)
+    open_with_initial_timestamps_in(
+        root,
+        directory,
+        session_id,
+        resume,
+        force,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: true,
+        },
+    )
+}
+
+pub(crate) fn open_uncommitted(
+    root: &Path,
+    session_id: &str,
+    initial: Vec<Item>,
+) -> Result<OpenSession, String> {
+    open_with_initial_timestamps_in(
+        root,
+        &default_directory()?,
+        session_id,
+        false,
+        false,
+        initial,
+        InitialTranscriptOptions {
+            stamp_items: true,
+            commit_creation: false,
+        },
+    )
 }
 
 fn open_with_initial_timestamps_in(
@@ -257,7 +297,7 @@ fn open_with_initial_timestamps_in(
     resume: bool,
     force: bool,
     initial: Vec<Item>,
-    stamp_initial: bool,
+    initial_options: InitialTranscriptOptions,
 ) -> Result<OpenSession, String> {
     validate_id(session_id)?;
     if !resume && initial.is_empty() {
@@ -322,7 +362,7 @@ fn open_with_initial_timestamps_in(
     let file = options
         .open(&path)
         .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let mut created = (!resume).then(|| CreatedTranscript::new(path.clone()));
+    let created = (!resume).then(|| CreatedTranscript::new(path.clone()));
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
@@ -330,13 +370,14 @@ fn open_with_initial_timestamps_in(
         workspace_root,
         file,
         lock,
+        created,
     };
     if resume && stored_workspace.is_none() {
         writer.replace(&transcript)?;
     }
     if !resume {
         for mut item in initial {
-            if stamp_initial {
+            if initial_options.stamp_items {
                 stamp_item(&mut item, Timestamp::now());
                 writer.append(&item)?;
             } else {
@@ -357,8 +398,8 @@ fn open_with_initial_timestamps_in(
     for item in crate::transcript::repair_unanswered_tool_calls(&mut transcript) {
         writer.append(&item)?;
     }
-    if let Some(created) = created.take() {
-        created.keep();
+    if initial_options.commit_creation {
+        writer.commit_creation();
     }
     Ok(OpenSession {
         transcript,
@@ -367,6 +408,13 @@ fn open_with_initial_timestamps_in(
 }
 
 impl SessionObserver {
+    pub(crate) fn commit_creation(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_creation();
+    }
+
     /// Durably records a complete transcript replacement produced by a mutator.
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
@@ -394,6 +442,12 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
+    fn commit_creation(&mut self) {
+        if let Some(created) = self.created.take() {
+            created.keep();
+        }
+    }
+
     fn append(&mut self, item: &Item) -> Result<(), String> {
         if item.created_at.is_none() {
             return Err("transcript item missing created_at before persistence".into());

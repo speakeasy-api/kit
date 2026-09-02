@@ -622,6 +622,11 @@ impl ChildSession {
     }
 
     pub async fn close(&self) -> Result<(), ChildError> {
+        if let Some(ancestor_id) = &self.descendant_parent {
+            crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: ancestor_id.clone(),
+            });
+        }
         if self.capabilities.session_capabilities.close.is_none() {
             return if self.tx.strong_count() == 1 {
                 Ok(())
@@ -641,19 +646,11 @@ impl ChildSession {
             .map_err(|_| {
                 ChildError::TerminalFailed("nested agent process is no longer running".into())
             })?;
-        let result = response.await.map_err(|_| {
+        response.await.map_err(|_| {
             ChildError::TerminalFailed(
                 "nested agent process exited without a close response".into(),
             )
-        })?;
-        if result.is_ok()
-            && let Some(ancestor_id) = &self.descendant_parent
-        {
-            crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
-                ancestor_id: ancestor_id.clone(),
-            });
-        }
-        result
+        })?
     }
 
     #[cfg(test)]

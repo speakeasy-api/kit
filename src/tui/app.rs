@@ -2131,6 +2131,17 @@ impl App {
                 generation_finished_at_unix_ms,
             } => {
                 if self.cleaned_agent_ids.contains(&id) {
+                    if status == SubagentStatus::Removed {
+                        self.agents.remove(&id);
+                    }
+                    return;
+                }
+                if parent_id
+                    .as_ref()
+                    .is_some_and(|parent| self.cleaned_agent_ids.contains(parent))
+                {
+                    self.cleaned_agent_ids.insert(id.clone());
+                    self.agents.remove(&id);
                     return;
                 }
                 let incoming_rank = agent_status_rank(status);
@@ -2188,6 +2199,7 @@ impl App {
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
+                self.cleaned_agent_ids.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
             }
             _ => unreachable!("only subagent runtime events reach the roster reducer"),
