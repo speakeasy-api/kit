@@ -1236,6 +1236,24 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
+#[cfg(windows)]
+fn symlink_kind(file_type: &fs::FileType) -> u8 {
+    use std::os::windows::fs::FileTypeExt;
+
+    if file_type.is_symlink_file() {
+        0
+    } else if file_type.is_symlink_dir() {
+        1
+    } else {
+        2
+    }
+}
+
+#[cfg(not(windows))]
+fn symlink_kind(_file_type: &fs::FileType) -> u8 {
+    0
+}
+
 fn write_cached_inventory(
     root: &Path,
     inventory: &BTreeMap<PathBuf, CachedEntry>,
@@ -1736,10 +1754,43 @@ fn hash_local_plugin_tree(root: &Path, fingerprint: &mut blake3::Hasher) -> Resu
                     ));
                 }
             } else if before.file_type().is_symlink() {
-                return Err(format!(
-                    "plugin path fingerprinting does not allow symlinks: {}",
-                    path.display()
-                ));
+                // Hash the link itself rather than following it outside the package or into a cycle.
+                let before_kind = symlink_kind(&before.file_type());
+                fingerprint.update(&[2, before_kind]);
+                let target = fs::read_link(&path).map_err(|error| {
+                    format!(
+                        "could not read plugin path symlink {}: {error}",
+                        path.display()
+                    )
+                })?;
+                let target_bytes = target.as_os_str().as_encoded_bytes();
+                bytes_seen = bytes_seen
+                    .checked_add(target_bytes.len() as u64)
+                    .filter(|total| *total <= MAX_EXPANDED_BYTES)
+                    .ok_or_else(|| "plugin path exceeds expanded size limit".to_string())?;
+                hash_fingerprint_field(fingerprint, target_bytes);
+                let after = fs::symlink_metadata(&path).map_err(|error| {
+                    format!(
+                        "could not recheck plugin path symlink {}: {error}",
+                        path.display()
+                    )
+                })?;
+                let target_after = fs::read_link(&path).map_err(|error| {
+                    format!(
+                        "could not recheck plugin path symlink {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if !after.file_type().is_symlink()
+                    || symlink_kind(&after.file_type()) != before_kind
+                    || !same_file_state(&before, &after)
+                    || target != target_after
+                {
+                    return Err(format!(
+                        "plugin path changed while being fingerprinted: {}",
+                        path.display()
+                    ));
+                }
             } else {
                 return Err(format!(
                     "plugin path contains an unsupported entry: {}",
@@ -3957,16 +4008,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_tree_fingerprint_rejects_symlinks() {
+    fn local_tree_fingerprint_hashes_symlink_without_following_it() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("plugin.json"), MANIFEST).unwrap();
-        fs::write(directory.path().join("target"), "body").unwrap();
-        symlink("target", directory.path().join("link")).unwrap();
-        let mut fingerprint = blake3::Hasher::new();
-        let error = hash_local_plugin_tree(directory.path(), &mut fingerprint).unwrap_err();
-        assert!(error.contains("does not allow symlinks"));
+        symlink("missing", directory.path().join("link")).unwrap();
+
+        let first = local_plugin_tree_fingerprint(directory.path()).unwrap();
+        assert_eq!(
+            first,
+            local_plugin_tree_fingerprint(directory.path()).unwrap()
+        );
+
+        fs::remove_file(directory.path().join("link")).unwrap();
+        symlink(".", directory.path().join("link")).unwrap();
+        assert_ne!(
+            first,
+            local_plugin_tree_fingerprint(directory.path()).unwrap()
+        );
     }
 
     #[test]
@@ -3991,6 +4051,40 @@ mod tests {
         .unwrap();
 
         fs::write(package.join("plugin.json"), "changed").unwrap();
+
+        let error = plan
+            .verify_path_fingerprints(&configs, directory.path())
+            .unwrap_err();
+        assert_eq!(error, "plugin path for \"local\" changed during staging");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_source_plan_verification_rejects_nested_symlink_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("plugin");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("plugin.json"), MANIFEST).unwrap();
+        symlink("first", package.join("link")).unwrap();
+        let mut configs = BTreeMap::new();
+        configs.insert(
+            "local".to_string(),
+            PluginConfig::Path {
+                path: package.clone(),
+            },
+        );
+        let plan = source_plan(
+            &configs,
+            directory.path(),
+            directory.path(),
+            &GitResolverMode::Https,
+        )
+        .unwrap();
+
+        fs::remove_file(package.join("link")).unwrap();
+        symlink("second", package.join("link")).unwrap();
 
         let error = plan
             .verify_path_fingerprints(&configs, directory.path())
