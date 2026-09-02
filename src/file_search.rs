@@ -2,16 +2,14 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, ParserConfig,
-    QueryParser, SharedFilePicker, SharedFrecency,
+    QueryParser,
 };
 use serde::{Deserialize, Serialize};
 
-const INDEX_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESULTS: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -21,7 +19,7 @@ pub struct FileMatch {
 }
 
 pub struct WorkspaceFileSearch {
-    picker: SharedFilePicker,
+    picker: FilePicker,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,32 +67,24 @@ impl WorkspaceFileSearch {
             .into_os_string()
             .into_string()
             .map_err(|_| "workspace root is not valid UTF-8".to_string())?;
-        let picker = SharedFilePicker::default();
-        FilePicker::new_with_shared_state(
-            picker.clone(),
-            SharedFrecency::noop(),
-            FilePickerOptions {
-                base_path,
-                mode: FFFMode::Ai,
-                ..FilePickerOptions::default()
-            },
-        )
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path,
+            mode: FFFMode::Ai,
+            watch: false,
+            enable_home_dir_scanning: true,
+            ..FilePickerOptions::default()
+        })
         .map_err(|error| format!("could not start workspace file index: {error}"))?;
+        // The synchronous path-only scan avoids fff-search's background
+        // content-classification pass and cannot overlap a replacement scan.
+        picker
+            .collect_files()
+            .map_err(|error| format!("could not scan workspace files: {error}"))?;
         Ok(Self { picker })
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<FileMatch>, String> {
-        if !self.picker.wait_for_scan(INDEX_TIMEOUT) {
-            return Err("workspace file index timed out".into());
-        }
-
-        let guard = self
-            .picker
-            .read()
-            .map_err(|error| format!("could not read workspace file index: {error}"))?;
-        let picker = guard
-            .as_ref()
-            .ok_or_else(|| "workspace file index is unavailable".to_string())?;
+        let picker = &self.picker;
         let parsed = QueryParser::new(LiteralPathConfig).parse(query);
         let results = picker.fuzzy_search(
             &parsed,
@@ -153,14 +143,12 @@ pub async fn search_workspace(
         let mut state = state
             .lock()
             .map_err(|error| format!("file search state is unavailable: {error}"))?;
-        if state.is_none() {
+        // An empty query starts a new picker activation, so refresh the
+        // path-only snapshot at that boundary without rescanning per keystroke.
+        if state.is_none() || query.is_empty() {
             *state = Some(WorkspaceFileSearch::start(root)?);
         }
-        let result = state.as_ref().expect("initialized above").search(&query);
-        if result.is_err() {
-            *state = None;
-        }
-        result
+        state.as_ref().expect("initialized above").search(&query)
     })
     .await
     .map_err(|error| format!("file search worker failed: {error}"))?
@@ -248,6 +236,27 @@ mod tests {
             unicode[0].relative_path.is_char_boundary(range.start)
                 && unicode[0].relative_path.is_char_boundary(range.end)
         }));
+    }
+
+    #[tokio::test]
+    async fn empty_query_refreshes_the_cached_snapshot() {
+        let workspace = workspace();
+        let root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let state = Arc::new(Mutex::new(None));
+
+        let initial = search_workspace(state.clone(), root.clone(), String::new())
+            .await
+            .expect("initial scan");
+        assert!(!initial.iter().any(|item| item.relative_path == "new.rs"));
+
+        fs::write(workspace.path().join("new.rs"), "new").expect("write new file");
+        let refreshed = search_workspace(state, root, String::new())
+            .await
+            .expect("refreshed scan");
+        assert!(refreshed.iter().any(|item| item.relative_path == "new.rs"));
     }
 
     #[test]
