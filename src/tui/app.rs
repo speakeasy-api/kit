@@ -1684,6 +1684,7 @@ impl App {
                 }
                 Ok(entries) => {
                     self.session_choices = entries;
+                    self.file_picker = None;
                     self.session_dialog = Some(SessionDialog { selected: 0 });
                 }
                 Err(error) => self.toast(format!("could not list sessions: {error}")),
@@ -2613,11 +2614,6 @@ impl App {
                 self.editor.move_right();
                 self.revalidate_file_picker();
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.editor.clear();
-                self.file_picker = None;
-                self.toast("prompt cleared — ctrl+c again to quit");
-            }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
@@ -2648,16 +2644,30 @@ impl App {
         // the arrival gap is the only thing separating it from typing.
         let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
         self.last_key = Some(Instant::now());
-        if self.file_picker.is_some() && key.code != KeyCode::Enter {
-            return self.handle_file_picker_key(key);
-        }
-        self.file_picker = None;
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let command = key.modifiers.contains(KeyModifiers::SUPER);
+        let file_picker_key = match key.code {
+            KeyCode::Char(_) => !control && !alt && !command,
+            KeyCode::Esc
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Tab
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Left
+            | KeyCode::Right => key.modifiers.is_empty(),
+            _ => false,
+        };
+        let pasted_input =
+            pasted && matches!(key.code, KeyCode::Char(_) | KeyCode::Tab | KeyCode::Enter);
+        if self.file_picker.is_some() && !pasted_input && file_picker_key {
+            return self.handle_file_picker_key(key);
+        }
+        self.file_picker = None;
         // `cmd` only reaches the client in terminals that speak the Kitty
         // keyboard protocol; the control equivalents cover the rest.
-        let command = key.modifiers.contains(KeyModifiers::SUPER);
         let word = alt || control;
         let line = command || control;
 
@@ -3338,6 +3348,23 @@ mod tests {
     }
 
     #[test]
+    fn unbracketed_paste_starting_with_at_dismisses_the_picker() {
+        let mut app = app();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        app.last_key = Some(Instant::now());
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('s'))),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "@s");
+        assert!(app.file_picker.is_none());
+    }
+
+    #[test]
     fn picker_revisions_discard_stale_results_and_follow_edits() {
         let mut app = app();
         let Action::SearchFiles {
@@ -3346,6 +3373,7 @@ mod tests {
         else {
             panic!("picker search");
         };
+        app.last_key = None;
         let Action::SearchFiles {
             query,
             revision: second,
@@ -3398,7 +3426,9 @@ mod tests {
                 },
             ]),
         });
+        app.last_key = Some(Instant::now());
         app.handle_key(press(KeyCode::Down));
+        app.last_key = None;
         app.handle_key(press(KeyCode::Tab));
         assert_eq!(app.editor.text(), "open @docs/file name.md");
         assert!(app.file_picker.is_none());
@@ -3436,6 +3466,38 @@ mod tests {
         app.handle_key(press(KeyCode::Left));
         assert_eq!(app.editor.text(), "@ @");
         assert!(app.file_picker.is_none());
+    }
+
+    #[test]
+    fn modified_editor_keys_bypass_and_dismiss_the_picker() {
+        let mut editing = app();
+        assert!(matches!(
+            editing.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        editing.last_key = None;
+
+        assert!(matches!(
+            editing.handle_key(modified_press(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert_eq!(editing.editor.cursor(), 0);
+        assert_eq!(editing.editor.text(), "@");
+        assert!(editing.file_picker.is_none());
+
+        let mut working = app();
+        assert!(matches!(
+            working.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
+        working.last_key = None;
+        working.phase = Phase::Working;
+        assert!(matches!(
+            working.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Cancel
+        ));
+        assert!(working.phase == Phase::Cancelling);
+        assert!(working.file_picker.is_none());
     }
 
     #[test]
@@ -4509,6 +4571,10 @@ mod tests {
     #[test]
     fn session_catalog_update_opens_the_dialog() {
         let mut app = app();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Char('@'))),
+            Action::SearchFiles { .. }
+        ));
         app.apply(Update::SessionCatalog(Ok(vec![
             crate::session::CatalogEntry {
                 id: "saved".into(),
@@ -4520,6 +4586,7 @@ mod tests {
         ])));
         assert_eq!(app.session_choices[0].id, "saved");
         assert!(app.session_dialog.is_some());
+        assert!(app.file_picker.is_none());
     }
 
     #[test]
