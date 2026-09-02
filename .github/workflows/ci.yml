@@ -41,6 +41,9 @@ jobs:
         with:
           toolchain: 1.94.0
           targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-desktop
       - name: Install pinned XcodeGen
         shell: bash
         run: |
@@ -53,8 +56,14 @@ jobs:
           scripts/generate-acp-swift.py --check
           PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
           git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
-      - name: Build real debug helper
-        run: cargo build --locked --bin kit
+      # Reuse one release helper for the Debug smoke test and the Release archive.
+      - name: Build real Kit helper
+        shell: bash
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          # The lifecycle XCTest discovers a local development helper at this path.
+          mkdir -p target/debug
+          ln -sf ../aarch64-apple-darwin/release/kit target/debug/kit
       - name: Run Swift tests and real Kit lifecycle smoke
         shell: bash
         run: |
@@ -69,13 +78,12 @@ jobs:
             -configuration Debug \
             -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath "$derived" \
-            KIT_BINARY="$GITHUB_WORKSPACE/target/debug/kit" \
+            KIT_BINARY="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/kit" \
             CODE_SIGNING_ALLOWED=NO
-          cmp target/debug/kit "$stale"
+          cmp target/aarch64-apple-darwin/release/kit "$stale"
       - name: Validate Release archive and bundled helper
         shell: bash
         run: |
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
           archive="$RUNNER_TEMP/Kit.xcarchive"
           xcodebuild archive -quiet \
             -project macos/KitDesktop.xcodeproj \
