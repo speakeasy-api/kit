@@ -15,7 +15,7 @@ struct ContentView: View {
                 get: { model.persistenceError != nil },
                 set: { if !$0 { model.persistenceError = nil } }
             )) {
-                Button("OK") { model.persistenceError = nil }
+                Button("OK") { model.persistenceError = nil }.pointingHandCursor()
             } message: {
                 Text(model.persistenceError ?? "")
             }
@@ -27,9 +27,10 @@ struct ContentView: View {
                 Text("Kit").brandDisplay(21)
                 Spacer()
                 Button(action: chooseWorkspace) { Image(systemName: "folder.badge.plus") }
-                    .buttonStyle(.plain).help("Add workspace")
+                    .buttonStyle(.plain).pointingHandCursor().help("Add workspace")
                 Button(action: model.createConversation) { Image(systemName: "square.and.pencil") }
-                    .buttonStyle(.plain).disabled(model.selectedWorkspaceID == nil).help("New conversation")
+                    .buttonStyle(.plain).pointingHandCursor()
+                    .disabled(model.selectedWorkspaceID == nil).help("New conversation")
             }
             .font(.system(size: 15, weight: .medium))
             .padding(.horizontal, 16).frame(height: 50)
@@ -41,7 +42,7 @@ struct ContentView: View {
                     Image(systemName: "folder.badge.plus").font(.system(size: 28)).foregroundStyle(.secondary)
                     Text("Add a workspace").brandDisplay(20)
                     Text("Choose a project folder to start.").font(.callout).foregroundStyle(.secondary)
-                    Button("Choose Folder", action: chooseWorkspace)
+                    Button("Choose Folder", action: chooseWorkspace).pointingHandCursor()
                 }.multilineTextAlignment(.center).padding(24)
                 Spacer()
             } else {
@@ -61,12 +62,13 @@ struct ContentView: View {
                                     running: model.activity[conversation.id] == true,
                                     locked: model.lockedConversationIDs.contains(conversation.id)
                                 )
-                            }.buttonStyle(.plain)
+                            }.buttonStyle(.plain).pointingHandCursor()
                         }
                         if model.workspaceConversations.isEmpty {
                             VStack(spacing: 8) {
                                 Text("No conversations yet").font(.callout).foregroundStyle(.secondary)
-                                Button("Start a conversation", action: model.createConversation).buttonStyle(.link)
+                                Button("Start a conversation", action: model.createConversation)
+                                    .buttonStyle(.link).pointingHandCursor()
                             }.frame(maxWidth: .infinity).padding(.top, 36)
                         }
                     }.padding(.horizontal, 8).padding(.bottom, 12)
@@ -116,7 +118,8 @@ struct ContentView: View {
                 Text(model.selectedWorkspace == nil ? "Add a workspace to begin" : "What should we work on?")
                     .brandDisplay(30)
                 if model.selectedWorkspace != nil {
-                    Button("New Conversation", action: model.createConversation).buttonStyle(.borderedProminent)
+                    Button("New Conversation", action: model.createConversation)
+                        .buttonStyle(.borderedProminent).pointingHandCursor()
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Brand.canvas)
         }
@@ -533,16 +536,19 @@ private struct ConversationView: View {
             if controller.shouldPresentAgentRoster {
                 Button { showAgentRoster.toggle() } label: {
                     Image(systemName: showAgentRoster ? "person.2.fill" : "person.2")
-                }.buttonStyle(.plain).help(showAgentRoster ? "Hide agent roster" : "Show agent roster")
+                }.buttonStyle(.plain).pointingHandCursor()
+                    .help(showAgentRoster ? "Hide agent roster" : "Show agent roster")
             }
             Button { followTranscript.toggle() } label: {
                 Image(systemName: followTranscript ? "arrow.down.to.line.compact" : "arrow.down")
-            }.buttonStyle(.plain).help(followTranscript ? "Following output" : "Resume following")
+            }.buttonStyle(.plain).pointingHandCursor()
+                .help(followTranscript ? "Following output" : "Resume following")
             Button { controller.copyLastResponse() } label: { Image(systemName: "doc.on.doc") }
-                .buttonStyle(.plain).help("Copy last response")
+                .buttonStyle(.plain).pointingHandCursor().help("Copy last response")
             if !controller.diagnostics.isEmpty {
                 Button { showDiagnostics.toggle() } label: { Image(systemName: "exclamationmark.bubble") }
-                    .buttonStyle(.plain).help("Diagnostics").popover(isPresented: $showDiagnostics) { diagnosticsPopover }
+                    .buttonStyle(.plain).pointingHandCursor().help("Diagnostics")
+                    .popover(isPresented: $showDiagnostics) { diagnosticsPopover }
             }
         }
         .foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 50)
@@ -615,7 +621,7 @@ private struct ConversationView: View {
                 )
                 HStack(spacing: 10) {
                     Button { choosingFiles = true } label: { Image(systemName: "plus") }
-                        .buttonStyle(.plain).font(.system(size: 15, weight: .medium))
+                        .buttonStyle(.plain).font(.system(size: 15, weight: .medium)).pointingHandCursor()
                         .disabled(controller.attachments.count >= ConversationController.maximumAttachmentCount)
                         .help("Attach image or audio")
                     modelControl
@@ -626,14 +632,14 @@ private struct ConversationView: View {
                         .brandMeta().foregroundStyle(.tertiary).lineLimit(1)
                     if controller.canCancel {
                         Button(action: controller.cancel) { Image(systemName: "stop.fill") }
-                            .buttonStyle(.bordered).controlSize(.small).help("Stop")
+                            .buttonStyle(.bordered).controlSize(.small).pointingHandCursor().help("Stop")
                     }
                     Button(action: controller.send) {
                         Image(systemName: "arrow.up").font(.system(size: 13, weight: .bold)).frame(width: 24, height: 24)
                     }
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.roundedRectangle(radius: Brand.Radius.small)).controlSize(.small)
-                    .keyboardShortcut(.return, modifiers: .command)
+                    .pointingHandCursor().keyboardShortcut(.return, modifiers: .command)
                     .disabled(!canSend)
                 }
             }
@@ -685,7 +691,7 @@ private struct ConversationView: View {
                         Text("/\(command.name)").fontWeight(.medium)
                         Text(command.description).foregroundStyle(.secondary)
                     }
-                }.buttonStyle(.plain)
+                }.buttonStyle(.plain).pointingHandCursor()
             }
             Spacer()
         }
@@ -703,7 +709,8 @@ private struct ConversationView: View {
                         HStack(spacing: 5) {
                             Image(systemName: attachment.kind == .image ? "photo" : "waveform")
                             Text(attachment.url.lastPathComponent).lineLimit(1)
-                            Button { controller.removeAttachment(attachment.id) } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain)
+                            Button { controller.removeAttachment(attachment.id) } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.plain).pointingHandCursor()
                         }
                         .font(.caption).padding(.horizontal, 8).padding(.vertical, 5)
                         .background(.quaternary, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
@@ -1091,7 +1098,7 @@ private struct ThoughtCard: View {
                             .font(.caption2).foregroundStyle(.tertiary)
                     }.contentShape(Rectangle())
                 }
-                .buttonStyle(.plain).padding(.horizontal, 12).padding(.vertical, 10)
+                .buttonStyle(.plain).pointingHandCursor().padding(.horizontal, 12).padding(.vertical, 10)
             }
             if entry.isStreaming || expanded {
                 Divider().opacity(0.55)
@@ -1176,7 +1183,7 @@ private struct ToolCard: View {
                     if !entry.children.isEmpty { Text("\(entry.children.count) calls").brandMeta().foregroundStyle(.tertiary) }
                     Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
                 }.contentShape(Rectangle())
-            }.buttonStyle(.plain).padding(.horizontal, 14).padding(.vertical, 12)
+            }.buttonStyle(.plain).pointingHandCursor().padding(.horizontal, 14).padding(.vertical, 12)
 
             if expanded {
                 Divider().opacity(0.55)
@@ -1204,7 +1211,7 @@ private struct ToolCard: View {
                     }
                     if entry.isStreaming, tool.compose != nil {
                         Button(entry.backgrounded ? "Cancel background call" : "Run in background", action: entry.backgrounded ? cancelBackground : detach)
-                            .buttonStyle(.bordered).controlSize(.small)
+                            .buttonStyle(.bordered).controlSize(.small).pointingHandCursor()
                     }
                 }.padding(12)
             }
