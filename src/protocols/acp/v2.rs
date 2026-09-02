@@ -38,6 +38,7 @@ use super::{
 };
 
 const PAGE_SIZE: usize = 100;
+
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3226,13 +3227,19 @@ mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let server = Server::new(runtime, SessionRegistry::new());
         let response = server
-            .initialize(wire::InitializeRequest::new(
-                wire::ProtocolVersion::V2,
-                wire::Implementation::new("test-client", "0"),
-            ))
+            .initialize(
+                wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("test-client", "0"),
+                )
+                .capabilities(wire::ClientCapabilities::new().auth(
+                    wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()),
+                )),
+            )
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
+        assert!(response.auth_methods.is_empty());
         let mut newer = wire::InitializeRequest::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("newer-client", "0"),
