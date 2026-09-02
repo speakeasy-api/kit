@@ -127,44 +127,96 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     }
 }
 
-fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below: bool) {
+struct CompletionPopup {
+    title: &'static str,
+    rows: Vec<Line<'static>>,
+    selected: Option<usize>,
+    footer: Option<Line<'static>>,
+    max_rows: usize,
+    max_width: u16,
+    prefer_below: bool,
+}
+
+fn draw_completion_popup(frame: &mut Frame<'_>, anchor: Rect, popup: CompletionPopup) {
     let outer = frame.area();
-    let dialog = app.file_picker.as_ref().expect("checked above");
-    let width = prompt.width.min(88);
-    let rows = match dialog.status {
-        FilePickerStatus::Ready => dialog.matches.len().max(1),
-        FilePickerStatus::Loading => 1,
-    };
-    let desired_height = (rows as u16).saturating_add(3).min(22);
-    let below_y = prompt.y.saturating_add(prompt.height);
+    let width = anchor.width.min(popup.max_width);
+    let below_y = anchor.y.saturating_add(anchor.height);
     let below_height = outer.bottom().saturating_sub(below_y);
-    let above_height = prompt.y.saturating_sub(outer.y);
-    let below = prefer_below && below_height >= 3;
-    let height = desired_height.min(if below { below_height } else { above_height });
-    if height == 0 || width == 0 {
+    let above_height = anchor.y.saturating_sub(outer.y);
+    let below = popup.prefer_below && below_height >= 3;
+    let available = if below { below_height } else { above_height };
+    if popup.rows.is_empty() || available < 3 || width < 4 {
         return;
     }
+    let footer_rows = u16::from(popup.footer.is_some() && available >= 4);
+    let visible = popup
+        .rows
+        .len()
+        .min(popup.max_rows)
+        .min(available.saturating_sub(2 + footer_rows) as usize);
+    if visible == 0 {
+        return;
+    }
+    let height = visible as u16 + 2 + footer_rows;
     let y = if below {
         below_y
     } else {
-        prompt.y.saturating_sub(height)
+        anchor.y.saturating_sub(height)
     };
     let area = Rect::new(
-        prompt.x + prompt.width.saturating_sub(width) / 2,
+        anchor.x + anchor.width.saturating_sub(width) / 2,
         y,
         width,
         height,
     );
-    let panel = Panel::bordered().title(" files ");
+    let panel = Panel::bordered()
+        .title(popup.title)
+        .border_type(BorderType::Rounded)
+        .border_style(theme::accent());
     let inner = panel.inner(area);
-    let footer_rows = u16::from(inner.height > 1);
     let [list, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(footer_rows)]).areas(inner);
-    let visible = list.height as usize;
-    let start = dialog
+    let selected = popup
         .selected
-        .saturating_sub(visible / 2)
-        .min(dialog.matches.len().saturating_sub(visible));
+        .map(|selected| selected.min(popup.rows.len().saturating_sub(1)));
+    let first = selected
+        .unwrap_or_default()
+        .saturating_sub(visible.saturating_sub(1))
+        .min(popup.rows.len().saturating_sub(visible));
+    let lines = popup
+        .rows
+        .into_iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+        .map(|(index, line)| {
+            let is_selected = selected == Some(index);
+            let mut spans = vec![Span::styled(
+                if is_selected { "› " } else { "  " },
+                theme::accent(),
+            )];
+            spans.extend(line.spans);
+            let line = Line::from(spans);
+            if is_selected {
+                line.style(theme::selection())
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), list);
+    if footer_rows != 0
+        && let Some(footer_line) = popup.footer
+    {
+        frame.render_widget(Paragraph::new(footer_line), footer);
+    }
+}
+
+fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below: bool) {
+    let dialog = app.file_picker.as_ref().expect("checked above");
+    let path_width = prompt.width.min(88).saturating_sub(4) as usize;
     let lines = match dialog.status {
         FilePickerStatus::Loading => {
             vec![Line::from(Span::styled(
@@ -175,21 +227,12 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
         FilePickerStatus::Ready if dialog.matches.is_empty() => {
             vec![Line::from(Span::styled("no matching files", theme::dim()))]
         }
-        FilePickerStatus::Ready => dialog.matches[start..]
+        FilePickerStatus::Ready => dialog
+            .matches
             .iter()
-            .take(visible)
-            .enumerate()
-            .map(|(offset, item)| {
-                let selected = start + offset == dialog.selected;
-                let mut spans = vec![Span::styled(
-                    if selected { "› " } else { "  " },
-                    if selected {
-                        theme::accent()
-                    } else {
-                        theme::text()
-                    },
-                )];
-                let path_width = list.width.saturating_sub(2) as usize;
+            .map(|item| {
+                let path_style = theme::text();
+                let mut spans = Vec::new();
                 let mut end = 0;
                 let mut used = 0;
                 for (index, grapheme) in item.relative_path.grapheme_indices(true) {
@@ -207,7 +250,7 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
                     if cursor < start {
                         spans.push(Span::styled(
                             item.relative_path[cursor..start].to_string(),
-                            theme::text(),
+                            path_style,
                         ));
                     }
                     if start < range_end {
@@ -221,22 +264,29 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
                 if cursor < end {
                     spans.push(Span::styled(
                         item.relative_path[cursor..end].to_string(),
-                        theme::text(),
+                        path_style,
                     ));
                 }
                 Line::from(spans)
             })
             .collect(),
     };
-    frame.render_widget(Clear, area);
-    frame.render_widget(panel, area);
-    frame.render_widget(Paragraph::new(lines), list);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            "↑/↓ navigate · tab complete · esc close",
-            theme::dim(),
-        )),
-        footer,
+    draw_completion_popup(
+        frame,
+        prompt,
+        CompletionPopup {
+            title: " files ",
+            rows: lines,
+            selected: (dialog.status == FilePickerStatus::Ready && !dialog.matches.is_empty())
+                .then_some(dialog.selected),
+            footer: Some(Line::from(Span::styled(
+                "↑/↓ navigate · tab complete · esc close",
+                theme::dim(),
+            ))),
+            max_rows: 19,
+            max_width: 88,
+            prefer_below,
+        },
     );
 }
 
@@ -1740,62 +1790,30 @@ fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_command_popup(frame: &mut Frame<'_>, app: &App, anchor: Rect) {
-    const MAX_ROWS: usize = 7;
-
     let commands = app.command_completions();
-    let available = anchor.y.saturating_sub(frame.area().y);
-    if commands.is_empty() || available < 3 || anchor.width < 4 {
-        return;
-    }
     let rows = commands
-        .len()
-        .min(MAX_ROWS)
-        .min(available.saturating_sub(2) as usize);
-    if rows == 0 {
-        return;
-    }
-    let selected = app
-        .command_completion_selected
-        .min(commands.len().saturating_sub(1));
-    let first = selected
-        .saturating_sub(rows.saturating_sub(1))
-        .min(commands.len().saturating_sub(rows));
-    let area = Rect::new(
-        anchor.x,
-        anchor.y - rows as u16 - 2,
-        anchor
-            .width
-            .min(frame.area().right().saturating_sub(anchor.x)),
-        rows as u16 + 2,
-    );
-    let panel = Panel::bordered()
-        .title(" commands ")
-        .border_type(BorderType::Rounded)
-        .border_style(theme::accent());
-    let inner = panel.inner(area);
-    let lines = commands
         .iter()
-        .enumerate()
-        .skip(first)
-        .take(rows)
-        .map(|(index, command)| {
-            let marker = if index == selected { "› " } else { "  " };
-            let line = Line::from(vec![
-                Span::styled(marker, theme::accent()),
+        .map(|command| {
+            Line::from(vec![
                 Span::styled(command.name.clone(), theme::accent()),
                 Span::styled("  ".to_string(), theme::text()),
                 Span::styled(command.description.clone(), theme::faint()),
-            ]);
-            if index == selected {
-                line.style(theme::selection())
-            } else {
-                line
-            }
+            ])
         })
-        .collect::<Vec<_>>();
-    frame.render_widget(Clear, area);
-    frame.render_widget(panel, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+        .collect();
+    draw_completion_popup(
+        frame,
+        anchor,
+        CompletionPopup {
+            title: " commands ",
+            rows,
+            selected: Some(app.command_completion_selected),
+            footer: None,
+            max_rows: 7,
+            max_width: u16::MAX,
+            prefer_below: false,
+        },
+    );
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1887,20 +1905,58 @@ fn prompt_lines(
     input: &str,
     available_commands: &[command::Command],
 ) -> Vec<Line<'static>> {
-    let mut highlighted =
-        command::known_token(input, available_commands).map_or(0, |range| range.len());
+    let mut highlights = command::known_token(input, available_commands)
+        .into_iter()
+        .collect::<Vec<_>>();
+    highlights.extend(input.char_indices().filter_map(|(start, character)| {
+        if character != '@'
+            || start > 0
+                && !input[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+        {
+            return None;
+        }
+        let end = input[start..]
+            .char_indices()
+            .skip(1)
+            .find_map(|(offset, character)| character.is_whitespace().then_some(start + offset))
+            .unwrap_or(input.len());
+        Some(start..end)
+    }));
+    let mut offset = 0;
     rows.into_iter()
         .map(|row| {
-            let prefix = highlighted.min(row.len());
-            highlighted -= prefix;
-            if prefix == 0 {
-                Line::from(Span::styled(row, theme::text()))
-            } else {
-                Line::from(vec![
-                    Span::styled(row[..prefix].to_string(), theme::accent()),
-                    Span::styled(row[prefix..].to_string(), theme::text()),
-                ])
+            let start = input[offset..].find(&row).map_or(offset, |at| offset + at);
+            let end = start + row.len();
+            offset = end;
+            let mut spans = Vec::new();
+            let mut cursor = start;
+            for range in highlights
+                .iter()
+                .filter(|range| range.start < end && range.end > start)
+            {
+                let highlighted_start = range.start.max(start).max(cursor);
+                let highlighted_end = range.end.min(end);
+                if cursor < highlighted_start {
+                    spans.push(Span::styled(
+                        input[cursor..highlighted_start].to_string(),
+                        theme::text(),
+                    ));
+                }
+                if highlighted_start < highlighted_end {
+                    spans.push(Span::styled(
+                        input[highlighted_start..highlighted_end].to_string(),
+                        theme::accent(),
+                    ));
+                }
+                cursor = highlighted_end;
             }
+            if cursor < end {
+                spans.push(Span::styled(input[cursor..end].to_string(), theme::text()));
+            }
+            Line::from(spans)
         })
         .collect()
 }
@@ -3411,6 +3467,20 @@ mod tests {
         assert_eq!(highlighted, "/new");
         assert_eq!(lines[0].spans[0].content, "/n");
         assert_eq!(lines[1].spans[0].content, "ew");
+    }
+
+    #[test]
+    fn highlights_file_paths_in_the_prompt() {
+        let input = "review @src/tui/app.rs and name@example.com";
+        let lines = prompt_lines(vec![input.into()], input, &[]);
+        let highlighted = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style == crate::tui::theme::accent())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(highlighted, "@src/tui/app.rs");
     }
 
     #[test]
