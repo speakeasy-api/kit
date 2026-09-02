@@ -464,7 +464,7 @@ struct Server {
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
     sessions: Mutex<HashMap<wire::SessionId, SessionHandle>>,
-    file_search: Arc<Mutex<Option<crate::file_search::WorkspaceFileSearch>>>,
+    file_search: Arc<Mutex<Option<crate::file_search::WorkspaceFileSearchState>>>,
 }
 
 impl Server {
@@ -483,6 +483,7 @@ impl Server {
             Arc::clone(&self.file_search),
             self.runtime.root().to_path_buf(),
             request.query,
+            request.activation,
         )
         .await
         .map(|matches| FileSearchResponse { matches })

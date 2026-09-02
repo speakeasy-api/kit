@@ -231,6 +231,7 @@ pub enum SessionRename {
 pub struct FilePickerDialog {
     pub query_range: Range<usize>,
     pub revision: u64,
+    pub activation: u64,
     pub selected: usize,
     pub matches: Vec<FileMatch>,
     pub status: FilePickerStatus,
@@ -299,6 +300,7 @@ pub enum Action {
     SearchFiles {
         query: String,
         revision: u64,
+        activation: u64,
     },
     Quit,
 }
@@ -2685,11 +2687,16 @@ impl App {
         self.file_picker = Some(FilePickerDialog {
             query_range,
             revision,
+            activation: revision,
             selected: 0,
             matches: Vec::new(),
             status: FilePickerStatus::Loading,
         });
-        Action::SearchFiles { query, revision }
+        Action::SearchFiles {
+            query,
+            revision,
+            activation: revision,
+        }
     }
 
     fn refresh_file_picker(&mut self) -> Action {
@@ -2697,6 +2704,11 @@ impl App {
             self.file_picker = None;
             return Action::None;
         };
+        let activation = self
+            .file_picker
+            .as_ref()
+            .expect("active query belongs to a picker")
+            .activation;
         let revision = self.next_file_search_revision();
         let query = self.editor.text()[query_range.start + 1..query_range.end].to_string();
         if let Some(dialog) = &mut self.file_picker {
@@ -2705,7 +2717,11 @@ impl App {
             dialog.selected = 0;
             dialog.status = FilePickerStatus::Loading;
         }
-        Action::SearchFiles { query, revision }
+        Action::SearchFiles {
+            query,
+            revision,
+            activation,
+        }
     }
 
     fn revalidate_file_picker(&mut self) {
@@ -3478,12 +3494,17 @@ mod tests {
     #[test]
     fn typed_eligible_at_opens_picker_but_paste_and_email_do_not() {
         let mut typed = app();
-        let Action::SearchFiles { query, revision } = typed.handle_key(press(KeyCode::Char('@')))
+        let Action::SearchFiles {
+            query,
+            revision,
+            activation,
+        } = typed.handle_key(press(KeyCode::Char('@')))
         else {
             panic!("eligible @ should search");
         };
         assert_eq!(query, "");
         assert_eq!(revision, 1);
+        assert_eq!(activation, revision);
         assert_eq!(typed.editor.text(), "@");
         assert!(typed.file_picker.is_some());
         typed.handle_key(press(KeyCode::Esc));
@@ -3526,7 +3547,9 @@ mod tests {
     fn picker_revisions_discard_stale_results_and_follow_edits() {
         let mut app = app();
         let Action::SearchFiles {
-            revision: first, ..
+            revision: first,
+            activation,
+            ..
         } = app.handle_key(press(KeyCode::Char('@')))
         else {
             panic!("picker search");
@@ -3535,12 +3558,14 @@ mod tests {
         let Action::SearchFiles {
             query,
             revision: second,
+            activation: refreshed_activation,
         } = app.handle_key(press(KeyCode::Char('s')))
         else {
             panic!("updated picker search");
         };
         assert_eq!(query, "s");
         assert!(second > first);
+        assert_eq!(refreshed_activation, activation);
 
         app.apply(Update::FileMatches {
             revision: first,
@@ -3562,6 +3587,18 @@ mod tests {
             app.file_picker.as_ref().unwrap().matches[0].relative_path,
             "src/lib.rs"
         );
+
+        app.last_key = None;
+        let Action::SearchFiles {
+            query,
+            activation: backspace_activation,
+            ..
+        } = app.handle_key(press(KeyCode::Backspace))
+        else {
+            panic!("backspace picker search");
+        };
+        assert_eq!(query, "");
+        assert_eq!(backspace_activation, activation);
     }
 
     #[test]

@@ -903,12 +903,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         ));
                                     }
                                 }
-                                Action::SearchFiles { query, revision } => {
+                                Action::SearchFiles {
+                                    query,
+                                    revision,
+                                    activation,
+                                } => {
                                     let connection = connection.clone();
                                     let updates = updates_tx.clone();
                                     tokio::spawn(async move {
                                         let result = connection
-                                            .send_request(FileSearchRequest { query })
+                                            .send_request(FileSearchRequest { query, activation })
                                             .block_task()
                                             .await
                                             .map(|response| response.matches)

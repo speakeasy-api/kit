@@ -2484,6 +2484,7 @@ mod tests {
         app.file_picker = Some(FilePickerDialog {
             query_range: 0..1,
             revision: 1,
+            activation: 1,
             selected: 0,
             matches: Vec::new(),
             status: FilePickerStatus::Loading,
@@ -2522,6 +2523,7 @@ mod tests {
         start.file_picker = Some(FilePickerDialog {
             query_range: 0..4,
             revision: 1,
+            activation: 1,
             selected: 0,
             matches: vec![FileMatch {
                 relative_path: "src/tui/app.rs".into(),

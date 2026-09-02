@@ -22,6 +22,11 @@ pub struct WorkspaceFileSearch {
     picker: FilePicker,
 }
 
+pub struct WorkspaceFileSearchState {
+    activation: u64,
+    search: WorkspaceFileSearch,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LiteralPathConfig;
 
@@ -135,20 +140,32 @@ impl WorkspaceFileSearch {
 }
 
 pub async fn search_workspace(
-    state: Arc<Mutex<Option<WorkspaceFileSearch>>>,
+    state: Arc<Mutex<Option<WorkspaceFileSearchState>>>,
     root: PathBuf,
     query: String,
+    activation: u64,
 ) -> Result<Vec<FileMatch>, String> {
     tokio::task::spawn_blocking(move || {
         let mut state = state
             .lock()
             .map_err(|error| format!("file search state is unavailable: {error}"))?;
-        // An empty query starts a new picker activation, so refresh the
-        // path-only snapshot at that boundary without rescanning per keystroke.
-        if state.is_none() || query.is_empty() {
-            *state = Some(WorkspaceFileSearch::start(root)?);
+        // The activation identifies a picker instance independently of its query.
+        // This lets a later query initialize the snapshot if it wins the request
+        // race, while older or same-activation requests cannot trigger a rescan.
+        let refresh = state
+            .as_ref()
+            .is_none_or(|cached| activation > cached.activation);
+        if refresh {
+            *state = Some(WorkspaceFileSearchState {
+                activation,
+                search: WorkspaceFileSearch::start(root)?,
+            });
         }
-        state.as_ref().expect("initialized above").search(&query)
+        state
+            .as_ref()
+            .expect("initialized above")
+            .search
+            .search(&query)
     })
     .await
     .map_err(|error| format!("file search worker failed: {error}"))?
@@ -239,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_query_refreshes_the_cached_snapshot() {
+    async fn activation_refreshes_even_when_a_later_query_arrives_first() {
         let workspace = workspace();
         let root = workspace
             .path()
@@ -247,16 +264,25 @@ mod tests {
             .expect("canonical workspace");
         let state = Arc::new(Mutex::new(None));
 
-        let initial = search_workspace(state.clone(), root.clone(), String::new())
+        search_workspace(state.clone(), root.clone(), String::new(), 1)
             .await
             .expect("initial scan");
-        assert!(!initial.iter().any(|item| item.relative_path == "new.rs"));
-
         fs::write(workspace.path().join("new.rs"), "new").expect("write new file");
-        let refreshed = search_workspace(state, root, String::new())
+
+        let raced = search_workspace(state.clone(), root.clone(), "new".into(), 2)
             .await
-            .expect("refreshed scan");
-        assert!(refreshed.iter().any(|item| item.relative_path == "new.rs"));
+            .expect("racing query");
+        assert!(raced.iter().any(|item| item.relative_path == "new.rs"));
+
+        fs::write(workspace.path().join("later.rs"), "later").expect("write later file");
+        let delayed_activation = search_workspace(state, root, String::new(), 2)
+            .await
+            .expect("delayed activation query");
+        assert!(
+            !delayed_activation
+                .iter()
+                .any(|item| item.relative_path == "later.rs")
+        );
     }
 
     #[test]
