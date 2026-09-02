@@ -2199,7 +2199,7 @@ mod tests {
                 &CredentialStorage::Filesystem(PathBuf::from("credentials")),
                 std::path::Path::new("/caller"),
             ),
-            CredentialStorage::Filesystem(path) if path == PathBuf::from("/caller/credentials")
+            CredentialStorage::Filesystem(path) if path == std::path::Path::new("/caller/credentials")
         ));
     }
 
