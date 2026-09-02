@@ -55,7 +55,58 @@ struct BrandSpectrumRule: View {
     }
 }
 
+private struct PointingHandCursorModifier: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content.background {
+            PointingHandCursorView(isEnabled: isEnabled)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct PointingHandCursorView: NSViewRepresentable {
+    let isEnabled: Bool
+
+    func makeNSView(context: Context) -> CursorView {
+        CursorView(isEnabled: isEnabled)
+    }
+
+    func updateNSView(_ view: CursorView, context: Context) {
+        view.isEnabled = isEnabled
+    }
+
+    final class CursorView: NSView {
+        var isEnabled: Bool {
+            didSet {
+                guard isEnabled != oldValue else { return }
+                window?.invalidateCursorRects(for: self)
+            }
+        }
+
+        init(isEnabled: Bool) {
+            self.isEnabled = isEnabled
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { nil }
+
+        override func resetCursorRects() {
+            super.resetCursorRects()
+            if isEnabled { addCursorRect(bounds, cursor: .pointingHand) }
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+}
+
 extension View {
+    func pointingHandCursor() -> some View {
+        modifier(PointingHandCursorModifier())
+    }
+
     func brandMicroLabel() -> some View {
         font(.system(size: 10, weight: .medium, design: .monospaced))
             .tracking(0.9)

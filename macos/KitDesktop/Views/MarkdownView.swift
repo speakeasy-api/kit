@@ -284,7 +284,7 @@ private struct CodeBlockView: View {
                     copied = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
                 } label: { Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc") }
-                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
+                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary).pointingHandCursor()
             }.padding(.horizontal, 12).padding(.vertical, 8)
             Divider()
             ScrollView(.horizontal) {
