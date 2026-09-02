@@ -13,18 +13,18 @@ use std::{
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AudioContent, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
-    BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
-    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
-    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
-    ResourceLink, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionForkCapabilities, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
-    ToolCallUpdateFields,
+    AudioContent, AuthMethod, AuthMethodTerminal, AutoDenyResolver, AvailableCommand,
+    AvailableCommandsUpdate, BlobResourceContents, CancelNotification, CloseSessionRequest,
+    CloseSessionResponse, ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource,
+    ForkSessionRequest, ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
+    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    SessionForkCapabilities, SessionInfo, SessionListCapabilities, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    TextContent, TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
@@ -57,6 +57,32 @@ const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
+
+fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec<AuthMethod> {
+    let supports_terminal_auth = capabilities.auth.terminal
+        || capabilities
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("terminal-auth"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if !supports_terminal_auth {
+        return Vec::new();
+    }
+
+    vec![
+        AuthMethod::Terminal(
+            AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
+                .description("Authenticate Kit with a ChatGPT subscription")
+                .args(vec!["auth".into(), "login".into(), "openai".into()]),
+        ),
+        AuthMethod::Terminal(
+            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
+                .description("Authenticate Kit with OpenRouter")
+                .args(vec!["auth".into(), "login".into(), "openrouter".into()]),
+        ),
+    ]
+}
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
     SessionNotification::new(
@@ -692,9 +718,10 @@ impl Server {
         }
     }
 
-    async fn initialize(&self, _request: InitializeRequest) -> InitializeResponse {
+    async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
             .agent_capabilities(capabilities())
+            .auth_methods(terminal_auth_methods(&request.client_capabilities))
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
                 self.integration.version().to_string(),
@@ -2087,6 +2114,28 @@ pub(super) mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn terminal_auth_methods_require_client_support() {
+        assert!(terminal_auth_methods(&agentkit_acp::ClientCapabilities::new()).is_empty());
+
+        let capabilities = agentkit_acp::ClientCapabilities::new()
+            .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
+        let methods = terminal_auth_methods(&capabilities);
+        assert_eq!(methods.len(), 2);
+        assert!(
+            matches!(&methods[0], AuthMethod::Terminal(method) if method.id.0.as_ref() == "openai")
+        );
+    }
+
+    #[test]
+    fn terminal_auth_methods_support_the_legacy_registry_capability() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
+        let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
+
+        assert_eq!(terminal_auth_methods(&capabilities).len(), 2);
+    }
 
     struct CompletionOnDrop(watch::Sender<bool>);
 
