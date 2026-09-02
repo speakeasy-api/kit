@@ -160,7 +160,8 @@ pub(crate) fn clone_completed_in(
     source: &str,
     destination: &str,
 ) -> Result<(), String> {
-    let transcript = load_in(root, directory, source)?;
+    let mut transcript = load_in(root, directory, source)?;
+    crate::transcript::sanitize_forked_transcript(&mut transcript);
     let opened = open_with_initial_timestamps_in(
         root,
         directory,
@@ -1636,7 +1637,8 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentkit_core::{ItemKind, Part};
+    use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
+    use serde_json::json;
 
     fn session_directory(root: &Path) -> PathBuf {
         root.join("sessions")
@@ -1995,6 +1997,53 @@ mod tests {
         let cloned = load(root.path(), "branch").unwrap();
         assert_eq!(cloned[0].created_at, None);
         assert_eq!(cloned[1].created_at, Some(Timestamp(77)));
+    }
+
+    #[test]
+    fn cloning_sanitizes_session_bound_continuation_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "openai.responses.continuation.v1".into(),
+            json!({ "session_id": "source" }),
+        );
+        metadata.insert("preserved".into(), true.into());
+        let source = open(
+            root.path(),
+            "source",
+            false,
+            false,
+            vec![Item::new(
+                ItemKind::Assistant,
+                vec![Part::Reasoning(
+                    ReasoningPart::summary("thought").with_metadata(metadata),
+                )],
+            )],
+        )
+        .unwrap();
+        drop(source);
+
+        clone_completed(root.path(), "source", "branch").unwrap();
+
+        let source = load(root.path(), "source").unwrap();
+        let branch = load(root.path(), "branch").unwrap();
+        let Part::Reasoning(source) = &source[0].parts[0] else {
+            panic!("expected source reasoning");
+        };
+        let Part::Reasoning(branch) = &branch[0].parts[0] else {
+            panic!("expected branch reasoning");
+        };
+        assert!(
+            source
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert!(
+            !branch
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert_eq!(branch.metadata["preserved"], true);
     }
 
     #[test]

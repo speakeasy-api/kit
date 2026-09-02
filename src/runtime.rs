@@ -34,7 +34,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
-    provider::{ProviderKind, SelectableAdapter, SelectableSession},
+    provider::{
+        ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
+    },
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
         ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
@@ -139,6 +141,13 @@ impl SessionSelection {
     }
 }
 
+pub(crate) struct AcpForkState {
+    pub transcript: Vec<Item>,
+    pub selection: ModelSelection,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub parent_context: Option<(String, String)>,
+}
+
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -151,6 +160,7 @@ pub(crate) struct AcpDriverContext<I = AcpIntegration> {
 enum SessionClaimKind {
     New { configured: bool, opened_new: bool },
     Load { configured: bool },
+    Fork,
 }
 
 pub(crate) struct SessionClaim {
@@ -170,6 +180,7 @@ impl SessionClaim {
             SessionClaimKind::New { configured, .. } | SessionClaimKind::Load { configured } => {
                 configured
             }
+            SessionClaimKind::Fork => false,
         }
     }
 
@@ -192,6 +203,7 @@ impl SessionClaim {
             SessionClaimKind::Load { configured } => {
                 selection.finish_load(&self.request, configured, true)
             }
+            SessionClaimKind::Fork => {}
         }
         self.committed = true;
         Ok(())
@@ -211,6 +223,7 @@ impl Drop for SessionClaim {
                 SessionClaimKind::Load { configured } => {
                     selection.finish_load(&self.request, configured, false)
                 }
+                SessionClaimKind::Fork => {}
             }
         }
     }
@@ -1092,6 +1105,19 @@ impl Runtime {
         })
     }
 
+    pub(crate) fn claim_session_fork(self: &Arc<Self>) -> Result<SessionClaim, AcpRuntimeError> {
+        Ok(SessionClaim {
+            runtime: Arc::clone(self),
+            request: SessionRequest {
+                id: crate::session::new_id(),
+                resume: false,
+                force: false,
+            },
+            kind: SessionClaimKind::Fork,
+            committed: false,
+        })
+    }
+
     pub(crate) fn claim_session_load(
         self: &Arc<Self>,
         id: &str,
@@ -1117,6 +1143,19 @@ impl Runtime {
     where
         I: LoopObserver + Clone + 'static,
     {
+        self.start_acp_driver_with_initial(context, claim, None)
+            .await
+    }
+
+    pub(crate) async fn start_acp_driver_with_initial<I>(
+        self: &Arc<Self>,
+        context: AcpDriverContext<I>,
+        claim: &mut SessionClaim,
+        forked: Option<AcpForkState>,
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
         let cwd = context
             .cwd
             .canonicalize()
@@ -1129,7 +1168,22 @@ impl Runtime {
         }
         let request = &claim.request;
         let session_id = request.id.clone();
-        let initial = if request.resume {
+        let (forked_transcript, selected, parent_context) = match forked {
+            Some(forked) => (
+                Some(forked.transcript),
+                Some((forked.selection, forked.reasoning_effort)),
+                forked.parent_context,
+            ),
+            None => (None, None, None),
+        };
+        let initial = if let Some(transcript) = forked_transcript {
+            if request.resume {
+                return Err(AcpRuntimeError::Loop(
+                    "a forked transcript requires a new session identity".into(),
+                ));
+            }
+            transcript
+        } else if request.resume {
             vec![Item::text(
                 ItemKind::System,
                 self.system_prompt(self.base_depth),
@@ -1150,11 +1204,17 @@ impl Runtime {
         claim.mark_opened();
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
+        let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
+            (
+                ModelSelection::new(self.provider, self.model.clone()),
+                self.reasoning_effort,
+            )
+        });
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
-            self.provider,
-            self.model.clone(),
+            selection.provider,
+            selection.model,
             self.credential_storage.clone(),
-            self.reasoning_effort,
+            reasoning_effort,
             self.openrouter_api_key.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
@@ -1168,7 +1228,10 @@ impl Runtime {
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
-        let subagents = self.subagents.fresh();
+        let subagents = match parent_context {
+            Some((id, name)) => self.subagents.fresh_with_parent(id, name),
+            None => self.subagents.fresh(),
+        };
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();

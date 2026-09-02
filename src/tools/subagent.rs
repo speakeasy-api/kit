@@ -282,6 +282,13 @@ impl Subagents {
         Self::new(self.config.clone(), self.max_depth)
     }
 
+    pub(crate) fn fresh_with_parent(&self, id: String, name: String) -> Self {
+        Self::new(
+            self.config.clone().with_parent_context(id, name),
+            self.max_depth,
+        )
+    }
+
     fn emit_event(&self, mut event: events::RuntimeEvent) {
         if let events::RuntimeEvent::SubagentStateChanged {
             parent_id,
@@ -710,9 +717,12 @@ impl Subagents {
             .config
             .clone()
             .with_root(root)
-            .with_parent_context(id.clone(), branch_name);
+            .with_parent_context(id.clone(), branch_name.clone());
         let child_result = if native_fork {
-            source_child.fork(model.as_deref(), &cancellation).await
+            let parent = kit.then(|| (id.clone(), branch_name));
+            source_child
+                .fork(model.as_deref(), parent, &cancellation)
+                .await
         } else {
             ChildSession::start(
                 child_config,
@@ -1114,36 +1124,55 @@ impl Subagents {
     }
 
     fn monitor_child_exit(&self, id: String, state: &Arc<AsyncMutex<State>>, child: &ChildSession) {
-        let manager = self.clone();
+        // Do not keep the manager alive while waiting for the child. Dropping a
+        // session-scoped manager must drop its child handles so their ACP
+        // processes (including native-fork siblings) can terminate.
+        let sessions = Arc::downgrade(&self.sessions);
         let state = Arc::downgrade(state);
+        let event_sink = Arc::clone(&self.event_sink);
+        let parent_id = self.config.parent_id.clone();
+        let parent_name = self.config.parent_name.clone();
         let mut closed = child.closed_signal();
         tokio::spawn(async move {
             if !*closed.borrow() {
                 let _ = closed.changed().await;
             }
-            if let Some(state) = state.upgrade() {
-                manager.retire_closed_child(id, state).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let mut locked = state.lock().await;
+            if locked.status == SubagentStatus::Removed {
+                return;
             }
+            if locked.status != SubagentStatus::Idle {
+                locked.outcome = Some(GenerationOutcome::Failed);
+            }
+            locked.status = SubagentStatus::Removed;
+            locked.forking = None;
+            locked
+                .generation_finished_at_unix_ms
+                .get_or_insert_with(events::now_millis);
+            let mut event = locked.runtime_event(id.clone());
+            drop(locked);
+            if let Some(sessions) = sessions.upgrade()
+                && let Ok(mut sessions) = sessions.lock()
+                && sessions
+                    .get(&id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.state, &state))
+            {
+                sessions.remove(&id);
+            }
+            if let events::RuntimeEvent::SubagentStateChanged {
+                parent_id: event_parent_id,
+                parent_name: event_parent_name,
+                ..
+            } = &mut event
+            {
+                *event_parent_id = parent_id;
+                *event_parent_name = parent_name;
+            }
+            let _ = event_sink(&event);
         });
-    }
-
-    async fn retire_closed_child(&self, id: String, state: Arc<AsyncMutex<State>>) {
-        let mut locked = state.lock().await;
-        if locked.status == SubagentStatus::Removed {
-            return;
-        }
-        if locked.status != SubagentStatus::Idle {
-            locked.outcome = Some(GenerationOutcome::Failed);
-        }
-        locked.status = SubagentStatus::Removed;
-        locked.forking = None;
-        locked
-            .generation_finished_at_unix_ms
-            .get_or_insert_with(events::now_millis);
-        let event = locked.runtime_event(id.clone());
-        drop(locked);
-        self.remove_if_same(&id, &state);
-        self.emit_event(event);
     }
 
     async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {

@@ -178,9 +178,9 @@ Omitting `allow_model_overrides` allows all explicit model selections accepted b
 
 ## Fork capability and transcript fallback
 
-Kit reads fork capability from the child's ACP `initialize` response at runtime. If advertised, `fork` uses native `session/fork`. If not advertised:
+Kit reads fork capability from the child's ACP `initialize` response at runtime. The built-in Kit ACP server advertises native `session/fork`, so current Kit children fork in-process. If a child does not advertise it:
 
-- `acp.kit` clones a completed durable transcript and starts an isolated Kit process for the branch. This fallback also applies when `[acp.kit]` overrides the executable/base arguments.
+- `acp.kit` clones a sanitized completed transcript and starts an isolated Kit process for the branch. This compatibility fallback applies to older Kit executables and to `[acp.kit]` overrides whose executable/base arguments do not expose native fork.
 - A generic profile fails with `ACP harness "acp.name" does not advertise session/fork; transcript fallback is only available for Kit`. Its existing session still supports ordinary `prompt` calls.
 
 Do not infer support from the agent name or an old compatibility table; ACP capabilities can change between agent releases.
