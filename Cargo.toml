@@ -21,7 +21,7 @@ agentkit-loop = { version = "=0.10.11", features = ["otel"] }
 agentkit-mcp = "=0.10.6"
 agentkit-http = "=0.10.6"
 agentkit-plugins = "=0.10.7"
-agentkit-provider-openai = "=0.10.6"
+agentkit-provider-openai = "=0.10.7"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
 agentkit-tool-compose = { version = "=0.10.10", default-features = false, features = ["runlet"] }
