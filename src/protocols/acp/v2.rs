@@ -3540,21 +3540,26 @@ mod tests {
     }
 
     #[test]
-    fn explicit_credentials_disable_terminal_authentication_and_logout() {
-        let root = tempfile::tempdir().unwrap();
-        let credentials = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
-            root.path(),
-            "openrouter:test",
-            crate::ProviderKind::OpenRouter,
-            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
-            None,
-            Some(crate::provider::OpenRouterApiKey::new("explicit")),
-        )
-        .unwrap();
+    fn explicit_openrouter_credentials_disable_agent_wide_authentication_and_logout() {
+        for (model, provider) in [
+            ("openrouter:test", crate::ProviderKind::OpenRouter),
+            ("gpt-5.4", crate::ProviderKind::OpenAiSubscription),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let credentials = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+                root.path(),
+                model,
+                provider,
+                crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+                None,
+                Some(crate::provider::OpenRouterApiKey::new("explicit")),
+            )
+            .unwrap();
 
-        assert!(!runtime.supports_terminal_authentication());
-        assert!(runtime.logout_authentication().is_err());
+            assert!(!runtime.supports_terminal_authentication());
+            assert!(runtime.logout_authentication().is_err());
+        }
     }
 
     #[test]

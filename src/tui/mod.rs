@@ -69,7 +69,7 @@ use app::{
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
-/// Terminal events applied per frame, so a paste lands in one redraw.
+/// Terminal events or queued updates applied per frame.
 const MAX_BURST: usize = 4_096;
 const MAX_ATTACHMENTS: usize = 8;
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -121,6 +121,26 @@ fn accept_queued_update(
             .is_ok_and(|route| route.generation == generation)
     });
     accepted.then_some(queued.update)
+}
+
+fn apply_pending_updates(
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
+    first: QueuedUpdate,
+) {
+    for queued in std::iter::once(first)
+        .chain(std::iter::from_fn(|| updates.try_recv().ok()))
+        .take(MAX_BURST)
+    {
+        let Some(update) = accept_queued_update(route, queued) else {
+            continue;
+        };
+        if let Update::ConfigOptions(options) = &update {
+            refresh_config_state(app, Some(options));
+        }
+        app.apply(update);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
@@ -295,6 +315,34 @@ async fn authenticate_in_terminal(
     leave(terminal);
     println!("Starting {}…", method.name);
     wait_for_terminal_auth(terminal_auth_command(invocation, root, method), stop).await
+}
+
+enum ConnectedAuthentication {
+    Completed(Option<std::io::Result<std::process::ExitStatus>>),
+    AgentExited(Result<std::io::Result<std::process::ExitStatus>, oneshot::error::RecvError>),
+    UpdatesClosed,
+}
+
+async fn wait_for_connected_authentication(
+    authentication: impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>>,
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+) -> ConnectedAuthentication {
+    tokio::pin!(authentication);
+    loop {
+        tokio::select! {
+            authenticated = &mut authentication => {
+                return ConnectedAuthentication::Completed(authenticated);
+            }
+            update = updates.recv() => match update {
+                Some(update) => apply_pending_updates(app, route, updates, update),
+                None => return ConnectedAuthentication::UpdatesClosed,
+            },
+            status = &mut *exit => return ConnectedAuthentication::AgentExited(status),
+        }
+    }
 }
 
 async fn wait_for_terminal_auth(
@@ -661,7 +709,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 initialized = initialize => initialized?,
                 status = &mut exit_rx => {
                     return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(died(status.ok().and_then(Result::ok), stderr_task, &recent).await),
+                        std::io::Error::other(died(
+                            status.ok().and_then(Result::ok),
+                            stderr_task,
+                            &recent,
+                            "before the session opened",
+                        )
+                        .await),
                     ));
                 }
                 () = tokio::time::sleep(HANDSHAKE) => {
@@ -700,6 +754,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             status.ok().and_then(Result::ok),
                             stderr_task,
                             &recent,
+                            "before the session opened",
                         ).await),
                     ));
                 }
@@ -770,14 +825,35 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::Login(method) => {
                                     drop(events);
-                                    let authenticated = authenticate_in_terminal(
+                                    let authentication = authenticate_in_terminal(
                                         &mut terminal,
                                         &auth_invocation,
                                         &root,
                                         &method,
                                         &mut stop,
+                                    );
+                                    let authenticated = wait_for_connected_authentication(
+                                        authentication,
+                                        &mut app,
+                                        &transition_session,
+                                        &mut updates_rx,
+                                        &mut exit_rx,
                                     )
                                     .await;
+                                    let authenticated = match authenticated {
+                                        ConnectedAuthentication::Completed(authenticated) => authenticated,
+                                        ConnectedAuthentication::UpdatesClosed => return Ok(()),
+                                        ConnectedAuthentication::AgentExited(status) => {
+                                            return Err(agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(died(
+                                                    status.ok().and_then(Result::ok),
+                                                    stderr_task,
+                                                    &recent,
+                                                    "before the session opened",
+                                                ).await),
+                                            ));
+                                        }
+                                    };
                                     let Some(outcome) = authenticated else {
                                         return Ok(());
                                     };
@@ -1168,14 +1244,35 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::Login(method) => {
                                     drop(events);
-                                    let authenticated = authenticate_in_terminal(
+                                    let authentication = authenticate_in_terminal(
                                         &mut terminal,
                                         &auth_invocation,
                                         &root,
                                         &method,
                                         &mut stop,
+                                    );
+                                    let authenticated = wait_for_connected_authentication(
+                                        authentication,
+                                        &mut app,
+                                        &transition_session,
+                                        &mut updates_rx,
+                                        &mut exit_rx,
                                     )
                                     .await;
+                                    let authenticated = match authenticated {
+                                        ConnectedAuthentication::Completed(authenticated) => authenticated,
+                                        ConnectedAuthentication::UpdatesClosed => return Ok(()),
+                                        ConnectedAuthentication::AgentExited(status) => {
+                                            return Err(agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(died(
+                                                    status.ok().and_then(Result::ok),
+                                                    stderr_task,
+                                                    &recent,
+                                                    "during authentication",
+                                                ).await),
+                                            ));
+                                        }
+                                    };
                                     let Some(outcome) = authenticated else {
                                         return Ok(());
                                     };
@@ -1330,23 +1427,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         update = updates_rx.recv() => match update {
-                            Some(update) => {
-                                if let Some(update) = accept_queued_update(&transition_session, update) {
-                                    if let Update::ConfigOptions(options) = &update {
-                                        refresh_config_state(&mut app, Some(options));
-                                    }
-                                    app.apply(update);
-                                }
-                                while let Ok(update) = updates_rx.try_recv() {
-                                    let Some(update) = accept_queued_update(&transition_session, update) else {
-                                        continue;
-                                    };
-                                    if let Update::ConfigOptions(options) = &update {
-                                        refresh_config_state(&mut app, Some(options));
-                                    }
-                                    app.apply(update);
-                                }
-                            }
+                            Some(update) => apply_pending_updates(
+                                &mut app,
+                                &transition_session,
+                                &mut updates_rx,
+                                update,
+                            ),
                             None => return Ok(()),
                         },
                         _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
@@ -1493,12 +1579,12 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-/// Explains an agent that exited before the session was open, quoting the last
-/// thing it said.
+/// Explains an agent exit, quoting the last thing it said.
 async fn died(
     status: Option<std::process::ExitStatus>,
     stderr: tokio::task::JoinHandle<()>,
     recent: &Mutex<Vec<String>>,
+    when: &str,
 ) -> String {
     // Its final diagnostics are usually still in flight when it exits, and they
     // are the part worth reading.
@@ -1515,9 +1601,9 @@ async fn died(
         None => "exited".to_string(),
     };
     if said.is_empty() {
-        format!("the agent {how} before the session opened")
+        format!("the agent {how} {when}")
     } else {
-        format!("the agent {how} before the session opened: {said}")
+        format!("the agent {how} {when}: {said}")
     }
 }
 
@@ -2181,14 +2267,15 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActiveSessionRoute, AgentInvocation, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate,
-        accept_queued_update, attachments_from_paste, authentication_required, client_capabilities,
-        command, credential_storage_for_launch, current_model_choice,
-        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
-        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
-        refresh_config_state, save_effort_default_to, save_model_defaults_to,
-        terminal_auth_command, transition_route, translate, translate_for_session,
-        usable_terminal_auth_methods, user_message_of, wire,
+        ActiveSessionRoute, AgentInvocation, ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST,
+        ModelChoice, QueuedUpdate, accept_queued_update, apply_pending_updates,
+        attachments_from_paste, authentication_required, client_capabilities, command,
+        credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
+        durable_session_id, effort_state, error_detail, handle, message_of, osc52,
+        previous_session_for_resume, prompt_blocks, readable, refresh_config_state,
+        save_effort_default_to, save_model_defaults_to, terminal_auth_command, transition_route,
+        translate, translate_for_session, usable_terminal_auth_methods, user_message_of,
+        wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -2382,6 +2469,69 @@ mod tests {
             accept_queued_update(&route, QueuedUpdate::global(Update::Log("global".into())))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn queued_updates_are_applied_in_bounded_bursts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..=MAX_BURST {
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(index.to_string())))
+                .unwrap();
+        }
+        let first = updates_rx.try_recv().unwrap();
+
+        apply_pending_updates(&mut app, &route, &mut updates_rx, first);
+
+        assert!(updates_rx.try_recv().is_ok());
+        assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_authentication_observes_agent_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+        let authentication =
+            std::future::pending::<Option<std::io::Result<std::process::ExitStatus>>>();
+
+        let result = wait_for_connected_authentication(
+            authentication,
+            &mut app,
+            &route,
+            &mut updates_rx,
+            &mut exit_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            ConnectedAuthentication::AgentExited(Ok(Err(_)))
+        ));
     }
 
     #[test]

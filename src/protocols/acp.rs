@@ -745,10 +745,13 @@ async fn logout_authentication(
     runtime: Arc<Runtime>,
     registry: &SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    let logout = tokio::task::spawn_blocking(move || runtime.logout_authentication())
-        .await
-        .map_err(|error| format!("authentication logout task failed: {error}"))
-        .and_then(|result| result);
+    let logout = match tokio::task::spawn_blocking(move || runtime.logout_authentication()).await {
+        Ok(Err(error)) if !error.credential_state_may_have_changed() => {
+            return Err(AcpRuntimeError::Loop(error.to_string()));
+        }
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!("authentication logout task failed: {error}")),
+    };
     let reset = registry.reset_authentication().await;
 
     match (logout, reset) {
@@ -2463,52 +2466,19 @@ pub(super) mod tests {
             .entry("speakeasy", "default")
             .save(b"removed")
             .unwrap();
-        let runtime = Runtime::new_with_provider_and_credentials(
+        let mut runtime = Runtime::new_with_provider_and_credentials(
             root.path(),
             "gpt-5.4",
             crate::ProviderKind::OpenAiSubscription,
             storage.clone(),
         )
         .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(false);
         let registry = SessionRegistry::new();
-        let server = Arc::new(Server::new(
-            runtime,
-            AcpIntegration::builder()
-                .name("logout-test")
-                .approval_resolver(AutoDenyResolver)
-                .build()
-                .unwrap(),
-            registry.clone(),
-        ));
-        let token = registry.next_token();
-        let session_id = agentkit_acp::SessionId::new("logout-session");
-        let (commands, mut received) = mpsc::channel(1);
-        let (completed, completion) = watch::channel(false);
-        let closed = Arc::new(AtomicBool::new(false));
-        let actor_closed = Arc::clone(&closed);
-        let actor = tokio::spawn(async move {
-            let _completion = CompletionOnDrop(completed);
-            if let Some(Command::Close { reply }) = received.recv().await {
-                actor_closed.store(true, Ordering::SeqCst);
-                let _ = reply.send(());
-            }
-        });
-        registry
-            .register(
-                registry.begin_attachment().unwrap(),
-                RegisteredSession {
-                    token,
-                    session_id,
-                    integration: Arc::clone(&server.integration),
-                    background_jobs: BackgroundJobs::default(),
-                    tasks: AsyncTaskManager::new().handle(),
-                    commands: commands.downgrade(),
-                    actor: actor.abort_handle(),
-                    completed: completion,
-                },
-            )
-            .unwrap();
-        drop(actor);
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
 
         let error = server.logout().await.unwrap_err();
 
@@ -2526,6 +2496,79 @@ pub(super) mod tests {
                 .is_none()
         );
         assert!(registry.begin_attachment().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unsupported_logout_preserves_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "openrouter:test",
+            crate::ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("explicit")),
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(error.to_string().contains("cannot be logged out"));
+        assert!(!closed.load(Ordering::SeqCst));
+
+        registry.shutdown().await;
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    fn logout_test_server(runtime: Arc<Runtime>, registry: SessionRegistry) -> Arc<Server> {
+        Arc::new(Server::new(
+            runtime,
+            AcpIntegration::builder()
+                .name("logout-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry,
+        ))
+    }
+
+    fn register_close_tracking_session(
+        server: &Arc<Server>,
+        registry: &SessionRegistry,
+    ) -> (mpsc::Sender<Command>, Arc<AtomicBool>) {
+        let token = registry.next_token();
+        let (commands, mut received) = mpsc::channel(1);
+        let (completed, completion) = watch::channel(false);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        let actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completed);
+            if let Some(Command::Close { reply }) = received.recv().await {
+                actor_closed.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+            }
+        });
+        registry
+            .register(
+                registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id: agentkit_acp::SessionId::new("logout-session"),
+                    integration: Arc::clone(&server.integration),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
+            .unwrap();
+        drop(actor);
+        (commands, closed)
     }
 
     #[test]

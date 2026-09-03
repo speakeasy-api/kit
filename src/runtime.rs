@@ -287,6 +287,27 @@ struct McpInstallSources {
 pub(crate) const SUBAGENT_SYSTEM_PROMPT_MARKER: &str =
     "This task was delegated to you by the primary agent.";
 
+#[derive(Debug)]
+pub(crate) enum LogoutAuthenticationError {
+    CredentialStateUnchanged(String),
+    CredentialStateMayHaveChanged(String),
+}
+
+impl LogoutAuthenticationError {
+    pub(crate) fn credential_state_may_have_changed(&self) -> bool {
+        matches!(self, Self::CredentialStateMayHaveChanged(_))
+    }
+}
+
+impl std::fmt::Display for LogoutAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CredentialStateUnchanged(message)
+            | Self::CredentialStateMayHaveChanged(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub struct Runtime {
     root: PathBuf,
     adapter: SelectableAdapter,
@@ -544,16 +565,16 @@ impl Runtime {
 
     pub(crate) fn supports_terminal_authentication(&self) -> bool {
         self.credential_storage.is_persistent()
-            && (self.provider != ProviderKind::OpenRouter
-                || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
+            && self.openrouter_api_key.is_none()
+            && !self.ambient_openrouter_api_key
     }
 
-    pub(crate) fn logout_authentication(&self) -> Result<(), String> {
+    pub(crate) fn logout_authentication(&self) -> Result<(), LogoutAuthenticationError> {
         if !self.supports_terminal_authentication() {
-            return Err(
+            return Err(LogoutAuthenticationError::CredentialStateUnchanged(
                 "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
                     .into(),
-            );
+            ));
         }
         let failures = [
             ProviderKind::OpenAiSubscription,
@@ -569,9 +590,11 @@ impl Runtime {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "could not remove all provider credentials: {}",
-                failures.join("; ")
+            Err(LogoutAuthenticationError::CredentialStateMayHaveChanged(
+                format!(
+                    "could not remove all provider credentials: {}",
+                    failures.join("; ")
+                ),
             ))
         }
     }

@@ -11,8 +11,9 @@ use agentkit_tools_core::{
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool, Runtime,
-    SessionRequest, SessionSelection, background_route, load_initial_transcript,
+    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool,
+    LogoutAuthenticationError, Runtime, SessionRequest, SessionSelection, background_route,
+    load_initial_transcript,
 };
 
 #[tokio::test]
@@ -225,7 +226,7 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
 }
 
 #[test]
-fn unrelated_openrouter_keys_do_not_disable_terminal_authentication() {
+fn openrouter_keys_disable_agent_wide_terminal_authentication() {
     let root = tempfile::tempdir().unwrap();
     let credentials = tempfile::tempdir().unwrap();
     let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
@@ -241,7 +242,11 @@ fn unrelated_openrouter_keys_do_not_disable_terminal_authentication() {
         .unwrap()
         .set_ambient_openrouter_api_key_for_test(true);
 
-    assert!(runtime.supports_terminal_authentication());
+    assert!(!runtime.supports_terminal_authentication());
+    assert!(matches!(
+        runtime.logout_authentication(),
+        Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
+    ));
 }
 
 #[test]
@@ -255,17 +260,23 @@ fn logout_attempts_all_providers_after_a_credential_removal_failure() {
         .entry("speakeasy", "default")
         .save(b"removed")
         .unwrap();
-    let runtime = Runtime::new_with_provider_and_credentials(
+    let mut runtime = Runtime::new_with_provider_and_credentials(
         root.path(),
         "gpt-5.4",
         crate::ProviderKind::OpenAiSubscription,
         storage.clone(),
     )
     .unwrap();
+    Arc::get_mut(&mut runtime)
+        .unwrap()
+        .set_ambient_openrouter_api_key_for_test(false);
 
     let error = runtime.logout_authentication().unwrap_err();
 
-    assert!(error.contains("could not remove OpenRouter credentials"));
+    let LogoutAuthenticationError::CredentialStateMayHaveChanged(message) = error else {
+        panic!("credential removal failure must report possibly changed state");
+    };
+    assert!(message.contains("could not remove OpenRouter credentials"));
     assert!(
         storage
             .entry("speakeasy", "default")
