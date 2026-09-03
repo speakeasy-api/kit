@@ -1590,8 +1590,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
             format!("  · {running} in flight"),
             Style::default().fg(theme::running_color()),
         ));
-    } else if !call.children.is_empty() && !(call.is_compose() && !call.running() && !call.expanded)
-    {
+    } else if (call.expanded || call.running() || !call.is_compose()) && !call.children.is_empty() {
         spans.push(Span::styled(
             format!("  · {} calls", call.children.len()),
             theme::faint(),
