@@ -52,7 +52,7 @@ pub mod v2;
 use crate::{
     provider::{
         ModelGroup, ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter,
-        authentication_method_id, model_catalog,
+        authentication_method_id,
     },
     runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
@@ -1311,7 +1311,7 @@ impl Server {
             .adapter
             .reasoning_effort()
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
-        let catalog = model_catalog(&current).await;
+        let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();

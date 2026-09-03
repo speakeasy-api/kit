@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    io::Cursor,
+    sync::Arc,
+    time::Duration,
+};
 
 use agentkit_core::{DataRef, ItemKind, MetadataMap, Modality, Part, ToolOutput};
 use agentkit_http::{
@@ -47,8 +53,58 @@ const JPEG_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
 const MAX_NORMALIZED_IMAGE_BYTES: usize = ((MAX_FIELD_BYTES - JPEG_DATA_URL_PREFIX.len()) / 4) * 3;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_CATALOG_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
+
+#[derive(Clone, Default)]
+pub(crate) struct SubscriptionModelCatalogCache {
+    entry: Arc<tokio::sync::Mutex<Option<SubscriptionModelCatalogCacheEntry>>>,
+}
+
+struct SubscriptionModelCatalogCacheEntry {
+    binding: auth::CredentialBinding,
+    catalog: Arc<tokio::sync::OnceCell<Arc<SubscriptionModelCatalog>>>,
+}
+
+impl SubscriptionModelCatalogCache {
+    async fn get_or_try_init<F, Fut>(
+        &self,
+        binding: &auth::CredentialBinding,
+        init: F,
+    ) -> Result<Arc<SubscriptionModelCatalog>, LoopError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<SubscriptionModelCatalog, LoopError>>,
+    {
+        let catalog = {
+            let mut entry = self.entry.lock().await;
+            if entry.as_ref().is_none_or(|entry| entry.binding != *binding) {
+                *entry = Some(SubscriptionModelCatalogCacheEntry {
+                    binding: binding.clone(),
+                    catalog: Arc::new(tokio::sync::OnceCell::new()),
+                });
+            }
+            Arc::clone(&entry.as_ref().expect("catalog cache entry exists").catalog)
+        };
+        catalog
+            .get_or_try_init(|| async { init().await.map(Arc::new) })
+            .await
+            .cloned()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SubscriptionModelCatalog {
+    context_windows: HashMap<String, u64>,
+    visible_models: Vec<String>,
+}
+
+impl SubscriptionModelCatalog {
+    pub(crate) fn visible_models(&self) -> &[String] {
+        &self.visible_models
+    }
+}
 
 fn subscription_resilience() -> ResilienceConfig {
     ResilienceConfig {
@@ -105,7 +161,7 @@ pub struct OpenAiSubscriptionAdapter {
     reasoning_effort: Option<super::adapter::ReasoningEffort>,
     catalog_client: reqwest::Client,
     responses_client: agentkit_http::Http,
-    context_windows: Arc<tokio::sync::OnceCell<Arc<HashMap<String, u64>>>>,
+    model_catalog: SubscriptionModelCatalogCache,
 }
 
 impl OpenAiSubscriptionAdapter {
@@ -116,6 +172,18 @@ impl OpenAiSubscriptionAdapter {
     pub(crate) fn new_with_reasoning_effort(
         config: SubscriptionConfig,
         reasoning_effort: Option<super::adapter::ReasoningEffort>,
+    ) -> Result<Self, String> {
+        Self::new_with_reasoning_effort_and_catalog(
+            config,
+            reasoning_effort,
+            SubscriptionModelCatalogCache::default(),
+        )
+    }
+
+    pub(crate) fn new_with_reasoning_effort_and_catalog(
+        config: SubscriptionConfig,
+        reasoning_effort: Option<super::adapter::ReasoningEffort>,
+        model_catalog: SubscriptionModelCatalogCache,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -131,8 +199,38 @@ impl OpenAiSubscriptionAdapter {
             reasoning_effort,
             catalog_client,
             responses_client,
-            context_windows: Arc::new(tokio::sync::OnceCell::new()),
+            model_catalog,
         })
+    }
+
+    async fn catalog_with_credentials(
+        &self,
+        credentials: &auth::TokenRecord,
+        binding: &auth::CredentialBinding,
+    ) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
+        self.model_catalog
+            .get_or_try_init(binding, || {
+                fetch_model_catalog(&self.catalog_client, credentials)
+            })
+            .await
+    }
+
+    pub(crate) async fn model_catalog(&self) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
+        let credentials = tokio::time::timeout(
+            MODEL_CATALOG_AUTH_TIMEOUT,
+            load_credentials(
+                self.config.credential_storage.clone(),
+                MODEL_CATALOG_AUTH_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            LoopError::Provider("OpenAI model catalog credential load timed out".into())
+        })??;
+        let binding = credentials
+            .binding()
+            .map_err(|error| LoopError::Provider(error.to_string()))?;
+        self.catalog_with_credentials(&credentials, &binding).await
     }
 }
 
@@ -155,17 +253,11 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
         let authentication_binding = binding_string(&binding);
-        // Catalog discovery stays independent and best-effort.
-        let context_windows = self
-            .context_windows
-            .get_or_try_init(|| async {
-                fetch_context_windows(&self.catalog_client, &credentials)
-                    .await
-                    .map(Arc::new)
-            })
+        // Catalog discovery stays independent and best-effort. A failed fetch is not cached.
+        let model_catalog = self
+            .catalog_with_credentials(&credentials, &binding)
             .await
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| Arc::new(SubscriptionModelCatalog::default()));
         let authentication = Authentication::new(OpenAiAuthenticationProvider {
             credential_storage: self.config.credential_storage.clone(),
             binding,
@@ -193,7 +285,10 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .await?;
         Ok(OpenAiSubscriptionSession {
             inner,
-            context_window: context_windows.get(&self.config.model).copied(),
+            context_window: model_catalog
+                .context_windows
+                .get(&self.config.model)
+                .copied(),
             model: self.config.model.clone(),
             authentication_binding,
         })
@@ -786,10 +881,10 @@ fn binding_string(binding: &auth::CredentialBinding) -> String {
     format!("openai-chatgpt-v1:{account_digest}:{}", binding.generation)
 }
 
-async fn fetch_context_windows(
+async fn fetch_model_catalog(
     client: &reqwest::Client,
     credentials: &auth::TokenRecord,
-) -> Result<HashMap<String, u64>, LoopError> {
+) -> Result<SubscriptionModelCatalog, LoopError> {
     let endpoint = format!("{MODELS_ENDPOINT}?client_version={MODEL_CATALOG_CLIENT_VERSION}");
     let mut request = client
         .get(endpoint)
@@ -827,16 +922,17 @@ async fn fetch_context_windows(
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| protocol("model catalog is not valid JSON"))?;
-    parse_context_windows(&value)
+    parse_model_catalog(&value)
 }
 
-fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopError> {
+fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopError> {
     let models = value
         .get("models")
         .and_then(Value::as_array)
         .filter(|models| models.len() <= MAX_MODELS)
         .ok_or_else(|| protocol("model catalog omitted a bounded models list"))?;
-    let mut windows = HashMap::new();
+    let mut context_windows = HashMap::new();
+    let mut visible_models = Vec::new();
     for model in models {
         let Some(slug) = model
             .get("slug")
@@ -845,18 +941,32 @@ fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopErro
         else {
             continue;
         };
-        let Some(window) = model
+        if let Some(window) = model
             .get("context_window")
-            .filter(|window| !window.is_null())
-        else {
-            continue;
-        };
-        let Some(window) = window.as_u64().filter(|window| *window > 0) else {
-            continue;
-        };
-        windows.entry(slug.to_owned()).or_insert(window);
+            .and_then(Value::as_u64)
+            .filter(|window| *window > 0)
+        {
+            context_windows.entry(slug.to_owned()).or_insert(window);
+        }
+        if model.get("visibility").and_then(Value::as_str) == Some("list") {
+            let priority = model
+                .get("priority")
+                .and_then(Value::as_i64)
+                .unwrap_or(i64::MAX);
+            visible_models.push((priority, slug.to_owned()));
+        }
     }
-    Ok(windows)
+    visible_models.sort_by_key(|(priority, _)| *priority);
+    let mut seen = HashSet::new();
+    let visible_models = visible_models
+        .into_iter()
+        .map(|(_, slug)| slug)
+        .filter(|slug| seen.insert(slug.clone()))
+        .collect();
+    Ok(SubscriptionModelCatalog {
+        context_windows,
+        visible_models,
+    })
 }
 
 fn protocol(message: &str) -> LoopError {
@@ -1002,6 +1112,7 @@ mod tests {
         assert_eq!(config.initial_backoff, Duration::from_secs(1));
         assert_eq!(config.max_backoff, Duration::from_secs(60));
         assert_eq!(MAX_SERVER_DELAY, Duration::from_secs(10 * 60));
+        assert_eq!(MODEL_CATALOG_AUTH_TIMEOUT, Duration::from_secs(5));
     }
 
     #[test]
@@ -1117,16 +1228,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_catalog_cache_is_scoped_to_account_and_generation() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let first_binding =
+            auth::TokenRecord::for_test_generation("token", "account-1", "generation-1")
+                .binding()
+                .unwrap();
+        let next_generation =
+            auth::TokenRecord::for_test_generation("token", "account-1", "generation-2")
+                .binding()
+                .unwrap();
+        let next_account =
+            auth::TokenRecord::for_test_generation("token", "account-2", "generation-1")
+                .binding()
+                .unwrap();
+
+        let first = cache
+            .get_or_try_init(&first_binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("first".into(), 100)]),
+                    visible_models: vec!["first".into()],
+                })
+            })
+            .await
+            .unwrap();
+        let same = cache
+            .get_or_try_init(&first_binding, || async {
+                Err(protocol("cached catalog was unexpectedly reloaded"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+
+        let second = cache
+            .get_or_try_init(&next_generation, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("second".into(), 200)]),
+                    visible_models: vec!["second".into()],
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.visible_models, ["second"]);
+        assert_eq!(second.context_windows.get("first"), None);
+        assert_eq!(second.context_windows.get("second"), Some(&200));
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        let third = cache
+            .get_or_try_init(&next_account, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("third".into(), 300)]),
+                    visible_models: vec!["third".into()],
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.visible_models, ["third"]);
+        assert_eq!(third.context_windows.get("second"), None);
+        assert_eq!(third.context_windows.get("third"), Some(&300));
+        assert!(!Arc::ptr_eq(&second, &third));
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_failure() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::TokenRecord::for_test_generation("token", "account", "generation")
+            .binding()
+            .unwrap();
+
+        let first = cache
+            .get_or_try_init(&binding, || async { Err(protocol("temporary failure")) })
+            .await;
+        assert!(first.is_err());
+
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["recovered".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.visible_models, ["recovered"]);
+    }
+
     #[test]
-    fn catalog_parser_preserves_valid_models() {
+    fn catalog_parser_filters_orders_and_deduplicates_visible_models() {
         let too_long = format!("g{}", "x".repeat(MAX_CATALOG_MODEL_ID_BYTES));
-        let windows = parse_context_windows(&json!({"models": [
-            {"slug": "gpt-5.4", "context_window": 200000},
-            {"slug": "bad slug", "context_window": 1},
-            {"slug": too_long, "context_window": 1}
+        let catalog = parse_model_catalog(&json!({"models": [
+            {"slug": "hidden", "visibility": "hide", "priority": 0, "context_window": 300000},
+            {"slug": "later", "visibility": "list", "priority": 20, "context_window": 200000},
+            {"slug": "first", "visibility": "list", "priority": 10, "supported_in_api": false},
+            {"slug": "same-priority", "visibility": "list", "priority": 10},
+            {"slug": "later", "visibility": "list", "priority": 30},
+            {"slug": "bad slug", "visibility": "list", "priority": 1, "context_window": 1},
+            {"slug": too_long, "visibility": "list", "priority": 1, "context_window": 1}
         ]}))
         .unwrap();
-        assert_eq!(windows.get("gpt-5.4"), Some(&200000));
-        assert_eq!(windows.len(), 1);
+
+        assert_eq!(catalog.visible_models, ["first", "same-priority", "later"]);
+        assert_eq!(catalog.context_windows.get("hidden"), Some(&300000));
+        assert_eq!(catalog.context_windows.get("later"), Some(&200000));
+        assert_eq!(catalog.context_windows.len(), 2);
     }
 }
