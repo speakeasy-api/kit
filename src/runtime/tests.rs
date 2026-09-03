@@ -226,7 +226,7 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
 }
 
 #[test]
-fn openrouter_keys_only_disable_openrouter_terminal_authentication() {
+fn openrouter_keys_only_disable_openrouter_authentication() {
     for (explicit_key, ambient_key) in [(true, false), (false, true)] {
         let root = tempfile::tempdir().unwrap();
         let credentials = tempfile::tempdir().unwrap();
@@ -246,11 +246,8 @@ fn openrouter_keys_only_disable_openrouter_terminal_authentication() {
         assert!(runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription));
         assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
         assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
-        assert!(!runtime.supports_logout_authentication());
-        assert!(matches!(
-            runtime.logout_authentication(),
-            Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
-        ));
+        assert!(runtime.supports_logout_authentication());
+        runtime.logout_authentication().unwrap();
     }
 }
 

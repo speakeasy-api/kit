@@ -569,8 +569,12 @@ impl Runtime {
                 || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
     }
 
+    pub(crate) fn supports_selected_provider_authentication_management(&self) -> bool {
+        self.supports_terminal_authentication(self.provider)
+    }
+
     pub(crate) fn supports_logout_authentication(&self) -> bool {
-        self.supports_terminal_authentication(ProviderKind::OpenRouter)
+        self.supports_selected_provider_authentication_management()
     }
 
     pub(crate) fn logout_authentication(&self) -> Result<(), LogoutAuthenticationError> {
