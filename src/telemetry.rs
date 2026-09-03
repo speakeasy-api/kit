@@ -3,7 +3,7 @@
 use agentkit_loop::{MessageCapture, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol as OtlpProtocol, WithExportConfig as _};
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::mpsc, thread, time::Duration};
 use tracing_subscriber::{
     Layer as _,
     filter::{LevelFilter, Targets},
@@ -202,12 +202,55 @@ fn http_trace_endpoint(endpoint: &str) -> Result<String, String> {
     })
 }
 
+const PROVIDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn shutdown_provider_with_timeout(
+    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let shutdown = thread::Builder::new()
+        .name("kit-otel-shutdown".into())
+        .spawn(move || {
+            let _ = sender.send(provider.shutdown_with_timeout(timeout));
+        })
+        .map_err(|error| format!("could not start OpenTelemetry shutdown: {error}"))?;
+
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => {
+            shutdown
+                .join()
+                .map_err(|_| "OpenTelemetry shutdown thread panicked".to_string())?;
+            result.map_err(|error| error.to_string())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "OpenTelemetry shutdown timed out after {timeout:?}"
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = shutdown.join();
+            Err("OpenTelemetry shutdown thread disconnected".into())
+        }
+    }
+}
+
 /// Keeps the tracer provider alive and flushes queued spans when Kit exits.
-pub struct Guard(opentelemetry_sdk::trace::SdkTracerProvider);
+pub struct Guard {
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    protocol: Protocol,
+}
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Err(error) = self.0.shutdown() {
+        let Some(provider) = self.provider.take() else {
+            return;
+        };
+        let result = match self.protocol {
+            Protocol::Grpc => provider.shutdown().map_err(|error| error.to_string()),
+            Protocol::HttpProtobuf | Protocol::HttpJson => {
+                shutdown_provider_with_timeout(provider, PROVIDER_SHUTDOWN_TIMEOUT)
+            }
+        };
+        if let Err(error) = result {
             eprintln!("could not shut down OpenTelemetry exporter: {error}");
         }
     }
@@ -281,7 +324,10 @@ pub fn init(settings: &Settings) -> Result<Option<Guard>, Box<dyn std::error::Er
         .with_target(false)
         .with_filter(exported_targets());
     tracing_subscriber::registry().with(layer).try_init()?;
-    Ok(Some(Guard(provider)))
+    Ok(Some(Guard {
+        provider: Some(provider),
+        protocol: settings.protocol,
+    }))
 }
 
 #[cfg(test)]
@@ -290,6 +336,7 @@ mod tests {
         io::{Read as _, Write as _},
         net::TcpListener,
         thread,
+        time::{Duration, Instant},
     };
 
     use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
@@ -297,6 +344,7 @@ mod tests {
     use super::{
         DEFAULT_MESSAGE_CONTENT_MAX_BYTES, DEFAULT_MESSAGE_CONTENT_MAX_MESSAGES, LevelFilter,
         Protocol, Settings, build_exporter, build_provider, exported_targets,
+        shutdown_provider_with_timeout,
     };
 
     #[test]
@@ -393,6 +441,7 @@ mod tests {
     fn serve_otlp_response(
         content_type: &'static str,
         body: &'static [u8],
+        delay: Duration,
     ) -> (String, thread::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -401,6 +450,7 @@ mod tests {
             let mut request = vec![0; 8192];
             let length = stream.read(&mut request).unwrap();
             request.truncate(length);
+            thread::sleep(delay);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -419,7 +469,8 @@ mod tests {
             (Protocol::HttpProtobuf, "application/x-protobuf", &[][..]),
             (Protocol::HttpJson, "application/json", &b"{}"[..]),
         ] {
-            let (endpoint, server) = serve_otlp_response(content_type, response_body);
+            let (endpoint, server) =
+                serve_otlp_response(content_type, response_body, Duration::ZERO);
             let settings =
                 Settings::try_new_with_protocol(Some(endpoint), protocol, false, 12, 4096).unwrap();
             let exporter = build_exporter(settings.endpoint.as_deref().unwrap(), protocol).unwrap();
@@ -443,6 +494,28 @@ mod tests {
                 "{request}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_http_export_does_not_exceed_shutdown_deadline() {
+        let delay = Duration::from_secs(1);
+        let timeout = Duration::from_millis(50);
+        let (endpoint, server) = serve_otlp_response("application/json", b"{}", delay);
+        let settings =
+            Settings::try_new_with_protocol(Some(endpoint), Protocol::HttpJson, false, 12, 4096)
+                .unwrap();
+        let exporter =
+            build_exporter(settings.endpoint.as_deref().unwrap(), Protocol::HttpJson).unwrap();
+        let provider = build_provider(exporter, Protocol::HttpJson);
+        let tracer = provider.tracer("stalled-http-export-test");
+        let mut span = tracer.start("test span");
+        span.end();
+
+        let started = Instant::now();
+        let error = shutdown_provider_with_timeout(provider, timeout).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < delay);
+        server.join().unwrap();
     }
 
     #[test]
