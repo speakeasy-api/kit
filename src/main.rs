@@ -438,6 +438,16 @@ enum AuthProvider {
     Speakeasy,
 }
 
+impl AuthProvider {
+    const fn provider_kind(self) -> kit::ProviderKind {
+        match self {
+            Self::Openai => kit::ProviderKind::OpenAiSubscription,
+            Self::Openrouter => kit::ProviderKind::OpenRouter,
+            Self::Speakeasy => kit::ProviderKind::Speakeasy,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AuthAction {
     /// Authenticate a model provider in the configured credential store.
@@ -708,6 +718,7 @@ async fn execute_auth(
         OpenAi(kit::provider::OpenAiAuthCommand),
         OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
+        Logout(kit::ProviderKind, bool),
     }
     let command = match action {
         AuthAction::Login { provider } => match provider {
@@ -731,21 +742,7 @@ async fn execute_auth(
         AuthAction::Logout {
             provider,
             local_only,
-        } => match provider {
-            AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Logout {
-                local_only: *local_only,
-            }),
-            AuthProvider::Openrouter => {
-                Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Logout {
-                    local_only: *local_only,
-                })
-            }
-            AuthProvider::Speakeasy => {
-                Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Logout {
-                    local_only: *local_only,
-                })
-            }
-        },
+        } => Execution::Logout(provider.provider_kind(), *local_only),
     };
     let output = tokio::task::spawn_blocking(move || match command {
         Execution::OpenAi(command) => kit::provider::execute_openai_auth(command, &storage),
@@ -757,6 +754,14 @@ async fn execute_auth(
                 .map(|(key, source)| (key, *source)),
         ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
+        Execution::Logout(provider, local_only) => kit::provider::execute_provider_logout(
+            provider,
+            &storage,
+            local_only,
+            openrouter_api_key
+                .as_ref()
+                .map(|(key, source)| (key, *source)),
+        ),
     })
     .await
     .map_err(io::Error::other)?

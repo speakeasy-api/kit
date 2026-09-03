@@ -127,6 +127,28 @@ pub fn execute_openrouter_auth(
     )
 }
 
+#[doc(hidden)]
+pub fn execute_provider_logout(
+    provider: ProviderKind,
+    storage: &crate::credentials::CredentialStorage,
+    local_only: bool,
+    active_openrouter_key: Option<(&OpenRouterApiKey, OpenRouterApiKeySource)>,
+) -> Result<String, String> {
+    match provider {
+        ProviderKind::OpenAiSubscription => {
+            execute_openai_auth(OpenAiAuthCommand::Logout { local_only }, storage)
+        }
+        ProviderKind::OpenRouter => execute_openrouter_auth(
+            OpenRouterAuthCommand::Logout { local_only },
+            storage,
+            active_openrouter_key,
+        ),
+        ProviderKind::Speakeasy => {
+            execute_speakeasy_auth(SpeakeasyAuthCommand::Logout { local_only }, storage)
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn store_openrouter_test_credentials(storage: &crate::credentials::CredentialStorage) {
     openrouter_auth::store_test_credentials(storage);

@@ -29,11 +29,14 @@ const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_SELECTOR_MODELS: usize = 2_000;
 const OPENROUTER_AUTH_REQUIRED: &str = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
+const SPEAKEASY_AUTH_REQUIRED: &str =
+    "speakeasy_auth_required: run `kit auth login speakeasy` before using the Speakeasy provider";
 
 pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
     [
         ("openai_auth_required:", "openai"),
         ("openrouter_auth_required:", "openrouter"),
+        ("speakeasy_auth_required:", "speakeasy"),
     ]
     .into_iter()
     .find_map(|(code, method_id)| detail.contains(code).then_some(method_id))
@@ -535,9 +538,8 @@ impl KitAdapter {
                 }))
             }
             ProviderKind::Speakeasy => {
-                let credentials = speakeasy_auth::load(&credential_storage)?.ok_or_else(|| {
-                    "run `kit auth login speakeasy` before using the Speakeasy provider".to_string()
-                })?;
+                let credentials = speakeasy_auth::load(&credential_storage)?
+                    .ok_or_else(|| SPEAKEASY_AUTH_REQUIRED.to_string())?;
                 let mut config =
                     OpenRouterConfig::new("unused", model).with_base_url(SPEAKEASY_COMPLETIONS_URL);
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);

@@ -379,6 +379,46 @@ fn dropped_uncommitted_session_claim_retries_as_new() {
 }
 
 #[test]
+fn uncommitted_claim_rolls_back_before_waiting_to_publish_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+
+    let selection = runtime.session.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(failed);
+    });
+    started_rx.recv().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while crate::session::load(root.path(), &session_id).is_ok()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        crate::session::load(root.path(), &session_id).is_err(),
+        "uncommitted transcript must roll back before the retry mutex is available"
+    );
+
+    drop(selection);
+    dropping.join().unwrap();
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+}
+
+#[test]
 fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();

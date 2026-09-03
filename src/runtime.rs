@@ -242,6 +242,7 @@ impl SessionClaim {
 impl Drop for SessionClaim {
     fn drop(&mut self) {
         let opened_uncommitted = self.uncommitted_observer.is_some();
+        drop(self.uncommitted_observer.take());
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -294,6 +295,7 @@ pub struct Runtime {
     reasoning_effort: Option<crate::provider::ReasoningEffort>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+    ambient_openrouter_api_key: bool,
     telemetry: crate::telemetry::Settings,
     max_subagent_depth: usize,
     base_depth: usize,
@@ -411,6 +413,8 @@ impl Runtime {
             reasoning_effort,
             credential_storage,
             openrouter_api_key,
+            ambient_openrouter_api_key: std::env::var_os("OPENROUTER_API_KEY")
+                .is_some_and(|value| !value.is_empty()),
             telemetry: Default::default(),
             max_subagent_depth,
             base_depth: 0,
@@ -531,6 +535,39 @@ impl Runtime {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ambient_openrouter_api_key_for_test(&mut self, present: bool) {
+        self.ambient_openrouter_api_key = present;
+    }
+
+    pub(crate) fn supports_terminal_authentication(&self) -> bool {
+        self.credential_storage.is_persistent()
+            && self.openrouter_api_key.is_none()
+            && !self.ambient_openrouter_api_key
+    }
+
+    pub(crate) fn logout_authentication(&self) -> Result<(), String> {
+        if !self.supports_terminal_authentication() {
+            return Err(
+                "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
+                    .into(),
+            );
+        }
+        for provider in [
+            ProviderKind::OpenAiSubscription,
+            ProviderKind::OpenRouter,
+            ProviderKind::Speakeasy,
+        ] {
+            crate::provider::execute_provider_logout(
+                provider,
+                &self.credential_storage,
+                true,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     /// Sets private immediate-parent context inherited by this runtime's direct children.

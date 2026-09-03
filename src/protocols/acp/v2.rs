@@ -67,25 +67,22 @@ fn complete_new_session<E>(
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     let detail = error.to_string();
     match authentication_method_id(&detail) {
-        Some(method_id) => agent_client_protocol::Error::internal_error()
+        Some(method_id) => agent_client_protocol::Error::auth_required()
             .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
         None => agent_client_protocol::util::internal_error(detail),
     }
 }
 
-fn terminal_auth_methods(capabilities: &wire::ClientCapabilities) -> Vec<wire::AuthMethod> {
+fn terminal_auth_methods(
+    capabilities: &wire::ClientCapabilities,
+    persistent_credentials: bool,
+) -> Vec<wire::AuthMethod> {
     let supports_terminal_auth = capabilities
         .auth
         .as_ref()
         .and_then(|auth| auth.terminal.as_ref())
-        .is_some()
-        || capabilities
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.get("terminal-auth"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-    if !supports_terminal_auth {
+        .is_some();
+    if !supports_terminal_auth || !persistent_credentials {
         return Vec::new();
     }
 
@@ -95,7 +92,10 @@ fn terminal_auth_methods(capabilities: &wire::ClientCapabilities) -> Vec<wire::A
             wire::AuthMethod::Terminal(
                 wire::AuthMethodTerminal::new(method.method_id, method.name)
                     .description(method.description)
-                    .args(method.args.iter().map(|arg| (*arg).into()).collect()),
+                    .args(vec![
+                        "--terminal-auth-login".into(),
+                        method.method_id.into(),
+                    ]),
             )
         })
         .collect()
@@ -524,6 +524,40 @@ impl Server {
         .map(|matches| FileSearchResponse { matches })
     }
 
+    fn login(
+        &self,
+        request: wire::LoginAuthRequest,
+    ) -> Result<wire::LoginAuthResponse, agent_client_protocol::Error> {
+        let method_id = request.method_id.0.as_ref();
+        let detail = if terminal_auth_method_specs()
+            .iter()
+            .any(|method| method.method_id == method_id)
+        {
+            "terminal authentication methods must be launched as a separate agent invocation"
+        } else {
+            "authentication method was not advertised by this agent"
+        };
+        Err(agent_client_protocol::Error::invalid_params()
+            .data(serde_json::json!({ "detail": detail, "methodId": method_id })))
+    }
+
+    async fn logout(self: &Arc<Self>) -> Result<wire::LogoutAuthResponse, AcpRuntimeError> {
+        let runtime = Arc::clone(&self.runtime);
+        tokio::task::spawn_blocking(move || runtime.logout_authentication())
+            .await
+            .map_err(|error| {
+                AcpRuntimeError::Loop(format!("authentication logout task failed: {error}"))
+            })?
+            .map_err(AcpRuntimeError::Loop)?;
+
+        if !self.registry.reset_authentication().await {
+            return Err(AcpRuntimeError::Loop(
+                "authentication logout could not finish session teardown".into(),
+            ));
+        }
+        Ok(wire::LogoutAuthResponse::new())
+    }
+
     fn remove_session(&self, session_id: &wire::SessionId, token: u64) {
         let mut sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
         if sessions
@@ -548,7 +582,10 @@ impl Server {
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
         .capabilities(agentkit_acp::v2::agent_capabilities())
-        .auth_methods(terminal_auth_methods(&request.capabilities)))
+        .auth_methods(terminal_auth_methods(
+            &request.capabilities,
+            self.runtime.supports_terminal_authentication(),
+        )))
     }
 
     async fn new_session(
@@ -687,6 +724,10 @@ impl Server {
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        let admission = self
+            .registry
+            .begin_attachment()
+            .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
         let cancellation = CancellationController::new();
         let sink = ResponseReplacementSink::new(ConnectionSink(connection));
@@ -784,18 +825,28 @@ impl Server {
                 }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
-        self.registry
+        if self
+            .registry
             .register_v2(
+                admission,
                 token,
                 interrupt,
                 close,
                 actor_task.abort_handle(),
                 completion,
             )
-            .map_err(|()| AcpRuntimeError::ClientClosed)?;
-        drop(actor_task);
+            .is_err()
+        {
+            drop(activation);
+            actor_task.abort();
+            let _ = actor_task.await;
+            return Err(AcpRuntimeError::ClientClosed);
+        }
         if let Err(error) = claim.commit() {
             self.registry.remove(token);
+            drop(activation);
+            actor_task.abort();
+            let _ = actor_task.await;
             return Err(error);
         }
         crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
@@ -816,6 +867,7 @@ impl Server {
                     tasks,
                 },
             );
+        drop(actor_task);
         Ok(AttachedSession {
             session_id,
             config_options,
@@ -1821,6 +1873,28 @@ pub(crate) fn component(
                 let state = Arc::clone(&state);
                 async move |request: wire::InitializeRequest, responder, _cx| {
                     responder.respond_with_result(state.initialize(request).map_err(sdk_error))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: wire::LoginAuthRequest, responder, _cx| {
+                    responder.respond_with_result(state.login(request))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |_request: wire::LogoutAuthRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(state.logout().await.map_err(sdk_error))
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3260,10 +3334,25 @@ mod tests {
     fn sdk_error_marks_only_missing_credentials_as_authentication_required() {
         let missing_detail = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
         let missing = sdk_error(AcpRuntimeError::Loop(missing_detail.into()));
+        assert_eq!(missing.code, agent_client_protocol::ErrorCode::AuthRequired);
         let data = missing.data.unwrap();
         let required = AuthenticationRequiredData::from_value(&data).unwrap();
         assert_eq!(required.method_id, "openrouter");
         assert_eq!(required.detail, format!("loop error: {missing_detail}"));
+
+        let speakeasy = sdk_error(AcpRuntimeError::Loop(
+            "speakeasy_auth_required: run `kit auth login speakeasy`".into(),
+        ));
+        assert_eq!(
+            speakeasy.code,
+            agent_client_protocol::ErrorCode::AuthRequired
+        );
+        assert_eq!(
+            AuthenticationRequiredData::from_value(speakeasy.data.as_ref().unwrap())
+                .unwrap()
+                .method_id,
+            "speakeasy"
+        );
 
         let unrelated = sdk_error(AcpRuntimeError::Loop(
             "stored OpenRouter credentials cannot be used with a noncanonical endpoint".into(),
@@ -3272,9 +3361,96 @@ mod tests {
     }
 
     #[test]
+    fn terminal_auth_login_route_rejects_in_process_login() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            SessionRegistry::new(),
+        );
+
+        for (method_id, expected_detail) in [
+            (
+                "openai",
+                "terminal authentication methods must be launched as a separate agent invocation",
+            ),
+            (
+                "unknown",
+                "authentication method was not advertised by this agent",
+            ),
+        ] {
+            let error = server
+                .login(wire::LoginAuthRequest::new(method_id))
+                .unwrap_err();
+            let data = error.data.unwrap();
+
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert_eq!(data["methodId"], method_id);
+            assert_eq!(data["detail"], expected_detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_logout_clears_persistent_provider_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let storage =
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+        crate::provider::store_openrouter_test_credentials(&storage);
+        let mut runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "openrouter:test",
+            crate::ProviderKind::OpenRouter,
+            storage.clone(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(false);
+        let server = Arc::new(Server::new(runtime, SessionRegistry::new()));
+
+        server.logout().await.unwrap();
+
+        assert!(
+            storage
+                .entry("openrouter", "default")
+                .load()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_credentials_disable_terminal_authentication_and_logout() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "openrouter:test",
+            crate::ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("explicit")),
+        )
+        .unwrap();
+
+        assert!(!runtime.supports_terminal_authentication());
+        assert!(runtime.logout_authentication().is_err());
+    }
+
+    #[test]
     fn initialize_negotiates_v2_and_advertises_injection_and_authentication() {
         let root = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(false);
         let server = Server::new(runtime, SessionRegistry::new());
         let response = server
             .initialize(
@@ -3289,18 +3465,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
-        assert_eq!(response.auth_methods.len(), 2);
+        assert_eq!(response.auth_methods.len(), 3);
         assert!(matches!(
             &response.auth_methods[0],
             wire::AuthMethod::Terminal(method)
                 if method.method_id.0.as_ref() == "openai"
-                    && method.args == ["serve", "--terminal-auth-login", "openai"]
+                    && method.args == ["--terminal-auth-login", "openai"]
         ));
         assert!(matches!(
             &response.auth_methods[1],
             wire::AuthMethod::Terminal(method)
                 if method.method_id.0.as_ref() == "openrouter"
-                    && method.args == ["serve", "--terminal-auth-login", "openrouter"]
+                    && method.args == ["--terminal-auth-login", "openrouter"]
+        ));
+        assert!(matches!(
+            &response.auth_methods[2],
+            wire::AuthMethod::Terminal(method)
+                if method.method_id.0.as_ref() == "speakeasy"
+                    && method.args == ["--terminal-auth-login", "speakeasy"]
         ));
         let unsupported = server
             .initialize(wire::InitializeRequest::new(
@@ -3309,6 +3491,14 @@ mod tests {
             ))
             .unwrap();
         assert!(unsupported.auth_methods.is_empty());
+        let terminal_capabilities = wire::ClientCapabilities::new()
+            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()));
+        assert!(terminal_auth_methods(&terminal_capabilities, false).is_empty());
+        let metadata_only = wire::ClientCapabilities::new().meta(serde_json::Map::from_iter([(
+            "terminal-auth".into(),
+            serde_json::Value::Bool(true),
+        )]));
+        assert!(terminal_auth_methods(&metadata_only, true).is_empty());
         let mut newer = wire::InitializeRequest::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("newer-client", "0"),

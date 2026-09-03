@@ -193,16 +193,18 @@ fn authentication_required(
     error: &agent_client_protocol::Error,
     methods: &[wire::AuthMethodTerminal],
 ) -> bool {
-    let Some(required) = error
+    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+        return false;
+    }
+    error
         .data
         .as_ref()
         .and_then(crate::protocols::acp::AuthenticationRequiredData::from_value)
-    else {
-        return false;
-    };
-    methods
-        .iter()
-        .any(|method| method.method_id.0.as_ref() == required.method_id)
+        .is_none_or(|required| {
+            methods
+                .iter()
+                .any(|method| method.method_id.0.as_ref() == required.method_id)
+        })
 }
 
 fn credential_storage_for_launch(
@@ -231,9 +233,7 @@ fn usable_terminal_auth_methods(methods: &[wire::AuthMethod]) -> Vec<wire::AuthM
     methods
         .iter()
         .filter_map(|method| match method {
-            wire::AuthMethod::Terminal(method)
-                if !method.method_id.0.is_empty() && !method.args.is_empty() =>
-            {
+            wire::AuthMethod::Terminal(method) if !method.method_id.0.is_empty() => {
                 Some(method.clone())
             }
             _ => None,
@@ -241,20 +241,44 @@ fn usable_terminal_auth_methods(methods: &[wire::AuthMethod]) -> Vec<wire::AuthM
         .collect()
 }
 
+struct AgentInvocation {
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+    env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+}
+
+impl AgentInvocation {
+    fn from_command(command: &std::process::Command) -> Self {
+        Self {
+            program: command.get_program().to_owned(),
+            args: command.get_args().map(std::ffi::OsStr::to_owned).collect(),
+            env: command
+                .get_envs()
+                .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+                .collect(),
+        }
+    }
+}
+
 fn terminal_auth_command(
-    program: &std::ffi::OsStr,
+    invocation: &AgentInvocation,
     root: &Path,
-    credential_storage: &CredentialStorage,
     method: &wire::AuthMethodTerminal,
 ) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(program);
+    let mut command = tokio::process::Command::new(&invocation.program);
     command
+        .args(&invocation.args)
         .args(&method.args)
         .current_dir(root)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    credential_storage.append_cli_args(&mut command);
+    for (name, value) in &invocation.env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
     for variable in &method.env {
         command.env(&variable.name, &variable.value);
     }
@@ -263,19 +287,14 @@ fn terminal_auth_command(
 
 async fn authenticate_in_terminal(
     terminal: &mut DefaultTerminal,
-    program: &std::ffi::OsStr,
+    invocation: &AgentInvocation,
     root: &Path,
-    credential_storage: &CredentialStorage,
     method: &wire::AuthMethodTerminal,
     stop: &mut Stop,
 ) -> Option<std::io::Result<std::process::ExitStatus>> {
     leave(terminal);
     println!("Starting {}…", method.name);
-    wait_for_terminal_auth(
-        terminal_auth_command(program, root, credential_storage, method),
-        stop,
-    )
-    .await
+    wait_for_terminal_auth(terminal_auth_command(invocation, root, method), stop).await
 }
 
 async fn wait_for_terminal_auth(
@@ -527,7 +546,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     if force {
         command.arg("--force");
     }
-    let auth_program = command.as_std().get_program().to_owned();
+    let auth_invocation = AgentInvocation::from_command(command.as_std());
     detach_from_controlling_terminal(&mut command);
     let mut child = command
         .env(EVENTS_ENV, "1")
@@ -753,9 +772,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     drop(events);
                                     let authenticated = authenticate_in_terminal(
                                         &mut terminal,
-                                        &auth_program,
+                                        &auth_invocation,
                                         &root,
-                                        credential_storage,
                                         &method,
                                         &mut stop,
                                     )
@@ -1152,9 +1170,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     drop(events);
                                     let authenticated = authenticate_in_terminal(
                                         &mut terminal,
-                                        &auth_program,
+                                        &auth_invocation,
                                         &root,
-                                        credential_storage,
                                         &method,
                                         &mut stop,
                                     )
@@ -2164,13 +2181,14 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
-        attachments_from_paste, authentication_required, client_capabilities, command,
-        credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
-        durable_session_id, effort_state, error_detail, handle, message_of, osc52,
-        previous_session_for_resume, prompt_blocks, readable, refresh_config_state,
-        save_effort_default_to, save_model_defaults_to, terminal_auth_command, transition_route,
-        translate, translate_for_session, usable_terminal_auth_methods, user_message_of, wire,
+        ActiveSessionRoute, AgentInvocation, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate,
+        accept_queued_update, attachments_from_paste, authentication_required, client_capabilities,
+        command, credential_storage_for_launch, current_model_choice,
+        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
+        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
+        refresh_config_state, save_effort_default_to, save_model_defaults_to,
+        terminal_auth_command, transition_route, translate, translate_for_session,
+        usable_terminal_auth_methods, user_message_of, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -2186,7 +2204,7 @@ mod tests {
                 "openrouter".into(),
             ]),
         ];
-        let required = agent_client_protocol::Error::internal_error().data(
+        let required = agent_client_protocol::Error::auth_required().data(
             crate::protocols::acp::AuthenticationRequiredData::new(
                 "openrouter",
                 "run `kit auth login openrouter` before using OpenRouter",
@@ -2194,6 +2212,14 @@ mod tests {
             .into_value(),
         );
         assert!(authentication_required(&required, &methods));
+        assert!(authentication_required(
+            &agent_client_protocol::Error::auth_required(),
+            &methods,
+        ));
+        assert!(!authentication_required(
+            &agent_client_protocol::Error::internal_error().data(required.data.clone()),
+            &methods,
+        ));
         assert_eq!(
             error_detail(&required),
             "run `kit auth login openrouter` before using OpenRouter"
@@ -2205,9 +2231,9 @@ mod tests {
             &methods,
         ));
         assert!(!authentication_required(
-            &agent_client_protocol::Error::internal_error().data(
+            &agent_client_protocol::Error::auth_required().data(
                 crate::protocols::acp::AuthenticationRequiredData::new(
-                    "speakeasy",
+                    "unadvertised",
                     "authentication required",
                 )
                 .into_value(),
@@ -2251,23 +2277,24 @@ mod tests {
             ])),
         ];
         let usable = usable_terminal_auth_methods(&methods);
-        assert_eq!(usable.len(), 1);
-        assert_eq!(usable[0].method_id.0.as_ref(), "openai");
+        assert_eq!(usable.len(), 2);
+        assert_eq!(usable[0].method_id.0.as_ref(), "empty");
+        assert_eq!(usable[1].method_id.0.as_ref(), "openai");
     }
 
     #[test]
-    fn terminal_auth_command_uses_advertised_args_env_and_credentials() {
+    fn terminal_auth_command_appends_to_agent_invocation() {
         let root = tempfile::tempdir().unwrap();
         let credentials = root.path().join("credentials");
+        let mut base = tokio::process::Command::new("kit-agent");
+        base.args(["serve", "--model", "test-model"]);
+        CredentialStorage::Filesystem(credentials.clone()).append_cli_args(&mut base);
+        base.env("KIT_BASE_TEST", "base");
+        let invocation = AgentInvocation::from_command(base.as_std());
         let method = AuthMethodTerminal::new("openai", "ChatGPT")
-            .args(vec!["auth".into(), "login".into(), "openai".into()])
+            .args(vec!["--terminal-auth-login".into(), "openai".into()])
             .env(vec![EnvVariable::new("KIT_AUTH_TEST", "set")]);
-        let command = terminal_auth_command(
-            std::ffi::OsStr::new("kit-agent"),
-            root.path(),
-            &CredentialStorage::Filesystem(credentials.clone()),
-            &method,
-        );
+        let command = terminal_auth_command(&invocation, root.path(), &method);
         let command = command.as_std();
         assert_eq!(command.get_program(), std::ffi::OsStr::new("kit-agent"));
         assert_eq!(command.get_current_dir(), Some(root.path()));
@@ -2277,15 +2304,20 @@ mod tests {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
             [
-                "auth",
-                "login",
-                "openai",
+                "serve",
+                "--model",
+                "test-model",
                 "--credential-store",
                 "file",
                 "--credential-dir",
                 credentials.to_str().unwrap(),
+                "--terminal-auth-login",
+                "openai",
             ]
         );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "KIT_BASE_TEST" && value == Some(std::ffi::OsStr::new("base"))
+        }));
         assert!(command.get_envs().any(|(name, value)| {
             name == "KIT_AUTH_TEST" && value == Some(std::ffi::OsStr::new("set"))
         }));
