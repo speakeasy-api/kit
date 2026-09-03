@@ -2168,7 +2168,7 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
             "intent".into(),
             json!({
                 "type": "string",
-                "description": "A short user-facing sentence explaining what the script is doing."
+                "description": "A brief user-facing status sentence, preferably 3–10 words. Start with an -ing verb; omit first-person language, rationale, and implementation details. Example: \"Checking AgentKit's telemetry for useful metrics.\""
             }),
         );
         properties.insert(

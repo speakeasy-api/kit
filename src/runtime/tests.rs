@@ -1077,7 +1077,11 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert!(
         specs[0].input_schema["properties"]["intent"]["description"]
             .as_str()
-            .is_some_and(|description| description.contains("short user-facing sentence"))
+            .is_some_and(|description| {
+                description.contains("preferably 3–10 words")
+                    && description.contains("omit first-person language")
+                    && description.contains("Checking AgentKit's telemetry for useful metrics.")
+            })
     );
     assert!(
         specs[0].input_schema["required"]
