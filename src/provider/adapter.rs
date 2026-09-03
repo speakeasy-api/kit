@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn, OpenRouterApiKey,
-    SubscriptionConfig, speakeasy_auth,
+    SubscriptionConfig, chatgpt::SubscriptionModelCatalogCache, speakeasy_auth,
 };
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
@@ -164,6 +164,7 @@ pub struct SelectableAdapter {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
+    openai_model_catalog: SubscriptionModelCatalogCache,
 }
 
 impl SelectableAdapter {
@@ -213,6 +214,7 @@ impl SelectableAdapter {
             })),
             credential_storage,
             openrouter_api_key,
+            openai_model_catalog: SubscriptionModelCatalogCache::default(),
         })
     }
 
@@ -228,6 +230,30 @@ impl SelectableAdapter {
             .lock()
             .map(|value| value.reasoning_effort)
             .map_err(|_| "session selection lock is poisoned".into())
+    }
+
+    async fn discovered_openai_models(&self) -> Vec<String> {
+        let config = match SubscriptionConfig::new(OPENAI_FALLBACK[0].to_string()) {
+            Ok(config) => config.with_credential_storage(self.credential_storage.clone()),
+            Err(_) => return Vec::new(),
+        };
+        let adapter = match OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_catalog(
+            config,
+            None,
+            self.openai_model_catalog.clone(),
+        ) {
+            Ok(adapter) => adapter,
+            Err(_) => return Vec::new(),
+        };
+        adapter
+            .model_catalog()
+            .await
+            .map(|catalog| catalog.visible_models().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub async fn model_catalog(&self, current: &ModelSelection) -> Vec<ModelGroup> {
+        model_catalog_with_openai(current, self.discovered_openai_models()).await
     }
 
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
@@ -277,6 +303,7 @@ pub struct SelectableSession {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
+    openai_model_catalog: SubscriptionModelCatalogCache,
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
@@ -292,12 +319,13 @@ impl ModelAdapter for SelectableAdapter {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
-        let inner = KitAdapter::new_with_credentials_and_effort(
+        let inner = KitAdapter::new_with_credentials_effort_and_catalog(
             active.model.provider,
             active.model.model.clone(),
             self.credential_storage.clone(),
             active.reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.openai_model_catalog.clone(),
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -306,6 +334,7 @@ impl ModelAdapter for SelectableAdapter {
             selection: Arc::clone(&self.selection),
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
+            openai_model_catalog: self.openai_model_catalog.clone(),
             config,
             active,
             inner,
@@ -355,12 +384,13 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
         if selected != self.active {
-            let replacement = KitAdapter::new_with_credentials_and_effort(
+            let replacement = KitAdapter::new_with_credentials_effort_and_catalog(
                 selected.model.provider,
                 selected.model.model.clone(),
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
                 self.openrouter_api_key.as_ref(),
+                self.openai_model_catalog.clone(),
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -509,11 +539,33 @@ impl KitAdapter {
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<&OpenRouterApiKey>,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_effort_and_catalog(
+            provider,
+            model,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            SubscriptionModelCatalogCache::default(),
+        )
+    }
+
+    fn new_with_credentials_effort_and_catalog(
+        provider: ProviderKind,
+        model: String,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+        openrouter_api_key: Option<&OpenRouterApiKey>,
+        openai_model_catalog: SubscriptionModelCatalogCache,
+    ) -> Result<Self, String> {
         match provider {
             ProviderKind::OpenAiSubscription => {
                 let config =
                     SubscriptionConfig::new(model)?.with_credential_storage(credential_storage);
-                OpenAiSubscriptionAdapter::new_with_reasoning_effort(config, reasoning_effort)
+                OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_catalog(
+                    config,
+                    reasoning_effort,
+                    openai_model_catalog,
+                )
             }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
@@ -972,18 +1024,29 @@ const OPENROUTER_FALLBACK: &[&str] = &[
     "google/gemini-2.5-pro",
 ];
 
-fn openai_models(current: &ModelSelection) -> Vec<String> {
-    let mut models = [
-        "gpt-5.6-sol",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex-spark",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
-    if current.provider == ProviderKind::OpenAiSubscription && !models.contains(&current.model) {
+const OPENAI_FALLBACK: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
+
+fn openai_models(discovered: Vec<String>, current: &ModelSelection) -> Vec<String> {
+    let mut models = if discovered.is_empty() {
+        OPENAI_FALLBACK
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        discovered
+    };
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|model| seen.insert(model.clone()));
+    if current.provider == ProviderKind::OpenAiSubscription
+        && valid_model_id(&current.model)
+        && !models.contains(&current.model)
+    {
         models.push(current.model.clone());
     }
     models
@@ -991,44 +1054,68 @@ fn openai_models(current: &ModelSelection) -> Vec<String> {
 
 /// Returns a bounded, provider-grouped catalog. Remote discovery is best effort.
 pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
-    let openai = openai_models(current);
+    match SelectableAdapter::new(current.provider, current.model.clone()) {
+        Ok(adapter) => adapter.model_catalog(current).await,
+        Err(_) => model_catalog_with_openai(current, std::future::ready(Vec::new())).await,
+    }
+}
+
+async fn model_catalog_with_openai(
+    current: &ModelSelection,
+    openai_catalog: impl std::future::Future<Output = Vec<String>>,
+) -> Vec<ModelGroup> {
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
     };
     let public_url = OPENROUTER_MODELS_URL.to_string();
     let same_catalog = openrouter_url.as_deref() == Some(public_url.as_str());
-    let (mut openrouter, mut speakeasy) = if same_catalog {
-        let models = fetch_model_ids(&public_url)
-            .await
-            .unwrap_or_else(|_| openrouter_fallback());
-        (models.clone(), models)
-    } else {
-        let openrouter_catalog = async {
-            match openrouter_url {
-                Some(url) => fetch_model_ids(&url)
-                    .await
-                    .unwrap_or_else(|_| openrouter_fallback()),
-                None => openrouter_fallback(),
-            }
-        };
-        let speakeasy_catalog = async {
-            fetch_model_ids(&public_url)
+    let other_catalogs = async move {
+        if same_catalog {
+            let models = fetch_model_ids(&public_url)
                 .await
-                .unwrap_or_else(|_| openrouter_fallback())
-        };
-        tokio::join!(openrouter_catalog, speakeasy_catalog)
+                .unwrap_or_else(|_| openrouter_fallback());
+            (models.clone(), models)
+        } else {
+            let openrouter_catalog = async {
+                match openrouter_url {
+                    Some(url) => fetch_model_ids(&url)
+                        .await
+                        .unwrap_or_else(|_| openrouter_fallback()),
+                    None => openrouter_fallback(),
+                }
+            };
+            let speakeasy_catalog = async {
+                fetch_model_ids(&public_url)
+                    .await
+                    .unwrap_or_else(|_| openrouter_fallback())
+            };
+            tokio::join!(openrouter_catalog, speakeasy_catalog)
+        }
     };
-    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+    let (discovered_openai, (mut openrouter, mut speakeasy)) =
+        tokio::join!(openai_catalog, other_catalogs);
+    let openai = openai_models(discovered_openai, current);
+    let current_is_valid = valid_model_id(&current.model);
+    if current_is_valid
+        && current.provider == ProviderKind::OpenRouter
+        && !openrouter.contains(&current.model)
+    {
         openrouter.push(current.model.clone());
     }
-    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::Speakeasy
+        && !speakeasy.contains(&current.model)
+    {
         speakeasy.push(current.model.clone());
     }
     openrouter.sort();
     openrouter.dedup();
     openrouter.truncate(MAX_SELECTOR_MODELS);
-    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::OpenRouter
+        && !openrouter.contains(&current.model)
+    {
         if openrouter.len() == MAX_SELECTOR_MODELS {
             openrouter.pop();
         }
@@ -1037,7 +1124,10 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     speakeasy.sort();
     speakeasy.dedup();
     speakeasy.truncate(MAX_SELECTOR_MODELS);
-    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::Speakeasy
+        && !speakeasy.contains(&current.model)
+    {
         if speakeasy.len() == MAX_SELECTOR_MODELS {
             speakeasy.pop();
         }
@@ -1135,12 +1225,13 @@ mod tests {
     use crate::credentials::CredentialStorage;
 
     use super::{
-        KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterApiKey,
-        OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
-        SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
-        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
-        gram_chat_id, models_url, openai_models, openrouter_config_from_env, parse_context_window,
-        rewrite_openrouter_media, stamp_context_window,
+        KitAdapter, KitSession, ModelSelection, OPENAI_FALLBACK, OPENROUTER_MODELS_URL,
+        OpenRouterApiKey, OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort,
+        SelectableAdapter, SelectableSession, SessionSelection, SpeakeasyKitAdapter,
+        SpeakeasyProvider, apply_openrouter_reasoning_effort, catalog_models_url,
+        expose_background_call_ids, gram_chat_id, models_url, openai_models,
+        openrouter_config_from_env, parse_context_window, rewrite_openrouter_media,
+        stamp_context_window,
     };
 
     #[test]
@@ -1558,6 +1649,7 @@ mod tests {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
             openrouter_api_key: None,
+            openai_model_catalog: Default::default(),
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,
@@ -1621,7 +1713,25 @@ mod tests {
     fn openai_catalog_keeps_the_active_custom_model() {
         let current = ModelSelection::new(ProviderKind::OpenAiSubscription, "custom-model");
 
-        assert!(openai_models(&current).contains(&current.model));
+        assert!(openai_models(Vec::new(), &current).contains(&current.model));
+    }
+
+    #[test]
+    fn openai_catalog_prefers_discovery_and_preserves_order() {
+        let current = ModelSelection::new(ProviderKind::OpenAiSubscription, "custom-model");
+        let models = openai_models(
+            vec!["second".into(), "first".into(), "second".into()],
+            &current,
+        );
+
+        assert_eq!(models, ["second", "first", "custom-model"]);
+    }
+
+    #[test]
+    fn openai_catalog_uses_fallback_only_when_discovery_is_empty() {
+        let current = ModelSelection::new(ProviderKind::OpenRouter, "other/model");
+
+        assert_eq!(openai_models(Vec::new(), &current), OPENAI_FALLBACK);
     }
 
     #[test]

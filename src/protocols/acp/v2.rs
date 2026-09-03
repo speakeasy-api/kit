@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    provider::{ProviderKind, SelectableAdapter, authentication_method_id, model_catalog},
+    provider::{ProviderKind, SelectableAdapter, authentication_method_id},
     runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
@@ -790,7 +790,7 @@ impl Server {
             .adapter
             .reasoning_effort()
             .map_err(AcpRuntimeError::Loop)?;
-        let catalog = model_catalog(&current).await;
+        let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = v2_config_options(&current, reasoning, &catalog);
         let canonical_transcript = driver.canonical_transcript;
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
