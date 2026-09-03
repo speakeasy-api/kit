@@ -13,18 +13,20 @@ use std::{
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AudioContent, AuthMethod, AuthMethodTerminal, AutoDenyResolver, AvailableCommand,
-    AvailableCommandsUpdate, BlobResourceContents, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
-    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
-    SessionForkCapabilities, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    TextContent, TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
+    AgentAuthCapabilities, AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
+    BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
+    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
@@ -39,7 +41,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
@@ -48,17 +50,84 @@ mod skill_catalog;
 pub mod v2;
 
 use crate::{
-    provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
+    provider::{
+        ModelGroup, ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter,
+        authentication_method_id, model_catalog,
+    },
     runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
 
-const MODEL_CONFIG_ID: &str = "model";
-const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+pub(crate) const MODEL_CONFIG_ID: &str = "model";
+pub(crate) const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
+const AUTH_REQUIRED_KIND: &str = "authentication_required";
+const AUTHENTICATION_RESET_TIMEOUT: Duration = Duration::from_secs(45);
 
-fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec<AuthMethod> {
+pub(crate) struct AuthenticationRequiredData<'a> {
+    pub(crate) method_id: &'a str,
+    pub(crate) detail: &'a str,
+}
+
+impl<'a> AuthenticationRequiredData<'a> {
+    pub(crate) fn new(method_id: &'a str, detail: &'a str) -> Self {
+        Self { method_id, detail }
+    }
+
+    pub(crate) fn from_value(value: &'a serde_json::Value) -> Option<Self> {
+        let data = value.as_object()?;
+        (data.get("kind")?.as_str()? == AUTH_REQUIRED_KIND).then_some(Self {
+            method_id: data.get("methodId")?.as_str()?,
+            detail: data.get("detail")?.as_str()?,
+        })
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": AUTH_REQUIRED_KIND,
+            "methodId": self.method_id,
+            "detail": self.detail,
+        })
+    }
+}
+
+pub(crate) struct TerminalAuthMethodSpec {
+    pub(crate) method_id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) provider: ProviderKind,
+}
+
+const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
+    TerminalAuthMethodSpec {
+        method_id: "openai",
+        name: "Sign in with ChatGPT",
+        description: "Authenticate Kit with a ChatGPT subscription",
+        provider: ProviderKind::OpenAiSubscription,
+    },
+    TerminalAuthMethodSpec {
+        method_id: "openrouter",
+        name: "Sign in with OpenRouter",
+        description: "Authenticate Kit with OpenRouter",
+        provider: ProviderKind::OpenRouter,
+    },
+    TerminalAuthMethodSpec {
+        method_id: "speakeasy",
+        name: "Sign in with Speakeasy",
+        description: "Authenticate Kit with Speakeasy",
+        provider: ProviderKind::Speakeasy,
+    },
+];
+
+pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] {
+    TERMINAL_AUTH_METHODS
+}
+
+fn terminal_auth_methods(
+    capabilities: &agentkit_acp::ClientCapabilities,
+    provider_available: impl Fn(ProviderKind) -> bool,
+) -> Vec<AuthMethod> {
     let supports_terminal_auth = capabilities.auth.terminal
         || capabilities
             .meta
@@ -70,18 +139,20 @@ fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec
         return Vec::new();
     }
 
-    vec![
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
-                .description("Authenticate Kit with a ChatGPT subscription")
-                .args(vec!["--terminal-auth-login".into(), "openai".into()]),
-        ),
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
-                .description("Authenticate Kit with OpenRouter")
-                .args(vec!["--terminal-auth-login".into(), "openrouter".into()]),
-        ),
-    ]
+    terminal_auth_method_specs()
+        .iter()
+        .filter(|method| provider_available(method.provider))
+        .map(|method| {
+            AuthMethod::Terminal(
+                AuthMethodTerminal::new(method.method_id, method.name)
+                    .description(method.description)
+                    .args(vec![
+                        "--terminal-auth-login".into(),
+                        method.method_id.into(),
+                    ]),
+            )
+        })
+        .collect()
 }
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
@@ -358,7 +429,12 @@ pub(crate) struct TurnStateNotification {
 }
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
-    agent_client_protocol::util::internal_error(error.to_string())
+    let detail = error.to_string();
+    match authentication_method_id(&detail) {
+        Some(method_id) => agent_client_protocol::Error::auth_required()
+            .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
+        None => agent_client_protocol::util::internal_error(detail),
+    }
 }
 
 #[derive(Debug)]
@@ -429,13 +505,49 @@ struct RegisteredV2Session {
 
 struct RegistryState {
     accepting: bool,
+    permanently_closed: bool,
+    generation: u64,
+    pending_attachments: usize,
     sessions: HashMap<u64, RegisteredSession>,
     v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
 
 struct SessionRegistryInner {
     next_token: AtomicU64,
+    lifecycle: tokio::sync::Mutex<()>,
+    attachments_changed: Notify,
     state: Mutex<RegistryState>,
+}
+
+pub(super) struct SessionAdmission {
+    generation: u64,
+    active: bool,
+    registry: Arc<SessionRegistryInner>,
+}
+
+impl SessionAdmission {
+    fn complete(&mut self, state: &mut RegistryState) {
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+        self.registry.attachments_changed.notify_waiters();
+    }
+}
+
+impl Drop for SessionAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        let mut state = registry
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+        drop(state);
+        registry.attachments_changed.notify_waiters();
+    }
 }
 
 /// Coordinates shutdown across stdio and all connection-scoped HTTP ACP components.
@@ -449,8 +561,13 @@ impl SessionRegistry {
         Self {
             inner: Arc::new(SessionRegistryInner {
                 next_token: AtomicU64::new(1),
+                lifecycle: tokio::sync::Mutex::new(()),
+                attachments_changed: Notify::new(),
                 state: Mutex::new(RegistryState {
                     accepting: true,
+                    permanently_closed: false,
+                    generation: 0,
+                    pending_attachments: 0,
                     sessions: HashMap::new(),
                     v2_sessions: HashMap::new(),
                 }),
@@ -462,7 +579,7 @@ impl SessionRegistry {
         self.inner.next_token.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn register(&self, session: RegisteredSession) -> Result<(), ()> {
+    fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
         let mut state = self
             .inner
             .state
@@ -471,12 +588,35 @@ impl SessionRegistry {
         if !state.accepting {
             return Err(());
         }
+        state.pending_attachments += 1;
+        Ok(SessionAdmission {
+            generation: state.generation,
+            active: true,
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    fn register(
+        &self,
+        admission: &mut SessionAdmission,
+        session: RegisteredSession,
+    ) -> Result<(), ()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        if !state.accepting || state.generation != admission.generation {
+            return Err(());
+        }
         state.sessions.insert(session.token, session);
+        admission.complete(&mut state);
         Ok(())
     }
 
     pub(super) fn register_v2(
         &self,
+        admission: &mut SessionAdmission,
         token: u64,
         interrupt: Arc<dyn Fn() + Send + Sync>,
         close: CloseV2Session,
@@ -488,7 +628,7 @@ impl SessionRegistry {
             .state
             .lock()
             .expect("ACP session registry poisoned");
-        if !state.accepting {
+        if !state.accepting || state.generation != admission.generation {
             return Err(());
         }
         state.v2_sessions.insert(
@@ -501,6 +641,7 @@ impl SessionRegistry {
                 completed,
             },
         );
+        admission.complete(&mut state);
         Ok(())
     }
 
@@ -514,25 +655,92 @@ impl SessionRegistry {
         state.v2_sessions.remove(&token);
     }
 
-    fn close_gate_and_snapshot(&self) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
+    fn close_gate_and_snapshot(
+        &self,
+        permanently: bool,
+    ) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
         let mut state = self
             .inner
             .state
             .lock()
             .expect("ACP session registry poisoned");
         state.accepting = false;
+        state.permanently_closed |= permanently;
+        state.generation = state.generation.wrapping_add(1);
         (
             state.sessions.values().cloned().collect(),
             state.v2_sessions.values().cloned().collect(),
         )
     }
 
-    pub async fn shutdown(&self) {
-        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    async fn wait_for_pending_attachments(&self) {
+        loop {
+            let changed = self.inner.attachments_changed.notified();
+            if self
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .pending_attachments
+                == 0
+            {
+                return;
+            }
+            changed.await;
+        }
     }
 
+    pub async fn shutdown(&self) {
+        self.close_sessions_with_timeout(Duration::from_secs(5), false, || async {})
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn reset_authentication(&self) -> bool {
+        self.reset_authentication_with(async {}).await.0
+    }
+
+    async fn reset_authentication_with<T>(
+        &self,
+        reset: impl std::future::Future<Output = T>,
+    ) -> (bool, Option<T>) {
+        self.close_sessions_with_timeout(Duration::from_secs(5), true, || reset)
+            .await
+    }
+
+    #[cfg(test)]
     async fn shutdown_with_timeout(&self, limit: Duration) {
-        let (sessions, v2_sessions) = self.close_gate_and_snapshot();
+        self.close_sessions_with_timeout(limit, false, || async {})
+            .await;
+    }
+
+    async fn close_sessions_with_timeout<T, F, Fut>(
+        &self,
+        limit: Duration,
+        reopen: bool,
+        after_close: F,
+    ) -> (bool, Option<T>)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _lifecycle = match timeout(limit, self.inner.lifecycle.lock()).await {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                if !reopen {
+                    let mut state = self
+                        .inner
+                        .state
+                        .lock()
+                        .expect("ACP session registry poisoned");
+                    state.accepting = false;
+                    state.permanently_closed = true;
+                    state.generation = state.generation.wrapping_add(1);
+                }
+                return (false, None);
+            }
+        };
+        let (sessions, v2_sessions) = self.close_gate_and_snapshot(!reopen);
         for session in &sessions {
             session.background_jobs.cancel_all();
             let _ = session.integration.interrupt_session(&session.session_id);
@@ -570,12 +778,13 @@ impl SessionRegistry {
             });
         }
 
-        if timeout(limit, async {
+        let timed_out = timeout(limit, async {
             while closing.join_next().await.is_some() {}
+            self.wait_for_pending_attachments().await;
         })
         .await
-        .is_err()
-        {
+        .is_err();
+        let teardown_complete = if timed_out {
             closing.abort_all();
             for session in &sessions {
                 if !*session.completed.borrow() {
@@ -588,19 +797,130 @@ impl SessionRegistry {
                 }
             }
             while closing.join_next().await.is_some() {}
-            for session in sessions {
-                self.remove(session.token);
-            }
-            for session in v2_sessions {
-                self.remove(session.token);
-            }
+            timeout(limit, async {
+                for mut session in sessions.iter().cloned() {
+                    if !*session.completed.borrow() {
+                        let _ = session.completed.changed().await;
+                    }
+                }
+                for mut session in v2_sessions.iter().cloned() {
+                    if !*session.completed.borrow() {
+                        let _ = session.completed.changed().await;
+                    }
+                }
+                self.wait_for_pending_attachments().await;
+            })
+            .await
+            .is_ok()
+        } else {
+            true
+        };
+        for session in &sessions {
+            self.remove(session.token);
         }
+        for session in &v2_sessions {
+            self.remove(session.token);
+        }
+        if !teardown_complete {
+            self.inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .permanently_closed = true;
+        }
+        let output = if teardown_complete {
+            Some(after_close().await)
+        } else {
+            None
+        };
+        let mut reopened = false;
+        if reopen && teardown_complete {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned");
+            state.accepting = !state.permanently_closed;
+            reopened = state.accepting;
+        }
+        (teardown_complete && (!reopen || reopened), output)
     }
 }
 
 impl Default for SessionRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+enum AuthenticationReset<T> {
+    Completed(bool, Option<T>),
+    TimedOut,
+    Failed(tokio::task::JoinError),
+}
+
+async fn bounded_authentication_reset<T>(
+    registry: SessionRegistry,
+    reset: impl std::future::Future<Output = T> + Send + 'static,
+    limit: Duration,
+) -> AuthenticationReset<T>
+where
+    T: Send + 'static,
+{
+    let task = tokio::spawn(async move { registry.reset_authentication_with(reset).await });
+    match timeout(limit, task).await {
+        Ok(Ok((complete, output))) => AuthenticationReset::Completed(complete, output),
+        Ok(Err(error)) => AuthenticationReset::Failed(error),
+        Err(_) => AuthenticationReset::TimedOut,
+    }
+}
+
+async fn logout_authentication(
+    runtime: Arc<Runtime>,
+    registry: &SessionRegistry,
+) -> Result<(), AcpRuntimeError> {
+    if !runtime.supports_logout_authentication() {
+        return Err(AcpRuntimeError::Loop(
+            "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
+                .into(),
+        ));
+    }
+    let logout = async move {
+        match tokio::task::spawn_blocking(move || runtime.logout_authentication()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("authentication logout task failed: {error}")),
+        }
+    };
+    let (reset, logout) = match bounded_authentication_reset(
+        registry.clone(),
+        logout,
+        AUTHENTICATION_RESET_TIMEOUT,
+    )
+    .await
+    {
+        AuthenticationReset::Completed(reset, logout) => (reset, logout),
+        AuthenticationReset::TimedOut => {
+            return Err(AcpRuntimeError::Loop(
+                "authentication logout timed out; session admission remains paused until credential deletion finishes"
+                    .into(),
+            ));
+        }
+        AuthenticationReset::Failed(error) => {
+            return Err(AcpRuntimeError::Loop(format!(
+                "authentication logout task failed: {error}"
+            )));
+        }
+    };
+    if !reset {
+        return Err(AcpRuntimeError::Loop(
+            "authentication logout could not finish session teardown".into(),
+        ));
+    }
+    match logout.expect("successful teardown runs the authentication reset action") {
+        Ok(()) => Ok(()),
+        Err(error) => Err(AcpRuntimeError::Loop(format!(
+            "{error}; active ACP sessions were reset because credential state may have changed"
+        ))),
     }
 }
 
@@ -734,6 +1054,28 @@ impl Server {
         .map(|matches| FileSearchResponse { matches })
     }
 
+    fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
+        let method_id = request.method_id.0.as_ref();
+        let detail = if terminal_auth_method_specs()
+            .iter()
+            .any(|method| method.method_id == method_id)
+        {
+            "terminal authentication methods must be launched as a separate agent invocation"
+        } else {
+            "authentication method was not advertised by this agent"
+        };
+        Err(agent_client_protocol::Error::invalid_params()
+            .data(serde_json::json!({ "detail": detail, "methodId": method_id })))
+    }
+
+    async fn logout(self: &Arc<Self>) -> Result<LogoutResponse, AcpRuntimeError> {
+        logout_authentication(Arc::clone(&self.runtime), &self.registry).await?;
+        Ok(LogoutResponse::new())
+    }
+
     fn remove_session(&self, session_id: &agentkit_acp::SessionId, token: u64) {
         let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
         if sessions
@@ -745,9 +1087,13 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        let logout_authentication = self.runtime.supports_logout_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-            .agent_capabilities(capabilities())
-            .auth_methods(terminal_auth_methods(&request.client_capabilities))
+            .agent_capabilities(capabilities(logout_authentication))
+            .auth_methods(terminal_auth_methods(
+                &request.client_capabilities,
+                |provider| self.runtime.supports_terminal_authentication(provider),
+            ))
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
                 self.integration.version().to_string(),
@@ -900,6 +1246,10 @@ impl Server {
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        let mut admission = self
+            .registry
+            .begin_attachment()
+            .map_err(|()| AcpRuntimeError::ClientClosed)?;
         // Claim the durable identity before binding ACP so every layer uses
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
@@ -1012,19 +1362,26 @@ impl Server {
             actor: actor_task.abort_handle(),
             completed: completion,
         };
-        drop(actor_task);
 
         // Hold the request-scoped map lock across registration, commit, and publication.
         // Shutdown either closes the gate before this point or snapshots this actor.
         let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        self.registry
-            .register(registered)
-            .map_err(|()| AcpRuntimeError::ClientClosed)?;
+        if self.registry.register(&mut admission, registered).is_err() {
+            drop(sessions);
+            drop(activation);
+            actor_task.abort();
+            let _ = actor_task.await;
+            return Err(AcpRuntimeError::ClientClosed);
+        }
         let pending_fork_creation = if claim.is_fork() {
             Some(claim.defer_fork_commit())
         } else {
             if let Err(error) = claim.commit() {
                 self.registry.remove(token);
+                drop(sessions);
+                drop(activation);
+                actor_task.abort();
+                let _ = actor_task.await;
                 return Err(record_acp_runtime_failure(
                     &session_id,
                     "session_commit",
@@ -1047,6 +1404,7 @@ impl Server {
             },
         );
         drop(sessions);
+        drop(actor_task);
         Ok(AttachedSession {
             session_id,
             config_options,
@@ -1859,6 +2217,28 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: AuthenticateRequest, responder, _cx| {
+                    responder.respond_with_result(state.authenticate(request))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |_request: LogoutRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(state.logout().await.map_err(sdk_error))
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: NewSessionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
@@ -2072,8 +2452,8 @@ fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
         .ok_or(ListSessionsError::InvalidCursor)
 }
 
-fn capabilities() -> agentkit_acp::AgentCapabilities {
-    agentkit_acp::AgentCapabilities::new()
+fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities {
+    let capabilities = agentkit_acp::AgentCapabilities::new()
         .load_session(true)
         .prompt_capabilities(
             PromptCapabilities::new()
@@ -2087,7 +2467,12 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
                 .fork(SessionForkCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
-        )
+        );
+    if logout_authentication {
+        capabilities.auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+    } else {
+        capabilities
+    }
 }
 
 async fn drain_turn_states(
@@ -2160,12 +2545,15 @@ pub(super) mod tests {
 
     #[test]
     fn terminal_auth_methods_require_client_support() {
-        assert!(terminal_auth_methods(&agentkit_acp::ClientCapabilities::new()).is_empty());
+        assert!(
+            terminal_auth_methods(&agentkit_acp::ClientCapabilities::new(), |_| true).is_empty()
+        );
 
         let capabilities = agentkit_acp::ClientCapabilities::new()
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
-        let methods = terminal_auth_methods(&capabilities);
-        assert_eq!(methods.len(), 2);
+        assert!(terminal_auth_methods(&capabilities, |_| false).is_empty());
+        let methods = terminal_auth_methods(&capabilities, |_| true);
+        assert_eq!(methods.len(), 3);
         assert!(matches!(
             &methods[0],
             AuthMethod::Terminal(method)
@@ -2178,6 +2566,178 @@ pub(super) mod tests {
                 if method.id.0.as_ref() == "openrouter"
                     && method.args == ["--terminal-auth-login", "openrouter"]
         ));
+        assert!(matches!(
+            &methods[2],
+            AuthMethod::Terminal(method)
+                if method.id.0.as_ref() == "speakeasy"
+                    && method.args == ["--terminal-auth-login", "speakeasy"]
+        ));
+
+        let methods = terminal_auth_methods(&capabilities, |provider| {
+            provider != ProviderKind::OpenRouter
+        });
+        let method_ids = methods
+            .iter()
+            .map(|method| match method {
+                AuthMethod::Terminal(method) => method.id.0.as_ref(),
+                _ => unreachable!("only terminal methods are advertised"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(method_ids, ["openai", "speakeasy"]);
+    }
+
+    #[test]
+    fn v1_logout_capability_is_independent_from_terminal_authentication_methods() {
+        let client = agentkit_acp::ClientCapabilities::new()
+            .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
+
+        assert!(capabilities(false).auth.logout.is_none());
+        assert!(
+            !terminal_auth_methods(&client, |provider| { provider != ProviderKind::OpenRouter })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v1_authentication_errors_and_terminal_login_use_protocol_codes() {
+        let error = sdk_error(AcpRuntimeError::Loop(
+            "speakeasy_auth_required: run `kit auth login speakeasy`".into(),
+        ));
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            AcpIntegration::builder()
+                .name("auth-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        );
+        for method_id in ["openai", "unknown"] {
+            let error = server
+                .authenticate(AuthenticateRequest::new(method_id))
+                .unwrap_err();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert_eq!(error.data.unwrap()["methodId"], method_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_logout_still_resets_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let storage =
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+        storage.make_entry_undeletable_for_test("openrouter", "default");
+        storage
+            .entry("speakeasy", "default")
+            .save(b"removed")
+            .unwrap();
+        let mut runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            storage.clone(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(false);
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not remove OpenRouter credentials")
+        );
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(
+            storage
+                .entry("speakeasy", "default")
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.begin_attachment().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unsupported_logout_preserves_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "openrouter:test",
+            crate::ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("explicit")),
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(error.to_string().contains("cannot be logged out"));
+        assert!(!closed.load(Ordering::SeqCst));
+
+        registry.shutdown().await;
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    fn logout_test_server(runtime: Arc<Runtime>, registry: SessionRegistry) -> Arc<Server> {
+        Arc::new(Server::new(
+            runtime,
+            AcpIntegration::builder()
+                .name("logout-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry,
+        ))
+    }
+
+    fn register_close_tracking_session(
+        server: &Arc<Server>,
+        registry: &SessionRegistry,
+    ) -> (mpsc::Sender<Command>, Arc<AtomicBool>) {
+        let token = registry.next_token();
+        let (commands, mut received) = mpsc::channel(1);
+        let (completed, completion) = watch::channel(false);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        let actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completed);
+            if let Some(Command::Close { reply }) = received.recv().await {
+                actor_closed.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+            }
+        });
+        registry
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id: agentkit_acp::SessionId::new("logout-session"),
+                    integration: Arc::clone(&server.integration),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
+            .unwrap();
+        drop(actor);
+        (commands, closed)
     }
 
     #[test]
@@ -2186,7 +2746,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities).len(), 2);
+        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 3);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);
@@ -2227,23 +2787,38 @@ pub(super) mod tests {
             }
         });
         registry
-            .register(RegisteredSession {
-                token,
-                session_id,
-                integration: Arc::clone(&integration),
-                background_jobs: background_jobs.clone(),
-                tasks: tasks.clone(),
-                commands: weak_commands,
-                actor: actor.abort_handle(),
-                completed: completion,
-            })
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id,
+                    integration: Arc::clone(&integration),
+                    background_jobs: background_jobs.clone(),
+                    tasks: tasks.clone(),
+                    commands: weak_commands,
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
             .unwrap();
         drop(actor);
 
-        registry.shutdown_with_timeout(Duration::from_secs(1)).await;
-        assert!(closed.load(Ordering::SeqCst));
-        assert!(tasks.list_running().await.is_empty());
-        assert!(!background_jobs.activity().active);
+        let mut late_admission = registry.begin_attachment().unwrap();
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_registry
+                .shutdown_with_timeout(Duration::from_secs(1))
+                .await;
+        });
+        while registry
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .accepting
+        {
+            tokio::task::yield_now().await;
+        }
 
         let late_token = registry.next_token();
         let (late_commands, _late_received) = mpsc::channel(1);
@@ -2254,20 +2829,193 @@ pub(super) mod tests {
         });
         assert!(
             registry
-                .register(RegisteredSession {
-                    token: late_token,
-                    session_id: agentkit_acp::SessionId::new("too-late"),
-                    integration,
-                    background_jobs: BackgroundJobs::default(),
-                    tasks: AsyncTaskManager::new().handle(),
-                    commands: late_commands.downgrade(),
-                    actor: late_actor.abort_handle(),
-                    completed: late_completion,
-                })
+                .register(
+                    &mut late_admission,
+                    RegisteredSession {
+                        token: late_token,
+                        session_id: agentkit_acp::SessionId::new("too-late"),
+                        integration,
+                        background_jobs: BackgroundJobs::default(),
+                        tasks: AsyncTaskManager::new().handle(),
+                        commands: late_commands.downgrade(),
+                        actor: late_actor.abort_handle(),
+                        completed: late_completion,
+                    }
+                )
                 .is_err()
         );
+        drop(late_admission);
+        shutdown.await.unwrap();
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(tasks.list_running().await.is_empty());
+        assert!(!background_jobs.activity().active);
         late_actor.abort();
         late_actor.await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn authentication_reset_closes_shared_v2_sessions_and_reopens_registration() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_flag = Arc::clone(&closed);
+        let (completed, completion) = watch::channel(false);
+        let close = Arc::new(move || {
+            let close_flag = Arc::clone(&close_flag);
+            let completed = completed.clone();
+            Box::pin(async move {
+                close_flag.store(true, Ordering::SeqCst);
+                completed.send_replace(true);
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let actor = tokio::spawn(std::future::pending::<()>());
+        registry
+            .register_v2(
+                &mut registry.begin_attachment().unwrap(),
+                token,
+                Arc::new(|| {}),
+                close,
+                actor.abort_handle(),
+                completion,
+            )
+            .unwrap();
+
+        let generation = registry
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .generation;
+        let during_reset = registry.clone();
+        let closed_during_reset = Arc::clone(&closed);
+        let (reset, action) = registry
+            .reset_authentication_with(async move {
+                assert!(closed_during_reset.load(Ordering::SeqCst));
+                assert!(during_reset.begin_attachment().is_err());
+            })
+            .await;
+        assert!(reset);
+        assert_eq!(action, Some(()));
+
+        assert!(closed.load(Ordering::SeqCst));
+        assert_ne!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .generation,
+            generation
+        );
+        assert!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .accepting
+        );
+        actor.abort();
+        actor.await.unwrap_err();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_authentication_reset_stays_closed_until_the_action_finishes() {
+        let registry = SessionRegistry::new();
+        let started = Arc::new(Notify::new());
+        let action_started = Arc::clone(&started);
+        let (release, released) = oneshot::channel();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move {
+            bounded_authentication_reset(
+                resetting,
+                async move {
+                    action_started.notify_one();
+                    let _ = released.await;
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        started.notified().await;
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(matches!(
+            reset.await.unwrap(),
+            AuthenticationReset::TimedOut
+        ));
+        assert!(registry.begin_attachment().is_err());
+
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if registry.begin_attachment().is_ok() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("authentication reset did not reopen admission");
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_reset_cannot_reopen_on_retry() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        let (_completed, completion) = watch::channel(false);
+        let actor = tokio::spawn(std::future::pending::<()>());
+        registry
+            .register_v2(
+                &mut registry.begin_attachment().unwrap(),
+                token,
+                Arc::new(|| {}),
+                Arc::new(|| Box::pin(std::future::pending())),
+                actor.abort_handle(),
+                completion,
+            )
+            .unwrap();
+
+        assert!(
+            !registry
+                .close_sessions_with_timeout(Duration::from_millis(10), true, || async {})
+                .await
+                .0
+        );
+        assert!(!registry.reset_authentication().await);
+        assert!(registry.begin_attachment().is_err());
+        actor.abort();
+        let _ = actor.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_bounded_while_an_authentication_reset_holds_the_lifecycle_lock() {
+        let registry = SessionRegistry::new();
+        let lifecycle = registry.inner.lifecycle.lock().await;
+
+        registry
+            .shutdown_with_timeout(Duration::from_secs(30))
+            .await;
+
+        assert!(registry.begin_attachment().is_err());
+        assert!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .permanently_closed
+        );
+        drop(lifecycle);
+    }
+
+    #[tokio::test]
+    async fn permanent_shutdown_cannot_be_reopened_by_authentication_reset() {
+        let registry = SessionRegistry::new();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move { resetting.reset_authentication().await });
+
+        registry.shutdown().await;
+        let _ = reset.await.unwrap();
+
+        assert!(registry.begin_attachment().is_err());
     }
 
     #[tokio::test]
@@ -2278,16 +3026,19 @@ pub(super) mod tests {
         let (_completed, completion) = watch::channel(false);
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
-            .register(RegisteredSession {
-                token,
-                session_id: agentkit_acp::SessionId::new("stuck"),
-                integration: shutdown_test_integration(),
-                background_jobs: BackgroundJobs::default(),
-                tasks: AsyncTaskManager::new().handle(),
-                commands: commands.downgrade(),
-                actor: actor.abort_handle(),
-                completed: completion,
-            })
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id: agentkit_acp::SessionId::new("stuck"),
+                    integration: shutdown_test_integration(),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
             .unwrap();
         timeout(
             Duration::from_secs(1),

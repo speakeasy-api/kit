@@ -11,8 +11,9 @@ use agentkit_tools_core::{
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool, Runtime,
-    SessionRequest, SessionSelection, background_route, load_initial_transcript,
+    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool,
+    LogoutAuthenticationError, Runtime, SessionRequest, SessionSelection, background_route,
+    load_initial_transcript,
 };
 
 #[tokio::test]
@@ -225,6 +226,72 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
 }
 
 #[test]
+fn openrouter_keys_disable_openrouter_authentication_and_global_logout() {
+    for (explicit_key, ambient_key) in [(true, false), (false, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            explicit_key.then(|| crate::provider::OpenRouterApiKey::new("unrelated")),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(ambient_key);
+
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription));
+        assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
+        assert!(!runtime.supports_logout_authentication());
+        assert!(matches!(
+            runtime.logout_authentication(),
+            Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
+        ));
+    }
+}
+
+#[test]
+fn logout_attempts_all_providers_after_a_credential_removal_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    let storage =
+        crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+    storage.make_entry_undeletable_for_test("openrouter", "default");
+    storage
+        .entry("speakeasy", "default")
+        .save(b"removed")
+        .unwrap();
+    let mut runtime = Runtime::new_with_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::ProviderKind::OpenAiSubscription,
+        storage.clone(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut runtime)
+        .unwrap()
+        .set_ambient_openrouter_api_key_for_test(false);
+
+    let error = runtime.logout_authentication().unwrap_err();
+
+    let LogoutAuthenticationError::CredentialStateMayHaveChanged(message) = error else {
+        panic!("credential removal failure must report possibly changed state");
+    };
+    assert!(message.contains("could not remove OpenRouter credentials"));
+    assert!(
+        storage
+            .entry("speakeasy", "default")
+            .load()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn explicit_openrouter_key_reaches_runtime_adapter_and_kit_children() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
@@ -278,14 +345,14 @@ fn configured_session_is_consumed_only_after_successful_start() {
     let (first, configured) = selection.claim();
     assert_eq!(first.id, "selected");
     assert!(configured);
-    selection.finish_new(&first, configured, false, true);
+    selection.finish_new(&first, configured, false, true, false);
     let (retry, configured) = selection.claim();
     assert_eq!(retry.id, "selected");
     assert!(
         retry.resume,
         "a transcript opened before failure is resumed"
     );
-    selection.finish_new(&retry, configured, true, false);
+    selection.finish_new(&retry, configured, true, false, false);
     assert!(selection.configured.is_none());
 }
 
@@ -355,6 +422,70 @@ fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
 }
 
 #[test]
+fn dropped_uncommitted_session_claim_retries_as_new() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+    drop(failed);
+
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+    assert!(!retry.request.resume);
+}
+
+#[test]
+fn uncommitted_claim_rolls_back_before_waiting_to_publish_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+
+    let selection = runtime.session.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(failed);
+    });
+    started_rx.recv().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while crate::session::load(root.path(), &session_id).is_ok()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        crate::session::load(root.path(), &session_id).is_err(),
+        "uncommitted transcript must roll back before the retry mutex is available"
+    );
+
+    drop(selection);
+    dropping.join().unwrap();
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+}
+
+#[test]
 fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -364,10 +495,11 @@ fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    failed.guard_fork_transcript(&opened.observer);
+    failed.guard_uncommitted_transcript(&opened.observer);
     drop(opened);
     assert!(crate::session::load(root.path(), &session_id).is_ok());
 
@@ -386,10 +518,11 @@ fn dropped_deferred_fork_creation_removes_transcript_before_response() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    claim.guard_fork_transcript(&opened.observer);
+    claim.guard_uncommitted_transcript(&opened.observer);
     let creation = claim.defer_fork_commit();
     drop(opened);
     drop(creation);
@@ -1420,6 +1553,55 @@ fn cancel_all_covers_running_and_late_background_registration() {
     jobs.register_foreground_for_test("next-turn");
     assert!(!jobs.is_cancelled_for_test("next-turn"));
     jobs.finish_for_test("next-turn");
+}
+
+#[tokio::test]
+async fn persistent_startup_failure_does_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+        root.path(),
+        "test/model",
+        crate::provider::ProviderKind::OpenRouter,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+        None,
+        Some(crate::provider::OpenRouterApiKey::new("")),
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(
+        error.contains("--openrouter-api-key cannot be empty"),
+        "{error}"
+    );
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+}
+
+#[tokio::test]
+async fn persistent_missing_openai_credentials_do_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::provider::ProviderKind::OpenAiSubscription,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(error.contains("openai_auth_required:"), "{error}");
+    assert!(crate::session::load(root.path(), &session_id).is_err());
 }
 
 #[tokio::test]

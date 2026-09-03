@@ -4,6 +4,7 @@ mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
 
+pub(crate) use adapter::authentication_method_id;
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
@@ -124,6 +125,28 @@ pub fn execute_openrouter_auth(
         active_key.map(|(_, source)| source),
         timeout,
     )
+}
+
+#[doc(hidden)]
+pub fn execute_provider_logout(
+    provider: ProviderKind,
+    storage: &crate::credentials::CredentialStorage,
+    local_only: bool,
+    active_openrouter_key: Option<(&OpenRouterApiKey, OpenRouterApiKeySource)>,
+) -> Result<String, String> {
+    match provider {
+        ProviderKind::OpenAiSubscription => {
+            execute_openai_auth(OpenAiAuthCommand::Logout { local_only }, storage)
+        }
+        ProviderKind::OpenRouter => execute_openrouter_auth(
+            OpenRouterAuthCommand::Logout { local_only },
+            storage,
+            active_openrouter_key,
+        ),
+        ProviderKind::Speakeasy => {
+            execute_speakeasy_auth(SpeakeasyAuthCommand::Logout { local_only }, storage)
+        }
+    }
 }
 
 #[cfg(test)]
