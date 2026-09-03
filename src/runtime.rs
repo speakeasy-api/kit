@@ -16,7 +16,8 @@ use agentkit_core::{
     ToolOutput, ToolResultPart,
 };
 use agentkit_loop::{
-    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep,
+    PROVIDER_FINISH_REASONS_METADATA_KEY, SessionConfig, TurnResult,
 };
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
@@ -35,7 +36,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
     provider::{
-        ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
+        ModelSelection, ProviderKind, RESPONSE_ID_METADATA_KEY, RESPONSE_MODEL_METADATA_KEY,
+        ReasoningEffort, SelectableAdapter, SelectableSession,
     },
     tools::{
         A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
@@ -2317,21 +2319,7 @@ fn record_loop_failure(
 async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
     loop {
         match driver.next().await? {
-            LoopStep::Finished(result) => {
-                if result.finish_reason == FinishReason::Cancelled {
-                    return Err(LoopError::Cancelled);
-                }
-                return Ok(result
-                    .items
-                    .iter()
-                    .flat_map(|item| &item.parts)
-                    .filter_map(|part| match part {
-                        Part::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""));
-            }
+            LoopStep::Finished(result) => return turn_output(&result),
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(_) => {
                 return Err(LoopError::InvalidState(
@@ -2340,4 +2328,74 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
             }
         }
     }
+}
+
+fn turn_output(result: &TurnResult) -> Result<String, LoopError> {
+    if result.finish_reason == FinishReason::Cancelled {
+        return Err(LoopError::Cancelled);
+    }
+    let output = result
+        .items
+        .iter()
+        .flat_map(|item| &item.parts)
+        .filter_map(|part| match part {
+            Part::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if !output.trim().is_empty() {
+        return Ok(output);
+    }
+
+    let parts = result
+        .items
+        .iter()
+        .map(|item| item.parts.len())
+        .sum::<usize>();
+    let mut detail = format!(
+        "model returned no non-whitespace text (finish_reason={:?}, items={}, parts={}",
+        result.finish_reason,
+        result.items.len(),
+        parts
+    );
+    append_metadata_diagnostic(
+        &mut detail,
+        &result.metadata,
+        PROVIDER_FINISH_REASONS_METADATA_KEY,
+        "provider_finish_reasons",
+    );
+    append_metadata_diagnostic(
+        &mut detail,
+        &result.metadata,
+        RESPONSE_MODEL_METADATA_KEY,
+        "model",
+    );
+    append_metadata_diagnostic(
+        &mut detail,
+        &result.metadata,
+        RESPONSE_ID_METADATA_KEY,
+        "response_id",
+    );
+    if let Some(tokens) = result
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.tokens.as_ref())
+    {
+        let _ = write!(detail, ", output_tokens={}", tokens.output_tokens);
+        if let Some(reasoning_tokens) = tokens.reasoning_tokens {
+            let _ = write!(detail, ", reasoning_tokens={reasoning_tokens}");
+        }
+    }
+    detail.push(')');
+    Err(LoopError::Provider(detail))
+}
+
+fn append_metadata_diagnostic(detail: &mut String, metadata: &MetadataMap, key: &str, label: &str) {
+    let Some(value) = metadata.get(key) else {
+        return;
+    };
+    let rendered = value.to_string();
+    let bounded = rendered.chars().take(160).collect::<String>();
+    let _ = write!(detail, ", {label}={bounded}");
 }

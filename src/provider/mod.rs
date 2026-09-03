@@ -4,10 +4,12 @@ mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
 
-pub(crate) use adapter::authentication_method_id;
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
+};
+pub(crate) use adapter::{
+    RESPONSE_ID_METADATA_KEY, RESPONSE_MODEL_METADATA_KEY, authentication_method_id,
 };
 
 /// An OpenRouter API key that is redacted in diagnostics and zeroized on drop.

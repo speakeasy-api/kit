@@ -433,17 +433,50 @@ jobs:
           tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             -C release-kit
           release-kit/kit --version
-          release-kit/kit prompt \
-            --root "$GITHUB_WORKSPACE" \
-            --provider openrouter \
-            --model openai/gpt-5.6-terra \
-            "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
-            > kit-output.txt
-          sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
-          if ! grep -q '[^[:space:]]' release-notes.md; then
-            echo "::error::Kit returned an empty release note."
+          generated=false
+          for attempt in 1 2 3; do
+            output="kit-output-${attempt}.txt"
+            stderr="kit-stderr-${attempt}.txt"
+            if release-kit/kit prompt \
+              --root "$GITHUB_WORKSPACE" \
+              --provider openrouter \
+              --model openai/gpt-5.6-terra \
+              "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
+              > "$output" 2> >(tee "$stderr" >&2)
+            then
+              sed '$ { /^session_id: /d; }' "$output" > release-notes.md
+              if grep -q '[^[:space:]]' release-notes.md; then
+                generated=true
+                break
+              fi
+            fi
+            echo "::warning::Kit release note attempt ${attempt} failed or returned no text."
+            if (( attempt < 3 )); then
+              sleep $((attempt * 5))
+            fi
+          done
+          if [[ $generated != true ]]; then
+            echo "::error::Kit failed to generate a non-empty release note after 3 attempts."
             exit 1
           fi
+      - name: Collect release note diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p release-note-diagnostics
+          cp kit-output-*.txt kit-stderr-*.txt release-note-diagnostics/
+          if [[ -d $HOME/.kit/sessions ]]; then
+            find "$HOME/.kit/sessions" -type f -name '*.jsonl' -print0 |
+              xargs -0 -r jq -c 'select(.item.kind == "Assistant") | {session_id, item: {id: .item.id, finish_reason: .item.finish_reason, usage: .item.usage, part_kinds: [.item.parts[] | keys[0]]}}' \
+              > release-note-diagnostics/model-turns.jsonl
+          fi
+      - name: Upload release note diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-note-diagnostics
+          path: release-note-diagnostics
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: release-notes

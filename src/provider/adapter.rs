@@ -28,6 +28,8 @@ use super::{
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_SELECTOR_MODELS: usize = 2_000;
+pub(crate) const RESPONSE_ID_METADATA_KEY: &str = "kit.provider.response_id";
+pub(crate) const RESPONSE_MODEL_METADATA_KEY: &str = "kit.provider.response_model";
 const OPENROUTER_AUTH_REQUIRED: &str = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
 const SPEAKEASY_AUTH_REQUIRED: &str =
     "speakeasy_auth_required: run `kit auth login speakeasy` before using the Speakeasy provider";
@@ -869,8 +871,8 @@ impl ModelTurn for KitTurn {
         &mut self,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
-        match self {
-            Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
+        let mut event = match self {
+            Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await?,
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
                 if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
@@ -879,9 +881,29 @@ impl ModelTurn for KitTurn {
                 if let Some(context_window) = turn.context_window {
                     stamp_context_window(&mut event, context_window, "openrouter.context_length");
                 }
-                Ok(event)
+                event
             }
-        }
+        };
+        stamp_response_diagnostics(&mut event);
+        Ok(event)
+    }
+}
+
+fn stamp_response_diagnostics(event: &mut Option<ModelTurnEvent>) {
+    let Some(ModelTurnEvent::Finished(result)) = event else {
+        return;
+    };
+    if let Some(response_id) = &result.response_id {
+        result.metadata.insert(
+            RESPONSE_ID_METADATA_KEY.into(),
+            Value::String(response_id.clone()),
+        );
+    }
+    if let Some(model) = &result.model {
+        result.metadata.insert(
+            RESPONSE_MODEL_METADATA_KEY.into(),
+            Value::String(model.clone()),
+        );
     }
 }
 
@@ -1226,12 +1248,12 @@ mod tests {
 
     use super::{
         KitAdapter, KitSession, ModelSelection, OPENAI_FALLBACK, OPENROUTER_MODELS_URL,
-        OpenRouterApiKey, OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort,
-        SelectableAdapter, SelectableSession, SessionSelection, SpeakeasyKitAdapter,
-        SpeakeasyProvider, apply_openrouter_reasoning_effort, catalog_models_url,
-        expose_background_call_ids, gram_chat_id, models_url, openai_models,
-        openrouter_config_from_env, parse_context_window, rewrite_openrouter_media,
-        stamp_context_window,
+        OpenRouterApiKey, OpenRouterKitSession, OpenRouterProvider, ProviderKind,
+        RESPONSE_ID_METADATA_KEY, RESPONSE_MODEL_METADATA_KEY, ReasoningEffort, SelectableAdapter,
+        SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
+        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
+        gram_chat_id, models_url, openai_models, openrouter_config_from_env, parse_context_window,
+        rewrite_openrouter_media, stamp_context_window, stamp_response_diagnostics,
     };
 
     #[test]
@@ -1844,5 +1866,31 @@ mod tests {
             assert_eq!(usage.metadata["context_window"], json!(200_000));
             assert_eq!(usage.metadata["openrouter.context_length"], json!(200_000));
         }
+    }
+
+    #[test]
+    fn response_diagnostics_are_retained_in_finished_metadata() {
+        let mut event = Some(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: Vec::new(),
+            usage: None,
+            metadata: MetadataMap::new(),
+            model: Some("test/model".into()),
+            response_id: Some("generation-123".into()),
+        }));
+
+        stamp_response_diagnostics(&mut event);
+
+        let Some(ModelTurnEvent::Finished(result)) = event else {
+            panic!("expected finished event");
+        };
+        assert_eq!(
+            result.metadata.get(RESPONSE_ID_METADATA_KEY),
+            Some(&json!("generation-123"))
+        );
+        assert_eq!(
+            result.metadata.get(RESPONSE_MODEL_METADATA_KEY),
+            Some(&json!("test/model"))
+        );
     }
 }

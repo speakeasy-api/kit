@@ -1,8 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use agentkit_core::{
-    CancellationController, ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput, TurnId,
+    CancellationController, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TokenUsage,
+    ToolCallId, ToolOutput, TurnId, Usage,
 };
+use agentkit_loop::{PROVIDER_FINISH_REASONS_METADATA_KEY, TurnResult};
 use agentkit_task_manager::RoutingDecision;
 use agentkit_tools_core::{
     AllowAllPermissions, BasicToolExecutor, OwnedToolContext, Tool, ToolExecutionOutcome,
@@ -13,8 +15,53 @@ use serde_json::{Value, json};
 use super::{
     BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool,
     LogoutAuthenticationError, Runtime, SessionRequest, SessionSelection, background_route,
-    load_initial_transcript,
+    load_initial_transcript, turn_output,
 };
+
+#[test]
+fn empty_turn_output_reports_provider_diagnostics() {
+    let mut metadata = MetadataMap::new();
+    metadata.insert(PROVIDER_FINISH_REASONS_METADATA_KEY.into(), json!(["stop"]));
+    metadata.insert(
+        crate::provider::RESPONSE_MODEL_METADATA_KEY.into(),
+        json!("z-ai/glm-5.3"),
+    );
+    metadata.insert(
+        crate::provider::RESPONSE_ID_METADATA_KEY.into(),
+        json!("generation-123"),
+    );
+    let result = TurnResult {
+        turn_id: TurnId::new("turn"),
+        finish_reason: FinishReason::Completed,
+        items: vec![Item::text(ItemKind::Assistant, " \n")],
+        usage: Some(Usage::new(
+            TokenUsage::new(100, 12).with_reasoning_tokens(12),
+        )),
+        metadata,
+    };
+
+    let error = turn_output(&result).unwrap_err().to_string();
+
+    assert!(error.contains("model returned no non-whitespace text"));
+    assert!(error.contains("provider_finish_reasons=[\"stop\"]"));
+    assert!(error.contains("model=\"z-ai/glm-5.3\""));
+    assert!(error.contains("response_id=\"generation-123\""));
+    assert!(error.contains("output_tokens=12"));
+    assert!(error.contains("reasoning_tokens=12"));
+}
+
+#[test]
+fn nonempty_turn_output_is_returned() {
+    let result = TurnResult {
+        turn_id: TurnId::new("turn"),
+        finish_reason: FinishReason::Completed,
+        items: vec![Item::text(ItemKind::Assistant, "release notes")],
+        usage: None,
+        metadata: MetadataMap::new(),
+    };
+
+    assert_eq!(turn_output(&result).unwrap(), "release notes");
+}
 
 #[tokio::test]
 async fn subagent_manager_survives_runtime_reconstruction() {
