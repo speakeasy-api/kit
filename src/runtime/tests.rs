@@ -1080,7 +1080,7 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
             .is_some_and(|description| {
                 description.contains("preferably 3–10 words")
                     && description.contains("omit first-person language")
-                    && description.contains("Checking AgentKit's telemetry for useful metrics.")
+                    && !description.contains("Example:")
             })
     );
     assert!(
