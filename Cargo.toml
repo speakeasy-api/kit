@@ -46,7 +46,7 @@ jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws
 keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
 jsonschema = { version = "=0.52.0", default-features = false, features = ["idna"] }
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }

@@ -1677,8 +1677,9 @@ mod tests {
             legacy_mcp_config: false,
             mcp_config: None,
             credential_storage: CredentialStorage::Filesystem(root.path().join("credentials")),
-            telemetry: crate::telemetry::Settings::try_new(
-                Some("http://collector:4317".into()),
+            telemetry: crate::telemetry::Settings::try_new_with_protocol(
+                Some("http://collector:4318".into()),
+                crate::telemetry::Protocol::HttpJson,
                 false,
                 12,
                 4096,
@@ -1735,7 +1736,11 @@ mod tests {
         }));
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["--otel-endpoint", "http://collector:4317"])
+                .any(|pair| pair == ["--otel-endpoint", "http://collector:4318/v1/traces"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--otel-protocol", "http/json"])
         );
         assert!(
             args.windows(2)

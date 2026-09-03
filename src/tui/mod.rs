@@ -3527,8 +3527,9 @@ a = [still text]
 
     #[test]
     fn forwards_all_resolved_telemetry_settings_to_the_tui_child() {
-        let settings = crate::telemetry::Settings::try_new(
-            Some("http://collector:4317".into()),
+        let settings = crate::telemetry::Settings::try_new_with_protocol(
+            Some("http://collector:4318".into()),
+            crate::telemetry::Protocol::HttpProtobuf,
             false,
             12,
             4096,
@@ -3541,7 +3542,9 @@ a = [still text]
             args,
             [
                 "--otel-endpoint",
-                "http://collector:4317",
+                "http://collector:4318/v1/traces",
+                "--otel-protocol",
+                "http/protobuf",
                 "--otel-capture-message-content",
                 "false",
                 "--otel-message-content-max-messages",
