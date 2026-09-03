@@ -28,8 +28,8 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 use super::{
     app::{
         AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
-        CachedTranscriptRow, Child, CodeHit, FilePickerStatus, Phase, SessionRename, ToolCall,
-        UserMessage,
+        CachedTranscriptRow, Child, CodeHit, ComposeView, FilePickerStatus, Phase, SessionRename,
+        ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -1196,7 +1196,7 @@ fn thought_lines(
 
 fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(tool_header(app, call, active))];
-    let compose = call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
+    let compose = call.is_compose();
     if call.running() {
         if compose && !call.script.is_empty() {
             lines.extend(live_script_lines(app, call));
@@ -1219,7 +1219,11 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
             )));
         }
     }
-    lines.extend(output_lines(call));
+    if compose {
+        lines.extend(completed_compose_lines(call));
+    } else {
+        lines.extend(output_lines(call));
+    }
     lines
 }
 
@@ -1422,6 +1426,80 @@ fn direct_execution_count(call: &ToolCall, index: usize) -> Option<usize> {
     })
 }
 
+fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
+    if !call.expanded {
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for child in &call.children {
+            *counts.entry(child.tool.as_str()).or_default() += 1;
+        }
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        if counts.is_empty() {
+            return output_lines(call);
+        }
+        let summary = counts
+            .into_iter()
+            .take(4)
+            .map(|(name, count)| {
+                if count > 1 {
+                    format!("{name} x {count}")
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        return vec![Line::from(vec![
+            Span::styled("   ▸ ", theme::dim()),
+            Span::styled(summary, theme::dim()),
+            Span::styled("  click or ^o to open", theme::faint()),
+        ])];
+    }
+
+    let (output_style, script_style, hint) = match call.compose_view {
+        ComposeView::Output => (
+            theme::bold(theme::accent_color()),
+            theme::faint(),
+            "  click or ^o for Script",
+        ),
+        ComposeView::Script => (
+            theme::faint(),
+            theme::bold(theme::accent_color()),
+            "  click or ^o to close",
+        ),
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("   ", theme::faint()),
+        Span::styled("Script", script_style),
+        Span::styled("  ", theme::faint()),
+        Span::styled("Output", output_style),
+        Span::styled(hint, theme::faint()),
+    ])];
+    match call.compose_view {
+        ComposeView::Output => lines.extend(expanded_output_lines(call)),
+        ComposeView::Script => {
+            let count = call.script.lines().count();
+            lines.extend(call.script.lines().take(MAX_OUTPUT_ROWS).map(|source| {
+                Line::from(vec![
+                    Span::styled("   │ ", theme::faint()),
+                    Span::styled(source.to_string(), theme::dim()),
+                ])
+            }));
+            if count > MAX_OUTPUT_ROWS {
+                lines.push(Line::from(Span::styled(
+                    format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
+                    theme::faint(),
+                )));
+            }
+        }
+    }
+    lines
+}
+
 /// Raw tool output stays folded: it is machine-shaped, often thousands of
 /// lines, and unreadable inline. The fold row says how much there is and opens
 /// on a click or `^o`.
@@ -1487,7 +1565,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(format!("{glyph} "), style),
         Span::styled(
-            call.title.clone(),
+            call.display_title().to_string(),
             theme::bold(if active {
                 theme::accent_color()
             } else {
@@ -1512,7 +1590,7 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
             format!("  · {running} in flight"),
             Style::default().fg(theme::running_color()),
         ));
-    } else if !call.children.is_empty() {
+    } else if (call.expanded || call.running() || !call.is_compose()) && !call.children.is_empty() {
         spans.push(Span::styled(
             format!("  · {} calls", call.children.len()),
             theme::faint(),
@@ -2899,34 +2977,98 @@ mod tests {
     }
 
     #[test]
-    fn completed_compose_replaces_the_script_with_output() {
+    fn compose_title_uses_trimmed_intent_or_running_tools_fallback() {
         let mut app = sample();
-        app.apply(Update::ToolUpdated {
+        let fallback = render(&mut app, 100, 30);
+        assert!(fallback.contains("Running tools."), "{fallback}");
+        assert!(!fallback.contains("compose"), "{fallback}");
+
+        app.apply(Update::ToolPatched {
             id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            title: None,
+            kind: None,
+            status: None,
             script: None,
-            output: vec!["compose result".into()],
+            output: None,
+            append_output: false,
+            intent: Some(Some("  Check every source file.  ".into())),
             backgrounded: false,
         });
-
-        let frame = render(&mut app, 100, 30);
-
-        assert!(!frame.contains("files = shell"), "{frame}");
-        assert!(frame.contains("compose result"), "{frame}");
-
-        app.apply(Update::AgentMessage {
-            id: "test-agent".into(),
-            text: "Moving on.".into(),
-            append: true,
-        });
-        let continued = render(&mut app, 100, 30);
-        assert!(continued.contains("Moving on."), "{continued}");
-        assert!(continued.contains("1 line of output"), "{continued}");
-        assert!(!continued.contains("compose result"), "{continued}");
+        let intent = render(&mut app, 100, 30);
+        assert!(intent.contains("Check every source file."), "{intent}");
+        assert!(!intent.contains("Running tools."), "{intent}");
     }
 
     #[test]
-    fn explicit_output_choice_survives_later_messages_and_tools() {
+    fn collapsed_compose_groups_sorts_and_caps_child_tool_names() {
+        let mut app = sample();
+        let Block::Tool(call) = app.blocks.last_mut().expect("compose call") else {
+            panic!("last block was not a tool");
+        };
+        for (index, tool) in [
+            "shell", "docs", "shell", "alpha", "edit", "docs", "fork", "shell", "alpha",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            call.attach(format!("extra-{index}"), tool.into(), tool.into());
+        }
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: None,
+            output: vec!["done".into()],
+            backgrounded: false,
+        });
+
+        let frame = render(&mut app, 120, 35);
+        let shell = frame.find("shell x 5").expect("shell summary");
+        let alpha = frame.find("alpha x 2").expect("alpha summary");
+        let docs = frame.find("docs x 2").expect("docs summary");
+        let edit = frame.find("edit").expect("edit summary");
+        assert!(shell < alpha && alpha < docs && docs < edit, "{frame}");
+        assert!(!frame.contains("edit x 1"), "{frame}");
+        assert!(!frame.contains("fork"), "{frame}");
+    }
+
+    #[test]
+    fn completed_compose_stays_collapsed_when_its_title_arrives_late() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.apply(Update::ToolPatched {
+            id: "late-title".into(),
+            title: None,
+            kind: None,
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: Some("return 1".into()),
+            output: Some(vec!["1".into()]),
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+        app.apply(Update::ToolPatched {
+            id: "late-title".into(),
+            title: Some("compose".into()),
+            kind: None,
+            status: None,
+            script: None,
+            output: None,
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+
+        assert!(app.blocks.iter().any(|block| {
+            matches!(block, Block::Tool(call) if call.id == "late-title" && call.is_compose() && !call.expanded)
+        }));
+    }
+
+    #[test]
+    fn completed_compose_defaults_collapsed_and_cycles_output_script_and_closed() {
         let mut app = sample();
         app.apply(Update::ToolUpdated {
             id: "call-1".into(),
@@ -2936,7 +3078,44 @@ mod tests {
             backgrounded: false,
         });
 
+        let collapsed = render(&mut app, 100, 30);
+        assert!(collapsed.contains("shell x 2"), "{collapsed}");
+        assert!(!collapsed.contains("compose result"), "{collapsed}");
+        assert!(!collapsed.contains("files = shell"), "{collapsed}");
+
         app.toggle_last_output();
+        let output = render(&mut app, 100, 30);
+        assert!(output.contains("Output"), "{output}");
+        assert!(output.contains("Script"), "{output}");
+        assert!(output.contains("compose result"), "{output}");
+        assert!(!output.contains("files = shell"), "{output}");
+
+        app.toggle_last_output();
+        let script = render(&mut app, 100, 30);
+        assert!(script.contains("Output"), "{script}");
+        assert!(script.contains("Script"), "{script}");
+        assert!(script.contains("files = shell"), "{script}");
+        assert!(!script.contains("compose result"), "{script}");
+
+        app.toggle_last_output();
+        let collapsed_again = render(&mut app, 100, 30);
+        assert!(collapsed_again.contains("shell x 2"), "{collapsed_again}");
+        assert!(!collapsed_again.contains("Output"), "{collapsed_again}");
+    }
+
+    #[test]
+    fn explicit_compose_view_survives_completion_and_later_messages() {
+        let mut app = sample();
+        app.toggle_last_output();
+        app.toggle_last_output();
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: None,
+            output: vec!["compose result".into()],
+            backgrounded: false,
+        });
+
         app.apply(Update::AgentMessage {
             id: "after-compose".into(),
             text: "Moving on.".into(),
@@ -2947,7 +3126,7 @@ mod tests {
                 |block| matches!(block, Block::Tool(call) if call.id == "call-1" && call.expanded),
             )
         };
-        assert!(!compose_expanded(&app));
+        assert!(compose_expanded(&app));
 
         app.toggle_last_output();
         app.apply(Update::ToolStarted {

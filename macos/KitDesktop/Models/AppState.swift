@@ -161,10 +161,21 @@ enum ComposeBackgroundRequest: Equatable {
 }
 
 struct ComposePresentation: Equatable {
+    let intent: String?
     let script: String
     let input: PresentationJSON?
     let background: ComposeBackgroundRequest?
     var output: PresentationJSON?
+
+    static func childToolSummary(_ toolNames: [String], maximumDistinctTools: Int = 4) -> String {
+        let counts = Dictionary(toolNames.map { ($0, 1) }, uniquingKeysWith: +)
+        return counts.sorted { lhs, rhs in
+            lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value
+        }
+        .prefix(max(0, maximumDistinctTools))
+        .map { name, count in count > 1 ? "\(name) x \(count)" : name }
+        .joined(separator: ", ")
+    }
 }
 
 struct ToolPresentation: Equatable {

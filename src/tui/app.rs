@@ -103,6 +103,7 @@ pub enum Update {
         script: Option<String>,
         output: Option<Vec<String>>,
         append_output: bool,
+        intent: Option<Option<String>>,
         backgrounded: bool,
     },
     /// Agent-advertised slash commands for one session.
@@ -331,6 +332,13 @@ impl Child {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComposeView {
+    #[default]
+    Output,
+    Script,
+}
+
 /// A model-visible tool call and, for compose, the program running inside it.
 pub struct ToolCall {
     pub id: String,
@@ -345,14 +353,33 @@ pub struct ToolCall {
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
+    /// User-facing summary supplied by a compose caller.
+    pub intent: Option<String>,
     pub expanded: bool,
-    /// The user explicitly chose the output's expanded or collapsed state.
+    /// The selected view for an expanded completed compose call.
+    pub compose_view: ComposeView,
+    /// The user explicitly chose the call's expanded state or compose view.
     pub expansion_explicit: bool,
     /// The call detached from its originating turn.
     pub backgrounded: bool,
 }
 
 impl ToolCall {
+    pub fn is_compose(&self) -> bool {
+        self.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+    }
+
+    pub fn display_title(&self) -> &str {
+        if !self.is_compose() {
+            return &self.title;
+        }
+        self.intent
+            .as_deref()
+            .map(str::trim)
+            .filter(|intent| !intent.is_empty())
+            .unwrap_or("Running tools.")
+    }
+
     pub fn running(&self) -> bool {
         matches!(
             self.status,
@@ -363,6 +390,15 @@ impl ToolCall {
     pub fn elapsed(&self) -> u64 {
         let end = self.finished.unwrap_or_else(Instant::now);
         u64::try_from(end.duration_since(self.started).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn finalize_terminal_state(&mut self) {
+        if self.is_compose() && !self.expansion_explicit {
+            self.expanded = false;
+            self.compose_view = ComposeView::Output;
+        }
+        self.finished = Some(Instant::now());
+        self.finish_running_children();
     }
 
     /// Records a nested dispatch against the plan node most likely to own it.
@@ -1020,14 +1056,6 @@ impl App {
         }
     }
 
-    fn call_is_latest_message(&self, id: &str) -> bool {
-        self.call_index(id).is_some_and(|index| {
-            self.blocks[index + 1..]
-                .iter()
-                .all(|block| matches!(block, Block::TurnDuration(_)))
-        })
-    }
-
     fn block_is_dynamic(block: &Block) -> bool {
         match block {
             Block::Thought { millis, .. } => millis.is_none(),
@@ -1260,7 +1288,13 @@ impl App {
                                     .unwrap_or_default(),
                                 children: Vec::new(),
                                 output: Vec::new(),
-                                expanded: call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME,
+                                intent: call
+                                    .input
+                                    .get("intent")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string),
+                                expanded: false,
+                                compose_view: ComposeView::Output,
                                 expansion_explicit: false,
                                 backgrounded: false,
                             })),
@@ -1685,8 +1719,7 @@ impl App {
                 } else {
                     ToolCallStatus::Failed
                 };
-                call.finished = Some(Instant::now());
-                call.finish_running_children();
+                call.finalize_terminal_state();
                 finished.push(index);
             }
         }
@@ -1834,7 +1867,9 @@ impl App {
                     script: script.unwrap_or_default(),
                     children: Vec::new(),
                     output: Vec::new(),
+                    intent: None,
                     expanded,
+                    compose_view: ComposeView::Output,
                     expansion_explicit: false,
                     backgrounded,
                 }));
@@ -1847,7 +1882,6 @@ impl App {
                 output,
                 backgrounded,
             } => {
-                let expand_compose = self.call_is_latest_message(&id);
                 let completed_background = {
                     let Some(call) = self.call_mut(&id) else {
                         return;
@@ -1864,13 +1898,7 @@ impl App {
                     if let Some(status) = status {
                         call.status = status;
                         if !call.running() {
-                            if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
-                                && !call.expansion_explicit
-                            {
-                                call.expanded = expand_compose;
-                            }
-                            call.finished = Some(Instant::now());
-                            call.finish_running_children();
+                            call.finalize_terminal_state();
                         }
                     }
                     was_running && !call.running() && call.backgrounded
@@ -1891,6 +1919,7 @@ impl App {
                 script,
                 output,
                 append_output,
+                intent,
                 backgrounded,
             } => {
                 if self.call_index(&id).is_none() {
@@ -1902,13 +1931,13 @@ impl App {
                         backgrounded,
                     });
                 }
-                let expand_compose = self.call_is_latest_message(&id);
                 let Some(call) = self.call_mut(&id) else {
                     return;
                 };
                 if let Some(title) = title {
                     if title == agentkit_tool_compose::COMPOSE_TOOL_NAME
                         && call.title != agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && call.running()
                         && !call.expansion_explicit
                     {
                         call.expanded = true;
@@ -1917,6 +1946,9 @@ impl App {
                 }
                 if let Some(kind) = kind {
                     call.kind = kind;
+                }
+                if let Some(intent) = intent {
+                    call.intent = intent;
                 }
                 if let Some(script) = script {
                     call.plan = parse_plan(&script);
@@ -1934,13 +1966,7 @@ impl App {
                 if let Some(status) = status {
                     call.status = status;
                     if !call.running() {
-                        if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
-                            && !call.expansion_explicit
-                        {
-                            call.expanded = expand_compose;
-                        }
-                        call.finished = Some(Instant::now());
-                        call.finish_running_children();
+                        call.finalize_terminal_state();
                     }
                 }
                 if let Some(index) = self.call_index(&id) {
@@ -2170,10 +2196,22 @@ impl App {
         self.blocks.len() as u64
     }
 
-    /// Folds a tool call's raw output open or shut.
+    /// Folds a tool call's raw output open or shut. Completed compose calls
+    /// cycle through their output and source views before folding closed.
     pub fn toggle_output(&mut self, id: &str) {
         if let Some(call) = self.call_mut(id) {
-            call.expanded = !call.expanded;
+            if call.is_compose() && !call.running() {
+                match (call.expanded, call.compose_view) {
+                    (false, _) => {
+                        call.expanded = true;
+                        call.compose_view = ComposeView::Output;
+                    }
+                    (true, ComposeView::Output) => call.compose_view = ComposeView::Script,
+                    (true, ComposeView::Script) => call.expanded = false,
+                }
+            } else {
+                call.expanded = !call.expanded;
+            }
             call.expansion_explicit = true;
         }
         if let Some(index) = self.call_index(id) {
@@ -4044,6 +4082,7 @@ mod tests {
             })
             .expect("tool block");
         assert_eq!(call.status, ToolCallStatus::Completed);
+        assert!(!call.expanded);
         assert!(!app.working());
     }
 

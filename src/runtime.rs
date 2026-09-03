@@ -2000,6 +2000,12 @@ impl BackgroundableCompose {
                 )));
             }
         }
+        if object
+            .remove("intent")
+            .is_some_and(|intent| !intent.is_string())
+        {
+            return Err(ToolError::InvalidInput("intent must be a string".into()));
+        }
         Ok(request)
     }
 }
@@ -2158,6 +2164,13 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
         .get_mut("properties")
         .and_then(Value::as_object_mut)
     {
+        properties.insert(
+            "intent".into(),
+            json!({
+                "type": "string",
+                "description": "A brief user-facing status sentence, preferably 3–10 words. Start with an -ing verb; omit first-person language, rationale, and implementation details."
+            }),
+        );
         properties.insert(
             "background".into(),
             json!({
