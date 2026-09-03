@@ -158,6 +158,7 @@ model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://localhost:4317"
+otel_protocol = "grpc" # grpc, http/protobuf, or http/json
 otel_capture_message_content = false
 otel_message_content_max_messages = 64
 otel_message_content_max_bytes = 16384
@@ -199,7 +200,7 @@ subdir = "agent-plugins/example"
 
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 
-`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP export of AgentKit's GenAI trace spans. `otel_protocol` accepts exactly `grpc`, `http/protobuf`, or `http/json`; gRPC is the default. For either HTTP protocol, Kit appends `/v1/traces` to a base endpoint unless it already ends with that path. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -211,8 +212,12 @@ For settings exposed by a command, precedence is:
 
 The OpenTelemetry endpoint follows the same CLI-over-TOML precedence, then falls
 back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. If none
-is set, trace export is disabled. Message capture is disabled by default because
-structured prompts, tool arguments, outputs, file content, and compaction summaries
+is set, trace export is disabled. The trace protocol precedence is
+`--otel-protocol`, `otel_protocol`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc`. Kit passes
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` to the upstream
+exporter. Message capture is disabled by default because structured prompts, tool
+arguments, outputs, file content, and compaction summaries
 can contain secrets. Kit resolves `--otel-capture-message-content BOOL`, the TOML
 `otel_capture_message_content` value, and
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` in that order. The environment
@@ -233,6 +238,7 @@ target, and span busy/idle metadata are omitted. For example:
 ```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 kit prompt "Summarize this project"
 kit prompt --otel-endpoint http://localhost:4317 "Summarize this project"
+kit prompt --otel-protocol http/protobuf --otel-endpoint https://otel.example.com/ingest "Summarize this project"
 kit prompt --otel-capture-message-content true --otel-message-content-max-messages 32 "Summarize this project"
 ```
 

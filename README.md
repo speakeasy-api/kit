@@ -255,7 +255,7 @@ When the provider reports 80% context-window use, Kit converts older history int
 - **Crash-safe.** Kit permits only one live process to modify each session. Kit reclaims a stale lock only when the operating system confirms that no process holds it. Use `--force` only with `--resume <session-id>` to reclaim a stale lock. The TUI also reclaims a stale lock when you switch sessions. Kit replaces an incomplete tool call with an explicit synthetic error result.
 - **OpenAI subscription retries.** Kit retries eligible transient failures with deterministic full-jitter backoff. Eligible failures include 408, 425, 429, 500, 502, 503, 504, and 529 responses. They also include transport failures and stream failures before the first token. The retry deadline is 24 hours. Kit reuses the same idempotency key. `openai-subscription` does not retry authentication failures, quota failures, or failures after output starts.
 - **Daemon operation.** `kit serve --remote-acp --no-stdio` runs independently of stdin. `SIGINT` and `SIGTERM` stop new connections, interrupt live sessions, and allow five seconds for draining. One bearer token file protects the HTTP listener.
-- **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans through OTLP/gRPC. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
+- **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans. OTLP/gRPC remains the default; set `otel_protocol` to `http/protobuf` or `http/json` to use an HTTP trace transport. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
 
 See [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md) for the trust model, operational limits, and recovery guidance.
 
@@ -285,6 +285,7 @@ credential_store = "file"          # memory | keychain | file
 credential_dir = "~/.kit/credentials"
 mcp_config = "~/.kit/mcp.json"
 otel_endpoint = "http://localhost:4317"
+otel_protocol = "grpc"                  # grpc | http/protobuf | http/json
 
 [acp.claude]
 command = "npx"

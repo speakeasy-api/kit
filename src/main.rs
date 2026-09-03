@@ -22,6 +22,8 @@ struct Cli {
 }
 
 const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const OTEL_PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+const OTEL_TRACES_PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
@@ -49,9 +51,12 @@ fn resolve_openrouter_api_key(
 
 #[derive(Args)]
 struct TelemetryArgs {
-    /// OTLP/gRPC collector endpoint for OpenTelemetry trace export.
+    /// OTLP collector endpoint for OpenTelemetry trace export.
     #[arg(long, global = true)]
     otel_endpoint: Option<String>,
+    /// OTLP trace transport: grpc, http/protobuf, or http/json.
+    #[arg(long, global = true)]
+    otel_protocol: Option<kit::telemetry::Protocol>,
     /// Capture structured GenAI input and output messages in exported spans.
     #[arg(long, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
     otel_capture_message_content: Option<bool>,
@@ -227,6 +232,7 @@ struct Config {
     reasoning_effort: Option<kit::ReasoningEffort>,
     a2a: Option<String>,
     otel_endpoint: Option<String>,
+    otel_protocol: Option<kit::telemetry::Protocol>,
     otel_capture_message_content: Option<bool>,
     otel_message_content_max_messages: Option<usize>,
     otel_message_content_max_bytes: Option<usize>,
@@ -365,7 +371,18 @@ impl Config {
         args: &TelemetryArgs,
         endpoint_environment: Option<String>,
         capture_environment: Option<String>,
+        traces_protocol_environment: Option<String>,
+        protocol_environment: Option<String>,
     ) -> io::Result<kit::telemetry::Settings> {
+        let protocol = if let Some(value) = args.otel_protocol.or(self.otel_protocol) {
+            value
+        } else if let Some(value) = traces_protocol_environment {
+            parse_otel_protocol(OTEL_TRACES_PROTOCOL_ENV, &value)?
+        } else if let Some(value) = protocol_environment {
+            parse_otel_protocol(OTEL_PROTOCOL_ENV, &value)?
+        } else {
+            kit::telemetry::Protocol::default()
+        };
         let capture_message_content = if let Some(value) = args.otel_capture_message_content {
             value
         } else if let Some(value) = self.otel_capture_message_content {
@@ -384,8 +401,9 @@ impl Config {
             .otel_message_content_max_bytes
             .or(self.otel_message_content_max_bytes)
             .unwrap_or(kit::telemetry::DEFAULT_MESSAGE_CONTENT_MAX_BYTES);
-        kit::telemetry::Settings::try_new(
+        kit::telemetry::Settings::try_new_with_protocol(
             self.otel_endpoint(args.otel_endpoint.clone(), endpoint_environment),
+            protocol,
             capture_message_content,
             max_messages,
             max_bytes,
@@ -410,6 +428,15 @@ impl Config {
         }
         Ok((harnesses, selected))
     }
+}
+
+fn parse_otel_protocol(name: &str, value: &str) -> io::Result<kit::telemetry::Protocol> {
+    value.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {name}: {error}"),
+        )
+    })
 }
 
 fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
@@ -908,6 +935,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cli.telemetry,
         env::var(OTEL_ENDPOINT_ENV).ok(),
         env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
+        env::var(OTEL_TRACES_PROTOCOL_ENV).ok(),
+        env::var(OTEL_PROTOCOL_ENV).ok(),
     )?;
     let _telemetry = kit::telemetry::init(&telemetry_settings)?;
     if let Command::Auth {
@@ -1209,9 +1238,9 @@ mod tests {
 
     use super::{
         AuthAction, AuthProvider, Cli, Command, Config, CredentialArgs, CredentialStoreKind,
-        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, SessionsAction,
-        format_sessions, init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
-        validate_auth_storage,
+        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, OTEL_TRACES_PROTOCOL_ENV, ReasoningEffortArg,
+        SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
+        supervise_serve_with_trigger, validate_auth_storage,
     };
 
     #[test]
@@ -1255,6 +1284,7 @@ provider = "openrouter"
 reasoning_effort = "medium"
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://configured:4317"
+otel_protocol = "http/protobuf"
 otel_capture_message_content = true
 otel_message_content_max_messages = 20
 otel_message_content_max_bytes = 200
@@ -1305,6 +1335,8 @@ credential_dir = "/configured/credentials"
         let cli = Cli::try_parse_from([
             "kit",
             "prompt",
+            "--otel-protocol",
+            "http/json",
             "--otel-capture-message-content",
             "false",
             "--otel-message-content-max-messages",
@@ -1319,12 +1351,15 @@ credential_dir = "/configured/credentials"
                 &cli.telemetry,
                 Some("http://environment:4317".into()),
                 Some("invalid-but-overridden".into()),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(
             telemetry.endpoint.as_deref(),
-            Some("http://configured:4317")
+            Some("http://configured:4317/v1/traces")
         );
+        assert_eq!(telemetry.protocol, kit::telemetry::Protocol::HttpJson);
         assert!(!telemetry.capture_message_content);
         assert_eq!(telemetry.message_content_max_messages, 5);
         assert_eq!(telemetry.message_content_max_bytes, 100);
@@ -1502,7 +1537,13 @@ credential_store = "keychain"
             Cli::try_parse_from(["kit", "--otel-endpoint", "", "prompt", "hello"]).unwrap();
         assert_eq!(
             configured
-                .telemetry_settings(&disabled_cli.telemetry, environment.clone(), None)
+                .telemetry_settings(
+                    &disabled_cli.telemetry,
+                    environment.clone(),
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap()
                 .endpoint,
             None
@@ -1514,15 +1555,89 @@ credential_store = "keychain"
     }
 
     #[test]
+    fn protocol_precedence_is_cli_then_toml_then_trace_env_then_generic_env() {
+        let default_cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
+        let defaults = Config::default();
+        assert_eq!(
+            defaults
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    None,
+                    Some("http/json".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpJson
+        );
+        assert_eq!(
+            defaults
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    Some("http/protobuf".into()),
+                    Some("http/json".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpProtobuf
+        );
+
+        let configured: Config = toml::from_str("otel_protocol = 'grpc'").unwrap();
+        assert_eq!(
+            configured
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    Some("invalid".into()),
+                    Some("invalid".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::Grpc
+        );
+        let cli = Cli::try_parse_from(["kit", "prompt", "--otel-protocol", "http/json", "hello"])
+            .unwrap();
+        assert_eq!(
+            configured
+                .telemetry_settings(
+                    &cli.telemetry,
+                    None,
+                    None,
+                    Some("invalid".into()),
+                    Some("invalid".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpJson
+        );
+
+        let error = defaults
+            .telemetry_settings(
+                &default_cli.telemetry,
+                None,
+                None,
+                Some("http".into()),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(OTEL_TRACES_PROTOCOL_ENV));
+        assert!(toml::from_str::<Config>("otel_protocol = 'http'").is_err());
+    }
+
+    #[test]
     fn telemetry_environment_is_strict_and_settings_are_bounded() {
         let config = Config::default();
         let cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
         let enabled = config
-            .telemetry_settings(&cli.telemetry, None, Some("TrUe".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("TrUe".into()), None, None)
             .unwrap();
         assert!(enabled.capture_message_content);
         let error = config
-            .telemetry_settings(&cli.telemetry, None, Some("yes".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("yes".into()), None, None)
             .unwrap_err();
         assert!(error.to_string().contains(OTEL_CAPTURE_MESSAGE_CONTENT_ENV));
 
@@ -1536,14 +1651,14 @@ credential_store = "keychain"
         .unwrap();
         assert!(
             config
-                .telemetry_settings(&invalid.telemetry, None, None)
+                .telemetry_settings(&invalid.telemetry, None, None, None, None)
                 .is_err()
         );
 
         let configured_false: Config =
             toml::from_str("otel_capture_message_content = false").unwrap();
         let disabled = configured_false
-            .telemetry_settings(&cli.telemetry, None, Some("true".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("true".into()), None, None)
             .unwrap();
         assert!(!disabled.capture_message_content);
         assert!(
@@ -1761,12 +1876,14 @@ future_option = true
     }
 
     #[test]
-    fn otel_endpoint_is_a_global_command_line_option() {
+    fn otel_trace_settings_are_global_command_line_options() {
         let cli = Cli::try_parse_from([
             "kit",
             "prompt",
             "--otel-endpoint",
             "http://collector:4317",
+            "--otel-protocol",
+            "http/protobuf",
             "--otel-capture-message-content",
             "true",
             "--otel-message-content-max-messages",
@@ -1780,9 +1897,16 @@ future_option = true
             cli.telemetry.otel_endpoint.as_deref(),
             Some("http://collector:4317")
         );
+        assert_eq!(
+            cli.telemetry.otel_protocol,
+            Some(kit::telemetry::Protocol::HttpProtobuf)
+        );
         assert_eq!(cli.telemetry.otel_capture_message_content, Some(true));
         assert_eq!(cli.telemetry.otel_message_content_max_messages, Some(12));
         assert_eq!(cli.telemetry.otel_message_content_max_bytes, Some(4096));
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "--otel-protocol", "http", "hello",]).is_err()
+        );
     }
 
     #[test]
