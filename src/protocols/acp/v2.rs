@@ -565,7 +565,7 @@ impl Server {
 
     fn publish_session(
         &self,
-        admission: u64,
+        admission: &mut super::SessionAdmission,
         publication: PendingSessionPublication,
         commit: impl FnOnce() -> Result<(), AcpRuntimeError>,
     ) -> Result<(), SessionPublicationError> {
@@ -612,18 +612,13 @@ impl Server {
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
         .capabilities(agentkit_acp::v2::agent_capabilities())
-        .auth_methods(
-            if self
-                .runtime
-                .supports_selected_provider_authentication_management()
-            {
-                terminal_auth_methods(&request.capabilities, |provider| {
-                    self.runtime.supports_terminal_authentication(provider)
-                })
-            } else {
-                Vec::new()
-            },
-        ))
+        .auth_methods(if self.runtime.supports_logout_authentication() {
+            terminal_auth_methods(&request.capabilities, |provider| {
+                self.runtime.supports_terminal_authentication(provider)
+            })
+        } else {
+            Vec::new()
+        }))
     }
 
     async fn new_session(
@@ -762,7 +757,7 @@ impl Server {
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
-        let admission = self
+        let mut admission = self
             .registry
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
@@ -866,7 +861,7 @@ impl Server {
         // Registration, durable identity commit, and local publication are one
         // critical section so logout cannot reopen admission around a dead actor.
         let publication = self.publish_session(
-            admission,
+            &mut admission,
             PendingSessionPublication {
                 token,
                 interrupt,
@@ -3486,7 +3481,7 @@ mod tests {
             Box::pin(async move { close_release.notify_one() })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
-        let admission = registry.begin_attachment().unwrap();
+        let mut admission = registry.begin_attachment().unwrap();
         let actor_abort = actor_task.abort_handle();
         let (commands, _received) = mpsc::channel(1);
         let (registered, registered_rx) = std_mpsc::channel();
@@ -3495,7 +3490,7 @@ mod tests {
         let published_session_id = session_id.clone();
         let publisher = tokio::task::spawn_blocking(move || {
             publisher_server.publish_session(
-                admission,
+                &mut admission,
                 PendingSessionPublication {
                     token,
                     interrupt: Arc::new(|| {}),
@@ -3571,20 +3566,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_openrouter_credentials_keep_v2_auth_consistent_with_selected_provider() {
+    async fn unmanaged_openrouter_credentials_disable_v2_authentication() {
         for (explicit_key, ambient_key) in [(true, false), (false, true)] {
-            for (model, provider, expected_methods) in [
-                ("openrouter:test", crate::ProviderKind::OpenRouter, &[][..]),
-                (
-                    "gpt-5.4",
-                    crate::ProviderKind::OpenAiSubscription,
-                    &["openai", "speakeasy"][..],
-                ),
-                (
-                    "test-model",
-                    crate::ProviderKind::Speakeasy,
-                    &["openai", "speakeasy"][..],
-                ),
+            for (model, provider) in [
+                ("openrouter:test", crate::ProviderKind::OpenRouter),
+                ("gpt-5.4", crate::ProviderKind::OpenAiSubscription),
+                ("test-model", crate::ProviderKind::Speakeasy),
             ] {
                 let root = tempfile::tempdir().unwrap();
                 let credentials = tempfile::tempdir().unwrap();
@@ -3609,9 +3596,8 @@ mod tests {
                     .initialize(terminal_auth_initialize_request())
                     .unwrap();
                 let method_ids = terminal_auth_method_ids(&response.auth_methods);
-                assert_eq!(method_ids, expected_methods);
-
-                assert_eq!(server.logout().await.is_ok(), !method_ids.is_empty());
+                assert!(method_ids.is_empty());
+                assert!(server.logout().await.is_err());
             }
         }
     }

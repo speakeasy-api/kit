@@ -41,7 +41,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
@@ -63,6 +63,7 @@ const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
 const AUTH_REQUIRED_KIND: &str = "authentication_required";
+const AUTHENTICATION_RESET_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(crate) struct AuthenticationRequiredData<'a> {
     pub(crate) method_id: &'a str,
@@ -506,6 +507,7 @@ struct RegistryState {
     accepting: bool,
     permanently_closed: bool,
     generation: u64,
+    pending_attachments: usize,
     sessions: HashMap<u64, RegisteredSession>,
     v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
@@ -513,7 +515,39 @@ struct RegistryState {
 struct SessionRegistryInner {
     next_token: AtomicU64,
     lifecycle: tokio::sync::Mutex<()>,
+    attachments_changed: Notify,
     state: Mutex<RegistryState>,
+}
+
+pub(super) struct SessionAdmission {
+    generation: u64,
+    active: bool,
+    registry: Arc<SessionRegistryInner>,
+}
+
+impl SessionAdmission {
+    fn complete(&mut self, state: &mut RegistryState) {
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+        self.registry.attachments_changed.notify_waiters();
+    }
+}
+
+impl Drop for SessionAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        let mut state = registry
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+        drop(state);
+        registry.attachments_changed.notify_waiters();
+    }
 }
 
 /// Coordinates shutdown across stdio and all connection-scoped HTTP ACP components.
@@ -528,10 +562,12 @@ impl SessionRegistry {
             inner: Arc::new(SessionRegistryInner {
                 next_token: AtomicU64::new(1),
                 lifecycle: tokio::sync::Mutex::new(()),
+                attachments_changed: Notify::new(),
                 state: Mutex::new(RegistryState {
                     accepting: true,
                     permanently_closed: false,
                     generation: 0,
+                    pending_attachments: 0,
                     sessions: HashMap::new(),
                     v2_sessions: HashMap::new(),
                 }),
@@ -543,31 +579,44 @@ impl SessionRegistry {
         self.inner.next_token.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn begin_attachment(&self) -> Result<u64, ()> {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        state.accepting.then_some(state.generation).ok_or(())
-    }
-
-    fn register(&self, admission: u64, session: RegisteredSession) -> Result<(), ()> {
+    fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
         let mut state = self
             .inner
             .state
             .lock()
             .expect("ACP session registry poisoned");
-        if !state.accepting || state.generation != admission {
+        if !state.accepting {
+            return Err(());
+        }
+        state.pending_attachments += 1;
+        Ok(SessionAdmission {
+            generation: state.generation,
+            active: true,
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    fn register(
+        &self,
+        admission: &mut SessionAdmission,
+        session: RegisteredSession,
+    ) -> Result<(), ()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned");
+        if !state.accepting || state.generation != admission.generation {
             return Err(());
         }
         state.sessions.insert(session.token, session);
+        admission.complete(&mut state);
         Ok(())
     }
 
     pub(super) fn register_v2(
         &self,
-        admission: u64,
+        admission: &mut SessionAdmission,
         token: u64,
         interrupt: Arc<dyn Fn() + Send + Sync>,
         close: CloseV2Session,
@@ -579,7 +628,7 @@ impl SessionRegistry {
             .state
             .lock()
             .expect("ACP session registry poisoned");
-        if !state.accepting || state.generation != admission {
+        if !state.accepting || state.generation != admission.generation {
             return Err(());
         }
         state.v2_sessions.insert(
@@ -592,6 +641,7 @@ impl SessionRegistry {
                 completed,
             },
         );
+        admission.complete(&mut state);
         Ok(())
     }
 
@@ -623,23 +673,73 @@ impl SessionRegistry {
         )
     }
 
+    async fn wait_for_pending_attachments(&self) {
+        loop {
+            let changed = self.inner.attachments_changed.notified();
+            if self
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .pending_attachments
+                == 0
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub async fn shutdown(&self) {
-        self.close_sessions_with_timeout(Duration::from_secs(5), false)
+        self.close_sessions_with_timeout(Duration::from_secs(5), false, || async {})
             .await;
     }
 
-    pub(super) async fn reset_authentication(&self) -> bool {
-        self.close_sessions_with_timeout(Duration::from_secs(5), true)
+    #[cfg(test)]
+    async fn reset_authentication(&self) -> bool {
+        self.reset_authentication_with(async {}).await.0
+    }
+
+    async fn reset_authentication_with<T>(
+        &self,
+        reset: impl std::future::Future<Output = T>,
+    ) -> (bool, Option<T>) {
+        self.close_sessions_with_timeout(Duration::from_secs(5), true, || reset)
             .await
     }
 
     #[cfg(test)]
     async fn shutdown_with_timeout(&self, limit: Duration) {
-        self.close_sessions_with_timeout(limit, false).await;
+        self.close_sessions_with_timeout(limit, false, || async {})
+            .await;
     }
 
-    async fn close_sessions_with_timeout(&self, limit: Duration, reopen: bool) -> bool {
-        let _lifecycle = self.inner.lifecycle.lock().await;
+    async fn close_sessions_with_timeout<T, F, Fut>(
+        &self,
+        limit: Duration,
+        reopen: bool,
+        after_close: F,
+    ) -> (bool, Option<T>)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _lifecycle = match timeout(limit, self.inner.lifecycle.lock()).await {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                if !reopen {
+                    let mut state = self
+                        .inner
+                        .state
+                        .lock()
+                        .expect("ACP session registry poisoned");
+                    state.accepting = false;
+                    state.permanently_closed = true;
+                    state.generation = state.generation.wrapping_add(1);
+                }
+                return (false, None);
+            }
+        };
         let (sessions, v2_sessions) = self.close_gate_and_snapshot(!reopen);
         for session in &sessions {
             session.background_jobs.cancel_all();
@@ -680,6 +780,7 @@ impl SessionRegistry {
 
         let timed_out = timeout(limit, async {
             while closing.join_next().await.is_some() {}
+            self.wait_for_pending_attachments().await;
         })
         .await
         .is_err();
@@ -707,6 +808,7 @@ impl SessionRegistry {
                         let _ = session.completed.changed().await;
                     }
                 }
+                self.wait_for_pending_attachments().await;
             })
             .await
             .is_ok()
@@ -726,6 +828,11 @@ impl SessionRegistry {
                 .expect("ACP session registry poisoned")
                 .permanently_closed = true;
         }
+        let output = if teardown_complete {
+            Some(after_close().await)
+        } else {
+            None
+        };
         let mut reopened = false;
         if reopen && teardown_complete {
             let mut state = self
@@ -736,7 +843,7 @@ impl SessionRegistry {
             state.accepting = !state.permanently_closed;
             reopened = state.accepting;
         }
-        teardown_complete && (!reopen || reopened)
+        (teardown_complete && (!reopen || reopened), output)
     }
 }
 
@@ -746,29 +853,73 @@ impl Default for SessionRegistry {
     }
 }
 
+enum AuthenticationReset<T> {
+    Completed(bool, Option<T>),
+    TimedOut,
+    Failed(tokio::task::JoinError),
+}
+
+async fn bounded_authentication_reset<T>(
+    registry: SessionRegistry,
+    reset: impl std::future::Future<Output = T> + Send + 'static,
+    limit: Duration,
+) -> AuthenticationReset<T>
+where
+    T: Send + 'static,
+{
+    let task = tokio::spawn(async move { registry.reset_authentication_with(reset).await });
+    match timeout(limit, task).await {
+        Ok(Ok((complete, output))) => AuthenticationReset::Completed(complete, output),
+        Ok(Err(error)) => AuthenticationReset::Failed(error),
+        Err(_) => AuthenticationReset::TimedOut,
+    }
+}
+
 async fn logout_authentication(
     runtime: Arc<Runtime>,
     registry: &SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    let logout = match tokio::task::spawn_blocking(move || runtime.logout_authentication()).await {
-        Ok(Err(error)) if !error.credential_state_may_have_changed() => {
-            return Err(AcpRuntimeError::Loop(error.to_string()));
+    if !runtime.supports_logout_authentication() {
+        return Err(AcpRuntimeError::Loop(
+            "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
+                .into(),
+        ));
+    }
+    let logout = async move {
+        match tokio::task::spawn_blocking(move || runtime.logout_authentication()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("authentication logout task failed: {error}")),
         }
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(error) => Err(format!("authentication logout task failed: {error}")),
     };
-    let reset = registry.reset_authentication().await;
-
-    match (logout, reset) {
-        (Ok(()), true) => Ok(()),
-        (Err(error), true) => Err(AcpRuntimeError::Loop(format!(
-            "{error}; active ACP sessions were reset because credential state may have changed"
-        ))),
-        (Ok(()), false) => Err(AcpRuntimeError::Loop(
+    let (reset, logout) = match bounded_authentication_reset(
+        registry.clone(),
+        logout,
+        AUTHENTICATION_RESET_TIMEOUT,
+    )
+    .await
+    {
+        AuthenticationReset::Completed(reset, logout) => (reset, logout),
+        AuthenticationReset::TimedOut => {
+            return Err(AcpRuntimeError::Loop(
+                "authentication logout timed out; session admission remains paused until credential deletion finishes"
+                    .into(),
+            ));
+        }
+        AuthenticationReset::Failed(error) => {
+            return Err(AcpRuntimeError::Loop(format!(
+                "authentication logout task failed: {error}"
+            )));
+        }
+    };
+    if !reset {
+        return Err(AcpRuntimeError::Loop(
             "authentication logout could not finish session teardown".into(),
-        )),
-        (Err(error), false) => Err(AcpRuntimeError::Loop(format!(
-            "{error}; authentication logout could not finish session teardown"
+        ));
+    }
+    match logout.expect("successful teardown runs the authentication reset action") {
+        Ok(()) => Ok(()),
+        Err(error) => Err(AcpRuntimeError::Loop(format!(
+            "{error}; active ACP sessions were reset because credential state may have changed"
         ))),
     }
 }
@@ -1095,7 +1246,7 @@ impl Server {
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
     ) -> Result<AttachedSession, AcpRuntimeError> {
-        let admission = self
+        let mut admission = self
             .registry
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
@@ -1215,7 +1366,7 @@ impl Server {
         // Hold the request-scoped map lock across registration, commit, and publication.
         // Shutdown either closes the gate before this point or snapshots this actor.
         let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        if self.registry.register(admission, registered).is_err() {
+        if self.registry.register(&mut admission, registered).is_err() {
             drop(sessions);
             drop(activation);
             actor_task.abort();
@@ -2572,7 +2723,7 @@ pub(super) mod tests {
         });
         registry
             .register(
-                registry.begin_attachment().unwrap(),
+                &mut registry.begin_attachment().unwrap(),
                 RegisteredSession {
                     token,
                     session_id: agentkit_acp::SessionId::new("logout-session"),
@@ -2637,7 +2788,7 @@ pub(super) mod tests {
         });
         registry
             .register(
-                registry.begin_attachment().unwrap(),
+                &mut registry.begin_attachment().unwrap(),
                 RegisteredSession {
                     token,
                     session_id,
@@ -2652,11 +2803,22 @@ pub(super) mod tests {
             .unwrap();
         drop(actor);
 
-        let late_admission = registry.begin_attachment().unwrap();
-        registry.shutdown_with_timeout(Duration::from_secs(1)).await;
-        assert!(closed.load(Ordering::SeqCst));
-        assert!(tasks.list_running().await.is_empty());
-        assert!(!background_jobs.activity().active);
+        let mut late_admission = registry.begin_attachment().unwrap();
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_registry
+                .shutdown_with_timeout(Duration::from_secs(1))
+                .await;
+        });
+        while registry
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .accepting
+        {
+            tokio::task::yield_now().await;
+        }
 
         let late_token = registry.next_token();
         let (late_commands, _late_received) = mpsc::channel(1);
@@ -2668,7 +2830,7 @@ pub(super) mod tests {
         assert!(
             registry
                 .register(
-                    late_admission,
+                    &mut late_admission,
                     RegisteredSession {
                         token: late_token,
                         session_id: agentkit_acp::SessionId::new("too-late"),
@@ -2682,6 +2844,11 @@ pub(super) mod tests {
                 )
                 .is_err()
         );
+        drop(late_admission);
+        shutdown.await.unwrap();
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(tasks.list_running().await.is_empty());
+        assert!(!background_jobs.activity().active);
         late_actor.abort();
         late_actor.await.unwrap_err();
     }
@@ -2704,7 +2871,7 @@ pub(super) mod tests {
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
             .register_v2(
-                registry.begin_attachment().unwrap(),
+                &mut registry.begin_attachment().unwrap(),
                 token,
                 Arc::new(|| {}),
                 close,
@@ -2719,7 +2886,16 @@ pub(super) mod tests {
             .lock()
             .expect("ACP session registry poisoned")
             .generation;
-        assert!(registry.reset_authentication().await);
+        let during_reset = registry.clone();
+        let closed_during_reset = Arc::clone(&closed);
+        let (reset, action) = registry
+            .reset_authentication_with(async move {
+                assert!(closed_during_reset.load(Ordering::SeqCst));
+                assert!(during_reset.begin_attachment().is_err());
+            })
+            .await;
+        assert!(reset);
+        assert_eq!(action, Some(()));
 
         assert!(closed.load(Ordering::SeqCst));
         assert_ne!(
@@ -2743,6 +2919,43 @@ pub(super) mod tests {
         actor.await.unwrap_err();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_authentication_reset_stays_closed_until_the_action_finishes() {
+        let registry = SessionRegistry::new();
+        let started = Arc::new(Notify::new());
+        let action_started = Arc::clone(&started);
+        let (release, released) = oneshot::channel();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move {
+            bounded_authentication_reset(
+                resetting,
+                async move {
+                    action_started.notify_one();
+                    let _ = released.await;
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        started.notified().await;
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(matches!(
+            reset.await.unwrap(),
+            AuthenticationReset::TimedOut
+        ));
+        assert!(registry.begin_attachment().is_err());
+
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if registry.begin_attachment().is_ok() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("authentication reset did not reopen admission");
+    }
+
     #[tokio::test]
     async fn failed_authentication_reset_cannot_reopen_on_retry() {
         let registry = SessionRegistry::new();
@@ -2751,7 +2964,7 @@ pub(super) mod tests {
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
             .register_v2(
-                registry.begin_attachment().unwrap(),
+                &mut registry.begin_attachment().unwrap(),
                 token,
                 Arc::new(|| {}),
                 Arc::new(|| Box::pin(std::future::pending())),
@@ -2762,13 +2975,35 @@ pub(super) mod tests {
 
         assert!(
             !registry
-                .close_sessions_with_timeout(Duration::from_millis(10), true)
+                .close_sessions_with_timeout(Duration::from_millis(10), true, || async {})
                 .await
+                .0
         );
         assert!(!registry.reset_authentication().await);
         assert!(registry.begin_attachment().is_err());
         actor.abort();
         let _ = actor.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_bounded_while_an_authentication_reset_holds_the_lifecycle_lock() {
+        let registry = SessionRegistry::new();
+        let lifecycle = registry.inner.lifecycle.lock().await;
+
+        registry
+            .shutdown_with_timeout(Duration::from_secs(30))
+            .await;
+
+        assert!(registry.begin_attachment().is_err());
+        assert!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .permanently_closed
+        );
+        drop(lifecycle);
     }
 
     #[tokio::test]
@@ -2792,7 +3027,7 @@ pub(super) mod tests {
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
             .register(
-                registry.begin_attachment().unwrap(),
+                &mut registry.begin_attachment().unwrap(),
                 RegisteredSession {
                     token,
                     session_id: agentkit_acp::SessionId::new("stuck"),

@@ -176,6 +176,7 @@ const CLOSE_SESSION: Duration = Duration::from_secs(3);
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
 const FAILURE_LINES: usize = 5;
+const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 #[cfg(unix)]
 fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
@@ -229,13 +230,13 @@ fn authentication_required(
 
 fn credential_storage_for_launch(
     credential_storage: &CredentialStorage,
-    current_dir: &Path,
-) -> CredentialStorage {
+    current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<CredentialStorage> {
     match credential_storage {
-        CredentialStorage::Filesystem(directory) if directory.is_relative() => {
-            CredentialStorage::Filesystem(current_dir.join(directory))
-        }
-        credential_storage => credential_storage.clone(),
+        CredentialStorage::Filesystem(directory) if directory.is_relative() => Ok(
+            CredentialStorage::Filesystem(current_dir()?.join(directory)),
+        ),
+        credential_storage => Ok(credential_storage.clone()),
     }
 }
 
@@ -276,6 +277,7 @@ impl AgentInvocation {
             args: command.get_args().map(std::ffi::OsStr::to_owned).collect(),
             env: command
                 .get_envs()
+                .filter(|(name, _)| *name != std::ffi::OsStr::new(OPENROUTER_API_KEY_ENV))
                 .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
                 .collect(),
             current_dir: command.get_current_dir().map(Path::to_path_buf),
@@ -343,6 +345,7 @@ fn terminal_auth_command(
 ) -> tokio::process::Command {
     let mut command = invocation.command();
     command
+        .env_remove(OPENROUTER_API_KEY_ENV)
         .args(&method.args)
         .current_dir(root)
         .stdin(Stdio::inherit())
@@ -408,6 +411,74 @@ async fn wait_for_terminal_auth(
             None
         }
     }
+}
+
+enum RequestInterrupt {
+    AgentExited(Option<std::process::ExitStatus>),
+    Stopped,
+    TimedOut,
+}
+
+enum RequestFailure {
+    AgentExited(Option<std::process::ExitStatus>),
+    TimedOut,
+}
+
+async fn bounded_agent_request<T>(
+    request: impl std::future::Future<Output = T>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    stop: impl std::future::Future<Output = ()>,
+    timeout: Duration,
+) -> Result<T, RequestInterrupt> {
+    tokio::select! {
+        output = request => Ok(output),
+        status = &mut *exit => Err(RequestInterrupt::AgentExited(
+            status.ok().and_then(Result::ok),
+        )),
+        () = stop => Err(RequestInterrupt::Stopped),
+        () = tokio::time::sleep(timeout) => Err(RequestInterrupt::TimedOut),
+    }
+}
+
+async fn bounded_startup_request<T>(
+    request: impl std::future::Future<Output = T>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    timeout: Duration,
+) -> Result<T, RequestFailure> {
+    match bounded_agent_request(request, exit, std::future::pending(), timeout).await {
+        Ok(output) => Ok(output),
+        Err(RequestInterrupt::AgentExited(status)) => Err(RequestFailure::AgentExited(status)),
+        Err(RequestInterrupt::TimedOut) => Err(RequestFailure::TimedOut),
+        Err(RequestInterrupt::Stopped) => unreachable!("the stop future is pending"),
+    }
+}
+
+async fn bounded_cancellable_request<T>(
+    request: impl std::future::Future<Output = T>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    stop: impl std::future::Future<Output = ()>,
+    timeout: Duration,
+) -> Result<Option<T>, RequestFailure> {
+    match bounded_agent_request(request, exit, stop, timeout).await {
+        Ok(output) => Ok(Some(output)),
+        Err(RequestInterrupt::AgentExited(status)) => Err(RequestFailure::AgentExited(status)),
+        Err(RequestInterrupt::Stopped) => Ok(None),
+        Err(RequestInterrupt::TimedOut) => Err(RequestFailure::TimedOut),
+    }
+}
+
+async fn request_failure(
+    failure: RequestFailure,
+    stderr: tokio::task::JoinHandle<()>,
+    recent: &Mutex<Vec<String>>,
+    when: &str,
+    timeout_message: String,
+) -> agent_client_protocol::Error {
+    let detail = match failure {
+        RequestFailure::AgentExited(status) => died(status, stderr, recent, when).await,
+        RequestFailure::TimedOut => timeout_message,
+    };
+    agent_client_protocol::Error::into_internal_error(std::io::Error::other(detail))
 }
 
 async fn request_initial_session(
@@ -646,7 +717,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         .canonicalize()
         .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
     let credential_storage =
-        credential_storage_for_launch(credential_storage, &std::env::current_dir()?);
+        credential_storage_for_launch(credential_storage, std::env::current_dir)?;
     let credential_storage = &credential_storage;
     let resume_session_id = resume.map(str::to_string);
     let persisted_session_id = resume_session_id
@@ -794,28 +865,23 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     .capabilities(client_capabilities(credential_storage)),
                 )
                 .block_task();
-            let initialized = tokio::select! {
-                initialized = initialize => initialized?,
-                status = &mut exit_rx => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(died(
-                            status.ok().and_then(Result::ok),
+            let initialized =
+                match bounded_startup_request(initialize, &mut exit_rx, HANDSHAKE).await {
+                    Ok(initialized) => initialized?,
+                    Err(failure) => {
+                        return Err(request_failure(
+                            failure,
                             stderr_task,
                             &recent,
                             "before the session opened",
+                            format!(
+                                "the agent did not answer the ACP handshake within {} seconds",
+                                HANDSHAKE.as_secs()
+                            ),
                         )
-                        .await),
-                    ));
-                }
-                () = tokio::time::sleep(HANDSHAKE) => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(format!(
-                            "the agent did not answer the ACP handshake within {} seconds",
-                            HANDSHAKE.as_secs()
-                        )),
-                    ));
-                }
-            };
+                        .await);
+                    }
+                };
             if initialized.protocol_version != ProtocolVersion::V2 {
                 return Err(agent_client_protocol::Error::into_internal_error(
                     std::io::Error::other("the agent did not negotiate ACP v2"),
@@ -831,29 +897,30 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         })
                 });
 
-            let initial = tokio::select! {
-                session = request_initial_session(
+            let initial = match bounded_startup_request(
+                request_initial_session(
                     &connection,
                     resume_session_id.as_deref(),
                     &root,
-                ) => session,
-                status = &mut exit_rx => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(died(
-                            status.ok().and_then(Result::ok),
-                            stderr_task,
-                            &recent,
-                            "before the session opened",
-                        ).await),
-                    ));
-                }
-                () = tokio::time::sleep(HANDSHAKE) => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(format!(
+                ),
+                &mut exit_rx,
+                HANDSHAKE,
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(failure) => {
+                    return Err(request_failure(
+                        failure,
+                        stderr_task,
+                        &recent,
+                        "before the session opened",
+                        format!(
                             "the agent did not start a session within {} seconds",
                             HANDSHAKE.as_secs()
-                        )),
-                    ));
+                        ),
+                    )
+                    .await);
                 }
             };
             let initial = match initial {
@@ -951,13 +1018,36 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     };
                                     match outcome {
                                         Ok(status) if status.success() => {
-                                            match request_initial_session(
-                                                &connection,
-                                                resume_session_id.as_deref(),
-                                                &root,
+                                            let requested = bounded_cancellable_request(
+                                                request_initial_session(
+                                                    &connection,
+                                                    resume_session_id.as_deref(),
+                                                    &root,
+                                                ),
+                                                &mut exit_rx,
+                                                stop.requested(),
+                                                HANDSHAKE,
                                             )
-                                            .await
-                                            {
+                                            .await;
+                                            let Some(initial) = (match requested {
+                                                Ok(initial) => initial,
+                                                Err(failure) => {
+                                                    return Err(request_failure(
+                                                        failure,
+                                                        stderr_task,
+                                                        &recent,
+                                                        "before the session opened",
+                                                        format!(
+                                                            "the agent did not start a session within {} seconds",
+                                                            HANDSHAKE.as_secs()
+                                                        ),
+                                                    )
+                                                    .await);
+                                                }
+                                            }) else {
+                                                return Ok(());
+                                            };
+                                            match initial {
                                                 Ok(session) => {
                                                     images = resume_terminal(&mut terminal).map_err(
                                                         agent_client_protocol::Error::into_internal_error,
@@ -1378,12 +1468,36 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     };
                                     match outcome {
                                         Ok(status) if status.success() => {
-                                            let options = refresh_session_after_auth(
-                                                &connection,
-                                                session_id.clone(),
-                                                &active_config,
+                                            let refreshed = bounded_cancellable_request(
+                                                refresh_session_after_auth(
+                                                    &connection,
+                                                    session_id.clone(),
+                                                    &active_config,
+                                                ),
+                                                &mut exit_rx,
+                                                stop.requested(),
+                                                HANDSHAKE,
                                             )
-                                            .await?;
+                                            .await;
+                                            let Some(options) = (match refreshed {
+                                                Ok(options) => options,
+                                                Err(failure) => {
+                                                    return Err(request_failure(
+                                                        failure,
+                                                        stderr_task,
+                                                        &recent,
+                                                        "during authentication refresh",
+                                                        format!(
+                                                            "the agent did not refresh the session within {} seconds",
+                                                            HANDSHAKE.as_secs()
+                                                        ),
+                                                    )
+                                                    .await);
+                                                }
+                                            }) else {
+                                                return Ok(());
+                                            };
+                                            let options = options?;
                                             refresh_config_state(&mut app, Some(&options));
                                             app.note(format!(
                                                 "authentication with {} succeeded",
@@ -2312,15 +2426,16 @@ mod tests {
 
     use super::{
         ActiveSessionRoute, AgentInvocation, ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST,
-        ModelChoice, ProtocolVersion, QueuedUpdate, accept_queued_update, active_config_matches,
-        active_session_config, agent_command_for_launch, apply_pending_updates,
-        attachments_from_paste, authentication_required, client_capabilities, command,
-        credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
-        durable_session_id, effort_state, error_detail, handle, message_of, osc52,
-        previous_session_for_resume, prompt_blocks, readable, refresh_config_state,
-        refresh_session_after_auth, save_effort_default_to, save_model_defaults_to,
-        terminal_auth_command, transition_route, translate, translate_for_session,
-        usable_terminal_auth_methods, user_message_of, wait_for_connected_authentication, wire,
+        ModelChoice, OPENROUTER_API_KEY_ENV, ProtocolVersion, QueuedUpdate, accept_queued_update,
+        active_config_matches, active_session_config, agent_command_for_launch,
+        apply_pending_updates, attachments_from_paste, authentication_required,
+        client_capabilities, command, credential_storage_for_launch, current_model_choice,
+        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
+        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
+        refresh_config_state, refresh_session_after_auth, save_effort_default_to,
+        save_model_defaults_to, terminal_auth_command, transition_route, translate,
+        translate_for_session, usable_terminal_auth_methods, user_message_of,
+        wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -2387,9 +2502,17 @@ mod tests {
         assert!(matches!(
             credential_storage_for_launch(
                 &CredentialStorage::Filesystem(PathBuf::from("credentials")),
-                std::path::Path::new("/caller"),
-            ),
+                || Ok(PathBuf::from("/caller")),
+            )
+            .unwrap(),
             CredentialStorage::Filesystem(path) if path == std::path::Path::new("/caller/credentials")
+        ));
+        assert!(matches!(
+            credential_storage_for_launch(&CredentialStorage::Keychain, || {
+                panic!("absolute storage must not query the current directory")
+            })
+            .unwrap(),
+            CredentialStorage::Keychain
         ));
     }
 
@@ -2506,7 +2629,14 @@ mod tests {
         base.current_dir(base_root.path());
         CredentialStorage::Filesystem(credentials.clone()).append_cli_args(&mut base);
         base.env("KIT_BASE_TEST", "base");
+        base.env(OPENROUTER_API_KEY_ENV, "secret");
         let invocation = AgentInvocation::from_command(base.as_std());
+        assert!(
+            invocation
+                .env
+                .iter()
+                .all(|(name, _)| name != OPENROUTER_API_KEY_ENV)
+        );
         let method = AuthMethodTerminal::new("openai", "ChatGPT")
             .args(vec!["--terminal-auth-login".into(), "openai".into()])
             .env(vec![EnvVariable::new("KIT_AUTH_TEST", "set")]);
@@ -2536,6 +2666,12 @@ mod tests {
         assert!(command.as_std().get_envs().any(|(name, value)| {
             name == "KIT_AUTH_TEST" && value == Some(std::ffi::OsStr::new("set"))
         }));
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, value)| { name == OPENROUTER_API_KEY_ENV && value.is_none() })
+        );
 
         let replacement = invocation.command();
         assert_eq!(
@@ -3451,7 +3587,55 @@ a = [still text]
 mod signal_tests {
     use std::{future, time::Duration};
 
-    use super::{Stop, bounded_graceful_close};
+    use super::{RequestInterrupt, Stop, bounded_agent_request, bounded_graceful_close};
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_session_request_is_bounded() {
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::pending(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn agent_exit_cancels_a_session_request() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::pending(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::AgentExited(None))));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_session_request() {
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::ready(()),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::Stopped)));
+    }
 
     #[tokio::test]
     async fn a_stuck_close_is_bounded() {
