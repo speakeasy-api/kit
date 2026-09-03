@@ -31,7 +31,7 @@ default `GITHUB_TOKEN` cannot bypass the pull-request and status-check rules.
 The newly built Linux Kit CLI reviews every change since the previous release and
 writes the GitHub release notes before the workflow attaches the archives and
 checksums. Configure the repository Actions secret `OPENROUTER_API_KEY` for this
-step. Kit uses the `release-notes` skill with the `z-ai/glm-5.3` OpenRouter model.
+step. Kit uses the `release-notes` skill with the `anthropic/claude-sonnet-5` OpenRouter model.
 
 ## macOS signing and notarization
 
