@@ -1109,27 +1109,34 @@ final class ConversationController: ObservableObject {
         if let content = update.content { dictionary["content"] = content.anyValue }
         if let rawInput = update.rawInput { dictionary["rawInput"] = rawInput.anyValue }
         if let rawOutput = update.rawOutput { dictionary["rawOutput"] = rawOutput.anyValue }
+        if let name = update.name { dictionary["name"] = name }
         return dictionary
     }
 
     static func toolPresentation(_ update: [String: Any]) -> ToolPresentation {
         let rawInput = update["rawInput"] as? [String: Any]
         let detail = toolDetail(update)
-        let allowedComposeKeys: Set<String> = ["script", "input", "background"]
-        let isComposeInput = rawInput.map { Set($0.keys).isSubset(of: allowedComposeKeys) } == true
+        let allowedComposeKeys: Set<String> = ["intent", "script", "input", "background"]
+        let toolName = update["name"] as? String
+        let hasComposeShape = rawInput.map { Set($0.keys).isSubset(of: allowedComposeKeys) } == true
+        let isComposeInput = toolName == "compose" || (toolName == nil && hasComposeShape)
         let compose = isComposeInput ? rawInput?["script"].flatMap { $0 as? String }.map { script in
             let background: ComposeBackgroundRequest? = switch rawInput?["background"] {
             case let value as Bool: .immediate(value)
             case let value as NSNumber: .delay(seconds: value.intValue)
             default: nil
             }
+            let intent = (rawInput?["intent"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let contentOutput: PresentationJSON? = update["content"] == nil || detail.isEmpty ? nil : .string(detail)
+            let output = contentOutput ?? update["rawOutput"].flatMap(PresentationJSON.init)
             return ComposePresentation(
-                script: script, input: rawInput?["input"].flatMap(PresentationJSON.init),
-                background: background, output: update["rawOutput"].flatMap(PresentationJSON.init)
+                intent: intent?.isEmpty == false ? intent : nil, script: script,
+                input: rawInput?["input"].flatMap(PresentationJSON.init),
+                background: background, output: output
             )
         } : nil
         return ToolPresentation(
-            title: update["title"] as? String ?? "Tool",
+            title: compose.map { $0.intent ?? "Running tools." } ?? (update["title"] as? String ?? "Tool"),
             status: (update["status"] as? String).map(ToolPresentationStatus.init) ?? .inProgress,
             detail: detail, compose: compose
         )

@@ -2126,6 +2126,11 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 MaybeUndefined::Null => Some(String::new()),
                 MaybeUndefined::Undefined => None,
             };
+            let intent = match &update.raw_input {
+                MaybeUndefined::Value(input) => Some(intent_of(input)),
+                MaybeUndefined::Null => Some(None),
+                MaybeUndefined::Undefined => None,
+            };
             let backgrounded = update
                 .raw_input
                 .value()
@@ -2157,6 +2162,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 script,
                 output,
                 append_output: false,
+                intent,
                 backgrounded,
             }]
         }
@@ -2173,6 +2179,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 script: None,
                 output: Some(output),
                 append_output: true,
+                intent: None,
                 backgrounded,
             }]
         }
@@ -2345,6 +2352,15 @@ fn script_of(input: &Value) -> Option<String> {
     input
         .get("script")
         .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn intent_of(input: &Value) -> Option<String> {
+    input
+        .get("intent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|intent| !intent.is_empty())
         .map(str::to_string)
 }
 
@@ -2907,6 +2923,27 @@ mod tests {
             translate_for_session(thought, "session").as_slice(),
             [Update::AgentThought { id, text, append: false }]
                 if id == "thought" && text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn translates_trimmed_compose_intent() {
+        let update = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool-1")
+                    .title("compose")
+                    .raw_input(json!({
+                        "script": "return 1",
+                        "intent": "  Check the project.  "
+                    })),
+            ),
+        );
+
+        assert!(matches!(
+            translate_for_session(update, "session").as_slice(),
+            [Update::ToolPatched { intent: Some(Some(intent)), script: Some(script), .. }]
+                if intent == "Check the project." && script == "return 1"
         ));
     }
 

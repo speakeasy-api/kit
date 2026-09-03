@@ -1071,6 +1071,20 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name.0, "compose");
     assert_eq!(
+        specs[0].input_schema["properties"]["intent"]["type"],
+        "string"
+    );
+    assert!(
+        specs[0].input_schema["properties"]["intent"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("short user-facing sentence"))
+    );
+    assert!(
+        specs[0].input_schema["required"]
+            .as_array()
+            .is_none_or(|required| !required.contains(&json!("intent")))
+    );
+    assert_eq!(
         specs[0].input_schema["properties"]["background"]["oneOf"],
         json!([
             {"type": "boolean"},
@@ -1470,6 +1484,23 @@ async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispa
             invoke(&runtime, value).await,
             ToolExecutionOutcome::Failed(_)
         ));
+    }
+
+    let with_intent = |intent| {
+        ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("compose"),
+            json!({"script": "return 7", "intent": intent}),
+            SessionId::new("session"),
+            TurnId::new("turn"),
+        )
+    };
+    let sanitized =
+        BackgroundableCompose::sanitized(with_intent(json!("Check the runtime behavior.")))
+            .unwrap();
+    assert!(sanitized.input.get("intent").is_none());
+    for invalid in [json!(7), json!(true), json!(null), json!({})] {
+        assert!(BackgroundableCompose::sanitized(with_intent(invalid)).is_err());
     }
 }
 
