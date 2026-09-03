@@ -563,14 +563,18 @@ impl Runtime {
         self.ambient_openrouter_api_key = present;
     }
 
-    pub(crate) fn supports_terminal_authentication(&self) -> bool {
+    pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
         self.credential_storage.is_persistent()
-            && self.openrouter_api_key.is_none()
-            && !self.ambient_openrouter_api_key
+            && (provider != ProviderKind::OpenRouter
+                || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
+    }
+
+    pub(crate) fn supports_logout_authentication(&self) -> bool {
+        self.supports_terminal_authentication(ProviderKind::OpenRouter)
     }
 
     pub(crate) fn logout_authentication(&self) -> Result<(), LogoutAuthenticationError> {
-        if !self.supports_terminal_authentication() {
+        if !self.supports_logout_authentication() {
             return Err(LogoutAuthenticationError::CredentialStateUnchanged(
                 "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
                     .into(),

@@ -226,27 +226,32 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
 }
 
 #[test]
-fn openrouter_keys_disable_agent_wide_terminal_authentication() {
-    let root = tempfile::tempdir().unwrap();
-    let credentials = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
-        root.path(),
-        "gpt-5.4",
-        crate::ProviderKind::OpenAiSubscription,
-        crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
-        None,
-        Some(crate::provider::OpenRouterApiKey::new("unrelated")),
-    )
-    .unwrap();
-    Arc::get_mut(&mut runtime)
-        .unwrap()
-        .set_ambient_openrouter_api_key_for_test(true);
+fn openrouter_keys_only_disable_openrouter_terminal_authentication() {
+    for (explicit_key, ambient_key) in [(true, false), (false, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            explicit_key.then(|| crate::provider::OpenRouterApiKey::new("unrelated")),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(ambient_key);
 
-    assert!(!runtime.supports_terminal_authentication());
-    assert!(matches!(
-        runtime.logout_authentication(),
-        Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
-    ));
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription));
+        assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
+        assert!(!runtime.supports_logout_authentication());
+        assert!(matches!(
+            runtime.logout_authentication(),
+            Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
+        ));
+    }
 }
 
 #[test]

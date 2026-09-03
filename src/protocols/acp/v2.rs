@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    provider::{SelectableAdapter, authentication_method_id, model_catalog},
+    provider::{ProviderKind, SelectableAdapter, authentication_method_id, model_catalog},
     runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
@@ -75,19 +75,20 @@ fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
 
 fn terminal_auth_methods(
     capabilities: &wire::ClientCapabilities,
-    persistent_credentials: bool,
+    provider_available: impl Fn(ProviderKind) -> bool,
 ) -> Vec<wire::AuthMethod> {
     let supports_terminal_auth = capabilities
         .auth
         .as_ref()
         .and_then(|auth| auth.terminal.as_ref())
         .is_some();
-    if !supports_terminal_auth || !persistent_credentials {
+    if !supports_terminal_auth {
         return Vec::new();
     }
 
     terminal_auth_method_specs()
         .iter()
+        .filter(|method| provider_available(method.provider))
         .map(|method| {
             wire::AuthMethod::Terminal(
                 wire::AuthMethodTerminal::new(method.method_id, method.name)
@@ -611,10 +612,9 @@ impl Server {
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
         .capabilities(agentkit_acp::v2::agent_capabilities())
-        .auth_methods(terminal_auth_methods(
-            &request.capabilities,
-            self.runtime.supports_terminal_authentication(),
-        )))
+        .auth_methods(terminal_auth_methods(&request.capabilities, |provider| {
+            self.runtime.supports_terminal_authentication(provider)
+        })))
     }
 
     async fn new_session(
@@ -3540,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_openrouter_credentials_disable_agent_wide_authentication_and_logout() {
+    fn explicit_openrouter_credentials_keep_unrelated_authentication_methods() {
         for (model, provider) in [
             ("openrouter:test", crate::ProviderKind::OpenRouter),
             ("gpt-5.4", crate::ProviderKind::OpenAiSubscription),
@@ -3557,8 +3557,38 @@ mod tests {
             )
             .unwrap();
 
-            assert!(!runtime.supports_terminal_authentication());
+            assert!(
+                runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription)
+            );
+            assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
+            assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
+            assert!(!runtime.supports_logout_authentication());
             assert!(runtime.logout_authentication().is_err());
+
+            let server = Server::new(runtime, SessionRegistry::new());
+            let response = server
+                .initialize(
+                    wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("test-client", "0"),
+                    )
+                    .capabilities(
+                        wire::ClientCapabilities::new().auth(
+                            wire::AuthCapabilities::new()
+                                .terminal(wire::TerminalAuthCapabilities::new()),
+                        ),
+                    ),
+                )
+                .unwrap();
+            let method_ids = response
+                .auth_methods
+                .iter()
+                .map(|method| match method {
+                    wire::AuthMethod::Terminal(method) => method.method_id.0.as_ref(),
+                    _ => unreachable!("only terminal methods are advertised"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(method_ids, ["openai", "speakeasy"]);
         }
     }
 
@@ -3618,12 +3648,24 @@ mod tests {
         assert!(unsupported.auth_methods.is_empty());
         let terminal_capabilities = wire::ClientCapabilities::new()
             .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()));
-        assert!(terminal_auth_methods(&terminal_capabilities, false).is_empty());
+        assert!(terminal_auth_methods(&terminal_capabilities, |_| false).is_empty());
+        let methods = terminal_auth_methods(&terminal_capabilities, |provider| {
+            provider != ProviderKind::OpenRouter
+        });
+        let method_ids = methods
+            .iter()
+            .map(|method| match method {
+                wire::AuthMethod::Terminal(method) => method.method_id.0.as_ref(),
+                _ => unreachable!("only terminal methods are advertised"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(method_ids, ["openai", "speakeasy"]);
+
         let metadata_only = wire::ClientCapabilities::new().meta(serde_json::Map::from_iter([(
             "terminal-auth".into(),
             serde_json::Value::Bool(true),
         )]));
-        assert!(terminal_auth_methods(&metadata_only, true).is_empty());
+        assert!(terminal_auth_methods(&metadata_only, |_| true).is_empty());
         let mut newer = wire::InitializeRequest::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("newer-client", "0"),

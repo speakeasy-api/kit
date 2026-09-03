@@ -305,16 +305,13 @@ fn terminal_auth_command(
     command
 }
 
-async fn authenticate_in_terminal(
-    terminal: &mut DefaultTerminal,
+fn authenticate_in_terminal<'a>(
     invocation: &AgentInvocation,
     root: &Path,
     method: &wire::AuthMethodTerminal,
-    stop: &mut Stop,
-) -> Option<std::io::Result<std::process::ExitStatus>> {
-    leave(terminal);
-    println!("Starting {}…", method.name);
-    wait_for_terminal_auth(terminal_auth_command(invocation, root, method), stop).await
+    stop: &'a mut Stop,
+) -> impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>> + 'a {
+    wait_for_terminal_auth(terminal_auth_command(invocation, root, method), stop)
 }
 
 enum ConnectedAuthentication {
@@ -325,11 +322,13 @@ enum ConnectedAuthentication {
 
 async fn wait_for_connected_authentication(
     authentication: impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>>,
+    prepare: impl FnOnce(),
     app: &mut App,
     route: &Arc<Mutex<ActiveSessionRoute>>,
     updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
 ) -> ConnectedAuthentication {
+    prepare();
     tokio::pin!(authentication);
     loop {
         tokio::select! {
@@ -826,7 +825,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 Action::Login(method) => {
                                     drop(events);
                                     let authentication = authenticate_in_terminal(
-                                        &mut terminal,
                                         &auth_invocation,
                                         &root,
                                         &method,
@@ -834,6 +832,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     );
                                     let authenticated = wait_for_connected_authentication(
                                         authentication,
+                                        || {
+                                            leave(&mut terminal);
+                                            println!("Starting {}…", method.name);
+                                        },
                                         &mut app,
                                         &transition_session,
                                         &mut updates_rx,
@@ -1245,7 +1247,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 Action::Login(method) => {
                                     drop(events);
                                     let authentication = authenticate_in_terminal(
-                                        &mut terminal,
                                         &auth_invocation,
                                         &root,
                                         &method,
@@ -1253,6 +1254,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     );
                                     let authenticated = wait_for_connected_authentication(
                                         authentication,
+                                        || {
+                                            leave(&mut terminal);
+                                            println!("Starting {}…", method.name);
+                                        },
                                         &mut app,
                                         &transition_session,
                                         &mut updates_rx,
@@ -2499,7 +2504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connected_authentication_observes_agent_exit() {
+    async fn connected_terminal_authentication_prepares_before_observing_agent_exit() {
         let root = tempfile::tempdir().unwrap();
         let mut app = App::new(
             root.path().into(),
@@ -2518,9 +2523,11 @@ mod tests {
             .unwrap();
         let authentication =
             std::future::pending::<Option<std::io::Result<std::process::ExitStatus>>>();
+        let prepared = std::cell::Cell::new(false);
 
         let result = wait_for_connected_authentication(
             authentication,
+            || prepared.set(true),
             &mut app,
             &route,
             &mut updates_rx,
@@ -2528,6 +2535,7 @@ mod tests {
         )
         .await;
 
+        assert!(prepared.get());
         assert!(matches!(
             result,
             ConnectedAuthentication::AgentExited(Ok(Err(_)))

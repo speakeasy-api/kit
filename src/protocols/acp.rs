@@ -51,8 +51,8 @@ pub mod v2;
 
 use crate::{
     provider::{
-        ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, authentication_method_id,
-        model_catalog,
+        ModelGroup, ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter,
+        authentication_method_id, model_catalog,
     },
     runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
@@ -95,6 +95,7 @@ pub(crate) struct TerminalAuthMethodSpec {
     pub(crate) method_id: &'static str,
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
+    pub(crate) provider: ProviderKind,
 }
 
 const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
@@ -102,16 +103,19 @@ const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
         method_id: "openai",
         name: "Sign in with ChatGPT",
         description: "Authenticate Kit with a ChatGPT subscription",
+        provider: ProviderKind::OpenAiSubscription,
     },
     TerminalAuthMethodSpec {
         method_id: "openrouter",
         name: "Sign in with OpenRouter",
         description: "Authenticate Kit with OpenRouter",
+        provider: ProviderKind::OpenRouter,
     },
     TerminalAuthMethodSpec {
         method_id: "speakeasy",
         name: "Sign in with Speakeasy",
         description: "Authenticate Kit with Speakeasy",
+        provider: ProviderKind::Speakeasy,
     },
 ];
 
@@ -121,7 +125,7 @@ pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] 
 
 fn terminal_auth_methods(
     capabilities: &agentkit_acp::ClientCapabilities,
-    persistent_credentials: bool,
+    provider_available: impl Fn(ProviderKind) -> bool,
 ) -> Vec<AuthMethod> {
     let supports_terminal_auth = capabilities.auth.terminal
         || capabilities
@@ -130,12 +134,13 @@ fn terminal_auth_methods(
             .and_then(|meta| meta.get("terminal-auth"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-    if !supports_terminal_auth || !persistent_credentials {
+    if !supports_terminal_auth {
         return Vec::new();
     }
 
     terminal_auth_method_specs()
         .iter()
+        .filter(|method| provider_available(method.provider))
         .map(|method| {
             AuthMethod::Terminal(
                 AuthMethodTerminal::new(method.method_id, method.name)
@@ -931,12 +936,12 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
-        let terminal_authentication = self.runtime.supports_terminal_authentication();
+        let logout_authentication = self.runtime.supports_logout_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-            .agent_capabilities(capabilities(terminal_authentication))
+            .agent_capabilities(capabilities(logout_authentication))
             .auth_methods(terminal_auth_methods(
                 &request.client_capabilities,
-                terminal_authentication,
+                |provider| self.runtime.supports_terminal_authentication(provider),
             ))
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
@@ -2296,7 +2301,7 @@ fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
         .ok_or(ListSessionsError::InvalidCursor)
 }
 
-fn capabilities(terminal_authentication: bool) -> agentkit_acp::AgentCapabilities {
+fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities {
     let capabilities = agentkit_acp::AgentCapabilities::new()
         .load_session(true)
         .prompt_capabilities(
@@ -2312,7 +2317,7 @@ fn capabilities(terminal_authentication: bool) -> agentkit_acp::AgentCapabilitie
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
         );
-    if terminal_authentication {
+    if logout_authentication {
         capabilities.auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
     } else {
         capabilities
@@ -2389,12 +2394,14 @@ pub(super) mod tests {
 
     #[test]
     fn terminal_auth_methods_require_client_support() {
-        assert!(terminal_auth_methods(&agentkit_acp::ClientCapabilities::new(), true).is_empty());
+        assert!(
+            terminal_auth_methods(&agentkit_acp::ClientCapabilities::new(), |_| true).is_empty()
+        );
 
         let capabilities = agentkit_acp::ClientCapabilities::new()
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
-        assert!(terminal_auth_methods(&capabilities, false).is_empty());
-        let methods = terminal_auth_methods(&capabilities, true);
+        assert!(terminal_auth_methods(&capabilities, |_| false).is_empty());
+        let methods = terminal_auth_methods(&capabilities, |_| true);
         assert_eq!(methods.len(), 3);
         assert!(matches!(
             &methods[0],
@@ -2414,19 +2421,30 @@ pub(super) mod tests {
                 if method.id.0.as_ref() == "speakeasy"
                     && method.args == ["--terminal-auth-login", "speakeasy"]
         ));
+
+        let methods = terminal_auth_methods(&capabilities, |provider| {
+            provider != ProviderKind::OpenRouter
+        });
+        let method_ids = methods
+            .iter()
+            .map(|method| match method {
+                AuthMethod::Terminal(method) => method.id.0.as_ref(),
+                _ => unreachable!("only terminal methods are advertised"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(method_ids, ["openai", "speakeasy"]);
     }
 
     #[test]
-    fn v1_logout_capability_tracks_terminal_authentication_methods() {
+    fn v1_logout_capability_is_independent_from_terminal_authentication_methods() {
         let client = agentkit_acp::ClientCapabilities::new()
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
 
-        for enabled in [false, true] {
-            assert_eq!(
-                capabilities(enabled).auth.logout.is_some(),
-                !terminal_auth_methods(&client, enabled).is_empty()
-            );
-        }
+        assert!(capabilities(false).auth.logout.is_none());
+        assert!(
+            !terminal_auth_methods(&client, |provider| { provider != ProviderKind::OpenRouter })
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2577,7 +2595,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities, true).len(), 3);
+        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 3);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);
