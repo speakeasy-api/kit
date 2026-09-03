@@ -1122,7 +1122,12 @@ private struct ComposePresentationView: View {
     private enum Tab: Hashable { case script, output }
 
     let compose: ComposePresentation
-    @State private var selectedTab: Tab = .output
+    @State private var selectedTab: Tab
+
+    init(compose: ComposePresentation) {
+        self.compose = compose
+        _selectedTab = State(initialValue: compose.output == nil ? .script : .output)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
