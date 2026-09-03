@@ -244,19 +244,34 @@ fn build_exporter(
     }
 }
 
+fn build_provider(
+    exporter: opentelemetry_otlp::SpanExporter,
+    protocol: Protocol,
+) -> opentelemetry_sdk::trace::SdkTracerProvider {
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .build();
+    let builder = opentelemetry_sdk::trace::SdkTracerProvider::builder().with_resource(resource);
+    match protocol {
+        Protocol::Grpc => builder.with_batch_exporter(exporter).build(),
+        Protocol::HttpProtobuf | Protocol::HttpJson => {
+            let processor = opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .build();
+            builder.with_span_processor(processor).build()
+        }
+    }
+}
+
 /// Installs OTLP trace export when an endpoint is configured.
 pub fn init(settings: &Settings) -> Result<Option<Guard>, Box<dyn std::error::Error>> {
     let Some(endpoint) = settings.endpoint.as_deref() else {
         return Ok(None);
     };
     let exporter = build_exporter(endpoint, settings.protocol)?;
-    let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name(env!("CARGO_PKG_NAME"))
-        .build();
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_resource(resource)
-        .with_batch_exporter(exporter)
-        .build();
+    let provider = build_provider(exporter, settings.protocol);
     let tracer = provider.tracer(env!("CARGO_PKG_NAME"));
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
@@ -271,9 +286,17 @@ pub fn init(settings: &Settings) -> Result<Option<Guard>, Box<dyn std::error::Er
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        thread,
+    };
+
+    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+
     use super::{
         DEFAULT_MESSAGE_CONTENT_MAX_BYTES, DEFAULT_MESSAGE_CONTENT_MAX_MESSAGES, LevelFilter,
-        Protocol, Settings, build_exporter, exported_targets,
+        Protocol, Settings, build_exporter, build_provider, exported_targets,
     };
 
     #[test]
@@ -367,20 +390,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn http_exporters_build_without_connecting() {
-        for protocol in [Protocol::HttpProtobuf, Protocol::HttpJson] {
-            let settings = Settings::try_new_with_protocol(
-                Some("https://collector.example".into()),
-                protocol,
-                false,
-                12,
-                4096,
+    fn serve_otlp_response(
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> (String, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; 8192];
+            let length = stream.read(&mut request).unwrap();
+            request.truncate(length);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             )
             .unwrap();
+            stream.write_all(body).unwrap();
+            request
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_transports_export_span_batches() {
+        for (protocol, content_type, response_body) in [
+            (Protocol::HttpProtobuf, "application/x-protobuf", &[][..]),
+            (Protocol::HttpJson, "application/json", &b"{}"[..]),
+        ] {
+            let (endpoint, server) = serve_otlp_response(content_type, response_body);
+            let settings =
+                Settings::try_new_with_protocol(Some(endpoint), protocol, false, 12, 4096).unwrap();
+            let exporter = build_exporter(settings.endpoint.as_deref().unwrap(), protocol).unwrap();
+            let provider = build_provider(exporter, protocol);
+            let tracer = provider.tracer("http-export-test");
+            let mut span = tracer.start("test span");
+            span.end();
+            provider.shutdown().unwrap();
+
+            let request = server.join().unwrap();
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap();
+            let request = String::from_utf8(request[..header_end].to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(request.starts_with("post /v1/traces http/1.1"), "{request}");
             assert!(
-                build_exporter(settings.endpoint.as_deref().unwrap(), protocol).is_ok(),
-                "failed to build {protocol} exporter"
+                request.contains(&format!("content-type: {content_type}")),
+                "{request}"
             );
         }
     }
