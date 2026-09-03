@@ -80,9 +80,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && app.pending_steers.is_empty()
         && !app.show_logs;
 
-    let (prompt_area, picker_below) = if show_start {
+    let (prompt_area, prompt_viewport, picker_below) = if show_start {
         app.prompt_width = start_prompt_width;
-        (draw_start(frame, app, start_width, start_prompt_rows), true)
+        let (prompt, viewport) = draw_start(frame, app, start_width, start_prompt_rows);
+        (prompt, viewport, true)
     } else {
         let prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
         app.prompt_width = prompt_width;
@@ -112,13 +113,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
             draw_logs(frame, app, logs);
         }
         draw_pending_steers(frame, app, pending);
-        draw_prompt(frame, app, prompt);
+        let viewport = draw_prompt(frame, app, prompt);
         draw_command_popup(frame, app, prompt);
         draw_status(frame, app, status);
-        (prompt, false)
+        (prompt, viewport, false)
     };
     if app.file_picker.is_some() {
-        draw_file_picker(frame, app, prompt_area, picker_below);
+        draw_file_picker(frame, app, prompt_area, prompt_viewport, picker_below);
     } else if app.session_dialog.is_some() {
         draw_session_dialog(frame, app);
     } else if app.model_dialog.is_some() {
@@ -126,6 +127,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     } else if app.effort_dialog.is_some() {
         draw_effort_dialog(frame, app);
     }
+}
+
+#[derive(Clone, Copy)]
+struct PromptViewport {
+    field: Rect,
+    first_row: usize,
 }
 
 struct CompletionPopup {
@@ -215,9 +222,24 @@ fn draw_completion_popup(frame: &mut Frame<'_>, anchor: Rect, popup: CompletionP
     }
 }
 
-fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below: bool) {
+fn draw_file_picker(
+    frame: &mut Frame<'_>,
+    app: &App,
+    prompt: Rect,
+    viewport: PromptViewport,
+    prefer_below: bool,
+) {
     let dialog = app.file_picker.as_ref().expect("checked above");
-    let path_width = prompt.width.min(88).saturating_sub(4) as usize;
+    let (row, column) = app
+        .editor
+        .display_position(dialog.query_range.start, viewport.field.width as usize);
+    let trigger_x = viewport.field.x + u16::try_from(column).unwrap_or(0);
+    let max_width = prompt.width.min(88).min(frame.area().width);
+    let min_width = max_width.min(24);
+    let available_width = frame.area().right().saturating_sub(trigger_x);
+    let width = max_width.min(available_width.max(min_width));
+    let x = trigger_x.min(frame.area().right().saturating_sub(width));
+    let path_width = width.saturating_sub(4) as usize;
     let lines = match dialog.status {
         FilePickerStatus::Loading => {
             vec![Line::from(Span::styled(
@@ -272,9 +294,21 @@ fn draw_file_picker(frame: &mut Frame<'_>, app: &App, prompt: Rect, prefer_below
             })
             .collect(),
     };
+    let y = if row < viewport.first_row {
+        if prefer_below {
+            prompt.bottom().saturating_sub(1)
+        } else {
+            prompt.y
+        }
+    } else {
+        let visible_row =
+            (row - viewport.first_row).min(viewport.field.height.saturating_sub(1) as usize);
+        viewport.field.y + u16::try_from(visible_row).unwrap_or(0)
+    };
+    let anchor = Rect::new(x, y, width, 1);
     draw_completion_popup(
         frame,
-        prompt,
+        anchor,
         CompletionPopup {
             title: " files ",
             rows: lines,
@@ -698,7 +732,12 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) -> Rect {
+fn draw_start(
+    frame: &mut Frame<'_>,
+    app: &App,
+    width: u16,
+    prompt_rows: u16,
+) -> (Rect, PromptViewport) {
     let area = frame.area();
     let height = START_LOGO_ROWS + START_LOGO_GAP + prompt_rows + 1;
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -709,11 +748,11 @@ fn draw_start(frame: &mut Frame<'_>, app: &App, width: u16, prompt_rows: u16) ->
     y += START_LOGO_ROWS + START_LOGO_GAP;
 
     let prompt = Rect::new(x, y, width, prompt_rows);
-    draw_start_prompt(frame, app, prompt);
+    let viewport = draw_start_prompt(frame, app, prompt);
     draw_command_popup(frame, app, prompt);
     let status = Rect::new(x, y + prompt_rows, width, 1);
     draw_status(frame, app, status);
-    prompt
+    (prompt, viewport)
 }
 
 fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, Option<Rect>) {
@@ -1903,7 +1942,7 @@ fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
     let inner = draw_start_prompt_frame(frame, area);
     let [input, _, metadata] = Layout::vertical([
         Constraint::Min(1),
@@ -1911,7 +1950,7 @@ fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    draw_prompt_editor(frame, app, input, theme::dim());
+    let viewport = draw_prompt_editor(frame, app, input, theme::dim());
 
     let metadata = Rect {
         x: metadata.x + 2,
@@ -1928,6 +1967,7 @@ fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])),
         metadata,
     );
+    viewport
 }
 
 fn draw_command_popup(frame: &mut Frame<'_>, app: &App, anchor: Rect) {
@@ -1957,7 +1997,7 @@ fn draw_command_popup(frame: &mut Frame<'_>, app: &App, anchor: Rect) {
     );
 }
 
-fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
     let border = if app.phase == Phase::Working && app.can_steer || app.phase == Phase::Idle {
         Style::default().fg(theme::accent_color())
     } else {
@@ -1968,7 +2008,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    draw_prompt_editor(frame, app, inner, theme::faint());
+    draw_prompt_editor(frame, app, inner, theme::faint())
 }
 
 fn draw_start_prompt_frame(frame: &mut Frame<'_>, area: Rect) -> Rect {
@@ -2003,7 +2043,12 @@ fn draw_start_prompt_frame(frame: &mut Frame<'_>, area: Rect) -> Rect {
     inner
 }
 
-fn draw_prompt_editor(frame: &mut Frame<'_>, app: &App, area: Rect, placeholder_style: Style) {
+fn draw_prompt_editor(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    placeholder_style: Style,
+) -> PromptViewport {
     let [gutter, field] =
         Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(area);
     frame.render_widget(
@@ -2044,6 +2089,10 @@ fn draw_prompt_editor(frame: &mut Frame<'_>, app: &App, area: Rect, placeholder_
                 .min(field.width.saturating_sub(1)),
         field.y + u16::try_from(cursor_row - first).unwrap_or(0),
     ));
+    PromptViewport {
+        field,
+        first_row: first,
+    }
 }
 
 fn prompt_lines(
@@ -2596,16 +2645,16 @@ mod tests {
     }
 
     #[test]
-    fn file_picker_stays_attached_to_the_prompt() {
+    fn file_picker_anchors_to_the_at_sign() {
         let mut start = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
             "openai-subscription".into(),
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         );
-        start.editor.insert_str("@app");
+        start.editor.insert_str("open\n      @app");
         start.file_picker = Some(FilePickerDialog {
-            query_range: 0..4,
+            query_range: 11..15,
             revision: 1,
             activation: 1,
             selected: 0,
@@ -2615,32 +2664,107 @@ mod tests {
             }],
             status: FilePickerStatus::Ready,
         });
-        let screen = render(&mut start, 80, 24);
-        let prompt_row = screen
-            .lines()
-            .position(|line| line.contains('@'))
-            .expect("prompt row");
-        let picker_row = screen
-            .lines()
-            .position(|line| line.contains("src/tui/app.rs"))
-            .expect("picker row");
-        assert!(picker_row > prompt_row, "{screen}");
+        let screen = render(&mut start, 120, 24);
+        let lines = screen.lines().collect::<Vec<_>>();
+        let prompt_row = lines.iter().position(|line| line.contains('@')).unwrap();
+        let prompt_column = lines[prompt_row]
+            .chars()
+            .position(|cell| cell == '@')
+            .unwrap();
+        let picker_row = lines
+            .iter()
+            .position(|line| line.contains(" files "))
+            .unwrap();
+        let picker_column = lines[picker_row]
+            .chars()
+            .position(|cell| cell == '╭')
+            .unwrap();
+        assert_eq!((picker_row, picker_column), (prompt_row + 1, prompt_column));
 
         let mut active = sample();
-        active.editor.insert_str("@app");
+        active.editor.insert_str("open\n      @app");
         active.file_picker = start.file_picker;
-        let screen = render(&mut active, 80, 24);
-        let prompt_row = screen
+        let screen = render(&mut active, 120, 24);
+        let lines = screen.lines().collect::<Vec<_>>();
+        let prompt_row = lines.iter().position(|line| line.contains('@')).unwrap();
+        let prompt_column = lines[prompt_row]
+            .chars()
+            .position(|cell| cell == '@')
+            .unwrap();
+        let picker_row = (0..prompt_row)
+            .rev()
+            .find(|row| lines[*row].contains('╰'))
+            .unwrap();
+        let picker_column = lines[picker_row]
+            .chars()
+            .position(|cell| cell == '╰')
+            .unwrap();
+        assert_eq!((picker_row + 1, picker_column), (prompt_row, prompt_column));
+    }
+
+    #[test]
+    fn file_picker_stays_outside_prompt_when_the_at_sign_scrolls_offscreen() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let input = format!("@{}", "a".repeat(1_000));
+        app.editor.insert_str(&input);
+        app.file_picker = Some(FilePickerDialog {
+            query_range: 0..input.len(),
+            revision: 1,
+            activation: 1,
+            selected: 0,
+            matches: vec![FileMatch {
+                relative_path: "src/tui/app.rs".into(),
+                match_byte_offsets: std::iter::once(8..11).collect(),
+            }],
+            status: FilePickerStatus::Ready,
+        });
+
+        let screen = render(&mut app, 120, 40);
+        let lines = screen.lines().collect::<Vec<_>>();
+        let last_prompt_row = lines
+            .iter()
+            .rposition(|line| line.contains("aaaaaaaaaa"))
+            .unwrap();
+        let picker_row = lines
+            .iter()
+            .position(|line| line.contains('╭') && line.contains(" files "))
+            .unwrap();
+        assert!(picker_row > last_prompt_row, "{screen}");
+    }
+
+    #[test]
+    fn file_picker_stays_visible_near_the_right_edge() {
+        let mut app = sample();
+        let input = format!("{} @app", "x".repeat(70));
+        let query_start = input.find('@').unwrap();
+        app.editor.insert_str(&input);
+        app.file_picker = Some(FilePickerDialog {
+            query_range: query_start..input.len(),
+            revision: 1,
+            activation: 1,
+            selected: 0,
+            matches: vec![FileMatch {
+                relative_path: "src/tui/app.rs".into(),
+                match_byte_offsets: std::iter::once(8..11).collect(),
+            }],
+            status: FilePickerStatus::Ready,
+        });
+
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("src/tui/app.rs"), "{screen}");
+        let picker_border = screen
             .lines()
-            .enumerate()
-            .filter_map(|(row, line)| line.contains('@').then_some(row))
-            .last()
-            .expect("prompt row");
-        let picker_row = screen
-            .lines()
-            .position(|line| line.contains("src/tui/app.rs"))
-            .expect("picker row");
-        assert!(picker_row < prompt_row, "{screen}");
+            .find(|line| line.contains('╭') && line.contains(" files "))
+            .unwrap();
+        let left = picker_border.chars().position(|cell| cell == '╭').unwrap();
+        let right = picker_border.chars().position(|cell| cell == '╮').unwrap();
+        assert_eq!(right - left + 1, 24);
+        assert_eq!(right, 79);
     }
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\

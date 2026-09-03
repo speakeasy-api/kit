@@ -68,6 +68,21 @@ impl Editor {
         (rows, cursor)
     }
 
+    /// Display row and column for a byte offset in the prompt.
+    pub fn display_position(&self, offset: usize, width: usize) -> (usize, usize) {
+        debug_assert!(offset <= self.text.len() && self.text.is_char_boundary(offset));
+        let width = width.max(1);
+        let ranges = self.rows(width);
+        let index = self.offset_row(&ranges, offset);
+        let (start, _) = ranges[index];
+        let column = self.text[start..offset].width();
+        if column >= width {
+            (index + 1, 0)
+        } else {
+            (index, column)
+        }
+    }
+
     /// Display rows the prompt needs at `width` columns.
     pub fn display_rows(&self, width: usize) -> usize {
         self.wrapped(width).0.len()
@@ -120,9 +135,13 @@ impl Editor {
     /// The display row holding the cursor. A cursor resting exactly on a soft
     /// break belongs to the row that follows it.
     fn cursor_row(&self, ranges: &[(usize, usize)]) -> usize {
+        self.offset_row(ranges, self.cursor)
+    }
+
+    fn offset_row(&self, ranges: &[(usize, usize)], offset: usize) -> usize {
         ranges
             .iter()
-            .position(|(_, end)| self.cursor < *end || (self.cursor == *end && self.ends_row(*end)))
+            .position(|(_, end)| offset < *end || (offset == *end && self.ends_row(*end)))
             .unwrap_or_else(|| ranges.len() - 1)
     }
 
@@ -485,6 +504,14 @@ mod tests {
         let editor = editor("one two three four five");
         assert_eq!(editor.display_rows(10), 3);
         assert_eq!(editor.display_rows(80), 1);
+    }
+
+    #[test]
+    fn locates_an_offset_across_wrapped_unicode_rows() {
+        let editor = editor("ok\n界e\u{301} @src");
+        let offset = editor.text().find('@').unwrap();
+        assert_eq!(editor.display_position(offset, 20), (1, 4));
+        assert_eq!(editor.display_position(offset, 4), (2, 0));
     }
 
     #[test]
