@@ -57,8 +57,8 @@ use crate::{
     runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
 
-const MODEL_CONFIG_ID: &str = "model";
-const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+pub(crate) const MODEL_CONFIG_ID: &str = "model";
+pub(crate) const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";

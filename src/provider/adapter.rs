@@ -155,6 +155,7 @@ impl ReasoningEffort {
 struct SessionSelection {
     model: ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
+    revision: u64,
 }
 
 /// A per-session adapter whose selection is read only when a new model turn begins.
@@ -208,6 +209,7 @@ impl SelectableAdapter {
             selection: Arc::new(Mutex::new(SessionSelection {
                 model: selection,
                 reasoning_effort,
+                revision: 0,
             })),
             credential_storage,
             openrouter_api_key,
@@ -240,10 +242,12 @@ impl SelectableAdapter {
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
         )?;
-        self.selection
+        let mut current = self
+            .selection
             .lock()
-            .map_err(|_| "session selection lock is poisoned")?
-            .model = selection;
+            .map_err(|_| "session selection lock is poisoned")?;
+        current.model = selection;
+        current.revision = current.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -259,10 +263,12 @@ impl SelectableAdapter {
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
         )?;
-        self.selection
+        let mut current = self
+            .selection
             .lock()
-            .map_err(|_| "session selection lock is poisoned")?
-            .reasoning_effort = reasoning_effort;
+            .map_err(|_| "session selection lock is poisoned")?;
+        current.reasoning_effort = reasoning_effort;
+        current.revision = current.revision.wrapping_add(1);
         Ok(())
     }
 }
@@ -966,9 +972,8 @@ const OPENROUTER_FALLBACK: &[&str] = &[
     "google/gemini-2.5-pro",
 ];
 
-/// Returns a bounded, provider-grouped catalog. Remote discovery is best effort.
-pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
-    let openai = [
+fn openai_models(current: &ModelSelection) -> Vec<String> {
+    let mut models = [
         "gpt-5.6-sol",
         "gpt-5.5",
         "gpt-5.4",
@@ -977,7 +982,16 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     ]
     .into_iter()
     .map(str::to_string)
-    .collect();
+    .collect::<Vec<_>>();
+    if current.provider == ProviderKind::OpenAiSubscription && !models.contains(&current.model) {
+        models.push(current.model.clone());
+    }
+    models
+}
+
+/// Returns a bounded, provider-grouped catalog. Remote discovery is best effort.
+pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
+    let openai = openai_models(current);
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
@@ -1125,7 +1139,7 @@ mod tests {
         OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
         SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
         apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
-        gram_chat_id, models_url, openrouter_config_from_env, parse_context_window,
+        gram_chat_id, models_url, openai_models, openrouter_config_from_env, parse_context_window,
         rewrite_openrouter_media, stamp_context_window,
     };
 
@@ -1538,6 +1552,7 @@ mod tests {
         let active = SessionSelection {
             model: active,
             reasoning_effort: None,
+            revision: 0,
         };
         SelectableSession {
             selection: Arc::new(Mutex::new(active.clone())),
@@ -1568,6 +1583,7 @@ mod tests {
                 SessionSelection {
                     model: selected.clone(),
                     reasoning_effort: Some(ReasoningEffort::High),
+                    revision: 1,
                 },
                 Ok(openrouter_session(&selected.model).await),
             )
@@ -1590,6 +1606,7 @@ mod tests {
                     SessionSelection {
                         model: selected,
                         reasoning_effort: None,
+                        revision: 1,
                     },
                     Err(LoopError::Provider("replacement failed".into())),
                 )
@@ -1598,6 +1615,33 @@ mod tests {
 
         assert_eq!(session.provider_name(), Some("openrouter"));
         assert_eq!(session.model_name(), Some("test/initial"));
+    }
+
+    #[test]
+    fn openai_catalog_keeps_the_active_custom_model() {
+        let current = ModelSelection::new(ProviderKind::OpenAiSubscription, "custom-model");
+
+        assert!(openai_models(&current).contains(&current.model));
+    }
+
+    #[test]
+    fn reselecting_the_active_model_refreshes_the_next_turn() {
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let adapter = SelectableAdapter::new_with_credentials(
+            ProviderKind::OpenRouter,
+            "test-model",
+            credentials,
+        )
+        .unwrap();
+        let before = adapter.selection.lock().unwrap().clone();
+
+        adapter.select(before.model.clone()).unwrap();
+
+        let after = adapter.selection.lock().unwrap().clone();
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.reasoning_effort, before.reasoning_effort);
+        assert_ne!(after.revision, before.revision);
     }
 
     #[test]

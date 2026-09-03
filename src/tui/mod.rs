@@ -58,7 +58,7 @@ use wire::{
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::FileSearchRequest,
+    protocols::acp::{FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID},
     tools::mcp::CredentialStorage,
 };
 
@@ -269,11 +269,6 @@ struct AgentInvocation {
     current_dir: Option<PathBuf>,
 }
 
-struct ReconnectLaunch {
-    resume_session_id: Option<String>,
-    force: bool,
-}
-
 impl AgentInvocation {
     fn from_command(command: &std::process::Command) -> Self {
         Self {
@@ -439,14 +434,7 @@ async fn request_initial_session(
 }
 
 fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
-    let current = options
-        .unwrap_or_default()
-        .iter()
-        .find(|option| option.config_id.to_string() == "model")
-        .and_then(|option| match &option.kind {
-            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
-            _ => None,
-        })?;
+    let current = current_config_value(options.unwrap_or_default(), MODEL_CONFIG_ID)?;
     model_choices(options)
         .into_iter()
         .find(|choice| choice.id == current)
@@ -458,7 +446,7 @@ fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<
         ..
     } = options?
         .iter()
-        .find(|option| option.config_id.to_string() == "reasoning_effort")?
+        .find(|option| option.config_id.to_string() == REASONING_EFFORT_CONFIG_ID)?
     else {
         return None;
     };
@@ -474,6 +462,64 @@ fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<
         _ => return None,
     };
     Some((select.current_value.to_string(), choices))
+}
+
+struct ActiveSessionConfig {
+    model: String,
+    reasoning_effort: Option<String>,
+}
+
+fn active_session_config(app: &App) -> ActiveSessionConfig {
+    ActiveSessionConfig {
+        model: app
+            .model_choices
+            .iter()
+            .find(|choice| choice.provider == app.provider && choice.model == app.model)
+            .map_or_else(
+                || format!("{}:{}", app.provider, app.model),
+                |choice| choice.id.clone(),
+            ),
+        reasoning_effort: (!app.effort_choices.is_empty()).then(|| app.reasoning_effort.clone()),
+    }
+}
+
+fn current_config_value(options: &[SessionConfigOption], config_id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.config_id.to_string() == config_id)
+        .and_then(|option| match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+            _ => None,
+        })
+}
+
+fn active_config_matches(active: &ActiveSessionConfig, options: &[SessionConfigOption]) -> bool {
+    current_config_value(options, MODEL_CONFIG_ID).as_deref() == Some(active.model.as_str())
+        && active.reasoning_effort.as_deref().is_none_or(|effort| {
+            current_config_value(options, REASONING_EFFORT_CONFIG_ID).as_deref() == Some(effort)
+        })
+}
+
+async fn refresh_session_after_auth(
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    session_id: wire::SessionId,
+    active: &ActiveSessionConfig,
+) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+    let options = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id,
+            MODEL_CONFIG_ID,
+            active.model.as_str(),
+        ))
+        .block_task()
+        .await?
+        .config_options;
+    if !active_config_matches(active, &options) {
+        return Err(agent_client_protocol::Error::into_internal_error(
+            std::io::Error::other("authentication refresh changed the active session settings"),
+        ));
+    }
+    Ok(options)
 }
 
 fn refresh_config_state(app: &mut App, options: Option<&[SessionConfigOption]>) {
@@ -496,7 +542,7 @@ fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
     }) = options
         .unwrap_or_default()
         .iter()
-        .find(|option| option.config_id.to_string() == "model")
+        .find(|option| option.config_id.to_string() == MODEL_CONFIG_ID)
     else {
         return Vec::new();
     };
@@ -602,7 +648,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let credential_storage =
         credential_storage_for_launch(credential_storage, &std::env::current_dir()?);
     let credential_storage = &credential_storage;
-    let mut resume_session_id = resume.map(str::to_string);
+    let resume_session_id = resume.map(str::to_string);
     let persisted_session_id = resume_session_id
         .clone()
         .unwrap_or_else(crate::session::new_id);
@@ -615,9 +661,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let a2a_address = a2a.map(str::to_string);
     let a2a = a2a_address.clone().unwrap_or_else(|| "allocating…".into());
     let mcp_config = mcp_config.map(Path::to_path_buf);
-    let mut launch_force = force;
 
-    loop {
+    {
         let launch_session_id = resume_session_id
             .as_deref()
             .unwrap_or(&persisted_session_id);
@@ -633,7 +678,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             credential_storage,
             launch_session_id,
             resume_session_id.is_some(),
-            launch_force,
+            force,
         )?;
         let auth_invocation = AgentInvocation::from_command(command.as_std());
         detach_from_controlling_terminal(&mut command);
@@ -704,17 +749,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let cleanup_root = root.clone();
         let transition_session = Arc::clone(&active_persisted_id);
         let notification_session = Arc::clone(&active_persisted_id);
-        let reconnect_resume = Arc::new(Mutex::new(None));
         let result = {
             let root = root.clone();
             let model = model.clone();
             let a2a = a2a.clone();
-            let a2a_address = a2a_address.clone();
-            let mcp_config = mcp_config.clone();
             let auth_invocation = auth_invocation.clone();
             let resume_session_id = resume_session_id.clone();
-            let launch_force = launch_force;
-            let reconnect_resume = Arc::clone(&reconnect_resume);
             agent_client_protocol::Client
         .v2()
         .on_receive_notification(
@@ -911,17 +951,29 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     };
                                     match outcome {
                                         Ok(status) if status.success() => {
-                                            // The running agent can retain stale provider state.
-                                            // Retry only after the outer loop has replaced it and
-                                            // negotiated a new ACP connection.
-                                            *reconnect_resume
-                                                .lock()
-                                                .expect("ACP reconnect state poisoned") =
-                                                Some(ReconnectLaunch {
-                                                    resume_session_id: resume_session_id.clone(),
-                                                    force: launch_force,
-                                                });
-                                            return Ok(());
+                                            match request_initial_session(
+                                                &connection,
+                                                resume_session_id.as_deref(),
+                                                &root,
+                                            )
+                                            .await
+                                            {
+                                                Ok(session) => {
+                                                    images = resume_terminal(&mut terminal).map_err(
+                                                        agent_client_protocol::Error::into_internal_error,
+                                                    )?;
+                                                    events = EventStream::new();
+                                                    break session;
+                                                }
+                                                Err(error) if authentication_required(
+                                                    &error,
+                                                    &app.auth_methods,
+                                                ) => app.note(format!(
+                                                    "could not start the session: {}; use /login to authenticate",
+                                                    error_detail(&error)
+                                                )),
+                                                Err(error) => return Err(error),
+                                            }
                                         }
                                         Ok(status) => app.note(format!(
                                             "authentication with {} failed: {status}",
@@ -1228,7 +1280,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 Action::SelectModel { choice, save_defaults } => {
                                     let response = connection.send_request(
                                         SetSessionConfigOptionRequest::new(
-                                            session_id.clone(), "model", choice.id.as_str(),
+                                            session_id.clone(),
+                                            MODEL_CONFIG_ID,
+                                            choice.id.as_str(),
                                         ),
                                     ).block_task().await;
                                     match response {
@@ -1253,7 +1307,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     let response = connection
                                         .send_request(SetSessionConfigOptionRequest::new(
                                             session_id.clone(),
-                                            "reasoning_effort",
+                                            REASONING_EFFORT_CONFIG_ID,
                                             effort.as_str(),
                                         ))
                                         .block_task()
@@ -1286,31 +1340,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::Login(method) => {
                                     drop(events);
-                                    let refreshed_id = durable_session_id(&session_id)
-                                        .map_err(|error| {
-                                            agent_client_protocol::Error::into_internal_error(
-                                                std::io::Error::other(error),
-                                            )
-                                        })?;
-                                    let current_auth_command = agent_command_for_launch(
-                                        &root,
-                                        &model,
-                                        provider,
-                                        reasoning_effort,
-                                        openrouter_api_key,
-                                        a2a_address.as_deref(),
-                                        mcp_config.as_deref(),
-                                        telemetry,
-                                        credential_storage,
-                                        &refreshed_id,
-                                        true,
-                                        false,
-                                    )
-                                    .map_err(agent_client_protocol::Error::into_internal_error)?;
-                                    let current_auth_invocation =
-                                        AgentInvocation::from_command(current_auth_command.as_std());
+                                    let active_config = active_session_config(&app);
                                     let authentication = authenticate_in_terminal(
-                                        &current_auth_invocation,
+                                        &auth_invocation,
                                         &root,
                                         &method,
                                         &mut stop,
@@ -1346,17 +1378,17 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     };
                                     match outcome {
                                         Ok(status) if status.success() => {
-                                            // Closing this callback closes the ACP connection;
-                                            // the outer loop then reaps this child before resuming
-                                            // the session on a newly initialized agent.
-                                            *reconnect_resume
-                                                .lock()
-                                                .expect("ACP reconnect state poisoned") =
-                                                Some(ReconnectLaunch {
-                                                    resume_session_id: Some(refreshed_id),
-                                                    force: false,
-                                                });
-                                            return Ok(());
+                                            let options = refresh_session_after_auth(
+                                                &connection,
+                                                session_id.clone(),
+                                                &active_config,
+                                            )
+                                            .await?;
+                                            refresh_config_state(&mut app, Some(&options));
+                                            app.note(format!(
+                                                "authentication with {} succeeded",
+                                                method.name
+                                            ));
                                         }
                                         Ok(status) => app.note(format!(
                                             "authentication with {} failed: {status}",
@@ -1476,8 +1508,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         // after CloseSession has unwound the lock owner, then wait for OS locks to
         // be released rather than relying on `kill_on_drop`.
         let _ = shutdown_tx.send(());
-        // Keep this await before the reconnect check: a replacement must not
-        // start until the old ACP process has been killed and reaped.
         let _ = watcher.await;
         // If the server failed before acknowledging CloseSession, reclaim only a
         // lock that is now provably stale; a live owner's OS lock is never stolen.
@@ -1485,19 +1515,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
         }
 
-        let reconnect = reconnect_resume
-            .lock()
-            .ok()
-            .and_then(|mut reconnect| reconnect.take());
-        if result.is_ok()
-            && let Some(reconnect) = reconnect
-        {
-            resume_session_id = reconnect.resume_session_id;
-            launch_force = reconnect.force;
-            continue;
-        }
         result?;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -2286,18 +2305,20 @@ mod tests {
         SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption, SessionUpdate,
         StateUpdate, TextContent, UpdateSessionNotification, UserMessage,
     };
+    use agent_client_protocol::{Channel, ConnectTo};
     use crossterm::event::Event;
 
     use serde_json::json;
 
     use super::{
         ActiveSessionRoute, AgentInvocation, ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST,
-        ModelChoice, QueuedUpdate, accept_queued_update, agent_command_for_launch,
-        apply_pending_updates, attachments_from_paste, authentication_required,
-        client_capabilities, command, credential_storage_for_launch, current_model_choice,
-        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
-        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
-        refresh_config_state, save_effort_default_to, save_model_defaults_to,
+        ModelChoice, ProtocolVersion, QueuedUpdate, accept_queued_update, active_config_matches,
+        active_session_config, agent_command_for_launch, apply_pending_updates,
+        attachments_from_paste, authentication_required, client_capabilities, command,
+        credential_storage_for_launch, current_model_choice, detach_from_controlling_terminal,
+        durable_session_id, effort_state, error_detail, handle, message_of, osc52,
+        previous_session_for_resume, prompt_blocks, readable, refresh_config_state,
+        refresh_session_after_auth, save_effort_default_to, save_model_defaults_to,
         terminal_auth_command, transition_route, translate, translate_for_session,
         usable_terminal_auth_methods, user_message_of, wait_for_connected_authentication, wire,
     };
@@ -2402,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_launch_tracks_transitioned_session_and_preserves_base_options() {
+    fn agent_launch_tracks_transitioned_session_and_preserves_base_options() {
         let root = tempfile::tempdir().unwrap();
         let mcp_config = root.path().join("mcp.toml");
         let telemetry = crate::telemetry::Settings::try_new(None, false, 12, 4096).unwrap();
@@ -3100,6 +3121,172 @@ a = [still text]
             toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("reasoning_effort").is_none());
         assert_eq!(saved["model"].as_str(), Some("kept"));
+    }
+
+    #[test]
+    fn successful_login_refresh_preserves_active_provider_model_and_effort() {
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "openrouter:active-model",
+                vec![SessionConfigSelectGroup::new(
+                    "openrouter",
+                    "OpenRouter",
+                    vec![
+                        SessionConfigSelectOption::new("openrouter:old-model", "old-model"),
+                        SessionConfigSelectOption::new("openrouter:active-model", "active-model"),
+                    ],
+                )],
+            ),
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectGroup::new(
+                    "reasoning-effort",
+                    "Reasoning effort",
+                    vec![
+                        SessionConfigSelectOption::new("default", "Default"),
+                        SessionConfigSelectOption::new("high", "High"),
+                    ],
+                )],
+            ),
+        ];
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openrouter".into(),
+            "active-model".into(),
+            "127.0.0.1:4321".into(),
+        );
+        app.set_model_choices(super::model_choices(Some(&options)));
+        app.set_effort(
+            "high".into(),
+            vec![
+                crate::tui::app::EffortChoice {
+                    id: "default".into(),
+                    name: "Default".into(),
+                },
+                crate::tui::app::EffortChoice {
+                    id: "high".into(),
+                    name: "High".into(),
+                },
+            ],
+        );
+
+        let active = active_session_config(&app);
+        assert_eq!(active.model, "openrouter:active-model");
+        assert_eq!(active.reasoning_effort.as_deref(), Some("high"));
+        assert!(active_config_matches(&active, &options));
+    }
+
+    #[test]
+    fn successful_login_refresh_preserves_a_custom_model_outside_the_catalog() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openai-subscription".into(),
+            "custom-model".into(),
+            "a2a".into(),
+        );
+        app.set_model_choices(vec![ModelChoice {
+            id: "openai-subscription:gpt-5.4".into(),
+            provider: "openai-subscription".into(),
+            model: "gpt-5.4".into(),
+        }]);
+
+        assert_eq!(
+            active_session_config(&app).model,
+            "openai-subscription:custom-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_login_refresh_is_scoped_to_the_active_session() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openrouter".into(),
+            "same-model".into(),
+            "127.0.0.1:4321".into(),
+        );
+        let options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "openrouter:same-model",
+            vec![SessionConfigSelectGroup::new(
+                "openrouter",
+                "OpenRouter",
+                vec![SessionConfigSelectOption::new(
+                    "openrouter:same-model",
+                    "same-model",
+                )],
+            )],
+        )];
+        app.set_model_choices(super::model_choices(Some(&options)));
+        let active = active_session_config(&app);
+
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = crate::runtime::Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "same-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
+        )
+        .unwrap();
+        let registry = crate::protocols::acp::SessionRegistry::new();
+        let agent = crate::protocols::acp::v2::component(runtime, registry).unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        let workspace = root.path().to_path_buf();
+
+        agent_client_protocol::Client
+            .v2()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                let active_session = connection
+                    .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                    .block_task()
+                    .await?;
+                let unrelated_session = connection
+                    .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                    .block_task()
+                    .await?;
+
+                refresh_session_after_auth(&connection, active_session.session_id.clone(), &active)
+                    .await?;
+
+                // This request proves that refreshing the TUI route left another
+                // route in the shared serve runtime active.
+                connection
+                    .send_request(wire::SetSessionConfigOptionRequest::new(
+                        unrelated_session.session_id.clone(),
+                        "reasoning_effort",
+                        "high",
+                    ))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(active_session.session_id))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(unrelated_session.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
