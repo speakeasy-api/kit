@@ -225,6 +225,57 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
 }
 
 #[test]
+fn unrelated_openrouter_keys_do_not_disable_terminal_authentication() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+        root.path(),
+        "gpt-5.4",
+        crate::ProviderKind::OpenAiSubscription,
+        crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+        None,
+        Some(crate::provider::OpenRouterApiKey::new("unrelated")),
+    )
+    .unwrap();
+    Arc::get_mut(&mut runtime)
+        .unwrap()
+        .set_ambient_openrouter_api_key_for_test(true);
+
+    assert!(runtime.supports_terminal_authentication());
+}
+
+#[test]
+fn logout_attempts_all_providers_after_a_credential_removal_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    let storage =
+        crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+    storage.make_entry_undeletable_for_test("openrouter", "default");
+    storage
+        .entry("speakeasy", "default")
+        .save(b"removed")
+        .unwrap();
+    let runtime = Runtime::new_with_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::ProviderKind::OpenAiSubscription,
+        storage.clone(),
+    )
+    .unwrap();
+
+    let error = runtime.logout_authentication().unwrap_err();
+
+    assert!(error.contains("could not remove OpenRouter credentials"));
+    assert!(
+        storage
+            .entry("speakeasy", "default")
+            .load()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn explicit_openrouter_key_reaches_runtime_adapter_and_kit_children() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(

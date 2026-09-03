@@ -47,6 +47,17 @@ impl CredentialStorage {
         !matches!(self, Self::Memory)
     }
 
+    #[cfg(test)]
+    pub(crate) fn make_entry_undeletable_for_test(&self, namespace: &str, identity: &str) {
+        let entry = self.entry(namespace, identity);
+        entry.save(b"blocked").unwrap();
+        let EntryBackend::Filesystem(path) = entry.backend else {
+            panic!("undeletable credential fixtures require filesystem storage");
+        };
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+    }
+
     pub(crate) async fn lock_refresh(&self) -> Result<CredentialRefreshLock, CredentialStoreError> {
         let path = match self {
             Self::Memory => {

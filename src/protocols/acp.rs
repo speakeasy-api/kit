@@ -13,17 +13,18 @@ use std::{
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest, AuthenticateResponse,
-    AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate, BlobResourceContents,
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
-    EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest, ForkSessionResponse,
-    ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutRequest, LogoutResponse, NewSessionRequest,
-    NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities, PromptRequest, PromptResponse,
-    ResourceLink, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
-    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionForkCapabilities, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    AgentAuthCapabilities, AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
+    BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
+    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
     ToolCallUpdateFields,
 };
@@ -740,6 +741,30 @@ impl Default for SessionRegistry {
     }
 }
 
+async fn logout_authentication(
+    runtime: Arc<Runtime>,
+    registry: &SessionRegistry,
+) -> Result<(), AcpRuntimeError> {
+    let logout = tokio::task::spawn_blocking(move || runtime.logout_authentication())
+        .await
+        .map_err(|error| format!("authentication logout task failed: {error}"))
+        .and_then(|result| result);
+    let reset = registry.reset_authentication().await;
+
+    match (logout, reset) {
+        (Ok(()), true) => Ok(()),
+        (Err(error), true) => Err(AcpRuntimeError::Loop(format!(
+            "{error}; active ACP sessions were reset because credential state may have changed"
+        ))),
+        (Ok(()), false) => Err(AcpRuntimeError::Loop(
+            "authentication logout could not finish session teardown".into(),
+        )),
+        (Err(error), false) => Err(AcpRuntimeError::Loop(format!(
+            "{error}; authentication logout could not finish session teardown"
+        ))),
+    }
+}
+
 struct AttachedSession {
     session_id: agentkit_acp::SessionId,
     config_options: Vec<SessionConfigOption>,
@@ -888,18 +913,7 @@ impl Server {
     }
 
     async fn logout(self: &Arc<Self>) -> Result<LogoutResponse, AcpRuntimeError> {
-        let runtime = Arc::clone(&self.runtime);
-        tokio::task::spawn_blocking(move || runtime.logout_authentication())
-            .await
-            .map_err(|error| {
-                AcpRuntimeError::Loop(format!("authentication logout task failed: {error}"))
-            })?
-            .map_err(AcpRuntimeError::Loop)?;
-        if !self.registry.reset_authentication().await {
-            return Err(AcpRuntimeError::Loop(
-                "authentication logout could not finish session teardown".into(),
-            ));
-        }
+        logout_authentication(Arc::clone(&self.runtime), &self.registry).await?;
         Ok(LogoutResponse::new())
     }
 
@@ -914,11 +928,12 @@ impl Server {
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        let terminal_authentication = self.runtime.supports_terminal_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-            .agent_capabilities(capabilities())
+            .agent_capabilities(capabilities(terminal_authentication))
             .auth_methods(terminal_auth_methods(
                 &request.client_capabilities,
-                self.runtime.supports_terminal_authentication(),
+                terminal_authentication,
             ))
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
@@ -2278,8 +2293,8 @@ fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
         .ok_or(ListSessionsError::InvalidCursor)
 }
 
-fn capabilities() -> agentkit_acp::AgentCapabilities {
-    agentkit_acp::AgentCapabilities::new()
+fn capabilities(terminal_authentication: bool) -> agentkit_acp::AgentCapabilities {
+    let capabilities = agentkit_acp::AgentCapabilities::new()
         .load_session(true)
         .prompt_capabilities(
             PromptCapabilities::new()
@@ -2293,7 +2308,12 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
                 .fork(SessionForkCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
-        )
+        );
+    if terminal_authentication {
+        capabilities.auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+    } else {
+        capabilities
+    }
 }
 
 async fn drain_turn_states(
@@ -2394,6 +2414,19 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn v1_logout_capability_tracks_terminal_authentication_methods() {
+        let client = agentkit_acp::ClientCapabilities::new()
+            .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
+
+        for enabled in [false, true] {
+            assert_eq!(
+                capabilities(enabled).auth.logout.is_some(),
+                !terminal_auth_methods(&client, enabled).is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn v1_authentication_errors_and_terminal_login_use_protocol_codes() {
         let error = sdk_error(AcpRuntimeError::Loop(
             "speakeasy_auth_required: run `kit auth login speakeasy`".into(),
@@ -2417,6 +2450,82 @@ pub(super) mod tests {
             assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
             assert_eq!(error.data.unwrap()["methodId"], method_id);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_logout_still_resets_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let storage =
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+        storage.make_entry_undeletable_for_test("openrouter", "default");
+        storage
+            .entry("speakeasy", "default")
+            .save(b"removed")
+            .unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            storage.clone(),
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = Arc::new(Server::new(
+            runtime,
+            AcpIntegration::builder()
+                .name("logout-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry.clone(),
+        ));
+        let token = registry.next_token();
+        let session_id = agentkit_acp::SessionId::new("logout-session");
+        let (commands, mut received) = mpsc::channel(1);
+        let (completed, completion) = watch::channel(false);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        let actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completed);
+            if let Some(Command::Close { reply }) = received.recv().await {
+                actor_closed.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+            }
+        });
+        registry
+            .register(
+                registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id,
+                    integration: Arc::clone(&server.integration),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
+            .unwrap();
+        drop(actor);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not remove OpenRouter credentials")
+        );
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(
+            storage
+                .entry("speakeasy", "default")
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.begin_attachment().is_ok());
     }
 
     #[test]

@@ -494,6 +494,22 @@ impl Drop for ActorGuard {
     }
 }
 
+#[derive(Debug)]
+enum SessionPublicationError {
+    AdmissionClosed,
+    Commit(AcpRuntimeError),
+}
+
+struct PendingSessionPublication {
+    token: u64,
+    interrupt: Arc<dyn Fn() + Send + Sync>,
+    close: super::CloseV2Session,
+    actor: tokio::task::AbortHandle,
+    completed: watch::Receiver<bool>,
+    session_id: wire::SessionId,
+    session: SessionHandle,
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -542,20 +558,33 @@ impl Server {
     }
 
     async fn logout(self: &Arc<Self>) -> Result<wire::LogoutAuthResponse, AcpRuntimeError> {
-        let runtime = Arc::clone(&self.runtime);
-        tokio::task::spawn_blocking(move || runtime.logout_authentication())
-            .await
-            .map_err(|error| {
-                AcpRuntimeError::Loop(format!("authentication logout task failed: {error}"))
-            })?
-            .map_err(AcpRuntimeError::Loop)?;
-
-        if !self.registry.reset_authentication().await {
-            return Err(AcpRuntimeError::Loop(
-                "authentication logout could not finish session teardown".into(),
-            ));
-        }
+        super::logout_authentication(Arc::clone(&self.runtime), &self.registry).await?;
         Ok(wire::LogoutAuthResponse::new())
+    }
+
+    fn publish_session(
+        &self,
+        admission: u64,
+        publication: PendingSessionPublication,
+        commit: impl FnOnce() -> Result<(), AcpRuntimeError>,
+    ) -> Result<(), SessionPublicationError> {
+        let mut sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
+        self.registry
+            .register_v2(
+                admission,
+                publication.token,
+                publication.interrupt,
+                publication.close,
+                publication.actor,
+                publication.completed,
+            )
+            .map_err(|()| SessionPublicationError::AdmissionClosed)?;
+        if let Err(error) = commit() {
+            self.registry.remove(publication.token);
+            return Err(SessionPublicationError::Commit(error));
+        }
+        sessions.insert(publication.session_id, publication.session);
+        Ok(())
     }
 
     fn remove_session(&self, session_id: &wire::SessionId, token: u64) {
@@ -825,39 +854,18 @@ impl Server {
                 }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
-        if self
-            .registry
-            .register_v2(
-                admission,
+        // Registration, durable identity commit, and local publication are one
+        // critical section so logout cannot reopen admission around a dead actor.
+        let publication = self.publish_session(
+            admission,
+            PendingSessionPublication {
                 token,
                 interrupt,
                 close,
-                actor_task.abort_handle(),
-                completion,
-            )
-            .is_err()
-        {
-            drop(activation);
-            actor_task.abort();
-            let _ = actor_task.await;
-            return Err(AcpRuntimeError::ClientClosed);
-        }
-        if let Err(error) = claim.commit() {
-            self.registry.remove(token);
-            drop(activation);
-            actor_task.abort();
-            let _ = actor_task.await;
-            return Err(error);
-        }
-        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-            session_id: session_id.to_string(),
-        });
-        self.sessions
-            .lock()
-            .expect("ACP v2 session map poisoned")
-            .insert(
-                session_id.clone(),
-                SessionHandle {
+                actor: actor_task.abort_handle(),
+                completed: completion,
+                session_id: session_id.clone(),
+                session: SessionHandle {
                     token,
                     commands: tx,
                     integration: handle,
@@ -866,7 +874,21 @@ impl Server {
                     structured_completion,
                     tasks,
                 },
-            );
+            },
+            || claim.commit(),
+        );
+        if let Err(error) = publication {
+            drop(activation);
+            actor_task.abort();
+            let _ = actor_task.await;
+            return Err(match error {
+                SessionPublicationError::AdmissionClosed => AcpRuntimeError::ClientClosed,
+                SessionPublicationError::Commit(error) => error,
+            });
+        }
+        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        });
         drop(actor_task);
         Ok(AttachedSession {
             session_id,
@@ -2092,7 +2114,10 @@ pub(crate) fn component(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::atomic::AtomicUsize};
+    use std::{
+        collections::VecDeque,
+        sync::{atomic::AtomicUsize, mpsc as std_mpsc},
+    };
 
     use serde_json::json;
 
@@ -3387,6 +3412,101 @@ mod tests {
             assert_eq!(data["methodId"], method_id);
             assert_eq!(data["detail"], expected_detail);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logout_reset_waits_for_registered_session_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = Arc::new(Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        ));
+        let session_id = wire::SessionId::new("publishing-session");
+        let integration = server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("publishing-session"),
+                RecordingSink::default(),
+            ))
+            .unwrap();
+        let token = registry.next_token();
+        let (completed, completion) = watch::channel(false);
+        let release = Arc::new(Notify::new());
+        let actor_release = Arc::clone(&release);
+        let dropping = Arc::new(Notify::new());
+        let actor_dropping = Arc::clone(&dropping);
+        let guard = ActorGuard {
+            server: Arc::downgrade(&server),
+            registry: registry.clone(),
+            session_id: session_id.clone(),
+            token,
+            completed,
+        };
+        let actor_task = tokio::spawn(async move {
+            let _guard = guard;
+            actor_release.notified().await;
+            actor_dropping.notify_one();
+        });
+        let close_release = Arc::clone(&release);
+        let close = Arc::new(move || {
+            let close_release = Arc::clone(&close_release);
+            Box::pin(async move { close_release.notify_one() })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+        let admission = registry.begin_attachment().unwrap();
+        let actor_abort = actor_task.abort_handle();
+        let (commands, _received) = mpsc::channel(1);
+        let (registered, registered_rx) = std_mpsc::channel();
+        let (continue_publication, continue_publication_rx) = std_mpsc::channel();
+        let publisher_server = Arc::clone(&server);
+        let published_session_id = session_id.clone();
+        let publisher = tokio::task::spawn_blocking(move || {
+            publisher_server.publish_session(
+                admission,
+                PendingSessionPublication {
+                    token,
+                    interrupt: Arc::new(|| {}),
+                    close,
+                    actor: actor_abort,
+                    completed: completion,
+                    session_id: published_session_id,
+                    session: SessionHandle {
+                        token,
+                        commands,
+                        integration,
+                        busy: Arc::new(AtomicBool::new(false)),
+                        background_jobs: BackgroundJobs::default(),
+                        structured_completion: false,
+                        tasks: AsyncTaskManager::new().handle(),
+                    },
+                },
+                || {
+                    registered.send(()).unwrap();
+                    continue_publication_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        tokio::task::spawn_blocking(move || registered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let reset_registry = registry.clone();
+        let mut reset = tokio::spawn(async move { reset_registry.reset_authentication().await });
+        dropping.notified().await;
+        assert!(
+            timeout(Duration::from_millis(20), &mut reset)
+                .await
+                .is_err()
+        );
+        continue_publication.send(()).unwrap();
+
+        publisher.await.unwrap().unwrap();
+        assert!(reset.await.unwrap());
+        actor_task.await.unwrap();
+        assert!(!server.sessions.lock().unwrap().contains_key(&session_id));
     }
 
     #[tokio::test]

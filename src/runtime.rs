@@ -544,8 +544,8 @@ impl Runtime {
 
     pub(crate) fn supports_terminal_authentication(&self) -> bool {
         self.credential_storage.is_persistent()
-            && self.openrouter_api_key.is_none()
-            && !self.ambient_openrouter_api_key
+            && (self.provider != ProviderKind::OpenRouter
+                || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
     }
 
     pub(crate) fn logout_authentication(&self) -> Result<(), String> {
@@ -555,19 +555,25 @@ impl Runtime {
                     .into(),
             );
         }
-        for provider in [
+        let failures = [
             ProviderKind::OpenAiSubscription,
             ProviderKind::OpenRouter,
             ProviderKind::Speakeasy,
-        ] {
-            crate::provider::execute_provider_logout(
-                provider,
-                &self.credential_storage,
-                true,
-                None,
-            )?;
+        ]
+        .into_iter()
+        .filter_map(|provider| {
+            crate::provider::execute_provider_logout(provider, &self.credential_storage, true, None)
+                .err()
+        })
+        .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not remove all provider credentials: {}",
+                failures.join("; ")
+            ))
         }
-        Ok(())
     }
 
     /// Sets private immediate-parent context inherited by this runtime's direct children.
