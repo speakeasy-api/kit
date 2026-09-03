@@ -3,7 +3,7 @@
 use agentkit_loop::{MessageCapture, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol as OtlpProtocol, WithExportConfig as _};
-use std::{fmt, str::FromStr, sync::mpsc, thread, time::Duration};
+use std::{fmt, mem::ManuallyDrop, str::FromStr, sync::mpsc, thread, time::Duration};
 use tracing_subscriber::{
     Layer as _,
     filter::{LevelFilter, Targets},
@@ -209,9 +209,12 @@ fn shutdown_provider_with_timeout(
     timeout: Duration,
 ) -> Result<(), String> {
     let (sender, receiver) = mpsc::sync_channel(1);
+    // A failed spawn must leak the provider because dropping it here can block past the timeout.
+    let provider = ManuallyDrop::new(provider);
     let shutdown = thread::Builder::new()
         .name("kit-otel-shutdown".into())
         .spawn(move || {
+            let provider = ManuallyDrop::into_inner(provider);
             let _ = sender.send(provider.shutdown_with_timeout(timeout));
         })
         .map_err(|error| format!("could not start OpenTelemetry shutdown: {error}"))?;
