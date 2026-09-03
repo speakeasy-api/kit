@@ -436,7 +436,7 @@ jobs:
           release-kit/kit prompt \
             --root "$GITHUB_WORKSPACE" \
             --provider openrouter \
-            --model z-ai/glm-5.3 \
+            --model anthropic/claude-sonnet-5 \
             "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
             > kit-output.txt
           sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
