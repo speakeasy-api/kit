@@ -23,6 +23,16 @@ The catalog requires an existing directory and is workspace-filtered and newest-
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 
+## When transcript storage is full
+
+If an open session's transcript append or sync fails because the disk is full or a quota is exceeded, Kit rolls back the failed append and warns on stderr. Provided rollback succeeds, the session continues with subsequent transcript changes held only in memory. Permission errors, lost locks, and rollback failures still stop the mutation rather than bypassing storage integrity checks.
+
+**Memory-only changes are not durable.** They are lost when the session closes or the process exits, and do not appear in disk-based session listings or resumed sessions. Freeing disk space does not automatically flush them: the affected writer stays memory-only to avoid gaps in the saved history. Save any needed content separately before closing or switching sessions.
+
+The fallback shares a 64 MiB allocation budget across session writers in one process. If that budget is exhausted or a fallback allocation fails, Kit makes a best-effort terminal restore, reports the loss of unsaved records on stderr, and exits with status 1 instead of panicking. This does not protect against unrelated out-of-memory failures elsewhere in the process.
+
+This fallback covers transcript records after initial session setup has completed. Session creation, migration, credential storage, configuration, and output artifacts can still report disk-space errors.
+
 ## TUI keys, prompt editing, and navigation
 
 | Key or input | Action |

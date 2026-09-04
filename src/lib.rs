@@ -13,6 +13,7 @@ pub mod protocols;
 pub mod provider;
 pub mod runtime;
 pub mod session;
+mod storage;
 pub mod telemetry;
 pub mod tools;
 pub mod transcript;

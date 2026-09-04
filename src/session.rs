@@ -85,6 +85,11 @@ struct Writer {
     file: File,
     lock: SessionLock,
     created: Option<CreatedTranscript>,
+    // Once degraded, the on-disk prefix is never appended to again.
+    memory: Option<crate::storage::MemoryBuffer>,
+    allow_memory: bool,
+    #[cfg(test)]
+    append_failure: Option<(usize, io::ErrorKind)>,
 }
 
 struct SessionLock {
@@ -380,6 +385,10 @@ fn open_with_initial_timestamps_in(
         file,
         lock,
         created,
+        memory: None,
+        allow_memory: false,
+        #[cfg(test)]
+        append_failure: None,
     };
     if resume && stored_workspace.is_none() {
         writer.replace(&transcript)?;
@@ -410,6 +419,9 @@ fn open_with_initial_timestamps_in(
     if initial_options.commit_creation {
         writer.commit_creation();
     }
+    // Opening/repairing and cloning a session must still establish durable
+    // history. Degradation is limited to subsequent active-session mutations.
+    writer.allow_memory = true;
     Ok(OpenSession {
         transcript,
         observer: SessionObserver(Arc::new(Mutex::new(writer))),
@@ -424,9 +436,10 @@ impl SessionObserver {
             .commit_creation();
     }
 
-    /// Durably records a complete transcript replacement produced by a mutator.
+    /// Records a complete transcript replacement produced by a mutator.
     /// Existing append records remain intact, while readers treat this record as
-    /// a new canonical snapshot.
+    /// a new canonical snapshot. After a capacity failure, replacements share
+    /// the writer's memory-only tail rather than claiming disk durability.
     pub fn replace(&self, transcript: &[Item]) -> Result<(), String> {
         if transcript.is_empty() {
             return Err("cannot persist an empty transcript replacement".into());
@@ -443,8 +456,8 @@ impl TranscriptObserver for SessionObserver {
         let mut writer = self.0.lock().expect("session transcript writer poisoned");
         if let Err(error) = writer.append(event.item) {
             // The loop invokes observers before committing the item in memory.
-            // Refusing that mutation is safer than continuing with history that
-            // was not durably recorded and cannot be resumed faithfully.
+            // Capacity failures use bounded volatile storage. Other failures
+            // still refuse the mutation rather than bypassing integrity checks.
             panic!("session persistence failed: {error}");
         }
     }
@@ -470,16 +483,7 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| "session generation overflowed".to_string())?;
-        let record = Record {
-            schema_version: SCHEMA_VERSION,
-            session_id: self.session_id.clone(),
-            generation,
-            workspace_root: Some(self.workspace_root.clone()),
-            item: Some(item.clone()),
-            replacement: None,
-            redirect: None,
-        };
-        self.write_record(record, generation)
+        self.write_record(Some(item), None, generation)
     }
 
     fn replace(&mut self, transcript: &[Item]) -> Result<(), String> {
@@ -488,33 +492,109 @@ impl Writer {
             .generation
             .checked_add(1)
             .ok_or_else(|| "session generation overflowed".to_string())?;
-        let record = Record {
-            schema_version: SCHEMA_VERSION,
-            session_id: self.session_id.clone(),
-            generation,
-            workspace_root: Some(self.workspace_root.clone()),
-            item: None,
-            replacement: Some(transcript.to_vec()),
-            redirect: None,
-        };
-        self.write_record(record, generation)
+        self.write_record(None, Some(transcript), generation)
     }
 
-    fn write_record(&mut self, record: Record, generation: u64) -> Result<(), String> {
-        // Encode before touching the append-only file, so serialization
-        // failures can never leave a partial JSON record behind.
-        let mut encoded = serde_json::to_vec(&record)
+    fn write_record(
+        &mut self,
+        item: Option<&Item>,
+        replacement: Option<&[Item]>,
+        generation: u64,
+    ) -> Result<(), String> {
+        // Borrow replacements rather than cloning the entire transcript before
+        // the fallible writer has a chance to enforce its budget.
+        #[derive(Serialize)]
+        struct AppendRecord<'a> {
+            schema_version: u32,
+            session_id: &'a str,
+            generation: u64,
+            workspace_root: &'a Path,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            item: Option<&'a Item>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            replacement: Option<&'a [Item]>,
+        }
+        let record = AppendRecord {
+            schema_version: SCHEMA_VERSION,
+            session_id: &self.session_id,
+            generation,
+            workspace_root: &self.workspace_root,
+            item,
+            replacement,
+        };
+        if self.memory.is_none() {
+            // Encode before touching disk; only append/sync capacity errors
+            // permit degradation, not serialization or metadata failures.
+            let mut encoded = serde_json::to_vec(&record)
+                .map_err(|error| format!("could not encode transcript record: {error}"))?;
+            encoded.push(b'\n');
+            let offset = self
+                .file
+                .metadata()
+                .map_err(|error| format!("could not inspect transcript length: {error}"))?
+                .len();
+            #[cfg(test)]
+            let result = if let Some((bytes, kind)) = self.append_failure.take() {
+                self.file
+                    .write_all(&encoded[..bytes.min(encoded.len())])
+                    .and_then(|_| Err(io::Error::from(kind)))
+            } else {
+                self.file
+                    .write_all(&encoded)
+                    .and_then(|_| self.file.sync_data())
+            };
+            #[cfg(not(test))]
+            let result = self
+                .file
+                .write_all(&encoded)
+                .and_then(|_| self.file.sync_data());
+            if let Err(error) = result {
+                // Sync failure can leave a complete record, not just a partial
+                // write. Remove either before accepting the memory-only tail.
+                self.file.set_len(offset).map_err(|rollback| {
+                    format!("could not roll back transcript append after {error}: {rollback}")
+                })?;
+                if !self.allow_memory || !crate::storage::is_capacity_error(&error) {
+                    return Err(format!("could not persist transcript record: {error}"));
+                }
+                // Sync itself may be failing: truncation restores the logical
+                // prefix, but its crash durability cannot be promised here.
+                self.memory = Some(crate::storage::MemoryBuffer::default());
+                let _ = io::stderr().write_all(
+                    b"kit: session storage is full; subsequent transcript changes are memory-only and will be lost when the session closes.\n",
+                );
+            } else {
+                self.generation = generation;
+                return Ok(());
+            }
+        }
+        // Validate without retaining bytes before mutating the memory log. A
+        // rejected timestamp/serialization must not leave a partial record if
+        // a caller handles the error and attempts another replacement.
+        serde_json::to_writer(io::sink(), &record)
             .map_err(|error| format!("could not encode transcript record: {error}"))?;
-        encoded.push(b'\n');
-        self.file
-            .write_all(&encoded)
-            .and_then(|_| self.file.sync_data())
-            .map_err(|error| format!("could not persist transcript record: {error}"))?;
+        let mut memory = self
+            .memory
+            .as_mut()
+            .expect("memory fallback initialized")
+            .writer_or_exit();
+        // Handle allocation refusal inside the writer, before serde_json can
+        // allocate a boxed I/O error while the allocator may be exhausted.
+        serde_json::to_writer(&mut memory, &record)
+            .map_err(|error| format!("could not encode transcript record: {error}"))?;
+        if memory.write_all(b"\n").is_err() {
+            crate::storage::exit_exhausted();
+        }
         self.generation = generation;
         Ok(())
     }
 
     fn ensure_lock(&mut self) -> Result<(), String> {
+        if self.memory.is_some() {
+            // Never reconstruct disk history from a prefix missing the memory
+            // tail, nor fabricate authority if the degraded writer loses its lock.
+            return self.lock.check().map_err(|error| error.to_string());
+        }
         match self.lock.check() {
             Ok(()) => {
                 if self.path.try_exists().map_err(|error| {
@@ -1899,6 +1979,166 @@ mod tests {
     use super::*;
     use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
     use serde_json::json;
+
+    #[test]
+    fn capacity_append_fallback_rolls_back_and_preserves_generations() {
+        // A short write and a sync failure (all bytes written) must both leave
+        // exactly the original disk prefix, including for quota exhaustion.
+        for kind in [io::ErrorKind::StorageFull, io::ErrorKind::QuotaExceeded] {
+            for bytes in [7, usize::MAX] {
+                let root = tempfile::tempdir().unwrap();
+                let opened = open(
+                    root.path(),
+                    "fallback",
+                    false,
+                    false,
+                    vec![Item::text(ItemKind::System, "system")],
+                )
+                .unwrap();
+                let mut writer = opened.observer.0.lock().unwrap();
+                let prefix = fs::read(&writer.path).unwrap();
+                let item = Item::text(ItemKind::User, "memory").with_created_at(Timestamp(123));
+                writer.append_failure = Some((bytes, kind));
+                writer.append(&item).unwrap();
+                assert_eq!(writer.generation, 2);
+                writer.replace(std::slice::from_ref(&item)).unwrap();
+                writer.append(&item).unwrap();
+                assert_eq!(writer.generation, 4);
+                assert_eq!(fs::read(&writer.path).unwrap(), prefix);
+                let records: Vec<Record> = writer
+                    .memory
+                    .as_ref()
+                    .unwrap()
+                    .as_slice()
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    records
+                        .iter()
+                        .map(|record| record.generation)
+                        .collect::<Vec<_>>(),
+                    vec![2, 3, 4]
+                );
+                assert!(records[0].item.is_some());
+                assert_eq!(records[1].replacement.as_ref().unwrap().len(), 1);
+                assert!(records[1].item.is_none());
+                assert!(records[2].item.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn observer_accepts_capacity_failure_without_panicking() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "observer",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        opened.observer.0.lock().unwrap().append_failure = Some((7, io::ErrorKind::StorageFull));
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("observer"),
+            item: &Item::text(ItemKind::User, "still running").with_created_at(Timestamp(123)),
+        });
+        let writer = opened.observer.0.lock().unwrap();
+        assert_eq!(writer.generation, 2);
+        assert!(writer.memory.is_some());
+        assert_eq!(read_records(&writer.path, "observer").unwrap().1, 1);
+    }
+
+    #[test]
+    fn non_capacity_append_errors_never_enable_memory_fallback() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+            for bytes in [7, usize::MAX] {
+                let root = tempfile::tempdir().unwrap();
+                let opened = open(
+                    root.path(),
+                    "failure",
+                    false,
+                    false,
+                    vec![Item::text(ItemKind::System, "system")],
+                )
+                .unwrap();
+                let mut writer = opened.observer.0.lock().unwrap();
+                let prefix = fs::read(&writer.path).unwrap();
+                writer.append_failure = Some((bytes, kind));
+                assert!(
+                    writer
+                        .append(
+                            &Item::text(ItemKind::User, "refused").with_created_at(Timestamp(123))
+                        )
+                        .is_err()
+                );
+                assert!(writer.memory.is_none());
+                assert_eq!(writer.generation, 1);
+                assert_eq!(fs::read(&writer.path).unwrap(), prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn capacity_fallback_does_not_relax_startup_or_rollback_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "startup",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let mut writer = opened.observer.0.lock().unwrap();
+        let prefix = fs::read(&writer.path).unwrap();
+        let item = Item::text(ItemKind::User, "refused").with_created_at(Timestamp(123));
+        writer.allow_memory = false;
+        writer.append_failure = Some((7, io::ErrorKind::StorageFull));
+        assert!(writer.append(&item).is_err());
+        assert!(writer.memory.is_none());
+        assert_eq!(fs::read(&writer.path).unwrap(), prefix);
+        writer.allow_memory = true;
+        // A read-only handle deterministically rejects truncation. Inject the
+        // capacity error before writing to exercise failed rollback itself.
+        writer.file = File::open(&writer.path).unwrap();
+        writer.append_failure = Some((0, io::ErrorKind::StorageFull));
+        assert!(writer.append(&item).unwrap_err().contains("roll back"));
+        assert!(writer.memory.is_none());
+        assert_eq!(writer.generation, 1);
+    }
+
+    #[test]
+    fn memory_fallback_preserves_validation_and_lock_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "locks",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let mut writer = opened.observer.0.lock().unwrap();
+        let item = Item::text(ItemKind::User, "memory").with_created_at(Timestamp(123));
+        writer.append_failure = Some((7, io::ErrorKind::StorageFull));
+        writer.append(&item).unwrap();
+        let memory_len = writer.memory.as_ref().unwrap().as_slice().len();
+        assert!(
+            writer
+                .append(&Item::text(ItemKind::User, "no timestamp"))
+                .is_err()
+        );
+        // Alter the expected token instead of unlinking an OS-locked file,
+        // which Windows correctly forbids.
+        writer.lock.token.push_str("-no-longer-owner");
+        assert!(writer.append(&item).is_err());
+        assert!(writer.replace(std::slice::from_ref(&item)).is_err());
+        assert_eq!(writer.generation, 2);
+        assert_eq!(writer.memory.as_ref().unwrap().as_slice().len(), memory_len);
+    }
 
     fn session_directory(root: &Path) -> PathBuf {
         root.join("sessions")

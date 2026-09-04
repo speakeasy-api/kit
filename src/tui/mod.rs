@@ -2050,6 +2050,15 @@ async fn bounded_graceful_close<T>(
     }
 }
 
+/// Restore terminal state before the allocation-free storage failure exit.
+pub(crate) fn restore_after_storage_failure() {
+    if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        restore_modes();
+        let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
+        let _ = ratatui::try_restore();
+    }
+}
+
 fn leave(terminal: &mut DefaultTerminal) {
     restore_modes();
     let _ = terminal.show_cursor();
