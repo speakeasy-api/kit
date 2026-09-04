@@ -289,7 +289,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
                 .context_windows
                 .get(&self.config.model)
                 .copied(),
-            model: self.config.model.clone(),
             authentication_binding,
         })
     }
@@ -302,7 +301,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
 pub struct OpenAiSubscriptionSession {
     inner: OpenAIResponsesSession,
     context_window: Option<u64>,
-    model: String,
     authentication_binding: String,
 }
 
@@ -314,7 +312,7 @@ impl ModelSession for OpenAiSubscriptionSession {
         mut request: TurnRequest,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        migrate_legacy_continuations(&mut request, &self.model, &self.authentication_binding)?;
+        migrate_legacy_continuations(&mut request, &self.authentication_binding)?;
         let normalization_cancellation = cancellation.clone();
         let request = tokio::task::spawn_blocking(move || {
             normalize_openai_images(request, normalization_cancellation.as_ref())
@@ -712,7 +710,6 @@ fn legacy_continuation_matches_authentication(
 
 fn migrate_legacy_continuations(
     request: &mut TurnRequest,
-    model: &str,
     authentication_binding: &str,
 ) -> Result<(), LoopError> {
     let session_id = request.session_id.to_string();
@@ -723,10 +720,8 @@ fn migrate_legacy_continuations(
             else {
                 continue;
             };
-            discard_incompatible_continuations(metadata, model, &session_id);
             migrate_legacy_continuation(
                 metadata,
-                model,
                 &session_id,
                 authentication_binding,
                 expected_kind,
@@ -746,30 +741,8 @@ fn continuation_metadata_mut(part: &mut Part) -> Option<(&mut MetadataMap, &'sta
     }
 }
 
-fn discard_incompatible_continuations(metadata: &mut MetadataMap, model: &str, session_id: &str) {
-    for key in [CONTINUATION_METADATA, LEGACY_CONTINUATION_METADATA] {
-        let incompatible = metadata
-            .get(key)
-            .and_then(Value::as_object)
-            .is_some_and(|value| {
-                value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .is_some_and(|stored| stored != model)
-                    || value
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|stored| stored != session_id)
-            });
-        if incompatible {
-            metadata.remove(key);
-        }
-    }
-}
-
 fn migrate_legacy_continuation(
     metadata: &mut MetadataMap,
-    model: &str,
     session_id: &str,
     authentication_binding: &str,
     expected_kind: &str,
@@ -789,7 +762,6 @@ fn migrate_legacy_continuation(
     if object.len() != expected_len
         || object.get("schema_version").and_then(Value::as_u64) != Some(1)
         || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(model)
         || object.get("session_id").and_then(Value::as_str) != Some(session_id)
         || object.get("output_index").and_then(Value::as_u64).is_none()
     {
@@ -797,6 +769,7 @@ fn migrate_legacy_continuation(
             "legacy Responses continuation metadata binding is invalid",
         ));
     }
+    let model = bounded_legacy_string(object.get("model"), "legacy model")?;
     let account_binding = object
         .get("account_binding")
         .and_then(Value::as_object)
@@ -1174,36 +1147,6 @@ mod tests {
     }
 
     #[test]
-    fn discards_continuations_bound_to_another_model_or_session() {
-        for continuation in [
-            json!({"model": "gpt-6-astra", "session_id": "session-1"}),
-            json!({"model": "gpt-5.6-sol", "session_id": "session-2"}),
-        ] {
-            let mut metadata = MetadataMap::from([
-                (CONTINUATION_METADATA.into(), continuation.clone()),
-                (LEGACY_CONTINUATION_METADATA.into(), continuation),
-                ("other".into(), json!(true)),
-            ]);
-
-            discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
-
-            assert!(!metadata.contains_key(CONTINUATION_METADATA));
-            assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
-            assert_eq!(metadata["other"], json!(true));
-        }
-
-        let matching = json!({"model": "gpt-5.6-sol", "session_id": "session-1"});
-        let mut metadata = MetadataMap::from([(CONTINUATION_METADATA.into(), matching.clone())]);
-        discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
-        assert_eq!(metadata[CONTINUATION_METADATA], matching);
-
-        let malformed = json!({"model": 7, "session_id": null});
-        let mut metadata = MetadataMap::from([(CONTINUATION_METADATA.into(), malformed.clone())]);
-        discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
-        assert_eq!(metadata[CONTINUATION_METADATA], malformed);
-    }
-
-    #[test]
     fn migrates_legacy_continuation_before_agentkit_encoding() {
         let digest = "a".repeat(64);
         let binding = format!("openai-chatgpt-v1:{digest}:generation-1");
@@ -1220,17 +1163,30 @@ mod tests {
             "output_index": 0,
             "kind": "function_call",
         });
+        for (field, value) in [
+            ("model", json!(null)),
+            ("model", json!("")),
+            ("session_id", json!("other-session")),
+        ] {
+            let mut malformed = legacy.clone();
+            malformed[field] = value;
+            let mut metadata =
+                MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), malformed)]);
+            assert!(
+                migrate_legacy_continuation(
+                    &mut metadata,
+                    "session-1",
+                    &binding,
+                    "function_call",
+                    false,
+                )
+                .is_err()
+            );
+        }
         let mut metadata = MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), legacy)]);
 
-        migrate_legacy_continuation(
-            &mut metadata,
-            "gpt-5.4",
-            "session-1",
-            &binding,
-            "function_call",
-            false,
-        )
-        .unwrap();
+        migrate_legacy_continuation(&mut metadata, "session-1", &binding, "function_call", false)
+            .unwrap();
 
         assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
         assert_eq!(metadata[CONTINUATION_METADATA]["schema_version"], 3);
@@ -1239,6 +1195,7 @@ mod tests {
             binding
         );
         assert_eq!(metadata[CONTINUATION_METADATA]["item_id"], "item-1");
+        assert_eq!(metadata[CONTINUATION_METADATA]["model"], "gpt-5.4");
     }
 
     #[test]
