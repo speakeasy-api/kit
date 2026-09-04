@@ -35,7 +35,7 @@ use super::{
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
-const MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
+const MODEL_CATALOG_CLIENT_VERSION: &str = "0.153.3";
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 1_000;
 const MAX_CATALOG_MODEL_ID_BYTES: usize = 128;
