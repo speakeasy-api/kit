@@ -4,10 +4,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use fff_search::{
-    FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, ParserConfig,
-    QueryParser,
-};
+use ignore::{WalkBuilder, WalkState};
+use neo_frizbee::{Config, match_list, match_list_indices};
 use serde::{Deserialize, Serialize};
 
 const MAX_RESULTS: usize = 100;
@@ -19,45 +17,12 @@ pub struct FileMatch {
 }
 
 pub struct WorkspaceFileSearch {
-    picker: FilePicker,
+    files: Vec<String>,
 }
 
 pub struct WorkspaceFileSearchState {
     activation: u64,
     search: WorkspaceFileSearch,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LiteralPathConfig;
-
-impl ParserConfig for LiteralPathConfig {
-    fn enable_glob(&self) -> bool {
-        false
-    }
-
-    fn enable_extension(&self) -> bool {
-        false
-    }
-
-    fn enable_exclude(&self) -> bool {
-        false
-    }
-
-    fn enable_path_segments(&self) -> bool {
-        false
-    }
-
-    fn enable_type_filter(&self) -> bool {
-        false
-    }
-
-    fn enable_git_status(&self) -> bool {
-        false
-    }
-
-    fn enable_location(&self) -> bool {
-        false
-    }
 }
 
 impl WorkspaceFileSearch {
@@ -68,72 +33,133 @@ impl WorkspaceFileSearch {
                 root.display()
             ));
         }
-        let base_path = root
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "workspace root is not valid UTF-8".to_string())?;
-        let mut picker = FilePicker::new(FilePickerOptions {
-            base_path,
-            mode: FFFMode::Ai,
-            watch: false,
-            enable_home_dir_scanning: true,
-            ..FilePickerOptions::default()
-        })
-        .map_err(|error| format!("could not start workspace file index: {error}"))?;
-        // The synchronous path-only scan avoids fff-search's background
-        // content-classification pass and cannot overlap a replacement scan.
-        picker
-            .collect_files()
-            .map_err(|error| format!("could not scan workspace files: {error}"))?;
-        Ok(Self { picker })
+        if root.parent().is_none() {
+            return Err(format!(
+                "refusing to index filesystem root: {}",
+                root.display()
+            ));
+        }
+        if root.to_str().is_none() {
+            return Err("workspace root is not valid UTF-8".to_string());
+        }
+
+        let is_git_repo = root
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists());
+        let mut builder = WalkBuilder::new(&root);
+        builder
+            .hidden(!is_git_repo)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .ignore(true)
+            .follow_links(false)
+            .filter_entry(|entry| entry.file_name() != ".git");
+
+        let files = Mutex::new(Vec::new());
+        let scan_error = Mutex::new(None);
+        builder.build_parallel().run(|| {
+            let files = &files;
+            let scan_error = &scan_error;
+            let root = &root;
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(entry) if entry.error().is_none() => entry,
+                    result => {
+                        let error = match result {
+                            Ok(entry) => entry.error().expect("entry has an error").to_string(),
+                            Err(error) => error.to_string(),
+                        };
+                        scan_error
+                            .lock()
+                            .expect("scan error mutex poisoned")
+                            .get_or_insert(error);
+                        return WalkState::Quit;
+                    }
+                };
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    return WalkState::Continue;
+                }
+                let Ok(relative) = entry.path().strip_prefix(root) else {
+                    return WalkState::Continue;
+                };
+                let relative_path = relative
+                    .iter()
+                    .map(|part| part.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files
+                    .lock()
+                    .expect("file list mutex poisoned")
+                    .push(relative_path);
+                WalkState::Continue
+            })
+        });
+        if let Some(error) = scan_error
+            .into_inner()
+            .map_err(|error| format!("could not collect workspace scan error: {error}"))?
+        {
+            return Err(format!("could not scan workspace files: {error}"));
+        }
+        let mut files = files
+            .into_inner()
+            .map_err(|error| format!("could not collect workspace files: {error}"))?;
+        files.sort_unstable();
+        Ok(Self { files })
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<FileMatch>, String> {
-        let picker = &self.picker;
-        let parsed = QueryParser::new(LiteralPathConfig).parse(query);
-        let results = picker.fuzzy_search(
-            &parsed,
-            None,
-            FuzzySearchOptions {
-                pagination: PaginationArgs {
-                    offset: 0,
-                    limit: MAX_RESULTS,
-                },
-                ..FuzzySearchOptions::default()
-            },
-        );
+        if query.is_empty() {
+            return Ok(self
+                .files
+                .iter()
+                .take(MAX_RESULTS)
+                .cloned()
+                .map(|relative_path| FileMatch {
+                    relative_path,
+                    match_byte_offsets: Vec::new(),
+                })
+                .collect());
+        }
 
-        Ok(results
-            .items
+        let config = Config {
+            max_typos: Some((query.len() as u16 / 4).clamp(2, 6)),
+            ..Config::default()
+        };
+        let candidates: Vec<_> = match_list(query, &self.files, &config)
             .into_iter()
-            .zip(results.match_byte_offsets)
-            .map(|(item, offsets)| {
-                let relative_path = item.relative_path(picker);
-                let mut match_byte_offsets: Vec<_> = offsets
-                    .into_iter()
-                    .filter_map(|(start, end)| {
-                        let range = start as usize..end as usize;
-                        (range.start < range.end
-                            && relative_path.is_char_boundary(range.start)
-                            && relative_path.is_char_boundary(range.end))
-                        .then_some(range)
-                    })
+            .take(MAX_RESULTS)
+            .filter_map(|matched| self.files.get(matched.index as usize))
+            .map(String::as_str)
+            .collect();
+
+        Ok(match_list_indices(query, &candidates, &config)
+            .into_iter()
+            .filter_map(|matched| {
+                let relative_path = candidates.get(matched.index as usize)?.to_string();
+                let char_byte_ranges: Vec<_> = relative_path
+                    .char_indices()
+                    .map(|(start, character)| (start, start + character.len_utf8()))
                     .collect();
-                match_byte_offsets.sort_by_key(|range| (range.start, range.end));
-                let mut normalized: Vec<Range<usize>> = Vec::new();
-                for range in match_byte_offsets {
-                    if let Some(previous) = normalized.last_mut()
-                        && range.start <= previous.end
+                let mut offsets = matched.indices;
+                offsets.sort_unstable();
+                let mut match_byte_offsets: Vec<Range<usize>> = Vec::new();
+                for char_index in offsets {
+                    let Some(&(start, end)) = char_byte_ranges.get(char_index) else {
+                        continue;
+                    };
+                    if let Some(previous) = match_byte_offsets.last_mut()
+                        && start <= previous.end
                     {
-                        previous.end = previous.end.max(range.end);
+                        previous.end = previous.end.max(end);
                     } else {
-                        normalized.push(range);
+                        match_byte_offsets.push(start..end);
                     }
                 }
-                FileMatch {
+                Some(FileMatch {
                     relative_path,
-                    match_byte_offsets: normalized,
-                }
+                    match_byte_offsets,
+                })
             })
             .collect())
     }
@@ -286,6 +312,27 @@ mod tests {
     }
 
     #[test]
+    fn prunes_git_metadata_before_scanning() {
+        let workspace = workspace();
+        // An invalid ignore rule would fail the scan if metadata were traversed.
+        fs::write(workspace.path().join(".git/.ignore"), "[z-a]\n")
+            .expect("write invalid metadata ignore rule");
+        let search = WorkspaceFileSearch::start(workspace.path().to_path_buf())
+            .expect("metadata must not be scanned");
+        assert!(search.files.iter().all(|path| !path.starts_with(".git/")));
+    }
+
+    #[test]
+    fn reports_invalid_ignore_rules() {
+        let workspace = workspace();
+        fs::write(workspace.path().join(".ignore"), "[z-a]\n").expect("write invalid ignore rule");
+        let error = WorkspaceFileSearch::start(workspace.path().to_path_buf())
+            .err()
+            .expect("invalid ignore rule must fail the scan");
+        assert!(error.contains("could not scan workspace files"), "{error}");
+    }
+
+    #[test]
     fn rejects_invalid_roots() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
         let file = workspace.path().join("file");
@@ -293,5 +340,6 @@ mod tests {
 
         assert!(WorkspaceFileSearch::start(file).is_err());
         assert!(WorkspaceFileSearch::start(workspace.path().join("missing")).is_err());
+        assert!(WorkspaceFileSearch::start(PathBuf::from(std::path::MAIN_SEPARATOR_STR)).is_err());
     }
 }
