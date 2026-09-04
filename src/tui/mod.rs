@@ -1109,6 +1109,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 }
             };
             refresh_config_state(&mut app, Some(&config_options));
+            let mut saved_model_default = current_model_choice(Some(&config_options));
             if let Ok(mut active) = transition_session.lock() {
                 active.id = active_session_id.clone();
             }
@@ -1199,13 +1200,26 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         .block_task()
                                         .await?;
                                     session_id = session.session_id;
+                                    let config_options = if let Some(choice) = &saved_model_default {
+                                        connection
+                                            .send_request(SetSessionConfigOptionRequest::new(
+                                                session_id.clone(),
+                                                MODEL_CONFIG_ID,
+                                                choice.id.as_str(),
+                                            ))
+                                            .block_task()
+                                            .await?
+                                            .config_options
+                                    } else {
+                                        session.config_options
+                                    };
                                     let persisted_id = durable_session_id(&session_id).map_err(|error| {
                                         agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
                                     })?;
                                     transition_route(&transition_session, persisted_id.clone());
                                     images.clear();
                                     app.start_session(persisted_id);
-                                    refresh_config_state(&mut app, Some(&session.config_options));
+                                    refresh_config_state(&mut app, Some(&config_options));
                                     if let Some(prompt) = first_prompt {
                                         let outcome = connection
                                             .send_request(wire::PromptRequest::new(
@@ -1385,7 +1399,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             app.note(format!("model changed to {} via {}", choice.model, choice.provider));
                                             if save_defaults {
                                                 match save_model_defaults(&choice) {
-                                                    Ok(()) => app.note("saved model defaults to ~/.kit/config.toml"),
+                                                    Ok(()) => {
+                                                        saved_model_default = Some(choice.clone());
+                                                        app.note("saved model defaults to ~/.kit/config.toml");
+                                                    }
                                                     Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
                                                 }
                                             }

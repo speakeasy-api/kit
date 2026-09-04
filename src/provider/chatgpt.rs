@@ -289,7 +289,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
                 .context_windows
                 .get(&self.config.model)
                 .copied(),
-            model: self.config.model.clone(),
             authentication_binding,
         })
     }
@@ -302,7 +301,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
 pub struct OpenAiSubscriptionSession {
     inner: OpenAIResponsesSession,
     context_window: Option<u64>,
-    model: String,
     authentication_binding: String,
 }
 
@@ -314,7 +312,7 @@ impl ModelSession for OpenAiSubscriptionSession {
         mut request: TurnRequest,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        migrate_legacy_continuations(&mut request, &self.model, &self.authentication_binding)?;
+        migrate_legacy_continuations(&mut request, &self.authentication_binding)?;
         let normalization_cancellation = cancellation.clone();
         let request = tokio::task::spawn_blocking(move || {
             normalize_openai_images(request, normalization_cancellation.as_ref())
@@ -712,7 +710,6 @@ fn legacy_continuation_matches_authentication(
 
 fn migrate_legacy_continuations(
     request: &mut TurnRequest,
-    model: &str,
     authentication_binding: &str,
 ) -> Result<(), LoopError> {
     let session_id = request.session_id.to_string();
@@ -725,7 +722,6 @@ fn migrate_legacy_continuations(
             };
             migrate_legacy_continuation(
                 metadata,
-                model,
                 &session_id,
                 authentication_binding,
                 expected_kind,
@@ -747,7 +743,6 @@ fn continuation_metadata_mut(part: &mut Part) -> Option<(&mut MetadataMap, &'sta
 
 fn migrate_legacy_continuation(
     metadata: &mut MetadataMap,
-    model: &str,
     session_id: &str,
     authentication_binding: &str,
     expected_kind: &str,
@@ -767,7 +762,6 @@ fn migrate_legacy_continuation(
     if object.len() != expected_len
         || object.get("schema_version").and_then(Value::as_u64) != Some(1)
         || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(model)
         || object.get("session_id").and_then(Value::as_str) != Some(session_id)
         || object.get("output_index").and_then(Value::as_u64).is_none()
     {
@@ -775,6 +769,7 @@ fn migrate_legacy_continuation(
             "legacy Responses continuation metadata binding is invalid",
         ));
     }
+    let model = bounded_legacy_string(object.get("model"), "legacy model")?;
     let account_binding = object
         .get("account_binding")
         .and_then(Value::as_object)
@@ -1168,17 +1163,30 @@ mod tests {
             "output_index": 0,
             "kind": "function_call",
         });
+        for (field, value) in [
+            ("model", json!(null)),
+            ("model", json!("")),
+            ("session_id", json!("other-session")),
+        ] {
+            let mut malformed = legacy.clone();
+            malformed[field] = value;
+            let mut metadata =
+                MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), malformed)]);
+            assert!(
+                migrate_legacy_continuation(
+                    &mut metadata,
+                    "session-1",
+                    &binding,
+                    "function_call",
+                    false,
+                )
+                .is_err()
+            );
+        }
         let mut metadata = MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), legacy)]);
 
-        migrate_legacy_continuation(
-            &mut metadata,
-            "gpt-5.4",
-            "session-1",
-            &binding,
-            "function_call",
-            false,
-        )
-        .unwrap();
+        migrate_legacy_continuation(&mut metadata, "session-1", &binding, "function_call", false)
+            .unwrap();
 
         assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
         assert_eq!(metadata[CONTINUATION_METADATA]["schema_version"], 3);
@@ -1187,6 +1195,7 @@ mod tests {
             binding
         );
         assert_eq!(metadata[CONTINUATION_METADATA]["item_id"], "item-1");
+        assert_eq!(metadata[CONTINUATION_METADATA]["model"], "gpt-5.4");
     }
 
     #[test]
