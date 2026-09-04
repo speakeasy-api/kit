@@ -751,6 +751,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             resume_session_id.is_some(),
             force,
         )?;
+        let child_mcp_config = mcp_config.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                crate::resilient_fs::global()
+                    .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
+            }
+            if let Some(path) = child_mcp_config {
+                crate::resilient_fs::global().require_disk(path)?;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await??;
         let auth_invocation = AgentInvocation::from_command(command.as_std());
         detach_from_controlling_terminal(&mut command);
         let mut child = command
@@ -1114,12 +1126,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id.clone());
+            let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
+                        _ = storage_shutdown.cancelled() => return Ok(()),
                         terminal_event = events.next() => {
                             // A paste is a burst: one bracketed-paste event, or
                             // thousands of key events where the terminal cannot
@@ -1398,10 +1412,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             );
                                             app.note(format!("model changed to {} via {}", choice.model, choice.provider));
                                             if save_defaults {
-                                                match save_model_defaults(&choice) {
+                                                let saved = {
+                                                    let choice = choice.clone();
+                                                    tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                                };
+                                                match saved {
                                                     Ok(()) => {
                                                         saved_model_default = Some(choice.clone());
-                                                        app.note("saved model defaults to ~/.kit/config.toml");
+                                                        app.note(config_save_message("model defaults"));
                                                     }
                                                     Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
                                                 }
@@ -1429,9 +1447,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                 "reasoning effort changed to {effort}"
                                             ));
                                             if save_defaults {
-                                                match save_effort_default(&effort) {
+                                                let saved = {
+                                                    let effort = effort.clone();
+                                                    tokio::task::spawn_blocking(move || save_effort_default(&effort)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                                };
+                                                match saved {
                                                     Ok(()) => app.note(
-                                                        "saved reasoning effort default to ~/.kit/config.toml",
+                                                        config_save_message("reasoning effort default"),
                                                     ),
                                                     Err(error) => app.note(format!(
                                                         "reasoning effort changed, but default was not saved: {error}"
@@ -1651,6 +1673,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     }
 }
 
+fn config_save_message(setting: &str) -> String {
+    if crate::resilient_fs::global().status().pending_operations > 0 {
+        format!("updated {setting} in memory; disk persistence is pending (not durable)")
+    } else {
+        format!("saved {setting} to ~/.kit/config.toml")
+    }
+}
+
 fn save_effort_default(effort: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
@@ -1698,9 +1728,7 @@ fn update_config(
     path: &Path,
     update: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
 ) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match crate::resilient_fs::read_to_string(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
@@ -1720,9 +1748,8 @@ fn update_config(
     let parent = path
         .parent()
         .ok_or_else(|| "config path has no parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
-        .write(|file| file.write_all(output.as_bytes()))
+    crate::resilient_fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    crate::resilient_fs::replace(path, output.as_bytes())
         .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
@@ -1941,6 +1968,7 @@ fn enable_tui_modes() {
 }
 
 fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
+    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
     let terminal = ratatui::try_init()?;
     // Query after entering the alternate screen but before the event stream owns
     // terminal input, as required by ratatui-image. The query has a short bound.
@@ -1960,6 +1988,7 @@ fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
 }
 
 fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::ImageRuntime> {
+    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
     let resumed = (|| {
         crossterm::terminal::enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -1973,6 +2002,31 @@ fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::Ima
         ratatui::restore();
     }
     resumed
+}
+
+/// Avoid terminal escape sequences on protocol stdout when no TUI was entered.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort cleanup for actual allocator failure, without command formatting,
+/// terminal queries, panic hooks, or allocating our own buffers. Raw-mode cleanup
+/// still relies on the platform terminal implementation; arbitrary failures in
+/// that implementation cannot be made allocation-safe by this hook.
+pub(crate) fn restore_after_allocation_failure() {
+    use std::io::Write as _;
+
+    if !TERMINAL_ACTIVE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    if ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = stdout.write_all(b"\x1b[<1u");
+    }
+    // Mouse modes, bracketed paste, cursor visibility, then alternate screen.
+    let _ = stdout.write_all(
+        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[?1049l",
+    );
+    let _ = stdout.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 /// Whether the keyboard enhancement flags were pushed and still need popping.
@@ -2050,19 +2104,11 @@ async fn bounded_graceful_close<T>(
     }
 }
 
-/// Restore terminal state before the allocation-free storage failure exit.
-pub(crate) fn restore_after_storage_failure() {
-    if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
-        restore_modes();
-        let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
-        let _ = ratatui::try_restore();
-    }
-}
-
 fn leave(terminal: &mut DefaultTerminal) {
     restore_modes();
     let _ = terminal.show_cursor();
     ratatui::restore();
+    TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 async fn request_resume(

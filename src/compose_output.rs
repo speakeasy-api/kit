@@ -1,9 +1,8 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use agentkit_core::ToolOutput;
 use agentkit_tools_core::ToolError;
 use serde_json::json;
-use tokio::io::AsyncWriteExt as _;
 
 const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -24,22 +23,29 @@ pub(crate) async fn guard(
         return Ok(output);
     }
 
-    let (mut artifact, path) =
-        crate::artifacts::create(&artifact_directory.join("compose-output.json"))
-            .await
-            .map_err(|error| ToolError::Internal(error.to_string()))?;
-    artifact
-        .write_all(body.as_bytes())
-        .await
-        .map_err(|error| ToolError::Internal(error.to_string()))?;
-    artifact
-        .flush()
-        .await
-        .map_err(|error| ToolError::Internal(error.to_string()))?;
-
-    let marker =
-        format!("\n...[compose output spilled: {original_bytes} bytes; see artifact field]...\n");
-    let artifact = path.display().to_string();
+    let body = Arc::new(body);
+    let artifact_body = Arc::clone(&body);
+    let path = artifact_directory.join("compose-output.json");
+    let stored = tokio::task::spawn_blocking(move || {
+        crate::artifacts::write(&path, artifact_body.as_bytes())
+    })
+    .await
+    .map_err(|error| ToolError::Internal(error.to_string()))?;
+    let (artifact, artifact_error) = match stored {
+        Ok(path) => (Some(path.display().to_string()), None),
+        Err(error) => (None, Some(prefix(&error.to_string(), 256).to_owned())),
+    };
+    // Artifact storage must not turn an already-executed tool into a failed
+    // tool call: retrying that call could duplicate its side effects.
+    let marker = if artifact.is_some() {
+        format!(
+            "\n...[compose output spilled: {original_bytes} bytes; read with artifact(path)]...\n"
+        )
+    } else {
+        format!(
+            "\n...[tool completed; output truncated: {original_bytes} bytes; artifact storage failed]...\n"
+        )
+    };
     let mut preview_budget = MAX_MODEL_OUTPUT_BYTES;
     loop {
         let preview = preview(&body, &marker, preview_budget);
@@ -47,6 +53,7 @@ pub(crate) async fn guard(
             "preview": preview,
             "artifact": artifact,
             "original_bytes": original_bytes,
+            "artifact_error": artifact_error,
         });
         let replacement_bytes = serde_json::to_vec(&replacement)
             .map_err(|error| ToolError::Internal(error.to_string()))?

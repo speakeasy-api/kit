@@ -1254,7 +1254,12 @@ impl Server {
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
+        if crate::resilient_fs::shutdown_token().is_cancelled() {
+            return Err(AcpRuntimeError::ClientClosed);
+        }
         let cancellation = CancellationController::new();
+        let shutdown_bridge =
+            crate::runtime::StorageCancellationBridge::new(cancellation.clone(), None);
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
         let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
@@ -1347,6 +1352,7 @@ impl Server {
             completed,
         };
         let actor_task = tokio::spawn(async move {
+            let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
             if activated.await.is_ok() {
                 session_actor(actor).await;
@@ -2156,10 +2162,14 @@ pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    component(runtime, registry)?
-        .connect_to(agent_client_protocol::Stdio::new())
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+    let component = component(runtime, registry.clone())?;
+    let shutdown = crate::resilient_fs::shutdown_token();
+    let result = tokio::select! {
+        result = component.connect_to(agent_client_protocol::Stdio::new()) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
+        _ = shutdown.cancelled() => Ok(()),
+    };
+    registry.shutdown().await;
+    result
 }
 
 async fn serve_transport(

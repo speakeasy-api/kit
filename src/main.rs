@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
     future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use kit::resilient_fs as fs;
 use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
@@ -863,7 +864,9 @@ async fn supervise_serve_with_trigger(
         };
         tokio::pin!(stdio);
         tokio::pin!(termination);
+        let shutdown = fs::shutdown_token();
         tokio::select! {
+            _ = shutdown.cancelled() => Exit::Signal(Ok(())),
             result = &mut stdio => Exit::Stdio(result),
             result = http.join() => Exit::Http(result),
             result = &mut termination => Exit::Signal(result),
@@ -897,16 +900,34 @@ async fn supervise_serve_with_trigger(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    kit::resilient_fs::start_recovery_worker();
+    let result = run().await;
+    // Finish synchronously: a detached task can be terminated with the process,
+    // and timing out spawn_blocking would still make runtime teardown wait.
+    let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
+    // Always attempt recovery, but preserve the original command error. The
+    // recovery helper separately warns if accepted data remains undurable.
+    result?;
+    recovery?;
+    Ok(())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if matches!(&cli.command, Command::Init) {
-        init_default_config()?;
+        tokio::task::spawn_blocking(init_default_config).await??;
+        if fs::global().status().pending_operations > 0 {
+            eprintln!(
+                "Config initialized in memory only; persistence is pending and will not survive process termination."
+            );
+        }
         println!(
             "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
     }
-    let config = Config::load_default()?;
+    let config = tokio::task::spawn_blocking(Config::load_default).await??;
     if let Command::Sessions { action, root } = &cli.command {
         let root = config.root(root.clone());
         match action {
@@ -1210,6 +1231,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
             let _ = config.plugin_runtime(&root).await?;
+            let config_path = config.config_path.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Some(path) = config_path {
+                    fs::global().require_disk(path)?;
+                }
+                Ok::<_, io::Error>(())
+            })
+            .await??;
             kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,

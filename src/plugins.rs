@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
     io::{self, Cursor, Read, Seek, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -19,9 +18,7 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use crate::process_tree::{isolate_process_tree, terminate_process_tree_with_pid};
-
-#[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt;
+use crate::resilient_fs::{self as fs, File, OpenOptions};
 
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
@@ -346,7 +343,7 @@ impl PluginRuntime {
     }
 
     pub(crate) async fn stage(&self) -> Result<StagedPlugins, String> {
-        let contents = match tokio::fs::read_to_string(&self.inner.config_path).await {
+        let contents = match fs::read_to_string(&self.inner.config_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => {
@@ -465,6 +462,7 @@ async fn resolve_with_skill_cache(
     .await
     .map_err(|error| format!("plugin resolver task failed: {error}"))??;
     let mut resolved = resolution.resolved;
+    require_skill_directories(&resolved.skill_directories)?;
     let registry = SkillRegistry::from_skill_dirs(resolved.skill_directories.clone())
         .discover_skills()
         .await;
@@ -538,6 +536,7 @@ async fn stage_with_skill_cache(
             mut resolved,
             source_fingerprint,
         } => {
+            require_skill_directories(&resolved.skill_directories)?;
             let registry = SkillRegistry::from_skill_dirs(resolved.skill_directories.clone())
                 .discover_skills()
                 .await;
@@ -585,7 +584,7 @@ fn resolve_blocking(
                 None => resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root)?,
             },
         };
-        let plugin = AgentPlugin::load(&root).map_err(|error| {
+        let plugin = load_plugin(&root).map_err(|error| {
             format!(
                 "could not load plugin {alias:?} from {}: {error}",
                 root.display()
@@ -606,15 +605,16 @@ fn resolve_blocking(
                     data_dir.display()
                 )
             })?;
-            let data_dir = data_dir.canonicalize().map_err(|error| {
+            let data_dir = fs::canonicalize(&data_dir).map_err(|error| {
                 format!("could not resolve data directory for plugin {alias:?}: {error}")
             })?;
-            if !data_dir.is_dir() {
+            if !fs::metadata(&data_dir).is_ok_and(|metadata| metadata.is_dir()) {
                 return Err(format!(
                     "plugin data path is not a directory: {}",
                     data_dir.display()
                 ));
             }
+            require_plugin_disk(&data_dir)?;
             resolved.mcp_plugins.push(ResolvedPluginMcp {
                 alias: alias.clone(),
                 manifest_name: plugin.manifest().name.clone(),
@@ -639,7 +639,7 @@ fn resolve_blocking(
         skill_cache_root,
     )?;
     for (alias, root, expected) in loaded_generations {
-        let plugin = AgentPlugin::load(&root).map_err(|error| {
+        let plugin = load_plugin(&root).map_err(|error| {
             format!(
                 "could not revalidate plugin {alias:?} from {}: {error}",
                 root.display()
@@ -836,7 +836,7 @@ fn make_tree_read_only(root: &Path) -> Result<(), String> {
     while index < paths.len() {
         let path = paths[index].clone();
         index += 1;
-        if path.is_dir() {
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
             for entry in fs::read_dir(&path).map_err(|error| {
                 format!(
                     "could not inspect plugin snapshot {}: {error}",
@@ -936,7 +936,7 @@ fn collect_skill_inventory(
     inventory: &mut BTreeMap<PathBuf, CachedEntry>,
     captured_bytes: &mut u64,
 ) -> Result<(), String> {
-    let canonical = directory.canonicalize().map_err(|error| {
+    let canonical = fs::canonicalize(directory).map_err(|error| {
         format!(
             "could not resolve plugin skill {}: {error}",
             directory.display()
@@ -1016,7 +1016,7 @@ fn collect_skill_inventory(
             directory.display()
         )
     })?;
-    let canonical_after = directory.canonicalize().map_err(|error| {
+    let canonical_after = fs::canonicalize(directory).map_err(|error| {
         format!(
             "could not re-resolve plugin skill {}: {error}",
             directory.display()
@@ -1042,7 +1042,7 @@ fn capture_snapshot_file(
     inventory: &mut BTreeMap<PathBuf, CachedEntry>,
     captured_bytes: &mut u64,
 ) -> Result<(), String> {
-    let canonical = source.canonicalize().map_err(|error| {
+    let canonical = fs::canonicalize(source).map_err(|error| {
         format!(
             "could not resolve plugin skill {}: {error}",
             source.display()
@@ -1146,70 +1146,16 @@ fn capture_snapshot_file(
     Ok(())
 }
 
-#[cfg(unix)]
 fn open_snapshot_file(package_root: &Path, source: &Path) -> Result<fs::File, String> {
-    use std::{
-        ffi::CString,
-        os::{
-            fd::{AsRawFd, FromRawFd, OwnedFd},
-            unix::ffi::OsStrExt,
-        },
-    };
-
     let relative = source
         .strip_prefix(package_root)
         .map_err(|_| format!("plugin skill is outside its package: {}", source.display()))?;
-    let root = CString::new(package_root.as_os_str().as_bytes())
-        .map_err(|_| "plugin package path contains a NUL byte".to_string())?;
-    // SAFETY: `root` is NUL terminated and the returned descriptor is owned.
-    let descriptor = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    fs::open_beneath(package_root, relative).map_err(|error| {
+        format!(
+            "could not open plugin skill {} without following links: {error}",
+            source.display()
         )
-    };
-    if descriptor < 0 {
-        return Err(format!(
-            "could not open plugin package {} without following links: {}",
-            package_root.display(),
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `descriptor` was returned uniquely by `open` above.
-    let mut current = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    let components = relative.components().collect::<Vec<_>>();
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(component) = component else {
-            return Err(format!("invalid plugin skill path: {}", source.display()));
-        };
-        let component = CString::new(component.as_bytes())
-            .map_err(|_| "plugin skill path contains a NUL byte".to_string())?;
-        let last = index + 1 == components.len();
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | if last { 0 } else { libc::O_DIRECTORY };
-        // SAFETY: both the directory descriptor and component C string are valid.
-        let descriptor = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
-        if descriptor < 0 {
-            return Err(format!(
-                "could not open plugin skill {} without following links: {}",
-                source.display(),
-                io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: `descriptor` was returned uniquely by `openat` above.
-        current = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    }
-    Ok(fs::File::from(current))
-}
-
-#[cfg(not(unix))]
-fn open_snapshot_file(_package_root: &Path, source: &Path) -> Result<fs::File, String> {
-    OpenOptions::new()
-        .read(true)
-        .open(source)
-        .map_err(|error| format!("could not open plugin skill {}: {error}", source.display()))
+    })
 }
 
 fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
@@ -1218,28 +1164,19 @@ fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.modified().ok() == right.modified().ok()
 }
 
-#[cfg(unix)]
 fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
+    // Overlay objects have service identities, not invented physical inode numbers.
+    left.same_identity(right)
 }
 
 #[cfg(windows)]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(windows)]
-fn symlink_kind(file_type: &fs::FileType) -> u8 {
+fn symlink_kind(metadata: &fs::Metadata) -> u8 {
     use std::os::windows::fs::FileTypeExt;
 
+    let Some(metadata) = metadata.disk_metadata() else {
+        return 2;
+    };
+    let file_type = metadata.file_type();
     if file_type.is_symlink_file() {
         0
     } else if file_type.is_symlink_dir() {
@@ -1250,7 +1187,7 @@ fn symlink_kind(file_type: &fs::FileType) -> u8 {
 }
 
 #[cfg(not(windows))]
-fn symlink_kind(_file_type: &fs::FileType) -> u8 {
+fn symlink_kind(_metadata: &fs::Metadata) -> u8 {
     0
 }
 
@@ -1388,7 +1325,7 @@ fn validate_skill_snapshot(
     package_count: usize,
     expected_skills: &BTreeSet<PathBuf>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    let canonical_root = root.canonicalize().map_err(|error| {
+    let canonical_root = fs::canonicalize(root).map_err(|error| {
         format!(
             "could not resolve immutable plugin skill snapshot {}: {error}",
             root.display()
@@ -1399,7 +1336,7 @@ fn validate_skill_snapshot(
     let mut actual_skills = BTreeSet::new();
     for index in 0..package_count {
         let package = root.join(index.to_string());
-        let plugin = AgentPlugin::load(&package).map_err(|error| {
+        let plugin = load_plugin(&package).map_err(|error| {
             format!(
                 "could not validate immutable plugin skill snapshot {}: {error}",
                 package.display()
@@ -1466,6 +1403,28 @@ fn publish_cached_directory(
     }
 }
 
+// These dependencies read disk directly. Do not hand them overlay-only paths.
+fn require_plugin_disk(path: &Path) -> Result<(), String> {
+    fs::require_disk(path).map_err(|error| {
+        format!(
+            "plugin path {} is not available on disk: {error}",
+            path.display()
+        )
+    })
+}
+
+fn load_plugin(root: &Path) -> Result<AgentPlugin, String> {
+    require_plugin_disk(root)?;
+    AgentPlugin::load(root).map_err(|error| error.to_string())
+}
+
+fn require_skill_directories(directories: &[PathBuf]) -> Result<(), String> {
+    for directory in directories {
+        require_plugin_disk(directory)?;
+    }
+    Ok(())
+}
+
 fn validate_plugin_diagnostics(alias: &str, plugin: &AgentPlugin) -> Result<(), String> {
     for diagnostic in plugin.diagnostics() {
         if matches!(diagnostic.kind, PluginDiagnosticKind::UnknownManifestField) {
@@ -1508,7 +1467,7 @@ fn resolve_path(path: &Path, runtime_root: &Path) -> Result<PathBuf, String> {
     } else {
         runtime_root.join(path)
     };
-    path.canonicalize()
+    fs::canonicalize(&path)
         .map_err(|error| format!("could not resolve plugin path {}: {error}", path.display()))
 }
 
@@ -1755,7 +1714,7 @@ fn hash_local_plugin_tree(root: &Path, fingerprint: &mut blake3::Hasher) -> Resu
                 }
             } else if before.file_type().is_symlink() {
                 // Hash the link itself rather than following it outside the package or into a cycle.
-                let before_kind = symlink_kind(&before.file_type());
+                let before_kind = symlink_kind(&before);
                 fingerprint.update(&[2, before_kind]);
                 let target = fs::read_link(&path).map_err(|error| {
                     format!(
@@ -1782,7 +1741,7 @@ fn hash_local_plugin_tree(root: &Path, fingerprint: &mut blake3::Hasher) -> Resu
                     )
                 })?;
                 if !after.file_type().is_symlink()
-                    || symlink_kind(&after.file_type()) != before_kind
+                    || symlink_kind(&after) != before_kind
                     || !same_file_state(&before, &after)
                     || target != target_after
                 {
@@ -1872,6 +1831,7 @@ impl SystemGitRunner {
         request: GitRunRequest<'_>,
         stdout_mode: GitStdout,
     ) -> Result<Vec<u8>, GitFailure> {
+        fs::require_disk(request.cwd).map_err(|error| GitFailure::Unavailable(error.kind()))?;
         let mut command = Command::new("git");
         command
             .args(request.args)
@@ -2406,8 +2366,7 @@ fn resolve_git_local_revision(
     cache_root: &Path,
     runner: &dyn GitRunner,
 ) -> Result<PathBuf, String> {
-    let repository = repository
-        .canonicalize()
+    let repository = fs::canonicalize(repository)
         .map_err(|error| format!("could not resolve test Git repository: {error}"))?;
     let subdir = subdir
         .map(|path| {
@@ -2624,6 +2583,9 @@ impl GitCommandContext<'_> {
         stdout_limit: u64,
         object_store_limit: Option<&Path>,
     ) -> Result<Vec<u8>, String> {
+        require_plugin_disk(cwd)?;
+        require_plugin_disk(self.hooks)?;
+        require_plugin_disk(self.attributes)?;
         let args = hardened_git_args(self.protocol, self.hooks, self.attributes, args);
         let config = hardened_git_config(self.remote);
         self.runner
@@ -2645,6 +2607,9 @@ impl GitCommandContext<'_> {
         args: &[&OsStr],
         destination: &Path,
     ) -> Result<(), String> {
+        require_plugin_disk(cwd)?;
+        require_plugin_disk(self.hooks)?;
+        require_plugin_disk(self.attributes)?;
         let args = hardened_git_args(self.protocol, self.hooks, self.attributes, args);
         let config = hardened_git_config(self.remote);
         self.runner
@@ -3056,7 +3021,7 @@ fn resolve_git_source(
     fs::create_dir(&repository).map_err(|error| error.to_string())?;
     git.archive("archive", &git_dir, &archive_args, &repository)?;
     let candidate = select_git_package_root(&repository, subdir)?;
-    AgentPlugin::load(&candidate).map_err(|error| {
+    load_plugin(&candidate).map_err(|error| {
         format!(
             "invalid Git plugin package at {}: {error}",
             candidate.display()
@@ -3305,20 +3270,19 @@ fn validate_git_cache_entry(
         return Err("Git plugin cache entry is incomplete".into());
     }
     let root = select_git_package_root(&repository_path, subdir)?;
-    AgentPlugin::load(&root)
-        .map_err(|error| format!("invalid cached Git plugin package: {error}"))?;
+    load_plugin(&root).map_err(|error| format!("invalid cached Git plugin package: {error}"))?;
     Ok(root)
 }
 
 fn select_git_package_root(repository: &Path, subdir: Option<&Path>) -> Result<PathBuf, String> {
-    let canonical_repository = repository
-        .canonicalize()
+    let canonical_repository = fs::canonicalize(repository)
         .map_err(|error| format!("could not resolve Git plugin cache: {error}"))?;
     let selected = subdir.map_or_else(|| repository.to_path_buf(), |path| repository.join(path));
-    let selected = selected
-        .canonicalize()
+    let selected = fs::canonicalize(&selected)
         .map_err(|error| format!("could not resolve Git plugin subdir: {error}"))?;
-    if !selected.is_dir() || !selected.starts_with(&canonical_repository) {
+    if !fs::metadata(&selected).is_ok_and(|metadata| metadata.is_dir())
+        || !selected.starts_with(&canonical_repository)
+    {
         return Err("plugin Git subdir escapes the repository".into());
     }
     Ok(selected)
@@ -3365,7 +3329,7 @@ fn resolve_archive(
     publish_cached_directory(&destination, "plugin archive", |staging| {
         extract_archive(&bytes, staging)?;
         let candidate = select_package_root(staging, subdir.as_deref())?;
-        AgentPlugin::load(&candidate).map_err(|error| {
+        load_plugin(&candidate).map_err(|error| {
             format!(
                 "invalid plugin archive package at {}: {error}",
                 candidate.display()
@@ -3439,7 +3403,7 @@ fn publish_cached_file(destination: &Path, bytes: &[u8], context: &str) -> Resul
         .map_err(|error| format!("could not write {context} staging file: {error}"))?;
     let result = match fs::rename(&staging, destination) {
         Ok(()) => Ok(()),
-        Err(_) if destination.is_file() => Ok(()),
+        Err(_) if fs::metadata(destination).is_ok_and(|metadata| metadata.is_file()) => Ok(()),
         Err(error) => Err(format!("could not publish {context}: {error}")),
     };
     let _ = fs::remove_file(staging);
@@ -3740,31 +3704,34 @@ fn write_entry(reader: &mut impl Read, output: &Path, declared_size: u64) -> Res
 }
 
 fn select_package_root(extraction: &Path, subdir: Option<&Path>) -> Result<PathBuf, String> {
-    let base = if extraction.join("plugin.json").is_file() {
-        extraction.to_path_buf()
-    } else {
-        let entries = fs::read_dir(extraction)
-            .map_err(|error| format!("could not inspect extracted plugin: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        if entries.len() != 1 || !entries[0].path().is_dir() {
-            return Err(
-                "plugin archive must contain plugin.json or one top-level directory".into(),
-            );
-        }
-        entries[0].path()
-    };
+    let base =
+        if fs::metadata(extraction.join("plugin.json")).is_ok_and(|metadata| metadata.is_file()) {
+            extraction.to_path_buf()
+        } else {
+            let entries = fs::read_dir(extraction)
+                .map_err(|error| format!("could not inspect extracted plugin: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            if entries.len() != 1
+                || !fs::metadata(entries[0].path()).is_ok_and(|metadata| metadata.is_dir())
+            {
+                return Err(
+                    "plugin archive must contain plugin.json or one top-level directory".into(),
+                );
+            }
+            entries[0].path()
+        };
     let selected = subdir.map_or(base.clone(), |subdir| base.join(subdir));
-    let canonical_base = extraction
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let selected = selected.canonicalize().map_err(|error| {
+    let canonical_base = fs::canonicalize(extraction).map_err(|error| error.to_string())?;
+    let selected = fs::canonicalize(&selected).map_err(|error| {
         format!(
             "could not resolve plugin archive package {}: {error}",
             selected.display()
         )
     })?;
-    if !selected.is_dir() || !selected.starts_with(&canonical_base) {
+    if !fs::metadata(&selected).is_ok_and(|metadata| metadata.is_dir())
+        || !selected.starts_with(&canonical_base)
+    {
         return Err("plugin archive subdir escapes the extracted package".into());
     }
     Ok(selected)
@@ -3776,6 +3743,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use std::fs::{self, File};
 
     const MANIFEST: &str = r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"test-plugin"}"#;
 
@@ -3974,6 +3942,48 @@ mod tests {
             toml::from_str::<PluginConfig>("source = 'path'\npath = '.'\nfuture_option = true"),
             Ok(PluginConfig::Path { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_reader_preserves_file_identity_and_rejects_directories() {
+        let package = tempfile::tempdir().unwrap();
+        let source = package.path().join("SKILL.md");
+        fs::write(&source, "safe").unwrap();
+        let before = super::fs::symlink_metadata(&source).unwrap();
+        let mut file = open_snapshot_file(package.path(), &source).unwrap();
+        assert!(same_file(&before, &file.metadata().unwrap()));
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "safe");
+
+        let replacement = package.path().join("replacement");
+        fs::write(&replacement, "safe").unwrap();
+        fs::remove_file(&source).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        assert!(!same_file(
+            &before,
+            &super::fs::symlink_metadata(&source).unwrap()
+        ));
+        let directory = package.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(open_snapshot_file(package.path(), &directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reader_rejects_root_and_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("SKILL.md"), "safe").unwrap();
+        let root_link = directory.path().join("root-link");
+        symlink(&package, &root_link).unwrap();
+        assert!(open_snapshot_file(&root_link, &root_link.join("SKILL.md")).is_err());
+        let leaf_link = package.join("leaf-link");
+        symlink(package.join("SKILL.md"), &leaf_link).unwrap();
+        assert!(open_snapshot_file(&package, &leaf_link).is_err());
     }
 
     #[cfg(unix)]

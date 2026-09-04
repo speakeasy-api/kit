@@ -90,7 +90,7 @@ pub struct WorkspaceFileSearchState {
 
 impl WorkspaceFileSearch {
     pub fn start(root: PathBuf) -> Result<Self, String> {
-        if !root.is_dir() {
+        if !crate::resilient_fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
             return Err(format!(
                 "workspace root is not a directory: {}",
                 root.display()
@@ -105,6 +105,11 @@ impl WorkspaceFileSearch {
         if root.to_str().is_none() {
             return Err("workspace root is not valid UTF-8".to_string());
         }
+
+        // The workspace picker reads native paths and never writes Kit state.
+        crate::resilient_fs::global()
+            .require_disk(&root)
+            .map_err(|error| format!("workspace files are not available on disk: {error}"))?;
 
         let is_git_repo = root
             .ancestors()

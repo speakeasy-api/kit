@@ -23,15 +23,17 @@ The catalog requires an existing directory and is workspace-filtered and newest-
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 
-## When transcript storage is full
+## Recovering from full storage
 
-If an open session's transcript append or sync fails because the disk is full or a quota is exceeded, Kit rolls back the failed append and warns on stderr. Provided rollback succeeds, the session continues with subsequent transcript changes held only in memory. Permission errors, lost locks, and rollback failures still stop the mutation rather than bypassing storage integrity checks.
+Kit routes its internal persistence through a shared filesystem service. If a write fails because storage is full or a quota is exceeded, the service retains the pending change in a bounded memory overlay. Internal reads and session listings use the same view, so finishing a turn or closing a session handle does not discard accepted changes. An existing session can be reopened in the same running process while persistence is pending.
 
-**Memory-only changes are not durable.** They are lost when the session closes or the process exits, and do not appear in disk-based session listings or resumed sessions. Freeing disk space does not automatically flush them: the affected writer stays memory-only to avoid gaps in the saved history. Save any needed content separately before closing or switching sessions.
+Recovery is automatic: internal operations retry pending work, and a process-owned worker retries with bounded backoff while Kit is idle. Once storage recovers, pending changes are persisted in order before newer changes can bypass them. Freeing space through a normal tool call can therefore restore persistence without restarting the session. Kit reports degradation and recovery on stderr.
 
-The fallback shares a 64 MiB allocation budget across session writers in one process. If that budget is exhausted or a fallback allocation fails, Kit makes a best-effort terminal restore, reports the loss of unsaved records on stderr, and exits with status 1 instead of panicking. This does not protect against unrelated out-of-memory failures elsewhere in the process.
+**Pending memory state does not survive process termination.** A different process cannot read it. Keep Kit running until recovery completes if you need those changes to be durable. Before normal exit, Kit makes one final recovery pass; if accepted changes remain unpersisted, it warns and exits unsuccessfully. The default service bounds retained data to 64 MiB and pending operations to 4,096; exhaustion requests cancellation and orderly shutdown rather than silently evicting accepted data. If a fallible fallback allocation itself fails, Kit instead makes a best-effort terminal restoration and exits immediately without allocating an error message.
 
-This fallback covers transcript records after initial session setup has completed. Session creation, migration, credential storage, configuration, and output artifacts can still report disk-space errors.
+Explicit `edit` and shell operations still use the real filesystem and report real failures to the model. The fallback does not pretend those operations succeeded. Native consumers, such as plugin subprocesses, require their inputs to be materialized on disk, and interprocess locks still require real ownership. Unsafe paths, lost ownership, and non-capacity errors are not permission to overwrite another process's data.
+
+Use the `artifact` tool to read spilled output, including memory-only artifacts; a shell cannot see the memory overlay.
 
 ## TUI keys, prompt editing, and navigation
 
