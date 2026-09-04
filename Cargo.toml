@@ -36,7 +36,7 @@ bytes = "=1.12.1"
 clap = { version = "=4.6.6", features = ["derive"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 flate2 = "=1.1.10"
-fff-search = { version = "=0.10.6", default-features = false, features = ["ripgrep"] }
+ignore = "=0.4.33"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
 hyper = "=1.11.1"
@@ -45,6 +45,7 @@ image = { version = "=0.25.10", default-features = false, features = ["gif", "jp
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
 keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
 jsonschema = { version = "=0.52.0", default-features = false, features = ["idna"] }
+neo_frizbee = "=0.11.0"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
