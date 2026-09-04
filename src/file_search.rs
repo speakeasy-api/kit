@@ -366,10 +366,11 @@ mod tests {
         let search = WorkspaceFileSearch {
             files: vec!["é.rs".into()],
         };
-        for (query, expected) in [("é", vec![0..2]), ("rs", vec![3..5]), ("é.rs", vec![0..5])] {
+        for (query, expected) in [("é", 0..2), ("rs", 3..5), ("é.rs", 0..5)] {
             let results = search.search(query).expect("Unicode search");
             assert_eq!(results.len(), 1, "query: {query}");
-            assert_eq!(results[0].match_byte_offsets, expected, "query: {query}");
+            assert_eq!(results[0].match_byte_offsets.len(), 1, "query: {query}");
+            assert_eq!(results[0].match_byte_offsets[0], expected, "query: {query}");
         }
     }
 
