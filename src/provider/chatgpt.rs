@@ -723,6 +723,7 @@ fn migrate_legacy_continuations(
             else {
                 continue;
             };
+            discard_incompatible_continuations(metadata, model, &session_id);
             migrate_legacy_continuation(
                 metadata,
                 model,
@@ -742,6 +743,27 @@ fn continuation_metadata_mut(part: &mut Part) -> Option<(&mut MetadataMap, &'sta
         Part::Reasoning(reasoning) => Some((&mut reasoning.metadata, "reasoning", true)),
         Part::Media(media) => Some((&mut media.metadata, "image_generation_call", false)),
         _ => None,
+    }
+}
+
+fn discard_incompatible_continuations(metadata: &mut MetadataMap, model: &str, session_id: &str) {
+    for key in [CONTINUATION_METADATA, LEGACY_CONTINUATION_METADATA] {
+        let incompatible = metadata
+            .get(key)
+            .and_then(Value::as_object)
+            .is_some_and(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|stored| stored != model)
+                    || value
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|stored| stored != session_id)
+            });
+        if incompatible {
+            metadata.remove(key);
+        }
     }
 }
 
@@ -1149,6 +1171,36 @@ mod tests {
             &legacy,
             &format!("openai-chatgpt-v1:{digest}:generation-2"),
         ));
+    }
+
+    #[test]
+    fn discards_continuations_bound_to_another_model_or_session() {
+        for continuation in [
+            json!({"model": "gpt-6-astra", "session_id": "session-1"}),
+            json!({"model": "gpt-5.6-sol", "session_id": "session-2"}),
+        ] {
+            let mut metadata = MetadataMap::from([
+                (CONTINUATION_METADATA.into(), continuation.clone()),
+                (LEGACY_CONTINUATION_METADATA.into(), continuation),
+                ("other".into(), json!(true)),
+            ]);
+
+            discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
+
+            assert!(!metadata.contains_key(CONTINUATION_METADATA));
+            assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
+            assert_eq!(metadata["other"], json!(true));
+        }
+
+        let matching = json!({"model": "gpt-5.6-sol", "session_id": "session-1"});
+        let mut metadata = MetadataMap::from([(CONTINUATION_METADATA.into(), matching.clone())]);
+        discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
+        assert_eq!(metadata[CONTINUATION_METADATA], matching);
+
+        let malformed = json!({"model": 7, "session_id": null});
+        let mut metadata = MetadataMap::from([(CONTINUATION_METADATA.into(), malformed.clone())]);
+        discard_incompatible_continuations(&mut metadata, "gpt-5.6-sol", "session-1");
+        assert_eq!(metadata[CONTINUATION_METADATA], malformed);
     }
 
     #[test]
