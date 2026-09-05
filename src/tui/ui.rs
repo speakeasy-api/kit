@@ -78,6 +78,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
+        && !app.editing_steer()
+        && !app.queue_focused
         && !app.show_logs;
 
     let (prompt_area, prompt_viewport, picker_below) = if show_start {
@@ -1936,7 +1938,13 @@ fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let mut lines = Vec::with_capacity(visible);
-    let skip = if app.pending_steers.len() > visible && visible > 1 {
+    let selected = app
+        .pending_steers
+        .iter()
+        .position(|pending| app.selected_steer.as_deref() == Some(pending.id.as_str()));
+    let skip = if let Some(selected) = selected {
+        selected.saturating_sub(visible - 1)
+    } else if app.pending_steers.len() > visible && visible > 1 {
         let hidden = app.pending_steers.len() - (visible - 1);
         lines.push(Line::from(Span::styled(
             format!("  … {hidden} earlier pending"),
@@ -1946,18 +1954,42 @@ fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         app.pending_steers.len().saturating_sub(visible)
     };
-    lines.extend(app.pending_steers.iter().skip(skip).map(|pending| {
-        let text = pending
-            .text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        Line::from(vec![
-            Span::styled("  › ", theme::bold(theme::user_color())),
-            Span::styled(text, theme::bold(theme::text_color())),
-            Span::styled("  · pending", theme::faint()),
-        ])
-    }));
+    lines.extend(
+        app.pending_steers
+            .iter()
+            .skip(skip)
+            .take(visible)
+            .map(|pending| {
+                let text = pending
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Line::from(vec![
+                    Span::styled(
+                        if app.selected_steer.as_deref() == Some(pending.id.as_str()) {
+                            "  ▶ "
+                        } else {
+                            "  › "
+                        },
+                        theme::bold(theme::user_color()),
+                    ),
+                    Span::styled(text, theme::bold(theme::text_color())),
+                    Span::styled(
+                        if app.selected_steer.as_deref() == Some(pending.id.as_str()) {
+                            format!(
+                                "  · pending [{}/{}]",
+                                selected.unwrap_or(0) + 1,
+                                app.pending_steers.len()
+                            )
+                        } else {
+                            "  · pending".to_owned()
+                        },
+                        theme::faint(),
+                    ),
+                ])
+            }),
+    );
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -2023,6 +2055,11 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
         theme::faint()
     };
     let block = Panel::bordered()
+        .title(if app.editing_steer() {
+            " editing pending · Enter save · Esc cancel "
+        } else {
+            ""
+        })
         .border_type(BorderType::Rounded)
         .border_style(border);
     let inner = block.inner(area);
@@ -2101,13 +2138,15 @@ fn draw_prompt_editor(
         .collect()
     };
     frame.render_widget(Paragraph::new(lines), field);
-    frame.set_cursor_position(Position::new(
-        field.x
-            + u16::try_from(cursor_column)
-                .unwrap_or(0)
-                .min(field.width.saturating_sub(1)),
-        field.y + u16::try_from(cursor_row - first).unwrap_or(0),
-    ));
+    if !app.queue_focused {
+        frame.set_cursor_position(Position::new(
+            field.x
+                + u16::try_from(cursor_column)
+                    .unwrap_or(0)
+                    .min(field.width.saturating_sub(1)),
+            field.y + u16::try_from(cursor_row - first).unwrap_or(0),
+        ));
+    }
     PromptViewport {
         field,
         first_row: first,
@@ -2208,7 +2247,25 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(theme::warn_color()),
         ));
     }
-    let hints = "⏎ send   ⇧⏎ newline   ^l log   ^c quit ";
+    let hints = if app.editing_steer() {
+        "⏎ save edit   esc restore draft "
+    } else if app.queue_focused && !app.pending_steers.is_empty() {
+        if app.can_replace_steer
+            && app.pending_steers.iter().any(|pending| {
+                app.selected_steer.as_deref() == Some(pending.id.as_str()) && pending.editable
+            })
+        {
+            "↑/↓ select   ⏎ edit   ⌫/del remove   esc back "
+        } else {
+            "↑/↓ select   ⌫/del remove   esc back · edit unavailable "
+        }
+    } else if app.queue_handoff {
+        "queue closed · type / ←→ / esc to continue "
+    } else if !app.pending_steers.is_empty() {
+        "F2 queue   ⏎ send   ⇧⏎ newline "
+    } else {
+        "⏎ send   ⇧⏎ newline   ^l log   ^c quit "
+    };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
     let gap = (area.width as usize)
         .saturating_sub(used + hints.chars().count())
@@ -2996,10 +3053,12 @@ mod tests {
             RunningStateUpdate::new(),
         )));
         app.apply(Update::SteerAccepted {
+            editable: true,
             id: "first".into(),
             text: "first pending".into(),
         });
         app.apply(Update::SteerAccepted {
+            editable: true,
             id: "second".into(),
             text: "second pending".into(),
         });
@@ -3028,6 +3087,94 @@ mod tests {
         assert!(
             matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "first pending")
         );
+    }
+
+    #[test]
+    fn queued_controls_are_discoverable_and_selection_scrolls_into_view() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.can_replace_steer = true;
+        for index in 0..8 {
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: index.to_string(),
+                text: format!("queued text {index}"),
+            });
+        }
+        assert!(render(&mut app, 100, 18).contains("F2 queue"));
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let first = render(&mut app, 100, 18);
+        assert!(first.contains("▶ queued text 0"), "{first}");
+        assert!(first.contains("⏎ edit"), "{first}");
+        assert!(first.contains("del remove"), "{first}");
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let last = render(&mut app, 100, 18);
+        assert!(last.contains("▶ queued text 7"), "{last}");
+        assert!(last.contains("[8/8]"), "{last}");
+        app.pending_steers[7].editable = false;
+        assert!(render(&mut app, 100, 18).contains("edit unavailable"));
+        app.pending_steers[7].editable = true;
+        app.can_replace_steer = false;
+        assert!(render(&mut app, 100, 18).contains("edit unavailable"));
+        app.can_replace_steer = true;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let editing = render(&mut app, 100, 18);
+        assert!(editing.contains("editing pending"), "{editing}");
+        assert!(editing.contains("esc restore draft"), "{editing}");
+    }
+
+    #[test]
+    fn drained_queue_shows_composer_handoff_hint_without_selector_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.paste("draft");
+        app.apply(Update::SteerAccepted {
+            id: "pending".into(),
+            text: "queued".into(),
+            editable: true,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.apply(Update::UserMessage {
+            id: "pending".into(),
+            text: "queued".into(),
+            images: Vec::new(),
+            append: false,
+        });
+        assert!(!app.queue_focused);
+        let frame = render(&mut app, 100, 18);
+        assert!(frame.contains("queue closed · type / ←→ / esc"), "{frame}");
+        assert!(!frame.contains("esc back"), "{frame}");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!render(&mut app, 100, 18).contains("queue closed"));
+    }
+
+    #[test]
+    fn empty_queue_keeps_the_composer_hint() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let frame = render(&mut app, 100, 18);
+        assert!(!app.queue_focused);
+        assert!(frame.contains("no pending messages"), "{frame}");
+        assert!(frame.contains("⏎ send"), "{frame}");
+        assert!(!frame.contains("esc back"), "{frame}");
     }
 
     #[test]

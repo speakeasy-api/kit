@@ -2073,6 +2073,19 @@ pub(crate) fn component(
         )
         .on_receive_request(
             {
+                let integration = Arc::clone(&state.integration);
+                async move |request: wire::ReplaceInjectSessionRequest, responder, cx| {
+                    let integration = Arc::clone(&integration);
+                    cx.spawn(async move {
+                        responder.respond_with_result(integration.replace_inject(request).await)
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
                 let state = Arc::clone(&state);
                 async move |request: DetachComposeRequest, responder, cx| {
                     let state = Arc::clone(&state);
@@ -4058,6 +4071,68 @@ mod tests {
                 assert!(server.logout().await.is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn v2_router_advertises_and_routes_pending_injection_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let client =
+            agent_client_protocol::Client
+                .v2()
+                .connect_with(client_transport, async move |cx| {
+                    let initialized = cx
+                        .send_request(wire::InitializeRequest::new(
+                            wire::ProtocolVersion::V2,
+                            wire::Implementation::new("replacement-test", "0"),
+                        ))
+                        .block_task()
+                        .await?;
+                    let pending = initialized
+                        .capabilities
+                        .session
+                        .expect("session capabilities")
+                        .inject
+                        .expect("injection capabilities")
+                        .pending
+                        .expect("pending injection capabilities");
+                    assert_eq!(pending.replace, Some(true));
+
+                    // A domain error, rather than method-not-found, proves that Kit's
+                    // production router forwards replacement requests to AgentKit.
+                    let error = cx
+                        .send_request(wire::ReplaceInjectSessionRequest::new(
+                            "missing-session",
+                            "pending-message",
+                            vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                "replacement",
+                            ))],
+                        ))
+                        .block_task()
+                        .await
+                        .expect_err("replacement must reject an unknown session");
+                    assert_eq!(
+                        i32::from(error.code),
+                        i32::from(wire::Error::resource_not_found(None).code)
+                    );
+                    assert_eq!(error.data, Some(json!({ "sessionId": "missing-session" })));
+                    Ok(())
+                });
+        let result = timeout(Duration::from_secs(2), client).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("replacement client timed out")
+            .expect("replacement client failed");
     }
 
     #[test]
