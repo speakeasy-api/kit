@@ -10,6 +10,7 @@ mod app;
 mod command;
 mod editor;
 mod image;
+mod input;
 mod markdown;
 mod plan;
 mod theme;
@@ -35,14 +36,13 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
     terminal::EnterAlternateScreen,
 };
-use futures_util::StreamExt;
+use input::{InputEvent, InputEvents, ReceivedEvent};
 use ratatui::DefaultTerminal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1058,7 +1058,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
             );
             app.auth_methods = auth_methods;
-            let mut events = EventStream::new();
+            let mut events = InputEvents::new();
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1079,7 +1079,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     tokio::select! {
                         event = events.next() => {
                             let action = match event {
-                                Some(Ok(event)) => handle(&mut app, event),
+                                Some(Ok(event)) => handle_input(&mut app, event),
                                 Some(Err(_)) | None => {
                                     leave(&mut terminal);
                                     return Ok(());
@@ -1161,7 +1161,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                     images = resume_terminal(&mut terminal).map_err(
                                                         agent_client_protocol::Error::into_internal_error,
                                                     )?;
-                                                    events = EventStream::new();
+                                                    events = InputEvents::new();
                                                     break session;
                                                 }
                                                 Err(error) if authentication_required(
@@ -1186,7 +1186,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     images = resume_terminal(&mut terminal).map_err(
                                         agent_client_protocol::Error::into_internal_error,
                                     )?;
-                                    events = EventStream::new();
+                                    events = InputEvents::new();
                                 }
                                 Action::None | Action::Redraw => {}
                                 _ => app.note("authenticate before starting a session"),
@@ -1227,10 +1227,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
-                    app.with_navigation_clock_paused(|app| {
-                        terminal.draw(|frame| ui::draw(frame, app, &mut images))
-                    })
-                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    terminal
+                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
                         _ = storage_shutdown.cancelled() => return Ok(()),
                         terminal_event = events.next() => {
@@ -1239,27 +1238,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             // bracket it. Applying everything the terminal has
                             // already buffered keeps a paste to a single redraw
                             // instead of one frame per character.
-                            let mut next = terminal_event;
-                            let mut action = Action::None;
-                            for _ in 0..MAX_BURST {
-                                match next {
-                                    Some(Ok(event)) => action = handle(&mut app, event),
-                                    Some(Err(_)) | None => return Ok(()),
-                                }
-                                if !matches!(action, Action::None) {
-                                    break;
-                                }
-                                // `EventStream::next().now_or_never()` polls with a noop
-                                // waker. If no event is ready, crossterm's background reader
-                                // retains that waker and cannot wake this select loop when the
-                                // next key arrives. Check synchronously before polling the
-                                // stream so an empty burst cannot make the TUI unresponsive.
-                                if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-                                    next = events.next().await;
-                                } else {
-                                    break;
-                                }
-                            }
+                            let Some(first) = terminal_event else { return Ok(()); };
+                            let burst = std::iter::once(first)
+                                .chain(std::iter::from_fn(|| events.try_next()));
+                            let action = match handle_input_burst(&mut app, burst) {
+                                Ok(action) => action,
+                                Err(_) => return Ok(()),
+                            };
                             match action {
                                 Action::Quit => return Ok(()),
                                 Action::Submit { prompt, inject } => {
@@ -1683,7 +1668,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     images = resume_terminal(&mut terminal).map_err(
                                         agent_client_protocol::Error::into_internal_error,
                                     )?;
-                                    events = EventStream::new();
+                                    events = InputEvents::new();
                                 }
                                 Action::Copy(text) => {
                                     execute!(terminal.backend_mut(), Print(osc52(&text)))
@@ -1780,14 +1765,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         update = updates_rx.recv() => match update {
-                            Some(update) => app.with_navigation_clock_paused(|app| {
-                                apply_pending_updates(
-                                    app,
-                                    &transition_session,
-                                    &mut updates_rx,
-                                    update,
-                                )
-                            }),
+                            Some(update) => apply_pending_updates(
+                                &mut app,
+                                &transition_session,
+                                &mut updates_rx,
+                                update,
+                            ),
                             None => return Ok(()),
                         },
                         _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
@@ -2039,10 +2022,46 @@ fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
     )
 }
 
+/// Dispatch at most one frame's input without dequeuing beyond its budget or
+/// the first action. In particular, an overflow warning must remain queued if
+/// a concurrently replenished burst reaches the frame limit before it.
+fn handle_input_burst(
+    app: &mut App,
+    events: impl Iterator<Item = std::io::Result<InputEvent>>,
+) -> std::io::Result<Action> {
+    for event in events.take(MAX_BURST) {
+        let action = handle_input(app, event?);
+        if !matches!(action, Action::None) {
+            return Ok(action);
+        }
+    }
+    Ok(Action::None)
+}
+
+/// Queue control messages never enter modal/composer key handling.
+fn handle_input(app: &mut App, input: InputEvent) -> Action {
+    match input {
+        InputEvent::Event(received) => handle(app, received),
+        InputEvent::Overflow => {
+            app.input_overflow = true;
+            Action::Redraw
+        }
+        InputEvent::Resumed(received_at) => {
+            app.input_overflow = false;
+            app.last_key = Some(received_at);
+            app.toast = Some((
+                "Input resumed; check draft before sending".into(),
+                std::time::Instant::now(),
+            ));
+            Action::Redraw
+        }
+    }
+}
+
 /// Applies one terminal event, returning the work it asks for.
-fn handle(app: &mut App, event: Event) -> Action {
-    match event {
-        Event::Key(key) => app.handle_key(key),
+fn handle(app: &mut App, received: ReceivedEvent) -> Action {
+    match received.event {
+        Event::Key(key) => app.handle_key_at(key, received.received_at),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
             if app.model_switch.is_some() {
@@ -2747,7 +2766,7 @@ mod tests {
         active_config_matches, active_session_config, agent_command_for_launch,
         apply_pending_updates, attachments_from_paste, authentication_required,
         client_capabilities, command, credential_storage_for_launch, current_model_choice,
-        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
+        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail,
         message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
         refresh_config_state, refresh_session_after_auth, save_effort_default_to,
         save_model_defaults_to, terminal_auth_command, transition_route, translate,
@@ -2758,6 +2777,106 @@ mod tests {
         tools::mcp::CredentialStorage,
         tui::app::{Action, App, SessionDialog, SessionRename, SubmittedPrompt, Update},
     };
+
+    fn handle(app: &mut App, event: Event) -> Action {
+        super::handle(
+            app,
+            super::ReceivedEvent {
+                event,
+                received_at: std::time::Instant::now(),
+            },
+        )
+    }
+
+    #[test]
+    fn replenished_input_burst_leaves_overflow_queued_and_displays_warning() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let mut app = App::new(
+            "/tmp".into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        // A one-slot transport must be replenished throughout the frame. Unlike
+        // a preloaded large collection, it also models a bounded reader queue.
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let producer = thread::spawn(move || {
+            let received_at = Instant::now();
+            for _ in 0..MAX_BURST {
+                sender
+                    .send(Ok(super::InputEvent::Event(super::ReceivedEvent {
+                        event: Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                        received_at,
+                    })))
+                    .unwrap();
+            }
+            sender.send(Ok(super::InputEvent::Overflow)).unwrap();
+        });
+        // Blocking receipt keeps this test's burst continuous regardless of
+        // producer scheduling; production uses the same dispatcher with try_next.
+        assert!(matches!(
+            super::handle_input_burst(&mut app, receiver.iter()).unwrap(),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "a".repeat(MAX_BURST));
+        assert!(!app.input_overflow);
+        producer.join().unwrap();
+        let pending = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(pending, Ok(super::InputEvent::Overflow)));
+        assert!(matches!(
+            super::handle_input_burst(&mut app, std::iter::once(pending)).unwrap(),
+            Action::Redraw
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut images = crate::tui::image::ImageRuntime::disabled();
+        terminal
+            .draw(|frame| super::ui::draw(frame, &mut app, &mut images))
+            .unwrap();
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            output.contains("Input overflow: input discarded"),
+            "{output}"
+        );
+        assert!(output.contains("Wait, then Esc to resume"), "{output}");
+        assert_eq!(app.editor.text(), "a".repeat(MAX_BURST));
+    }
+
+    #[test]
+    fn input_burst_stops_at_action_without_consuming_the_next_event() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let mut events = [
+            Ok(super::InputEvent::Overflow),
+            Ok(super::InputEvent::Resumed(std::time::Instant::now())),
+        ]
+        .into_iter();
+        assert!(matches!(
+            super::handle_input_burst(&mut app, events.by_ref()).unwrap(),
+            Action::Redraw
+        ));
+        assert!(app.input_overflow);
+        assert!(matches!(
+            events.next(),
+            Some(Ok(super::InputEvent::Resumed(_)))
+        ));
+    }
 
     fn command_args(command: &tokio::process::Command) -> Vec<String> {
         command
@@ -3926,7 +4045,6 @@ mod tests {
                 };
                 // Feed the real rapid sequence: do not repair the app's clock
                 // between keys, which would mask slow-processing regressions.
-                let arrived = Instant::now();
                 assert!(matches!(
                     handle(
                         &mut app,
@@ -3934,7 +4052,6 @@ mod tests {
                     ),
                     Action::None
                 ));
-                assert!(app.last_key.is_some_and(|last| last >= arrived));
                 assert!(
                     app.navigation.dialog.is_some(),
                     "paste must not close navigator: {code:?}"

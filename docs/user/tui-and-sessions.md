@@ -83,6 +83,10 @@ Press `F3` to open the read-only transcript navigator, even while a response is 
 
 Navigator queries are limited to 4,096 UTF-8 bytes. Oversized pastes keep a bounded whole-grapheme prefix; pasted newlines and tabs are ignored rather than activating navigator controls.
 
+The terminal input queue retains at most 1,024 events and 256 KiB of paste-string allocations (including spare string capacity). These limits apply across all TUI views, not just the navigator. If either limit is exceeded, Kit discards **all pending input**, shows a persistent input-overflow warning, and continues draining the terminal without applying events. Input already applied is not undone; parked drafts and attachments are not cleared.
+
+To recover, stop typing/pasting for at least 100 ms, then press plain `Esc`. Kit consumes that acknowledgement without closing a modal or cancelling a turn. It also discards input until another 100 ms quiet interval after the acknowledgement, so a buffered paste tail cannot become an actionable Enter or Tab. Then input resumes; check your draft before sending. The limits bound Kit's queued events and retained paste payloads, not the terminal library's temporary allocation while decoding a single bracketed-paste event.
+
 Revealing a Thought block temporarily shows it even when reasoning is hidden. Browsing and closing alone do not move the transcript; `Enter` explicitly reveals the selected block. While the navigator is open, `Esc` closes it rather than interrupting the turn.
 
 The navigator searches only the currently displayed or replayed history, not a compacted archive or undelivered messages in the pending queue. Tool searches include display text such as the title, script, and output; media labels are searchable, but binary media payloads are not. Block identities are local and ephemeral, not durable addresses for forking. This is navigation only: it does not fork a session, write history, cancel a turn, or send a prompt.

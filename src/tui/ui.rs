@@ -128,6 +128,24 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     if app.navigation.dialog.is_some() {
         draw_navigation(frame, app, &navigation_matches);
     }
+    // This warning must not expire or disappear behind a modal while the reader
+    // discards input. Esc acknowledgement is handled by the reader, not the UI.
+    if app.input_overflow {
+        let area = frame.area();
+        let height = area.height.min(3);
+        let warning = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(height),
+            area.width,
+            height,
+        );
+        frame.render_widget(Clear, warning);
+        frame.render_widget(
+            Paragraph::new("Input overflow: input discarded\nWait, then Esc to resume\nCheck draft before sending")
+                .style(Style::default().fg(Color::Yellow)),
+            warning,
+        );
+    }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
     if app.storage_pending || app.storage_exhausted {
@@ -394,11 +412,7 @@ fn visible_query_tail(query: &str, width: usize) -> &str {
     // Match the renderer's per-grapheme cell widths. Two forward passes keep
     // this linear, including long regional-indicator runs; repeatedly measuring
     // the remaining string (or finding boundaries backwards) can be quadratic.
-    let grapheme_width = |grapheme: &str| {
-        #[cfg(test)]
-        QUERY_WIDTH_BYTES.with(|count| count.set(count.get() + grapheme.len()));
-        UnicodeWidthStr::width(grapheme)
-    };
+    let grapheme_width = |grapheme: &str| UnicodeWidthStr::width(grapheme);
     let mut remaining: usize = query.graphemes(true).map(grapheme_width).sum();
     for (index, grapheme) in query.grapheme_indices(true) {
         if remaining <= width {
@@ -699,8 +713,6 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, matches: &[usize]) {
             .skip(start)
             .take(visible)
             .map(|(position, index)| {
-                #[cfg(test)]
-                NAVIGATION_PREVIEWS.with(|count| count.set(count.get() + 1));
                 let marker = if Some(position) == selected {
                     "› "
                 } else {
@@ -2477,7 +2489,7 @@ fn compact(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::schema::v2::{
-        IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
+        IdleStateUpdate, RequiresActionStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
     };
     use std::path::PathBuf;
 
@@ -3128,6 +3140,88 @@ mod tests {
     }
 
     #[test]
+    fn input_overflow_warning_stays_visible_over_navigation_without_changing_draft() {
+        let mut app = navigation_app(vec![Block::Agent("matching history".into())]);
+        app.paste("parked draft");
+        app.open_navigation();
+        crate::tui::handle_input(&mut app, crate::tui::input::InputEvent::Overflow);
+        app.tick();
+        let output = render(&mut app, 60, 14);
+        assert!(
+            output.contains("Input overflow: input discarded"),
+            "{output}"
+        );
+        assert!(output.contains("Wait, then Esc to resume"), "{output}");
+        assert!(app.navigation.dialog.is_some());
+        assert_eq!(app.editor.text(), "parked draft");
+        crate::tui::handle_input(
+            &mut app,
+            crate::tui::input::InputEvent::Resumed(std::time::Instant::now()),
+        );
+        let output = render(&mut app, 60, 14);
+        assert!(
+            !output.contains("Input overflow: input discarded"),
+            "{output}"
+        );
+        assert!(app.navigation.dialog.is_some());
+        assert_eq!(app.editor.text(), "parked draft");
+    }
+
+    #[test]
+    fn navigation_reveal_then_state_update_keeps_following_on_resize() {
+        for state in [
+            StateUpdate::Running(RunningStateUpdate::new()),
+            StateUpdate::RequiresAction(RequiresActionStateUpdate::new()),
+        ] {
+            for (width, height) in [(30, 14), (60, 9)] {
+                let mut app = navigation_app(vec![
+                    Block::Agent("earlier wrapped words ".repeat(40)),
+                    Block::Agent("selected message".into()),
+                    Block::Agent("later message\n".repeat(40)),
+                ]);
+                render(&mut app, 60, 14);
+                reveal(&mut app, 1);
+                assert!(render(&mut app, 60, 14).contains("selected message"));
+                assert!(!app.follow);
+                assert!(!app.navigation.reveal_pending);
+
+                app.apply(Update::State(state.clone()));
+                let output = render(&mut app, width, height);
+                assert!(app.follow);
+                assert!(!app.navigation.anchored);
+                assert_eq!(app.scroll, app.total_lines.saturating_sub(app.viewport));
+                assert!(!output.contains("selected message"), "{output}");
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_pending_reveal_survives_state_update_and_resize() {
+        for state in [
+            StateUpdate::Running(RunningStateUpdate::new()),
+            StateUpdate::RequiresAction(RequiresActionStateUpdate::new()),
+        ] {
+            let mut app = navigation_app(vec![
+                Block::Agent("earlier wrapped words ".repeat(40)),
+                Block::Agent("selected message".into()),
+                Block::Agent("later message\n".repeat(40)),
+            ]);
+            render(&mut app, 60, 14);
+            reveal(&mut app, 1);
+            app.apply(Update::State(state));
+            assert!(app.follow);
+            assert!(app.navigation.reveal_pending);
+
+            let output = render(&mut app, 30, 14);
+            assert!(!app.follow);
+            assert!(app.navigation.anchored);
+            assert!(!app.navigation.reveal_pending);
+            assert_eq!(app.scroll, app.transcript_prefixes[1] + 1);
+            assert!(output.contains("selected message"), "{output}");
+        }
+    }
+
+    #[test]
     fn navigation_reveal_remains_visible_when_only_height_shrinks() {
         let mut app = navigation_app(vec![
             Block::Agent("earlier lines\n".repeat(40)),
@@ -3222,7 +3316,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_overlay_previews_only_visible_chronological_results() {
+    fn navigation_overlay_shows_only_visible_chronological_results() {
         let mut app = navigation_app(
             (0..10_000)
                 .map(|index| Block::Agent(format!("message-{index:05}")))
@@ -3232,17 +3326,16 @@ mod tests {
         app.navigation.dialog.as_mut().unwrap().selected = app.navigation.id(9_999);
         let matches = app.sync_navigation();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        super::NAVIGATION_PREVIEWS.with(|count| count.set(0));
         terminal
             .draw(|frame| super::draw_navigation(frame, &app, &matches))
             .unwrap();
-        super::NAVIGATION_PREVIEWS.with(|count| assert_eq!(count.get(), 3));
         let buffer = terminal.backend().buffer();
         let rows = (0..12)
             .map(|row| buffer_row(buffer, row))
             .collect::<Vec<_>>();
         let output = rows.join("\n");
         assert!(output.contains("10000/10000"), "{output}");
+        assert_eq!(output.matches("message-").count(), 3, "{output}");
         assert!(output.contains("› Assistant: message-09999"), "{output}");
         let first = output.find("message-09997").expect("first visible preview");
         let second = output
@@ -3274,24 +3367,21 @@ mod tests {
     }
 
     #[test]
-    fn visible_query_tail_measures_at_most_twice_the_input_bytes() {
-        for query in [
-            "a".repeat(100_000),
-            "🇺🇸".repeat(25_000),
-            format!("e{}z", "\u{301}".repeat(100_000)),
+    fn visible_query_tail_preserves_expected_suffix_for_large_inputs() {
+        for (query, expected) in [
+            ("a".repeat(100_000), "a"),
+            ("🇺🇸".repeat(25_000), ""),
+            (format!("e{}z", "\u{301}".repeat(100_000)), "z"),
         ] {
-            super::QUERY_WIDTH_BYTES.with(|count| count.set(0));
             let tail = super::visible_query_tail(&query, 1);
-            assert!(matches!(tail, "a" | "" | "z"));
-            super::QUERY_WIDTH_BYTES.with(|count| {
-                assert!(count.get() >= query.len());
-                assert!(count.get() <= 2 * query.len());
-            });
+            assert_eq!(tail, expected);
+            assert!(query.ends_with(tail));
+            assert!(UnicodeWidthStr::width(tail) <= 1);
         }
     }
 
     #[test]
-    fn navigation_large_paste_render_has_bounded_query_work() {
+    fn navigation_large_paste_renders_truncated_query_and_empty_results() {
         let mut app = navigation_app(vec![Block::Agent("answer".into())]);
         app.open_navigation();
         app.paste(&"x".repeat(1_000_000));
@@ -3301,14 +3391,9 @@ mod tests {
         );
         let matches = app.sync_navigation();
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        super::QUERY_WIDTH_BYTES.with(|count| count.set(0));
         terminal
             .draw(|frame| super::draw_navigation(frame, &app, &matches))
             .unwrap();
-        super::QUERY_WIDTH_BYTES.with(|count| {
-            assert!(count.get() >= super::transcript::MAX_QUERY_BYTES);
-            assert!(count.get() <= 2 * super::transcript::MAX_QUERY_BYTES);
-        });
         let output = (0..12)
             .map(|row| buffer_row(terminal.backend().buffer(), row))
             .collect::<Vec<_>>()

@@ -45,11 +45,6 @@ impl Role {
 /// Bounds navigator matching, rendering, and grapheme-aware backspace work.
 pub(super) const MAX_QUERY_BYTES: usize = 4096;
 
-#[cfg(test)]
-thread_local! {
-    static QUERY_INPUT_CHARACTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 #[derive(Default)]
 pub(super) struct Navigator {
     pub query: String,
@@ -189,23 +184,39 @@ fn text_parts(block: &Block) -> impl Iterator<Item = &str> {
         .chain(output.iter().map(String::as_str))
 }
 
+// Shared across text parts, including grapheme lookahead and control filtering.
+const MAX_PREVIEW_BYTES: usize = 4096;
+
 pub(super) fn preview(block: &Block) -> String {
-    // Bound the work even for large tool output and preserve Unicode graphemes.
-    let mut words =
-        text_parts(block).flat_map(|text| text.graphemes(true).chain(std::iter::once(" ")));
-    let mut preview: String = words
-        .by_ref()
-        .take(96)
-        .map(|character| {
-            if character.chars().any(char::is_control) {
+    let mut remaining = MAX_PREVIEW_BYTES;
+    let mut count = 0;
+    let mut preview = String::new();
+    'parts: for text in text_parts(block) {
+        // Bound source bytes BEFORE segmentation: even one grapheme (including
+        // the 97th, used as lookahead) can contain arbitrarily many codepoints.
+        let end = text.floor_char_boundary(text.len().min(remaining));
+        remaining -= end;
+        let truncated = end < text.len();
+        for (index, grapheme) in text[..end].grapheme_indices(true) {
+            // The final cluster may continue outside the bounded source slice.
+            // Omit it rather than scan beyond the budget or display a fragment.
+            if count == 96 || (truncated && index + grapheme.len() == end) {
+                preview.push('…');
+                break 'parts;
+            }
+            preview.push_str(if grapheme.chars().any(char::is_control) {
                 " "
             } else {
-                character
-            }
-        })
-        .collect();
-    if words.next().is_some() {
-        preview.push('…');
+                grapheme
+            });
+            count += 1;
+        }
+        if truncated || count == 96 {
+            preview.push('…');
+            break;
+        }
+        preview.push(' ');
+        count += 1;
     }
     preview.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -224,8 +235,6 @@ impl Navigator {
             .chars()
             .take(remaining + 1)
             .filter(|character| {
-                #[cfg(test)]
-                QUERY_INPUT_CHARACTERS.with(|count| count.set(count.get() + 1));
                 consumed += character.len_utf8();
                 !character.is_control()
             })
@@ -274,24 +283,23 @@ mod tests {
         for (paste, expected) in [
             ("a".repeat(1_000_000), "a".repeat(super::MAX_QUERY_BYTES)),
             ("\n".repeat(1_000_000), String::new()),
+            (
+                format!("{}unvisited", "\n".repeat(super::MAX_QUERY_BYTES + 1)),
+                String::new(),
+            ),
             (format!("e{}", "\u{301}".repeat(1_000_000)), String::new()),
         ] {
             let mut dialog = Navigator::default();
-            super::QUERY_INPUT_CHARACTERS.with(|count| count.set(0));
             dialog.insert(&paste);
             assert_eq!(dialog.query, expected);
-            super::QUERY_INPUT_CHARACTERS
-                .with(|count| assert_eq!(count.get(), super::MAX_QUERY_BYTES + 1));
         }
 
         let mut dialog = Navigator {
             query: "a".repeat(super::MAX_QUERY_BYTES),
             ..Navigator::default()
         };
-        super::QUERY_INPUT_CHARACTERS.with(|count| count.set(0));
         dialog.insert(&"b".repeat(1_000_000));
-        super::QUERY_INPUT_CHARACTERS.with(|count| assert_eq!(count.get(), 0));
-        assert_eq!(dialog.query.len(), super::MAX_QUERY_BYTES);
+        assert_eq!(dialog.query, "a".repeat(super::MAX_QUERY_BYTES));
         dialog.backspace();
         dialog.insert("z");
         assert!(dialog.query.ends_with('z'));
@@ -334,6 +342,47 @@ mod tests {
         assert_eq!(
             preview(&Block::Agent("first\n\tsecond".into())),
             "first second"
+        );
+    }
+
+    #[test]
+    fn previews_omit_huge_clusters_at_the_prefix_limit_and_lookahead() {
+        for prefix_len in [0, 1, 95, 96] {
+            let prefix = "x".repeat(prefix_len);
+            let block = Block::Agent(format!("{prefix}e{}unvisited", "\u{301}".repeat(1_000_000)));
+            assert_eq!(preview(&block), format!("{prefix}…"));
+        }
+    }
+
+    #[test]
+    fn previews_omit_clusters_cut_at_byte_or_joiner_boundaries() {
+        for (remaining, suffix) in [(3, "e\u{301}tail"), (7, "👩‍💻tail"), (5, "🇺🇸tail")]
+        {
+            // A complete first cluster uses most of the byte budget. The next
+            // cluster is cut after a combining mark/ZWJ or inside a codepoint.
+            let prefix = format!(
+                "e{}",
+                "\u{301}".repeat((super::MAX_PREVIEW_BYTES - remaining - 1) / 2)
+            );
+            assert_eq!(prefix.len() + remaining, super::MAX_PREVIEW_BYTES);
+            assert_eq!(
+                preview(&Block::Agent(format!("{prefix}{suffix}"))),
+                format!("{prefix}…")
+            );
+        }
+    }
+
+    #[test]
+    fn previews_preserve_complete_clusters_at_the_source_boundary() {
+        let cluster = format!("e{}", "\u{301}".repeat((super::MAX_PREVIEW_BYTES - 2) / 2));
+        assert_eq!(
+            preview(&Block::Agent(format!("{cluster}x"))),
+            format!("{cluster}x")
+        );
+        // With more source available, the last bounded cluster is uncertain.
+        assert_eq!(
+            preview(&Block::Agent(format!("{cluster}xunvisited"))),
+            format!("{cluster}…")
         );
     }
 

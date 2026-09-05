@@ -709,6 +709,8 @@ pub struct App {
     /// dismissed an older selection, while still allowing it to start a drag.
     press: Option<(usize, usize, bool)>,
     pub toast: Option<(String, Instant)>,
+    /// Terminal queue overload requires acknowledgement before input resumes.
+    pub input_overflow: bool,
     /// When the last key arrived, for telling a paste from typing.
     pub last_key: Option<Instant>,
     next_file_search_revision: u64,
@@ -945,6 +947,7 @@ impl App {
             selection: None,
             press: None,
             toast: None,
+            input_overflow: false,
             last_key: None,
             next_file_search_revision: 0,
         }
@@ -3025,6 +3028,11 @@ impl App {
 
     /// Resolve only after the wrapping cache has current-width prefix offsets.
     pub(super) fn apply_navigation_reveal(&mut self, viewport_changed: bool) {
+        // Resuming follow supersedes an old anchor, but not an explicit reveal.
+        if self.follow && !self.navigation.reveal_pending {
+            self.navigation.anchored = false;
+            return;
+        }
         if !(self.navigation.reveal_pending || viewport_changed && self.navigation.anchored) {
             return;
         }
@@ -3040,24 +3048,9 @@ impl App {
         self.navigation.reveal_pending = false;
     }
 
-    /// Exclude synchronous navigator work from the inter-key paste gap, without
-    /// erasing time actually spent waiting for input. Never wrap an input wait.
-    pub(super) fn with_navigation_clock_paused<T>(
-        &mut self,
-        work: impl FnOnce(&mut Self) -> T,
-    ) -> T {
-        let last_key = self.last_key.filter(|_| self.navigation.dialog.is_some());
-        let started = Instant::now();
-        let result = work(self);
-        // Do not overwrite a clock changed by the work.
-        if last_key.is_some() && self.last_key == last_key {
-            self.last_key = last_key.and_then(|last| last.checked_add(started.elapsed()));
-        }
-        result
-    }
-
-    /// Applies a key press, returning work for the event loop.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+    /// Applies a key press using its terminal receipt time, not dispatch time.
+    /// Synchronous rendering/search must not change inter-key paste gaps.
+    pub fn handle_key_at(&mut self, key: KeyEvent, received_at: Instant) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
@@ -3097,18 +3090,19 @@ impl App {
             return Action::Redraw;
         }
         if self.navigation.dialog.is_some() {
-            let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
-            let action = self.handle_navigation_key(key, pasted);
-            // The search can take longer than PASTE_GAP. Measure the next gap
-            // from completion, not from before that synchronous work.
-            self.last_key = Some(Instant::now());
-            return action;
+            let pasted = self
+                .last_key
+                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+            self.last_key = Some(received_at);
+            return self.handle_navigation_key(key, pasted);
         }
         if self.session_dialog.is_some() {
             // Terminals without bracketed paste deliver a paste as a key burst, so
             // the arrival gap is the only thing separating it from typing.
-            let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
-            self.last_key = Some(Instant::now());
+            let pasted = self
+                .last_key
+                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+            self.last_key = Some(received_at);
             return self.handle_session_key(key, pasted);
         }
         if self.model_dialog.is_some() {
@@ -3219,8 +3213,10 @@ impl App {
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
-        let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
-        self.last_key = Some(Instant::now());
+        let pasted = self
+            .last_key
+            .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+        self.last_key = Some(received_at);
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -3934,6 +3930,12 @@ mod tests {
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
+    impl App {
+        pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Action {
+            self.handle_key_at(key, Instant::now())
+        }
+    }
+
     fn press(code: KeyCode) -> KeyEvent {
         modified_press(code, KeyModifiers::NONE)
     }
@@ -4094,56 +4096,48 @@ mod tests {
     }
 
     #[test]
-    fn transcript_navigation_slow_work_does_not_create_an_input_gap() {
-        let mut app = app();
-        app.push_block(Block::Agent("matching text".into()));
-        app.paste("parked draft");
-        app.open_navigation();
-        app.handle_key(press(KeyCode::Char('m')));
-        let before_work = app.last_key.unwrap();
-        let delay = super::PASTE_GAP * 3;
-        // Inject synchronous work slower than the paste threshold. Rendering
-        // and update processing use this pause; keys record their completion.
-        app.with_navigation_clock_paused(|app| {
-            app.handle_navigation_key(press(KeyCode::Char('a')), true);
-            std::thread::sleep(delay);
-        });
-        assert!(app.last_key.unwrap().duration_since(before_work) >= delay);
-        // No manual timestamp repair between the slow processing and buffered keys.
-        for code in [KeyCode::Tab, KeyCode::Enter, KeyCode::Enter] {
-            assert!(matches!(app.handle_key(press(code)), Action::None));
-            assert!(app.navigation.dialog.is_some());
-            assert_eq!(
-                app.navigation.dialog.as_ref().unwrap().role,
-                super::Role::All
-            );
-            assert_eq!(app.editor.text(), "parked draft");
+    fn transcript_navigation_receipt_times_survive_slow_processing() {
+        for deliberate in [false, true] {
+            for key in [KeyCode::Tab, KeyCode::Enter] {
+                let mut app = app();
+                app.push_block(Block::Agent("matching text".into()));
+                app.paste("parked draft");
+                app.open_navigation();
+                let first = Instant::now();
+                app.handle_key_at(press(KeyCode::Char('m')), first);
+                // These are input receipt times, not dispatch times. Both events
+                // can be queued while the UI is busy rendering or searching.
+                let gap = if deliberate {
+                    super::PASTE_GAP * 3
+                } else {
+                    Duration::ZERO
+                };
+                let received_at = first + gap;
+                std::thread::sleep(super::PASTE_GAP * 4);
+                assert!(matches!(
+                    app.handle_key_at(press(key), received_at),
+                    Action::None
+                ));
+                assert_eq!(app.editor.text(), "parked draft");
+                if deliberate && key == KeyCode::Enter {
+                    assert!(app.navigation.dialog.is_none());
+                    assert!(app.navigation.revealed.is_some());
+                } else {
+                    let dialog = app.navigation.dialog.as_ref().unwrap();
+                    assert_eq!(dialog.role == super::Role::All, !deliberate);
+                    assert!(app.navigation.revealed.is_none());
+                }
+                if !deliberate {
+                    // A second buffered newline must not submit the parked draft.
+                    assert!(matches!(
+                        app.handle_key_at(press(KeyCode::Enter), received_at),
+                        Action::None
+                    ));
+                    assert!(app.navigation.dialog.is_some());
+                    assert_eq!(app.editor.text(), "parked draft");
+                }
+            }
         }
-        assert!(app.navigation.revealed.is_none());
-    }
-
-    #[test]
-    fn transcript_navigation_slow_render_preserves_deliberate_input_gaps() {
-        let mut app = app();
-        app.push_block(Block::Agent("matching text".into()));
-        app.open_navigation();
-        app.paste("matching");
-        app.last_key = Some(Instant::now() - Duration::from_millis(500));
-        app.with_navigation_clock_paused(|_| std::thread::sleep(super::PASTE_GAP * 3));
-        // Redrawing a streaming navigator must not turn a deliberate Enter into paste.
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert!(app.navigation.dialog.is_none());
-        assert!(app.navigation.revealed.is_some());
-
-        let editor_clock = app.last_key;
-        app.with_navigation_clock_paused(|_| {});
-        assert_eq!(app.last_key, editor_clock); // No change to unrelated editor semantics.
-        app.open_navigation();
-        app.with_navigation_clock_paused(|app| app.last_key = None);
-        assert!(app.last_key.is_none()); // Do not resurrect a reset clock.
     }
 
     #[test]
