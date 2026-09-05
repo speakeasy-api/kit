@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tracing::Instrument as _;
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
 const MAX_DISPLAY_NAME_LEN: usize = 32;
@@ -608,18 +609,21 @@ impl Subagents {
 
         let (reply, response) = oneshot::channel();
         let manager = self.clone();
-        tokio::spawn(async move {
-            let source_state = Arc::clone(&operation.source_state);
-            let reservation = operation.id.clone();
-            let result = manager.run_fork(operation, &reply).await;
-            manager.finish_forking(&source_state, &reservation).await;
-            match result {
-                Ok(value) => manager.handoff_fork_success(reply, value).await,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
+        tokio::spawn(
+            async move {
+                let source_state = Arc::clone(&operation.source_state);
+                let reservation = operation.id.clone();
+                let result = manager.run_fork(operation, &reply).await;
+                manager.finish_forking(&source_state, &reservation).await;
+                match result {
+                    Ok(value) => manager.handoff_fork_success(reply, value).await,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
                 }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
         match response.await.map_err(|_| {
             ChildError::Failed("subagent fork task stopped before returning a result".into())
         })? {
@@ -1087,11 +1091,14 @@ impl Subagents {
         error: ChildError,
     ) -> ChildError {
         let manager = self.clone();
-        match tokio::spawn(async move {
-            manager
-                .cleanup_installed_child(&id, &state, &child, error)
-                .await
-        })
+        match tokio::spawn(
+            async move {
+                manager
+                    .cleanup_installed_child(&id, &state, &child, error)
+                    .await
+            }
+            .instrument(tracing::Span::current()),
+        )
         .await
         {
             Ok(error) => error,

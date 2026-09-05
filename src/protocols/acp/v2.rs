@@ -26,6 +26,7 @@ use agentkit_loop::{
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot, watch};
+use tracing::Instrument as _;
 
 use crate::{
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
@@ -1160,6 +1161,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &background_jobs,
                         structured_completion,
                     &activity,)
+                    .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
                     busy.store(false, Ordering::Release);
                     if let Err(error) = result {
@@ -1185,17 +1187,22 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             },
             event = mcp_events.recv() => {
                 if let Some(event) = event {
-                    let result = match driver.submit_input(vec![Item::notification(event.message)]) {
-                        Ok(()) => drive_autonomous(
-                            &session_id,
-                            &integration,
-                            &handle,
-                            &busy,
-                            &mut driver,
-                            &sink,
-                        &activity,).await,
-                        Err(error) => Err(map_loop_error(&session_id, &error)),
-                    };
+                    let result = async {
+                        match driver.submit_input(vec![Item::notification(event.message)]) {
+                            Ok(()) => drive_autonomous(
+                                &session_id,
+                                &integration,
+                                &handle,
+                                &busy,
+                                &mut driver,
+                                &sink,
+                                &activity,
+                            ).await,
+                            Err(error) => Err(map_loop_error(&session_id, &error)),
+                        }
+                    }
+                    .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
+                    .await;
                     if let Err(error) = result {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }
@@ -1212,7 +1219,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity,).await
+                        &activity,)
+                        .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
+                        .await
                     {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }

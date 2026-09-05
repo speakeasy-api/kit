@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
@@ -1007,11 +1008,20 @@ impl Runtime {
     }
 
     pub async fn run(self: &Arc<Self>, prompt: String, depth: usize) -> Result<String, LoopError> {
-        self.run_interruptible(prompt, depth, None).await
+        self.run_interruptible(prompt, depth, None)
+            .instrument(crate::telemetry::error_spans::operation("prompt"))
+            .await
     }
 
     /// Runs one prompt in the configured durable session.
     pub async fn run_persistent(self: &Arc<Self>, prompt: String) -> Result<String, String> {
+        // Keep the operation current through startup and the existing fatal writes.
+        self.run_persistent_inner(prompt)
+            .instrument(crate::telemetry::error_spans::operation("prompt"))
+            .await
+    }
+
+    async fn run_persistent_inner(self: &Arc<Self>, prompt: String) -> Result<String, String> {
         let request = self
             .session
             .lock()

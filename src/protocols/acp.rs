@@ -45,6 +45,7 @@ use tokio::{
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
+use tracing::Instrument as _;
 
 mod activity;
 mod skill_catalog;
@@ -1650,7 +1651,9 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         &tasks,
                         &background_jobs,
                         structured_completion,
-                    ), |reason| Some(reason.clone())).await;
+                    ), |reason| Some(reason.clone()))
+                    .instrument(crate::telemetry::error_spans::operation("acp"))
+                    .await;
                     let response = result.and_then(|reason| {
                         agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
                     });
@@ -2080,6 +2083,7 @@ async fn drive_unsolicited<S: ModelSession>(
             drive_finalized(session_id, integration, driver, false, None),
             |reason| Some(reason.clone()),
         )
+        .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
         .await
         .map(|_| ())
 }

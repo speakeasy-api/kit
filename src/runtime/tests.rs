@@ -1648,6 +1648,179 @@ async fn persistent_startup_failure_does_not_commit_new_session() {
     assert!(crate::session::load(root.path(), &session_id).is_err());
 }
 
+/// Run with a private HOME in a subprocess: fatal logs and durable sessions both
+/// use HOME, and changing it in this process would race unrelated tests.
+#[tokio::test]
+async fn persistent_provider_failure_retains_private_span_context() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::{Layer, layer::SubscriberExt as _, registry::LookupSpan};
+
+    const CHILD: &str = "KIT_TEST_PERSISTENT_ERROR_SPANS";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": {
+                    "message": "response-secret-sentinel",
+                    "type": "invalid_request_error",
+                    "code": 400
+                }})),
+            )
+        });
+        let server = tokio::spawn(
+            async move { axum::serve(listener, app).await.unwrap() }.with_current_subscriber(),
+        );
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::tests::persistent_provider_failure_retains_private_span_context",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env(
+                "OPENROUTER_BASE_URL",
+                format!("http://{address}/endpoint-secret-sentinel"),
+            )
+            .env("NO_PROXY", "127.0.0.1")
+            .env_remove("OPENROUTER_MAX_COMPLETION_TOKENS")
+            .env_remove("OPENROUTER_TEMPERATURE")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("isolated runtime test timed out")
+            .unwrap();
+        server.abort();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    struct ClosedBeforeLog {
+        directory: std::path::PathBuf,
+        names: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl<S> Layer<S> for ClosedBeforeLog
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let span = ctx.span(&id).unwrap();
+            let name = span.metadata().name();
+            if matches!(name, "chat" | "agent.turn") && !self.directory.exists() {
+                self.names.lock().unwrap().push(name);
+            }
+        }
+    }
+
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "context-secret-sentinel").unwrap();
+    let mut original_error = None;
+    for (session_id, capture, block_log) in [
+        ("span-enabled", true, false),
+        ("span-default-disabled", false, false),
+        ("span-write-failed", true, true),
+    ] {
+        let directory = home.join(".kit/errors").join(session_id);
+        if block_log {
+            // A file where the log directory belongs is a permanent write error.
+            std::fs::write(&directory, "not a directory").unwrap();
+        }
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut settings = crate::telemetry::Settings {
+            capture_message_content: true,
+            ..Default::default()
+        };
+        assert!(!settings.capture_error_spans);
+        settings.capture_error_spans = capture;
+        assert!(settings.endpoint.is_none());
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                settings
+                    .capture_error_spans
+                    .then_some(crate::telemetry::error_spans::ErrorSpanLayer),
+            )
+            .with(ClosedBeforeLog {
+                directory: directory.clone(),
+                names: closed.clone(),
+            });
+        let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "private/model-secret-sentinel",
+            crate::provider::ProviderKind::OpenRouter,
+            SessionRequest {
+                id: session_id.into(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new(
+                "api-secret-sentinel",
+            )),
+        )
+        .unwrap();
+        let runtime = Runtime::with_telemetry(runtime, settings).unwrap();
+        let error = runtime
+            .run_persistent("prompt-secret-sentinel".into())
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        let rendered = error.split("; fatal log: ").next().unwrap();
+        assert!(rendered.starts_with("provider error:"), "{error}");
+        if let Some(original) = &original_error {
+            assert_eq!(rendered, original);
+        } else {
+            original_error = Some(rendered.to_owned());
+        }
+        if block_log {
+            assert!(!error.contains("; fatal log: "));
+            assert_eq!(
+                std::fs::read_to_string(&directory).unwrap(),
+                "not a directory"
+            );
+            continue;
+        }
+        let (_, path) = error.split_once("; fatal log: ").unwrap();
+        let encoded = std::fs::read_to_string(path).unwrap();
+        let record: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(record["session_id"], session_id);
+        assert_eq!(record["surface"], "prompt");
+        assert_eq!(record["kind"], "provider");
+        assert_eq!(record["code"], "provider_error");
+        assert_eq!(record["message"], "provider request failed");
+        assert!(!encoded.contains("secret-sentinel"), "{encoded}");
+        assert!(!encoded.contains(&root.path().display().to_string()));
+        assert!(!encoded.contains(&home.display().to_string()));
+        if capture {
+            let fragments = record["span_context"]["fragments"].as_array().unwrap();
+            assert_eq!(fragments[0]["name"], "kit.operation");
+            assert_eq!(fragments[0]["fields"]["surface"], "prompt");
+            for name in ["agent.turn", "chat"] {
+                assert!(
+                    closed.lock().unwrap().contains(&name),
+                    "{name} did not close before logging"
+                );
+                assert!(
+                    fragments.iter().any(|fragment| fragment["name"] == name),
+                    "{encoded}"
+                );
+            }
+        } else {
+            assert!(record.get("span_context").is_none(), "{encoded}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn persistent_missing_openai_credentials_do_not_commit_new_session() {
     let root = tempfile::tempdir().unwrap();
