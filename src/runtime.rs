@@ -210,17 +210,29 @@ impl SessionClaim {
 
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
         if matches!(self.kind, SessionClaimKind::Fork) {
-            if let Some(observer) = self.uncommitted_observer.take() {
-                observer.commit_creation();
+            if let Some(observer) = &self.uncommitted_observer {
+                observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
             }
             self.committed = true;
             return Ok(());
         }
-        self.mark_opened();
-        let mut selection =
-            self.runtime.session.lock().map_err(|_| {
-                AcpRuntimeError::Loop("runtime session selection is poisoned".into())
-            })?;
+        // Already-committed transcripts survive rejection. A guarded creation
+        // does not: its cleanup still owns the file until commit succeeds.
+        if self.uncommitted_observer.is_none() {
+            self.mark_opened();
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let mut selection = runtime
+            .session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?;
+        // Validate transcript publication before consuming the reserved identity.
+        // Retain the observer until success so rejected commits still run the
+        // claim's normal uncommitted-transcript cleanup and retry bookkeeping.
+        if let Some(observer) = &self.uncommitted_observer {
+            observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
+            self.mark_opened();
+        }
         match self.kind {
             SessionClaimKind::New {
                 configured,
@@ -231,10 +243,8 @@ impl SessionClaim {
             }
             SessionClaimKind::Fork => unreachable!("fork claims commit before locking selection"),
         }
-        if let Some(observer) = self.uncommitted_observer.take() {
-            observer.commit_creation();
-        }
         self.committed = true;
+        drop(selection);
         Ok(())
     }
 }
@@ -1101,7 +1111,7 @@ impl Runtime {
         {
             Ok(driver) => {
                 if let Some(observer) = pending_creation {
-                    observer.commit_creation();
+                    observer.commit_creation()?;
                 }
                 driver
             }
@@ -1669,7 +1679,9 @@ impl ToolSource for ComposeOnly {
 }
 
 struct BackgroundJob {
+    registration: Arc<()>,
     controller: CancellationController,
+    cancellation_requested: bool,
     foreground_cancellation: Option<agentkit_core::TurnCancellation>,
     cancellation_relay: Option<tokio::task::AbortHandle>,
     detached: bool,
@@ -1718,27 +1730,62 @@ impl Default for BackgroundJobs {
     }
 }
 
+impl BackgroundJob {
+    fn request_cancellation(&mut self) -> Option<CancellationController> {
+        // This private controller is signalled only once. In agentkit-core 0.10.5
+        // interrupt is an atomic generation increment (waiters poll); selecting
+        // at most one signal also prevents overflow before the out-of-lock effect.
+        if std::mem::replace(&mut self.cancellation_requested, true) {
+            None
+        } else {
+            Some(self.controller.clone())
+        }
+    }
+}
+
+impl BackgroundJobState {
+    fn changed(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+}
+
 impl BackgroundJobs {
-    fn changed(&self, jobs: &mut BackgroundJobState) {
-        jobs.generation = jobs.generation.wrapping_add(1);
-        self.activity.send_replace(jobs.generation);
+    fn lock_jobs(&self) -> std::sync::MutexGuard<'_, BackgroundJobState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            // Every writer commits only owned maps/sets, booleans and wrapping
+            // counters here. Registration rejects live IDs before changing state;
+            // finish moves the job out and records its terminal debt atomically;
+            // acknowledgement handles both sides of that transition. Relay handles,
+            // removed jobs, aborts, cancellation signals and watch wakeups all leave
+            // this lock before running/dropping. No await or user code runs guarded.
+            // Cancellation decisions are sticky per job, so detach cannot overtake
+            // a signal selected under this lock; cancel_all also covers later jobs.
+            // Signals target cloned controllers; relays also check registration
+            // identity, so an old relay racing its abort cannot cancel a reused ID.
+            // Registration establishes RAII cleanup before any wakeup can unwind.
+            // Thus poison cannot mean a partly published job or lost terminal debt;
+            // recover the actual activity, never substitute a fictitious idle state.
+            let jobs = poisoned.into_inner();
+            self.state.clear_poison();
+            jobs
+        })
+    }
+
+    fn notify_changed(&self, generation: u64) {
+        // Notifications may arrive out of commit order after unlocking. The watch
+        // value is only a wakeup hint; activity_after always reads authoritative state.
+        self.activity.send_replace(generation);
     }
 
     pub(crate) fn activity(&self) -> BackgroundActivity {
-        self.state.lock().map_or(
-            BackgroundActivity {
-                generation: *self.activity.borrow(),
-                active: false,
-                background_started: 0,
-                unacknowledged_terminals: false,
-            },
-            |jobs| BackgroundActivity {
-                generation: jobs.generation,
-                active: !jobs.running.is_empty(),
-                background_started: jobs.background_started,
-                unacknowledged_terminals: !jobs.unacknowledged_terminals.is_empty(),
-            },
-        )
+        let jobs = self.lock_jobs();
+        BackgroundActivity {
+            generation: jobs.generation,
+            active: !jobs.running.is_empty(),
+            background_started: jobs.background_started,
+            unacknowledged_terminals: !jobs.unacknowledged_terminals.is_empty(),
+        }
     }
 
     pub(crate) async fn activity_after(&self, generation: u64) -> BackgroundActivity {
@@ -1765,86 +1812,106 @@ impl BackgroundJobs {
     }
 
     pub(crate) fn acknowledge_terminal(&self, call_id: &agentkit_core::ToolCallId) {
-        if let Ok(mut jobs) = self.state.lock() {
-            let changed = if let Some(job) = jobs.running.get_mut(call_id) {
-                !std::mem::replace(&mut job.terminal_published, true)
-            } else {
-                jobs.unacknowledged_terminals.remove(call_id)
-            };
-            if changed {
-                self.changed(&mut jobs);
-            }
+        let mut jobs = self.lock_jobs();
+        let changed = if let Some(job) = jobs.running.get_mut(call_id) {
+            !std::mem::replace(&mut job.terminal_published, true)
+        } else {
+            jobs.unacknowledged_terminals.remove(call_id)
+        };
+        let generation = changed.then(|| jobs.changed());
+        drop(jobs);
+        if let Some(generation) = generation {
+            self.notify_changed(generation);
         }
     }
 
     pub(crate) fn begin_turn(&self) {
-        if let Ok(mut jobs) = self.state.lock() {
-            jobs.cancel_all = false;
-        }
+        self.lock_jobs().cancel_all = false;
     }
 
     pub(crate) fn cancel_all(&self) {
-        if let Ok(mut jobs) = self.state.lock() {
-            jobs.cancel_all = true;
-            for job in jobs.running.values() {
-                job.controller.interrupt();
-            }
+        let mut jobs = self.lock_jobs();
+        jobs.cancel_all = true;
+        let controllers: Vec<_> = jobs
+            .running
+            .values_mut()
+            .filter_map(BackgroundJob::request_cancellation)
+            .collect();
+        drop(jobs);
+        for controller in controllers {
+            controller.interrupt();
         }
     }
 
     fn cancel_running(&self, call_id: &str) -> bool {
+        self.cancel_registration(call_id, None)
+    }
+
+    fn cancel_registration(&self, call_id: &str, registration: Option<&Arc<()>>) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(jobs) = self.state.lock() else {
+        let mut jobs = self.lock_jobs();
+        let Some(job) = jobs.running.get_mut(&call_id).filter(|job| {
+            registration.is_none_or(|registration| Arc::ptr_eq(&job.registration, registration))
+        }) else {
             return false;
         };
-        let Some(job) = jobs.running.get(&call_id) else {
-            return false;
-        };
-        job.controller.interrupt();
+        let controller = job.request_cancellation();
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
+        }
         true
     }
 
     pub fn cancel(&self, call_id: &str) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return false;
-        };
-        if let Some(job) = jobs.running.get(&call_id) {
-            job.controller.interrupt();
+        let mut jobs = self.lock_jobs();
+        let controller = if let Some(job) = jobs.running.get_mut(&call_id) {
+            job.request_cancellation()
         } else {
-            // ACP can expose the call just before its execution future registers.
-            // Remember the request so registration and cancellation are atomic
-            // from the user's perspective.
+            // Registration consumes the pending request in the same state commit.
             jobs.pending_cancellations.insert(call_id);
+            None
+        };
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
         true
     }
 
     pub(crate) fn detach(&self, call_id: &str) -> Option<DetachRegistration> {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return None;
-        };
+        let mut jobs = self.lock_jobs();
         if let Some(job) = jobs.running.get_mut(&call_id) {
             if job.manual_detach {
                 return Some(DetachRegistration::AlreadyDetached);
             }
+            if job.cancellation_requested
+                || job
+                    .foreground_cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+            {
+                let controller = job.request_cancellation();
+                drop(jobs);
+                if let Some(controller) = controller {
+                    controller.interrupt();
+                }
+                return None;
+            }
             let newly_detached = !job.detached;
             job.detached = true;
             job.manual_detach = true;
-            if job
-                .foreground_cancellation
-                .as_ref()
-                .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
-            {
-                job.detached = false;
-                job.manual_detach = false;
-                job.controller.interrupt();
-                return None;
-            }
-            if newly_detached {
+            let generation = if newly_detached {
                 jobs.background_started = jobs.background_started.wrapping_add(1);
-                self.changed(&mut jobs);
+                Some(jobs.changed())
+            } else {
+                None
+            };
+            drop(jobs);
+            if let Some(generation) = generation {
+                self.notify_changed(generation);
             }
             return Some(DetachRegistration::Registered);
         }
@@ -1857,9 +1924,7 @@ impl BackgroundJobs {
 
     pub(crate) fn restore_foreground(&self, call_id: &str) {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return;
-        };
+        let mut jobs = self.lock_jobs();
         let Some(job) = jobs.running.get_mut(&call_id) else {
             jobs.pending_detaches.remove(&call_id);
             return;
@@ -1868,67 +1933,92 @@ impl BackgroundJobs {
         if job.foreground_cancellation.is_some() {
             job.detached = false;
         }
-        if job
+        let controller = if job
             .foreground_cancellation
             .as_ref()
             .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
         {
-            job.controller.interrupt();
+            job.request_cancellation()
+        } else {
+            None
+        };
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
     }
 
-    fn propagate_foreground_cancellation(&self, call_id: &agentkit_core::ToolCallId) {
-        let Ok(jobs) = self.state.lock() else {
-            return;
-        };
-        if let Some(job) = jobs.running.get(call_id)
-            && !job.detached
-        {
-            job.controller.interrupt();
+    fn propagate_foreground_cancellation(
+        &self,
+        call_id: &agentkit_core::ToolCallId,
+        registration: &Arc<()>,
+    ) {
+        let mut jobs = self.lock_jobs();
+        let controller = jobs
+            .running
+            .get_mut(call_id)
+            .filter(|job| !job.detached && Arc::ptr_eq(&job.registration, registration))
+            .and_then(BackgroundJob::request_cancellation);
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
     }
 
     fn finish(&self, call_id: &agentkit_core::ToolCallId) {
-        if let Ok(mut jobs) = self.state.lock() {
-            if let Some(job) = jobs.running.remove(call_id) {
-                if job.detached && !job.terminal_published {
-                    jobs.unacknowledged_terminals.insert(call_id.clone());
-                }
-                if let Some(relay) = job.cancellation_relay {
-                    relay.abort();
-                }
-            }
-            jobs.pending_cancellations.remove(call_id);
-            jobs.pending_detaches.remove(call_id);
-            self.changed(&mut jobs);
+        let mut jobs = self.lock_jobs();
+        let job = jobs.running.remove(call_id);
+        if job
+            .as_ref()
+            .is_some_and(|job| job.detached && !job.terminal_published)
+        {
+            jobs.unacknowledged_terminals.insert(call_id.clone());
         }
+        jobs.pending_cancellations.remove(call_id);
+        jobs.pending_detaches.remove(call_id);
+        let generation = jobs.changed();
+        drop(jobs);
+        if let Some(job) = &job
+            && let Some(relay) = &job.cancellation_relay
+        {
+            relay.abort();
+        }
+        drop(job);
+        self.notify_changed(generation);
     }
 
     #[cfg(test)]
     pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
-        if let Ok(mut jobs) = self.state.lock() {
-            let call_id = agentkit_core::ToolCallId::new(call_id);
-            let manual_detach = jobs.pending_detaches.remove(&call_id);
-            let controller = CancellationController::new();
-            if jobs.cancel_all {
-                controller.interrupt();
-            }
-            jobs.running.insert(
-                call_id,
-                BackgroundJob {
-                    controller,
-                    foreground_cancellation: None,
-                    cancellation_relay: None,
-                    detached: manual_detach,
-                    manual_detach,
-                    terminal_published: false,
-                },
-            );
-            if manual_detach {
-                jobs.background_started = jobs.background_started.wrapping_add(1);
-            }
-            self.changed(&mut jobs);
+        let call_id = agentkit_core::ToolCallId::new(call_id);
+        let controller = CancellationController::new();
+        let mut jobs = self.lock_jobs();
+        if jobs.running.contains_key(&call_id) {
+            return;
         }
+        let cancelled = jobs.pending_cancellations.remove(&call_id) || jobs.cancel_all;
+        let manual_detach = jobs.pending_detaches.remove(&call_id);
+        jobs.running.insert(
+            call_id,
+            BackgroundJob {
+                registration: Arc::new(()),
+                controller: controller.clone(),
+                cancellation_requested: cancelled,
+                foreground_cancellation: None,
+                cancellation_relay: None,
+                detached: manual_detach,
+                manual_detach,
+                terminal_published: false,
+            },
+        );
+        if manual_detach {
+            jobs.background_started = jobs.background_started.wrapping_add(1);
+        }
+        let generation = jobs.changed();
+        drop(jobs);
+        if cancelled {
+            controller.interrupt();
+        }
+        self.notify_changed(generation);
     }
 
     #[cfg(test)]
@@ -1938,21 +2028,18 @@ impl BackgroundJobs {
 
     #[cfg(test)]
     pub(crate) fn is_cancelled_for_test(&self, call_id: &str) -> bool {
-        let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running
-                .get(&call_id)
-                .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
-        })
+        self.lock_jobs()
+            .running
+            .get(&agentkit_core::ToolCallId::new(call_id))
+            .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
     }
 
     #[cfg(test)]
     pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running.get(&call_id).is_some_and(|job| job.detached)
-                || jobs.pending_detaches.contains(&call_id)
-        })
+        let jobs = self.lock_jobs();
+        jobs.running.get(&call_id).is_some_and(|job| job.detached)
+            || jobs.pending_detaches.contains(&call_id)
     }
 }
 
@@ -2049,7 +2136,7 @@ impl Tool for BackgroundableCompose {
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
         let request = Self::sanitized(request)?;
-        let _job = self.begin_background(background, &call_id, ctx);
+        let _job = self.begin_background(background, &call_id, ctx)?;
         match self.inner.invoke(request, ctx).await {
             Ok(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
@@ -2078,7 +2165,10 @@ impl Tool for BackgroundableCompose {
             Ok(request) => request,
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
-        let _job = self.begin_background(background, &call_id, ctx);
+        let _job = match self.begin_background(background, &call_id, ctx) {
+            Ok(job) => job,
+            Err(error) => return ToolExecutionOutcome::FailedBeforeInvocation(error),
+        };
         match self.inner.invoke_outcome(request, ctx).await {
             ToolExecutionOutcome::Completed(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
@@ -2101,67 +2191,83 @@ impl BackgroundableCompose {
         background: bool,
         call_id: &agentkit_core::ToolCallId,
         ctx: &mut ToolContext<'_>,
-    ) -> BackgroundJobGuard {
+    ) -> Result<BackgroundJobGuard, ToolError> {
         let foreground_cancellation = (!background).then(|| ctx.cancellation.clone()).flatten();
+        let registration = Arc::new(());
         let controller = CancellationController::new();
         let cancellation = controller.handle().checkpoint();
+        let mut jobs = self.background_jobs.lock_jobs();
+        if jobs.running.contains_key(call_id) || jobs.unacknowledged_terminals.contains(call_id) {
+            drop(jobs);
+            return Err(ToolError::InvalidInput(
+                "compose call ID is already registered".into(),
+            ));
+        }
+        let manual_detach = jobs.pending_detaches.remove(call_id);
+        let detached = background || manual_detach;
+        let cancelled = jobs.pending_cancellations.remove(call_id)
+            || jobs.cancel_all
+            || (!detached
+                && foreground_cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled));
+        jobs.running.insert(
+            call_id.clone(),
+            BackgroundJob {
+                registration: Arc::clone(&registration),
+                controller: controller.clone(),
+                cancellation_requested: cancelled,
+                foreground_cancellation: foreground_cancellation.clone(),
+                cancellation_relay: None,
+                detached,
+                manual_detach,
+                terminal_published: false,
+            },
+        );
+        if detached {
+            jobs.background_started = jobs.background_started.wrapping_add(1);
+        }
+        let generation = jobs.changed();
+        drop(jobs);
+        // The guard must exist before notification, spawning, or context drops can
+        // unwind. It owns this unique registration until execution completes/cancels.
+        let guard = BackgroundJobGuard {
+            jobs: self.background_jobs.clone(),
+            call_id: call_id.clone(),
+        };
+        if cancelled {
+            controller.interrupt();
+        }
         ctx.cancellation = Some(cancellation.clone());
         if let Some(scope) = &mut ctx.execution_scope {
             scope.cancellation = Some(cancellation);
         }
-        if let Ok(mut jobs) = self.background_jobs.state.lock() {
-            if jobs.pending_cancellations.remove(call_id) || jobs.cancel_all {
-                controller.interrupt();
+        self.background_jobs.notify_changed(generation);
+        let shutdown = crate::resilient_fs::shutdown_token().child_token();
+        let relay_jobs = self.background_jobs.clone();
+        let relay_call_id = call_id.clone();
+        let relay = tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => { relay_jobs.cancel_registration(&relay_call_id.0, Some(&registration)); },
+                _ = async {
+                    if let Some(cancellation) = foreground_cancellation { cancellation.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => relay_jobs.propagate_foreground_cancellation(&relay_call_id, &registration),
             }
-            let manual_detach = jobs.pending_detaches.remove(call_id);
-            let detached = background || manual_detach;
-            if !detached
-                && foreground_cancellation
-                    .as_ref()
-                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
-            {
-                controller.interrupt();
-            }
-            jobs.running.insert(
-                call_id.clone(),
-                BackgroundJob {
-                    controller,
-                    foreground_cancellation: foreground_cancellation.clone(),
-                    cancellation_relay: None,
-                    detached,
-                    manual_detach,
-                    terminal_published: false,
-                },
-            );
-            if detached {
-                jobs.background_started = jobs.background_started.wrapping_add(1);
-            }
-            self.background_jobs.changed(&mut jobs);
+        }).abort_handle();
+        let mut jobs = self.background_jobs.lock_jobs();
+        // This guard is the sole removal owner and has not yet left this function.
+        let old_relay = jobs
+            .running
+            .get_mut(call_id)
+            .map(|job| job.cancellation_relay.replace(relay.clone()));
+        drop(jobs);
+        match old_relay {
+            Some(Some(old_relay)) => old_relay.abort(),
+            None => relay.abort(),
+            Some(None) => {}
         }
-        {
-            let shutdown = crate::resilient_fs::shutdown_token().child_token();
-            let jobs = self.background_jobs.clone();
-            let relay_call_id = call_id.clone();
-            let relay = tokio::spawn(async move {
-                tokio::select! {
-                    _ = shutdown.cancelled() => { jobs.cancel_running(&relay_call_id.0); },
-                    _ = async {
-                        if let Some(cancellation) = foreground_cancellation { cancellation.cancelled().await; }
-                        else { std::future::pending::<()>().await; }
-                    } => jobs.propagate_foreground_cancellation(&relay_call_id),
-                }
-            })
-            .abort_handle();
-            if let Ok(mut jobs) = self.background_jobs.state.lock()
-                && let Some(job) = jobs.running.get_mut(call_id)
-            {
-                job.cancellation_relay = Some(relay);
-            }
-        }
-        BackgroundJobGuard {
-            jobs: self.background_jobs.clone(),
-            call_id: call_id.clone(),
-        }
+        Ok(guard)
     }
 }
 

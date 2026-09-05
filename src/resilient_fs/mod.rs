@@ -58,8 +58,21 @@ fn allocation_oom() -> io::Error {
 fn oom() -> io::Error {
     io::ErrorKind::OutOfMemory.into()
 }
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// An unwind interrupted guarded filesystem state. The affected service or
+/// lease is isolated rather than inferring success from a partial transition.
+#[derive(Debug)]
+pub struct PoisonedState;
+impl std::fmt::Display for PoisonedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("resilient filesystem state poisoned by an interrupted operation")
+    }
+}
+impl std::error::Error for PoisonedState {}
+
+// Never recover a guard: backend callbacks can unwind after changing disk but
+// before the corresponding image, cursor, replay stage, or lease is updated.
+fn lock<T>(m: &Mutex<T>) -> io::Result<std::sync::MutexGuard<'_, T>> {
+    m.lock().map_err(|_| io::Error::other(PoisonedState))
 }
 fn bytes(data: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut v = Vec::new();
@@ -239,7 +252,7 @@ impl Image {
             }
             Source::Native(file) => {
                 if base_n > 0 {
-                    let mut file = lock(file);
+                    let mut file = lock(file)?;
                     file.seek(SeekFrom::Start(offset))?;
                     file.read_exact(&mut buf[..base_n])?;
                 }
@@ -308,12 +321,20 @@ pub struct Fs {
     service: Arc<Service>,
     lease: Option<Arc<LeaseCaller>>,
 }
+// Lock order: service state -> cursor (when present) -> object -> native file.
+// Lease fencing is acquired under service state, or independently by observers;
+// it never acquires service state. No guard crosses an await. File and namespace
+// callbacks run under state so an unwind also isolates sibling handles.
+// Backends must not reenter this service while a synchronous call is active.
 struct Service {
     backend: Arc<dyn Backend>,
     state: Mutex<State>,
     max_bytes: usize,
     max_operations: usize,
 }
+// Fs and File transitions coordinate namespace entries/redirects, live object
+// images, budget accounting, replay stages, and retained lease authority here.
+// Disk effects cannot be rolled back generically after an unwind.
 struct State {
     entries: Vec<Entry>,
     redirects: Vec<(PathBuf, PathBuf)>,
@@ -329,13 +350,16 @@ struct State {
 }
 #[derive(Debug)]
 pub struct Status {
+    /// `usize::MAX` when poison prevents a trustworthy snapshot.
     pub pending_operations: usize,
+    /// `usize::MAX` when poison prevents a trustworthy snapshot.
     pub retained_bytes: usize,
     pub exhausted: bool,
 }
 #[derive(Debug)]
 pub struct RecoveryReport {
     pub completed_operations: usize,
+    /// `usize::MAX` when poison prevents inspecting the pending queue.
     pub remaining_operations: usize,
     pub blocked: Option<io::Error>,
 }
@@ -359,7 +383,7 @@ struct LeaseInner {
 }
 impl LeaseInner {
     fn check(&self) -> io::Result<()> {
-        let mut fenced = lock(&self.fenced);
+        let mut fenced = lock(&self.fenced)?;
         if let Some(kind) = *fenced {
             if kind == io::ErrorKind::NotFound {
                 // Keep Missing while the name is absent, but report a replaced
@@ -504,7 +528,7 @@ impl Fs {
     ) -> io::Result<Lease> {
         let path = self.norm(path.as_ref())?;
         let scope = self.norm(scope.as_ref())?;
-        let mut state = lock(&self.service.state);
+        let mut state = lock(&self.service.state)?;
         state
             .leases
             .retain(|(_, authority, _)| authority.strong_count() > 0);
@@ -541,7 +565,7 @@ impl Fs {
         }
         // Retained authority precedes recovery: parent sync touches the lock.
         let report = self.recover_locked(&mut state);
-        self.rebase(&mut state);
+        self.rebase(&mut state)?;
         Self::prune(&mut state);
         if state.pending.iter().any(|p| p.action.touches(&path)) {
             return Err(report.blocked.unwrap_or_else(|| {
@@ -573,6 +597,7 @@ impl Fs {
         Ok(Lease { inner: caller })
     }
     fn norm(&self, path: &Path) -> io::Result<PathBuf> {
+        let _state = lock(&self.service.state)?;
         // Canonicalize a real ancestor, never collapse `..` through a symlink.
         let absolute = if path.is_absolute() {
             path.to_path_buf()
@@ -629,7 +654,7 @@ impl Fs {
             }
             if let Some(e) = s.entries.iter().find(|e| e.path == cur) {
                 if let Some(o) = &e.object {
-                    if lock(o).meta.kind.symlink {
+                    if lock(o)?.meta.kind.symlink {
                         return Err(error(
                             io::ErrorKind::PermissionDenied,
                             "symlink in managed path",
@@ -657,27 +682,38 @@ impl Fs {
         }
         Ok(())
     }
-    fn retained(s: &State) -> usize {
+    fn retained(s: &State) -> io::Result<usize> {
         let objects = s
             .objects
             .iter()
             .filter_map(|o| o.upgrade())
-            .map(|o| lock(&o).image.payload_bytes())
-            .sum::<usize>();
-        objects.saturating_add(s.pending.iter().map(|p| p.action.bytes()).sum::<usize>())
+            .try_fold(0usize, |total, o| {
+                Ok::<_, io::Error>(total.saturating_add(lock(&o)?.image.payload_bytes()))
+            })?;
+        Ok(objects.saturating_add(s.pending.iter().map(|p| p.action.bytes()).sum::<usize>()))
     }
+    /// Poison makes accounting unknowable. The infallible snapshot reports
+    /// saturated counts and exhaustion rather than inspecting interrupted state.
+    /// Use `recover().blocked` for the typed poison error.
     pub fn status(&self) -> Status {
-        let s = lock(&self.service.state);
-        Status {
-            pending_operations: s.pending.len(),
-            retained_bytes: Self::retained(&s),
-            exhausted: s.exhausted
-                || ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Acquire),
-        }
+        let snapshot = || -> io::Result<Status> {
+            let s = lock(&self.service.state)?;
+            Ok(Status {
+                pending_operations: s.pending.len(),
+                retained_bytes: Self::retained(&s)?,
+                exhausted: s.exhausted
+                    || ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Acquire),
+            })
+        };
+        snapshot().unwrap_or(Status {
+            pending_operations: usize::MAX,
+            retained_bytes: usize::MAX,
+            exhausted: true,
+        })
     }
     fn reserve(&self, s: &mut State, additional: usize, entries: usize) -> io::Result<()> {
         if s.pending.len() >= self.service.max_operations
-            || Self::retained(s).saturating_add(additional) > self.service.max_bytes
+            || Self::retained(s)?.saturating_add(additional) > self.service.max_bytes
             || s.entries.len().saturating_add(entries)
                 > self.service.max_operations.saturating_mul(4)
         {
@@ -745,8 +781,8 @@ impl Fs {
             return e
                 .object
                 .as_ref()
-                .map(|o| lock(o).meta.clone())
-                .ok_or_else(|| error(io::ErrorKind::NotFound, "removed path"));
+                .ok_or_else(|| error(io::ErrorKind::NotFound, "removed path"))
+                .and_then(|o| Ok(lock(o)?.meta.clone()));
         }
         if s.entries.iter().any(|e| {
             e.object.is_none()
@@ -783,7 +819,7 @@ impl Fs {
         // Share logical identity only while the named inode still matches.
         // Explicit and external replacements must remain distinct.
         for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-            let held = lock(&object);
+            let held = lock(&object)?;
             if held.path.as_deref() == Some(path)
                 && same_disk_identity(held.meta.disk_identity, opened.meta.disk_identity)
             {
@@ -805,14 +841,19 @@ impl Fs {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(s.objects.iter().filter_map(|w| w.upgrade()).find(|o| {
-            let o = lock(o);
-            o.path.as_deref() == Some(path) && same_disk_identity(o.meta.disk_identity, identity)
-        }))
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let o = lock(&object)?;
+            if o.path.as_deref() == Some(path) && same_disk_identity(o.meta.disk_identity, identity)
+            {
+                drop(o);
+                return Ok(Some(object));
+            }
+        }
+        Ok(None)
     }
-    fn entry(s: &mut State, path: PathBuf, object: Option<Obj>) {
+    fn entry(s: &mut State, path: PathBuf, object: Option<Obj>) -> io::Result<()> {
         if let Some(o) = &object {
-            lock(o).path = Some(path.clone());
+            lock(o)?.path = Some(path.clone());
         }
         if let Some(o) = &object
             && !s.objects.iter().any(|w| w.ptr_eq(&Arc::downgrade(o)))
@@ -824,6 +865,7 @@ impl Fs {
         } else {
             s.entries.push(Entry { path, object });
         }
+        Ok(())
     }
     fn new_permissions(
         &self,
@@ -842,9 +884,20 @@ impl Fs {
             let mut parent = path
                 .parent()
                 .ok_or_else(|| error(io::ErrorKind::InvalidInput, "no parent"))?;
-            while s.entries.iter().any(|e| {
-                e.path == parent && e.object.as_ref().is_some_and(|o| lock(o).meta.is_dir())
-            }) && matches!(self.service.backend.metadata(parent, false),
+            while s
+                .entries
+                .iter()
+                .filter(|e| e.path == parent)
+                .try_fold(false, |found, e| {
+                    Ok::<_, io::Error>(
+                        found
+                            || match &e.object {
+                                Some(o) => lock(o)?.meta.is_dir(),
+                                None => false,
+                            },
+                    )
+                })?
+                && matches!(self.service.backend.metadata(parent, false),
                 Err(e) if e.kind() == io::ErrorKind::NotFound)
             {
                 parent = parent
@@ -1050,22 +1103,25 @@ impl Fs {
         }
     }
     fn abandon(&self, action: &Action) {
+        // Best-effort cleanup needs a trustworthy descriptor identity. A
+        // poisoned descriptor cannot authorize deleting a temporary pathname.
         if let Action::Put {
             temp,
             temp_file: Some(file),
             stage: 1 | 2,
             ..
         } = action
-            && let Ok(held) = lock(file).identity()
+            && let Ok(file) = lock(file)
+            && let Ok(held) = file.identity()
             && let Ok(named) = self.service.backend.identity(temp, false)
             && same_disk_identity(held, named)
         {
             let _ = self.service.backend.remove_file(temp);
         }
     }
-    fn rebase(&self, s: &mut State) {
+    fn rebase(&self, s: &mut State) -> io::Result<()> {
         for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-            let mut object = lock(&object);
+            let mut object = lock(&object)?;
             let Some(path) = object.path.as_ref() else {
                 continue;
             };
@@ -1089,7 +1145,7 @@ impl Fs {
             });
             if let Some(file) = published {
                 let snapshot = {
-                    let held = lock(&file);
+                    let held = lock(&file)?;
                     held.metadata()
                         .and_then(|meta| Ok((meta, held.identity()?)))
                 };
@@ -1123,6 +1179,7 @@ impl Fs {
                 object.dirty = false;
             }
         }
+        Ok(())
     }
     fn enqueue(&self, s: &mut State, action: Action) -> (bool, io::Result<()>) {
         s.pending.push_back(Pending {
@@ -1157,9 +1214,20 @@ impl Fs {
         }
     }
     pub fn recover(&self) -> RecoveryReport {
-        let mut s = lock(&self.service.state);
-        let report = self.recover_locked(&mut s);
-        self.rebase(&mut s);
+        let mut s = match lock(&self.service.state) {
+            Ok(s) => s,
+            Err(e) => {
+                return RecoveryReport {
+                    completed_operations: 0,
+                    remaining_operations: usize::MAX,
+                    blocked: Some(e),
+                };
+            }
+        };
+        let mut report = self.recover_locked(&mut s);
+        if let Err(e) = self.rebase(&mut s) {
+            report.blocked = Some(e);
+        }
         Self::prune(&mut s);
         report
     }
@@ -1251,7 +1319,7 @@ impl Fs {
                     let file = temp_file.as_ref().ok_or_else(|| {
                         error(io::ErrorKind::InvalidData, "missing temporary descriptor")
                     })?;
-                    let mut file = lock(file);
+                    let mut file = lock(file)?;
                     #[cfg(unix)]
                     let named = b.metadata(temp, false)?;
                     if !same_disk_identity(file.identity()?, b.identity(temp, false)?)
@@ -1332,9 +1400,9 @@ impl Fs {
     }
     pub fn require_disk<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         let report = self.recover_locked(&mut s);
-        self.rebase(&mut s);
+        self.rebase(&mut s)?;
         Self::prune(&mut s);
         if s.pending.iter().any(|p| p.action.touches(&path)) {
             return Err(report.blocked.unwrap_or_else(|| {
@@ -1348,13 +1416,13 @@ impl Fs {
     }
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state);
+        let s = lock(&self.service.state)?;
         self.secure_path(&s, &path, false)?;
         self.lookup(&s, &path)
     }
     pub fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state);
+        let s = lock(&self.service.state)?;
         self.secure_path(&s, &path, true)?;
         self.lookup(&s, &path)
     }
@@ -1367,7 +1435,8 @@ impl Fs {
     }
     pub fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<u8>> {
         let file = self.open(path)?;
-        let image = lock(&file.object).image.clone();
+        let _state = lock(&self.service.state)?;
+        let image = lock(&file.object)?.image.clone();
         let len = usize::try_from(image.len).map_err(|_| allocation_oom())?;
         let mut data = Zeroizing::new(Vec::new());
         data.try_reserve_exact(len).map_err(|_| allocation_oom())?;
@@ -1396,7 +1465,7 @@ impl Fs {
         new_object: bool,
     ) -> io::Result<()> {
         let path = self.norm(path)?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.preflight(&s, &path)?;
         s.entries.try_reserve(1).map_err(|_| allocation_oom())?;
@@ -1445,20 +1514,20 @@ impl Fs {
             // Acceptance replaces the logical name even when publication is queued.
             // Old handles must not publish writes or chmod through that name.
             for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object);
+                let mut object = lock(&object)?;
                 if object.path.as_ref() == Some(&path) {
                     object.path = None;
                 }
             }
         }
         let object = if let Some(o) = object {
-            *lock(&o) = Object::memory(data.clone(), meta);
+            *lock(&o)? = Object::memory(data.clone(), meta);
             o
         } else {
             Arc::new(Mutex::new(Object::memory(data.clone(), meta)))
         };
-        Self::entry(&mut s, path.clone(), Some(object));
-        self.rebase(&mut s);
+        Self::entry(&mut s, path.clone(), Some(object))?;
+        self.rebase(&mut s)?;
         result
     }
     fn prune(s: &mut State) {
@@ -1470,7 +1539,7 @@ impl Fs {
     }
     fn recover_before(&self, s: &mut State) -> io::Result<()> {
         let report = self.recover_locked(s);
-        self.rebase(s);
+        self.rebase(s)?;
         Self::prune(s);
         match report.blocked {
             Some(e) if !capacity(&e) => Err(e),
@@ -1489,7 +1558,7 @@ impl Fs {
     }
     pub fn read_link<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let p = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state);
+        let s = lock(&self.service.state)?;
         self.secure_path(&s, &p, true)?;
         if !self.lookup(&s, &p)?.file_type().is_symlink() {
             return Err(error(io::ErrorKind::InvalidInput, "not a symlink"));
@@ -1498,10 +1567,12 @@ impl Fs {
     }
     pub fn canonicalize<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let p = self.norm(path.as_ref())?;
+        let s = lock(&self.service.state)?;
         match self.service.backend.canonicalize(&p) {
             Ok(p) => Ok(p),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.metadata(&p)?;
+                self.secure_path(&s, &p, false)?;
+                self.lookup(&s, &p)?;
                 Ok(p)
             }
             Err(e) => Err(e),
@@ -1588,7 +1659,7 @@ impl Fs {
     }
     pub fn read_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<ReadDir> {
         let p = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state);
+        let s = lock(&self.service.state)?;
         self.secure_path(&s, &p, false)?;
         let paths = self.list(&s, &p)?;
         let mut entries = Vec::new();
@@ -1612,7 +1683,7 @@ impl Fs {
     }
     fn mkdir(&self, path: &Path, private: bool) -> io::Result<()> {
         let p = self.norm(path)?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1654,7 +1725,7 @@ impl Fs {
                 Arc::new(Zeroizing::new(Vec::new())),
                 meta,
             )))),
-        );
+        )?;
         result
     }
     pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
@@ -1699,7 +1770,7 @@ impl Fs {
     }
     fn unlink(&self, path: &Path, dir: bool) -> io::Result<()> {
         let p = self.norm(path)?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1724,12 +1795,12 @@ impl Fs {
         );
         if accepted {
             for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object);
+                let mut object = lock(&object)?;
                 if object.path.as_ref() == Some(&p) {
                     object.path = None;
                 }
             }
-            Self::entry(&mut s, p, None);
+            Self::entry(&mut s, p, None)?;
         }
         result
     }
@@ -1748,7 +1819,7 @@ impl Fs {
     pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<()> {
         let from = self.norm(from.as_ref())?;
         let to = self.norm(to.as_ref())?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.authority(&from)?;
         self.authority(&to)?;
@@ -1820,7 +1891,7 @@ impl Fs {
         );
         if accepted {
             for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object);
+                let mut object = lock(&object)?;
                 if let Some(path) = &object.path {
                     if path.starts_with(&from) {
                         object.path = Some(if *path == from {
@@ -1838,9 +1909,9 @@ impl Fs {
                     e.object = None;
                 }
             }
-            Self::entry(&mut s, from.clone(), None);
+            Self::entry(&mut s, from.clone(), None)?;
             for (path, object) in moved {
-                Self::entry(&mut s, path, object);
+                Self::entry(&mut s, path, object)?;
             }
             s.redirects
                 .retain(|(path, _)| !path.starts_with(&from) && !path.starts_with(&to));
@@ -1863,7 +1934,7 @@ impl Fs {
         permissions: Permissions,
     ) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1885,7 +1956,7 @@ impl Fs {
             .find(|e| e.path == p)
             .and_then(|e| e.object.as_ref())
         {
-            let mut o = lock(o);
+            let mut o = lock(o)?;
             o.meta.permissions = permissions.clone();
             o.meta.disk = None;
         }
@@ -1904,13 +1975,13 @@ impl Fs {
                     Arc::new(Zeroizing::new(Vec::new())),
                     meta,
                 )))),
-            );
+            )?;
         }
         Ok(())
     }
     pub fn sync_directory<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1938,9 +2009,9 @@ impl Fs {
         }
         let root = self.norm(root.as_ref())?;
         let p = root.join(relative);
-        let mut s = lock(&self.service.state);
+        let mut s = lock(&self.service.state)?;
         let _ = self.recover_locked(&mut s);
-        self.rebase(&mut s);
+        self.rebase(&mut s)?;
         Self::prune(&mut s);
         self.secure_path(&s, &p, false)?;
         if s.entries.iter().any(|e| e.path == p) {
@@ -2023,12 +2094,12 @@ impl OpenOptions {
         {
             return Err(error(io::ErrorKind::InvalidInput, "invalid open options"));
         }
-        let mut s = lock(&fs.service.state);
+        let mut s = lock(&fs.service.state)?;
         if writable {
             fs.recover_before(&mut s)?;
         } else {
             let _ = fs.recover_locked(&mut s);
-            fs.rebase(&mut s);
+            fs.rebase(&mut s)?;
             Fs::prune(&mut s);
         }
         fs.secure_path(&s, &p, false)?;
@@ -2090,15 +2161,15 @@ impl OpenOptions {
                 unreachable!();
             }
             let object = if let Some(obj) = obj {
-                *lock(&obj) = Object::memory(data.clone(), meta);
+                *lock(&obj)? = Object::memory(data.clone(), meta);
                 obj
             } else {
                 Arc::new(Mutex::new(Object::memory(data.clone(), meta)))
             };
-            Fs::entry(&mut s, p.clone(), Some(object));
+            Fs::entry(&mut s, p.clone(), Some(object))?;
             result?;
         }
-        fs.rebase(&mut s);
+        fs.rebase(&mut s)?;
         let object = fs.object(&mut s, &p)?;
         Ok(File {
             fs: fs.clone(),
@@ -2142,11 +2213,16 @@ impl File {
         })
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
-        let object = lock(&self.object);
+        let _state = lock(&self.fs.service.state)?;
+        self.metadata_locked()
+    }
+    // Caller holds service state; seek also holds the cursor in lock order.
+    fn metadata_locked(&self) -> io::Result<Metadata> {
+        let object = lock(&self.object)?;
         if !object.dirty
             && let Source::Native(file) = &object.image.source
         {
-            let file = lock(file);
+            let file = lock(file)?;
             let mut meta = Metadata::disk(file.metadata()?, file.identity()?);
             meta.identity = object.meta.identity;
             Ok(meta)
@@ -2164,15 +2240,15 @@ impl File {
         if data.is_empty() && size.is_none() {
             return Ok(0);
         }
-        let mut s = lock(&self.fs.service.state);
+        let mut s = lock(&self.fs.service.state)?;
         self.fs.recover_before(&mut s)?;
-        let mut cursor = lock(&self.cursor);
-        let mut object = lock(&self.object);
+        let mut cursor = lock(&self.cursor)?;
+        let mut object = lock(&self.object)?;
         if !object.dirty
             && let Source::Native(native) = &object.image.source
         {
             let (meta, disk_identity) = {
-                let native = lock(native);
+                let native = lock(native)?;
                 (native.metadata()?, native.identity()?)
             };
             if disk_identity.is_none() {
@@ -2235,7 +2311,7 @@ impl File {
             unreachable!();
         }
         {
-            let mut object = lock(&self.object);
+            let mut object = lock(&self.object)?;
             object.image = image;
             object.meta.len = len;
             object.meta.modified = SystemTime::now();
@@ -2246,12 +2322,12 @@ impl File {
             object.dirty = true;
         }
         if let Some(path) = path {
-            Fs::entry(&mut s, path, Some(self.object.clone()));
+            Fs::entry(&mut s, path, Some(self.object.clone()))?;
         }
         if size.is_none() {
             *cursor = end;
         }
-        self.fs.rebase(&mut s);
+        self.fs.rebase(&mut s)?;
         result?;
         Ok(data.len())
     }
@@ -2269,15 +2345,15 @@ impl File {
         self.sync_data()
     }
     pub fn set_permissions(&self, p: Permissions) -> io::Result<()> {
-        let mut s = lock(&self.fs.service.state);
+        let mut s = lock(&self.fs.service.state)?;
         self.fs.recover_before(&mut s)?;
         let path = {
-            let mut object = lock(&self.object);
+            let mut object = lock(&self.object)?;
             if let Some(path) = &object.path
                 && !s.pending.iter().any(|p| p.action.touches(path))
                 && let Source::Native(native) = &object.image.source
             {
-                let held = lock(native).identity()?;
+                let held = lock(native)?.identity()?;
                 match self.fs.service.backend.identity(path, false) {
                     Ok(named) if same_disk_identity(held, named) => {}
                     Ok(None) => {
@@ -2311,15 +2387,15 @@ impl File {
             (true, Ok(()))
         };
         if accepted {
-            let mut object = lock(&self.object);
+            let mut object = lock(&self.object)?;
             object.meta.permissions = p;
             object.meta.disk = None;
             object.dirty = true;
             drop(object);
             if let Some(path) = path {
-                Fs::entry(&mut s, path, Some(self.object.clone()));
+                Fs::entry(&mut s, path, Some(self.object.clone()))?;
             }
-            self.fs.rebase(&mut s);
+            self.fs.rebase(&mut s)?;
         }
         result
     }
@@ -2332,13 +2408,14 @@ impl Read for File {
                 "handle is not readable",
             ));
         }
-        let mut cursor = lock(&self.cursor);
+        let _state = lock(&self.fs.service.state)?;
+        let mut cursor = lock(&self.cursor)?;
         let (image, dirty) = {
-            let object = lock(&self.object);
+            let object = lock(&self.object)?;
             (object.image.clone(), object.dirty)
         };
         let n = if !dirty && let Source::Native(file) = &image.source {
-            let mut file = lock(file);
+            let mut file = lock(file)?;
             file.seek(SeekFrom::Start(*cursor))?;
             file.read(buf)?
         } else {
@@ -2358,11 +2435,12 @@ impl Write for File {
 }
 impl Seek for File {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        let mut cursor = lock(&self.cursor);
+        let _state = lock(&self.fs.service.state)?;
+        let mut cursor = lock(&self.cursor)?;
         let next = match from {
             SeekFrom::Start(n) => n as i128,
             SeekFrom::Current(n) => *cursor as i128 + n as i128,
-            SeekFrom::End(n) => self.metadata()?.len() as i128 + n as i128,
+            SeekFrom::End(n) => self.metadata_locked()?.len() as i128 + n as i128,
         };
         if !(0..=u64::MAX as i128).contains(&next) {
             return Err(error(io::ErrorKind::InvalidInput, "invalid seek"));

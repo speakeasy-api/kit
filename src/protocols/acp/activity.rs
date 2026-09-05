@@ -17,6 +17,7 @@ enum State {
     Idle,
     Running,
     Settling,
+    Unavailable,
 }
 
 /// An ordered snapshot, not another reducer. Projections select only wire format.
@@ -35,15 +36,18 @@ struct Activity {
     next_id: u64,
     origin: ExecutionOrigin,
     current: Option<Transition>,
+    projecting: bool,
+    executing: bool,
 }
 
 /// Session-owned lifecycle instrument shared by the actor and its observer.
 /// Admission alone is silent; TurnStarted allocates the activity identity. All
 /// logical turns drained by an execution share that identity until settlement.
-/// Projection runs synchronously under the state lock: Running precedes content,
-/// and the actor must flush final content/diagnostics before settling to Idle.
-/// Projections only enqueue wire notifications; they must not reenter this
-/// instrument while its ordered transition is being projected.
+/// Projection runs synchronously outside the state lock. An in-flight claim
+/// prevents another projection from overtaking it, including callback reentry.
+/// The actor must flush final content/diagnostics before settling to Idle.
+/// Abandoned executions/projections isolate this owner: external delivery cannot
+/// be rolled back or safely retried after unwind or cancellation.
 #[derive(Clone)]
 pub(super) struct SessionActivity {
     state: Arc<Mutex<Activity>>,
@@ -60,33 +64,47 @@ impl SessionActivity {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn begin(&self, origin: ExecutionOrigin) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut state) = self.state.lock() else {
+            return; // A poisoned owner is never reused.
+        };
         // Continuations cannot redefine the origin of an existing interval.
-        if state.state == State::Idle {
+        if state.state == State::Idle && !state.projecting && !state.executing {
             state.origin = origin;
         }
     }
 
     pub(super) fn observe(&self, event: &AgentEvent) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match event {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.state == State::Unavailable || state.projecting {
+            return;
+        }
+        let transition = match event {
             AgentEvent::TurnStarted { .. } => {
                 let was_idle = state.state == State::Idle;
-                state.state = State::Running;
                 if was_idle {
-                    state.next_id = state.next_id.wrapping_add(1);
+                    let Some(id) = state.next_id.checked_add(1) else {
+                        state.state = State::Unavailable;
+                        return;
+                    };
                     let transition = Transition {
-                        id: state.next_id,
+                        id,
                         origin: state.origin,
                         active: true,
                         reason: FinishReason::Completed,
                         error: None,
                     };
                     state.current = Some(transition.clone());
-                    if let Err(error) = (self.project)(transition) {
-                        tracing::debug!(%error, "failed to project session activity");
-                    }
+                    state.next_id = id;
+                    state.state = State::Running;
+                    state.projecting = true;
+                    Some(transition)
+                } else {
+                    state.state = State::Running;
+                    None
                 }
             }
             AgentEvent::TurnFinished(result) if state.state != State::Idle => {
@@ -94,9 +112,29 @@ impl SessionActivity {
                 if let Some(current) = &mut state.current {
                     current.reason = result.finish_reason.clone();
                 }
+                None
             }
-            _ => {}
+            _ => None,
+        };
+        drop(state);
+        if let Some(transition) = transition
+            && let Err(error) = self.project_transition(transition)
+        {
+            tracing::debug!(%error, "failed to project session activity");
         }
+    }
+
+    fn project_transition(&self, transition: Transition) -> Result<(), AcpRuntimeError> {
+        // The claim is already installed. Drop isolates the owner if the client
+        // callback unwinds; it never calls client code during unwind.
+        let mut claim = ActivityClaim {
+            activity: self,
+            projection: true,
+            completed: false,
+        };
+        let result = (self.project)(transition);
+        claim.completed = true;
+        result
     }
 
     pub(super) fn settle(
@@ -104,10 +142,18 @@ impl SessionActivity {
         reason: Option<FinishReason>,
         error: Option<String>,
     ) -> Result<(), AcpRuntimeError> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+        if state.state == State::Unavailable || state.projecting {
+            return Err(AcpRuntimeError::Loop(
+                "session activity is unavailable".into(),
+            ));
+        }
         state.origin = ExecutionOrigin::Prompt;
         state.state = State::Idle;
-        if let Some(mut terminal) = state.current.take() {
+        let terminal = state.current.take().map(|mut terminal| {
             terminal.active = false;
             if let Some(reason) = reason {
                 terminal.reason = reason;
@@ -116,7 +162,14 @@ impl SessionActivity {
                 terminal.reason = FinishReason::Error;
             }
             terminal.error = error;
-            (self.project)(terminal)?;
+            terminal
+        });
+        state.projecting = terminal.is_some();
+        drop(state);
+        if let Some(terminal) = terminal {
+            // A returned transport error is an at-most-once projection attempt,
+            // not a reason to replay an already consumed terminal transition.
+            self.project_transition(terminal)?;
         }
         Ok(())
     }
@@ -129,13 +182,58 @@ impl SessionActivity {
         operation: impl std::future::Future<Output = Result<T, AcpRuntimeError>>,
         reason: impl FnOnce(&T) -> Option<FinishReason>,
     ) -> Result<T, AcpRuntimeError> {
-        self.begin(origin);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+            if state.state == State::Unavailable || state.projecting || state.executing {
+                return Err(AcpRuntimeError::Loop(
+                    "session activity is unavailable".into(),
+                ));
+            }
+            if state.state == State::Idle {
+                state.origin = origin;
+            }
+            state.executing = true;
+        }
+        let mut claim = ActivityClaim {
+            activity: self,
+            projection: false,
+            completed: false,
+        };
         let result = operation.await;
         let terminal = result.as_ref().ok().and_then(reason);
         let settled = self.settle(terminal, result.as_ref().err().map(ToString::to_string));
+        claim.completed = true;
         match result {
             Err(error) => Err(error),
             Ok(value) => settled.map(|()| value),
+        }
+    }
+}
+
+/// No callbacks, awaits, or external effects occur while releasing a claim.
+/// Poison is left isolated rather than recovering potentially incomplete state.
+struct ActivityClaim<'a> {
+    activity: &'a SessionActivity,
+    projection: bool,
+    completed: bool,
+}
+
+impl Drop for ActivityClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.activity.state.lock() {
+            if self.projection {
+                state.projecting = false;
+            } else {
+                state.executing = false;
+            }
+            if !self.completed || (!self.projection && state.state != State::Idle) {
+                // A failed settlement must not hand an unterminated interval
+                // to another execution, even if a concurrent projection won.
+                state.state = State::Unavailable;
+            }
         }
     }
 }
@@ -364,5 +462,156 @@ mod tests {
             .unwrap_err();
         activity.settle(None, None).unwrap();
         assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn projection_unwind_isolates_without_poison_or_replay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for fail_active in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let output = calls.clone();
+            let activity = SessionActivity::new(move |transition| {
+                output.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(transition.active, fail_active, "projection failed");
+                Ok(())
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                activity.observe(&started("first"));
+                activity.settle(None, None).unwrap();
+            }));
+            assert!(result.is_err());
+            assert!(!activity.state.is_poisoned());
+            activity.begin(ExecutionOrigin::Autonomous);
+            activity.observe(&started("later"));
+            assert!(matches!(
+                activity.settle(None, None),
+                Err(AcpRuntimeError::Loop(_))
+            ));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                if fail_active { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn projection_reentry_is_rejected_without_deadlock_or_reordering() {
+        let owner = Arc::new(std::sync::OnceLock::<SessionActivity>::new());
+        let callback_owner = Arc::downgrade(&owner);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let output = calls.clone();
+        let activity = SessionActivity::new(move |_| {
+            let owner = callback_owner.upgrade().unwrap();
+            let activity = owner.get().unwrap();
+            assert!(activity.state.try_lock().is_ok());
+            assert!(matches!(
+                activity.settle(None, None),
+                Err(AcpRuntimeError::Loop(_))
+            ));
+            activity.observe(&started("reentrant"));
+            output.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(owner.set(activity.clone()).is_ok());
+        activity.observe(&started("first"));
+        activity.settle(None, None).unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(activity.state.lock().unwrap().next_id, 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_execution_isolates_before_another_operation_can_run() {
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let output = transitions.clone();
+        let activity = SessionActivity::new(move |transition| {
+            output.lock().unwrap().push(transition);
+            Ok(())
+        });
+        let mut execution = Box::pin(activity.execute(
+            ExecutionOrigin::Autonomous,
+            async {
+                activity.observe(&started("first"));
+                std::future::pending::<Result<(), AcpRuntimeError>>().await
+            },
+            |_| None,
+        ));
+        assert!(futures_util::poll!(execution.as_mut()).is_pending());
+        // A concurrent execution must not steal the live interval either.
+        assert!(
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async { panic!("must not run") },
+                    |_: &()| None
+                )
+                .await
+                .is_err()
+        );
+        drop(execution);
+        activity.observe(&started("stale"));
+        assert!(matches!(
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async { panic!("must not run") },
+                    |_: &()| None
+                )
+                .await,
+            Err(AcpRuntimeError::Loop(_))
+        ));
+        assert_eq!(transitions.lock().unwrap().len(), 1);
+        assert!(!activity.state.is_poisoned());
+    }
+
+    #[test]
+    fn exhausted_identity_and_poison_never_resume_projection() {
+        let activity = SessionActivity::new(|_| panic!("must not project"));
+        activity.state.lock().unwrap().next_id = u64::MAX;
+        activity.observe(&started("overflow"));
+        assert!(activity.settle(None, None).is_err());
+        let poisoned = activity.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = poisoned.state.lock().unwrap();
+                panic!("state mutation interrupted");
+            })
+            .join()
+            .is_err()
+        );
+        activity.begin(ExecutionOrigin::Prompt);
+        activity.observe(&started("after-poison"));
+        assert!(matches!(
+            activity.settle(None, None),
+            Err(AcpRuntimeError::Loop(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn outcome_callback_unwind_isolates_the_execution_owner() {
+        use futures_util::FutureExt;
+        let activity = SessionActivity::new(|_| Ok(()));
+        let result = std::panic::AssertUnwindSafe(activity.execute(
+            ExecutionOrigin::Prompt,
+            async {
+                activity.observe(&started("first"));
+                Ok(())
+            },
+            |_| panic!("outcome callback failed"),
+        ))
+        .catch_unwind()
+        .await;
+        assert!(result.is_err());
+        assert!(!activity.state.is_poisoned());
+        assert!(activity.settle(None, None).is_err());
+        assert!(
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async { panic!("must not run") },
+                    |_: &()| None
+                )
+                .await
+                .is_err()
+        );
     }
 }
