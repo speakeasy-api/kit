@@ -15,7 +15,8 @@ const VERSION: u32 = 1;
 pub(crate) struct Boundary {
     /// Index in `load_history`, including states preceding compaction.
     pub state_index: usize,
-    /// Number of items retained before the selected prompt.
+    /// Number of items in the retained prefix (exclusive for a selected user
+    /// prompt, inclusive for a selected assistant answer or closed tool batch).
     pub prefix_len: usize,
     /// BLAKE3 of the original parent prefix, including its metadata/timestamps.
     pub prefix_hash: String,
