@@ -676,6 +676,8 @@ pub struct App {
     pub can_replace_steer: bool,
     pub(super) selected_steer: Option<String>,
     pub(super) queue_focused: bool,
+    /// Asynchronous selector closure must not redirect stale destructive keys.
+    pub(super) queue_handoff: bool,
     steer_edit: Option<SteerEdit>,
     retired_steers: HashSet<String>,
     steer_mutations: HashMap<String, SteerMutation>,
@@ -978,6 +980,7 @@ impl App {
             can_replace_steer: false,
             selected_steer: None,
             queue_focused: false,
+            queue_handoff: false,
             steer_edit: None,
             retired_steers: HashSet::new(),
             steer_mutations: HashMap::new(),
@@ -1753,8 +1756,7 @@ impl App {
     fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
         self.retired_steers
             .extend(self.pending_steers.drain(..).map(|pending| pending.id));
-        self.selected_steer = None;
-        self.queue_focused = false;
+        self.close_queue_after_update();
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
@@ -2196,6 +2198,7 @@ impl App {
         self.cancel_steer_edit();
         self.selected_steer = None;
         self.queue_focused = false;
+        self.queue_handoff = false;
         self.retired_steers.clear();
         self.steer_mutations.clear();
         self.session_catalog_pending = false;
@@ -2458,6 +2461,7 @@ impl App {
             self.toast("pending-message edits are text-only");
             return;
         }
+        self.queue_handoff = false;
         self.next_attachment += 1;
         let label = match kind {
             AttachmentKind::Image => "Image",
@@ -2542,6 +2546,7 @@ impl App {
             return;
         }
         self.file_picker = None;
+        self.queue_handoff = false;
         self.editor.insert_str(text);
         self.sync_command_completion();
         let lines = text.lines().count();
@@ -2915,6 +2920,12 @@ impl App {
         }
     }
 
+    fn close_queue_after_update(&mut self) {
+        self.queue_handoff |= self.queue_focused;
+        self.queue_focused = false;
+        self.selected_steer = None;
+    }
+
     fn remove_pending_steer(&mut self, id: &str) {
         self.retired_steers.insert(id.to_owned());
         let index = self
@@ -2923,8 +2934,7 @@ impl App {
             .position(|pending| pending.id == id);
         self.pending_steers.retain(|pending| pending.id != id);
         if self.pending_steers.is_empty() {
-            self.selected_steer = None;
-            self.queue_focused = false;
+            self.close_queue_after_update();
         } else if self.selected_steer.as_deref() == Some(id) {
             self.selected_steer = index.and_then(|index| {
                 self.pending_steers
@@ -3051,8 +3061,7 @@ impl App {
             .iter()
             .position(|pending| Some(&pending.id) == self.selected_steer.as_ref())
         else {
-            self.selected_steer = None;
-            self.queue_focused = false;
+            self.close_queue_after_update();
             return Action::None;
         };
         match key.code {
@@ -3173,6 +3182,41 @@ impl App {
         if self.queue_focused && !global_key {
             return self.handle_steer_selection(key);
         }
+        if self.queue_handoff && !global_key {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let command = key.modifiers.contains(KeyModifiers::SUPER);
+            let destructive = matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+            ) || (control && matches!(key.code, KeyCode::Char('w' | 'u' | 'k')))
+                || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d'));
+            if destructive {
+                self.toast("queue closed — type, move cursor or Esc before sending/deleting draft");
+                return Action::None;
+            }
+            if key.code == KeyCode::Esc {
+                self.queue_handoff = false;
+                self.toast = None;
+                return Action::None;
+            }
+            // Normal composer interaction stays responsive. View/task shortcuts
+            // above do not acknowledge the changed focus, nor do repeat deletes.
+            if matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Tab
+            ) || (matches!(key.code, KeyCode::Char(_)) && !control && !command)
+                || (control && matches!(key.code, KeyCode::Char('a' | 'e' | 'j')))
+            {
+                self.queue_handoff = false;
+                self.toast = None;
+            }
+        }
         if key.code == KeyCode::F(2) && !self.editing_steer() {
             let Some(pending) = self.pending_steers.front() else {
                 self.toast("no pending messages");
@@ -3180,6 +3224,7 @@ impl App {
             };
             self.selected_steer = Some(pending.id.clone());
             self.queue_focused = true;
+            self.queue_handoff = false;
             self.file_picker = None;
             return Action::None;
         }
@@ -5328,6 +5373,7 @@ mod tests {
         app.paste("draft");
         app.handle_key(press(KeyCode::F(2)));
         assert!(!app.queue_focused);
+        assert!(!app.queue_handoff);
         assert!(app.selected_steer.is_none());
         assert_eq!(app.toast_text(), Some("no pending messages"));
         app.handle_key(press(KeyCode::Char('!')));
@@ -5366,6 +5412,127 @@ mod tests {
             app.handle_key(press(KeyCode::Char('!')));
             assert_eq!(app.editor.text(), "draft!", "{outcome}");
         }
+    }
+
+    #[test]
+    fn automatic_queue_closure_guards_stale_destructive_keys_until_acknowledged() {
+        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
+            for key in [KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete] {
+                let mut app = queued_app();
+                app.paste("draft");
+                app.attach(
+                    PathBuf::from("image.png"),
+                    "image/png",
+                    AttachmentKind::Image,
+                    3,
+                );
+                app.editor.move_left();
+                let draft = app.editor.text().to_owned();
+                let attachments = app.attachments.clone();
+                app.handle_key(press(KeyCode::F(2)));
+                if outcome == "turn_end" {
+                    app.apply(Update::State(StateUpdate::Idle(
+                        IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+                    )));
+                } else {
+                    for id in ["a", "b", "c"] {
+                        match outcome {
+                            "delivery" => app.apply(Update::UserMessage {
+                                id: id.into(),
+                                text: id.into(),
+                                images: Vec::new(),
+                                append: false,
+                            }),
+                            "removal" => {
+                                let token = app.begin_steer_mutation(id, None).unwrap();
+                                app.apply(Update::SteerMutationFinished {
+                                    id: id.into(),
+                                    token,
+                                    result: Ok(()),
+                                });
+                            }
+                            "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(!app.queue_focused);
+                assert!(app.queue_handoff);
+                for _ in 0..3 {
+                    assert!(matches!(app.handle_key(press(key)), Action::None));
+                    assert_eq!(app.editor.text(), draft, "{outcome} {key:?}");
+                    assert_eq!(app.attachments, attachments);
+                    assert!(app.queue_handoff);
+                }
+                assert!(app.toast_text().unwrap().contains("queue closed"));
+                // Esc acknowledges composer focus rather than cancelling the turn.
+                assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+                assert!(!app.queue_handoff);
+                assert!(app.phase != Phase::Cancelling);
+                let action = app.handle_key(press(key));
+                if key == KeyCode::Enter {
+                    assert!(
+                        matches!(action, Action::Submit { prompt, .. } if prompt.text == draft && prompt.attachments == attachments)
+                    );
+                } else {
+                    assert_ne!(app.editor.text(), draft);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typing_paste_and_cursor_movement_acknowledge_queue_handoff() {
+        for interaction in ["typing", "paste", "cursor"] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            for id in ["a", "b", "c"] {
+                app.steer_revoked(id);
+            }
+            assert!(app.queue_handoff);
+            match interaction {
+                "typing" => {
+                    app.handle_key(press(KeyCode::Char('!')));
+                }
+                "paste" => app.paste("!"),
+                "cursor" => {
+                    app.handle_key(press(KeyCode::Left));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!app.queue_handoff, "{interaction}");
+            assert!(!app.queue_focused);
+            app.apply(Update::State(StateUpdate::Idle(
+                IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+            )));
+            assert!(
+                !app.queue_handoff,
+                "turn completion must not rearm the handoff"
+            );
+            app.last_key = None;
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::Submit { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_queue_exit_and_session_switch_do_not_require_handoff_acknowledgement() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.queue_handoff);
+        app.handle_key(press(KeyCode::F(2)));
+        for id in ["a", "b", "c"] {
+            app.steer_revoked(id);
+        }
+        assert!(app.queue_handoff);
+        app.start_session("other-session".into());
+        assert!(!app.queue_handoff);
+        assert_eq!(app.editor.text(), "draft");
     }
 
     #[test]
@@ -5410,6 +5577,7 @@ mod tests {
         )));
         assert!(app.pending_steers.is_empty());
         assert!(app.editing_steer());
+        assert!(!app.queue_handoff);
         assert!(matches!(
             app.handle_key(press(KeyCode::Enter)),
             Action::None

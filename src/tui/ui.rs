@@ -2259,6 +2259,8 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             "↑/↓ select   ⌫/del remove   esc back · edit unavailable "
         }
+    } else if app.queue_handoff {
+        "queue closed · type / ←→ / esc to continue "
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
     } else {
@@ -3126,6 +3128,36 @@ mod tests {
         let editing = render(&mut app, 100, 18);
         assert!(editing.contains("editing pending"), "{editing}");
         assert!(editing.contains("esc restore draft"), "{editing}");
+    }
+
+    #[test]
+    fn drained_queue_shows_composer_handoff_hint_without_selector_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.paste("draft");
+        app.apply(Update::SteerAccepted {
+            id: "pending".into(),
+            text: "queued".into(),
+            editable: true,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.apply(Update::UserMessage {
+            id: "pending".into(),
+            text: "queued".into(),
+            images: Vec::new(),
+            append: false,
+        });
+        assert!(!app.queue_focused);
+        let frame = render(&mut app, 100, 18);
+        assert!(frame.contains("queue closed · type / ←→ / esc"), "{frame}");
+        assert!(!frame.contains("esc back"), "{frame}");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!render(&mut app, 100, 18).contains("queue closed"));
     }
 
     #[test]
