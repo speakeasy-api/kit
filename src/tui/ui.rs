@@ -20,6 +20,8 @@ use unicode_width::UnicodeWidthStr;
 thread_local! {
     static MATERIALIZED_TRANSCRIPT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFRESHED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUERY_WIDTH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NAVIGATION_PREVIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static VISITED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -35,7 +37,7 @@ use super::{
     image::{ImageRuntime, RESERVED_ROWS},
     markdown,
     plan::PlanKind,
-    theme,
+    theme, transcript,
     wrap::{LinkedLine, LinkedSpan, wrap_linked_tagged},
 };
 
@@ -56,6 +58,7 @@ type TranscriptTag = (Option<String>, Option<CodeHit>, Option<usize>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
+    let navigation_matches = app.sync_navigation();
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let start_width = frame
@@ -128,6 +131,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_model_dialog(frame, app);
     } else if app.effort_dialog.is_some() {
         draw_effort_dialog(frame, app);
+    }
+    if app.navigation.dialog.is_some() {
+        draw_navigation(frame, app, &navigation_matches);
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
@@ -392,14 +398,22 @@ fn model_dialog_viewport(
 }
 
 fn visible_query_tail(query: &str, width: usize) -> &str {
-    let mut tail = query;
-    while UnicodeWidthStr::width(tail) > width {
-        let Some((index, _)) = tail.grapheme_indices(true).nth(1) else {
-            return "";
-        };
-        tail = &tail[index..];
+    // Match the renderer's per-grapheme cell widths. Two forward passes keep
+    // this linear, including long regional-indicator runs; repeatedly measuring
+    // the remaining string (or finding boundaries backwards) can be quadratic.
+    let grapheme_width = |grapheme: &str| {
+        #[cfg(test)]
+        QUERY_WIDTH_BYTES.with(|count| count.set(count.get() + grapheme.len()));
+        UnicodeWidthStr::width(grapheme)
+    };
+    let mut remaining: usize = query.graphemes(true).map(grapheme_width).sum();
+    for (index, grapheme) in query.grapheme_indices(true) {
+        if remaining <= width {
+            return &query[index..];
+        }
+        remaining -= grapheme_width(grapheme);
     }
-    tail
+    ""
 }
 
 fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
@@ -574,6 +588,122 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(Span::styled(footer, theme::dim())),
         footer_area,
     );
+}
+
+/// A read-only index of display text. Only visible entries build previews.
+fn draw_navigation(frame: &mut Frame<'_>, app: &App, matches: &[usize]) {
+    let outer = frame.area();
+    let width = if outer.width > 20 {
+        outer.width.saturating_sub(4).min(80)
+    } else {
+        outer.width
+    };
+    let height = if outer.height > 8 {
+        outer.height.saturating_sub(4).min(22)
+    } else {
+        outer.height
+    };
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let dialog = app.navigation.dialog.as_ref().expect("checked above");
+    let selected = matches
+        .iter()
+        .position(|index| app.navigation.id(*index) == dialog.selected);
+    let panel = Panel::bordered().title(format!(
+        " transcript {}/{} ",
+        selected.map_or(0, |index| index + 1),
+        matches.len()
+    ));
+    let inner = panel.inner(area);
+    let footer_rows = if inner.height >= 5 {
+        2
+    } else {
+        u16::from(inner.height >= 3)
+    };
+    let [search, list, footer] = Layout::vertical([
+        Constraint::Length(u16::from(inner.height >= 2)),
+        Constraint::Min(0),
+        Constraint::Length(footer_rows),
+    ])
+    .areas(inner);
+    let visible = list.height as usize;
+    let start = selected
+        .unwrap_or(0)
+        .saturating_sub(visible.saturating_sub(1));
+    let lines = if matches.is_empty() {
+        vec![Line::from(Span::styled(
+            "No matching messages",
+            theme::dim(),
+        ))]
+    } else {
+        matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(position, index)| {
+                #[cfg(test)]
+                NAVIGATION_PREVIEWS.with(|count| count.set(count.get() + 1));
+                let marker = if Some(position) == selected {
+                    "› "
+                } else {
+                    "  "
+                };
+                let style = if Some(position) == selected {
+                    theme::accent().add_modifier(Modifier::BOLD)
+                } else {
+                    theme::text()
+                };
+                let role = transcript::role(&app.blocks[*index])
+                    .expect("matched message")
+                    .label();
+                Line::from(Span::styled(
+                    format!(
+                        "{marker}{role}: {}",
+                        transcript::preview(&app.blocks[*index])
+                    ),
+                    style,
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    let prefix = format!("{} / ", dialog.role.label());
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str()).min(search.width as usize);
+    let query = visible_query_tail(
+        &dialog.query,
+        (search.width as usize).saturating_sub(prefix_width + 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, theme::dim()),
+            Span::styled(query.to_owned(), theme::text()),
+        ])),
+        search,
+    );
+    frame.render_widget(Paragraph::new(lines), list);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "↑/↓ select · Enter reveal · Esc/F3 close",
+                theme::dim(),
+            )),
+            Line::from(Span::styled(
+                "type to search · Tab roles · Ctrl+↑/↓ User jumps",
+                theme::dim(),
+            )),
+        ]),
+        footer,
+    );
+    if search.width > 0 && search.height > 0 {
+        let column = (prefix_width + UnicodeWidthStr::width(query)).min(search.width as usize - 1);
+        frame.set_cursor_position(Position::new(search.x + column as u16, search.y));
+    }
 }
 
 fn draw_model_dialog(frame: &mut Frame<'_>, app: &App) {
@@ -815,7 +945,10 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     }
 
     let width = inner.width.max(1) as usize;
+    let viewport_changed =
+        app.transcript_cache_width != width || app.viewport != inner.height as usize;
     refresh_transcript_cache_with_images(app, images, width);
+    app.apply_navigation_reveal(viewport_changed);
     let working_rows = if app.working() {
         wrap_linked_tagged(
             &[(LinkedLine::plain(working_line(app)), (None, None, None))],
@@ -855,10 +988,15 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         String::new(),
     );
     let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
-    let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
+    let mut materialize = |row: &crate::tui::app::CachedTranscriptRow, revealed: bool| {
         #[cfg(test)]
         MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(count.get() + 1));
-        visible.push(row.0.clone());
+        let mut line = row.0.clone();
+        if revealed {
+            // Navigation is independent of tool-card focus and cached styles.
+            line.style = line.style.add_modifier(Modifier::REVERSED);
+        }
+        visible.push(line);
         app.row_calls.push(row.1.0.clone());
         app.row_code.push(row.1.1.clone());
         app.row_links.push(row.2.clone());
@@ -878,7 +1016,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             }
             let separator_rows = usize::from(span_start > 0);
             if separator_rows > 0 && offset <= span_start && span_start < end {
-                materialize(&separator);
+                materialize(&separator, false);
             }
             let content_start = span_start + separator_rows;
             if let Some(block) = &app.transcript_cache[block_index] {
@@ -888,7 +1026,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                     if absolute >= end {
                         break;
                     }
-                    materialize(row);
+                    materialize(row, app.navigation.is_revealed(block_index));
                 }
                 for placement in &block.images {
                     let image_start = content_start + placement.row;
@@ -909,7 +1047,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     if !working_rows.is_empty() && transcript_rows < end {
         let separator_row = transcript_rows;
         if offset <= separator_row && separator_row < end {
-            materialize(&separator);
+            materialize(&separator, false);
         }
         let content_start = separator_row + 1;
         let first_row = offset.saturating_sub(content_start);
@@ -917,7 +1055,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             if content_start + row_index >= end {
                 break;
             }
-            materialize(row);
+            materialize(row, false);
         }
     }
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
@@ -1154,6 +1292,7 @@ fn transcript_block_lines(
                 text,
                 started.elapsed().as_millis(),
                 *millis,
+                app.navigation.is_revealed(block_index),
             ))),
             None,
         ),
@@ -1228,9 +1367,10 @@ fn thought_lines(
     text: &str,
     running_millis: u128,
     millis: Option<u64>,
+    revealed: bool,
 ) -> Vec<Line<'static>> {
     let elapsed = millis.unwrap_or(u64::try_from(running_millis).unwrap_or(u64::MAX));
-    if millis.is_some() && !app.show_thoughts {
+    if millis.is_some() && !app.show_thoughts && !revealed {
         return vec![Line::from(Span::styled(
             format!("⋮ thought for {} · ^t to read", theme::duration(elapsed)),
             theme::faint(),
@@ -1238,7 +1378,7 @@ fn thought_lines(
     }
     let style = theme::dim().add_modifier(Modifier::ITALIC);
     let all: Vec<&str> = text.split('\n').collect();
-    let shown = if app.show_thoughts {
+    let shown = if app.show_thoughts || revealed {
         all.as_slice()
     } else {
         &all[all.len().saturating_sub(4)..]
@@ -1719,7 +1859,7 @@ fn working_line(app: &App) -> Line<'static> {
             format!("  {}", theme::duration(app.elapsed())),
             theme::dim(),
         ),
-        Span::styled("   esc interrupts", theme::faint()),
+        Span::styled("   esc interrupts · F3 transcript", theme::faint()),
     ])
 }
 
@@ -2264,7 +2404,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
     } else {
-        "⏎ send   ⇧⏎ newline   ^l log   ^c quit "
+        "F3 transcript   ⏎ send   ⇧⏎ newline   ^l log   ^c quit "
     };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
     let gap = (area.width as usize)
@@ -2890,6 +3030,322 @@ mod tests {
             at: 0,
         }));
         app
+    }
+
+    fn navigation_app(blocks: Vec<Block>) -> App {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "0:0".into(),
+        );
+        app.blocks = blocks;
+        app
+    }
+
+    fn reveal(app: &mut App, index: usize) {
+        app.open_navigation();
+        app.navigation.dialog.as_mut().unwrap().selected = app.navigation.id(index);
+        app.last_key = None; // Deliberate reveal, not an unbracketed paste burst.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn navigation_reveal_uses_wrapped_prefix_and_reanchors_on_resize() {
+        let mut app = navigation_app(vec![
+            Block::Agent("earlier wrapped words ".repeat(40)),
+            Block::Agent("selected message".into()),
+            Block::Agent("later message\n".repeat(40)),
+        ]);
+        render(&mut app, 60, 14);
+        reveal(&mut app, 1);
+        let wide = render(&mut app, 60, 14);
+        let wide_prefix = app.transcript_prefixes[1];
+        assert_eq!(app.scroll, wide_prefix + 1);
+        assert!(!app.follow);
+        assert!(wide.contains("selected message"), "{wide}");
+
+        let narrow = render(&mut app, 30, 14);
+        assert!(app.transcript_prefixes[1] > wide_prefix);
+        assert_eq!(app.scroll, app.transcript_prefixes[1] + 1);
+        assert!(narrow.contains("selected message"), "{narrow}");
+        assert!(!app.navigation.reveal_pending);
+
+        app.scroll_by(-1);
+        let manual_offset = app.scroll;
+        render(&mut app, 50, 14);
+        assert!(!app.navigation.anchored);
+        assert_eq!(
+            app.scroll,
+            manual_offset.min(app.total_lines.saturating_sub(app.viewport))
+        );
+    }
+
+    #[test]
+    fn navigation_reveal_remains_visible_when_only_height_shrinks() {
+        let mut app = navigation_app(vec![
+            Block::Agent("earlier lines\n".repeat(40)),
+            Block::Agent("selected last message".into()),
+        ]);
+        render(&mut app, 60, 24);
+        reveal(&mut app, 1);
+        assert!(render(&mut app, 60, 24).contains("selected last message"));
+        let shorter = render(&mut app, 60, 9);
+        assert!(shorter.contains("selected last message"), "{shorter}");
+        assert!(!app.follow);
+    }
+
+    #[test]
+    fn navigation_highlight_is_materialized_without_changing_cached_styles() {
+        let mut app = navigation_app(vec![
+            Block::Agent("selected message".into()),
+            Block::Agent("ordinary message".into()),
+        ]);
+        render(&mut app, 50, 14);
+        reveal(&mut app, 0);
+        let mut terminal = Terminal::new(TestBackend::new(50, 14)).unwrap();
+        let mut images = crate::tui::image::ImageRuntime::disabled();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let x = app.transcript_left as u16;
+        let y = app.transcript_top as u16;
+        assert!(
+            buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            !buffer[(x, y + 2)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            app.transcript_cache
+                .iter()
+                .flatten()
+                .all(|block| block.rows.iter().all(|row| !row
+                    .0
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)))
+        );
+        // Moving the reveal removes the old highlight, even at the same viewport offset.
+        reveal(&mut app, 1);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !buffer[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            buffer[(x, y + 2)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn navigation_reveals_hidden_thoughts_without_changing_preference() {
+        let mut app = navigation_app(vec![
+            Block::Thought {
+                text: "first private line\nsecond private line\nthird private line".into(),
+                started: std::time::Instant::now(),
+                millis: Some(1000),
+            },
+            Block::Agent("ordinary answer".into()),
+        ]);
+        app.show_thoughts = false;
+        assert!(!render(&mut app, 60, 14).contains("first private line"));
+        reveal(&mut app, 0);
+        assert!(render(&mut app, 60, 14).contains("first private line"));
+        assert_eq!(app.transcript_cache[0].as_ref().unwrap().rows.len(), 3);
+        assert!(!app.show_thoughts);
+        reveal(&mut app, 1);
+        assert!(!render(&mut app, 60, 14).contains("first private line"));
+        assert_eq!(app.transcript_cache[0].as_ref().unwrap().rows.len(), 1);
+        assert!(!app.show_thoughts);
+
+        let running = "one\ntwo\nthree\nfour\nfive\nsix";
+        assert_eq!(super::thought_lines(&app, running, 0, None, false).len(), 4);
+        assert_eq!(super::thought_lines(&app, running, 0, None, true).len(), 6);
+    }
+
+    #[test]
+    fn navigation_overlay_previews_only_visible_chronological_results() {
+        let mut app = navigation_app(
+            (0..10_000)
+                .map(|index| Block::Agent(format!("message-{index:05}")))
+                .collect(),
+        );
+        app.open_navigation();
+        app.navigation.dialog.as_mut().unwrap().selected = app.navigation.id(9_999);
+        let matches = app.sync_navigation();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        super::NAVIGATION_PREVIEWS.with(|count| count.set(0));
+        terminal
+            .draw(|frame| super::draw_navigation(frame, &app, &matches))
+            .unwrap();
+        super::NAVIGATION_PREVIEWS.with(|count| assert_eq!(count.get(), 3));
+        let buffer = terminal.backend().buffer();
+        let rows = (0..12)
+            .map(|row| buffer_row(buffer, row))
+            .collect::<Vec<_>>();
+        let output = rows.join("\n");
+        assert!(output.contains("10000/10000"), "{output}");
+        assert!(output.contains("› Assistant: message-09999"), "{output}");
+        let first = output.find("message-09997").expect("first visible preview");
+        let second = output
+            .find("message-09998")
+            .expect("second visible preview");
+        let third = output.find("message-09999").expect("selected preview");
+        assert!(first < second && second < third);
+        assert!(!output.contains("message-09996"), "{output}");
+    }
+
+    #[test]
+    fn visible_query_tail_preserves_graphemes_and_cell_budget() {
+        for (query, width, expected) in [
+            ("", 0, ""),
+            ("abc", 0, ""),
+            ("abc", 2, "bc"),
+            ("abc", 3, "abc"),
+            ("a界", 1, ""),
+            ("a界", 2, "界"),
+            ("ae\u{301}", 1, "e\u{301}"),
+            ("a👩‍💻", 1, ""),
+            ("a👩‍💻", 2, "👩‍💻"),
+            ("a🇺🇸", 2, "🇺🇸"),
+            ("\u{301}", 0, "\u{301}"),
+            ("a\u{301}\u{301}z", 1, "z"),
+        ] {
+            assert_eq!(super::visible_query_tail(query, width), expected);
+        }
+    }
+
+    #[test]
+    fn visible_query_tail_measures_at_most_twice_the_input_bytes() {
+        for query in [
+            "a".repeat(100_000),
+            "🇺🇸".repeat(25_000),
+            format!("e{}z", "\u{301}".repeat(100_000)),
+        ] {
+            super::QUERY_WIDTH_BYTES.with(|count| count.set(0));
+            let tail = super::visible_query_tail(&query, 1);
+            assert!(matches!(tail, "a" | "" | "z"));
+            super::QUERY_WIDTH_BYTES.with(|count| {
+                assert!(count.get() >= query.len());
+                assert!(count.get() <= 2 * query.len());
+            });
+        }
+    }
+
+    #[test]
+    fn navigation_large_paste_render_has_bounded_query_work() {
+        let mut app = navigation_app(vec![Block::Agent("answer".into())]);
+        app.open_navigation();
+        app.paste(&"x".repeat(1_000_000));
+        assert_eq!(
+            app.navigation.dialog.as_ref().unwrap().query.len(),
+            super::transcript::MAX_QUERY_BYTES
+        );
+        let matches = app.sync_navigation();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        super::QUERY_WIDTH_BYTES.with(|count| count.set(0));
+        terminal
+            .draw(|frame| super::draw_navigation(frame, &app, &matches))
+            .unwrap();
+        super::QUERY_WIDTH_BYTES.with(|count| {
+            assert!(count.get() >= super::transcript::MAX_QUERY_BYTES);
+            assert!(count.get() <= 2 * super::transcript::MAX_QUERY_BYTES);
+        });
+        let output = (0..12)
+            .map(|row| buffer_row(terminal.backend().buffer(), row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(output.contains("All / xxxxx"), "{output}");
+        assert!(output.contains("No matching messages"), "{output}");
+    }
+
+    #[test]
+    fn navigation_overlay_handles_empty_results_and_narrow_terminals() {
+        let mut app = navigation_app(vec![Block::Agent("answer".into())]);
+        app.open_navigation();
+        app.navigation.dialog.as_mut().unwrap().query = "no such message".into();
+        let output = render(&mut app, 60, 14);
+        assert!(output.contains("transcript 0/0"), "{output}");
+        assert!(output.contains("No matching messages"), "{output}");
+        assert!(output.contains("All / no such message"), "{output}");
+        assert!(output.contains("Tab roles"), "{output}");
+        assert!(app.navigation.dialog.as_ref().unwrap().selected.is_none());
+        app.navigation.dialog.as_mut().unwrap().query.clear();
+        let narrow = render(&mut app, 20, 3);
+        assert!(narrow.contains("› Assistant: ans"), "{narrow}");
+        for (width, height) in [(1, 1), (2, 2), (5, 3), (16, 4)] {
+            render(&mut app, width, height);
+        }
+        let mut empty = navigation_app(Vec::new());
+        empty.open_navigation();
+        assert!(render(&mut empty, 60, 14).contains("No matching messages"));
+    }
+
+    #[test]
+    fn navigation_overlay_takes_priority_over_file_picker_and_reconciles_on_draw() {
+        let mut app = navigation_app(Vec::new());
+        app.apply(Update::AgentMessage {
+            id: "answer".into(),
+            text: "first answer".into(),
+            append: false,
+        });
+        app.file_picker = Some(FilePickerDialog {
+            query_range: 0..0,
+            revision: 1,
+            activation: 1,
+            selected: 0,
+            matches: Vec::new(),
+            status: FilePickerStatus::Loading,
+        });
+        app.open_navigation();
+        let output = render(&mut app, 60, 14);
+        assert!(output.contains("› Assistant: first answer"), "{output}");
+        assert!(app.file_picker.is_some());
+        app.navigation.dialog.as_mut().unwrap().query = "replacement".into();
+        assert!(render(&mut app, 60, 14).contains("No matching messages"));
+        app.apply(Update::AgentMessage {
+            id: "answer".into(),
+            text: "replacement answer".into(),
+            append: false,
+        });
+        let output = render(&mut app, 60, 14);
+        assert!(
+            output.contains("› Assistant: replacement answer"),
+            "{output}"
+        );
+        app.push_user("replacement prompt".into());
+        let output = render(&mut app, 60, 14);
+        assert!(output.contains("transcript 1/2"), "{output}");
+        assert!(output.contains("User: replacement prompt"), "{output}");
+        app.navigation.dialog.as_mut().unwrap().role = crate::tui::transcript::Role::User;
+        let output = render(&mut app, 60, 14);
+        assert!(output.contains("transcript 1/1"), "{output}");
+        assert!(output.contains("User / replacement"), "{output}");
+        assert!(output.contains("› User: replacement prompt"), "{output}");
+    }
+
+    #[test]
+    fn navigation_shortcut_is_visible_in_idle_and_streaming_hints() {
+        let mut app = navigation_app(vec![Block::Agent("answer".into())]);
+        assert!(render(&mut app, 100, 14).contains("F3 transcript"));
+        app.phase = Phase::Working;
+        let output = render(&mut app, 100, 14);
+        assert!(
+            output.contains("esc interrupts · F3 transcript"),
+            "{output}"
+        );
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
