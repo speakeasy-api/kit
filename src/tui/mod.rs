@@ -7,6 +7,7 @@
 //! ([`crate::events`]) that feeds the live graph of a running Runlet program.
 
 mod app;
+mod branches;
 mod command;
 mod editor;
 mod image;
@@ -174,6 +175,7 @@ const MAX_OUTPUT_LINES: usize = 5_000;
 struct ActiveSessionRoute {
     id: String,
     generation: u64,
+    runtime_activation: Option<u64>,
 }
 
 enum BranchResponse {
@@ -194,6 +196,7 @@ struct BranchCompletion {
 struct BranchReplayBuffer {
     request: Option<(u64, u64)>,
     notifications: Vec<UpdateSessionNotification>,
+    diagnostics: Vec<QueuedUpdate>,
 }
 
 impl BranchCompletion {
@@ -203,17 +206,42 @@ impl BranchCompletion {
 }
 
 impl BranchReplayBuffer {
-    fn finish(&mut self, generation: u64, epoch: u64) -> Vec<UpdateSessionNotification> {
+    fn finish(
+        &mut self,
+        generation: u64,
+        epoch: u64,
+    ) -> (Vec<UpdateSessionNotification>, Vec<QueuedUpdate>) {
         if self.request != Some((generation, epoch)) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         self.request = None;
-        std::mem::take(&mut self.notifications)
+        (
+            std::mem::take(&mut self.notifications),
+            std::mem::take(&mut self.diagnostics),
+        )
+    }
+
+    fn route_diagnostic(
+        &mut self,
+        current: &ActiveSessionRoute,
+        update: QueuedUpdate,
+    ) -> Option<QueuedUpdate> {
+        if self.request.is_some()
+            && matches!(&update.update, Update::RoutedRuntime { session_id, .. } if session_id != &current.id)
+        {
+            // Child identity is still unverified. Retain, but do not apply it;
+            // the successful submit response will authorize exactly one epoch.
+            self.diagnostics.push(update);
+            None
+        } else {
+            Some(update)
+        }
     }
 }
 
 struct QueuedUpdate {
     generation: Option<u64>,
+    runtime_activation: Option<events::DiagnosticActivation>,
     update: Update,
 }
 
@@ -221,6 +249,7 @@ impl QueuedUpdate {
     fn global(update: Update) -> Self {
         Self {
             generation: None,
+            runtime_activation: None,
             update,
         }
     }
@@ -228,28 +257,66 @@ impl QueuedUpdate {
     fn for_session(generation: u64, update: Update) -> Self {
         Self {
             generation: Some(generation),
+            runtime_activation: None,
             update,
         }
     }
 }
 
-// Stderr and ACP are independent streams. Capture identity while reading stderr,
-// not when applying its queued events after a possibly newer ACP activation.
-// Markers are stream boundaries, never commands to switch the visible session.
-fn runtime_diagnostic_update(
+// Stderr and ACP are independent streams. The envelope records emission-time
+// identity, and only a successful ACP response can authorize that identity.
+// Never assign the current generation while reading delayed stderr bytes.
+fn runtime_diagnostic_envelope_update(
     route: &mut Option<String>,
-    event: events::RuntimeEvent,
-) -> Option<Update> {
+    diagnostic: events::DiagnosticEvent,
+) -> Option<QueuedUpdate> {
+    let events::DiagnosticEvent { event, activation } = diagnostic;
     match event {
         events::RuntimeEvent::SessionStarted { session_id } => {
             *route = Some(session_id);
             None
         }
-        event @ events::RuntimeEvent::StorageStatus { .. } => Some(Update::Runtime(event)),
-        event => route.as_ref().map(|session_id| Update::RoutedRuntime {
-            session_id: session_id.clone(),
+        event @ events::RuntimeEvent::StorageStatus { .. } => {
+            Some(QueuedUpdate::global(Update::Runtime(event)))
+        }
+        event => {
+            let session_id = activation
+                .as_ref()
+                .map(|activation| &activation.session_id)
+                .or(route.as_ref())?
+                .clone();
+            Some(QueuedUpdate {
+                generation: None,
+                runtime_activation: activation,
+                update: Update::RoutedRuntime { session_id, event },
+            })
+        }
+    }
+}
+
+// App-level replay tests also exercise historical unscoped runtime lines.
+#[cfg(test)]
+fn runtime_diagnostic_update(
+    route: &mut Option<String>,
+    event: events::RuntimeEvent,
+) -> Option<Update> {
+    runtime_diagnostic_envelope_update(
+        route,
+        events::DiagnosticEvent {
             event,
-        }),
+            activation: None,
+        },
+    )
+    .map(|queued| queued.update)
+}
+
+fn response_activation(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<u64> {
+    meta?.get(events::ACTIVATION_META_KEY)?.as_u64()
+}
+
+fn verify_runtime_activation(route: &Arc<Mutex<ActiveSessionRoute>>, epoch: Option<u64>) {
+    if let Ok(mut route) = route.lock() {
+        route.runtime_activation = epoch;
     }
 }
 
@@ -257,6 +324,7 @@ fn transition_route(route: &Arc<Mutex<ActiveSessionRoute>>, id: String) {
     if let Ok(mut route) = route.lock() {
         route.id = id;
         route.generation = route.generation.wrapping_add(1);
+        route.runtime_activation = None;
     }
 }
 
@@ -264,6 +332,22 @@ fn accept_queued_update(
     route: &Arc<Mutex<ActiveSessionRoute>>,
     queued: QueuedUpdate,
 ) -> Option<Update> {
+    // No marker or legacy line is activation authority. Historical child
+    // replay goes through ACP; StorageStatus and process updates remain global.
+    if let Update::RoutedRuntime { session_id, .. } = &queued.update {
+        let route = route.lock().ok()?;
+        let accepted = session_id == &route.id
+            && match &queued.runtime_activation {
+                Some(activation) => {
+                    activation.session_id == route.id
+                        && Some(activation.epoch) == route.runtime_activation
+                }
+                None => false,
+            };
+        if !accepted {
+            return None;
+        }
+    }
     let accepted = queued.generation.is_none_or(|generation| {
         route
             .lock()
@@ -634,6 +718,7 @@ async fn request_initial_session(
     connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
     resume_id: Option<&str>,
     root: &Path,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
 ) -> Result<(wire::SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error> {
     if let Some(resume_id) = resume_id {
         let response = connection
@@ -643,12 +728,14 @@ async fn request_initial_session(
             )
             .block_task()
             .await?;
+        verify_runtime_activation(route, response_activation(response.meta.as_ref()));
         Ok((wire::SessionId::new(resume_id), response.config_options))
     } else {
         let response = connection
             .send_request(wire::NewSessionRequest::new(root.to_path_buf()))
             .block_task()
             .await?;
+        verify_runtime_activation(route, response_activation(response.meta.as_ref()));
         Ok((response.session_id, response.config_options))
     }
 }
@@ -875,6 +962,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let active_persisted_id = Arc::new(Mutex::new(ActiveSessionRoute {
         id: persisted_session_id.clone(),
         generation: 0,
+        runtime_activation: None,
     }));
     let root = root.to_path_buf();
     let model = model.to_string();
@@ -929,6 +1017,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let (branch_tx, mut branch_rx) = mpsc::unbounded_channel::<BranchCompletion>();
         let branch_replay = Arc::new(Mutex::new(BranchReplayBuffer::default()));
         let notification_branch_replay = Arc::clone(&branch_replay);
+        let diagnostic_branch_replay = Arc::clone(&branch_replay);
+        let diagnostic_session = Arc::clone(&active_persisted_id);
 
         // The agent's own diagnostics are the only explanation of a failed start,
         // so they are kept aside as well as shown in the log pane.
@@ -939,16 +1029,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let mut lines = BufReader::new(stderr).lines();
             let mut runtime_route = None;
             while let Ok(Some(line)) = lines.next_line().await {
-                let update = match events::parse(&line) {
+                let update = match events::parse_diagnostic(&line) {
                     Some(event) => {
-                        let Some(update) = runtime_diagnostic_update(&mut runtime_route, event)
+                        let Some(update) =
+                            runtime_diagnostic_envelope_update(&mut runtime_route, event)
                         else {
                             continue;
                         };
                         update
                     }
                     None if line.starts_with("A2A listening on ") => {
-                        Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
+                        QueuedUpdate::global(Update::A2aAddress(
+                            line.trim_start_matches("A2A listening on ").to_string(),
+                        ))
                     }
                     None => {
                         if let Ok(mut recent) = recorder.lock() {
@@ -956,10 +1049,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             let extra = recent.len().saturating_sub(FAILURE_LINES);
                             recent.drain(..extra);
                         }
-                        Update::Log(line)
+                        QueuedUpdate::global(Update::Log(line))
                     }
                 };
-                if diagnostics.send(QueuedUpdate::global(update)).is_err() {
+                let mut replay = diagnostic_branch_replay.lock().expect("branch replay lock");
+                let current = diagnostic_session.lock().expect("session route lock");
+                let Some(update) = replay.route_diagnostic(&current, update) else {
+                    continue;
+                };
+                if diagnostics.send(update).is_err() {
                     return;
                 }
             }
@@ -1090,6 +1188,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     &connection,
                     resume_session_id.as_deref(),
                     &root,
+                    &transition_session,
                 ),
                 &mut exit_rx,
                 HANDSHAKE,
@@ -1212,6 +1311,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                     &connection,
                                                     resume_session_id.as_deref(),
                                                     &root,
+                                                    &transition_session,
                                                 ),
                                                 &mut exit_rx,
                                                 stop.requested(),
@@ -1327,6 +1427,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 Ok(action) => action,
                                 Err(_) => return Ok(()),
                             };
+                            if !session_action_allowed(&mut app, &action) {
+                                continue;
+                            }
                             match action {
                                 Action::Quit => return Ok(()),
                                 Action::ListPromptBranches { epoch } => {
@@ -1357,6 +1460,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         let mut replay = branch_replay.lock().expect("branch replay lock");
                                         replay.request = Some((generation, epoch));
                                         replay.notifications.clear();
+                                        replay.diagnostics.clear();
                                     }
                                     let connection = connection.clone();
                                     let session_id = session_id.clone();
@@ -1461,6 +1565,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         .send_request(wire::NewSessionRequest::new(root.clone()))
                                         .block_task()
                                         .await?;
+                                    let runtime_activation = response_activation(session.meta.as_ref());
                                     session_id = session.session_id;
                                     let config_options = if let Some(choice) = &saved_model_default {
                                         connection
@@ -1479,6 +1584,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
                                     })?;
                                     transition_route(&transition_session, persisted_id.clone());
+                                    verify_runtime_activation(&transition_session, runtime_activation);
                                     images.clear();
                                     app.start_session(persisted_id);
                                     app.activate_runtime_session();
@@ -1496,7 +1602,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         }
                                     }
                                 }
-                                Action::ListSessions => {
+                                Action::ListSessions { epoch } => {
                                     let Ok(route) = transition_session.lock() else {
                                         app.note("could not start session catalog scan");
                                         continue;
@@ -1516,7 +1622,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         .and_then(|result| result);
                                         let _ = updates.send(QueuedUpdate::for_session(
                                             generation,
-                                            Update::SessionCatalog(result),
+                                            Update::SessionCatalog { epoch, result },
                                         ));
                                     });
                                 }
@@ -1564,22 +1670,17 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         app.note(format!("invalid session id: {error}"));
                                         continue;
                                     }
-                                    let Some(previous_persisted_id) =
-                                        previous_session_for_resume(&session_id, &requested_id)
-                                            .map_err(|error| {
-                                                agent_client_protocol::Error::into_internal_error(
-                                                    std::io::Error::other(error),
-                                                )
-                                            })?
-                                    else {
-                                        app.note(format!("session {requested_id} is already active"));
+                                    if !app.session_switch_allowed(&requested_id) {
                                         continue;
-                                    };
-                                    // Session switching has no `--force` flag. Reclaim only a
-                                    // lock that the OS proves no live Kit process still holds.
+                                    }
+                                    let previous_persisted_id = durable_session_id(&session_id)
+                                        .map_err(|error| agent_client_protocol::Error::into_internal_error(std::io::Error::other(error)))?;
+                                    let same_session = requested_id == previous_persisted_id;
+                                    // The current actor owns its live lock. Other destinations may
+                                    // reclaim only locks the OS proves no live Kit process holds.
                                     if let Err(error) = crate::session::load(&root, &requested_id)
                                         .and_then(|_| {
-                                            if preserved_branch_sources.contains(&requested_id) {
+                                            if same_session || preserved_branch_sources.contains(&requested_id) {
                                                 Ok(())
                                             } else {
                                                 crate::session::remove_stale_lock(&root, &requested_id)
@@ -1589,63 +1690,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         app.note(format!("could not resume session: {error}"));
                                         continue;
                                     }
-                                    let previous_session_id = session_id.clone();
-                                    if let Err(error) = connection
-                                        .send_request(CloseSessionRequest::new(session_id.clone()))
-                                        .block_task()
-                                        .await
-                                    {
-                                        app.note(format!(
-                                            "could not close the current session: {}",
-                                            error.message
-                                        ));
-                                        continue;
-                                    }
-                                    session_id = wire::SessionId::new(requested_id.clone());
-                                    transition_route(&transition_session, requested_id.clone());
-                                    images.clear();
-                                    app.start_session(requested_id.clone());
-                                    match request_resume(&connection, session_id.clone(), root.clone()).await {
-                                        Ok(response) => {
-                                            app.activate_runtime_session();
-                                            refresh_config_state(&mut app, Some(&response.config_options));
-                                        },
-                                        Err(error) => {
-                                            session_id = previous_session_id;
-                                            transition_route(
-                                                &transition_session,
-                                                previous_persisted_id.clone(),
-                                            );
-                                            images.clear();
-                                            app.start_session(previous_persisted_id);
-                                            let restored = request_resume(
-                                                &connection,
-                                                session_id.clone(),
-                                                root.clone(),
-                                            )
-                                            .await;
-                                            match restored {
-                                                Ok(response) => {
-                                                    app.activate_runtime_session();
-                                                    refresh_config_state(
-                                                        &mut app,
-                                                        Some(&response.config_options),
-                                                    );
-                                                    app.note(format!(
-                                                        "could not resume {requested_id}: {}",
-                                                        error.message
-                                                    ));
-                                                }
-                                                Err(restore_error) => {
-                                                    return Err(agent_client_protocol::Error::into_internal_error(
-                                                        std::io::Error::other(format!(
-                                                            "could not resume {requested_id}: {}; could not restore the previous session: {}",
-                                                            error.message, restore_error.message
-                                                        )),
-                                                    ));
-                                                }
-                                            }
-                                        }
+                                    if resume_with_restoration(
+                                        &mut app,
+                                        &connection,
+                                        &mut session_id,
+                                        &transition_session,
+                                        &root,
+                                        requested_id,
+                                    ).await {
+                                        images.clear();
                                     }
                                 }
                                 Action::Close => return Ok(()),
@@ -1894,9 +1947,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             let mut replay = branch_replay.lock().expect("branch replay lock");
                             let current = completion.is_current(&transition_session.lock().expect("session route lock"), &app);
                             let submitted = matches!(completion.response, BranchResponse::Submitted(_));
-                            let buffered = if submitted {
+                            let (buffered, buffered_diagnostics) = if submitted {
                                 replay.finish(completion.generation, completion.epoch)
-                            } else { Vec::new() };
+                            } else { (Vec::new(), Vec::new()) };
                             if !current { continue; }
                             match completion.response {
                                 BranchResponse::Listed(result) => app.branch_listed(completion.epoch, result.map(|response| response.boundaries)),
@@ -1911,6 +1964,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         preserved_branch_sources.insert(session_id.to_string());
                                         session_id = response.session_id;
                                         transition_route(&transition_session, child_id.clone());
+                                        verify_runtime_activation(&transition_session, response.runtime_activation);
                                         images.clear();
                                         refresh_config_state(&mut app, Some(&response.config_options));
                                         // Replay precedes activation, just as with resume. No ordinary
@@ -1920,6 +1974,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                 if let Update::ConfigOptions(options) = &update {
                                                     refresh_config_state(&mut app, Some(options));
                                                 }
+                                                app.apply(update);
+                                            }
+                                        }
+                                        for queued in buffered_diagnostics {
+                                            if let Some(update) = accept_queued_update(&transition_session, queued) {
                                                 app.apply(update);
                                             }
                                         }
@@ -1956,7 +2015,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             .await;
             result?;
             if let Some(closed) = closed {
-                closed?;
+                recovery_close_result(closed)?;
             }
             Ok(())
         })
@@ -2236,17 +2295,18 @@ fn handle(app: &mut App, received: ReceivedEvent) -> Action {
             if app.model_switch.is_some() {
                 return Action::None;
             }
-            if app.navigation.dialog.is_some()
+            if app.session_dialog.is_some()
+                || app.navigation.dialog.is_some()
                 || app.branch_chooser.is_some()
                 || app.editing_branch()
             {
                 app.paste(&text);
                 return Action::None;
             }
-            if app.queue_focused && !app.session_rename_active() {
+            if app.queue_focused {
                 return Action::None;
             }
-            if app.session_rename_active() || app.editing_steer() {
+            if app.editing_steer() {
                 app.paste(&text);
             } else if let Some(attachments) = attachments_from_paste(&app.root, &text) {
                 app.prune_attachments();
@@ -2544,6 +2604,100 @@ fn leave(terminal: &mut DefaultTerminal) {
     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
 }
 
+// A failed prior recovery (or a retired actor) can leave no live map entry.
+// Retrying the same durable ID must still reach load, not get stuck at close.
+fn recovery_close_result(
+    result: Result<wire::CloseSessionResponse, agent_client_protocol::Error>,
+) -> Result<(), agent_client_protocol::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error)
+            if i32::from(error.code) == i32::from(wire::Error::resource_not_found(None).code) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// Keep this allowlist local-only: disconnected sessions can still be inspected
+// and explicitly retried, but must not dispatch work to an absent actor.
+fn session_action_allowed(app: &mut App, action: &Action) -> bool {
+    matches!(
+        action,
+        Action::None
+            | Action::Redraw
+            | Action::ListSessions { .. }
+            | Action::RenameSession { .. }
+            | Action::Resume(_)
+            | Action::Close
+            | Action::Quit
+            | Action::Copy(_)
+    ) || app.require_session_connection()
+}
+
+/// Close the actor, load the destination, and make at most one restoration
+/// attempt. The visible session is replaced only after ACP acknowledges a load.
+/// A failed restoration leaves the editor usable and Resume available for retry.
+async fn resume_with_restoration(
+    app: &mut App,
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    session_id: &mut wire::SessionId,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    root: &std::path::Path,
+    requested_id: String,
+) -> bool {
+    let previous_id = session_id.to_string();
+    if let Err(error) = recovery_close_result(
+        connection
+            .send_request(CloseSessionRequest::new(session_id.clone()))
+            .block_task()
+            .await,
+    ) {
+        app.note(format!(
+            "could not close the current session: {}",
+            error.message
+        ));
+        return false;
+    }
+    app.session_connected = false;
+    transition_route(route, String::new());
+    let mut load_error = None;
+    for target in [&requested_id, &previous_id] {
+        *session_id = wire::SessionId::new(target.clone());
+        transition_route(route, target.clone());
+        match request_resume(connection, session_id.clone(), root.to_path_buf()).await {
+            Ok(response) => {
+                verify_runtime_activation(route, response_activation(response.meta.as_ref()));
+                app.start_session(target.clone());
+                app.activate_runtime_session();
+                refresh_config_state(app, Some(&response.config_options));
+                if let Some(error) = load_error {
+                    app.note(format!(
+                        "could not resume {requested_id}: {error}; previous session restored"
+                    ));
+                }
+                return true;
+            }
+            Err(error) => {
+                if let Some(load_error) = load_error {
+                    // Invalidate replay and completions from both failed attempts.
+                    // Keep the durable ID for a subsequent explicit Resume retry,
+                    // but do not advertise it as an active backend route.
+                    transition_route(route, String::new());
+                    app.note(format!(
+                        "could not resume {requested_id}: {load_error}; could not restore the previous session: {}; disconnected — use Resume to retry",
+                        error.message
+                    ));
+                    return false;
+                }
+                load_error = Some(error.message);
+            }
+        }
+    }
+    unreachable!("the two load attempts return on success or restoration failure")
+}
+
 async fn request_resume(
     connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
     session_id: wire::SessionId,
@@ -2562,14 +2716,6 @@ fn durable_session_id(session_id: &wire::SessionId) -> Result<String, String> {
     let session_id = session_id.to_string();
     crate::session::validate_id(&session_id)?;
     Ok(session_id)
-}
-
-fn previous_session_for_resume(
-    current: &wire::SessionId,
-    requested: &str,
-) -> Result<Option<String>, String> {
-    let current = durable_session_id(current)?;
-    Ok((current != requested).then_some(current))
 }
 
 /// Maps one ACP session notification onto client updates.
@@ -2939,11 +3085,10 @@ mod tests {
         apply_pending_updates, attachments_from_paste, authentication_required,
         client_capabilities, command, credential_storage_for_launch, current_model_choice,
         detach_from_controlling_terminal, durable_session_id, effort_state, error_detail,
-        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
-        refresh_config_state, refresh_session_after_auth, save_effort_default_to,
-        save_model_defaults_to, terminal_auth_command, transition_route, translate,
-        translate_for_session, usable_terminal_auth_methods, user_message_of,
-        wait_for_connected_authentication, wire,
+        message_of, osc52, prompt_blocks, readable, refresh_config_state,
+        refresh_session_after_auth, save_effort_default_to, save_model_defaults_to,
+        terminal_auth_command, transition_route, translate, translate_for_session,
+        usable_terminal_auth_methods, user_message_of, wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -3329,21 +3474,6 @@ mod tests {
     }
 
     #[test]
-    fn resuming_the_active_session_is_a_noop() {
-        let current = wire::SessionId::new("current");
-        assert_eq!(
-            previous_session_for_resume(&current, "current").unwrap(),
-            None
-        );
-        assert_eq!(
-            previous_session_for_resume(&current, "other")
-                .unwrap()
-                .as_deref(),
-            Some("current")
-        );
-    }
-
-    #[test]
     fn model_switch_request_rejects_invalid_actions_and_missing_warnings() {
         use crate::protocols::acp::model_switch::{Confirmation, Decision, META, Warning};
         let mut app = App::new(
@@ -3425,6 +3555,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "first".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let choice = ModelChoice {
             id: "openrouter:target".into(),
@@ -3468,6 +3599,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "first".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let operation = app
             .begin_model_switch(
@@ -3493,6 +3625,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "first".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let old = QueuedUpdate::for_session(0, Update::Log("old".into()));
 
@@ -3532,10 +3665,11 @@ mod tests {
         ) {
             for _ in 0..4 {
                 let line = lines.next_line().await.unwrap().unwrap();
-                if let Some(update) =
-                    super::runtime_diagnostic_update(ingress, crate::events::parse(&line).unwrap())
-                {
-                    tx.send(QueuedUpdate::global(update)).unwrap();
+                if let Some(update) = super::runtime_diagnostic_envelope_update(
+                    ingress,
+                    crate::events::parse_diagnostic(&line).unwrap(),
+                ) {
+                    tx.send(update).unwrap();
                 }
             }
         }
@@ -3555,6 +3689,7 @@ mod tests {
             let route = Arc::new(Mutex::new(ActiveSessionRoute {
                 id: "child".into(),
                 generation: 0,
+                runtime_activation: Some(1),
             }));
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let (mut writer, reader) = tokio::io::duplex(4096);
@@ -3585,8 +3720,18 @@ mod tests {
                 ] {
                     writer
                         .write_all(
-                            format!("{EVENT_MARKER}{}\n", serde_json::to_string(&event).unwrap())
-                                .as_bytes(),
+                            format!(
+                                "{EVENT_MARKER}{}\n",
+                                serde_json::to_string(&crate::events::DiagnosticEvent {
+                                    event,
+                                    activation: Some(crate::events::DiagnosticActivation {
+                                        session_id: session.into(),
+                                        epoch: if session == "child" { 1 } else { 2 }
+                                    }),
+                                })
+                                .unwrap()
+                            )
+                            .as_bytes(),
                         )
                         .await
                         .unwrap();
@@ -3596,6 +3741,7 @@ mod tests {
                         ingest(&mut lines, &mut ingress, &tx).await;
                     }
                     transition_route(&route, "source".into());
+                    super::verify_runtime_activation(&route, Some(2));
                     app.start_session("source".into());
                     app.activate_runtime_session();
                     app.apply(Update::ToolStarted {
@@ -3634,6 +3780,651 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn diagnostic_epochs_reject_delayed_same_id_bytes_and_queued_events() {
+        use crate::events::{DiagnosticActivation, DiagnosticEvent, EVENT_MARKER, RuntimeEvent};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        for via_other_session in [false, true] {
+            for read_before_activation in [false, true] {
+                let route = Arc::new(Mutex::new(ActiveSessionRoute {
+                    id: "source".into(),
+                    generation: 0,
+                    runtime_activation: Some(10),
+                }));
+                let mut ingress = None;
+                let (mut writer, reader) = tokio::io::duplex(4096);
+                let mut lines = BufReader::new(reader).lines();
+                for (epoch, event) in [
+                    (
+                        10,
+                        RuntimeEvent::SessionStarted {
+                            session_id: "source".into(),
+                        },
+                    ),
+                    (
+                        10,
+                        RuntimeEvent::CompactionStarted {
+                            reason: "stale".into(),
+                            at: 1,
+                        },
+                    ),
+                    (
+                        10,
+                        RuntimeEvent::StorageStatus {
+                            pending: true,
+                            exhausted: true,
+                        },
+                    ),
+                    (
+                        12,
+                        RuntimeEvent::ChildStarted {
+                            call: "compose:child".into(),
+                            tool: "shell".into(),
+                            summary: "current".into(),
+                            at: 2,
+                        },
+                    ),
+                ] {
+                    let diagnostic = DiagnosticEvent {
+                        event,
+                        activation: Some(DiagnosticActivation {
+                            session_id: "source".into(),
+                            epoch,
+                        }),
+                    };
+                    writer
+                        .write_all(
+                            format!(
+                                "{EVENT_MARKER}{}\n",
+                                serde_json::to_string(&diagnostic).unwrap()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let mut queued = Vec::new();
+                if read_before_activation {
+                    for _ in 0..4 {
+                        let line = lines.next_line().await.unwrap().unwrap();
+                        if let Some(update) = super::runtime_diagnostic_envelope_update(
+                            &mut ingress,
+                            crate::events::parse_diagnostic(&line).unwrap(),
+                        ) {
+                            queued.push(update);
+                        }
+                    }
+                }
+                if via_other_session {
+                    transition_route(&route, "other".into());
+                    super::verify_runtime_activation(&route, Some(11));
+                }
+                transition_route(&route, "source".into());
+                super::verify_runtime_activation(&route, Some(12));
+                if !read_before_activation {
+                    for _ in 0..4 {
+                        let line = lines.next_line().await.unwrap().unwrap();
+                        if let Some(update) = super::runtime_diagnostic_envelope_update(
+                            &mut ingress,
+                            crate::events::parse_diagnostic(&line).unwrap(),
+                        ) {
+                            queued.push(update);
+                        }
+                    }
+                }
+                assert_eq!(route.lock().unwrap().runtime_activation, Some(12));
+                let mut queued = queued.into_iter();
+                assert!(accept_queued_update(&route, queued.next().unwrap()).is_none());
+                assert!(matches!(
+                    accept_queued_update(&route, queued.next().unwrap()),
+                    Some(Update::Runtime(RuntimeEvent::StorageStatus {
+                        pending: true,
+                        exhausted: true
+                    }))
+                ));
+                assert!(matches!(
+                    accept_queued_update(&route, queued.next().unwrap()),
+                    Some(Update::RoutedRuntime {
+                        event: RuntimeEvent::ChildStarted { .. },
+                        ..
+                    })
+                ));
+
+                // Neither a bare same-ID marker nor a forged/unacknowledged epoch
+                // can authorize legacy or future diagnostics for this activation.
+                for activation in [
+                    None,
+                    Some(DiagnosticActivation {
+                        session_id: "source".into(),
+                        epoch: 13,
+                    }),
+                    Some(DiagnosticActivation {
+                        session_id: "other".into(),
+                        epoch: 12,
+                    }),
+                ] {
+                    let update = super::runtime_diagnostic_envelope_update(
+                        &mut ingress,
+                        DiagnosticEvent {
+                            event: RuntimeEvent::CompactionStarted {
+                                reason: "unverified".into(),
+                                at: 3,
+                            },
+                            activation,
+                        },
+                    )
+                    .unwrap();
+                    assert!(accept_queued_update(&route, update).is_none());
+                }
+            }
+        }
+    }
+
+    // The peer actually retires its actor on Close and faults Resume responses.
+    // No production pause/observer hooks are needed to exercise the runtime path.
+    #[test]
+    fn spawned_producer_diagnostics_are_rejected_when_read_after_reactivation() {
+        use crate::events::{self, RuntimeEvent};
+
+        const CHILD: &str = "KIT_TUI_PRODUCER_TEST";
+        if let Ok(mode) = std::env::var(CHILD) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    events::activate_diagnostics("source");
+                    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    // Return the task handle: awaiting it inside this scope
+                    // would deadlock before the parent releases its barrier.
+                    #[allow(clippy::async_yields_async)]
+                    let producer = events::scope_diagnostics("source", async {
+                        tokio::spawn(events::inherit_diagnostics(async move {
+                            entered_tx.send(()).unwrap();
+                            released.await.unwrap();
+                            events::emit(&RuntimeEvent::CompactionStarted {
+                                reason: "old producer".into(),
+                                at: 1,
+                            });
+                        }))
+                    })
+                    .await;
+                    entered.await.unwrap();
+                    if mode == "roundtrip" {
+                        events::activate_diagnostics("sibling");
+                    }
+                    let verified_epoch = events::activate_diagnostics("source");
+                    // Transfer the actual activation return value, independently
+                    // of stderr markers, just as the ACP response establishes it.
+                    println!("\nverified-epoch:{verified_epoch}");
+                    release.send(()).unwrap();
+                    producer.await.unwrap();
+                    events::scope_diagnostics("source", async {
+                        events::emit(&RuntimeEvent::CompactionStarted {
+                            reason: "current producer".into(),
+                            at: 2,
+                        });
+                    })
+                    .await;
+                    tokio::spawn(async {
+                        events::emit(&RuntimeEvent::CompactionStarted {
+                            reason: "unscoped producer".into(),
+                            at: 3,
+                        });
+                        events::emit(&RuntimeEvent::StorageStatus {
+                            pending: true,
+                            exhausted: false,
+                        });
+                    })
+                    .await
+                    .unwrap();
+                });
+            return;
+        }
+        for mode in ["same", "roundtrip"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tui::tests::spawned_producer_diagnostics_are_rejected_when_read_after_reactivation", "--nocapture"])
+                .env(CHILD, mode).env(events::EVENTS_ENV, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let epoch = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("verified-epoch:")
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .unwrap();
+            let route = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "source".into(),
+                generation: 1,
+                runtime_activation: Some(epoch),
+            }));
+            let mut ingress = None;
+            let mut observed = Vec::new();
+            // Only read the real emitted bytes after reactivation and producer
+            // completion. No hand-stamped DiagnosticEvent fixtures are used.
+            for diagnostic in String::from_utf8(output.stderr)
+                .unwrap()
+                .lines()
+                .filter_map(events::parse_diagnostic)
+            {
+                if matches!(diagnostic.event, RuntimeEvent::SessionStarted { .. }) {
+                    super::runtime_diagnostic_envelope_update(&mut ingress, diagnostic);
+                    continue;
+                }
+                let label = match &diagnostic.event {
+                    RuntimeEvent::CompactionStarted { reason, .. } => {
+                        if reason == "old producer" {
+                            assert!(diagnostic.activation.as_ref().unwrap().epoch < epoch);
+                        }
+                        reason.clone()
+                    }
+                    RuntimeEvent::StorageStatus { .. } => "global storage".into(),
+                    _ => continue,
+                };
+                let queued =
+                    super::runtime_diagnostic_envelope_update(&mut ingress, diagnostic).unwrap();
+                let accepted = accept_queued_update(&route, queued).is_some();
+                assert_eq!(
+                    accepted,
+                    label == "current producer" || label == "global storage",
+                    "{mode}/{label}"
+                );
+                observed.push(label);
+            }
+            assert_eq!(
+                observed,
+                [
+                    "old producer",
+                    "current producer",
+                    "unscoped producer",
+                    "global storage"
+                ]
+            );
+        }
+    }
+
+    async fn same_id_recovery_over_transport(failures: usize) {
+        use std::collections::VecDeque;
+
+        struct Peer {
+            active: bool,
+            outcomes: VecDeque<bool>,
+            requests: Vec<&'static str>,
+        }
+        let peer = Arc::new(Mutex::new(Peer {
+            active: true,
+            outcomes: std::iter::repeat_n(false, failures).chain([true]).collect(),
+            requests: Vec::new(),
+        }));
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "source".into(),
+            generation: 10,
+            runtime_activation: Some(41),
+        }));
+        let (updates, mut replay) = tokio::sync::mpsc::unbounded_channel();
+        let notification_route = Arc::clone(&route);
+        let agent = agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async move |_request: wire::InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        wire::InitializeResponse::new(
+                            ProtocolVersion::V2,
+                            wire::Implementation::new("faulting-peer", "0"),
+                        )
+                        .capabilities(agentkit_acp::v2::agent_capabilities()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let peer = Arc::clone(&peer);
+                    async move |request: wire::CloseSessionRequest, responder, _cx| {
+                        assert_eq!(request.session_id.to_string(), "source");
+                        let mut peer = peer.lock().unwrap();
+                        peer.requests.push("close");
+                        if std::mem::replace(&mut peer.active, false) {
+                            responder.respond(wire::CloseSessionResponse::new())
+                        } else {
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::resource_not_found(None),
+                            )
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let peer = Arc::clone(&peer);
+                    async move |request: wire::ResumeSessionRequest, responder, cx| {
+                        assert_eq!(request.session_id.to_string(), "source");
+                        assert!(matches!(
+                            request.replay_from,
+                            Some(wire::ReplayFrom::Start(_))
+                        ));
+                        let mut peer = peer.lock().unwrap();
+                        peer.requests.push("resume");
+                        assert!(!peer.active, "close must retire the previous actor first");
+                        let succeeds = peer
+                            .outcomes
+                            .pop_front()
+                            .expect("unexpected automatic retry");
+                        cx.send_notification(UpdateSessionNotification::new(
+                            "source",
+                            SessionUpdate::UserMessage(UserMessage::new("replayed").content(vec![
+                                ContentBlock::Text(TextContent::new(if succeeds {
+                                    "loaded replay"
+                                } else {
+                                    "failed replay"
+                                })),
+                            ])),
+                        ))?;
+                        if succeeds {
+                            peer.active = true;
+                            responder.respond(
+                                wire::ResumeSessionResponse::new()
+                                    .config_options(vec![SessionConfigOption::select(
+                                        "reasoning_effort",
+                                        "Reasoning effort",
+                                        "high",
+                                        vec![SessionConfigSelectGroup::new(
+                                            "reasoning-effort",
+                                            "Reasoning effort",
+                                            vec![SessionConfigSelectOption::new("high", "High")],
+                                        )],
+                                    )])
+                                    .meta(serde_json::Map::from_iter([(
+                                        super::events::ACTIVATION_META_KEY.into(),
+                                        json!(42),
+                                    )])),
+                            )
+                        } else {
+                            responder.respond_with_error(
+                                agent_client_protocol::Error::into_internal_error(
+                                    std::io::Error::other("injected resume failure"),
+                                ),
+                            )
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.start_session("source".into());
+        app.activate_runtime_session();
+        app.apply(Update::UserMessage {
+            id: "visible".into(),
+            text: "keep the visible transcript until load succeeds".into(),
+            images: vec![],
+            append: false,
+        });
+        app.paste("parked draft [Image #1]");
+        app.attachments.push(crate::tui::app::Attachment {
+            path: root.path().join("draft.png"),
+            placeholder: "[Image #1]".into(),
+            mime_type: "image/png",
+            kind: crate::tui::app::AttachmentKind::Image,
+            size: 7,
+        });
+        let draft = app.editor.text().to_owned();
+        let attachments = app.attachments.clone();
+        let workspace = root.path().to_path_buf();
+        agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |notification: UpdateSessionNotification, _cx| {
+                    let route = notification_route.lock().unwrap().clone();
+                    for update in translate_for_session(notification, &route.id) {
+                        updates
+                            .send(QueuedUpdate::for_session(route.generation, update))
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("recovery-test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                let mut session_id = wire::SessionId::new("source");
+                assert!(app.session_switch_allowed("source"));
+                let restored = super::resume_with_restoration(
+                    &mut app,
+                    &connection,
+                    &mut session_id,
+                    &route,
+                    &workspace,
+                    "source".into(),
+                )
+                .await;
+                assert_eq!(restored, failures == 1);
+                assert_eq!(peer.lock().unwrap().requests, ["close", "resume", "resume"]);
+                assert_eq!(app.editor.text(), draft);
+                assert_eq!(app.attachments, attachments);
+                assert_eq!(app.session_id.as_deref(), Some("source"));
+                assert_eq!(session_id.to_string(), "source");
+                for _ in 0..2 {
+                    let update = replay.recv().await.unwrap();
+                    if let Some(update) = accept_queued_update(&route, update) {
+                        app.apply(update);
+                    }
+                }
+                if failures == 2 {
+                    assert!(!app.session_connected);
+                    assert!(!peer.lock().unwrap().active);
+                    assert!(
+                        matches!(&app.blocks[0], crate::tui::app::Block::User(message)
+                        if message.text == "keep the visible transcript until load succeeds")
+                    );
+                    assert!(
+                        matches!(app.blocks.last(), Some(crate::tui::app::Block::Notice(message))
+                        if message.contains("disconnected") && message.contains("Resume to retry"))
+                    );
+                    assert_eq!(
+                        app.blocks.len(),
+                        2,
+                        "failed replay must not replace the view"
+                    );
+                    assert!(route.lock().unwrap().id.is_empty());
+                    assert_eq!(route.lock().unwrap().runtime_activation, None);
+                    assert!(!super::session_action_allowed(&mut app, &Action::Cancel));
+                    assert!(super::session_action_allowed(
+                        &mut app,
+                        &Action::Copy("visible".into())
+                    ));
+                    assert!(super::session_action_allowed(
+                        &mut app,
+                        &Action::ListSessions { epoch: 0 }
+                    ));
+                    assert!(super::session_action_allowed(
+                        &mut app,
+                        &Action::Resume("source".into())
+                    ));
+                    assert!(app.session_switch_allowed("source"));
+                    assert_eq!(app.editor.text(), draft);
+                    assert_eq!(app.attachments, attachments);
+                    // Explicit retry reaches Resume even though Close now reports
+                    // that the already-retired actor is absent.
+                    assert!(
+                        super::resume_with_restoration(
+                            &mut app,
+                            &connection,
+                            &mut session_id,
+                            &route,
+                            &workspace,
+                            "source".into(),
+                        )
+                        .await
+                    );
+                    assert_eq!(
+                        peer.lock().unwrap().requests,
+                        ["close", "resume", "resume", "close", "resume"]
+                    );
+                    let update = replay.recv().await.unwrap();
+                    app.apply(
+                        accept_queued_update(&route, update).expect("retry replay is current"),
+                    );
+                }
+                assert!(app.session_connected);
+                assert!(peer.lock().unwrap().active);
+                assert!(peer.lock().unwrap().outcomes.is_empty());
+                let users = app
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        crate::tui::app::Block::User(message) => Some(message.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(users, ["loaded replay"]);
+                assert_eq!(route.lock().unwrap().id, "source");
+                assert_eq!(route.lock().unwrap().runtime_activation, Some(42));
+                assert_eq!(app.reasoning_effort, "high");
+                assert_eq!(app.editor.text(), draft);
+                assert_eq!(app.attachments, attachments);
+                assert!(super::session_action_allowed(&mut app, &Action::Cancel));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn same_id_recovery_restores_after_first_resume_failure_over_transport() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            same_id_recovery_over_transport(1),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_id_recovery_stays_disconnected_then_explicit_retry_succeeds_over_transport() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            same_id_recovery_over_transport(2),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn same_id_recovery_disconnected_gate_allows_local_actions_only() {
+        let mut app = App::new(".".into(), "provider".into(), "model".into(), "a2a".into());
+        app.start_session("source".into());
+        app.paste("untouched draft");
+        app.session_connected = false;
+        let backend_actions = [
+            Action::ListPromptBranches { epoch: 0 },
+            Action::PreparePromptBranch {
+                epoch: 0,
+                address: "prompt".into(),
+            },
+            Action::SubmitPromptBranch {
+                epoch: 0,
+                checkout_token: "token".into(),
+                text: "edit".into(),
+            },
+            Action::Submit {
+                prompt: SubmittedPrompt {
+                    text: "send".into(),
+                    attachments: vec![],
+                },
+                inject: false,
+            },
+            Action::ReplaceSteer {
+                id: "steer".into(),
+                text: "replace".into(),
+            },
+            Action::RevokeSteer { id: "steer".into() },
+            Action::New(None),
+            Action::SelectModel {
+                choice: ModelChoice {
+                    id: "provider:model".into(),
+                    provider: "provider".into(),
+                    model: "model".into(),
+                },
+                save_defaults: false,
+            },
+            Action::SelectEffort {
+                effort: "high".into(),
+                save_defaults: false,
+            },
+            Action::Login(AuthMethodTerminal::new("provider", "Provider")),
+            Action::Cancel,
+            Action::DetachCompose("call".into()),
+            Action::CancelBackground("call".into()),
+            Action::SearchFiles {
+                query: "file".into(),
+                revision: 0,
+                activation: 0,
+            },
+        ];
+        for action in &backend_actions {
+            assert!(!super::session_action_allowed(&mut app, action));
+        }
+        for action in [
+            Action::None,
+            Action::Redraw,
+            Action::ListSessions { epoch: 0 },
+            Action::RenameSession {
+                session_id: "source".into(),
+                display_name: Some("renamed".into()),
+            },
+            Action::Resume("source".into()),
+            Action::Close,
+            Action::Quit,
+            Action::Copy("visible".into()),
+        ] {
+            assert!(super::session_action_allowed(&mut app, &action));
+        }
+        assert_eq!(app.editor.text(), "untouched draft");
+        app.session_connected = true;
+        for action in &backend_actions {
+            assert!(super::session_action_allowed(&mut app, action));
+        }
+    }
+
+    #[test]
+    fn same_id_recovery_can_retry_after_actor_is_already_absent() {
+        assert!(super::recovery_close_result(Ok(wire::CloseSessionResponse::new())).is_ok());
+        assert!(
+            super::recovery_close_result(Err(agent_client_protocol::Error::resource_not_found(
+                None
+            )))
+            .is_ok()
+        );
+        assert!(
+            super::recovery_close_result(Err(agent_client_protocol::Error::internal_error()))
+                .is_err()
+        );
+    }
+
     #[test]
     fn queued_updates_are_applied_in_bounded_bursts() {
         let root = tempfile::tempdir().unwrap();
@@ -3646,6 +4437,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "session".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
         for index in 0..=MAX_BURST {
@@ -3673,6 +4465,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "session".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
         let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
@@ -3710,6 +4503,7 @@ mod tests {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "session".into(),
             generation: 0,
+            runtime_activation: None,
         }));
         let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
@@ -3762,6 +4556,7 @@ mod tests {
         let route = super::ActiveSessionRoute {
             id: "source".into(),
             generation: 7,
+            runtime_activation: None,
         };
         for response in [
             super::BranchResponse::Listed(Err("list".into())),
@@ -3786,6 +4581,7 @@ mod tests {
     fn prompt_branch_replay_waits_for_child_route_and_stale_submit_does_not_drain_new_buffer() {
         let mut buffer = super::BranchReplayBuffer {
             request: Some((7, 3)),
+            diagnostics: Vec::new(),
             notifications: vec![UpdateSessionNotification::new(
                 "child",
                 SessionUpdate::UserMessage(
@@ -3794,13 +4590,14 @@ mod tests {
                 ),
             )],
         };
-        assert!(buffer.finish(7, 2).is_empty());
+        assert!(buffer.finish(7, 2).0.is_empty());
         assert_eq!(buffer.notifications.len(), 1);
         let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
             id: "source".into(),
             generation: 7,
+            runtime_activation: None,
         }));
-        let notifications = buffer.finish(7, 3);
+        let (notifications, _) = buffer.finish(7, 3);
         assert!(buffer.request.is_none());
         transition_route(&route, "child".into());
         let active = route.lock().unwrap();
@@ -3812,6 +4609,71 @@ mod tests {
             matches!(updates.as_slice(), [Update::UserMessage { id, text, append: false, .. }] if id == "edited-prompt" && text == "edited")
         );
         assert_eq!(active.generation, 8);
+    }
+
+    #[test]
+    fn branch_diagnostics_wait_for_verified_child_epoch_without_blocking_storage() {
+        use crate::events::{DiagnosticActivation, DiagnosticEvent, RuntimeEvent};
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "source".into(),
+            generation: 7,
+            runtime_activation: Some(40),
+        }));
+        let mut replay = super::BranchReplayBuffer {
+            request: Some((7, 3)),
+            ..Default::default()
+        };
+        for epoch in [41, 42] {
+            let update = super::runtime_diagnostic_envelope_update(
+                &mut None,
+                DiagnosticEvent {
+                    event: RuntimeEvent::ChildStarted {
+                        call: format!("compose:{epoch}"),
+                        tool: "shell".into(),
+                        summary: "early".into(),
+                        at: 1,
+                    },
+                    activation: Some(DiagnosticActivation {
+                        session_id: "child".into(),
+                        epoch,
+                    }),
+                },
+            )
+            .unwrap();
+            assert!(
+                replay
+                    .route_diagnostic(&route.lock().unwrap(), update)
+                    .is_none()
+            );
+        }
+        let storage = super::runtime_diagnostic_envelope_update(
+            &mut None,
+            DiagnosticEvent {
+                event: RuntimeEvent::StorageStatus {
+                    pending: true,
+                    exhausted: false,
+                },
+                activation: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            replay
+                .route_diagnostic(&route.lock().unwrap(), storage)
+                .is_some()
+        );
+        assert!(replay.finish(7, 2).1.is_empty());
+        assert_eq!(replay.diagnostics.len(), 2);
+        let (_, diagnostics) = replay.finish(7, 3);
+        transition_route(&route, "child".into());
+        super::verify_runtime_activation(&route, Some(42));
+        let accepted: Vec<_> = diagnostics
+            .into_iter()
+            .filter_map(|queued| accept_queued_update(&route, queued))
+            .collect();
+        assert!(
+            matches!(accepted.as_slice(), [Update::RoutedRuntime { event: RuntimeEvent::ChildStarted { call, .. }, .. }] if call == "compose:42")
+        );
     }
 
     #[test]
@@ -4105,6 +4967,7 @@ mod tests {
         let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
             id: "session".into(),
             generation: 1,
+            runtime_activation: None,
         }));
         let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, waiting) = tokio::sync::oneshot::channel();
@@ -4147,6 +5010,7 @@ mod tests {
         let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
             id: "session".into(),
             generation: 1,
+            runtime_activation: None,
         }));
         let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, waiting) = tokio::sync::oneshot::channel();
@@ -4593,14 +5457,6 @@ mod tests {
                 "model".into(),
                 "a2a".into(),
             );
-            app.paste("/sessions");
-            assert!(matches!(
-                handle(
-                    &mut app,
-                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                ),
-                Action::ListSessions
-            ));
             app.paste("parked draft");
             if populated {
                 app.apply(Update::SteerAccepted {
@@ -4614,15 +5470,26 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             );
             assert_eq!(app.queue_focused, populated);
-            app.apply(Update::SessionCatalog(Ok(vec![
-                crate::session::CatalogEntry {
+            assert!(matches!(
+                handle(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
+                ),
+                Action::ListSessions { .. }
+            ));
+            app.apply(Update::SessionCatalog {
+                epoch: app.session_catalog_epoch,
+                result: Ok(vec![crate::session::CatalogEntry {
                     id: "saved".into(),
                     title: Some("Saved".into()),
                     preview: None,
                     is_subagent: false,
+                    lineage: crate::session::CatalogLineage::Root,
+                    branch_point: None,
                     updated_at: 0,
-                },
-            ])));
+                }]),
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
             handle(
                 &mut app,
                 Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
@@ -4640,6 +5507,67 @@ mod tests {
     }
 
     #[test]
+    fn loading_session_dialog_owns_media_paste_and_enter_over_parked_queue() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.paste("parked draft ");
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        app.apply(Update::SteerAccepted {
+            id: "pending".into(),
+            text: "queued text".into(),
+            editable: true,
+        });
+        handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+        );
+        let draft = app.editor.text().to_owned();
+        let attachments = app.attachments.clone();
+        let Action::ListSessions { epoch } = handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+        ) else {
+            panic!("catalog requested")
+        };
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(matches!(
+            handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            ),
+            Action::None
+        ));
+        assert_eq!(
+            app.session_dialog.as_ref().unwrap().query,
+            path.to_str().unwrap()
+        );
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.attachments, attachments);
+        assert!(app.queue_focused);
+        handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        app.apply(Update::SessionCatalog {
+            epoch,
+            result: Ok(Vec::new()),
+        });
+        assert!(app.session_dialog.is_none());
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.attachments, attachments);
+        assert!(app.queue_focused);
+    }
+
+    #[test]
     fn session_rename_paste_is_not_interpreted_as_an_attachment() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.png");
@@ -4651,6 +5579,8 @@ mod tests {
             "a2a".into(),
         );
         app.session_dialog = Some(SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: Some(SessionRename::Editing(String::new())),
         });
@@ -4662,6 +5592,36 @@ mod tests {
             app.session_dialog.as_ref().unwrap().rename.as_ref(),
             Some(SessionRename::Editing(input)) if input == path.to_str().unwrap()
         ));
+    }
+
+    #[test]
+    fn session_browsing_paste_precedes_queue_media_and_parked_editor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        for queue_focused in [false, true] {
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("parked draft");
+            app.queue_focused = queue_focused;
+            app.session_dialog = Some(SessionDialog {
+                query: String::new(),
+                searching: false,
+                selected: 0,
+                rename: None,
+            });
+            handle(&mut app, Event::Paste(path.display().to_string()));
+            let dialog = app.session_dialog.as_ref().unwrap();
+            assert!(dialog.searching);
+            assert_eq!(dialog.query, path.to_str().unwrap());
+            assert_eq!(app.editor.text(), "parked draft");
+            assert!(app.attachments.is_empty());
+            assert_eq!(app.queue_focused, queue_focused);
+        }
     }
 
     #[test]
@@ -4678,6 +5638,8 @@ mod tests {
                 "a2a".into(),
             );
             app.session_dialog = Some(SessionDialog {
+                query: String::new(),
+                searching: false,
                 selected: 0,
                 rename: Some(rename),
             });

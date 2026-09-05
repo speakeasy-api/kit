@@ -14,8 +14,9 @@
 //! ACP hosts never see the extra chatter.
 
 use std::{
+    collections::HashMap,
     io::Write,
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -101,7 +102,7 @@ pub enum GenerationOutcome {
 }
 
 impl RuntimeEvent {
-    /// Whether a parent Kit runtime should forward this child event unchanged.
+    /// Whether a parent Kit runtime should forward this child event payload.
     pub(crate) fn forward_from_child(&self) -> bool {
         matches!(
             self,
@@ -135,19 +136,189 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os(EVENTS_ENV).is_some())
 }
 
-/// Writes one event to stderr when emission is enabled.
-pub fn emit(event: &RuntimeEvent) {
-    if !enabled() {
-        return;
-    }
-    let mut stderr = std::io::stderr().lock();
-    write_event(&mut stderr, event);
+/// Private, ephemeral stderr envelope. Persisted/replayed `RuntimeEvent` shapes
+/// are unchanged. Legacy lines decode without an activation and cannot establish
+/// live routing authority; historical replay still reads the unchanged event.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticEvent {
+    #[serde(flatten)]
+    pub event: RuntimeEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<DiagnosticActivation>,
 }
 
-fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticActivation {
+    pub session_id: String,
+    pub epoch: u64,
+}
+
+pub const ACTIVATION_META_KEY: &str = "kitRuntimeActivation";
+
+#[derive(Default)]
+struct DiagnosticRoutes {
+    next_epoch: u64,
+    sessions: HashMap<String, u64>,
+    active: Option<DiagnosticActivation>,
+}
+
+fn diagnostic_routes() -> &'static Mutex<DiagnosticRoutes> {
+    static ROUTES: OnceLock<Mutex<DiagnosticRoutes>> = OnceLock::new();
+    ROUTES.get_or_init(Mutex::default)
+}
+
+/// Commit a new activation only after session admission has succeeded. The ACP
+/// response returns this exact epoch; stderr alone is never activation authority.
+pub fn activate_diagnostics(session_id: &str) -> u64 {
+    let mut routes = diagnostic_routes().lock().expect("diagnostic routes lock");
+    routes.next_epoch = routes
+        .next_epoch
+        .checked_add(1)
+        .expect("activation epoch overflow");
+    let epoch = routes.next_epoch;
+    routes.sessions.insert(session_id.to_owned(), epoch);
+    routes.active = Some(DiagnosticActivation {
+        session_id: session_id.to_owned(),
+        epoch,
+    });
+    write_diagnostic_marker(&routes);
+    epoch
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_epoch(session_id: &str) -> Option<u64> {
+    diagnostic_routes()
+        .lock()
+        .expect("diagnostic routes lock")
+        .sessions
+        .get(session_id)
+        .copied()
+}
+
+/// Restore an actor's route without minting a new activation on each turn.
+pub fn restore_diagnostics(session_id: &str) {
+    let mut routes = diagnostic_routes().lock().expect("diagnostic routes lock");
+    routes.active = routes
+        .sessions
+        .get(session_id)
+        .map(|epoch| DiagnosticActivation {
+            session_id: session_id.to_owned(),
+            epoch: *epoch,
+        });
+    write_diagnostic_marker(&routes);
+}
+
+tokio::task_local! {
+    static DIAGNOSTIC_ACTIVATION: Option<DiagnosticActivation>;
+}
+
+/// Preserve the turn's activation even if another actor restores its route, or
+/// a loaded-session resume reactivates this durable ID while the turn is live.
+/// Capture synchronously at construction, before the future can be spawned.
+pub fn scope_diagnostics<F: std::future::Future>(
+    session_id: &str,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    let activation = {
+        let routes = diagnostic_routes().lock().expect("diagnostic routes lock");
+        routes
+            .sessions
+            .get(session_id)
+            .map(|epoch| DiagnosticActivation {
+                session_id: session_id.to_owned(),
+                epoch: *epoch,
+            })
+    };
+    DiagnosticScope(activation).scope(future)
+}
+
+fn write_diagnostic_marker(routes: &DiagnosticRoutes) {
+    if enabled()
+        && let Some(activation) = &routes.active
+    {
+        write_diagnostic(
+            &mut std::io::stderr().lock(),
+            &DiagnosticEvent {
+                event: RuntimeEvent::SessionStarted {
+                    session_id: activation.session_id.clone(),
+                },
+                activation: Some(activation.clone()),
+            },
+        );
+    }
+}
+
+/// Immutable producer identity. Capture before constructing a spawned task, not
+/// when that task is first polled. Unscoped producers never borrow the active UI
+/// route, including after a durable session ID is reactivated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DiagnosticScope(Option<DiagnosticActivation>);
+
+impl DiagnosticScope {
+    pub(crate) fn capture() -> Self {
+        Self(DIAGNOSTIC_ACTIVATION.try_with(Clone::clone).unwrap_or(None))
+    }
+
+    pub(crate) fn scope<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<F> {
+        DIAGNOSTIC_ACTIVATION.scope(self.0.clone(), future)
+    }
+
+    pub(crate) fn emit(&self, event: &RuntimeEvent) {
+        if !enabled() {
+            return;
+        }
+        write_diagnostic(
+            &mut std::io::stderr().lock(),
+            &DiagnosticEvent {
+                event: event.clone(),
+                activation: if matches!(event, RuntimeEvent::StorageStatus { .. }) {
+                    None
+                } else {
+                    self.0.clone()
+                },
+            },
+        );
+    }
+}
+
+/// Inherit the caller's scope synchronously, before the returned future can be
+/// moved into another task. Tokio task locals do not propagate through spawn.
+pub(crate) fn inherit_diagnostics<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> + use<F> {
+    DiagnosticScope::capture().scope(future)
+}
+
+/// Writes with the originating producer's scope. Truly unscoped events remain
+/// unscoped; process-wide StorageStatus is global even inside a session scope.
+pub fn emit(event: &RuntimeEvent) {
+    DiagnosticScope::capture().emit(event);
+}
+
+fn write_diagnostic(writer: &mut impl Write, event: &DiagnosticEvent) {
     if let Ok(line) = serde_json::to_string(event) {
         let _ = writeln!(writer, "{EVENT_MARKER}{line}");
     }
+}
+
+#[cfg(test)]
+fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
+    write_diagnostic(
+        writer,
+        &DiagnosticEvent {
+            event: event.clone(),
+            activation: None,
+        },
+    );
+}
+
+/// Decode both current activation-aware and historical unscoped stderr lines.
+#[must_use]
+pub fn parse_diagnostic(line: &str) -> Option<DiagnosticEvent> {
+    serde_json::from_str(line.strip_prefix(EVENT_MARKER)?).ok()
 }
 
 /// Parses one stderr line, returning an event when the line carries one.
@@ -227,9 +398,74 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
-        summarize_output, write_event,
+        DIAGNOSTIC_ACTIVATION, DiagnosticActivation, DiagnosticEvent, EVENT_MARKER,
+        GenerationOutcome, RuntimeEvent, SubagentStatus, activate_diagnostics, parse,
+        parse_diagnostic, restore_diagnostics, scope_diagnostics, summarize_input,
+        summarize_output, write_diagnostic, write_event,
     };
+
+    #[test]
+    fn diagnostic_envelope_preserves_legacy_replay_and_rejects_malformed_identity() {
+        let legacy = format!(
+            "{EVENT_MARKER}{}",
+            r#"{"event":"child_started","call":"p:compose:c","tool":"shell","summary":"ok","at":1}"#
+        );
+        let event = parse(&legacy).unwrap();
+        assert_eq!(parse_diagnostic(&legacy).unwrap().activation, None);
+        let current = DiagnosticEvent {
+            event: event.clone(),
+            activation: Some(DiagnosticActivation {
+                session_id: "source".into(),
+                epoch: 42,
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_diagnostic(&mut bytes, &current);
+        let line = String::from_utf8(bytes).unwrap();
+        assert_eq!(parse_diagnostic(line.trim_end()), Some(current));
+        // Old child-forwarding/replay readers retain exactly their event shape.
+        assert_eq!(parse(line.trim_end()), Some(event));
+        assert!(line.contains(r#""activation":{"session_id":"source","epoch":42}"#));
+        for activation in [
+            r#"{"session_id":"source","epoch":"42"}"#,
+            r#"{"session_id":"source","epoch":-1}"#,
+            r#"{"epoch":42}"#,
+        ] {
+            let malformed = format!(
+                "{EVENT_MARKER}{{\"event\":\"session_started\",\"session_id\":\"source\",\"activation\":{activation}}}"
+            );
+            assert!(parse_diagnostic(&malformed).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_epochs_change_on_reactivation_not_turn_restoration() {
+        let session_id = "event-epoch-test";
+        let first = activate_diagnostics(session_id);
+        restore_diagnostics(session_id);
+        scope_diagnostics(session_id, async {
+            assert_eq!(
+                DIAGNOSTIC_ACTIVATION.with(|activation| activation.as_ref().unwrap().epoch),
+                first
+            );
+            let second = activate_diagnostics(session_id);
+            assert!(second > first);
+            // Already-running futures keep their original activation identity.
+            assert_eq!(
+                DIAGNOSTIC_ACTIVATION.with(|activation| activation.as_ref().unwrap().epoch),
+                first
+            );
+            restore_diagnostics(session_id);
+            scope_diagnostics(session_id, async {
+                assert_eq!(
+                    DIAGNOSTIC_ACTIVATION.with(|activation| activation.as_ref().unwrap().epoch),
+                    second
+                );
+            })
+            .await;
+        })
+        .await;
+    }
 
     #[test]
     fn storage_status_events_round_trip_without_session_affinity() {

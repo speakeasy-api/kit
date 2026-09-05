@@ -555,7 +555,7 @@ impl ChildSession {
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = watch::channel(false);
         let actor_tx = tx.clone();
-        let mut task = tokio::spawn(async move {
+        let mut task = tokio::spawn(crate::events::inherit_diagnostics(async move {
             let result = run(
                 RunConfig {
                     config,
@@ -572,7 +572,7 @@ impl ChildSession {
             .await;
             let _ = closed_tx.send(true);
             result
-        });
+        }));
         let result = tokio::select! {
             ready = &mut ready_rx => match ready {
                 Ok(Ok(ready)) => Ok(ready),
@@ -621,6 +621,9 @@ impl ChildSession {
 
     pub async fn close(&self) -> Result<(), ChildError> {
         if let Some(ancestor_id) = &self.descendant_parent {
+            // Explicit close belongs to its caller, which may be a new turn
+            // using a reused or native-forked child. Deferred cleanup callers
+            // retain their originating scope across their own spawn boundary.
             crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
                 ancestor_id: ancestor_id.clone(),
             });
@@ -784,23 +787,8 @@ async fn run(
         .stderr
         .take()
         .ok_or("could not open ACP harness stderr")?;
-    let label = harness.clone();
-    let ancestor_id = config.parent_id.clone();
-    let descendant_parent = ancestor_id.clone();
-    tokio::spawn(async move {
-        forward_stderr(
-            stderr,
-            &label,
-            ancestor_id.as_deref(),
-            |output| match output {
-                ForwardedStderr::RuntimeLine(line) | ForwardedStderr::Diagnostic(line) => {
-                    eprintln!("{line}");
-                }
-                ForwardedStderr::Cleanup(event) => crate::events::emit(&event),
-            },
-        )
-        .await;
-    });
+    let descendant_parent = config.parent_id.clone();
+    spawn_forward_stderr(stderr, harness.clone(), config.parent_id.clone());
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(
         HashMap::<SessionId, Arc<Mutex<ChildOutput>>>::new(),
@@ -1113,6 +1101,41 @@ async fn run(
                 "the child did not complete the ACP handshake",
             )
         }
+    })
+}
+
+// Capture before spawn. ACP v1 stderr is one process-wide stream shared by
+// reused sessions and native forks. Neither a prompt response nor a new request
+// identifies the operation that produced buffered bytes; even child activation
+// IDs belong to another process and have no parent-operation mapping here.
+// Keep the launch scope for this stream and its EOF cleanup. After reactivation,
+// the reader must reject these events, including otherwise-current nested
+// diagnostics. This intentionally sacrifices nested live detail rather than
+// retagging delayed old bytes. Parent-owned Subagents lifecycle events and
+// explicit ChildSession::close use their invocation scope and remain current.
+fn spawn_forward_stderr(
+    stderr: impl AsyncRead + Unpin + Send + 'static,
+    label: String,
+    ancestor_id: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    let diagnostics = crate::events::DiagnosticScope::capture();
+    tokio::spawn(async move {
+        forward_stderr(stderr, &label, ancestor_id.as_deref(), |output| {
+            match output {
+                ForwardedStderr::RuntimeLine(line) => {
+                    // Child epochs belong to another process. Re-envelope the
+                    // event with this parent's captured activation at the IPC
+                    // boundary; recursively forwarded roster events keep their
+                    // own subagent/ancestor IDs in the unchanged payload.
+                    if let Some(event) = crate::events::parse(&line) {
+                        diagnostics.emit(&event);
+                    }
+                }
+                ForwardedStderr::Diagnostic(line) => eprintln!("{line}"),
+                ForwardedStderr::Cleanup(event) => diagnostics.emit(&event),
+            }
+        })
+        .await;
     })
 }
 
@@ -2197,6 +2220,175 @@ mod tests {
                     if ancestor_id == "s-owner"
             ));
         }
+    }
+
+    #[test]
+    fn spawned_stderr_keeps_origin_activation_and_unscoped_is_none() {
+        use crate::events::{self, DiagnosticActivation, RuntimeEvent};
+        const PROBE: &str = "KIT_TEST_STDERR_ACTIVATION_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use tokio::io::AsyncWriteExt;
+                    for route in ["same", "roundtrip", "construction", "unscoped", "current"] {
+                        let session = format!("stderr-{route}");
+                        events::activate_diagnostics(&session);
+                        if route == "current" {
+                            events::activate_diagnostics("stderr-current-other");
+                            events::activate_diagnostics(&session);
+                        }
+                        let (mut writer, reader) = tokio::io::duplex(4096);
+                        // Also exercise a future constructed before reactivation
+                        // but first polled afterward (the construction case).
+                        // The parent must reactivate and supply stderr bytes
+                        // before awaiting the returned forwarder task.
+                        #[allow(clippy::async_yields_async)]
+                        let producer = events::scope_diagnostics(&session, async move {
+                            spawn_forward_stderr(reader, "acp.kit".into(), Some(route.into()))
+                        });
+                        let (task, delayed) = if route == "construction" {
+                            (None, Some(producer))
+                        } else if route == "unscoped" {
+                            drop(producer);
+                            let (new_writer, reader) = tokio::io::duplex(4096);
+                            writer = new_writer;
+                            (
+                                Some(spawn_forward_stderr(
+                                    reader,
+                                    "acp.kit".into(),
+                                    Some(route.into()),
+                                )),
+                                None,
+                            )
+                        } else {
+                            (Some(producer.await), None)
+                        };
+                        if route == "roundtrip" {
+                            events::activate_diagnostics("stderr-other");
+                        }
+                        if route != "current" {
+                            events::activate_diagnostics(&session);
+                        }
+                        let task = match task {
+                            Some(task) => task,
+                            None => delayed.unwrap().await,
+                        };
+                        // Actual stderr transport gates both forwarded events
+                        // and EOF cleanup until the new activation is active.
+                        let event = RuntimeEvent::SubagentDescendantsRemoved {
+                            ancestor_id: format!("forward-{route}"),
+                        };
+                        let child_line = events::DiagnosticEvent {
+                            event,
+                            activation: Some(DiagnosticActivation {
+                                session_id: "child-process".into(),
+                                epoch: 999,
+                            }),
+                        };
+                        writer
+                            .write_all(
+                                format!(
+                                    "{}{}\n",
+                                    events::EVENT_MARKER,
+                                    serde_json::to_string(&child_line).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        writer.shutdown().await.unwrap();
+                        task.await.unwrap();
+                    }
+                    events::scope_diagnostics("stderr-same", async {
+                        events::emit(&RuntimeEvent::StorageStatus {
+                            pending: true,
+                            exhausted: false,
+                        });
+                    })
+                    .await;
+                    events::emit(&RuntimeEvent::CompactionStarted {
+                        reason: "unscoped".into(),
+                        at: 1,
+                    });
+                });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::spawned_stderr_keeps_origin_activation_and_unscoped_is_none",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let diagnostics = stderr
+            .lines()
+            .filter_map(events::parse_diagnostic)
+            .collect::<Vec<_>>();
+        for route in ["same", "roundtrip", "construction", "unscoped", "current"] {
+            let session = format!("stderr-{route}");
+            let first = diagnostics
+                .iter()
+                .find_map(|line| match &line.event {
+                    RuntimeEvent::SessionStarted { session_id } if session_id == &session => {
+                        line.activation.clone()
+                    }
+                    _ => None,
+                })
+                .expect("missing initial activation");
+            let expected = if route == "current" {
+                diagnostics
+                    .iter()
+                    .rev()
+                    .find_map(|line| match &line.event {
+                        RuntimeEvent::SessionStarted { session_id } if session_id == &session => {
+                            line.activation.clone()
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            } else {
+                first
+            };
+            for ancestor in [route.to_string(), format!("forward-{route}")] {
+                let line = diagnostics.iter().find(|line| matches!(&line.event,
+                    RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } if ancestor_id == &ancestor))
+                    .expect("missing forwarded event or EOF cleanup");
+                assert_eq!(
+                    line.activation,
+                    (route != "unscoped").then(|| expected.clone())
+                );
+            }
+        }
+        for line in diagnostics.iter().filter(|line| {
+            matches!(
+                line.event,
+                RuntimeEvent::StorageStatus { .. } | RuntimeEvent::CompactionStarted { .. }
+            )
+        }) {
+            assert_eq!(line.activation, None);
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| matches!(line.event, RuntimeEvent::StorageStatus { .. }))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| matches!(line.event, RuntimeEvent::CompactionStarted { .. }))
+        );
     }
 
     mod removes_descendants_on_exit {

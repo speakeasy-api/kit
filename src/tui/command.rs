@@ -62,7 +62,7 @@ const LOCAL_COMMANDS: &[Spec] = &[
     },
     Spec {
         token: "/sessions",
-        description: "Browse saved sessions",
+        description: "Browse saved conversation branches (F4)",
         kind: Kind::Sessions,
     },
     Spec {
@@ -94,6 +94,11 @@ const LOCAL_COMMANDS: &[Spec] = &[
         token: "/branch",
         description: "Edit a previous text prompt in a new session",
         kind: Kind::Branch,
+    },
+    Spec {
+        token: "/branches",
+        description: "Browse saved conversation branches (F4)",
+        kind: Kind::Sessions,
     },
     Spec {
         token: "/login",
@@ -256,6 +261,8 @@ mod tests {
             }
         );
         assert_eq!(parse("/sessions"), Parsed::Sessions);
+        assert_eq!(parse("/branches"), Parsed::Sessions);
+        assert_eq!(parse("/branch"), Parsed::Branch);
         assert_eq!(parse("/close"), Parsed::Close);
         assert_eq!(parse("/model"), Parsed::Model { query: None });
         assert_eq!(parse("/effort"), Parsed::Effort { value: None });
@@ -423,6 +430,7 @@ mod tests {
                 "/agents",
                 "/transcript",
                 "/branch",
+                "/branches",
                 "/compact",
             ]
         );

@@ -44,6 +44,7 @@ use crate::{
     },
 };
 
+mod diagnostics;
 mod input_settlement;
 pub(crate) use input_settlement::{InputSettlement, InputSettlingDriver};
 
@@ -2452,8 +2453,8 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
     spec
 }
 
-fn background_task_manager() -> AsyncTaskManager {
-    AsyncTaskManager::new().routing(background_route)
+fn background_task_manager() -> diagnostics::DiagnosticTaskManager {
+    diagnostics::DiagnosticTaskManager(AsyncTaskManager::new().routing(background_route))
 }
 
 fn background_route(request: &ToolRequest) -> RoutingDecision {

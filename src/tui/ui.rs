@@ -70,6 +70,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         .min(available_start_prompt_rows);
     let show_start = frame.area().width >= 20
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
+        && app.session_connected
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
         && !app.editing_steer()
@@ -135,8 +136,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_model_switch_dialog(frame, pending);
     } else if app.file_picker.is_some() {
         draw_file_picker(frame, app, prompt_area, prompt_viewport, picker_below);
-    } else if app.session_dialog.is_some() {
-        draw_session_dialog(frame, app);
     } else if app.model_dialog.is_some() {
         draw_model_dialog(frame, app);
     } else if app.effort_dialog.is_some() {
@@ -147,6 +146,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     }
     if app.branch_chooser.is_some() {
         draw_branch_chooser(frame, app);
+    }
+    if app.session_dialog.is_some() {
+        draw_session_dialog(frame, app);
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
@@ -458,11 +460,13 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
         .session_dialog
         .as_ref()
         .and_then(|dialog| dialog.rename.as_ref());
-    let prompt_rows = u16::from(rename.is_some());
+    let dialog = app.session_dialog.as_ref().expect("session dialog is open");
+    let prompt_rows = u16::from(rename.is_some() || dialog.searching || !dialog.query.is_empty());
     let height = outer.height.min(
-        (app.session_choices.len() as u16)
-            .saturating_add(3 + prompt_rows)
-            .min(23),
+        u16::try_from(app.session_matches.len().max(1))
+            .unwrap_or(u16::MAX)
+            .saturating_add(5 + prompt_rows)
+            .min(25),
     );
     let area = Rect::new(
         outer.x + outer.width.saturating_sub(width) / 2,
@@ -470,15 +474,22 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
         width,
         height,
     );
-    let selected = app
-        .session_dialog
-        .as_ref()
-        .map_or(0, |dialog| dialog.selected);
-    let panel = Panel::bordered().title(" sessions ");
+    let selected = dialog.selected;
+    let panel = Panel::bordered().title(if app.session_connected {
+        " branches · sessions "
+    } else {
+        " branches · disconnected "
+    });
     let inner = panel.inner(area);
     let footer_rows = u16::from(inner.height > prompt_rows.saturating_add(1));
-    let [list, prompt, footer] = Layout::vertical([
+    let detail_rows = if inner.height > prompt_rows + footer_rows + 2 {
+        2
+    } else {
+        0
+    };
+    let [list, detail, prompt, footer] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(detail_rows),
         Constraint::Length(prompt_rows),
         Constraint::Length(footer_rows),
     ])
@@ -486,36 +497,51 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
     let visible = list.height as usize;
     let start = selected
         .saturating_sub(visible / 2)
-        .min(app.session_choices.len().saturating_sub(visible));
-    let lines = app.session_choices[start..]
+        .min(app.session_matches.len().saturating_sub(visible));
+    let lines = app.session_matches[start..]
         .iter()
         .take(visible)
         .enumerate()
-        .map(|(offset, entry)| {
+        .map(|(offset, matched)| {
+            let row = &app.session_forest.rows[matched.index];
+            let entry = &row.entry;
             let is_selected = start + offset == selected;
-            let label = entry
-                .title
-                .as_deref()
-                .or(entry.preview.as_deref())
-                .unwrap_or("untitled");
-            let detail = entry
-                .preview
-                .as_deref()
-                .filter(|preview| *preview != label)
-                .map_or_else(
-                    || label.to_string(),
-                    |preview| format!("{label} — {preview}"),
-                );
-            let updated = entry.updated_at_rfc3339();
-            let text = format!(
-                "{}{} · {} · {}",
-                if is_selected { "› " } else { "  " },
-                &updated[..10],
-                entry.id,
-                detail
+            let current = app.session_id.as_deref() == Some(entry.id.as_str());
+            let indent = row
+                .display_depth()
+                .min((list.width as usize).saturating_sub(24) / 2);
+            let short_id: String = entry.id.chars().take(12).collect();
+            let title = truncate_to_width(entry.title.as_deref().unwrap_or("untitled"), 24);
+            let preview = truncate_to_width(entry.preview.as_deref().unwrap_or(""), 48);
+            let warning = row.warning.as_deref().map_or("", |warning| {
+                if warning.contains("orphan") {
+                    " [orphan]"
+                } else if warning.to_lowercase().contains("cycle") {
+                    " [cycle]"
+                } else if warning.contains("incomplete") {
+                    " [incomplete]"
+                } else {
+                    " [warning]"
+                }
+            });
+            let label = format!(
+                "{}{}{}{}{}{}{} · {} · {}",
+                if is_selected { "›" } else { " " },
+                if current { "●" } else { " " },
+                "  ".repeat(indent),
+                if row.parent.is_some() { "↳ " } else { "" },
+                short_id,
+                warning,
+                if matched.direct_match {
+                    ""
+                } else {
+                    " [ancestor]"
+                },
+                title,
+                preview
             );
             Line::from(Span::styled(
-                truncate_to_width(&text, list.width as usize),
+                truncate_to_width(&label, list.width as usize),
                 if is_selected {
                     theme::accent()
                 } else {
@@ -526,18 +552,88 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
         .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
     frame.render_widget(panel, area);
-    frame.render_widget(Paragraph::new(lines), list);
-
+    if app.session_catalog_pending {
+        frame.render_widget(Paragraph::new("Loading sessions… type to search"), list);
+    } else if lines.is_empty() {
+        frame.render_widget(Paragraph::new("No matching sessions"), list);
+    } else {
+        frame.render_widget(Paragraph::new(lines), list);
+    }
+    if let Some(matched) = app.session_matches.get(selected) {
+        let row = &app.session_forest.rows[matched.index];
+        let point = row
+            .entry
+            .branch_point
+            .clone()
+            .unwrap_or_else(|| match &row.entry.lineage {
+                crate::session::CatalogLineage::Branch(metadata) => format!(
+                    "parent {} · persisted prefix {} · {}",
+                    metadata.parent_session_id,
+                    metadata.boundary.prefix_len,
+                    metadata
+                        .boundary
+                        .prefix_hash
+                        .chars()
+                        .take(12)
+                        .collect::<String>()
+                ),
+                crate::session::CatalogLineage::Root => {
+                    "Independent session (no branch lineage)".into()
+                }
+                crate::session::CatalogLineage::Warning(warning) => warning.clone(),
+            });
+        let point = format!("Branch point: {point}");
+        let status = row
+            .warning
+            .clone()
+            .or_else(|| row.depth_note())
+            .unwrap_or_else(|| {
+                if let crate::session::CatalogLineage::Branch(metadata) = &row.entry.lineage {
+                    return format!(
+                        "Parent {} · persisted prefix {} · {}",
+                        metadata.parent_session_id,
+                        metadata.boundary.prefix_len,
+                        metadata
+                            .boundary
+                            .prefix_hash
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    );
+                }
+                if app.session_id.as_deref() == Some(row.entry.id.as_str()) {
+                    "● current session · Enter closes/reloads committed history".into()
+                } else {
+                    "● marks current session; › marks selection".into()
+                }
+            });
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(truncate_to_width(&point, detail.width as usize)),
+                Line::from(truncate_to_width(&status, detail.width as usize)),
+            ])
+            .style(theme::dim()),
+            detail,
+        );
+    }
     let footer_text = match rename {
         Some(SessionRename::Editing(_)) => "enter save · esc cancel",
         Some(SessionRename::ConfirmClear) => "enter clear name · esc cancel",
         Some(SessionRename::Saving) => "saving…",
-        None => "↑/↓ select · enter resume · r rename · esc close",
+        None if app.session_catalog_pending => {
+            "type search · esc/F4 close · activation waits for catalog"
+        }
+        None if dialog.searching => "type search · enter/esc finish search",
+        None => "↑/↓ select · enter resume · / search · r rename · esc/F4 close",
     };
     frame.render_widget(
         Paragraph::new(Span::styled(footer_text, theme::dim())),
         footer,
     );
+    if rename.is_none() && prompt_rows > 0 {
+        let value = visible_query_tail(&dialog.query, (prompt.width as usize).saturating_sub(9));
+        frame.render_widget(Paragraph::new(format!("search: {value}")), prompt);
+    }
 
     match rename {
         Some(SessionRename::Editing(input)) if prompt.width > 0 => {
@@ -869,7 +965,7 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, matches: &[usize]) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "↑/↓ · Enter reveal · /branch ↵ edit prompt · Esc/F3 close",
+                "↑/↓ · Enter reveal · F2 branch chooser · Esc/F3 close",
                 theme::dim(),
             )),
             Line::from(Span::styled(
@@ -2527,6 +2623,14 @@ fn prompt_lines(
 }
 
 fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if !app.session_connected {
+        frame.render_widget(
+            Paragraph::new(" disconnected · F4: select current session and Enter to retry")
+                .style(Style::default().fg(theme::warn_color())),
+            area,
+        );
+        return;
+    }
     let mut left = match app.phase {
         Phase::Idle => vec![Span::styled(" ready", theme::dim())],
         Phase::Cancelling => vec![
@@ -2579,7 +2683,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
     } else {
-        "F3 transcript   ⏎ send   ⇧⏎ newline   ^l log   ^c quit "
+        "F3 transcript   F4 branches   ⏎ send   ⇧⏎ newline   ^l log   ^c quit "
     };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
     let gap = (area.width as usize)
@@ -3887,6 +3991,72 @@ mod tests {
     }
 
     #[test]
+    fn explorer_renders_loading_and_keeps_query_visible_before_catalog_arrives() {
+        let mut app = panel_app(0);
+        app.paste("parked draft");
+        app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE));
+        app.paste("searching now");
+        let output = render(&mut app, 100, 18);
+        assert!(output.contains("Loading sessions"), "{output}");
+        assert!(output.contains("search: searching now"), "{output}");
+        assert!(!output.contains("No matching sessions"), "{output}");
+        assert_eq!(app.editor.text(), "parked draft");
+    }
+
+    #[test]
+    fn disconnected_status_never_claims_ready_even_with_empty_history() {
+        let mut app = panel_app(0);
+        app.session_connected = false;
+        let output = render(&mut app, 100, 18);
+        assert!(output.contains("disconnected"), "{output}");
+        assert!(output.contains("Enter to retry"), "{output}");
+        assert!(!output.contains(" ready"), "{output}");
+    }
+
+    #[test]
+    fn branch_explorer_renders_current_separately_from_selection_and_bounded_search() {
+        let mut app = panel_app(0);
+        app.session_id = Some("source".into());
+        app.set_session_choices(vec![
+            crate::session::CatalogEntry {
+                id: "source".into(),
+                title: Some("Current source".into()),
+                preview: Some("latest source".into()),
+                is_subagent: false,
+                lineage: crate::session::CatalogLineage::Root,
+                branch_point: None,
+                updated_at: 1,
+            },
+            crate::session::CatalogEntry {
+                id: "orphan".into(),
+                title: Some("Orphan name".into()),
+                preview: Some("latest orphan".into()),
+                is_subagent: false,
+                lineage: crate::session::CatalogLineage::Warning(
+                    "Missing parent; shown as an orphan root".into(),
+                ),
+                branch_point: None,
+                updated_at: 2,
+            },
+        ]);
+        app.session_dialog = Some(SessionDialog {
+            query: String::new(),
+            searching: false,
+            selected: 0,
+            rename: None,
+        });
+        let output = render(&mut app, 100, 18);
+        assert!(output.contains("› orphan [orphan]"), "{output}");
+        assert!(output.contains("●source"), "{output}");
+        assert!(output.contains("latest orphan"), "{output}");
+        assert!(output.contains("Missing parent"), "{output}");
+        app.paste(&"界👩‍💻".repeat(3000));
+        let output = render(&mut app, 32, 8);
+        assert!(output.contains("No matching sessions"), "{output}");
+        assert_eq!(app.editor.text(), "");
+    }
+
+    #[test]
     fn session_dialog_renders_custom_names_and_inline_rename_states() {
         let mut app = App::new(
             PathBuf::from("/tmp/project"),
@@ -3894,14 +4064,18 @@ mod tests {
             "model".into(),
             "127.0.0.1:7331".into(),
         );
-        app.session_choices = vec![crate::session::CatalogEntry {
+        app.set_session_choices(vec![crate::session::CatalogEntry {
             id: "s-abc123".into(),
             title: Some("OAuth token bug".into()),
             preview: Some("Preview remains available".into()),
             is_subagent: false,
+            lineage: crate::session::CatalogLineage::Root,
+            branch_point: None,
             updated_at: 0,
-        }];
+        }]);
         app.session_dialog = Some(SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: None,
         });
@@ -3931,7 +4105,7 @@ mod tests {
         );
         assert!(confirming.contains("enter clear name"), "{confirming}");
 
-        app.session_choices[0].title = Some("界".repeat(100));
+        app.session_forest.rows[0].entry.title = Some("界".repeat(100));
         app.session_dialog.as_mut().unwrap().rename = None;
         let narrow = render(&mut app, 20, 6);
         assert!(narrow.contains('…'), "{narrow}");

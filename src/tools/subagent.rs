@@ -610,7 +610,7 @@ impl Subagents {
         let (reply, response) = oneshot::channel();
         let manager = self.clone();
         tokio::spawn(
-            async move {
+            crate::events::inherit_diagnostics(async move {
                 let source_state = Arc::clone(&operation.source_state);
                 let reservation = operation.id.clone();
                 let result = manager.run_fork(operation, &reply).await;
@@ -621,7 +621,7 @@ impl Subagents {
                         let _ = reply.send(Err(error));
                     }
                 }
-            }
+            })
             .instrument(tracing::Span::current()),
         );
         match response.await.map_err(|_| {
@@ -1092,11 +1092,11 @@ impl Subagents {
     ) -> ChildError {
         let manager = self.clone();
         match tokio::spawn(
-            async move {
+            crate::events::inherit_diagnostics(async move {
                 manager
                     .cleanup_installed_child(&id, &state, &child, error)
                     .await
-            }
+            })
             .instrument(tracing::Span::current()),
         )
         .await
@@ -1140,7 +1140,7 @@ impl Subagents {
         let parent_id = self.config.parent_id.clone();
         let parent_name = self.config.parent_name.clone();
         let mut closed = child.closed_signal();
-        tokio::spawn(async move {
+        tokio::spawn(crate::events::inherit_diagnostics(async move {
             if !*closed.borrow() {
                 let _ = closed.changed().await;
             }
@@ -1179,7 +1179,7 @@ impl Subagents {
                 *event_parent_name = parent_name;
             }
             let _ = event_sink(&event);
-        });
+        }));
     }
 
     async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {

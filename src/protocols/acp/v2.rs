@@ -55,9 +55,13 @@ static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn establish_diagnostic_route(session_id: &wire::SessionId) {
-    crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-        session_id: session_id.to_string(),
-    });
+    crate::events::restore_diagnostics(&session_id.to_string());
+}
+
+fn activation_meta(epoch: u64) -> serde_json::Map<String, serde_json::Value> {
+    [(crate::events::ACTIVATION_META_KEY.to_owned(), epoch.into())]
+        .into_iter()
+        .collect()
 }
 
 fn validate_resume_location(
@@ -707,6 +711,7 @@ struct AttachedSession {
     session_id: wire::SessionId,
     config_options: Vec<wire::SessionConfigOption>,
     canonical_transcript: Vec<Item>,
+    runtime_activation: u64,
     activation: oneshot::Sender<()>,
 }
 
@@ -943,11 +948,14 @@ impl Server {
         let AttachedSession {
             session_id,
             config_options,
+            runtime_activation,
             activation,
             ..
         } = attached;
         Ok((
-            wire::NewSessionResponse::new(session_id).config_options(config_options),
+            wire::NewSessionResponse::new(session_id)
+                .config_options(config_options)
+                .meta(activation_meta(runtime_activation)),
             activation,
         ))
     }
@@ -987,7 +995,9 @@ impl Server {
                 Vec::new()
             };
             return Ok((
-                wire::ResumeSessionResponse::new().config_options(attached.config_options),
+                wire::ResumeSessionResponse::new()
+                    .config_options(attached.config_options)
+                    .meta(activation_meta(attached.runtime_activation)),
                 updates,
                 attached.activation,
             ));
@@ -1025,7 +1035,9 @@ impl Server {
             Vec::new()
         };
         Ok((
-            wire::ResumeSessionResponse::new().config_options(attached.config_options),
+            wire::ResumeSessionResponse::new()
+                .config_options(attached.config_options)
+                .meta(activation_meta(attached.runtime_activation)),
             updates,
             attached.activation,
         ))
@@ -1242,12 +1254,13 @@ impl Server {
                 SessionPublicationError::Commit(error) => error,
             });
         }
-        establish_diagnostic_route(&session_id);
+        let runtime_activation = crate::events::activate_diagnostics(&session_id.to_string());
         drop(actor_task);
         Ok(AttachedSession {
             session_id,
             config_options,
             canonical_transcript,
+            runtime_activation,
             activation,
         })
     }
@@ -1280,12 +1293,13 @@ impl Server {
             .map_err(|_| AcpRuntimeError::ClientClosed)??;
         // Reattachment can switch the client's diagnostic route without creating
         // an actor. Write the source marker before returning the load response.
-        establish_diagnostic_route(session_id);
+        let runtime_activation = crate::events::activate_diagnostics(&session_id.to_string());
         let (activation, _already_active) = oneshot::channel();
         Ok(Some(AttachedSession {
             session_id: session_id.clone(),
             config_options,
             canonical_transcript,
+            runtime_activation,
             activation,
         }))
     }
@@ -1357,6 +1371,7 @@ impl Server {
                 let response = SubmitPromptBranchResponse {
                     session_id: attached.session_id.clone(),
                     config_options: attached.config_options.clone(),
+                    runtime_activation: Some(attached.runtime_activation),
                 };
                 return Ok((response, Some(attached)));
             }
@@ -1377,6 +1392,7 @@ impl Server {
             let response = SubmitPromptBranchResponse {
                 session_id: attached.session_id.clone(),
                 config_options: attached.config_options.clone(),
+                runtime_activation: Some(attached.runtime_activation),
             };
             // A durable retry may reattach, but never starts another generation.
             return Ok((response, Some(attached)));
@@ -1415,6 +1431,7 @@ impl Server {
         let response = SubmitPromptBranchResponse {
             session_id: attached.session_id.clone(),
             config_options: attached.config_options.clone(),
+            runtime_activation: Some(attached.runtime_activation),
         };
         Ok((response, Some(attached)))
     }
@@ -2410,8 +2427,9 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     // after the client returns to its source without sending session/resume.
     // Re-establish identity before activity, model, or cleanup diagnostics.
     establish_diagnostic_route(session_id);
-    activity
-        .execute(
+    crate::events::scope_diagnostics(
+        &session_id.to_string(),
+        activity.execute(
             origin,
             async {
                 let result = drive_prompt(
@@ -2441,8 +2459,9 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
                 result
             },
             |reason| Some(reason.clone()),
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 // False means admission was denied; the actor must retain the selected wake.
@@ -3950,6 +3969,257 @@ mod tests {
             return;
         }
         cancelled_gated_branch_activation(false, GatedTurn::Autonomous).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_recovers_through_close_and_actual_resume_then_executes_once() {
+        const CHILD: &str = "KIT_TEST_CANCELLED_CHILD_ACTUAL_RESUME";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate provider environment overrides in a subprocess. The real
+            // runtime/load driver uses a local model endpoint, not a substituted
+            // Agent::builder transcript or a test-only attachment implementation.
+            let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let recorded = requests.clone();
+            let model = axum::Router::new()
+                .route("/models", axum::routing::get(|| async {
+                    axum::Json(json!({"data": [{"id": "test-model", "name": "test-model", "context_length": 8192}]}))
+                }))
+                .route("/chat/completions", axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        recorded.lock().unwrap().push(request);
+                        ([ (axum::http::header::CONTENT_TYPE, "text/event-stream") ], concat!(
+                            "data: {\"id\":\"reloaded\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"recovered answer\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"reloaded\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        ))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, model).await.unwrap();
+            });
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "protocols::acp::v2::tests::cancelled_child_recovers_through_close_and_actual_resume_then_executes_once", "--nocapture"])
+                .env(CHILD, "1")
+                .env("OPENROUTER_API_KEY", "test-key")
+                .env("OPENROUTER_BASE_URL", format!("http://{address}/chat/completions"))
+                .kill_on_drop(true)
+                .output();
+            let output = timeout(Duration::from_secs(45), output)
+                .await
+                .unwrap()
+                .unwrap();
+            server.abort();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "cancelled prompt must make zero model calls; new prompt exactly one"
+            );
+            let last_user = requests[0]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+                .unwrap();
+            assert!(
+                last_user["content"]
+                    .to_string()
+                    .contains("new prompt after recovery")
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let source_id = crate::session::new_id();
+        drop(
+            crate::session::open(
+                root.path(),
+                &source_id,
+                false,
+                false,
+                vec![
+                    Item::text(ItemKind::System, "system"),
+                    Item::text(ItemKind::User, "original prompt"),
+                    Item::text(ItemKind::Assistant, "original answer"),
+                ],
+            )
+            .unwrap(),
+        );
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let state = Arc::new(Server::new(runtime, SessionRegistry::new()));
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (done, finished) = oneshot::channel();
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |_update: wire::UpdateSessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |_cx| {
+                let _ = finished.await;
+                Ok(())
+            });
+        let agent = agent_client_protocol::Agent.v2().connect_with(
+            agent_transport,
+            async move |connection| {
+                let workspace = root.path().to_path_buf();
+                let (_, _, activate_source) = state
+                    .resume_session(
+                        wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone()),
+                        connection.clone(),
+                    )
+                    .await
+                    .unwrap();
+                activate_source.send(()).unwrap();
+                let listed = state
+                    .list_prompt_branches(ListPromptBranchesRequest {
+                        session_id: wire::SessionId::new(source_id.clone()),
+                    })
+                    .await
+                    .unwrap();
+                let prepared = state
+                    .prepare_prompt_branch(PreparePromptBranchRequest {
+                        session_id: wire::SessionId::new(source_id.clone()),
+                        address: listed.boundaries[0].address.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let (submitted, attached) = state
+                    .submit_prompt_branch(
+                        SubmitPromptBranchRequest {
+                            session_id: wire::SessionId::new(source_id.clone()),
+                            checkout_token: prepared.checkout_token,
+                            text: "cancelled edited prompt".into(),
+                        },
+                        connection.clone(),
+                    )
+                    .await
+                    .unwrap();
+                let child_id = submitted.session_id;
+                let retired_commands = state.sender(&child_id).unwrap();
+                state
+                    .cancel(wire::CancelSessionNotification::new(child_id.clone()))
+                    .await
+                    .unwrap();
+                attached.unwrap().activation.send(()).unwrap();
+                timeout(Duration::from_secs(5), retired_commands.closed())
+                    .await
+                    .unwrap();
+                // An actor may already have removed itself from the map. The common
+                // client close path treats precisely this not-found case as closed.
+                let closed = state
+                    .close(wire::CloseSessionRequest::new(child_id.clone()))
+                    .await;
+                assert!(matches!(
+                    closed,
+                    Ok(_) | Err(AcpRuntimeError::SessionNotFound(_))
+                ));
+                let (resumed, replay, activation) = state
+                    .resume_session(
+                        wire::ResumeSessionRequest::new(child_id.clone(), workspace.clone())
+                            .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                        connection.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    resumed.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY].as_u64(),
+                    submitted.runtime_activation
+                );
+                assert!(!replay.is_empty());
+                activation.send(()).unwrap();
+                let busy = state
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&child_id)
+                    .unwrap()
+                    .busy
+                    .clone();
+                assert!(
+                    !busy.load(Ordering::Acquire),
+                    "actual resume must be passive"
+                );
+                let history =
+                    crate::session::branch::load_history(&workspace, &child_id.to_string())
+                        .unwrap();
+                assert!(
+                    !history
+                        .last()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item.kind == ItemKind::Assistant)
+                );
+                let start = state
+                    .prepare_prompt(wire::PromptRequest::new(
+                        child_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "new prompt after recovery",
+                        ))],
+                    ))
+                    .await
+                    .unwrap();
+                assert!(busy.load(Ordering::Acquire));
+                start.send(()).unwrap();
+                timeout(Duration::from_secs(10), async {
+                    while busy.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                state
+                    .close(wire::CloseSessionRequest::new(child_id.clone()))
+                    .await
+                    .unwrap();
+                state
+                    .close(wire::CloseSessionRequest::new(source_id))
+                    .await
+                    .unwrap();
+                let history =
+                    crate::session::branch::load_history(&workspace, &child_id.to_string())
+                        .unwrap();
+                assert_eq!(
+                    history
+                        .last()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item.kind == ItemKind::Assistant)
+                        .count(),
+                    1
+                );
+                assert!(
+                    serde_json::to_string(&history)
+                        .unwrap()
+                        .contains("recovered answer")
+                );
+                let _ = done.send(());
+                Ok(())
+            },
+        );
+        let (agent, client) = timeout(Duration::from_secs(30), async {
+            tokio::join!(agent, client)
+        })
+        .await
+        .unwrap();
+        agent.unwrap();
+        client.unwrap();
     }
 
     #[test]
@@ -7236,12 +7506,61 @@ mod tests {
                 ))
                 .block_task()
                 .await?;
-                cx.send_request(
-                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone())
-                        .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
-                )
-                .block_task()
-                .await?;
+                let opened = cx
+                    .send_request(
+                        wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone())
+                            .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                    )
+                    .block_task()
+                    .await?;
+                let first_epoch = opened.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY]
+                    .as_u64()
+                    .unwrap();
+                assert_eq!(
+                    crate::events::diagnostic_epoch(&source_id),
+                    Some(first_epoch)
+                );
+                // Rejected requests must not reactivate a loaded actor. Exercise
+                // every pre-lookup validation, including unknown replay cursors.
+                let mut directories =
+                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone());
+                directories
+                    .additional_directories
+                    .push(workspace.clone().into());
+                let mut cursor =
+                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone());
+                cursor.replay_from =
+                    Some(serde_json::from_value(json!({"type": "_unsupported"})).unwrap());
+                for invalid in [
+                    directories,
+                    cursor,
+                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.join("missing")),
+                ] {
+                    cx.send_request(invalid)
+                        .block_task()
+                        .await
+                        .expect_err("invalid loaded resume");
+                    assert_eq!(
+                        crate::events::diagnostic_epoch(&source_id),
+                        Some(first_epoch)
+                    );
+                }
+                let same_id = cx
+                    .send_request(wire::ResumeSessionRequest::new(
+                        source_id.clone(),
+                        workspace.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+                let same_id_epoch = same_id.meta.as_ref().unwrap()
+                    [crate::events::ACTIVATION_META_KEY]
+                    .as_u64()
+                    .unwrap();
+                assert!(same_id_epoch > first_epoch);
+                assert_eq!(
+                    crate::events::diagnostic_epoch(&source_id),
+                    Some(same_id_epoch)
+                );
                 let listed = cx
                     .send_request(ListPromptBranchesRequest {
                         session_id: wire::SessionId::new(source_id.clone()),
@@ -7315,8 +7634,13 @@ mod tests {
                     async { cx.send_request(request.clone()).block_task().await },
                     async { cx.send_request(request.clone()).block_task().await },
                 );
-                assert_eq!(first?.session_id.to_string(), child_id);
-                assert_eq!(second?.session_id.to_string(), child_id);
+                let first = first?;
+                let second = second?;
+                assert_eq!(first.session_id.to_string(), child_id);
+                assert_eq!(second.session_id.to_string(), child_id);
+                assert!(first.runtime_activation.is_some());
+                assert!(second.runtime_activation.is_some());
+                assert_ne!(first.runtime_activation, second.runtime_activation);
                 let changed = cx
                     .send_request(wire::SetSessionConfigOptionRequest::new(
                         child_id.clone(),
@@ -7343,11 +7667,56 @@ mod tests {
                     )
                     .block_task()
                     .await?;
-                assert!(
-                    serde_json::to_string(&resumed.config_options)
-                        .unwrap()
-                        .contains("high")
+                let returned_epoch = resumed.meta.as_ref().unwrap()
+                    [crate::events::ACTIVATION_META_KEY]
+                    .as_u64()
+                    .unwrap();
+                assert!(returned_epoch > same_id_epoch);
+                assert_eq!(
+                    crate::events::diagnostic_epoch(&source_id),
+                    Some(returned_epoch)
                 );
+                assert_eq!(serde_json::to_value(&resumed.config_options).unwrap()[1]["currentValue"], "high");
+                // A distinct durable sibling has its own captured defaults and
+                // replay, even after visiting a still-loaded source and child.
+                let sibling_id = crate::session::new_id();
+                let sibling_initial = crate::session::branch::prepare(
+                    prefix.clone(), source_id.clone(),
+                    crate::session::branch::Boundary::new(0, &prefix).unwrap(),
+                    "sibling-checkout".into(),
+                    crate::session::branch::SubmittedRequest {
+                        id: prompt_branches::submitted_request_id(&source_id, "sibling prompt"),
+                        selection: crate::session::branch::CapturedSelection::new(&selection, None),
+                    },
+                    Item::text(ItemKind::User, "sibling prompt"),
+                ).unwrap();
+                let sibling = crate::session::open_uncommitted(&workspace, &sibling_id, false, sibling_initial).unwrap();
+                crate::session::branch::commit(&sibling.observer, &sibling.transcript).unwrap();
+                let mut sibling_future = sibling.transcript.clone();
+                sibling_future.push(Item::text(ItemKind::Assistant, "distinct sibling answer"));
+                sibling.observer.replace(&sibling_future).unwrap();
+                drop(sibling);
+                let sibling_resume = cx.send_request(
+                    wire::ResumeSessionRequest::new(sibling_id.clone(), workspace.clone())
+                        .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                ).block_task().await?;
+                let sibling_epoch = sibling_resume.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY].as_u64().unwrap();
+                assert!(sibling_epoch > returned_epoch);
+                assert_eq!(crate::events::diagnostic_epoch(&sibling_id), Some(sibling_epoch));
+                assert_eq!(serde_json::to_value(&sibling_resume.config_options).unwrap()[1]["currentValue"], "default");
+                cx.send_request(wire::CloseSessionRequest::new(sibling_id.clone())).block_task().await?;
+                let source_again = cx.send_request(
+                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone())
+                        .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                ).block_task().await?;
+                let source_epoch = source_again.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY].as_u64().unwrap();
+                assert!(source_epoch > sibling_epoch);
+                assert_eq!(crate::events::diagnostic_epoch(&source_id), Some(source_epoch));
+                assert_eq!(serde_json::to_value(&source_again.config_options).unwrap()[1]["currentValue"], "high");
+                assert!(updates.lock().unwrap().iter().any(|update| {
+                    update.session_id.to_string() == sibling_id
+                        && serde_json::to_string(&update.update).unwrap().contains("distinct sibling answer")
+                }));
                 cx.send_request(wire::CloseSessionRequest::new(source_id.clone()))
                     .block_task()
                     .await?;
@@ -8266,6 +8635,8 @@ mod tests {
                 title: Some("Saved session".into()),
                 preview: Some("Saved session preview".into()),
                 is_subagent: true,
+                lineage: crate::session::CatalogLineage::Root,
+                branch_point: None,
                 updated_at: 0,
             },
             &PathBuf::from("/workspace"),

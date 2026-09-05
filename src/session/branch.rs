@@ -10,9 +10,9 @@ use crate::{ReasoningEffort, provider::ModelSelection};
 pub(crate) const METADATA_KEY: &str = "dev.kit.session.prompt_checkout";
 const VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Boundary {
+pub struct Boundary {
     /// Index in `load_history`, including states preceding compaction.
     pub state_index: usize,
     /// Number of items in the retained prefix (exclusive for a selected user
@@ -36,9 +36,9 @@ impl Boundary {
 }
 
 /// Canonical IDs from the actual runtime types, not UI labels or adapter defaults.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CapturedSelection {
+pub struct CapturedSelection {
     pub provider: String,
     pub model: String,
     /// `default` is explicit: absence is not silently interpreted as default.
@@ -62,16 +62,16 @@ impl CapturedSelection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SubmittedRequest {
+pub struct SubmittedRequest {
     pub id: String,
     pub selection: CapturedSelection,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Completion {
+pub struct Completion {
     pub prefix_len: usize,
     /// Hash of every retained item, with only this payload removed.
     pub prefix_hash: String,
@@ -79,9 +79,9 @@ pub(crate) struct Completion {
     pub prompt_hash: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BranchMetadata {
+pub struct BranchMetadata {
     pub version: u32,
     pub parent_session_id: String,
     pub boundary: Boundary,
@@ -167,6 +167,114 @@ impl BranchMetadata {
             && digest(prompt)? == self.completion.prompt_hash
             && prefix_digest(prefix)? == self.completion.prefix_hash)
     }
+}
+
+/// Classify a catalog row without opening, repairing, flushing, or rereading it.
+/// Exact replacement boundaries (not subsequently appended state) are the same
+/// completion evidence used by checkout recovery. This is provenance validation,
+/// not a new durability barrier for process-resident filesystem overlays.
+pub(super) fn catalog_lineage(authority: &Authority, session_id: &str) -> CatalogLineage {
+    match catalog_provenance(authority, session_id) {
+        Ok(Some(metadata)) => CatalogLineage::Branch(Box::new(metadata)),
+        Ok(None) => CatalogLineage::Root,
+        Err(error) => {
+            CatalogLineage::Warning(truncate_catalog_text(&normalize_catalog_text(&error), 160))
+        }
+    }
+}
+
+fn catalog_provenance(
+    authority: &Authority,
+    session_id: &str,
+) -> Result<Option<BranchMetadata>, String> {
+    let mut provenance = BranchMetadata::read(&authority.items)?;
+    for state in &authority.historical_items {
+        if let Some(metadata) = BranchMetadata::read(state)? {
+            if provenance
+                .as_ref()
+                .is_some_and(|previous| previous != &metadata)
+            {
+                return Err("prompt checkout metadata changed across history".into());
+            }
+            provenance = Some(metadata);
+        }
+    }
+    // Compaction may remove the bootstrap payload; a validated historical
+    // completion still proves the branch's original lineage.
+    let Some(metadata) = provenance else {
+        return Ok(None);
+    };
+    if metadata.parent_session_id == session_id {
+        return Err("prompt checkout cannot parent itself".into());
+    }
+    let mut completed: Option<&[Item]> = None;
+    for &(state_index, length) in &authority.replacement_boundaries {
+        let snapshot = &authority.historical_items[state_index][..length];
+        if BranchMetadata::read(snapshot)?.as_ref() == Some(&metadata)
+            && metadata.matches_snapshot(snapshot)?
+        {
+            if completed.is_some_and(|previous| previous != snapshot) {
+                return Err("conflicting prompt checkout completion records".into());
+            }
+            completed = Some(snapshot);
+        }
+    }
+    if completed.is_none() {
+        return Err("incomplete prompt checkout: no matching completion record".into());
+    }
+    Ok(Some(metadata))
+}
+
+/// Describe the actual retained parent context only after verifying the original
+/// prefix with the same canonical digest as `Boundary::new`. In particular, do
+/// not hash the sanitized child prefix or substitute the parent's current state.
+/// The catalog owns this history snapshot; this helper performs no filesystem IO.
+pub(super) fn catalog_branch_point(
+    metadata: &BranchMetadata,
+    parent_history: Option<&[Vec<Item>]>,
+) -> String {
+    let Some(history) = parent_history else {
+        return "Provenance only: parent history unavailable".into();
+    };
+    let Some(prefix) = history
+        .get(metadata.boundary.state_index)
+        .and_then(|state| state.get(..metadata.boundary.prefix_len))
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return "Provenance only: recorded parent prefix unavailable".into();
+    };
+    match digest(prefix) {
+        Ok(hash) if hash == metadata.boundary.prefix_hash => {}
+        Ok(_) => return "Provenance only: recorded parent prefix hash does not match".into(),
+        Err(_) => return "Provenance only: parent prefix could not be verified".into(),
+    }
+    let retained = prefix.last().expect("nonempty verified parent prefix");
+    let role = match retained.kind {
+        ItemKind::System => "System",
+        ItemKind::Developer => "Developer",
+        ItemKind::Context => "Context",
+        ItemKind::Notification => "Notification",
+        ItemKind::User => "User",
+        ItemKind::Assistant => "Assistant",
+        ItemKind::Tool => "Tool",
+    };
+    let preview = retained
+        .parts
+        .iter()
+        .find_map(|part| {
+            let text = match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                Part::ToolResult(result) => match &result.output {
+                    agentkit_core::ToolOutput::Text(text) => Some(text.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            }?;
+            let text = normalize_catalog_text(text);
+            (!text.is_empty()).then(|| truncate_catalog_text(&text, 160))
+        })
+        .unwrap_or_else(|| "[no visible text in retained item]".into());
+    format!("Validated parent context · {role}: {preview}")
 }
 
 /// Validate a branch reload before an opener can repair history or an adapter
@@ -678,6 +786,341 @@ mod tests {
         assert_eq!(metadata.request.selection.reasoning, "default");
         assert_eq!(descendant[0].metadata["unrelated"], json!(true));
         assert!(metadata.matches_snapshot(&descendant).unwrap());
+    }
+
+    fn catalog_row(root: &Path) -> CatalogEntry {
+        let mut entries = catalog_for_workspace(root, &root.join("sessions")).unwrap();
+        assert_eq!(entries.len(), 1);
+        entries.remove(0)
+    }
+
+    fn disk_snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut snapshot = Vec::new();
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::metadata(&path).unwrap();
+            let bytes = if metadata.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                None
+            } else {
+                Some(std::fs::read(&path).unwrap())
+            };
+            snapshot.push((path, metadata.modified().unwrap(), bytes));
+        }
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
+    }
+
+    #[test]
+    fn catalog_lineage_validates_completion_survives_compaction_and_never_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let transcript = prepared();
+        let expected = BranchMetadata::read(&transcript).unwrap().unwrap();
+        let opened = open_branch(root.path(), transcript.clone());
+        let before = disk_snapshot(root.path());
+        assert!(matches!(
+            catalog_row(root.path()).lineage,
+            CatalogLineage::Warning(_)
+        ));
+        assert_eq!(disk_snapshot(root.path()), before);
+        commit(&opened.observer, &transcript).unwrap();
+        let mut later = Item::text(ItemKind::Assistant, "later answer");
+        stamp_item(&mut later, Timestamp::now());
+        opened.observer.0.lock().unwrap().append(&later).unwrap();
+        let before = disk_snapshot(root.path());
+        for _ in 0..2 {
+            assert_eq!(
+                catalog_row(root.path()).lineage,
+                CatalogLineage::Branch(Box::new(expected.clone()))
+            );
+        }
+        assert_eq!(disk_snapshot(root.path()), before);
+        opened
+            .observer
+            .replace(&[Item::text(ItemKind::System, "compacted")])
+            .unwrap();
+        drop(opened);
+        let before = disk_snapshot(root.path());
+        assert_eq!(
+            catalog_row(root.path()).lineage,
+            CatalogLineage::Branch(Box::new(expected.clone()))
+        );
+        assert_eq!(disk_snapshot(root.path()), before);
+        // Provenance extraction consumes the authority's existing parsed records.
+        // It must not reopen the transcript or introduce a disk/flush barrier.
+        let authority = select_authority_with(
+            &root.path().join("sessions"),
+            &canonical_workspace(root.path()),
+            "branch",
+            false,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::remove_file(path(root.path())).unwrap();
+        assert_eq!(
+            catalog_lineage(&authority, "branch"),
+            CatalogLineage::Branch(Box::new(expected))
+        );
+    }
+
+    #[test]
+    fn catalog_lineage_keeps_malformed_unknown_and_conflicting_metadata_visible() {
+        for value in [
+            serde_json::Value::Null,
+            json!({"version": 999}),
+            json!({"version": 1}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut transcript = prepared();
+            transcript[0].metadata.insert(METADATA_KEY.into(), value);
+            let opened = open_branch(root.path(), transcript);
+            opened.observer.commit_creation();
+            drop(opened);
+            let before = disk_snapshot(root.path());
+            assert!(matches!(
+                catalog_row(root.path()).lineage,
+                CatalogLineage::Warning(_)
+            ));
+            assert_eq!(disk_snapshot(root.path()), before);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut transcript = prepared();
+        let opened = open_branch(root.path(), transcript.clone());
+        commit(&opened.observer, &transcript).unwrap();
+        transcript[0].metadata.get_mut(METADATA_KEY).unwrap()["parent_session_id"] =
+            json!("other-parent");
+        opened.observer.replace(&transcript).unwrap();
+        drop(opened);
+        assert!(matches!(
+            catalog_row(root.path()).lineage,
+            CatalogLineage::Warning(_)
+        ));
+    }
+
+    #[test]
+    fn catalog_lineage_rejects_append_only_and_short_replacement_completion() {
+        for short_replacement in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let transcript = prepared();
+            let opened = open_branch(root.path(), transcript[..1].to_vec());
+            if short_replacement {
+                opened.observer.replace(&transcript[..1]).unwrap();
+            }
+            opened
+                .observer
+                .0
+                .lock()
+                .unwrap()
+                .append(&transcript[1])
+                .unwrap();
+            opened.observer.commit_creation();
+            drop(opened);
+            let before = disk_snapshot(root.path());
+            assert!(matches!(
+                catalog_row(root.path()).lineage,
+                CatalogLineage::Warning(_)
+            ));
+            assert_eq!(disk_snapshot(root.path()), before);
+        }
+    }
+
+    #[test]
+    fn catalog_lineage_rejects_mismatched_completion_and_self_parenting() {
+        for self_parent in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut transcript = prepared();
+            if self_parent {
+                transcript[0].metadata.get_mut(METADATA_KEY).unwrap()["parent_session_id"] =
+                    json!("branch");
+            } else {
+                transcript[1].parts = Item::text(ItemKind::User, "changed prompt").parts;
+            }
+            let opened = open_branch(root.path(), transcript.clone());
+            opened.observer.replace(&transcript).unwrap();
+            opened.observer.commit_creation();
+            drop(opened);
+            let before = disk_snapshot(root.path());
+            assert!(matches!(
+                catalog_row(root.path()).lineage,
+                CatalogLineage::Warning(_)
+            ));
+            assert_eq!(disk_snapshot(root.path()), before);
+        }
+    }
+
+    #[test]
+    fn catalog_lineage_preserves_legacy_roots_without_rewriting() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_branch(root.path(), vec![Item::text(ItemKind::System, "legacy")]);
+        opened.observer.commit_creation();
+        drop(opened);
+        let before = disk_snapshot(root.path());
+        assert_eq!(catalog_row(root.path()).lineage, CatalogLineage::Root);
+        assert_eq!(disk_snapshot(root.path()), before);
+    }
+
+    fn catalog_child(root: &Path) -> CatalogEntry {
+        catalog_for_workspace(root, &root.join("sessions"))
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == "branch")
+            .unwrap()
+    }
+
+    fn prepared_from_parent(prefix: Vec<Item>, state_index: usize) -> Vec<Item> {
+        let boundary = Boundary::new(state_index, &prefix).unwrap();
+        let request = BranchMetadata::read(&prepared()).unwrap().unwrap().request;
+        // Deliberately model a sanitized child copy: only the original parent
+        // history, never this changed child text, can provide the context detail.
+        let mut sanitized = prefix;
+        sanitized.last_mut().unwrap().parts =
+            Item::text(ItemKind::Assistant, "sanitized child copy").parts;
+        prepare(
+            sanitized,
+            "parent".into(),
+            boundary,
+            "checkout-1".into(),
+            request,
+            Item::text(ItemKind::User, "new submitted branch prompt"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_branch_point_uses_original_historical_prefix_after_parent_advances_and_compacts() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sessions");
+        let parent = open_in(
+            root.path(),
+            &directory,
+            "parent",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "initial bootstrap")],
+        )
+        .unwrap();
+        let retained = vec![
+            Item::text(ItemKind::System, "compacted bootstrap"),
+            Item::text(ItemKind::User, "original parent prompt"),
+            Item::text(ItemKind::Assistant, "retained parent answer"),
+        ];
+        parent.observer.replace(&retained).unwrap();
+        let transcript = prepared_from_parent(retained, 1);
+        let child = open_branch(root.path(), transcript.clone());
+        let before = disk_snapshot(root.path());
+        let row = catalog_child(root.path());
+        assert!(matches!(row.lineage, CatalogLineage::Warning(_)));
+        assert_eq!(row.branch_point, None);
+        assert_eq!(disk_snapshot(root.path()), before);
+        commit(&child.observer, &transcript).unwrap();
+        let expected = Some("Validated parent context · Assistant: retained parent answer".into());
+        assert_eq!(catalog_child(root.path()).branch_point, expected);
+        let mut later = Item::text(
+            ItemKind::User,
+            "later parent prompt must not become the branch point",
+        );
+        stamp_item(&mut later, Timestamp::now());
+        parent.observer.0.lock().unwrap().append(&later).unwrap();
+        assert_eq!(catalog_child(root.path()).branch_point, expected);
+        parent
+            .observer
+            .replace(&[
+                Item::text(ItemKind::System, "new compaction"),
+                Item::text(
+                    ItemKind::Assistant,
+                    "newest answer must not become the branch point",
+                ),
+            ])
+            .unwrap();
+        child
+            .observer
+            .replace(&[Item::text(ItemKind::System, "child compaction")])
+            .unwrap();
+        drop(parent);
+        drop(child);
+        let before = disk_snapshot(root.path());
+        assert_eq!(catalog_child(root.path()).branch_point, expected);
+        assert_eq!(disk_snapshot(root.path()), before);
+    }
+
+    #[test]
+    fn catalog_branch_point_labels_missing_and_mismatched_parent_prefix_as_provenance_only() {
+        for mode in [
+            "missing parent",
+            "missing state",
+            "short prefix",
+            "hash mismatch",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("sessions");
+            let parent = open_in(
+                root.path(),
+                &directory,
+                "parent",
+                false,
+                false,
+                vec![
+                    Item::text(ItemKind::System, "bootstrap"),
+                    Item::text(ItemKind::User, "parent prompt"),
+                    Item::text(ItemKind::Assistant, "retained answer"),
+                ],
+            )
+            .unwrap();
+            let mut transcript = prepared_from_parent(parent.transcript.clone(), 0);
+            if mode == "missing state" {
+                transcript[0].metadata.get_mut(METADATA_KEY).unwrap()["boundary"]["state_index"] =
+                    json!(99);
+            } else if mode == "hash mismatch" {
+                transcript[0].metadata.get_mut(METADATA_KEY).unwrap()["boundary"]["prefix_hash"] =
+                    json!("0".repeat(64));
+            }
+            let child = open_branch(root.path(), transcript.clone());
+            commit(&child.observer, &transcript).unwrap();
+            drop(parent);
+            drop(child);
+            let parent_path = transcript_path(
+                &workspace_storage_directory(&directory, &canonical_workspace(root.path())),
+                "parent",
+            );
+            if mode == "missing parent" {
+                std::fs::remove_file(&parent_path).unwrap();
+            } else if mode == "short prefix" {
+                let bytes = std::fs::read(&parent_path).unwrap();
+                let end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+                std::fs::write(&parent_path, &bytes[..end]).unwrap();
+            }
+            let before = disk_snapshot(root.path());
+            let row = catalog_child(root.path());
+            assert!(matches!(row.lineage, CatalogLineage::Branch(_)), "{mode}");
+            let detail = row.branch_point.unwrap();
+            assert!(detail.starts_with("Provenance only:"), "{mode}: {detail}");
+            assert!(!detail.contains("retained answer"), "{mode}");
+            assert_eq!(disk_snapshot(root.path()), before, "{mode}");
+        }
+    }
+
+    #[test]
+    fn catalog_branch_point_is_bounded_sanitized_and_has_no_filesystem_dependency() {
+        let mut prefix = vec![Item::text(ItemKind::System, "bootstrap")];
+        prefix.push(Item::text(
+            ItemKind::Assistant,
+            format!("safe\u{1b}\u{202e} {}", "界".repeat(500)),
+        ));
+        let transcript = prepared_from_parent(prefix.clone(), 0);
+        let metadata = BranchMetadata::read(&transcript).unwrap().unwrap();
+        let detail = catalog_branch_point(&metadata, Some(&[prefix]));
+        assert!(detail.starts_with("Validated parent context · Assistant: safe "));
+        assert!(detail.chars().count() <= 210);
+        assert!(!detail.contains(['\u{1b}', '\u{202e}']));
+        assert_eq!(
+            catalog_branch_point(&metadata, None),
+            "Provenance only: parent history unavailable"
+        );
     }
 
     #[test]

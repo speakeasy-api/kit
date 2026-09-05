@@ -44,6 +44,7 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 | `Esc` | Close the transcript navigator; cancel a pending-message edit and restore the previous draft; leave the queue selector; otherwise interrupt a running turn or dismiss an idle notice |
 | `F2` | Focus the pending-message queue (or return to the composer) |
 | `F3` | Open or close the read-only transcript navigator, including while streaming |
+| `F4` | Browse saved conversation branches without replacing the editor draft |
 | `Up` / `Down`, `Enter`, `Backspace` / `Delete` in the queue | Select a pending message, edit it if supported, or remove it |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
 | `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
@@ -80,7 +81,7 @@ Press `F3` to open the read-only transcript navigator, even while a response is 
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous / next User prompt, switching to the User filter while retaining the query |
 | `Enter` | Reveal and highlight the selected rendered block in the transcript |
 | `Esc` / `F3` | Close without changing transcript scroll position, editor text, or attachments |
-| Type `/branch`, then `Enter` | While idle, open the backend-approved conversation checkpoint chooser |
+| `F2` (or type `/branch`, then `Enter`) | While idle, open the backend-approved conversation checkpoint chooser; the selected display block is not a checkout address |
 
 Navigator queries are limited to 4,096 UTF-8 bytes. Oversized pastes keep a bounded whole-grapheme prefix; pasted newlines and tabs are ignored rather than activating navigator controls.
 
@@ -92,9 +93,21 @@ Revealing a Thought block temporarily shows it even when reasoning is hidden. Br
 
 The navigator searches only the currently displayed or replayed history, not a compacted archive or undelivered messages in the pending queue. Tool searches include display text such as the title, script, and output; media labels are searchable, but binary media payloads are not. Block identities are local and ephemeral, not durable addresses for forking. This is navigation only: it does not fork a session, write history, cancel a turn, or send a prompt.
 
+### Browse saved conversation futures
+
+Press **F4** to open the existing sessions dialog as a read-only branch tree. `/branches` is an alias for `/sessions`; neither creates a branch. **`/branch` (singular) creates a new conversation future from an authoritative checkpoint.** F4 preserves editor text, cursor, attachments, and any parked pending-message draft. The loading dialog opens immediately: typing and paste already belong to its search field while the catalog is scanned, and Enter cannot activate a session until the scan finishes. Esc cancels the loading dialog; a late result cannot reopen it. The typed `/sessions` or `/branches` command can consume its own command text.
+
+Each durable workspace session appears once, using its existing name, short ID, and latest preview. Indentation follows validated persisted parent lineage, not visible transcript block positions. The detail shows the persisted branch point separately from latest activity. Legacy sessions are independent roots. Missing parents are labeled orphans; malformed, incomplete, or cyclic lineage is shown with a warning rather than hiding unrelated sessions. Reading the tree does not repair or write transcripts or locks.
+
+`●` marks the **current session**; `›` marks only the **selected row**. Use Up/Down to select, `/` to edit a case-insensitive name/ID/preview search, and Enter or Esc to finish editing the search. Matching ancestors remain as labeled context. Queries are bounded to 4,096 UTF-8 bytes and indentation and scrolling are bounded for large trees. Press `r` to rename the selected visible session using the existing naming dialog; Esc cancels. Esc or F4 closes the tree without changing the draft or active session.
+
+Enter resumes the selected visible session only while **idle**, outside provisional checkout, submission, pending-message edits, or conflicting queued work. Browsing is still available while working. A different session cannot replace an unsent draft or attachments: send or clear them first. Selecting the current session explicitly closes and reloads committed history while retaining its unsent editor draft and attachments. Reload never reconstructs or submits cancelled input. If loading fails after the current actor closes, Kit makes one restoration attempt. If that also fails, the TUI shows **disconnected**, retains the draft and attachments, and blocks backend-dependent actions. Open F4 and select the current session again to retry; only a successful load reconnects it.
+
+Live diagnostic compatibility: after a session reload or switch back, Kit rejects delayed diagnostics from earlier activations. A reused legacy ACP v1 child shares one stderr stream without per-operation identity, so its nested live stderr details remain tied to its original activation and are also rejected. Parent-owned subagent roster events, explicit closes, and tool results still update normally. Newly launched children report live details under the new activation.
+
 ### Branch from a text checkpoint in a new session
 
-While idle, type the exact local command `/branch`, or open `/transcript` (`F3`), type `/branch` in its search field, and press Enter. The separate checkout chooser lists only conversation checkpoints approved by the backend, labeled `[user]`, `[assistant]`, or `[tool]`. Archived checkpoints also show `[archived]`; this list is authoritative, not inferred from the visible transcript. Press `0` for All, `1` for User, `2` for Assistant, or `3` for Tool. Changing the filter selects its first match. Use Up/Down to select a checkpoint and Enter to prepare a draft; an empty filter has nothing to prepare. Filtering never changes the backend address used for checkout. Unsupported agents or ineligible checkpoints produce an error without changing the source session. `/transcript` remains a display-only navigator: its local block positions are not checkout addresses.
+While idle, type the exact local command `/branch`, or open `/transcript` (`F3`) and press `F2` (typing `/branch` in its search field and pressing Enter also works). The separate checkout chooser lists only conversation checkpoints approved by the backend, labeled `[user]`, `[assistant]`, or `[tool]`. Archived checkpoints also show `[archived]`; this list is authoritative, not inferred from the visible transcript. Press `0` for All, `1` for User, `2` for Assistant, or `3` for Tool. Changing the filter selects its first match. Use Up/Down to select a checkpoint and Enter to prepare a draft; an empty filter has nothing to prepare. Filtering never changes the backend address used for checkout. Unsupported agents or ineligible checkpoints produce an error without changing the source session. `/transcript` remains a display-only navigator: its local block positions are not checkout addresses.
 
 > Only conversation context changes. Filesystem changes, running processes, and external effects are not rolled back.
 
@@ -108,7 +121,7 @@ The child retains the safe prefix before the selected user prompt or after the s
 
 An unsubmitted checkout becomes stale when its source conversation or configuration changes, including compaction, or when the backend restarts. Abandon it and list checkpoints again. Committed submissions survive restart: retrying the same checkout and text finds the same child without generating a second response. Errors after a durable commit identify the child so it remains discoverable even if activation or response delivery failed.
 
-After successful submission, the source remains loaded and unchanged. Use `/sessions` to return to it. If the child is cancelled before execution starts, its committed history remains available but its connection can close to prevent the cancelled prompt from running later. Select the source, then the child in `/sessions` to reload it without rerunning that prompt. Checkout does not restore files, stop processes, reverse tool calls, or undo any other external effect.
+After successful submission, the source remains loaded and unchanged. Use `/sessions` to return to it. If the child is cancelled before execution starts, its committed history remains available but its connection can close to prevent the cancelled prompt from running later. Select the current child in `/branches` and press Enter to explicitly close and reload its committed history without rerunning that prompt. An unsent editor draft and its attachments survive this same-session reload; they are not submitted automatically. Checkout does not restore files, stop processes, reverse tool calls, or undo any other external effect.
 
 ### Edit or remove a pending message
 
@@ -158,7 +171,7 @@ When the agent roster is visible, terminals at least 108 columns wide show the t
 
 ## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, `/transcript`, and `/branch` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/sessions`, `/branches`, `/close`, `/model`, `/effort`, `/agents`, `/transcript`, and `/branch` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
@@ -175,7 +188,7 @@ The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `
 /transcript
 ```
 
-Except for `/transcript`, which also opens while streaming, these local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
+Read-only `/transcript`, `/sessions`, and `/branches` also open while streaming; switching sessions and creating a branch require idle state. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID explicitly closes and reloads committed history while preserving the unsent editor draft and attachments. `/sessions` (alias `/branches`, shortcut F4) opens the derived branch tree for the same workspace, with newest-activity sibling ordering. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
