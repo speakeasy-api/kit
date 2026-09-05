@@ -2,26 +2,69 @@
 
 use std::{io, path::Path};
 
-// User-selected configuration files may be symlinks. Resolve only at this read
-// boundary: managed storage continues to reject final symlinks. Resolve each
-// target through the facade so even a memory-only target remains readable.
-pub fn read_in(filesystem: &crate::resilient_fs::Fs, path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut path = path.to_path_buf();
-    for _ in 0..40 {
-        if !filesystem.symlink_metadata(&path)?.file_type().is_symlink() {
-            return filesystem.read(path);
+// Resolve components in filesystem order. In particular, `..` applies to the
+// resolved directory, not to the lexical parent of a directory symlink. Each
+// lookup uses the overlay and never requires the final target to exist on disk.
+fn resolve_in(
+    filesystem: &crate::resilient_fs::Fs,
+    path: &Path,
+    links: &mut usize,
+) -> io::Result<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !filesystem.metadata(&resolved)?.is_dir() {
+                    return Err(io::ErrorKind::NotADirectory.into());
+                }
+                // Popping a root has no effect, as with native path traversal.
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                if !filesystem.metadata(&resolved)?.is_dir() {
+                    return Err(io::ErrorKind::NotADirectory.into());
+                }
+                resolved.push(name);
+                if filesystem
+                    .symlink_metadata(&resolved)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    if *links == 40 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "too many symbolic links in configuration path",
+                        ));
+                    }
+                    *links += 1;
+                    let target = filesystem.read_link(&resolved)?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        resolved
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(target)
+                    };
+                    resolved = resolve_in(filesystem, &target, links)?;
+                }
+            }
         }
-        let target = filesystem.read_link(&path)?;
-        path = if target.is_absolute() {
-            target
-        } else {
-            path.parent().unwrap_or_else(|| Path::new(".")).join(target)
-        };
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "too many symbolic links in configuration path",
-    ))
+    Ok(resolved)
+}
+
+pub fn read_in(filesystem: &crate::resilient_fs::Fs, path: &Path) -> io::Result<Vec<u8>> {
+    filesystem.read(resolve_in(filesystem, path, &mut 0)?)
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {

@@ -1441,6 +1441,16 @@ impl Fs {
         if !accepted {
             return result;
         }
+        if new_object {
+            // Acceptance replaces the logical name even when publication is queued.
+            // Old handles must not publish writes or chmod through that name.
+            for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+                let mut object = lock(&object);
+                if object.path.as_ref() == Some(&path) {
+                    object.path = None;
+                }
+            }
+        }
         let object = if let Some(o) = object {
             *lock(&o) = Object::memory(data.clone(), meta);
             o

@@ -2869,10 +2869,59 @@ mod tests {
             repaired: directory.path().join("repaired"),
         });
         let filesystem = crate::resilient_fs::Fs::new(Arc::new(CapacityDisk(capacity)));
+        let project = directory.path().join("project");
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(elsewhere.join("nested")).unwrap();
         let target = directory.path().join("config.json");
         let link = directory.path().join(".mcp.json");
         std::os::unix::fs::symlink("config.json", &link).unwrap();
         filesystem.write(&target, b"pending").unwrap();
+        let parent_link = project.join(".mcp.json");
+        std::os::unix::fs::symlink("../config.json", &parent_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &parent_link).unwrap(),
+            b"pending"
+        );
+
+        // `..` must follow directory symlinks before selecting the parent.
+        std::os::unix::fs::symlink(elsewhere.join("nested"), project.join("directory-link"))
+            .unwrap();
+        let indirect = project.join("indirect.json");
+        std::os::unix::fs::symlink("directory-link/../config.json", &indirect).unwrap();
+        filesystem
+            .write(elsewhere.join("config.json"), b"resolved parent")
+            .unwrap();
+        filesystem
+            .write(project.join("config.json"), b"wrong lexical parent")
+            .unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &indirect).unwrap(),
+            b"resolved parent"
+        );
+
+        // Traversal also works through an accepted, memory-only directory.
+        filesystem
+            .create_dir(directory.path().join("virtual"))
+            .unwrap();
+        let virtual_link = project.join("virtual.json");
+        std::os::unix::fs::symlink("../virtual/../config.json", &virtual_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &virtual_link).unwrap(),
+            b"pending"
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("missing/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("config.json/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
         assert!(!target.exists());
         assert_eq!(
             crate::config_files::read_in(&filesystem, &link).unwrap(),

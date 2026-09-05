@@ -1220,6 +1220,162 @@ fn stale_handle_chmod_does_not_change_replacement() {
 
 #[cfg(unix)]
 #[test]
+fn blocked_replacement_detaches_stale_handle_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+    for replacement in [
+        "replace",
+        "private",
+        "unlink",
+        "rename",
+        "replace-rename",
+        "rename-replace",
+    ] {
+        for mutation in ["chmod", "write", "set_len"] {
+            for dirty in [false, true] {
+                let t = Fixture::new();
+                let path = t.path("value");
+                let moved = t.path("moved");
+                native::write(&path, b"baseline").unwrap();
+                native::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+                native::write(t.path("source"), b"replacement").unwrap();
+                native::set_permissions(t.path("source"), Permissions::from_mode(0o640)).unwrap();
+                let mut held = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open_in(&t.fs, &path)
+                    .unwrap();
+                t.faults.arm(Point::Rename, libc::ENOSPC);
+                if dirty {
+                    // Also cover a displaced object with an existing queued image.
+                    t.fs.write(&path, b"baseline").unwrap();
+                }
+                let named = match replacement {
+                    "replace" => {
+                        t.fs.replace(&path, b"replacement").unwrap();
+                        &path
+                    }
+                    "private" => {
+                        t.fs.replace_private(&path, b"replacement").unwrap();
+                        &path
+                    }
+                    "unlink" => {
+                        t.faults.arm(Point::Remove, libc::ENOSPC);
+                        t.fs.remove_file(&path).unwrap();
+                        t.fs.write(&path, b"replacement").unwrap();
+                        t.fs.set_permissions(&path, Permissions::from_mode(0o640))
+                            .unwrap();
+                        &path
+                    }
+                    "rename" => {
+                        t.fs.rename(t.path("source"), &path).unwrap();
+                        &path
+                    }
+                    "replace-rename" => {
+                        t.fs.replace(&path, b"replacement").unwrap();
+                        t.fs.rename(&path, &moved).unwrap();
+                        &moved
+                    }
+                    "rename-replace" => {
+                        t.fs.rename(&path, &moved).unwrap();
+                        t.fs.replace(&moved, b"replacement").unwrap();
+                        &moved
+                    }
+                    _ => unreachable!(),
+                };
+                let mode = if replacement == "private" {
+                    0o600
+                } else {
+                    0o640
+                };
+                let pending = t.fs.status().pending_operations;
+                assert!(pending > 0);
+                match mutation {
+                    "chmod" => held.set_permissions(Permissions::from_mode(0o400)).unwrap(),
+                    "write" => held.write_all(b"stale").unwrap(),
+                    "set_len" => held.set_len(3).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert_eq!(t.fs.status().pending_operations, pending);
+                assert_eq!(native::read(&path).unwrap(), b"baseline");
+                assert_eq!(
+                    native::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+                assert_eq!(t.fs.read(named).unwrap(), b"replacement");
+                assert_eq!(
+                    t.fs.metadata(named).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                held.rewind().unwrap();
+                let mut old = Vec::new();
+                held.read_to_end(&mut old).unwrap();
+                assert_eq!(
+                    old,
+                    match mutation {
+                        "write" => b"staleine".as_slice(),
+                        "set_len" => b"bas".as_slice(),
+                        _ => b"baseline".as_slice(),
+                    }
+                );
+                assert_eq!(
+                    held.metadata().unwrap().permissions().mode() & 0o777,
+                    if mutation == "chmod" { 0o400 } else { 0o640 }
+                );
+                t.settle();
+                assert_eq!(native::read(named).unwrap(), b"replacement");
+                assert_eq!(
+                    native::metadata(named).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                assert_eq!(t.fs.read(named).unwrap(), b"replacement");
+                if named == &moved {
+                    assert!(!t.fs.try_exists(&path).unwrap());
+                    assert!(!path.exists());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_ordinary_write_and_truncate_keep_shared_handle_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"baseline").unwrap();
+    native::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+    let mut held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_in(&t.fs, &path)
+        .unwrap();
+    t.faults.arm(Point::Rename, libc::ENOSPC);
+    t.fs.write(&path, b"ordinary").unwrap();
+    let mut bytes = Vec::new();
+    held.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"ordinary");
+    let truncated = t.fs.create(&path).unwrap();
+    assert_eq!(held.metadata().unwrap().len(), 0);
+    held.rewind().unwrap();
+    held.write_all(b"shared").unwrap();
+    assert_eq!(truncated.metadata().unwrap().len(), 6);
+    held.set_permissions(Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(t.fs.read(&path).unwrap(), b"shared");
+    assert_eq!(
+        t.fs.metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    t.settle();
+    assert_eq!(native::read(&path).unwrap(), b"shared");
+    assert_eq!(
+        native::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn pending_handle_metadata_and_zero_patch_reads_are_logical() {
     use std::os::unix::fs::PermissionsExt;
     let t = Fixture::new();
