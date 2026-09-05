@@ -1941,7 +1941,7 @@ fn handle(app: &mut App, event: Event) -> Action {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            if app.queue_focused {
+            if app.queue_focused && !app.session_rename_active() {
                 return Action::None;
             }
             if app.session_rename_active() || app.editing_steer() {
@@ -3510,6 +3510,66 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.attachments, attachments);
         assert_eq!(app.editor.text(), draft);
+    }
+
+    #[test]
+    fn async_session_catalog_rename_paste_takes_precedence_over_queue_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        for populated in [false, true] {
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("/sessions");
+            assert!(matches!(
+                handle(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                ),
+                Action::ListSessions
+            ));
+            app.paste("parked draft");
+            if populated {
+                app.apply(Update::SteerAccepted {
+                    id: "pending".into(),
+                    text: "queued text".into(),
+                    editable: true,
+                });
+            }
+            handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            );
+            assert!(app.queue_focused);
+            app.apply(Update::SessionCatalog(Ok(vec![
+                crate::session::CatalogEntry {
+                    id: "saved".into(),
+                    title: Some("Saved".into()),
+                    preview: None,
+                    is_subagent: false,
+                    updated_at: 0,
+                },
+            ])));
+            handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            );
+            assert!(app.session_rename_active());
+            handle(&mut app, Event::Paste(path.display().to_string()));
+            assert!(matches!(
+                app.session_dialog.as_ref().unwrap().rename.as_ref(),
+                Some(SessionRename::Editing(input)) if input == path.to_str().unwrap()
+            ));
+            assert!(app.attachments.is_empty());
+            assert!(app.queue_focused);
+            assert_eq!(app.editor.text(), "parked draft");
+        }
     }
 
     #[test]
