@@ -80,12 +80,31 @@ Press `F3` to open the read-only transcript navigator, even while a response is 
 | `Ctrl+Up` / `Ctrl+Down` | Select the previous / next User prompt, switching to the User filter while retaining the query |
 | `Enter` | Reveal and highlight the selected rendered block in the transcript |
 | `Esc` / `F3` | Close without changing transcript scroll position, editor text, or attachments |
+| Type `/branch`, then `Enter` | While idle, open the backend-approved text prompt checkout chooser |
 
 Navigator queries are limited to 4,096 UTF-8 bytes. Oversized pastes keep a bounded whole-grapheme prefix; pasted newlines and tabs are ignored rather than activating navigator controls.
 
 Revealing a Thought block temporarily shows it even when reasoning is hidden. Browsing and closing alone do not move the transcript; `Enter` explicitly reveals the selected block. While the navigator is open, `Esc` closes it rather than interrupting the turn.
 
 The navigator searches only the currently displayed or replayed history, not a compacted archive or undelivered messages in the pending queue. Tool searches include display text such as the title, script, and output; media labels are searchable, but binary media payloads are not. Block identities are local and ephemeral, not durable addresses for forking. This is navigation only: it does not fork a session, write history, cancel a turn, or send a prompt.
+
+### Edit a previous prompt in a new session
+
+While idle, type the exact local command `/branch`, or open `/transcript` (`F3`), type `/branch` in its search field, and press Enter. The separate checkout chooser lists only text prompts approved by the backend. Archived prompts are labeled `[archived]`; this list is authoritative, not inferred from the visible transcript. Use Up/Down to select a prompt and Enter to prepare an edit. Unsupported agents or ineligible prompts produce an error without changing the source session.
+
+> Only conversation context changes. Filesystem changes, running processes, and external effects are not rolled back.
+
+The TUI displays the backend's conversation prefix and puts the original prompt text in a **provisional prompt checkout** editor. Your source transcript, unsent editor draft, attachments, and model/configuration state are parked, not discarded. Edit the text, use Shift+Enter for a newline, then Enter to create and activate a new persisted session. No branch is created by merely browsing or preparing an edit. The edited prompt is persisted by branch submission itself; the TUI does not send it a second time as an ordinary prompt.
+
+Press Esc before submission to abandon the checkout and restore the parked source view, draft, attachments, and configuration. Esc also cancels a pending list or prepare request; late responses cannot replace a newer view. Once submission is in progress, wait for its result: Esc cannot undo a committed branch. A failed submit keeps the provisional draft available. Retry with the same text to recover a child if the response was lost. Once a submission reaches the backend, its checkout token is bound to that exact text; to submit a different edit, abandon and prepare a new checkout.
+
+Checkout edits are text-only. Adding image or audio attachments is rejected; attachments already in the parked source draft remain intact. While the checkout chooser or provisional editor is active, model/configuration changes, session switching, ordinary sends, and steering are disabled. Slash-command text in the provisional editor is edited prompt text, not a local command.
+
+The child retains the conversation strictly before the selected prompt, including its original bootstrap context. Archived prompts use validated pre-compaction history, never a later summary as a substitute for missing context. Prompts with unsupported content, unresolved tool calls in their prefix, or unreconstructable legacy context are not eligible.
+
+An unsubmitted checkout becomes stale when its source conversation or configuration changes, including compaction, or when the backend restarts. Abandon it and list prompts again. Committed submissions survive restart: retrying the same checkout and text finds the same child without generating a second response. Errors after a durable commit identify the child so it remains discoverable even if activation or response delivery failed.
+
+After successful submission, the source remains loaded and unchanged. Use `/sessions` to return to it. If the child is cancelled before execution starts, its committed history remains available but its connection can close to prevent the cancelled prompt from running later. Select the source, then the child in `/sessions` to reload it without rerunning that prompt. Checkout does not restore files, stop processes, reverse tool calls, or undo any other external effect.
 
 ### Edit or remove a pending message
 
@@ -135,7 +154,7 @@ When the agent roster is visible, terminals at least 108 columns wide show the t
 
 ## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, and `/transcript` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, `/transcript`, and `/branch` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new

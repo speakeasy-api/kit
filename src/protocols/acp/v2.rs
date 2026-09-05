@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, Weak,
@@ -25,7 +25,8 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, watch};
+use futures_util::FutureExt;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::{
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
@@ -33,6 +34,11 @@ use crate::{
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
+use super::prompt_branches::{
+    self, ListPromptBranchesRequest, ListPromptBranchesResponse, PreparePromptBranchRequest,
+    PreparePromptBranchResponse, PreparedCheckout, PromptCheckouts, SubmitPromptBranchRequest,
+    SubmitPromptBranchResponse,
+};
 
 use super::{
     AuthenticationRequiredData, CancelBackgroundRequest, CancelBackgroundResponse,
@@ -42,8 +48,39 @@ use super::{
 
 const PAGE_SIZE: usize = 100;
 
+static BRANCH_SUBMISSIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static NEXT_ERROR_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_THOUGHT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+tokio::task_local! {
+    static DIAGNOSTIC_ROUTE_OBSERVER: Box<dyn Fn(&str) + Send + Sync>;
+}
+
+fn establish_diagnostic_route(session_id: &wire::SessionId) {
+    crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+        session_id: session_id.to_string(),
+    });
+    #[cfg(test)]
+    let _ = DIAGNOSTIC_ROUTE_OBSERVER.try_with(|observe| observe(&session_id.to_string()));
+}
+
+fn validate_resume_location(
+    root: &std::path::Path,
+    cwd: &std::path::Path,
+    has_additional_directories: bool,
+) -> Result<(), AcpRuntimeError> {
+    let cwd = crate::resilient_fs::canonicalize(cwd)
+        .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+    if cwd != root || has_additional_directories {
+        return Err(AcpRuntimeError::Loop(format!(
+            "this Kit runtime is fixed to {} and does not accept additional directories",
+            root.display()
+        )));
+    }
+    Ok(())
+}
 
 fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSessionNotification {
     wire::UpdateSessionNotification::new(
@@ -149,11 +186,89 @@ fn claim_prompt(busy: &AtomicBool) -> Result<(), AcpRuntimeError> {
 }
 
 #[derive(Clone)]
-struct ConnectionSink(V2ConnectionTo<Client>);
+struct ConnectionSink(V2ConnectionTo<Client>, Arc<Mutex<InjectionWork>>);
+
+// The integration's pending queue is private. Track admission before awaiting
+// its reservation, then track accepted IDs until delivery or successful revoke.
+#[derive(Default)]
+struct InjectionWork {
+    admitting: usize,
+    pending: HashSet<wire::MessageId>,
+    branch_reserved: bool,
+    admission_released: Arc<Notify>,
+}
+
+struct InjectionAdmission(Arc<Mutex<InjectionWork>>);
+
+impl Drop for InjectionAdmission {
+    fn drop(&mut self) {
+        self.0.lock().expect("injection work poisoned").admitting -= 1;
+    }
+}
+
+struct TrackedInjection {
+    work: Arc<Mutex<InjectionWork>>,
+    id: wire::MessageId,
+    retained: bool,
+}
+
+impl Drop for TrackedInjection {
+    fn drop(&mut self) {
+        if !self.retained {
+            self.work
+                .lock()
+                .expect("injection work poisoned")
+                .pending
+                .remove(&self.id);
+        }
+    }
+}
+
+struct BranchAdmission {
+    busy: Arc<AtomicBool>,
+    injections: Arc<Mutex<InjectionWork>>,
+}
+
+impl BranchAdmission {
+    fn claim(
+        busy: Arc<AtomicBool>,
+        injections: Arc<Mutex<InjectionWork>>,
+    ) -> Result<Self, AcpRuntimeError> {
+        {
+            let mut work = injections.lock().expect("injection work poisoned");
+            if work.branch_reserved || work.admitting != 0 || !work.pending.is_empty() {
+                return Err(AcpRuntimeError::Loop(
+                    "source session has queued injection work".into(),
+                ));
+            }
+            claim_prompt(&busy)?;
+            work.branch_reserved = true;
+        }
+        Ok(Self { busy, injections })
+    }
+}
+
+impl Drop for BranchAdmission {
+    fn drop(&mut self) {
+        let mut work = self.injections.lock().expect("injection work poisoned");
+        work.branch_reserved = false;
+        self.busy.store(false, Ordering::Release);
+        // Admission can be dropped before its command reaches the actor. Keep
+        // a permit so a selected autonomous event is retried even in that case.
+        work.admission_released.notify_one();
+    }
+}
 
 #[async_trait]
 impl AcpSessionUpdateSink for ConnectionSink {
     fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
+        if let wire::SessionUpdate::UserMessage(message) = &notification.update {
+            self.1
+                .lock()
+                .expect("injection work poisoned")
+                .pending
+                .remove(&message.message_id);
+        }
         self.0
             .send_notification(notification)
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
@@ -466,6 +581,22 @@ struct PromptCommand {
 }
 
 enum Command {
+    Snapshot {
+        reply: oneshot::Sender<Result<SessionSnapshot, AcpRuntimeError>>,
+    },
+    ListPromptBranches {
+        reply: oneshot::Sender<Result<ListPromptBranchesResponse, AcpRuntimeError>>,
+    },
+    PreparePromptBranch {
+        address: String,
+        admission: BranchAdmission,
+        reply: oneshot::Sender<Result<PreparePromptBranchResponse, AcpRuntimeError>>,
+    },
+    ReservePromptBranch {
+        checkout_token: String,
+        admission: BranchAdmission,
+        reply: oneshot::Sender<Result<(PreparedCheckout, oneshot::Sender<()>), AcpRuntimeError>>,
+    },
     Prompt(PromptCommand),
     SetConfig {
         request: wire::SetSessionConfigOptionRequest,
@@ -477,6 +608,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    injections: Arc<Mutex<InjectionWork>>,
     token: u64,
     commands: mpsc::Sender<Command>,
     integration: AcpSessionHandle,
@@ -484,6 +616,11 @@ struct SessionHandle {
     background_jobs: BackgroundJobs,
     structured_completion: bool,
     tasks: TaskManagerHandle,
+}
+
+struct SessionSnapshot {
+    canonical_transcript: Vec<Item>,
+    config_options: Vec<wire::SessionConfigOption>,
 }
 
 struct AttachedSession {
@@ -664,6 +801,7 @@ impl Server {
                     .collect(),
                 connection,
                 claim,
+                None,
             )
             .await?;
         let AttachedSession {
@@ -699,6 +837,25 @@ impl Server {
                 ));
             }
         };
+        // Validate before consulting the loaded actor: successful lookup emits
+        // its diagnostic identity, which a rejected resume must not change.
+        validate_resume_location(
+            self.runtime.root(),
+            &request.cwd.0,
+            !request.additional_directories.is_empty(),
+        )?;
+        if let Some(attached) = self.loaded_session(&request.session_id).await? {
+            let updates = if replay {
+                transcript_replay(&attached.session_id, &attached.canonical_transcript)
+            } else {
+                Vec::new()
+            };
+            return Ok((
+                wire::ResumeSessionResponse::new().config_options(attached.config_options),
+                updates,
+                attached.activation,
+            ));
+        }
         let claim = self
             .runtime
             .claim_session_load(&request.session_id.to_string())?;
@@ -723,6 +880,7 @@ impl Server {
                     .collect(),
                 connection,
                 claim,
+                None,
             )
             .await?;
         let updates = if replay {
@@ -783,6 +941,7 @@ impl Server {
         additional_directories: Vec<PathBuf>,
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
+        forked: Option<crate::runtime::AcpForkState>,
     ) -> Result<AttachedSession, AcpRuntimeError> {
         let mut admission = self
             .registry
@@ -790,7 +949,8 @@ impl Server {
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
         let cancellation = CancellationController::new();
-        let sink = ResponseReplacementSink::new(ConnectionSink(connection));
+        let injections = Arc::new(Mutex::new(InjectionWork::default()));
+        let sink = ResponseReplacementSink::new(ConnectionSink(connection, injections.clone()));
         let activity = native_activity(session_id.clone(), sink.clone());
         let binding =
             AcpSessionBinding::new(session_id.clone(), SessionId::new(claim.id()), sink.clone())
@@ -813,7 +973,20 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
+        // Admission starts before publication, not when the response/replay gate
+        // opens. Neither cancel nor close may become the new turn's baseline.
+        let initial_generation = forked
+            .as_ref()
+            .map(|_| handle.cancellation_handle().generation());
+        handle.prepare_injection_turn();
+        let activate_prompt = initial_generation.is_some();
+        let driver = if let Some(forked) = forked {
+            self.runtime
+                .start_acp_branch_driver_with_initial(context, &mut claim, forked)
+                .await?
+        } else {
+            self.runtime.start_acp_driver(context, &mut claim).await?
+        };
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let reasoning = driver
             .adapter
@@ -829,8 +1002,16 @@ impl Server {
         let structured_completion = driver.structured_completion;
         let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
         let (tx, rx) = mpsc::channel(8);
-        let busy = Arc::new(AtomicBool::new(false));
+        let busy = Arc::new(AtomicBool::new(activate_prompt));
         let actor = SessionActor {
+            initial_generation,
+            admission_released: injections
+                .lock()
+                .expect("injection work poisoned")
+                .admission_released
+                .clone(),
+            #[cfg(test)]
+            autonomous_pause: None,
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -863,6 +1044,9 @@ impl Server {
             let _guard = guard;
             if activated.await.is_ok() {
                 session_actor(actor).await;
+            } else {
+                // Abandoning response/replay retires the queued input as well.
+                actor.busy.store(false, Ordering::Release);
             }
         });
         let interrupt_handle = handle.clone();
@@ -874,7 +1058,9 @@ impl Server {
         let weak = tx.downgrade();
         let close_background_jobs = background_jobs.clone();
         let close_tasks = tasks.clone();
+        let close_handle = handle.clone();
         let close = Arc::new(move || {
+            close_handle.close();
             let close_background_jobs = close_background_jobs.clone();
             let close_tasks = close_tasks.clone();
             let weak = weak.clone();
@@ -900,6 +1086,7 @@ impl Server {
                 completed: completion,
                 session_id: session_id.clone(),
                 session: SessionHandle {
+                    injections,
                     token,
                     commands: tx,
                     integration: handle,
@@ -920,9 +1107,7 @@ impl Server {
                 SessionPublicationError::Commit(error) => error,
             });
         }
-        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-            session_id: session_id.to_string(),
-        });
+        establish_diagnostic_route(&session_id);
         drop(actor_task);
         Ok(AttachedSession {
             session_id,
@@ -930,6 +1115,191 @@ impl Server {
             canonical_transcript,
             activation,
         })
+    }
+
+    // Replaying a session already owned by this connection is read-only. It
+    // must not reacquire its disk lock, replace its adapter, or restart a turn.
+    async fn loaded_session(
+        &self,
+        session_id: &wire::SessionId,
+    ) -> Result<Option<AttachedSession>, AcpRuntimeError> {
+        let sender = self
+            .sessions
+            .lock()
+            .expect("ACP v2 session map poisoned")
+            .get(session_id)
+            .map(|session| session.commands.clone());
+        let Some(sender) = sender else {
+            return Ok(None);
+        };
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::Snapshot { reply })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        let SessionSnapshot {
+            canonical_transcript,
+            config_options,
+        } = response
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)??;
+        // Reattachment can switch the client's diagnostic route without creating
+        // an actor. Write the source marker before returning the load response.
+        establish_diagnostic_route(session_id);
+        let (activation, _already_active) = oneshot::channel();
+        Ok(Some(AttachedSession {
+            session_id: session_id.clone(),
+            config_options,
+            canonical_transcript,
+            activation,
+        }))
+    }
+
+    fn branch_admission(
+        &self,
+        session_id: &wire::SessionId,
+    ) -> Result<(mpsc::Sender<Command>, BranchAdmission), AcpRuntimeError> {
+        let sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))?;
+        let admission = BranchAdmission::claim(session.busy.clone(), session.injections.clone())?;
+        Ok((session.commands.clone(), admission))
+    }
+
+    async fn list_prompt_branches(
+        &self,
+        request: ListPromptBranchesRequest,
+    ) -> Result<ListPromptBranchesResponse, AcpRuntimeError> {
+        let sender = self.sender(&request.session_id)?;
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::ListPromptBranches { reply })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+    }
+
+    async fn prepare_prompt_branch(
+        &self,
+        request: PreparePromptBranchRequest,
+    ) -> Result<PreparePromptBranchResponse, AcpRuntimeError> {
+        let (sender, admission) = self.branch_admission(&request.session_id)?;
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::PreparePromptBranch {
+                address: request.address,
+                admission,
+                reply,
+            })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+    }
+
+    async fn submit_prompt_branch(
+        self: &Arc<Self>,
+        request: SubmitPromptBranchRequest,
+        connection: V2ConnectionTo<Client>,
+    ) -> Result<(SubmitPromptBranchResponse, Option<AttachedSession>), AcpRuntimeError> {
+        // Idempotency is global, not tied to a live actor or its busy flag. A
+        // retry after restart/close/source advancement must find the disk child.
+        let _submission = BRANCH_SUBMISSIONS.lock().await;
+        if let Some(committed) = prompt_branches::lookup_committed(
+            self.runtime.root(),
+            &request.session_id.to_string(),
+            &request.checkout_token,
+            &request.text,
+        )
+        .map_err(AcpRuntimeError::Loop)?
+        {
+            let child_id = wire::SessionId::new(committed.session_id.clone());
+            if let Some(attached) = self
+                .loaded_session(&child_id)
+                .await
+                .map_err(|error| branch_child_error(&committed.session_id, error))?
+            {
+                let response = SubmitPromptBranchResponse {
+                    session_id: attached.session_id.clone(),
+                    config_options: attached.config_options.clone(),
+                };
+                return Ok((response, Some(attached)));
+            }
+            let claim = self
+                .runtime
+                .claim_session_load(&committed.session_id)
+                .map_err(|error| branch_child_error(&committed.session_id, error))?;
+            let attached = self
+                .attach_session(
+                    self.runtime.root().to_owned(),
+                    Vec::new(),
+                    connection,
+                    claim,
+                    None,
+                )
+                .await
+                .map_err(|error| branch_child_error(&committed.session_id, error))?;
+            let response = SubmitPromptBranchResponse {
+                session_id: attached.session_id.clone(),
+                config_options: attached.config_options.clone(),
+            };
+            // A durable retry may reattach, but never starts another generation.
+            return Ok((response, Some(attached)));
+        }
+        let (sender, admission) = self.branch_admission(&request.session_id)?;
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::ReservePromptBranch {
+                checkout_token: request.checkout_token,
+                admission,
+                reply,
+            })
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        let (checkout, release) = response
+            .await
+            .map_err(|_| AcpRuntimeError::ClientClosed)??;
+        let forked = checkout
+            .fork(&request.text)
+            .map_err(AcpRuntimeError::Loop)?;
+        let claim = self.runtime.claim_session_fork()?;
+        let child_id = claim.id().to_string();
+        // Keep the actor reservation alive through the durable commit and route
+        // publication. Dropping release also unblocks the actor on any failure.
+        let attached = self
+            .attach_session(
+                self.runtime.root().to_owned(),
+                Vec::new(),
+                connection,
+                claim,
+                Some(forked),
+            )
+            .await;
+        drop(release);
+        let attached = attached.map_err(|error| branch_child_error(&child_id, error))?;
+        let response = SubmitPromptBranchResponse {
+            session_id: attached.session_id.clone(),
+            config_options: attached.config_options.clone(),
+        };
+        Ok((response, Some(attached)))
+    }
+
+    fn injection_admission(
+        &self,
+        session_id: &wire::SessionId,
+    ) -> Result<InjectionAdmission, AcpRuntimeError> {
+        let sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))?;
+        let mut work = session.injections.lock().expect("injection work poisoned");
+        if work.branch_reserved {
+            return Err(AcpRuntimeError::Loop(
+                "source session is reserved for prompt checkout".into(),
+            ));
+        }
+        work.admitting += 1;
+        Ok(InjectionAdmission(session.injections.clone()))
     }
 
     async fn prepare_prompt(
@@ -978,10 +1348,10 @@ impl Server {
         let session = sessions
             .get(session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))?;
-        claim_prompt(&session.busy)?;
         let handle = session.integration.clone();
-        handle.prepare_injection_turn();
         let generation = handle.cancellation_handle().generation();
+        claim_prompt(&session.busy)?;
+        handle.prepare_injection_turn();
         Ok((
             session.commands.clone(),
             Arc::clone(&session.busy),
@@ -1021,10 +1391,11 @@ impl Server {
                 )
             });
         if let Some((handle, background_jobs, tasks, structured_completion)) = session {
+            // Interrupt admission before waiting for asynchronous task cleanup.
+            handle.interrupt();
             if structured_completion {
                 super::cancel_background_jobs(&tasks, &background_jobs).await;
             }
-            handle.interrupt();
         }
         Ok(())
     }
@@ -1039,17 +1410,19 @@ impl Server {
             .expect("ACP v2 session map poisoned")
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
         session.integration.close();
+        super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
         let (reply, acknowledged) = oneshot::channel();
-        session
+        // A cancelled, unactivated child may retire its actor before this
+        // command arrives. A dropped receiver is already a completed close.
+        if session
             .commands
             .send(Command::Close { reply })
             .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        acknowledged
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+            .is_ok()
+        {
+            let _ = acknowledged.await;
+        }
         self.registry.remove(session.token);
         Ok(wire::CloseSessionResponse::new())
     }
@@ -1101,14 +1474,64 @@ impl Server {
     }
 }
 
-struct SessionActor<S: ModelSession> {
+async fn hold_branch_reservation<T>(
+    checkout: T,
+    admission: BranchAdmission,
+    reply: oneshot::Sender<Result<(T, oneshot::Sender<()>), AcpRuntimeError>>,
+) {
+    let (release, released) = oneshot::channel();
+    if reply.send(Ok((checkout, release))).is_ok() {
+        // No select here: config, MCP and autonomous work must remain queued
+        // until the child is committed. Cancellation also releases the actor.
+        let _ = released.await;
+    }
+    drop(admission);
+}
+
+fn branch_child_error(child_id: &str, error: AcpRuntimeError) -> AcpRuntimeError {
+    AcpRuntimeError::Loop(format!(
+        "prompt checkout child {child_id}: {error}; retry the same checkout to recover a committed child"
+    ))
+}
+
+async fn settled_branch_source<S: ModelSession + Send + 'static>(
+    driver: &LoopDriver<S>,
+    tasks: &TaskManagerHandle,
+    jobs: &BackgroundJobs,
+    mcp: &crate::tools::mcp::McpSubscription,
+) -> Result<(), AcpRuntimeError> {
+    let before = jobs.activity();
+    let running = !tasks.list_running().await.is_empty();
+    let after = jobs.activity();
+    if !driver.snapshot().pending_input.is_empty()
+        || running
+        || before.active
+        || after.active
+        || before.unacknowledged_terminals
+        || after.unacknowledged_terminals
+        || before.generation != after.generation
+        || mcp.has_pending()
+        || driver.wait_for_loop_update().now_or_never().is_some()
+    {
+        return Err(AcpRuntimeError::Loop(
+            "source session has unsettled work".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct SessionActor<S: ModelSession, K> {
+    initial_generation: Option<u64>,
+    admission_released: Arc<Notify>,
+    #[cfg(test)]
+    autonomous_pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     session_id: wire::SessionId,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     handle: AcpSessionHandle,
     busy: Arc<AtomicBool>,
     binding: BindingGuard,
-    sink: ResponseReplacementSink<ConnectionSink>,
+    sink: ResponseReplacementSink<K>,
     activity: SessionActivity,
     driver: LoopDriver<S>,
     tasks: TaskManagerHandle,
@@ -1121,8 +1544,81 @@ struct SessionActor<S: ModelSession> {
     mcp_events: crate::tools::mcp::McpSubscription,
 }
 
-async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
+// Content equality does not establish uninterrupted authority: admitted work
+// (including compaction) can restore identical bytes. Read-only actor commands
+// never advance this shared transcript/configuration revision.
+fn advance_checkout_revision(revision: &mut u64) {
+    *revision = revision
+        .checked_add(1)
+        .expect("checkout revision exhausted");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_initial_branch_turn<S: ModelSession + Send + 'static>(
+    session_id: &wire::SessionId,
+    integration: &AcpIntegration,
+    handle: &AcpSessionHandle,
+    busy: &AtomicBool,
+    mut driver: LoopDriver<S>,
+    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
+    generation: u64,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    activity: &SessionActivity,
+) -> Result<Option<LoopDriver<S>>, AcpRuntimeError> {
+    // Runtime already committed this user item and queued it exactly once.
+    // Admission and its cancellation baseline precede the publication gate.
+    integration.finish_prompt(session_id);
+    if !handle.cancellation_handle().is_cancelled_since(generation) {
+        handle.start_injection_turn();
+    }
+    let result = run_active_turn(
+        session_id,
+        integration,
+        handle,
+        &mut driver,
+        sink,
+        generation,
+        structured,
+        activity,
+        ExecutionOrigin::Autonomous,
+    )
+    .await;
+    handle.stop_injection_turn();
+    busy.store(false, Ordering::Release);
+    if !driver.snapshot().pending_input.is_empty() {
+        result?;
+        // retire_interrupted_turn preserves queued input. There is no loop API
+        // to clear unstarted input, so retire this attachment instead. Dropping
+        // the driver prevents a later MCP/task/injection wake from executing it;
+        // the committed child remains discoverable and reloads passively.
+        return Ok(None);
+    }
+    // As with ordinary prompts, an execution error is already reported and
+    // settled. Once input was consumed, retain the driver for the next prompt.
+    if let Err(error) = result {
+        eprintln!("ACP v2 branch turn failed for {session_id}: {error}");
+    }
+    Ok(Some(driver))
+}
+
+#[cfg(test)]
+async fn pause_selected_autonomous_event(
+    pause: &mut Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+) {
+    if let Some((selected, resume)) = pause.take() {
+        let _ = selected.send(());
+        let _ = resume.await;
+    }
+}
+
+async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink + 'static>(
+    actor: SessionActor<S, K>,
+) {
     let SessionActor {
+        initial_generation,
+        admission_released,
+        #[cfg(test)]
+        mut autonomous_pause,
         session_id,
         runtime,
         integration,
@@ -1142,11 +1638,101 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
+    let mut checkouts = PromptCheckouts::default();
+    let mut checkout_revision = 0u64;
+    // Event selection is not admission: a branch may claim busy before its
+    // command reaches this actor. Retain the wake until a drive is admitted.
+    let mut autonomous_pending = false;
+    if let Some(generation) = initial_generation {
+        advance_checkout_revision(&mut checkout_revision);
+        let initial = run_initial_branch_turn(
+            &session_id,
+            &integration,
+            &handle,
+            &busy,
+            driver,
+            &sink,
+            generation,
+            structured_completion.then_some((&tasks, &background_jobs)),
+            &activity,
+        )
+        .await;
+        match initial {
+            Ok(Some(active)) => driver = active,
+            stopped => {
+                if let Err(error) = stopped {
+                    eprintln!("ACP v2 branch turn failed for {session_id}: {error}");
+                }
+                super::cancel_background_jobs(&tasks, &background_jobs).await;
+                drop(binding.take());
+                commands.close();
+                while let Some(command) = commands.recv().await {
+                    if let Command::Close { reply } = command {
+                        let _ = reply.send(());
+                    }
+                }
+                return;
+            }
+        }
+    }
     loop {
         tokio::select! {
             biased;
             command = commands.recv() => match command {
+                Some(Command::Snapshot { reply }) => {
+                    let result = (|| {
+                        let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+                        let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+                        Ok(SessionSnapshot { canonical_transcript: driver.snapshot().transcript, config_options: v2_config_options(&selection, reasoning, &catalog) })
+                    })();
+                    let _ = reply.send(result);
+                }
+                Some(Command::ListPromptBranches { reply }) => {
+                    let result = (|| {
+                        let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+                        let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+                        checkouts.list(runtime.root(), &session_id.to_string(), &driver.snapshot().transcript,
+                            checkout_revision, &selection, reasoning).map_err(AcpRuntimeError::Loop)
+                    })();
+                    let _ = reply.send(result);
+                }
+                Some(Command::PreparePromptBranch { address, admission, reply }) => {
+                    let result = async {
+                        settled_branch_source(&driver, &tasks, &background_jobs, &mcp_events).await?;
+                        let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+                        let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+                        let checkout = checkouts.prepare(&address, &driver.snapshot().transcript,
+                            checkout_revision, &selection, reasoning).map_err(AcpRuntimeError::Loop)?;
+                        Ok(PreparePromptBranchResponse {
+                            checkout_token: checkout.token,
+                            original_text: checkout.original_text,
+                            prefix: transcript_replay(&session_id, &checkout.prefix).into_iter().map(|update| update.update).collect(),
+                            config_options: v2_config_options(&checkout.selection, checkout.reasoning, &catalog),
+                        })
+                    }.await;
+                    drop(admission);
+                    let _ = reply.send(result);
+                }
+                Some(Command::ReservePromptBranch { checkout_token, admission, reply }) => {
+                    let result = async {
+                        settled_branch_source(&driver, &tasks, &background_jobs, &mcp_events).await?;
+                        let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
+                        let reasoning = adapter.reasoning_effort().map_err(AcpRuntimeError::Loop)?;
+                        checkouts.checkout(&checkout_token, &driver.snapshot().transcript,
+                            checkout_revision, &selection, reasoning).map_err(AcpRuntimeError::Loop)
+                    }.await;
+                    match result {
+                        Ok(checkout) => {
+                            hold_branch_reservation(checkout, admission, reply).await;
+                            continue;
+                        }
+                        Err(error) => { let _ = reply.send(Err(error)); }
+                    }
+                    drop(admission);
+                }
                 Some(Command::Prompt(command)) => {
+                    let generation = command.cancellation_generation;
+                    advance_checkout_revision(&mut checkout_revision);
                     let result = prepare_prompt(
                         &session_id,
                         PromptSkillSource::Runtime(&runtime),
@@ -1165,9 +1751,19 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     if let Err(error) = result {
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
+                    if handle.cancellation_handle().is_cancelled_since(generation)
+                        && !driver.snapshot().pending_input.is_empty()
+                    {
+                        // The same pre-step cancellation race applies to a
+                        // queued ordinary prompt, not just branch activation.
+                        let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
+                        super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                        break;
+                    }
                 }
                 Some(Command::SetConfig { request, reply }) => {
                     let result = set_v2_config(&adapter, &catalog, request);
+                    if result.is_ok() { advance_checkout_revision(&mut checkout_revision); }
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -1183,38 +1779,49 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     break;
                 }
             },
+            _ = admission_released.notified(), if autonomous_pending => {}
+            _ = std::future::ready(()), if autonomous_pending && !busy.load(Ordering::Acquire) => {
+                let generation = handle.cancellation_handle().generation();
+                let result = drive_autonomous(
+                    &session_id, &integration, &handle, &busy,
+                    &mut driver, &sink, &activity,
+                ).await;
+                autonomous_pending = matches!(result, Ok(false));
+                if let Err(error) = result {
+                    eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                }
+                if !autonomous_pending
+                    && handle.cancellation_handle().is_cancelled_since(generation)
+                    && !driver.snapshot().pending_input.is_empty()
+                {
+                    let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
+                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    break;
+                }
+            }
             event = mcp_events.recv() => {
                 if let Some(event) = event {
-                    let result = match driver.submit_input(vec![Item::notification(event.message)]) {
-                        Ok(()) => drive_autonomous(
-                            &session_id,
-                            &integration,
-                            &handle,
-                            &busy,
-                            &mut driver,
-                            &sink,
-                        &activity,).await,
-                        Err(error) => Err(map_loop_error(&session_id, &error)),
-                    };
-                    if let Err(error) = result {
-                        eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                    advance_checkout_revision(&mut checkout_revision);
+                    match driver.submit_input(vec![Item::notification(event.message)]) {
+                        Ok(()) => {
+                            #[cfg(test)]
+                            pause_selected_autonomous_event(&mut autonomous_pause).await;
+                            autonomous_pending = true;
+                        }
+                        Err(error) => {
+                            eprintln!("ACP v2 autonomous turn failed for {session_id}: {}", map_loop_error(&session_id, &error));
+                        }
                     }
                 }
             }
             event = tasks.next_event() => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
-                    if snapshot.kind == agentkit_task_manager::TaskKind::Background
-                        && let Err(error) = drive_autonomous(
-                            &session_id,
-                            &integration,
-                            &handle,
-                            &busy,
-                            &mut driver,
-                            &sink,
-                        &activity,).await
-                    {
-                        eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                    if snapshot.kind == agentkit_task_manager::TaskKind::Background {
+                        advance_checkout_revision(&mut checkout_revision);
+                        #[cfg(test)]
+                        pause_selected_autonomous_event(&mut autonomous_pause).await;
+                        autonomous_pending = true;
                     }
                 }
                 Some(TaskEvent::Cancelled(snapshot) | TaskEvent::Failed(snapshot, _)) => {
@@ -1402,6 +2009,12 @@ where
     C: TurnControl<S>,
 {
     loop {
+        // Check before *every* driver step: next() can checkpoint a fresh
+        // generation and dispatch queued input before its first await returns.
+        if control.is_cancelled_since(cancellation_generation) {
+            control.stop_injection_turn();
+            return Ok(FinishReason::Cancelled);
+        }
         let step = match driver.next().await {
             Ok(step) => step,
             Err(error) => {
@@ -1516,6 +2129,10 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     activity: &SessionActivity,
     origin: ExecutionOrigin,
 ) -> Result<(), AcpRuntimeError> {
+    // A failed child submission may leave stderr routed to the child even
+    // after the client returns to its source without sending session/resume.
+    // Re-establish identity before activity, model, or cleanup diagnostics.
+    establish_diagnostic_route(session_id);
     activity
         .execute(
             origin,
@@ -1551,6 +2168,7 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
         .map(|_| ())
 }
 
+// False means admission was denied; the actor must retain the selected wake.
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
@@ -1559,13 +2177,13 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     driver: &mut LoopDriver<S>,
     sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
     activity: &SessionActivity,
-) -> Result<(), AcpRuntimeError> {
+) -> Result<bool, AcpRuntimeError> {
+    let cancellation_generation = handle.cancellation_handle().generation();
     if claim_prompt(busy).is_err() {
-        return Ok(());
+        return Ok(false);
     }
     handle.prepare_injection_turn();
     integration.finish_prompt(session_id);
-    let cancellation_generation = handle.cancellation_handle().generation();
     handle.start_injection_turn();
     let result = run_active_turn(
         session_id,
@@ -1582,7 +2200,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
     busy.store(false, Ordering::Release);
-    result
+    result.map(|()| true)
 }
 
 fn error_diagnostic_notification(
@@ -2016,6 +2634,92 @@ pub(crate) fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: ListPromptBranchesRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.list_prompt_branches(request).await.map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: PreparePromptBranchRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state
+                                .prepare_prompt_branch(request)
+                                .await
+                                .map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: SubmitPromptBranchRequest,
+                            responder: Responder<SubmitPromptBranchResponse>,
+                            cx| {
+                    let state = Arc::clone(&state);
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                        match state
+                            .submit_prompt_branch(request, connection.clone())
+                            .await
+                        {
+                            Ok((response, attached)) => {
+                                let child_id = response.session_id.clone();
+                                let postcommit = |error: agent_client_protocol::Error| {
+                                    agent_client_protocol::util::internal_error(format!(
+                                        "prompt checkout child {child_id}: {error}"
+                                    ))
+                                };
+                                // The response establishes the child route before
+                                // replay; execution is gated behind both phases.
+                                responder
+                                    .respond_tracked(response)
+                                    .map_err(&postcommit)?
+                                    .await
+                                    .map_err(&postcommit)?;
+                                if let Some(attached) = attached {
+                                    for update in transcript_replay(
+                                        &attached.session_id,
+                                        &attached.canonical_transcript,
+                                    ) {
+                                        connection
+                                            .send_notification(update)
+                                            .map_err(&postcommit)?;
+                                    }
+                                    connection
+                                        .send_notification(available_commands_update(
+                                            child_id.clone(),
+                                        ))
+                                        .map_err(&postcommit)?;
+                                    let _ = attached.activation.send(());
+                                }
+                                Ok(())
+                            }
+                            Err(error) => responder.respond_with_error(sdk_error(error)),
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: wire::PromptRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -2049,13 +2753,40 @@ pub(crate) fn component(
         )
         .on_receive_request(
             {
-                let integration = Arc::clone(&state.integration);
+                let state = Arc::clone(&state);
                 async move |request: wire::InjectSessionRequest,
                             responder: Responder<wire::InjectSessionResponse>,
                             cx| {
-                    let integration = Arc::clone(&integration);
+                    let admission = match state.injection_admission(&request.session_id) {
+                        Ok(admission) => admission,
+                        Err(error) => return responder.respond_with_error(sdk_error(error)),
+                    };
+                    let integration = Arc::clone(&state.integration);
                     cx.spawn(async move {
-                        integration.handle_inject_request(request, responder).await
+                        let Some(reserved) = integration
+                            .reserve_inject_request(request, responder)
+                            .await?
+                        else {
+                            return Ok(());
+                        };
+                        let id = reserved.response().message_id;
+                        admission
+                            .0
+                            .lock()
+                            .expect("injection work poisoned")
+                            .pending
+                            .insert(id.clone());
+                        let mut pending = TrackedInjection {
+                            work: admission.0.clone(),
+                            id,
+                            retained: false,
+                        };
+                        if let Some(acceptance) = reserved.respond_tracked()? {
+                            acceptance.activate_after_response().await?;
+                            pending.retained = true;
+                        }
+                        drop(admission);
+                        Ok(())
                     })?;
                     Ok(())
                 }
@@ -2064,9 +2795,26 @@ pub(crate) fn component(
         )
         .on_receive_request(
             {
-                let integration = Arc::clone(&state.integration);
+                let state = Arc::clone(&state);
                 async move |request: wire::RevokeInjectSessionRequest, responder, _cx| {
-                    responder.respond_with_result(integration.revoke_inject(request).await)
+                    let tracker = state
+                        .sessions
+                        .lock()
+                        .expect("ACP v2 session map poisoned")
+                        .get(&request.session_id)
+                        .map(|session| session.injections.clone());
+                    let id = request.message_id.clone();
+                    let result = state.integration.revoke_inject(request).await;
+                    if result.is_ok()
+                        && let Some(tracker) = tracker
+                    {
+                        tracker
+                            .lock()
+                            .expect("injection work poisoned")
+                            .pending
+                            .remove(&id);
+                    }
+                    responder.respond_with_result(result)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2176,6 +2924,1227 @@ mod tests {
 
     use super::*;
     use crate::protocols::acp::tests::{BlockingTool, ScriptAdapter};
+
+    #[tokio::test]
+    async fn branch_admitted_work_invalidates_checkout_even_when_bytes_do_not_change() {
+        let root = tempfile::tempdir().unwrap();
+        let source_id = crate::session::new_id();
+        let source = crate::session::open(
+            root.path(),
+            &source_id,
+            false,
+            false,
+            vec![
+                Item::text(ItemKind::System, "system"),
+                Item::text(ItemKind::User, "original prompt"),
+                Item::text(ItemKind::Assistant, "original answer"),
+            ],
+        )
+        .unwrap();
+        let original = source.transcript.clone();
+        drop(source);
+        let selection =
+            crate::provider::ModelSelection::new(ProviderKind::OpenRouter, "test-model");
+        let mut checkouts = PromptCheckouts::default();
+        let mut revision = 0;
+        let listed = checkouts
+            .list(
+                root.path(),
+                &source_id,
+                &original,
+                revision,
+                &selection,
+                None,
+            )
+            .unwrap();
+        let checkout = checkouts
+            .prepare(
+                &listed.boundaries[0].address,
+                &original,
+                revision,
+                &selection,
+                None,
+            )
+            .unwrap();
+        let integration = AcpIntegration::default();
+        let sink = ResponseReplacementSink::new(RecordingSink::default());
+        let session_id = wire::SessionId::new(source_id.clone());
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new(source_id.clone()),
+                sink.clone(),
+            ))
+            .unwrap();
+        let turns = Arc::new(AtomicU64::new(0));
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .transcript(original.clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new(source_id.clone())).without_cache())
+            .await
+            .unwrap();
+        // Re-listing and reading an identical snapshot leave the token valid.
+        checkouts
+            .list(
+                root.path(),
+                &source_id,
+                &driver.snapshot().transcript,
+                revision,
+                &selection,
+                None,
+            )
+            .unwrap();
+        checkouts
+            .checkout(
+                &checkout.token,
+                &driver.snapshot().transcript,
+                revision,
+                &selection,
+                None,
+            )
+            .unwrap();
+        // A background wake can settle without changing canonical bytes. Its
+        // admission still invalidates authority, just like a compaction round
+        // that restores the same contents.
+        advance_checkout_revision(&mut revision);
+        drive_autonomous(
+            &session_id,
+            &integration,
+            &handle,
+            &AtomicBool::new(false),
+            &mut driver,
+            &sink,
+            &activity,
+        )
+        .await
+        .unwrap();
+        assert_eq!(driver.snapshot().transcript, original);
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(
+            checkouts
+                .checkout(
+                    &checkout.token,
+                    &driver.snapshot().transcript,
+                    revision,
+                    &selection,
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_initial_activation_drives_committed_pending_prompt_exactly_once() {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("initial-branch");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("initial-branch"),
+                sink.clone(),
+            ))
+            .unwrap();
+        let turns = Arc::new(AtomicU64::new(0));
+        let prompt = Item::text(ItemKind::User, "already committed edited prompt");
+        // Match runtime's fresh-branch bootstrap: disk/canonical replay already
+        // has the prompt, while the loop receives it once through pending input.
+        let driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(ResponseReplacementObserver::new(
+                integration.clone(),
+                sink.clone(),
+                session_id.clone(),
+                activity.clone(),
+            ))
+            .transcript(vec![Item::text(ItemKind::System, "system")])
+            .input(vec![prompt.clone()])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new("initial-branch")).without_cache())
+            .await
+            .unwrap();
+        assert_eq!(driver.snapshot().pending_input.len(), 1);
+        let busy = Arc::new(AtomicBool::new(true));
+        let actor_busy = busy.clone();
+        handle.prepare_injection_turn();
+        let generation = handle.cancellation_handle().generation();
+        let (activation, activated) = oneshot::channel();
+        let actor = tokio::spawn(async move {
+            activated.await.unwrap();
+            let driver = run_initial_branch_turn(
+                &session_id,
+                &integration,
+                &handle,
+                &actor_busy,
+                driver,
+                &sink,
+                generation,
+                None,
+                &activity,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            driver.snapshot()
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(recording.updates.lock().unwrap().is_empty());
+        assert!(busy.load(Ordering::Acquire));
+        // The production actor opens this same gate only after response/replay.
+        activation.send(()).unwrap();
+        let snapshot = actor.await.unwrap();
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert!(snapshot.pending_input.is_empty());
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .filter(|item| item.kind == ItemKind::User)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .find(|item| item.kind == ItemKind::User)
+                .unwrap()
+                .parts,
+            prompt.parts
+        );
+        assert_eq!(
+            snapshot
+                .transcript
+                .iter()
+                .filter(|item| item.kind == ItemKind::Assistant)
+                .count(),
+            1
+        );
+        assert!(!busy.load(Ordering::Acquire));
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::EndTurn,
+        );
+        assert!(
+            !recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| matches!(update.update, wire::SessionUpdate::UserMessage(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_first_turn_errors_allow_next_prompt_on_same_actor() {
+        async fn snapshot(commands: &mpsc::Sender<Command>) -> SessionSnapshot {
+            let (reply, response) = oneshot::channel();
+            commands.send(Command::Snapshot { reply }).await.unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .expect("execution errors must retain the loaded child")
+                .unwrap()
+        }
+
+        for outcome in [
+            TestOutcome::ProviderErrorThenContent,
+            TestOutcome::FinishErrorThenContent,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new_with_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                ProviderKind::OpenAiSubscription,
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap();
+            let child_id = crate::session::new_id();
+            let session_id = wire::SessionId::new(child_id.clone());
+            let selection =
+                crate::provider::ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
+            let prefix = vec![Item::text(ItemKind::System, "system")];
+            let initial = crate::session::branch::prepare(
+                prefix.clone(),
+                "source".into(),
+                crate::session::branch::Boundary::new(0, &prefix).unwrap(),
+                "failed-first-turn".into(),
+                crate::session::branch::SubmittedRequest {
+                    id: "edited-request".into(),
+                    selection: crate::session::branch::CapturedSelection::new(&selection, None),
+                },
+                Item::text(ItemKind::User, "committed edited prompt"),
+            )
+            .unwrap();
+            // Successful submit committed this exact prompt before execution.
+            // Runtime places it in the loop's pending input, not its prefix.
+            let child =
+                crate::session::open_uncommitted(root.path(), &child_id, false, initial).unwrap();
+            crate::session::branch::commit(&child.observer, &child.transcript).unwrap();
+            let mut prefix = child.transcript.clone();
+            let prompt = prefix.pop().unwrap();
+            drop(child);
+
+            let integration = Arc::new(AcpIntegration::default());
+            let recording = RecordingSink::default();
+            let sink = ResponseReplacementSink::new(recording.clone());
+            let activity = native_activity(session_id.clone(), sink.clone());
+            let handle = integration
+                .bind_session(AcpSessionBinding::new(
+                    session_id.clone(),
+                    SessionId::new(child_id.clone()),
+                    sink.clone(),
+                ))
+                .unwrap();
+            handle.prepare_injection_turn();
+            let generation = handle.cancellation_handle().generation();
+            let turns = Arc::new(AtomicU64::new(0));
+            let manager = AsyncTaskManager::new();
+            let tasks = manager.handle();
+            let driver = Agent::builder()
+                .model(TestAdapter {
+                    outcome,
+                    turns: turns.clone(),
+                    interrupt: None,
+                })
+                .observer(ResponseReplacementObserver::new(
+                    integration.as_ref().clone(),
+                    sink.clone(),
+                    session_id.clone(),
+                    activity.clone(),
+                ))
+                .task_manager(manager)
+                .transcript(prefix)
+                .input(vec![prompt.clone()])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(SessionId::new(child_id.clone())).without_cache())
+                .await
+                .unwrap();
+            let busy = Arc::new(AtomicBool::new(true));
+            let (commands, receiver) = mpsc::channel(8);
+            let mcp_events = runtime.subscribe_mcp(child_id.clone());
+            let actor = tokio::spawn(session_actor(SessionActor {
+                initial_generation: Some(generation),
+                admission_released: Arc::new(Notify::new()),
+                autonomous_pause: None,
+                session_id: session_id.clone(),
+                runtime,
+                integration: integration.clone(),
+                handle: handle.clone(),
+                busy: busy.clone(),
+                binding: BindingGuard {
+                    integration,
+                    session_id: session_id.clone(),
+                },
+                sink,
+                activity,
+                driver,
+                tasks,
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+                adapter: SelectableAdapter::new_with_credentials(
+                    ProviderKind::OpenAiSubscription,
+                    "gpt-5.4",
+                    crate::credentials::CredentialStorage::Memory,
+                )
+                .unwrap(),
+                catalog: vec![],
+                commands: receiver,
+                mcp_events,
+            }));
+            // Snapshot is a serialized actor barrier, not a scheduler delay.
+            let failed = snapshot(&commands).await;
+            assert_eq!(turns.load(Ordering::Relaxed), 1);
+            assert!(!busy.load(Ordering::Acquire));
+            assert_eq!(failed.canonical_transcript.last(), Some(&prompt));
+            assert_running_then_idle(&recording.updates.lock().unwrap(), error_stop_reason());
+
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(Command::SetConfig {
+                    request: wire::SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        "reasoning_effort",
+                        "high",
+                    ),
+                    reply,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                turns.load(Ordering::Relaxed),
+                1,
+                "config must not execute a model turn"
+            );
+
+            // Ordinary admission on this exact actor and binding: no load,
+            // switch, or replacement driver. A new fake session would fail again.
+            let generation = handle.cancellation_handle().generation();
+            claim_prompt(&busy).unwrap();
+            handle.prepare_injection_turn();
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(Command::Prompt(PromptCommand {
+                    request: wire::PromptRequest::new(
+                        session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "try again",
+                        ))],
+                    ),
+                    cancellation_generation: generation,
+                    reply,
+                }))
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let recovered = snapshot(&commands).await;
+            assert_eq!(turns.load(Ordering::Relaxed), 2);
+            assert!(!busy.load(Ordering::Acquire));
+            assert_eq!(
+                recovered
+                    .canonical_transcript
+                    .iter()
+                    .filter(|item| item.kind == ItemKind::User)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                recovered
+                    .canonical_transcript
+                    .iter()
+                    .filter(|item| item.kind == ItemKind::Assistant)
+                    .count(),
+                1
+            );
+            assert!(
+                matches!(recording.updates.lock().unwrap().last().map(|update| &update.update),
+                Some(wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle)))
+                    if idle.stop_reason.as_ref() == Some(&wire::StopReason::EndTurn))
+            );
+            assert!(
+                recording
+                    .updates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|update| update.session_id == session_id)
+            );
+            assert_eq!(
+                crate::session::branch::lookup_committed(
+                    root.path(),
+                    &child_id,
+                    "failed-first-turn",
+                    "edited-request",
+                )
+                .unwrap()
+                .unwrap()
+                .session_id,
+                child_id
+            );
+
+            handle.close();
+            let (reply, response) = oneshot::channel();
+            commands.send(Command::Close { reply }).await.unwrap();
+            response.await.unwrap();
+            timeout(Duration::from_secs(5), actor)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    enum GatedTurn {
+        Branch,
+        Prompt,
+        Autonomous,
+    }
+
+    async fn cancelled_gated_branch_activation(close: bool, turn: GatedTurn) {
+        let initial_branch = matches!(turn, GatedTurn::Branch);
+        let autonomous = matches!(turn, GatedTurn::Autonomous);
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let source_id = crate::session::new_id();
+        let child_id = crate::session::new_id();
+        let prefix = vec![Item::text(ItemKind::System, "system")];
+        let prompt = Item::text(ItemKind::User, "cancelled edited prompt");
+        let selection =
+            crate::provider::ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
+        let checkout = "gated-cancel-checkout";
+        let request = prompt_branches::submitted_request_id(&source_id, "cancelled edited prompt");
+        let initial = crate::session::branch::prepare(
+            prefix.clone(),
+            source_id.clone(),
+            crate::session::branch::Boundary::new(0, &prefix).unwrap(),
+            checkout.into(),
+            crate::session::branch::SubmittedRequest {
+                id: request.clone(),
+                selection: crate::session::branch::CapturedSelection::new(&selection, None),
+            },
+            prompt.clone(),
+        )
+        .unwrap();
+        let child =
+            crate::session::open_uncommitted(root.path(), &child_id, false, initial).unwrap();
+        crate::session::branch::commit(&child.observer, &child.transcript).unwrap();
+        drop(child);
+        let committed = crate::session::branch::load_history(root.path(), &child_id).unwrap();
+        let session_id = wire::SessionId::new(child_id.clone());
+        let integration = Arc::new(AcpIntegration::default());
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new(child_id.clone()),
+                sink.clone(),
+            ))
+            .unwrap();
+        handle.prepare_injection_turn();
+        let generation = handle.cancellation_handle().generation();
+        let turns = Arc::new(AtomicU64::new(0));
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .task_manager(manager)
+            .transcript(prefix)
+            .input(if initial_branch { vec![prompt] } else { vec![] })
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new(child_id.clone())).without_cache())
+            .await
+            .unwrap();
+        let mcp = crate::tools::mcp::empty();
+        let mcp_events = mcp.subscribe(child_id.clone());
+        let busy = Arc::new(AtomicBool::new(!autonomous));
+        let (commands, receiver) = mpsc::channel(8);
+        let actor = SessionActor {
+            initial_generation: initial_branch.then_some(generation),
+            admission_released: Arc::new(Notify::new()),
+            autonomous_pause: None,
+            session_id: session_id.clone(),
+            runtime,
+            integration: integration.clone(),
+            handle: handle.clone(),
+            busy: busy.clone(),
+            binding: BindingGuard {
+                integration,
+                session_id: session_id.clone(),
+            },
+            sink,
+            activity,
+            driver,
+            tasks,
+            background_jobs: BackgroundJobs::default(),
+            structured_completion: false,
+            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+            adapter: SelectableAdapter::new_with_credentials(
+                ProviderKind::OpenAiSubscription,
+                "gpt-5.4",
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap(),
+            catalog: vec![],
+            commands: receiver,
+            mcp_events,
+        };
+        let (activation, activated) = oneshot::channel();
+        let interrupt = handle.clone();
+        let task = tokio::spawn(DIAGNOSTIC_ROUTE_OBSERVER.scope(
+            Box::new(move |_| {
+                // Cancel after autonomous admission captures its generation,
+                // but before its first driver step. No sleeps or scheduler race.
+                if autonomous {
+                    interrupt.interrupt();
+                }
+            }),
+            async move {
+                activated.await.unwrap();
+                session_actor(actor).await;
+            },
+        ));
+        // For ordinary prompts, open actor activation but hold the separate
+        // prompt response gate after input has been submitted to the driver.
+        let activation = if initial_branch || autonomous {
+            activation
+        } else {
+            activation.send(()).unwrap();
+            let (reply, response) = oneshot::channel();
+            commands
+                .send(Command::Prompt(PromptCommand {
+                    request: wire::PromptRequest::new(
+                        session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "cancelled ordinary prompt",
+                        ))],
+                    ),
+                    cancellation_generation: generation,
+                    reply,
+                }))
+                .await
+                .unwrap();
+            response.await.unwrap().unwrap()
+        };
+        // The initial turn cannot run until its response gate opens.
+        let acknowledged = if close {
+            handle.close();
+            let (reply, acknowledged) = oneshot::channel();
+            commands.send(Command::Close { reply }).await.unwrap();
+            Some(acknowledged)
+        } else {
+            if !autonomous {
+                handle.interrupt();
+            }
+            None
+        };
+        // Queue a wake before activation: it must not resurrect the initial input.
+        mcp.publish(
+            &child_id,
+            crate::tools::mcp::McpEvent {
+                message: "late wake".into(),
+            },
+        );
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert_eq!(busy.load(Ordering::Acquire), !autonomous);
+        activation.send(()).unwrap();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(acknowledged) = acknowledged {
+            acknowledged.await.unwrap();
+        }
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(
+            handle.cancellation_handle().is_cancelled_since(generation),
+            "the autonomous admission hook must actually run"
+        );
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(
+            commands.is_closed(),
+            "cancelled pending input must lose its execution owner"
+        );
+        assert!(
+            !recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| matches!(
+                    update.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                )),
+            "an unstarted turn must not report model activity"
+        );
+        // A lost response/retry discovers the same committed child, never a new
+        // destination or a second activation. Reload its full history passively.
+        let found =
+            crate::session::branch::find_committed(root.path(), &source_id, checkout, &request)
+                .unwrap()
+                .unwrap();
+        assert_eq!(found.session_id, child_id);
+        assert_eq!(
+            crate::session::branch::load_history(root.path(), &child_id).unwrap(),
+            committed
+        );
+        let mut reloaded = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .transcript(found.transcript)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new(child_id)).without_cache())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn branch_cancel_before_activation_discards_pending_execution_but_preserves_retry() {
+        cancelled_gated_branch_activation(false, GatedTurn::Branch).await;
+    }
+
+    #[tokio::test]
+    async fn branch_close_before_activation_discards_pending_execution_but_preserves_retry() {
+        cancelled_gated_branch_activation(true, GatedTurn::Branch).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_prompt_cancel_before_response_gate_retires_pending_execution() {
+        cancelled_gated_branch_activation(false, GatedTurn::Prompt).await;
+    }
+
+    #[tokio::test]
+    async fn autonomous_cancel_before_first_step_retires_pending_execution() {
+        cancelled_gated_branch_activation(false, GatedTurn::Autonomous).await;
+    }
+
+    #[test]
+    fn resume_location_rejects_invalid_routes_before_loaded_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let canonical = crate::resilient_fs::canonicalize(root.path()).unwrap();
+        assert!(validate_resume_location(&canonical, root.path(), false).is_ok());
+        assert!(validate_resume_location(&canonical, root.path(), true).is_err());
+        assert!(validate_resume_location(&canonical, other.path(), false).is_err());
+        assert!(validate_resume_location(&canonical, &root.path().join("missing"), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_active_turn_restores_source_route_before_activity_diagnostics() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        DIAGNOSTIC_ROUTE_OBSERVER
+            .scope(
+                Box::new(move |id| observed.lock().unwrap().push(format!("route:{id}"))),
+                async {
+                    for origin in [ExecutionOrigin::Prompt, ExecutionOrigin::Autonomous] {
+                        let integration = AcpIntegration::default();
+                        let recording = RecordingSink::default();
+                        let sink = ResponseReplacementSink::new(recording);
+                        let session_id = wire::SessionId::new("source");
+                        let handle = integration
+                            .bind_session(AcpSessionBinding::new(
+                                session_id.clone(),
+                                SessionId::new("source"),
+                                sink.clone(),
+                            ))
+                            .unwrap();
+                        let activity = SessionActivity::new({
+                            let events = events.clone();
+                            move |transition| {
+                                if transition.active {
+                                    let mut events = events.lock().unwrap();
+                                    assert_eq!(events.last().unwrap(), "route:source");
+                                    events.push("source:activity".into());
+                                }
+                                Ok(())
+                            }
+                        });
+                        let turns = Arc::new(AtomicU64::new(0));
+                        let mut driver = Agent::builder()
+                            .model(TestAdapter {
+                                outcome: TestOutcome::Content,
+                                turns: turns.clone(),
+                                interrupt: None,
+                            })
+                            .observer(ResponseReplacementObserver::new(
+                                integration.clone(),
+                                sink.clone(),
+                                session_id.clone(),
+                                activity.clone(),
+                            ))
+                            .input(vec![Item::text(ItemKind::User, "continue source")])
+                            .build()
+                            .unwrap()
+                            .start(SessionConfig::new(SessionId::new("source")).without_cache())
+                            .await
+                            .unwrap();
+                        handle.prepare_injection_turn();
+                        let generation = handle.cancellation_handle().generation();
+                        handle.start_injection_turn();
+                        // Esc can return to source without an explicit resume.
+                        establish_diagnostic_route(&wire::SessionId::new("failed-child"));
+                        run_active_turn(
+                            &session_id,
+                            &integration,
+                            &handle,
+                            &mut driver,
+                            &sink,
+                            generation,
+                            None,
+                            &activity,
+                            origin,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(turns.load(Ordering::Relaxed), 1);
+                    }
+                },
+            )
+            .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "route:failed-child",
+                "route:source",
+                "source:activity",
+                "route:failed-child",
+                "route:source",
+                "source:activity",
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_admission_rejects_busy_and_pending_injections_without_leaking() {
+        let busy = Arc::new(AtomicBool::new(true));
+        let work = Arc::new(Mutex::new(InjectionWork::default()));
+        assert!(BranchAdmission::claim(busy.clone(), work.clone()).is_err());
+        assert!(!work.lock().unwrap().branch_reserved);
+        busy.store(false, Ordering::Release);
+        work.lock().unwrap().admitting = 1;
+        assert!(BranchAdmission::claim(busy.clone(), work.clone()).is_err());
+        drop(InjectionAdmission(work.clone()));
+        let id = wire::MessageId::new("accepted-but-not-delivered");
+        work.lock().unwrap().pending.insert(id.clone());
+        assert!(BranchAdmission::claim(busy.clone(), work.clone()).is_err());
+        assert!(!busy.load(Ordering::Acquire));
+        work.lock().unwrap().pending.remove(&id);
+        let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
+        assert!(busy.load(Ordering::Acquire));
+        assert!(work.lock().unwrap().branch_reserved);
+        drop(admission);
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(!work.lock().unwrap().branch_reserved);
+    }
+
+    #[test]
+    fn branch_injection_tracking_retains_only_accepted_work() {
+        let work = Arc::new(Mutex::new(InjectionWork::default()));
+        let failed = wire::MessageId::new("failed-receipt");
+        let retained = wire::MessageId::new("accepted");
+        work.lock()
+            .unwrap()
+            .pending
+            .extend([failed.clone(), retained.clone()]);
+        drop(TrackedInjection {
+            work: work.clone(),
+            id: failed.clone(),
+            retained: false,
+        });
+        drop(TrackedInjection {
+            work: work.clone(),
+            id: retained.clone(),
+            retained: true,
+        });
+        assert_eq!(work.lock().unwrap().pending, HashSet::from([retained]));
+    }
+
+    #[tokio::test]
+    async fn branch_actor_reservation_blocks_following_work_until_release() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let work = Arc::new(Mutex::new(InjectionWork::default()));
+        let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
+        let (reply, response) = oneshot::channel();
+        let next_command = Arc::new(AtomicBool::new(false));
+        let processed = next_command.clone();
+        let actor = tokio::spawn(async move {
+            hold_branch_reservation(42, admission, reply).await;
+            processed.store(true, Ordering::Release);
+        });
+        let (checkout, release) = response.await.unwrap().unwrap();
+        assert_eq!(checkout, 42);
+        tokio::task::yield_now().await;
+        assert!(!next_command.load(Ordering::Acquire));
+        assert!(busy.load(Ordering::Acquire));
+        assert!(work.lock().unwrap().branch_reserved);
+        drop(release); // failed submission/cancelled receiver also unblocks
+        actor.await.unwrap();
+        assert!(next_command.load(Ordering::Acquire));
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(!work.lock().unwrap().branch_reserved);
+    }
+
+    #[tokio::test]
+    async fn branch_actor_failed_reply_releases_admission() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let work = Arc::new(Mutex::new(InjectionWork::default()));
+        let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        hold_branch_reservation((), admission, reply).await;
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(!work.lock().unwrap().branch_reserved);
+    }
+
+    #[derive(Clone, Copy)]
+    enum RacingBranch {
+        Prepare,
+        Reserve,
+        Abandon,
+    }
+
+    async fn selected_completion_survives_branch_admission(background: bool, branch: RacingBranch) {
+        use agentkit_core::{TaskId, ToolCallId, TurnId};
+        use agentkit_task_manager::{ContinuePolicy, TaskLaunchRequest, TaskStartContext};
+        use agentkit_tools_core::{
+            AllowAllPermissions, BasicToolExecutor, OwnedToolContext, ToolRequest, ToolSource,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let session_id = wire::SessionId::new("selected-completion");
+        let loop_id = SessionId::new("selected-completion");
+        let integration = Arc::new(AcpIntegration::default());
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let generations = Arc::new(Mutex::new(Vec::new()));
+        let activity = SessionActivity::new({
+            let generations = generations.clone();
+            move |transition| {
+                generations
+                    .lock()
+                    .unwrap()
+                    .push((transition.id, transition.active));
+                Ok(())
+            }
+        });
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let cancellation_generation = handle.cancellation_handle().generation();
+        let task_manager =
+            AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background);
+        let tasks = task_manager.handle();
+        let release_task = Arc::new(Notify::new());
+        if background {
+            let tools = ToolRegistry::new().with(BlockingTool {
+                spec: ToolSpec {
+                    name: ToolName::new("race-completion"),
+                    description: "controlled background completion".into(),
+                    input_schema: json!({"type": "object"}),
+                    output_schema: None,
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+                entered: Arc::new(AtomicBool::new(false)),
+                release: release_task.clone(),
+            });
+            let task_id = TaskId::new("race-task");
+            task_manager
+                .start_task(
+                    TaskLaunchRequest::plain(
+                        Some(task_id.clone()),
+                        ToolRequest {
+                            call_id: ToolCallId::new("race-call"),
+                            tool_name: ToolName::new("race-completion"),
+                            input: json!({}),
+                            session_id: loop_id.clone(),
+                            turn_id: TurnId::new("background-turn"),
+                            metadata: MetadataMap::new(),
+                        },
+                    ),
+                    TaskStartContext {
+                        executor: Arc::new(BasicToolExecutor::new([
+                            Arc::new(tools) as Arc<dyn ToolSource>
+                        ])),
+                        tool_context: OwnedToolContext {
+                            session_id: loop_id.clone(),
+                            turn_id: TurnId::new("background-turn"),
+                            metadata: MetadataMap::new(),
+                            permissions: Arc::new(AllowAllPermissions),
+                            resources: Arc::new(()),
+                            cancellation: None,
+                            execution_scope: None,
+                            approved_request: None,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            tasks
+                .set_continue_policy(task_id, ContinuePolicy::RequestContinue)
+                .await
+                .unwrap();
+        }
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer = ResponseReplacementObserver::new(
+            integration.as_ref().clone(),
+            sink.clone(),
+            session_id.clone(),
+            activity.clone(),
+        );
+        let driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .task_manager(task_manager)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+        let mcp = crate::tools::mcp::empty();
+        let mcp_events = mcp.subscribe(session_id.to_string());
+        let work = Arc::new(Mutex::new(InjectionWork::default()));
+        let busy = Arc::new(AtomicBool::new(false));
+        let (commands, receiver) = mpsc::channel(8);
+        let (selected, event_selected) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let actor = tokio::spawn(session_actor(SessionActor {
+            initial_generation: None,
+            admission_released: work.lock().unwrap().admission_released.clone(),
+            autonomous_pause: Some((selected, resumed)),
+            session_id: session_id.clone(),
+            runtime,
+            integration: integration.clone(),
+            handle: handle.clone(),
+            busy: busy.clone(),
+            binding: BindingGuard {
+                integration,
+                session_id: session_id.clone(),
+            },
+            sink,
+            activity,
+            driver,
+            tasks,
+            background_jobs: BackgroundJobs::default(),
+            structured_completion: false,
+            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+            adapter: SelectableAdapter::new_with_credentials(
+                ProviderKind::OpenAiSubscription,
+                "gpt-5.4",
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap(),
+            catalog: vec![],
+            commands: receiver,
+            mcp_events,
+        }));
+        if background {
+            release_task.notify_one();
+        } else {
+            mcp.publish(
+                &session_id.to_string(),
+                crate::tools::mcp::McpEvent {
+                    message: "selected MCP completion".into(),
+                },
+            );
+        }
+        timeout(Duration::from_secs(5), event_selected)
+            .await
+            .unwrap()
+            .unwrap();
+        // The actual actor has consumed the event, but has not driven the loop.
+        let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
+        assert!(busy.load(Ordering::Acquire));
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        match branch {
+            RacingBranch::Prepare => {
+                let (reply, response) = oneshot::channel();
+                commands
+                    .send(Command::PreparePromptBranch {
+                        address: "unused: unsettled must reject first".into(),
+                        admission,
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+                let error = timeout(Duration::from_secs(5), response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect_err("selected completion must reject checkout preparation");
+                assert!(error.to_string().contains("unsettled work"), "{error}");
+            }
+            RacingBranch::Reserve => {
+                let (reply, response) = oneshot::channel();
+                commands
+                    .send(Command::ReservePromptBranch {
+                        checkout_token: "unused: unsettled must reject first".into(),
+                        admission,
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+                let error = timeout(Duration::from_secs(5), response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .err()
+                    .expect("selected completion must reject child reservation");
+                assert!(error.to_string().contains("unsettled work"), "{error}");
+            }
+            RacingBranch::Abandon => {
+                resume.send(()).unwrap();
+                // A read-only barrier proves the event handler returned while
+                // busy is still held. No branch command will wake this actor.
+                let (reply, response) = oneshot::channel();
+                commands.send(Command::Snapshot { reply }).await.unwrap();
+                timeout(Duration::from_secs(5), response)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(turns.load(Ordering::Relaxed), 0);
+                drop(admission);
+            }
+        }
+        // No prompt, snapshot, MCP event or task event is sent to wake the drive.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if generations
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|(_, active)| !active)
+                    && !busy.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("selected completion was stranded after branch admission released");
+        let (reply, response) = oneshot::channel();
+        commands.send(Command::Snapshot { reply }).await.unwrap();
+        let snapshot = response.await.unwrap().unwrap();
+        let transcript = serde_json::to_string(&snapshot.canonical_transcript).unwrap();
+        assert_eq!(
+            transcript
+                .matches(if background {
+                    "background done"
+                } else {
+                    "selected MCP completion"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(transcript.matches("autonomous content").count(), 1);
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert_eq!(*generations.lock().unwrap(), vec![(1, true), (1, false)]);
+        assert_eq!(
+            handle.cancellation_handle().generation(),
+            cancellation_generation
+        );
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(!work.lock().unwrap().branch_reserved);
+        let (reply, response) = oneshot::channel();
+        commands.send(Command::Close { reply }).await.unwrap();
+        response.await.unwrap();
+        actor.await.unwrap();
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn branch_actor_selected_mcp_completion_is_not_stranded() {
+        for branch in [
+            RacingBranch::Prepare,
+            RacingBranch::Reserve,
+            RacingBranch::Abandon,
+        ] {
+            selected_completion_survives_branch_admission(false, branch).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_actor_selected_background_completion_is_not_stranded() {
+        for branch in [
+            RacingBranch::Prepare,
+            RacingBranch::Reserve,
+            RacingBranch::Abandon,
+        ] {
+            selected_completion_survives_branch_admission(true, branch).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_settled_snapshot_rejects_input_mcp_and_unacknowledged_work() {
+        let (mut driver, turns) = test_driver(TestOutcome::Content, "branch-settled").await;
+        let tasks = AsyncTaskManager::new().handle();
+        let jobs = BackgroundJobs::default();
+        let mcp = crate::tools::mcp::empty();
+        let mut events = mcp.subscribe("branch-settled".into());
+        let original = driver.snapshot().transcript;
+        settled_branch_source(&driver, &tasks, &jobs, &events)
+            .await
+            .unwrap();
+        mcp.publish(
+            "branch-settled",
+            crate::tools::mcp::McpEvent {
+                message: "queued update".into(),
+            },
+        );
+        assert!(
+            settled_branch_source(&driver, &tasks, &jobs, &events)
+                .await
+                .is_err()
+        );
+        assert!(events.has_pending()); // checking never consumes the event
+        events.recv().await.unwrap();
+        jobs.register_foreground_for_test("branch-job");
+        assert!(
+            settled_branch_source(&driver, &tasks, &jobs, &events)
+                .await
+                .is_err()
+        );
+        jobs.detach("branch-job");
+        jobs.finish_for_test("branch-job");
+        assert!(jobs.activity().unacknowledged_terminals);
+        assert!(
+            settled_branch_source(&driver, &tasks, &jobs, &events)
+                .await
+                .is_err()
+        );
+        jobs.acknowledge_terminal(&agentkit_core::ToolCallId::new("branch-job"));
+        settled_branch_source(&driver, &tasks, &jobs, &events)
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "queued prompt")])
+            .unwrap();
+        assert!(
+            settled_branch_source(&driver, &tasks, &jobs, &events)
+                .await
+                .is_err()
+        );
+        assert_eq!(driver.snapshot().transcript, original);
+        assert_eq!(driver.snapshot().pending_input.len(), 1);
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+    }
 
     fn terminal_auth_initialize_request() -> wire::InitializeRequest {
         wire::InitializeRequest::new(
@@ -2613,6 +4582,8 @@ mod tests {
         Content,
         FinishError,
         ProviderError,
+        FinishErrorThenContent,
+        ProviderErrorThenContent,
     }
 
     struct TestAdapter {
@@ -2723,7 +4694,14 @@ mod tests {
             if let Some(handle) = &self.interrupt {
                 handle.interrupt();
             }
-            match self.outcome {
+            let outcome = self.outcome;
+            if matches!(
+                outcome,
+                TestOutcome::FinishErrorThenContent | TestOutcome::ProviderErrorThenContent
+            ) {
+                self.outcome = TestOutcome::Content;
+            }
+            match outcome {
                 TestOutcome::ToolThenContent => {
                     self.outcome = TestOutcome::Content;
                     let call = agentkit_core::ToolCallPart::new(
@@ -2771,7 +4749,7 @@ mod tests {
                         ]),
                     })
                 }
-                TestOutcome::FinishError => Ok(TestTurn {
+                TestOutcome::FinishError | TestOutcome::FinishErrorThenContent => Ok(TestTurn {
                     events: VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
                         model: None,
                         response_id: None,
@@ -2781,7 +4759,9 @@ mod tests {
                         metadata: MetadataMap::new(),
                     })]),
                 }),
-                TestOutcome::ProviderError => Err(LoopError::Provider("provider failed".into())),
+                TestOutcome::ProviderError | TestOutcome::ProviderErrorThenContent => {
+                    Err(LoopError::Provider("provider failed".into()))
+                }
             }
         }
     }
@@ -3211,6 +5191,7 @@ mod tests {
 
     struct BoundaryCancellationControl {
         before_boundary: bool,
+        turns: Arc<AtomicU64>,
         boundaries: AtomicU64,
     }
 
@@ -3219,7 +5200,7 @@ mod tests {
         fn stop_injection_turn(&self) {}
 
         fn is_cancelled_since(&self, _generation: u64) -> bool {
-            self.before_boundary
+            self.before_boundary && self.turns.load(Ordering::Relaxed) > 0
         }
 
         async fn handle_injection_boundary(
@@ -3271,6 +5252,7 @@ mod tests {
             .unwrap();
         let control = BoundaryCancellationControl {
             before_boundary,
+            turns: turns.clone(),
             boundaries: AtomicU64::new(0),
         };
         let reason = activity
@@ -3970,6 +5952,7 @@ mod tests {
                     completed: completion,
                     session_id: published_session_id,
                     session: SessionHandle {
+                        injections: Arc::new(Mutex::new(InjectionWork::default())),
                         token,
                         commands,
                         integration,
@@ -4071,6 +6054,212 @@ mod tests {
                 assert!(server.logout().await.is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn branch_router_replays_loaded_source_and_durable_child_without_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().to_path_buf();
+        let source_id = crate::session::new_id();
+        let source = crate::session::open(
+            root.path(),
+            &source_id,
+            false,
+            false,
+            vec![
+                Item::text(ItemKind::System, "system"),
+                Item::text(ItemKind::User, "original prompt"),
+                Item::text(ItemKind::Assistant, "original answer"),
+            ],
+        )
+        .unwrap();
+        let prefix = source.transcript[..1].to_vec();
+        drop(source);
+        let source_before = crate::session::branch::load_history(root.path(), &source_id).unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let updates = Arc::new(Mutex::new(Vec::<wire::UpdateSessionNotification>::new()));
+        let received = updates.clone();
+        let result = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                async move |update: wire::UpdateSessionNotification, _cx| {
+                    received.lock().unwrap().push(update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |cx| {
+                cx.send_request(wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("checkout-test", "0"),
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(
+                    wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone())
+                        .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                )
+                .block_task()
+                .await?;
+                let listed = cx
+                    .send_request(ListPromptBranchesRequest {
+                        session_id: wire::SessionId::new(source_id.clone()),
+                    })
+                    .block_task()
+                    .await?;
+                assert_eq!(listed.boundaries.len(), 1);
+                let address = listed.boundaries[0].address.clone();
+                // An integration-rejected injection must release the admission
+                // tracker, so a subsequent settled checkout still succeeds.
+                cx.send_request(wire::InjectSessionRequest::new(
+                    source_id.clone(),
+                    wire::SessionInjectMode::Steer,
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                        "queued steer",
+                    ))],
+                ))
+                .block_task()
+                .await
+                .expect_err("idle session cannot accept a new injection");
+                let prepared = cx
+                    .send_request(PreparePromptBranchRequest {
+                        session_id: wire::SessionId::new(source_id.clone()),
+                        address,
+                    })
+                    .block_task()
+                    .await?;
+                assert_eq!(prepared.original_text, "original prompt");
+                // Simulate the durable commit from a prior successful submission.
+                // Recovery must never dispatch a provider turn, even if the live
+                // source revision has subsequently changed.
+                let child_id = crate::session::new_id();
+                let selection = crate::provider::ModelSelection::new(
+                    crate::ProviderKind::OpenRouter,
+                    "test-model",
+                );
+                let initial = crate::session::branch::prepare(
+                    prefix.clone(),
+                    source_id.clone(),
+                    crate::session::branch::Boundary::new(0, &prefix).unwrap(),
+                    prepared.checkout_token.clone(),
+                    crate::session::branch::SubmittedRequest {
+                        id: prompt_branches::submitted_request_id(&source_id, "edited prompt"),
+                        selection: crate::session::branch::CapturedSelection::new(&selection, None),
+                    },
+                    Item::text(ItemKind::User, "edited prompt"),
+                )
+                .unwrap();
+                let child = crate::session::open_uncommitted(&workspace, &child_id, false, initial)
+                    .unwrap();
+                crate::session::branch::commit(&child.observer, &child.transcript).unwrap();
+                let mut child_future = child.transcript.clone();
+                child_future.push(Item::text(ItemKind::Assistant, "existing child answer"));
+                child.observer.replace(&child_future).unwrap();
+                drop(child);
+                let child_before =
+                    crate::session::branch::load_history(&workspace, &child_id).unwrap();
+                cx.send_request(wire::SetSessionConfigOptionRequest::new(
+                    source_id.clone(),
+                    "reasoning_effort",
+                    "high",
+                ))
+                .block_task()
+                .await?;
+                let request = SubmitPromptBranchRequest {
+                    session_id: wire::SessionId::new(source_id.clone()),
+                    checkout_token: prepared.checkout_token,
+                    text: "edited prompt".into(),
+                };
+                let (first, second) = tokio::join!(
+                    async { cx.send_request(request.clone()).block_task().await },
+                    async { cx.send_request(request.clone()).block_task().await },
+                );
+                assert_eq!(first?.session_id.to_string(), child_id);
+                assert_eq!(second?.session_id.to_string(), child_id);
+                let changed = cx
+                    .send_request(wire::SetSessionConfigOptionRequest::new(
+                        child_id.clone(),
+                        "reasoning_effort",
+                        "high",
+                    ))
+                    .block_task()
+                    .await?;
+                let retry = cx.send_request(request.clone()).block_task().await?;
+                assert_eq!(
+                    serde_json::to_value(retry.config_options).unwrap(),
+                    serde_json::to_value(changed.config_options).unwrap()
+                );
+                let mut different = request.clone();
+                different.text = "different edit".into();
+                cx.send_request(different)
+                    .block_task()
+                    .await
+                    .expect_err("token must bind the original request");
+                let resumed = cx
+                    .send_request(
+                        wire::ResumeSessionRequest::new(source_id.clone(), workspace.clone())
+                            .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                    )
+                    .block_task()
+                    .await?;
+                assert!(
+                    serde_json::to_string(&resumed.config_options)
+                        .unwrap()
+                        .contains("high")
+                );
+                cx.send_request(wire::CloseSessionRequest::new(source_id.clone()))
+                    .block_task()
+                    .await?;
+                // Durable lookup remains available with no source actor at all.
+                assert_eq!(
+                    cx.send_request(request)
+                        .block_task()
+                        .await?
+                        .session_id
+                        .to_string(),
+                    child_id
+                );
+                cx.send_request(wire::CloseSessionRequest::new(child_id.clone()))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    crate::session::branch::load_history(&workspace, &source_id).unwrap(),
+                    source_before
+                );
+                assert_eq!(
+                    crate::session::branch::load_history(&workspace, &child_id).unwrap(),
+                    child_before
+                );
+                let received = updates.lock().unwrap();
+                assert!(received.iter().any(|update| {
+                    update.session_id.to_string() == child_id
+                        && serde_json::to_string(&update.update)
+                            .unwrap()
+                            .contains("existing child answer")
+                }));
+                assert!(!received.iter().any(|update| matches!(
+                    update.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                )));
+                Ok(())
+            });
+        let result = timeout(Duration::from_secs(10), result).await;
+        server.abort();
+        let _ = server.await;
+        result
+            .expect("checkout routing timed out")
+            .expect("checkout routing failed");
     }
 
     #[tokio::test]

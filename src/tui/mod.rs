@@ -63,6 +63,11 @@ use crate::{
     tools::mcp::CredentialStorage,
 };
 
+use crate::protocols::acp::prompt_branches::{
+    ListPromptBranchesRequest, ListPromptBranchesResponse, PreparePromptBranchRequest,
+    PreparePromptBranchResponse, SubmitPromptBranchRequest, SubmitPromptBranchResponse,
+};
+
 use app::{
     Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
     UserImage,
@@ -84,6 +89,42 @@ struct ActiveSessionRoute {
     generation: u64,
 }
 
+enum BranchResponse {
+    Listed(Result<ListPromptBranchesResponse, String>),
+    Prepared(Result<PreparePromptBranchResponse, String>),
+    Submitted(Result<SubmitPromptBranchResponse, String>),
+}
+
+struct BranchCompletion {
+    generation: u64,
+    epoch: u64,
+    response: BranchResponse,
+}
+
+// A child ID is unknown until submit responds. Buffer its replay and early live
+// notifications under the same lock used to install the route at completion.
+#[derive(Default)]
+struct BranchReplayBuffer {
+    request: Option<(u64, u64)>,
+    notifications: Vec<UpdateSessionNotification>,
+}
+
+impl BranchCompletion {
+    fn is_current(&self, route: &ActiveSessionRoute, app: &App) -> bool {
+        self.generation == route.generation && self.epoch == app.branch_epoch
+    }
+}
+
+impl BranchReplayBuffer {
+    fn finish(&mut self, generation: u64, epoch: u64) -> Vec<UpdateSessionNotification> {
+        if self.request != Some((generation, epoch)) {
+            return Vec::new();
+        }
+        self.request = None;
+        std::mem::take(&mut self.notifications)
+    }
+}
+
 struct QueuedUpdate {
     generation: Option<u64>,
     update: Update,
@@ -102,6 +143,26 @@ impl QueuedUpdate {
             generation: Some(generation),
             update,
         }
+    }
+}
+
+// Stderr and ACP are independent streams. Capture identity while reading stderr,
+// not when applying its queued events after a possibly newer ACP activation.
+// Markers are stream boundaries, never commands to switch the visible session.
+fn runtime_diagnostic_update(
+    route: &mut Option<String>,
+    event: events::RuntimeEvent,
+) -> Option<Update> {
+    match event {
+        events::RuntimeEvent::SessionStarted { session_id } => {
+            *route = Some(session_id);
+            None
+        }
+        event @ events::RuntimeEvent::StorageStatus { .. } => Some(Update::Runtime(event)),
+        event => route.as_ref().map(|session_id| Update::RoutedRuntime {
+            session_id: session_id.clone(),
+            event,
+        }),
     }
 }
 
@@ -137,7 +198,9 @@ fn apply_pending_updates(
         let Some(update) = accept_queued_update(route, queued) else {
             continue;
         };
-        if let Update::ConfigOptions(options) = &update {
+        if let Update::ConfigOptions(options) = &update
+            && !app.editing_branch()
+        {
             refresh_config_state(app, Some(options));
         }
         app.apply(update);
@@ -778,6 +841,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let stderr = child.stderr.take().ok_or("could not open Kit stderr")?;
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+        let (branch_tx, mut branch_rx) = mpsc::unbounded_channel::<BranchCompletion>();
+        let branch_replay = Arc::new(Mutex::new(BranchReplayBuffer::default()));
+        let notification_branch_replay = Arc::clone(&branch_replay);
 
         // The agent's own diagnostics are the only explanation of a failed start,
         // so they are kept aside as well as shown in the log pane.
@@ -786,9 +852,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let diagnostics = updates_tx.clone();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
+            let mut runtime_route = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 let update = match events::parse(&line) {
-                    Some(event) => Update::Runtime(event),
+                    Some(event) => {
+                        let Some(update) = runtime_diagnostic_update(&mut runtime_route, event)
+                        else {
+                            continue;
+                        };
+                        update
+                    }
                     None if line.starts_with("A2A listening on ") => {
                         Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
                     }
@@ -853,7 +926,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         .v2()
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
+                let mut replay = notification_branch_replay.lock().expect("branch replay lock");
                 let current = notification_session.lock().ok().map(|route| route.clone());
+                if replay.request.is_some()
+                    && current.as_ref().is_some_and(|route| route.id != notification.session_id.to_string())
+                {
+                    replay.notifications.push(notification);
+                    return Ok(());
+                }
                 for update in current.as_ref().map_or_else(Vec::new, |route| {
                     translate_for_session(notification, &route.id)
                 }) {
@@ -1140,6 +1220,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id.clone());
+            app.activate_runtime_session();
+            let mut preserved_branch_sources = std::collections::HashSet::new();
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
@@ -1178,6 +1260,44 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                             match action {
                                 Action::Quit => return Ok(()),
+                                Action::ListPromptBranches { epoch } => {
+                                    let generation = transition_session.lock().expect("session route lock").generation;
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let sender = branch_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = connection.send_request(ListPromptBranchesRequest { session_id })
+                                            .block_task().await.map_err(|error| error.message.to_string());
+                                        let _ = sender.send(BranchCompletion { generation, epoch, response: BranchResponse::Listed(result) });
+                                    });
+                                }
+                                Action::PreparePromptBranch { epoch, address } => {
+                                    let generation = transition_session.lock().expect("session route lock").generation;
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let sender = branch_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = connection.send_request(PreparePromptBranchRequest { session_id, address })
+                                            .block_task().await.map_err(|error| error.message.to_string());
+                                        let _ = sender.send(BranchCompletion { generation, epoch, response: BranchResponse::Prepared(result) });
+                                    });
+                                }
+                                Action::SubmitPromptBranch { epoch, checkout_token, text } => {
+                                    let generation = transition_session.lock().expect("session route lock").generation;
+                                    {
+                                        let mut replay = branch_replay.lock().expect("branch replay lock");
+                                        replay.request = Some((generation, epoch));
+                                        replay.notifications.clear();
+                                    }
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let sender = branch_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = connection.send_request(SubmitPromptBranchRequest { session_id, checkout_token, text })
+                                            .block_task().await.map_err(|error| error.message.to_string());
+                                        let _ = sender.send(BranchCompletion { generation, epoch, response: BranchResponse::Submitted(result) });
+                                    });
+                                }
                                 Action::Submit { prompt, inject } => {
                                     let blocks = match prompt_blocks(&prompt) {
                                         Ok(blocks) => blocks,
@@ -1292,6 +1412,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     transition_route(&transition_session, persisted_id.clone());
                                     images.clear();
                                     app.start_session(persisted_id);
+                                    app.activate_runtime_session();
                                     refresh_config_state(&mut app, Some(&config_options));
                                     if let Some(prompt) = first_prompt {
                                         let outcome = connection
@@ -1389,7 +1510,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     // lock that the OS proves no live Kit process still holds.
                                     if let Err(error) = crate::session::load(&root, &requested_id)
                                         .and_then(|_| {
-                                            crate::session::remove_stale_lock(&root, &requested_id)
+                                            if preserved_branch_sources.contains(&requested_id) {
+                                                Ok(())
+                                            } else {
+                                                crate::session::remove_stale_lock(&root, &requested_id)
+                                            }
                                         })
                                     {
                                         app.note(format!("could not resume session: {error}"));
@@ -1412,10 +1537,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     images.clear();
                                     app.start_session(requested_id.clone());
                                     match request_resume(&connection, session_id.clone(), root.clone()).await {
-                                        Ok(response) => refresh_config_state(
-                                            &mut app,
-                                            Some(&response.config_options),
-                                        ),
+                                        Ok(response) => {
+                                            app.activate_runtime_session();
+                                            refresh_config_state(&mut app, Some(&response.config_options));
+                                        },
                                         Err(error) => {
                                             session_id = previous_session_id;
                                             transition_route(
@@ -1432,6 +1557,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             .await;
                                             match restored {
                                                 Ok(response) => {
+                                                    app.activate_runtime_session();
                                                     refresh_config_state(
                                                         &mut app,
                                                         Some(&response.config_options),
@@ -1678,6 +1804,45 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::None | Action::Redraw => {}
                             }
+                        },
+                        Some(completion) = branch_rx.recv() => {
+                            let mut replay = branch_replay.lock().expect("branch replay lock");
+                            let current = completion.is_current(&transition_session.lock().expect("session route lock"), &app);
+                            let submitted = matches!(completion.response, BranchResponse::Submitted(_));
+                            let buffered = if submitted {
+                                replay.finish(completion.generation, completion.epoch)
+                            } else { Vec::new() };
+                            if !current { continue; }
+                            app.with_navigation_clock_paused(|app| {
+                            match completion.response {
+                                BranchResponse::Listed(result) => app.branch_listed(completion.epoch, result.map(|response| response.boundaries)),
+                                BranchResponse::Prepared(result) => {
+                                    app.branch_prepared(completion.epoch, result);
+                                    images.clear();
+                                }
+                                BranchResponse::Submitted(Err(error)) => app.branch_submit_failed(completion.epoch, error),
+                                BranchResponse::Submitted(Ok(response)) => {
+                                    let child_id = response.session_id.to_string();
+                                    if app.branch_submitted(completion.epoch, child_id.clone()) {
+                                        preserved_branch_sources.insert(session_id.to_string());
+                                        session_id = response.session_id;
+                                        transition_route(&transition_session, child_id.clone());
+                                        images.clear();
+                                        refresh_config_state(app, Some(&response.config_options));
+                                        // Replay precedes activation, just as with resume. No ordinary
+                                        // prompt request: submit already persisted the edited prompt.
+                                        for notification in buffered {
+                                            for update in translate_for_session(notification, &child_id) {
+                                                if let Update::ConfigOptions(options) = &update {
+                                                    refresh_config_state(app, Some(options));
+                                                }
+                                                app.apply(update);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            });
                         },
                         update = updates_rx.recv() => match update {
                             Some(update) => app.with_navigation_clock_paused(|app| {
@@ -2980,6 +3145,121 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delayed_stderr_cannot_retarget_loaded_source_or_misattribute_child_events() {
+        use crate::events::{EVENT_MARKER, RuntimeEvent};
+        use crate::tui::app::Block;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
+
+        async fn ingest(
+            lines: &mut Lines<BufReader<DuplexStream>>,
+            ingress: &mut Option<String>,
+            tx: &tokio::sync::mpsc::UnboundedSender<QueuedUpdate>,
+        ) {
+            for _ in 0..4 {
+                let line = lines.next_line().await.unwrap().unwrap();
+                if let Some(update) =
+                    super::runtime_diagnostic_update(ingress, crate::events::parse(&line).unwrap())
+                {
+                    tx.send(QueuedUpdate::global(update)).unwrap();
+                }
+            }
+        }
+
+        // Exercise both delays: stderr already read but queued behind ACP resume,
+        // and child bytes still in the pipe when ACP resume activates the source.
+        for read_before_resume in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut app = App::new(
+                root.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.start_session("child".into());
+            app.activate_runtime_session();
+            let route = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "child".into(),
+                generation: 0,
+            }));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mut writer, reader) = tokio::io::duplex(4096);
+            let mut lines = BufReader::new(reader).lines();
+            let mut ingress = None;
+            for (session, call, pending) in [
+                ("child", "compose:child", true),
+                ("source", "compose:source", false),
+            ] {
+                for event in [
+                    RuntimeEvent::SessionStarted {
+                        session_id: session.into(),
+                    },
+                    RuntimeEvent::CompactionStarted {
+                        reason: session.into(),
+                        at: 0,
+                    },
+                    RuntimeEvent::ChildStarted {
+                        call: call.into(),
+                        tool: "shell".into(),
+                        summary: session.into(),
+                        at: 0,
+                    },
+                    RuntimeEvent::StorageStatus {
+                        pending,
+                        exhausted: pending,
+                    },
+                ] {
+                    writer
+                        .write_all(
+                            format!("{EVENT_MARKER}{}\n", serde_json::to_string(&event).unwrap())
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                if session == "child" {
+                    if read_before_resume {
+                        ingest(&mut lines, &mut ingress, &tx).await;
+                    }
+                    transition_route(&route, "source".into());
+                    app.start_session("source".into());
+                    app.activate_runtime_session();
+                    app.apply(Update::ToolStarted {
+                        id: "compose".into(),
+                        title: "compose".into(),
+                        kind: wire::ToolKind::Other,
+                        script: Some("shell({})".into()),
+                        backgrounded: false,
+                    });
+                    if !read_before_resume {
+                        ingest(&mut lines, &mut ingress, &tx).await;
+                    }
+                } else {
+                    // Loaded resume must emit this source marker on stderr even
+                    // though it reuses an actor and does not start a new driver.
+                    ingest(&mut lines, &mut ingress, &tx).await;
+                }
+                let first = rx.try_recv().unwrap();
+                apply_pending_updates(&mut app, &route, &mut rx, first);
+                assert_eq!(app.session_id.as_deref(), Some("source"));
+                assert_eq!(app.compacting, session == "source");
+                assert_eq!(
+                    (app.storage_pending, app.storage_exhausted),
+                    (pending, pending)
+                );
+                let Block::Tool(compose) = &app.blocks[0] else {
+                    panic!("compose")
+                };
+                if session == "child" {
+                    assert!(compose.children.is_empty());
+                } else {
+                    assert_eq!(compose.children.len(), 1);
+                    assert_eq!(compose.children[0].call, "compose:source");
+                }
+            }
+        }
+    }
+
     #[test]
     fn queued_updates_are_applied_in_bounded_bursts() {
         let root = tempfile::tempdir().unwrap();
@@ -3062,6 +3342,70 @@ mod tests {
                     && commands.as_slice()
                         == [command::Command::new("compact", "Compact context")]
         ));
+    }
+
+    #[test]
+    fn prompt_branch_completions_require_both_route_generation_and_draft_epoch() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.branch_epoch = 3;
+        let route = super::ActiveSessionRoute {
+            id: "source".into(),
+            generation: 7,
+        };
+        for response in [
+            super::BranchResponse::Listed(Err("list".into())),
+            super::BranchResponse::Prepared(Err("prepare".into())),
+            super::BranchResponse::Submitted(Err("submit".into())),
+        ] {
+            let mut completion = super::BranchCompletion {
+                generation: 7,
+                epoch: 3,
+                response,
+            };
+            assert!(completion.is_current(&route, &app));
+            completion.epoch = 2;
+            assert!(!completion.is_current(&route, &app));
+            completion.epoch = 3;
+            completion.generation = 6;
+            assert!(!completion.is_current(&route, &app));
+        }
+    }
+
+    #[test]
+    fn prompt_branch_replay_waits_for_child_route_and_stale_submit_does_not_drain_new_buffer() {
+        let mut buffer = super::BranchReplayBuffer {
+            request: Some((7, 3)),
+            notifications: vec![UpdateSessionNotification::new(
+                "child",
+                SessionUpdate::UserMessage(
+                    UserMessage::new("edited-prompt")
+                        .content(vec![ContentBlock::Text(TextContent::new("edited"))]),
+                ),
+            )],
+        };
+        assert!(buffer.finish(7, 2).is_empty());
+        assert_eq!(buffer.notifications.len(), 1);
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "source".into(),
+            generation: 7,
+        }));
+        let notifications = buffer.finish(7, 3);
+        assert!(buffer.request.is_none());
+        transition_route(&route, "child".into());
+        let active = route.lock().unwrap();
+        let updates: Vec<_> = notifications
+            .into_iter()
+            .flat_map(|notification| translate_for_session(notification, &active.id))
+            .collect();
+        assert!(
+            matches!(updates.as_slice(), [Update::UserMessage { id, text, append: false, .. }] if id == "edited-prompt" && text == "edited")
+        );
+        assert_eq!(active.generation, 8);
     }
 
     #[test]

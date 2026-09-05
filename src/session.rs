@@ -21,6 +21,8 @@ use agentkit_core::{Item, ItemKind, Part, Timestamp};
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod branch;
+
 pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -183,6 +185,7 @@ pub(crate) fn clone_completed_in(
     destination: &str,
 ) -> Result<(), String> {
     let mut transcript = load_in(root, directory, source)?;
+    branch::strip_for_plain_fork(&mut transcript)?;
     crate::transcript::sanitize_forked_transcript(&mut transcript);
     let opened = open_with_initial_timestamps_in(
         root,
@@ -288,6 +291,9 @@ pub(crate) fn open_uncommitted(
     force: bool,
     initial: Vec<Item>,
 ) -> Result<OpenSession, String> {
+    // Checkout fingerprints bind exact historical items, including unknown
+    // timestamps. The new submitted prompt is stamped during preparation.
+    let stamp_items = branch::BranchMetadata::read(&initial)?.is_none();
     open_with_initial_timestamps_in(
         root,
         &default_directory()?,
@@ -296,7 +302,7 @@ pub(crate) fn open_uncommitted(
         force,
         initial,
         InitialTranscriptOptions {
-            stamp_items: true,
+            stamp_items,
             commit_creation: false,
         },
     )
@@ -671,6 +677,9 @@ struct TranscriptHistory {
     items: Vec<Item>,
     generation: u64,
     states: Vec<Vec<Item>>,
+    // Each replacement is a prefix of a retained state. Keep its exact length
+    // without duplicating every historical transcript in memory.
+    replacement_boundaries: Vec<(usize, usize)>,
 }
 
 enum StoredTranscript {
@@ -732,6 +741,7 @@ fn read_record_lines(
     let mut items = Vec::new();
     let mut expected = 1_u64;
     let mut states = Vec::new();
+    let mut replacement_boundaries = Vec::new();
     let mut redirect = None;
     for (index, line) in lines.enumerate() {
         let line = line?;
@@ -774,6 +784,7 @@ fn read_record_lines(
                 if !items.is_empty() {
                     states.push(items.clone());
                 }
+                replacement_boundaries.push((states.len(), replacement.len()));
                 items = replacement;
             }
             (None, None, Some(target))
@@ -802,6 +813,7 @@ fn read_record_lines(
         items,
         generation: expected - 1,
         states,
+        replacement_boundaries,
     }))
 }
 
@@ -1322,20 +1334,8 @@ fn select_authority(
 fn transcript_snapshot(path: &Path, tolerate_incomplete_tail: bool) -> Result<Vec<u8>, String> {
     let mut bytes =
         fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    if tolerate_incomplete_tail && !bytes.ends_with(b"\n") {
-        let tail_start = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        let tail = &bytes[tail_start..];
-        let incomplete = match std::str::from_utf8(tail) {
-            Ok(_) => serde_json::from_slice::<Record>(tail)
-                .is_err_and(|error| error.classify() == serde_json::error::Category::Eof),
-            Err(error) => error.error_len().is_none(),
-        };
-        if incomplete {
-            bytes.truncate(tail_start);
-        }
+    if tolerate_incomplete_tail && let Some(complete) = torn_migration_tail_start(&bytes) {
+        bytes.truncate(complete);
     }
     Ok(bytes)
 }
@@ -1488,8 +1488,14 @@ fn torn_migration_tail_start(bytes: &[u8]) -> Option<usize> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
-    serde_json::from_slice::<Record>(&bytes[start..])
-        .is_err()
+    // Missing fields, invalid syntax, and unknown record shapes are not torn
+    // writes. Even without a newline, a complete JSON value must be validated.
+    let tail = &bytes[start..];
+    if std::str::from_utf8(tail).is_err_and(|error| error.error_len().is_some()) {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(tail)
+        .is_err_and(|error| error.is_eof())
         .then_some(start)
 }
 
@@ -1551,6 +1557,33 @@ fn recover_torn_migration_writes(
             continue;
         }
         let Some(complete) = torn_migration_tail_start(&bytes) else {
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                // A complete record can lose only its separator. Validate the
+                // entire history before repairing it under the mutation lock,
+                // before either migration or the resumed writer can append.
+                read_records_bytes(&path, session_id, &bytes)?;
+                if let Some(workspace) = transcript_workspace_bytes(&path, session_id, &bytes)?
+                    && workspace != root
+                {
+                    return Err(format!(
+                        "session {session_id:?} belongs to workspace {}, not {}",
+                        workspace.display(),
+                        root.display()
+                    ));
+                }
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open_in(&filesystem, &path)
+                    .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+                file.write_all(b"\n")
+                    .and_then(|_| file.sync_all())
+                    .map_err(|error| {
+                        format!(
+                            "could not recover transcript separator {}: {error}",
+                            path.display()
+                        )
+                    })?;
+            }
             continue;
         };
         if complete == 0 && path == scoped {
@@ -1848,6 +1881,14 @@ fn legacy_transcript_for_workspace(
 fn workspace_storage_directory(directory: &Path, root: &Path) -> PathBuf {
     let identity = blake3::hash(root.as_os_str().as_encoded_bytes());
     directory.join(format!("w-{}", identity.to_hex()))
+}
+
+#[cfg(test)]
+pub(crate) fn transcript_path_for_test(root: &Path, session_id: &str) -> PathBuf {
+    transcript_path(
+        &workspace_storage_directory(&default_directory().unwrap(), &canonical_workspace(root)),
+        session_id,
+    )
 }
 
 fn transcript_path(directory: &Path, session_id: &str) -> PathBuf {
@@ -2708,6 +2749,113 @@ mod tests {
         let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
         assert_eq!(opened.transcript, compacted);
         drop(opened);
+        assert!(matches!(
+            read_records_direct(&global, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+    }
+
+    #[test]
+    fn torn_tail_requires_json_eof_and_only_incomplete_final_utf8() {
+        for tail in [b"{".as_slice(), b"{\"item\":", b"{\"item\":\"\xe2\x82"] {
+            let mut bytes = b"complete\n".to_vec();
+            bytes.extend_from_slice(tail);
+            assert_eq!(torn_migration_tail_start(&bytes), Some(9), "{tail:?}");
+        }
+        for tail in [
+            b"{}".as_slice(),
+            b"{bad",
+            b"{bad\xe2",
+            b"{\"item\":\xe2",   // a UTF-8 value cannot start outside a JSON string
+            b"{\"item\":\"\xff", // definite invalid UTF-8, not an interrupted codepoint
+            b"{\"item\":\"\xe2\x82\n", // incomplete nonfinal record
+        ] {
+            let mut bytes = b"complete\n".to_vec();
+            bytes.extend_from_slice(tail);
+            assert_eq!(torn_migration_tail_start(&bytes), None, "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn resume_repairs_only_missing_separator_before_appending() {
+        for remove_newline in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let opened = open(
+                root.path(),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            let mut expected = opened.transcript.clone();
+            drop(opened);
+            let path = transcript_path(root.path(), "abc");
+            let complete = fs::read(&path).unwrap();
+            let input = if remove_newline {
+                &complete[..complete.len() - 1]
+            } else {
+                &complete[..]
+            };
+            fs::write(&path, input).unwrap();
+            assert_eq!(load(root.path(), "abc").unwrap(), expected);
+            assert_eq!(fs::read(&path).unwrap(), input);
+            let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+            assert_eq!(resumed.transcript, expected);
+            assert_eq!(fs::read(&path).unwrap(), complete);
+            let appended =
+                Item::text(ItemKind::User, "after resume").with_created_at(Timestamp(123));
+            resumed.observer.on_transcript_event(TranscriptEvent {
+                session_id: &agentkit_core::SessionId::new("abc"),
+                item: &appended,
+            });
+            expected.push(appended);
+            drop(resumed);
+            assert_eq!(load(root.path(), "abc").unwrap(), expected);
+            assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        }
+    }
+
+    #[test]
+    fn missing_separator_does_not_allow_invalid_history_to_be_repaired() {
+        for field in ["generation", "schema_version", "workspace_root"] {
+            let root = tempfile::tempdir().unwrap();
+            let opened = open(
+                root.path(),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            drop(opened);
+            let path = transcript_path(root.path(), "abc");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record[field] = if field == "workspace_root" {
+                serde_json::json!(root.path().join("other-workspace"))
+            } else {
+                serde_json::json!(999)
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(open(root.path(), "abc", true, false, Vec::new()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{field}");
+        }
+    }
+
+    #[test]
+    fn missing_legacy_separator_is_repaired_before_redirect_append() {
+        let root = tempfile::tempdir().unwrap();
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let expected = write_history(&global, PREVIOUS_SCHEMA_VERSION, "abc", &["legacy"], None);
+        let complete = fs::read(&global).unwrap();
+        fs::write(&global, &complete[..complete.len() - 1]).unwrap();
+        let resumed = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(resumed.transcript, expected);
+        drop(resumed);
+        assert_eq!(load(root.path(), "abc").unwrap(), expected);
+        assert!(fs::read(&global).unwrap().starts_with(&complete));
         assert!(matches!(
             read_records_direct(&global, "abc").unwrap(),
             StoredTranscript::Redirect(_)

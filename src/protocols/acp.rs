@@ -47,6 +47,7 @@ use tokio::{
 };
 
 mod activity;
+pub(crate) mod prompt_branches;
 mod skill_catalog;
 pub mod v2;
 
