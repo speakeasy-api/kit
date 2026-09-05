@@ -13,7 +13,11 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-use agent_client_protocol::schema::v2::{AuthMethodTerminal, StopReason, ToolCallStatus, ToolKind};
+#[cfg(test)]
+use agent_client_protocol::schema::v2::RunningStateUpdate;
+use agent_client_protocol::schema::v2::{
+    AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
+};
 #[cfg(test)]
 use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
@@ -115,14 +119,8 @@ pub enum Update {
     ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
     /// Context window accounting.
     Usage { used: u64, size: u64 },
-    /// Standard ACP v2 foreground state.
-    State {
-        active: bool,
-        steerable: bool,
-        cancelled: bool,
-    },
-    /// An ACP v2 turn became idle with its exact terminal reason.
-    Stopped(Option<StopReason>),
+    /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
+    State(StateUpdate),
     /// A nested tool call started or finished inside a compose run.
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
@@ -1674,10 +1672,6 @@ impl App {
         self.message_blocks.insert(id, self.blocks.len() - 1);
     }
 
-    fn finish_turn(&mut self, cancelled: bool) {
-        self.finish_turn_with_outcome(!cancelled, cancelled.then_some("turn interrupted".into()));
-    }
-
     fn finish_with_stop_reason(&mut self, reason: Option<StopReason>) {
         let (successful, notice) = match reason {
             Some(StopReason::EndTurn) => (true, None),
@@ -1709,7 +1703,6 @@ impl App {
         }
         self.close_thought();
         self.agent_stream_sealed = true;
-        let interrupted = self.phase == Phase::Cancelling;
         let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
         self.compacting = false;
@@ -1732,9 +1725,7 @@ impl App {
             self.mark_block_dirty(index);
             self.reclassify_dynamic(index);
         }
-        if interrupted {
-            self.note("turn interrupted");
-        } else if let Some(notice) = notice {
+        if let Some(notice) = notice {
             self.note(notice);
         }
         if let Some(millis) = turn_millis {
@@ -1990,18 +1981,14 @@ impl App {
                 }
             }
             Update::ConfigOptions(_) => {}
-            Update::State {
-                active,
-                steerable,
-                cancelled,
-            } => {
-                if active {
+            Update::State(state) => match state {
+                StateUpdate::Running(_) | StateUpdate::RequiresAction(_) => {
                     if self.phase == Phase::Idle {
                         self.agent_stream_sealed = true;
                         self.turn_started = Some(Instant::now());
                     }
                     if self.phase != Phase::Cancelling {
-                        self.phase = if steerable {
+                        self.phase = if matches!(state, StateUpdate::Running(_)) {
                             Phase::Working
                         } else {
                             Phase::Blocked
@@ -2009,11 +1996,10 @@ impl App {
                     }
                     self.follow = true;
                     self.scroll = usize::MAX;
-                } else {
-                    self.finish_turn(cancelled);
                 }
-            }
-            Update::Stopped(reason) => self.finish_with_stop_reason(reason),
+                StateUpdate::Idle(idle) => self.finish_with_stop_reason(idle.stop_reason),
+                _ => {}
+            },
             Update::ProcessExited(error) => {
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
@@ -2199,11 +2185,9 @@ impl App {
             images: Vec::new(),
             append: false,
         });
-        self.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        self.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         self.blocks.len() as u64
     }
 
@@ -3482,7 +3466,8 @@ mod tests {
     };
 
     use agent_client_protocol::schema::v2::{
-        AuthMethodTerminal, StopReason, ToolCallStatus, ToolKind,
+        AuthMethodTerminal, IdleStateUpdate, RequiresActionStateUpdate, RunningStateUpdate,
+        StateUpdate, StopReason, ToolCallStatus, ToolKind,
     };
     use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{
@@ -3925,16 +3910,12 @@ mod tests {
     fn turn_end_clears_compaction_state() {
         let mut app = app();
         app.compacting = true;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         assert!(!app.compacting);
     }
 
@@ -4077,12 +4058,12 @@ mod tests {
     fn closes_running_calls_when_the_turn_ends() {
         let mut app = app();
         compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        app.apply(Update::Stopped(Some(StopReason::EndTurn)));
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         let call = app
             .blocks
             .iter()
@@ -4115,12 +4096,12 @@ mod tests {
         ] {
             let mut app = app();
             compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-            app.apply(Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false,
-            });
-            app.apply(Update::Stopped(Some(reason)));
+            app.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            app.apply(Update::State(StateUpdate::Idle(
+                IdleStateUpdate::new().stop_reason(reason),
+            )));
 
             let notice = app
                 .blocks
@@ -4145,31 +4126,115 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_state_updates_are_idempotent() {
+    fn transcript_and_tool_activity_do_not_drive_foreground_lifecycle() {
         let mut app = app();
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
+        app.apply(Update::UserMessage {
+            id: "user".into(),
+            text: "hello".into(),
+            images: Vec::new(),
+            append: false,
         });
-        let started = app.turn_started;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        assert_eq!(app.turn_started, started);
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
+        compose(&mut app, "return 1");
+        app.apply(Update::AgentMessage {
+            id: "agent".into(),
+            text: "hello".into(),
+            append: false,
         });
         assert!(!app.working());
+        assert!(app.turn_started.is_none());
+
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::ToolUpdated {
+            id: "call-1".into(),
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: Vec::new(),
+            backgrounded: false,
+        });
+        assert!(app.working());
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        app.apply(Update::AgentMessage {
+            id: "late".into(),
+            text: "background result".into(),
+            append: false,
+        });
+        compose(&mut app, "return 2");
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+    }
+
+    #[test]
+    fn requires_action_preserves_the_running_turn_timer() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::State(StateUpdate::RequiresAction(
+            RequiresActionStateUpdate::new(),
+        )));
+        assert!(app.phase == Phase::Blocked);
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        assert!(app.phase == Phase::Working);
+        assert_eq!(app.turn_started, started);
+    }
+
+    #[test]
+    fn cancellation_request_does_not_override_the_actual_stop_reason() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        assert!(matches!(app.request_cancel(), Action::Cancel));
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::Notice(text) if text == "turn interrupted"))
+        );
+    }
+
+    #[test]
+    fn duplicate_state_updates_are_idempotent() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|block| matches!(block, Block::TurnDuration(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4178,11 +4243,9 @@ mod tests {
         app.push_user("hello".into());
         app.turn_started = Some(Instant::now() - Duration::from_secs(65));
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
 
         assert!(matches!(
             app.blocks.last(),
@@ -4194,21 +4257,17 @@ mod tests {
     fn autonomous_turn_is_visible_and_cancellable() {
         let mut app = app();
 
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
 
         assert!(app.working());
         assert!(matches!(app.request_cancel(), Action::Cancel));
         assert!(app.phase == Phase::Cancelling);
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::Cancelled),
+        )));
 
         assert!(!app.working());
         assert!(matches!(
@@ -4235,11 +4294,9 @@ mod tests {
             backgrounded: true,
         });
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
 
         let running = app
             .blocks
@@ -4582,11 +4639,9 @@ mod tests {
     fn active_plain_text_is_submitted_as_steering_when_advertised() {
         let mut app = app();
         app.can_steer = true;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         app.paste("change direction");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
 
@@ -4628,11 +4683,9 @@ mod tests {
     #[test]
     fn active_text_is_preserved_when_steering_is_not_advertised() {
         let mut app = app();
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         app.paste("wait");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
         assert!(matches!(
@@ -4778,11 +4831,9 @@ mod tests {
     fn copies_only_agent_text_after_the_latest_user_message() {
         let mut app = app();
         app.apply(Update::test_text("old".into()));
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         app.push_user("next".into());
         app.apply(Update::AgentMessage {
             id: "next-agent".into(),
@@ -4809,11 +4860,9 @@ mod tests {
     fn autonomous_text_starts_a_new_block_after_turn_end() {
         let mut app = app();
         app.apply(Update::test_text("Started.".into()));
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         app.apply(Update::AgentMessage {
             id: "autonomous".into(),
             text: "RAVENS_".into(),
