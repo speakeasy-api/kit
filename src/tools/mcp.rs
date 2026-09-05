@@ -1372,11 +1372,6 @@ impl McpRuntime {
                 .filter(|name| current_entries.get(*name) != entries.get(*name))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            let deleted = current_entries
-                .keys()
-                .filter(|name| !entries.contains_key(*name))
-                .cloned()
-                .collect::<Vec<_>>();
 
             let gates = if changed.is_empty() {
                 Vec::new()
@@ -1470,13 +1465,16 @@ impl McpRuntime {
             }
             drop(generation_writer);
             drop(initialization_guard);
-            if !deleted.is_empty() {
-                let mut operations = self.inner.operations.lock().await;
-                for name in deleted {
-                    operations.remove(&name);
-                }
-            }
             drop(operation_guards);
+            drop(gates);
+            // A deleted name can still have callers holding or waiting on its
+            // gate. Keep that identity until its last owner leaves, including
+            // across deletion and re-addition of the same server name.
+            self.inner
+                .operations
+                .lock()
+                .await
+                .retain(|_, gate| gate.strong_count() > 0);
             return Ok(());
         }
     }
@@ -1788,11 +1786,43 @@ impl McpRuntime {
         )
         .await
         .map_err(ToolError::Unavailable)?;
+        self.start_authorization(
+            name.to_string(),
+            record.fingerprint,
+            request,
+            pending,
+            session_id,
+        )
+        .await
+    }
+
+    async fn start_authorization(
+        &self,
+        name: String,
+        fingerprint: Vec<u8>,
+        request: AuthRequest,
+        pending: auth::PendingAuthorization,
+        session_id: String,
+    ) -> Result<Value, ToolError> {
+        // The caller retains the server operation gate and auth_setup guard.
+        // Acquire both publication guards before changing either registry. No
+        // writer holds servers while waiting for pending (reload releases its
+        // servers guard first). Cancellation at either await only drops the
+        // uninstalled OAuth listener; it needs no generation-sensitive rollback.
+        let mut registrations = self.inner.pending.lock().await;
+        let mut servers = self.inner.servers.write().await;
+        let record = servers
+            .get_mut(&name)
+            .filter(|record| record.fingerprint == fingerprint)
+            .ok_or_else(|| {
+                ToolError::Unavailable(
+                    "MCP configuration changed during authentication setup; retry auth".into(),
+                )
+            })?;
         let url = pending.url.clone();
-        self.set_status(name, ServerStatus::Pending).await;
         let runtime = self.clone();
-        let server = name.to_string();
-        let fingerprint = record.fingerprint.clone();
+        let server = name.clone();
+        let task_fingerprint = fingerprint.clone();
         let event_generation = self.event_generation(&session_id);
         let (start, started) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1800,7 +1830,7 @@ impl McpRuntime {
                 runtime
                     .complete_authorization(
                         server,
-                        fingerprint,
+                        task_fingerprint,
                         request,
                         pending,
                         session_id,
@@ -1809,16 +1839,21 @@ impl McpRuntime {
                     .await;
             }
         });
-        self.inner.pending.lock().await.insert(
-            name.to_string(),
+        registrations.insert(
+            name.clone(),
             PendingRecord {
                 url: url.clone(),
                 expires: Instant::now() + auth::FLOW_TIMEOUT,
-                fingerprint: record.fingerprint,
+                fingerprint,
                 abort: task.abort_handle(),
             },
         );
+        record.status = ServerStatus::Pending;
+        // Publish the registered worker and its status without another await.
+        // The start barrier prevents completion before registration is visible.
         let _ = start.send(());
+        drop(servers);
+        drop(registrations);
         Ok(json!({
             "server": name,
             "status": "pending",
@@ -3092,6 +3127,174 @@ mod tests {
             server,
             request_seen_rx,
         )
+    }
+
+    async fn pending_authorization() -> super::auth::PendingAuthorization {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..read]).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let body = if path == "/resource-metadata" {
+                    json!({
+                        "resource": format!("{server_base}/mcp"),
+                        "authorization_servers": [server_base]
+                    })
+                } else {
+                    json!({
+                        "issuer": server_base,
+                        "authorization_endpoint": format!("{server_base}/authorize"),
+                        "token_endpoint": format!("{server_base}/token"),
+                        "response_types_supported": ["code"],
+                        "code_challenge_methods_supported": ["S256"]
+                    })
+                }
+                .to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let config = serde_json::from_value(json!({
+            "type": "oauth", "clientId": "kit-client"
+        }))
+        .unwrap();
+        let challenge = format!(r#"Bearer resource_metadata="{base}/resource-metadata""#);
+        let pending = super::auth::begin(
+            &format!("{base}/mcp"),
+            &config,
+            &CredentialStorage::Memory,
+            None,
+            Some(&challenge),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        pending
+    }
+
+    #[tokio::test]
+    async fn cancelled_authorization_registration_leaves_no_pending_status_or_listener() {
+        for block_pending in [true, false] {
+            let runtime = super::empty();
+            let mut record = connected_oauth_record();
+            record.status = ServerStatus::AuthenticationRequired;
+            let fingerprint = record.fingerprint.clone();
+            runtime
+                .inner
+                .servers
+                .write()
+                .await
+                .insert("remote".into(), record);
+            let pending = pending_authorization().await;
+            let url = url::Url::parse(&pending.url).unwrap();
+            let callback = url
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .unwrap()
+                .1;
+            let callback = url::Url::parse(&callback).unwrap();
+            let pending_guard = if block_pending {
+                Some(runtime.inner.pending.lock().await)
+            } else {
+                None
+            };
+            let servers_guard = if block_pending {
+                None
+            } else {
+                Some(runtime.inner.servers.write().await)
+            };
+            let mut registration = Box::pin(runtime.start_authorization(
+                "remote".into(),
+                fingerprint.clone(),
+                tool_auth_request(),
+                pending,
+                "session".into(),
+            ));
+            // Poll at the real registry boundary, then cancel the caller while
+            // the selected lock is unavailable. No sleeps or production hooks.
+            assert!(futures_util::poll!(registration.as_mut()).is_pending());
+            drop(registration);
+            drop(servers_guard);
+            drop(pending_guard);
+            let records = runtime.inner.servers.read().await;
+            assert!(matches!(
+                records["remote"].status,
+                ServerStatus::AuthenticationRequired
+            ));
+            assert_eq!(records["remote"].fingerprint, fingerprint);
+            drop(records);
+            assert!(runtime.inner.pending.lock().await.is_empty());
+            assert!(
+                tokio::net::TcpStream::connect((
+                    callback.host_str().unwrap(),
+                    callback.port().unwrap()
+                ))
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_registration_rejects_stale_generation_before_publication() {
+        let runtime = super::empty();
+        let mut record = connected_oauth_record();
+        let stale = record.fingerprint.clone();
+        record.fingerprint.push(1);
+        let current = record.fingerprint.clone();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), record);
+        let result = runtime
+            .start_authorization(
+                "remote".into(),
+                stale,
+                tool_auth_request(),
+                pending_authorization().await,
+                "session".into(),
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("configuration changed")
+        );
+        assert!(runtime.inner.pending.lock().await.is_empty());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+
+        let result = runtime
+            .start_authorization(
+                "remote".into(),
+                current.clone(),
+                tool_auth_request(),
+                pending_authorization().await,
+                "session".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "pending");
+        let registrations = runtime.inner.pending.lock().await;
+        assert_eq!(registrations["remote"].fingerprint, current);
+        assert_eq!(registrations["remote"].url, result["url"].as_str().unwrap());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Pending
+        ));
+        registrations["remote"].abort.abort();
     }
 
     #[test]
@@ -4519,6 +4722,33 @@ mod tests {
         let record = runtime.inner.servers.read().await["shared"].clone();
         assert_eq!(record.description, "tools-manifest plugin MCP server");
         assert_eq!(record.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    #[tokio::test]
+    async fn removed_server_operation_gate_remains_shared_with_existing_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let config = r#"{"mcpServers":{"removed":{"command":"unused"}}}"#;
+        std::fs::write(&path, config).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        // Model a caller that fetched the gate but has not acquired it yet.
+        let existing = runtime.operation_gate("removed").await;
+
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &existing,
+            &runtime.operation_gate("removed").await
+        ));
+
+        std::fs::write(&path, config).unwrap();
+        runtime.reload_config().await.unwrap();
+        let replacement = runtime.operation_gate("removed").await;
+        assert!(Arc::ptr_eq(&existing, &replacement));
+        let _held = existing.read().await;
+        assert!(replacement.try_write().is_err());
     }
 
     #[tokio::test]
