@@ -1474,6 +1474,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_active_turn<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,

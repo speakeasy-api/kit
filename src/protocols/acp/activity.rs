@@ -146,6 +146,54 @@ impl LoopObserver for SessionActivity {
     }
 }
 
+/// Domain outcome selected before any protocol representation. Cancellation wins
+/// over model/approval errors; cleanup or delivery failure cannot become success.
+pub(super) struct ExecutionOutcome {
+    result: Result<FinishReason, AcpRuntimeError>,
+}
+
+impl ExecutionOutcome {
+    pub(super) fn new(result: Result<FinishReason, AcpRuntimeError>, cancelled: bool) -> Self {
+        Self {
+            result: if cancelled || matches!(result, Err(AcpRuntimeError::Cancelled)) {
+                Ok(FinishReason::Cancelled)
+            } else {
+                result
+            },
+        }
+    }
+}
+
+/// Shared finalization order: cancel/drain structured work, drain all content even
+/// on failure, render a diagnostic, then return the outcome for single settlement.
+/// Hooks are transport only; neither hook chooses lifecycle or cleanup policy.
+pub(super) async fn finalize(
+    outcome: ExecutionOutcome,
+    structured: Option<(
+        &agentkit_task_manager::TaskManagerHandle,
+        &crate::runtime::BackgroundJobs,
+    )>,
+    flush: impl std::future::Future<Output = Result<(), AcpRuntimeError>>,
+    diagnostic: impl FnOnce(&AcpRuntimeError) -> Result<(), AcpRuntimeError>,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let mut result = outcome.result;
+    if (result.is_err() || matches!(result, Ok(FinishReason::Cancelled)))
+        && let Some((tasks, jobs)) = structured
+    {
+        super::cancel_background_jobs(tasks, jobs).await;
+        if let Err(error) = super::settle_background_jobs(tasks, jobs).await {
+            result = Err(error);
+        }
+    }
+    if let Err(error) = flush.await {
+        result = Err(error);
+    }
+    if let Err(error) = &result {
+        diagnostic(error)?;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,52 +365,4 @@ mod tests {
         activity.settle(None, None).unwrap();
         assert_eq!(*calls.lock().unwrap(), 2);
     }
-}
-
-/// Domain outcome selected before any protocol representation. Cancellation wins
-/// over model/approval errors; cleanup or delivery failure cannot become success.
-pub(super) struct ExecutionOutcome {
-    result: Result<FinishReason, AcpRuntimeError>,
-}
-
-impl ExecutionOutcome {
-    pub(super) fn new(result: Result<FinishReason, AcpRuntimeError>, cancelled: bool) -> Self {
-        Self {
-            result: if cancelled || matches!(result, Err(AcpRuntimeError::Cancelled)) {
-                Ok(FinishReason::Cancelled)
-            } else {
-                result
-            },
-        }
-    }
-}
-
-/// Shared finalization order: cancel/drain structured work, drain all content even
-/// on failure, render a diagnostic, then return the outcome for single settlement.
-/// Hooks are transport only; neither hook chooses lifecycle or cleanup policy.
-pub(super) async fn finalize(
-    outcome: ExecutionOutcome,
-    structured: Option<(
-        &agentkit_task_manager::TaskManagerHandle,
-        &crate::runtime::BackgroundJobs,
-    )>,
-    flush: impl std::future::Future<Output = Result<(), AcpRuntimeError>>,
-    diagnostic: impl FnOnce(&AcpRuntimeError) -> Result<(), AcpRuntimeError>,
-) -> Result<FinishReason, AcpRuntimeError> {
-    let mut result = outcome.result;
-    if (result.is_err() || matches!(result, Ok(FinishReason::Cancelled)))
-        && let Some((tasks, jobs)) = structured
-    {
-        super::cancel_background_jobs(tasks, jobs).await;
-        if let Err(error) = super::settle_background_jobs(tasks, jobs).await {
-            result = Err(error);
-        }
-    }
-    if let Err(error) = flush.await {
-        result = Err(error);
-    }
-    if let Err(error) = &result {
-        diagnostic(error)?;
-    }
-    result
 }
