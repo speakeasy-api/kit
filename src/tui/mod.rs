@@ -13,6 +13,7 @@ mod image;
 mod markdown;
 mod plan;
 mod theme;
+mod transcript;
 mod ui;
 mod wrap;
 
@@ -1142,9 +1143,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
-                    terminal
-                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    app.with_navigation_clock_paused(|app| {
+                        terminal.draw(|frame| ui::draw(frame, app, &mut images))
+                    })
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
                         _ = storage_shutdown.cancelled() => return Ok(()),
                         terminal_event = events.next() => {
@@ -1678,12 +1680,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         update = updates_rx.recv() => match update {
-                            Some(update) => apply_pending_updates(
-                                &mut app,
-                                &transition_session,
-                                &mut updates_rx,
-                                update,
-                            ),
+                            Some(update) => app.with_navigation_clock_paused(|app| {
+                                apply_pending_updates(
+                                    app,
+                                    &transition_session,
+                                    &mut updates_rx,
+                                    update,
+                                )
+                            }),
                             None => return Ok(()),
                         },
                         _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
@@ -1941,6 +1945,10 @@ fn handle(app: &mut App, event: Event) -> Action {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
+            if app.navigation.dialog.is_some() {
+                app.paste(&text);
+                return Action::None;
+            }
             if app.queue_focused && !app.session_rename_active() {
                 return Action::None;
             }
@@ -3429,6 +3437,202 @@ mod tests {
         assert!(!super::pending_message_unavailable(
             &agent_client_protocol::Error::invalid_params()
         ));
+    }
+
+    #[test]
+    fn transcript_navigation_tool_media_search_uses_labels_not_payloads() {
+        let content = serde_json::from_value::<wire::ToolCallContent>(json!({
+            "type": "content",
+            "content": {
+                "type": "image",
+                "data": "c2VjcmV0",
+                "mimeType": "image/png",
+                "uri": "data:image/png;base64,c2VjcmV0"
+            }
+        }))
+        .unwrap();
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.apply(Update::ToolStarted {
+            id: "image-tool".into(),
+            title: "media".into(),
+            kind: wire::ToolKind::Other,
+            script: None,
+            backgrounded: false,
+        });
+        app.apply(Update::ToolUpdated {
+            id: "image-tool".into(),
+            status: None,
+            script: None,
+            output: super::output_of(Some(&[content])),
+            backgrounded: false,
+        });
+        app.open_navigation();
+        app.paste("c2VjcmV0");
+        assert!(app.sync_navigation().is_empty());
+        app.navigation.dialog.as_mut().unwrap().query = "base64".into();
+        assert!(app.sync_navigation().is_empty());
+        app.navigation.dialog.as_mut().unwrap().query = "image".into();
+        assert_eq!(app.sync_navigation(), vec![0]);
+    }
+
+    fn assert_navigation_key_paste_preserves_draft(working: bool) {
+        use crate::tui::{
+            app::{AttachmentKind, Phase},
+            transcript::Role,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::time::{Duration, Instant};
+
+        for suffix in ["\n\n", "\t\n\n"] {
+            let mut app = App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.apply(Update::AgentMessage {
+                id: "answer".into(),
+                text: "matching text".into(),
+                append: false,
+            });
+            app.paste("parked draft");
+            app.attach(
+                PathBuf::from("/tmp/parked.png"),
+                "image/png",
+                AttachmentKind::Image,
+                12,
+            );
+            app.editor.move_left();
+            let draft = app.editor.text().to_owned();
+            let cursor = app.editor.cursor();
+            let attachments = app.attachments.clone();
+            app.phase = if working { Phase::Working } else { Phase::Idle };
+            app.can_steer = true;
+            app.follow = false;
+            app.scroll = 7;
+            app.last_key = None;
+            assert!(matches!(
+                handle(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+                ),
+                Action::None
+            ));
+            for character in format!("matching text{suffix}").chars() {
+                let code = match character {
+                    '\n' => KeyCode::Enter,
+                    '\t' => KeyCode::Tab,
+                    character => KeyCode::Char(character),
+                };
+                // Feed the real rapid sequence: do not repair the app's clock
+                // between keys, which would mask slow-processing regressions.
+                let arrived = Instant::now();
+                assert!(matches!(
+                    handle(
+                        &mut app,
+                        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+                    ),
+                    Action::None
+                ));
+                assert!(app.last_key.is_some_and(|last| last >= arrived));
+                assert!(
+                    app.navigation.dialog.is_some(),
+                    "paste must not close navigator: {code:?}"
+                );
+                assert_eq!(app.editor.text(), draft);
+                assert_eq!(app.editor.cursor(), cursor);
+                assert_eq!(app.attachments, attachments);
+            }
+            let dialog = app.navigation.dialog.as_ref().unwrap();
+            // Single-line queries discard control whitespace in both paste modes.
+            assert_eq!(dialog.query, "matching text");
+            assert_eq!(dialog.role, Role::All);
+            assert!(app.navigation.revealed.is_none());
+            assert!(app.pending_steers.is_empty());
+            assert_eq!(app.scroll, 7);
+            assert!(!app.follow);
+            assert_eq!(app.working(), working);
+
+            // An intentional Enter after the burst still reveals the selection.
+            app.last_key = Some(Instant::now() - Duration::from_millis(500));
+            assert!(matches!(
+                handle(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                ),
+                Action::None
+            ));
+            assert!(app.navigation.dialog.is_none());
+            assert!(app.navigation.revealed.is_some());
+            assert_eq!(app.editor.text(), draft);
+            assert_eq!(app.editor.cursor(), cursor);
+            assert_eq!(app.attachments, attachments);
+            assert!(app.pending_steers.is_empty());
+            assert_eq!(app.working(), working);
+        }
+    }
+
+    #[test]
+    fn transcript_navigation_key_paste_cannot_send_parked_draft() {
+        assert_navigation_key_paste_preserves_draft(false);
+    }
+
+    #[test]
+    fn transcript_navigation_key_paste_cannot_steer_parked_draft() {
+        assert_navigation_key_paste_preserves_draft(true);
+    }
+
+    #[test]
+    fn transcript_navigation_paste_and_mouse_do_not_touch_the_composer() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image.png");
+        std::fs::write(&image, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().to_path_buf(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.paste("parked draft");
+        app.scroll = 7;
+        app.follow = false;
+        handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+        );
+        let query = image.display().to_string();
+        assert!(matches!(
+            handle(&mut app, Event::Paste(query.clone())),
+            Action::None
+        ));
+        assert_eq!(app.navigation.dialog.as_ref().unwrap().query, query);
+        assert!(app.attachments.is_empty());
+        assert_eq!(app.editor.text(), "parked draft");
+        assert!(matches!(
+            handle(
+                &mut app,
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE
+                })
+            ),
+            Action::None
+        ));
+        handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        assert_eq!(app.scroll, 7);
+        assert!(!app.follow);
+        assert_eq!(app.editor.text(), "parked draft");
     }
 
     #[test]

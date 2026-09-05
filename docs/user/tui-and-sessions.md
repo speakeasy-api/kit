@@ -41,8 +41,9 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 | --- | --- |
 | `Enter` | Send a non-empty prompt when idle; steer and finish the current response while active if the agent advertises that capability |
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
-| `Esc` | Cancel a pending-message edit and restore the previous draft; leave the queue selector; otherwise interrupt a running turn or dismiss an idle notice |
+| `Esc` | Close the transcript navigator; cancel a pending-message edit and restore the previous draft; leave the queue selector; otherwise interrupt a running turn or dismiss an idle notice |
 | `F2` | Focus the pending-message queue (or return to the composer) |
+| `F3` | Open or close the read-only transcript navigator, including while streaming |
 | `Up` / `Down`, `Enter`, `Backspace` / `Delete` in the queue | Select a pending message, edit it if supported, or remove it |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
 | `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
@@ -65,7 +66,26 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 
 Pasted text is inserted rather than sent. Bracketed paste is used when available; otherwise Kit treats a rapid key burst as a paste, so returns in that burst become line breaks. This keeps a multiline paste in one prompt. Press plain `Enter` afterward to submit it.
 
-When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` uses ACP v2 `steer` injection with `finish` stream behavior only when the agent advertised both capabilities. An accepted injected user message first appears in the pending queue above the composer. It moves to the transcript when the agent delivers it as part of the current turn. If steering is unavailable, the editor keeps the message and shows `this agent does not support active steering`. Local commands and agent-advertised session commands are available only while idle.
+When the session is idle, `Enter` starts a normal prompt. While the agent is active, `Enter` uses ACP v2 `steer` injection with `finish` stream behavior only when the agent advertised both capabilities. An accepted injected user message first appears in the pending queue above the composer. It moves to the transcript when the agent delivers it as part of the current turn. If steering is unavailable, the editor keeps the message and shows `this agent does not support active steering`. Except for the read-only `/transcript` navigator, local commands and agent-advertised session commands are available only while idle.
+
+### Find and reveal transcript blocks
+
+Press `F3` to open the read-only transcript navigator, even while a response is streaming. This dedicated shortcut does not replace an editor shortcut and leaves the prompt draft and attachments untouched. You can also type the exact local command `/transcript` and press `Enter`: it opens the navigator, preserves the typed command in the editor, and never sends it to the agent. The command takes no arguments; `/transcript query` is an ordinary prompt instead.
+
+| Key in the navigator | Action |
+| --- | --- |
+| Type text | Filter blocks with a case-insensitive substring query |
+| `Tab` / `Shift+Tab` | Cycle forward / backward through All, User, Assistant, Thought, and Tool filters |
+| `Up` / `Down` | Select the previous / next matching block in chronological order |
+| `Ctrl+Up` / `Ctrl+Down` | Select the previous / next User prompt, switching to the User filter while retaining the query |
+| `Enter` | Reveal and highlight the selected rendered block in the transcript |
+| `Esc` / `F3` | Close without changing transcript scroll position, editor text, or attachments |
+
+Navigator queries are limited to 4,096 UTF-8 bytes. Oversized pastes keep a bounded whole-grapheme prefix; pasted newlines and tabs are ignored rather than activating navigator controls.
+
+Revealing a Thought block temporarily shows it even when reasoning is hidden. Browsing and closing alone do not move the transcript; `Enter` explicitly reveals the selected block. While the navigator is open, `Esc` closes it rather than interrupting the turn.
+
+The navigator searches only the currently displayed or replayed history, not a compacted archive or undelivered messages in the pending queue. Tool searches include display text such as the title, script, and output; media labels are searchable, but binary media payloads are not. Block identities are local and ephemeral, not durable addresses for forking. This is navigation only: it does not fork a session, write history, cancel a turn, or send a prompt.
 
 ### Edit or remove a pending message
 
@@ -115,7 +135,7 @@ When the agent roster is visible, terminals at least 108 columns wide show the t
 
 ## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, and `/agents` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/agents`, and `/transcript` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
@@ -129,9 +149,10 @@ The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, a
 /effort
 /effort high
 /agents
+/transcript
 ```
 
-These local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
+Except for `/transcript`, which also opens while streaming, these local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. A new or resumed process starts from the resolved CLI/TOML default unless the selection was saved.
 
