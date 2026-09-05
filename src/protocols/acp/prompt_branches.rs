@@ -1,4 +1,4 @@
-//! Kit-private text-prompt checkout protocol. Addresses are issued by the backend;
+//! Kit-private conversation checkout protocol. Addresses are issued by the backend;
 //! neither display positions nor provider item identifiers are branch authority.
 
 use agentkit_acp::v2::wire;
@@ -16,10 +16,23 @@ pub(crate) struct ListPromptBranchesResponse {
     pub boundaries: Vec<PromptBoundary>,
 }
 
+/// Missing roles on the legacy private wire describe before-user checkouts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptRole {
+    #[default]
+    User,
+    Assistant,
+    Tool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PromptBoundary {
     pub address: String,
+    /// Chooser preview, not the prepared editor contents.
     pub text: String,
+    #[serde(default)]
+    pub role: PromptRole,
     pub historical: bool,
 }
 
@@ -113,7 +126,9 @@ struct ApprovedBoundary {
     parent_session_id: String,
     provenance: branch::Boundary,
     state: Arc<Vec<Item>>,
-    text: String,
+    role: PromptRole,
+    selection_identity: blake3::Hash,
+    original_text: String,
 }
 
 #[derive(Clone)]
@@ -240,19 +255,23 @@ impl PromptCheckouts {
             }
             let state = Arc::new(state.clone());
             for (index, item) in state.iter().enumerate() {
-                if item.kind != ItemKind::User {
-                    continue;
-                }
-                let Ok(text) = text_prompt(item) else {
+                let Some((role, text, original_text)) = checkout_candidate(item) else {
                     continue;
                 };
-                let prefix = &state[..index];
-                if prefix.is_empty() || crate::transcript::has_unanswered_tool_calls(prefix) {
+                // User edits replace the selected prompt; continuations retain
+                // the entire selected assistant/result item, never a partial batch.
+                let prefix_len = index + usize::from(role != PromptRole::User);
+                let prefix = &state[..prefix_len];
+                if prefix.is_empty() || crate::transcript::validate_checkout_prefix(prefix).is_err()
+                {
                     continue;
                 }
-                let identity =
-                    serde_json::to_vec(&state[..=index]).map_err(|error| error.to_string())?;
-                if !seen.insert(blake3::hash(&identity)) {
+                // Distinct selections can retain the same prefix (an assistant
+                // answer and the following user prompt). Bind role AND selection.
+                let identity = serde_json::to_vec(&(role, &state[..=index]))
+                    .map_err(|error| error.to_string())?;
+                let selection_identity = blake3::hash(&identity);
+                if !seen.insert(selection_identity) {
                     continue;
                 }
                 let provenance = branch::Boundary::new(state_index, prefix)?;
@@ -260,7 +279,9 @@ impl PromptCheckouts {
                     .boundaries
                     .iter()
                     .find_map(|(address, existing)| {
-                        (existing.provenance == provenance && existing.text == text)
+                        (existing.provenance == provenance
+                            && existing.role == role
+                            && existing.selection_identity == selection_identity)
                             .then(|| address.clone())
                     })
                     .unwrap_or_else(crate::session::new_id);
@@ -269,12 +290,15 @@ impl PromptCheckouts {
                     parent_session_id: session_id.into(),
                     provenance,
                     state: Arc::clone(&state),
-                    text: text.clone(),
+                    role,
+                    selection_identity,
+                    original_text,
                 };
                 self.boundaries.insert(address.clone(), boundary);
                 result.push(PromptBoundary {
                     address,
                     text,
+                    role,
                     historical: state_index + 1 != states.len(),
                 });
             }
@@ -299,7 +323,7 @@ impl PromptCheckouts {
             .validate(transcript, checkout_revision, selection, reasoning)?;
         let checkout = PreparedCheckout {
             token: crate::session::new_id(),
-            original_text: boundary.text.clone(),
+            original_text: boundary.original_text.clone(),
             prefix: boundary.state[..boundary.provenance.prefix_len].to_vec(),
             selection: selection.clone(),
             reasoning,
@@ -328,6 +352,48 @@ impl PromptCheckouts {
             .source
             .validate(transcript, checkout_revision, selection, reasoning)?;
         Ok(checkout.clone())
+    }
+}
+
+/// Only selection-specific restrictions belong here. The ordered prefix
+/// validator checks inherited history without imposing text-only user input.
+fn checkout_candidate(item: &Item) -> Option<(PromptRole, String, String)> {
+    match item.kind {
+        ItemKind::User => {
+            let text = text_prompt(item).ok()?;
+            Some((PromptRole::User, text.clone(), text))
+        }
+        ItemKind::Assistant => {
+            let mut text = String::new();
+            for part in &item.parts {
+                match part {
+                    Part::Text(part) => text.push_str(&part.text),
+                    Part::Reasoning(_) | Part::ToolCall(_) => {}
+                    // Do not offer a selected item whose visible content would
+                    // be dropped by the sanitizer or unsupported by adapters.
+                    _ => return None,
+                }
+            }
+            // A reasoning display summary is not portable assistant text.
+            (!text.trim().is_empty()).then_some((PromptRole::Assistant, text, String::new()))
+        }
+        ItemKind::Tool => {
+            let mut previews = Vec::new();
+            for part in &item.parts {
+                let Part::ToolResult(result) = part else {
+                    return None;
+                };
+                // Preview only: never serialize potentially large/binary tool
+                // outputs into the chooser. The retained snapshot is unchanged.
+                let output = match &result.output {
+                    agentkit_core::ToolOutput::Text(text) => text.chars().take(240).collect(),
+                    _ => "[non-text result]".to_string(),
+                };
+                previews.push(format!("{}: {output}", result.call_id));
+            }
+            (!previews.is_empty()).then_some((PromptRole::Tool, previews.join("\n"), String::new()))
+        }
+        _ => None,
     }
 }
 
@@ -408,11 +474,11 @@ mod tests {
         let before = source.clone();
         let mut checkouts = PromptCheckouts::default();
         let boundaries = list(&mut checkouts, &source, std::slice::from_ref(&source));
-        assert_eq!(boundaries.boundaries.len(), 2);
+        assert_eq!(boundaries.boundaries.len(), 4);
         for (index, prefix_len) in [2, 4].into_iter().enumerate() {
             let prepared = checkouts
                 .prepare(
-                    &boundaries.boundaries[index].address,
+                    &boundaries.boundaries[index * 2].address,
                     &source,
                     0,
                     &selection(),
@@ -438,6 +504,228 @@ mod tests {
             );
         }
         assert_eq!(source, before);
+    }
+
+    #[test]
+    fn assistant_continuations_keep_exact_inclusive_prefix_and_empty_draft() {
+        // Neither intermediate nor final committed text needs a finish-reason
+        // marker. The following user selection retains the same prefix but has
+        // distinct authority and still prefills its original prompt.
+        let source = conversation();
+        let mut checkouts = PromptCheckouts::default();
+        let listed = list(&mut checkouts, &source, std::slice::from_ref(&source));
+        for (boundary_index, prefix_len) in [(1, 4), (3, 6)] {
+            let boundary = &listed.boundaries[boundary_index];
+            assert_eq!(boundary.role, PromptRole::Assistant);
+            assert!(!boundary.text.is_empty());
+            let prepared = checkouts
+                .prepare(&boundary.address, &source, 0, &selection(), None)
+                .unwrap();
+            assert_eq!(prepared.prefix, source[..prefix_len]);
+            assert!(prepared.original_text.is_empty());
+            assert!(prepared.fork(" \n").is_err());
+            let fork = prepared.fork("continue here").unwrap();
+            assert_eq!(&fork.transcript[1..prefix_len], &source[1..prefix_len]);
+            assert_eq!(fork.transcript.len(), prefix_len + 1);
+            assert_eq!(
+                text_prompt(fork.transcript.last().unwrap()).unwrap(),
+                "continue here"
+            );
+            let metadata = branch::BranchMetadata::read(&fork.transcript)
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata.boundary.prefix_len, prefix_len);
+            assert!(
+                checkouts
+                    .prepare(&boundary.address, &source, 1, &selection(), None)
+                    .is_err()
+            );
+        }
+        assert_ne!(listed.boundaries[1].address, listed.boundaries[2].address);
+        let again = list(&mut checkouts, &source, std::slice::from_ref(&source));
+        for (old, new) in listed.boundaries.iter().zip(&again.boundaries) {
+            assert_eq!(old.address, new.address);
+        }
+    }
+
+    fn tool_result(id: &str) -> Item {
+        Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+                id,
+                agentkit_core::ToolOutput::text(format!("result {id}")),
+            ))],
+        )
+    }
+
+    fn parallel_conversation() -> Vec<Item> {
+        vec![
+            Item::text(ItemKind::System, "bootstrap"),
+            Item::text(ItemKind::User, "run tools"),
+            Item::new(
+                ItemKind::Assistant,
+                vec![
+                    Part::text("calling both tools"),
+                    Part::ToolCall(ToolCallPart::new("a", "tool", json!({}))),
+                    Part::ToolCall(ToolCallPart::new("b", "tool", json!({}))),
+                ],
+            ),
+            tool_result("a"),
+            tool_result("b"),
+            Item::text(ItemKind::Assistant, "after tools"),
+        ]
+    }
+
+    #[test]
+    fn only_last_parallel_result_is_a_boundary_in_either_order() {
+        for reverse in [false, true] {
+            let mut source = parallel_conversation();
+            if reverse {
+                source.swap(3, 4);
+            }
+            let mut checkouts = PromptCheckouts::default();
+            let listed = list(&mut checkouts, &source, std::slice::from_ref(&source));
+            assert_eq!(
+                listed.boundaries.iter().map(|b| b.role).collect::<Vec<_>>(),
+                [PromptRole::User, PromptRole::Tool, PromptRole::Assistant]
+            );
+            let boundary = &listed.boundaries[1];
+            let prepared = checkouts
+                .prepare(&boundary.address, &source, 0, &selection(), None)
+                .unwrap();
+            assert_eq!(prepared.prefix, source[..5]);
+            assert!(prepared.original_text.is_empty());
+            let fork = prepared.fork("continue after tools").unwrap();
+            assert_eq!(&fork.transcript[1..5], &source[1..5]);
+            assert_eq!(fork.transcript.len(), 6);
+            // Listing a still-open batch must not move the selected partial
+            // result forward or split the text+calls assistant item.
+            for end in [3, 4] {
+                let partial = &source[..end];
+                let listed = list(&mut checkouts, partial, &[partial.to_vec()]);
+                assert_eq!(listed.boundaries.len(), 1);
+                assert_eq!(listed.boundaries[0].role, PromptRole::User);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_ordered_history_never_offers_later_candidates() {
+        let source = parallel_conversation();
+        let malformed = [
+            vec![source[2].clone(), source[3].clone()], // missing result
+            vec![source[3].clone()],                    // orphan / before call
+            vec![source[3].clone(), source[2].clone(), source[4].clone()],
+            vec![
+                source[2].clone(),
+                source[3].clone(),
+                source[3].clone(),
+                source[4].clone(),
+            ],
+            vec![
+                source[2].clone(),
+                source[2].clone(),
+                source[3].clone(),
+                source[4].clone(),
+            ],
+            vec![
+                source[2].clone(),
+                Item::text(ItemKind::User, "interrupt"),
+                source[3].clone(),
+                source[4].clone(),
+            ],
+        ];
+        for middle in malformed {
+            let mut invalid = source[..2].to_vec();
+            invalid.extend(middle);
+            invalid.push(Item::text(ItemKind::Assistant, "unsafe answer"));
+            invalid.push(Item::text(ItemKind::User, "unsafe prompt"));
+            let listed = list(
+                &mut PromptCheckouts::default(),
+                &invalid,
+                std::slice::from_ref(&invalid),
+            );
+            assert_eq!(listed.boundaries.len(), 1);
+            assert_eq!(listed.boundaries[0].text, "run tools");
+        }
+    }
+
+    #[test]
+    fn reasoning_only_is_not_a_candidate_but_inherited_reasoning_and_user_media_survive() {
+        let mut source = conversation()[..3].to_vec();
+        source.push(Item::new(
+            ItemKind::Assistant,
+            vec![Part::Reasoning(agentkit_core::ReasoningPart::summary(
+                "displayed thought, not assistant text",
+            ))],
+        ));
+        source.push(Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(vec![1]),
+            )],
+        ));
+        source.push(Item::new(
+            ItemKind::Assistant,
+            vec![
+                Part::Reasoning(agentkit_core::ReasoningPart::summary("inherited thought")),
+                Part::text("portable answer"),
+            ],
+        ));
+        source.push(Item::text(ItemKind::User, "next prompt"));
+        let mut checkouts = PromptCheckouts::default();
+        let listed = list(&mut checkouts, &source, std::slice::from_ref(&source));
+        assert_eq!(listed.boundaries.len(), 3);
+        for boundary in &listed.boundaries[1..] {
+            let prepared = checkouts
+                .prepare(&boundary.address, &source, 0, &selection(), None)
+                .unwrap();
+            assert_eq!(prepared.prefix, source[..6]);
+            let fork = prepared.fork("edited").unwrap();
+            assert_eq!(&fork.transcript[1..6], &source[1..6]);
+        }
+        source[5].parts.push(Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![1]),
+        ));
+        assert!(checkout_candidate(&source[5]).is_none());
+    }
+
+    #[test]
+    fn role_wire_defaults_legacy_and_writes_current_shape() {
+        let legacy = json!({"address":"opaque", "text":"preview", "historical":false});
+        let parsed: PromptBoundary = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(parsed.role, PromptRole::User);
+        assert_eq!(serde_json::to_value(parsed).unwrap()["role"], "user");
+        for (name, role) in [
+            ("user", PromptRole::User),
+            ("assistant", PromptRole::Assistant),
+            ("tool", PromptRole::Tool),
+        ] {
+            let mut current = legacy.clone();
+            current["role"] = json!(name);
+            let parsed: PromptBoundary = serde_json::from_value(current.clone()).unwrap();
+            assert_eq!(parsed.role, role);
+            assert_eq!(serde_json::to_value(parsed).unwrap(), current);
+        }
+        for malformed in [
+            json!(null),
+            json!("Assistant"),
+            json!("system"),
+            json!(0),
+            json!({}),
+            json!([]),
+        ] {
+            let mut invalid = legacy.clone();
+            invalid["role"] = malformed;
+            assert!(serde_json::from_value::<PromptBoundary>(invalid).is_err());
+        }
+        assert!(serde_json::from_str::<PromptBoundary>(
+            r#"{"address":"opaque","text":"preview","historical":false,"role":"user","role":"tool"}"#
+        ).is_err());
     }
 
     #[test]
@@ -480,6 +768,81 @@ mod tests {
     }
 
     #[test]
+    fn archived_assistant_and_tool_boundaries_keep_the_selected_snapshot() {
+        let historical = parallel_conversation();
+        let current = vec![
+            historical[0].clone(),
+            Item::text(ItemKind::Developer, "FUTURE SUMMARY"),
+            Item::text(ItemKind::User, "future prompt"),
+        ];
+        let states = vec![historical.clone(), current.clone()];
+        let mut checkouts = PromptCheckouts::default();
+        let listed = list(&mut checkouts, &current, &states);
+        for (role, prefix_len) in [(PromptRole::Tool, 5), (PromptRole::Assistant, 6)] {
+            let boundary = listed.boundaries.iter().find(|b| b.role == role).unwrap();
+            assert!(boundary.historical);
+            let prepared = checkouts
+                .prepare(&boundary.address, &current, 0, &selection(), None)
+                .unwrap();
+            assert_eq!(prepared.prefix, historical[..prefix_len]);
+            assert!(prepared.original_text.is_empty());
+            assert_eq!(prepared.boundary.provenance.state_index, 0);
+            assert!(
+                !serde_json::to_string(&prepared.fork("new future").unwrap().transcript)
+                    .unwrap()
+                    .contains("FUTURE SUMMARY")
+            );
+        }
+        // An unchanged selection retained across snapshots appears only as a
+        // current point; source authority still binds the exact current state.
+        let mut extended = historical.clone();
+        extended.push(Item::text(ItemKind::User, "next"));
+        let listed = list(&mut checkouts, &extended, &[historical, extended.clone()]);
+        assert_eq!(listed.boundaries.len(), 4);
+        assert!(
+            listed
+                .boundaries
+                .iter()
+                .all(|boundary| !boundary.historical)
+        );
+    }
+
+    #[test]
+    fn inclusive_tool_fork_uses_shared_provider_sanitizer_without_mutating_snapshot() {
+        let mut source = parallel_conversation();
+        let Part::ToolCall(call) = &mut source[2].parts[1] else {
+            unreachable!()
+        };
+        call.metadata.insert(
+            "openai.responses.continuation.v1".into(),
+            json!({"id":"source"}),
+        );
+        call.metadata.insert("preserved".into(), json!(true));
+        let mut checkouts = PromptCheckouts::default();
+        let listed = list(&mut checkouts, &source, std::slice::from_ref(&source));
+        let boundary = listed
+            .boundaries
+            .iter()
+            .find(|b| b.role == PromptRole::Tool)
+            .unwrap();
+        let prepared = checkouts
+            .prepare(&boundary.address, &source, 0, &selection(), None)
+            .unwrap();
+        let fork = prepared.fork("continue").unwrap();
+        let Part::ToolCall(call) = &fork.transcript[2].parts[1] else {
+            unreachable!()
+        };
+        assert!(
+            !call
+                .metadata
+                .contains_key("openai.responses.continuation.v1")
+        );
+        assert_eq!(call.metadata["preserved"], true);
+        assert_eq!(prepared.prefix, source[..5]);
+        assert_eq!(prepared.boundary.state.as_slice(), source);
+    }
+
+    #[test]
     fn read_only_lists_and_prepares_do_not_stale_existing_tokens() {
         let source = conversation();
         let mut checkouts = PromptCheckouts::default();
@@ -497,7 +860,7 @@ mod tests {
                 .checkout(&prepared.token, &source, 0, &selection(), None)
                 .is_ok()
         );
-        assert_eq!(checkouts.boundaries.len(), 2);
+        assert_eq!(checkouts.boundaries.len(), 4);
         // Restart creates a fresh actor-local authority regardless of Item.id.
         assert!(
             PromptCheckouts::default()

@@ -6118,7 +6118,7 @@ mod tests {
                     })
                     .block_task()
                     .await?;
-                assert_eq!(listed.boundaries.len(), 1);
+                assert_eq!(listed.boundaries.len(), 2);
                 let address = listed.boundaries[0].address.clone();
                 // An integration-rejected injection must release the admission
                 // tracker, so a subsequent settled checkout still succeeds.

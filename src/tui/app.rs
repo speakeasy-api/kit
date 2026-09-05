@@ -30,6 +30,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::compaction::is_compaction_summary;
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
+use crate::protocols::acp::prompt_branches::{PromptBoundary, PromptRole};
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
@@ -308,10 +309,58 @@ struct SteerEdit {
 
 pub(super) const BRANCH_WARNING: &str = "Only conversation context changes. Filesystem changes, running processes, and external effects are not rolled back.";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum BranchFilter {
+    #[default]
+    All,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl BranchFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+            Self::Tool => "Tool",
+        }
+    }
+
+    fn matches(self, role: &PromptRole) -> bool {
+        matches!(
+            (self, role),
+            (Self::All, _)
+                | (Self::User, PromptRole::User)
+                | (Self::Assistant, PromptRole::Assistant)
+                | (Self::Tool, PromptRole::Tool)
+        )
+    }
+}
+
+pub(super) fn branch_role_label(role: &PromptRole) -> &'static str {
+    match role {
+        PromptRole::User => "[user]",
+        PromptRole::Assistant => "[assistant]",
+        PromptRole::Tool => "[tool]",
+    }
+}
+
 pub(super) struct BranchChooser {
-    pub boundaries: Vec<crate::protocols::acp::prompt_branches::PromptBoundary>,
+    pub boundaries: Vec<PromptBoundary>,
+    pub filter: BranchFilter,
+    /// Index within the filtered list, never a backend address.
     pub selected: usize,
     pub pending: bool,
+}
+
+impl BranchChooser {
+    pub fn filtered_boundaries(&self) -> impl Iterator<Item = &PromptBoundary> {
+        self.boundaries
+            .iter()
+            .filter(|boundary| self.filter.matches(&boundary.role))
+    }
 }
 
 struct BranchDraft {
@@ -3480,6 +3529,7 @@ impl App {
         self.branch_epoch = self.branch_epoch.wrapping_add(1);
         self.branch_chooser = Some(BranchChooser {
             boundaries: Vec::new(),
+            filter: BranchFilter::All,
             selected: 0,
             pending: true,
         });
@@ -3502,6 +3552,7 @@ impl App {
         match result {
             Ok(boundaries) => {
                 chooser.boundaries = boundaries;
+                chooser.selected = 0;
                 chooser.pending = false;
             }
             Err(error) => {
@@ -3625,14 +3676,26 @@ impl App {
                 return Action::None;
             }
             match key.code {
+                KeyCode::Char(c @ ('0'..='3')) if key.modifiers.is_empty() && !pasted => {
+                    chooser.filter = match c {
+                        '1' => BranchFilter::User,
+                        '2' => BranchFilter::Assistant,
+                        '3' => BranchFilter::Tool,
+                        _ => BranchFilter::All,
+                    };
+                    chooser.selected = 0;
+                }
                 KeyCode::Up => chooser.selected = chooser.selected.saturating_sub(1),
                 KeyCode::Down => {
-                    chooser.selected =
-                        (chooser.selected + 1).min(chooser.boundaries.len().saturating_sub(1))
+                    chooser.selected = (chooser.selected + 1)
+                        .min(chooser.filtered_boundaries().count().saturating_sub(1))
                 }
                 KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
-                    if let Some(boundary) = chooser.boundaries.get(chooser.selected) {
-                        let address = boundary.address.clone();
+                    let address = chooser
+                        .filtered_boundaries()
+                        .nth(chooser.selected)
+                        .map(|boundary| boundary.address.clone());
+                    if let Some(address) = address {
                         chooser.pending = true;
                         self.branch_epoch = self.branch_epoch.wrapping_add(1);
                         return Action::PreparePromptBranch {
@@ -4489,8 +4552,11 @@ mod tests {
     };
 
     use super::{
-        Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
-        MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+        Action, App, AttachmentKind, Block, BranchFilter, MAX_IMAGE_BASE64_BYTES,
+        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+    };
+    use crate::protocols::acp::prompt_branches::{
+        PreparePromptBranchResponse, PromptBoundary, PromptRole,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -4615,6 +4681,7 @@ mod tests {
             epoch,
             Ok(vec![
                 crate::protocols::acp::prompt_branches::PromptBoundary {
+                    role: PromptRole::User,
                     address: "opaque".into(),
                     text: "original".into(),
                     historical: false,
@@ -4622,6 +4689,180 @@ mod tests {
             ]),
         );
         epoch
+    }
+
+    #[test]
+    fn branch_role_filters_select_backend_addresses_not_filtered_positions() {
+        let mut app = app();
+        let epoch = ready_branch_chooser(&mut app);
+        app.branch_listed(
+            epoch,
+            Ok(vec![
+                PromptBoundary {
+                    role: PromptRole::User,
+                    address: "user-address".into(),
+                    text: "user".into(),
+                    historical: false,
+                },
+                PromptBoundary {
+                    role: PromptRole::Tool,
+                    address: "tool-address".into(),
+                    text: "tool".into(),
+                    historical: false,
+                },
+                PromptBoundary {
+                    role: PromptRole::Assistant,
+                    address: "assistant-first".into(),
+                    text: "first".into(),
+                    historical: true,
+                },
+                PromptBoundary {
+                    role: PromptRole::Assistant,
+                    address: "assistant-last".into(),
+                    text: "last".into(),
+                    historical: false,
+                },
+            ]),
+        );
+        for (key, filter, count, expected) in [
+            ('2', BranchFilter::Assistant, 2, "assistant-last"),
+            ('3', BranchFilter::Tool, 1, "tool-address"),
+            ('1', BranchFilter::User, 1, "user-address"),
+            ('0', BranchFilter::All, 4, "assistant-last"),
+        ] {
+            app.handle_branch_key(press(KeyCode::Char(key)), false);
+            let chooser = app.branch_chooser.as_ref().unwrap();
+            assert_eq!(chooser.filter, filter);
+            assert_eq!(chooser.selected, 0);
+            assert_eq!(chooser.filtered_boundaries().count(), count);
+            for _ in 0..5 {
+                app.handle_branch_key(press(KeyCode::Down), false);
+            }
+            assert_eq!(app.branch_chooser.as_ref().unwrap().selected, count - 1);
+            let Action::PreparePromptBranch { address, epoch } =
+                app.handle_branch_key(press(KeyCode::Enter), false)
+            else {
+                panic!("must prepare selected boundary")
+            };
+            assert_eq!(address, expected);
+            // A failed prepare keeps the filter and selection available to retry.
+            app.branch_prepared(epoch, Err("retry".into()));
+        }
+    }
+
+    #[test]
+    fn branch_empty_filter_and_empty_list_are_safe_and_filter_keys_are_unmodified() {
+        let mut app = app();
+        let epoch = ready_branch_chooser(&mut app);
+        app.handle_branch_key(
+            modified_press(KeyCode::Char('2'), KeyModifiers::CONTROL),
+            false,
+        );
+        app.handle_branch_key(press(KeyCode::Char('3')), true);
+        assert_eq!(
+            app.branch_chooser.as_ref().unwrap().filter,
+            BranchFilter::All
+        );
+        app.handle_branch_key(press(KeyCode::Char('2')), false);
+        for empty_list in [false, true] {
+            if empty_list {
+                app.branch_listed(epoch, Ok(Vec::new()));
+                app.handle_branch_key(press(KeyCode::Char('0')), false);
+            }
+            for key in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
+                assert!(matches!(
+                    app.handle_branch_key(press(key), false),
+                    Action::None
+                ));
+            }
+            let chooser = app.branch_chooser.as_ref().unwrap();
+            assert_eq!(chooser.filtered_boundaries().count(), 0);
+            assert_eq!(chooser.selected, 0);
+            assert!(!chooser.pending);
+        }
+    }
+
+    #[test]
+    fn branch_assistant_and_tool_empty_prefill_require_text_and_restore_source_on_escape() {
+        for role in [PromptRole::Assistant, PromptRole::Tool] {
+            let mut app = app();
+            app.start_session("source".into());
+            app.push_block(Block::Agent("source answer".into()));
+            app.paste("unsent draft");
+            app.attach(
+                PathBuf::from("/tmp/source.png"),
+                "image/png",
+                AttachmentKind::Image,
+                1,
+            );
+            let source_text = app.editor.text().to_string();
+            let source_attachments = app.attachments.clone();
+            let epoch = ready_branch_chooser(&mut app);
+            app.branch_listed(
+                epoch,
+                Ok(vec![PromptBoundary {
+                    role,
+                    address: "backend-address".into(),
+                    text: "preview, not prefill".into(),
+                    historical: false,
+                }]),
+            );
+            let Action::PreparePromptBranch { epoch, .. } =
+                app.handle_branch_key(press(KeyCode::Enter), false)
+            else {
+                panic!("prepare")
+            };
+            app.branch_prepared(
+                epoch,
+                Ok(PreparePromptBranchResponse {
+                    checkout_token: "empty-prefill".into(),
+                    original_text: String::new(),
+                    prefix: Vec::new(),
+                    config_options: Vec::new(),
+                }),
+            );
+            assert!(app.editing_branch());
+            assert!(app.editor.text().is_empty());
+            assert!(app.attachments.is_empty());
+            for text in ["", " \n\t"] {
+                app.editor.clear();
+                app.editor.insert_str(text);
+                assert!(matches!(
+                    app.handle_branch_key(press(KeyCode::Enter), false),
+                    Action::None
+                ));
+                assert!(!app.branch_submitting());
+            }
+            app.editor.insert_str("continue here");
+            let Action::SubmitPromptBranch {
+                epoch,
+                text,
+                checkout_token,
+            } = app.handle_branch_key(press(KeyCode::Enter), false)
+            else {
+                panic!("nonblank continuation must submit")
+            };
+            assert_eq!(text, " \n    continue here");
+            assert_eq!(checkout_token, "empty-prefill");
+            app.branch_submit_failed(epoch, "retry".into());
+            app.handle_branch_key(press(KeyCode::Esc), false);
+            assert_eq!(app.editor.text(), source_text);
+            assert_eq!(app.attachments, source_attachments);
+            assert_eq!(app.session_id.as_deref(), Some("source"));
+            assert!(matches!(&app.blocks[0], Block::Agent(text) if text == "source answer"));
+            // An empty prepared editor is still guarded against late responses.
+            app.branch_prepared(
+                epoch,
+                Ok(PreparePromptBranchResponse {
+                    checkout_token: "late".into(),
+                    original_text: String::new(),
+                    prefix: Vec::new(),
+                    config_options: Vec::new(),
+                }),
+            );
+            assert!(!app.editing_branch());
+            assert_eq!(app.editor.text(), source_text);
+        }
     }
 
     #[test]
@@ -4957,6 +5198,7 @@ mod tests {
         app.branch_listed(
             epoch,
             Ok(vec![PromptBoundary {
+                role: PromptRole::User,
                 address: "stale".into(),
                 text: "stale".into(),
                 historical: false,

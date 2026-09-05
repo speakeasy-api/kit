@@ -626,10 +626,11 @@ fn draw_branch_chooser(frame: &mut Frame<'_>, app: &App) {
     let inner = panel.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(panel, area);
-    let [warning, entries, help] = Layout::vertical([
+    let [warning, filters, entries, help] = Layout::vertical([
         Constraint::Length(
             (super::app::BRANCH_WARNING.len() as u16 / inner.width.max(1) + 2).min(7),
         ),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -640,17 +641,25 @@ fn draw_branch_chooser(frame: &mut Frame<'_>, app: &App) {
             .wrap(ratatui::widgets::Wrap { trim: false }),
         warning,
     );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "0 All · 1 User · 2 Assistant · 3 Tool · Filter: {}",
+            chooser.filter.label()
+        )),
+        filters,
+    );
     let rows = if chooser.pending {
         vec![Line::from("Loading checkout… Esc cancels")]
-    } else if chooser.boundaries.is_empty() {
-        vec![Line::from("No eligible text prompts in this session.")]
+    } else if chooser.filtered_boundaries().next().is_none() {
+        vec![Line::from(
+            "No eligible text checkpoints match this filter.",
+        )]
     } else {
         let start = chooser
             .selected
             .saturating_sub(entries.height.saturating_sub(1) as usize);
         chooser
-            .boundaries
-            .iter()
+            .filtered_boundaries()
             .enumerate()
             .skip(start)
             .take(entries.height as usize)
@@ -663,12 +672,13 @@ fn draw_branch_chooser(frame: &mut Frame<'_>, app: &App) {
                     .collect();
                 Line::styled(
                     format!(
-                        "{} {}{}  {}",
+                        "{} {} {}{}  {}",
                         if index == chooser.selected {
                             "›"
                         } else {
                             " "
                         },
+                        super::app::branch_role_label(&boundary.role),
                         if boundary.historical {
                             "[archived] "
                         } else {
@@ -687,7 +697,7 @@ fn draw_branch_chooser(frame: &mut Frame<'_>, app: &App) {
             .collect()
     };
     frame.render_widget(Paragraph::new(rows), entries);
-    frame.render_widget(Paragraph::new("↑/↓ select · Enter edit in provisional draft · Esc back\nNo branch is created until the edited draft is submitted."), help);
+    frame.render_widget(Paragraph::new("↑/↓ select · Enter prepare draft · Esc back\nNo branch is created until a nonblank text draft is submitted."), help);
 }
 
 /// A read-only index of display text. Only visible entries build previews.
@@ -3165,10 +3175,12 @@ mod tests {
         app.session_id = Some("source".into());
         app.branch_chooser = Some(crate::tui::app::BranchChooser {
             boundaries: vec![PromptBoundary {
+                role: crate::protocols::acp::prompt_branches::PromptRole::User,
                 address: "opaque-boundary".into(),
                 text: "editable text".into(),
                 historical: true,
             }],
+            filter: crate::tui::app::BranchFilter::All,
             selected: 0,
             pending: false,
         });
@@ -3197,6 +3209,64 @@ mod tests {
         );
         assert!(output.contains("not rolled back."), "{output}");
         assert!(output.contains("Esc abandon"), "{output}");
+    }
+
+    #[test]
+    fn prompt_branch_chooser_renders_role_filters_and_empty_matches() {
+        use crate::protocols::acp::prompt_branches::{PromptBoundary, PromptRole};
+        use crate::tui::app::{BranchChooser, BranchFilter};
+        let mut app = navigation_app(Vec::new());
+        app.branch_chooser = Some(BranchChooser {
+            boundaries: vec![
+                PromptBoundary {
+                    role: PromptRole::User,
+                    address: "user-address".into(),
+                    text: "user preview".into(),
+                    historical: false,
+                },
+                PromptBoundary {
+                    role: PromptRole::Assistant,
+                    address: "assistant-address".into(),
+                    text: "assistant preview".into(),
+                    historical: true,
+                },
+                PromptBoundary {
+                    role: PromptRole::Tool,
+                    address: "tool-address".into(),
+                    text: "tool preview".into(),
+                    historical: false,
+                },
+            ],
+            filter: BranchFilter::All,
+            selected: 0,
+            pending: false,
+        });
+        let output = render(&mut app, 100, 24);
+        for text in [
+            "[user] user-address",
+            "[assistant] [archived] assistant-address",
+            "[tool] tool-address",
+            "0 All · 1 User · 2 Assistant · 3 Tool",
+            "Filter: All",
+        ] {
+            assert!(output.contains(text), "{output}");
+        }
+        app.branch_chooser.as_mut().unwrap().filter = BranchFilter::Assistant;
+        let output = render(&mut app, 100, 24);
+        assert!(output.contains("Filter: Assistant"), "{output}");
+        assert!(
+            output.contains("› [assistant] [archived] assistant-address"),
+            "{output}"
+        );
+        assert!(!output.contains("user-address"), "{output}");
+        assert!(!output.contains("tool-address"), "{output}");
+        app.branch_chooser.as_mut().unwrap().boundaries.clear();
+        let output = render(&mut app, 100, 24);
+        assert!(
+            output.contains("No eligible text checkpoints match this filter."),
+            "{output}"
+        );
+        assert!(output.contains("Esc back"), "{output}");
     }
 
     #[test]
