@@ -2070,7 +2070,7 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         .fork(
             session::new_id(),
             super::ForkRequest {
-                prior: prior,
+                prior,
                 prompt: "branch".into(),
                 name: None,
                 contract: None,
