@@ -1210,7 +1210,11 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity, &background_jobs.observations,).await,
+                            SessionInstruments {
+                                activity: &activity,
+                                observations: &background_jobs.observations,
+                            },
+                        ).await,
                         Err(error) => Err(map_loop_error_observed(&session_id, &error, &background_jobs.observations)),
                     };
                     if let Err(error) = result {
@@ -1229,7 +1233,11 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity, &background_jobs.observations,).await
+                            SessionInstruments {
+                                activity: &activity,
+                                observations: &background_jobs.observations,
+                            },
+                        ).await
                     {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }
@@ -1648,7 +1656,12 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
         .map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Session-owned lifecycle and effects instruments used during execution.
+struct SessionInstruments<'a> {
+    activity: &'a SessionActivity,
+    observations: &'a crate::effects::Observations,
+}
+
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
@@ -1656,8 +1669,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     busy: &AtomicBool,
     driver: &mut LoopDriver<S>,
     sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    activity: &SessionActivity,
-    observations: &crate::effects::Observations,
+    instruments: SessionInstruments<'_>,
 ) -> Result<(), AcpRuntimeError> {
     if claim_prompt(busy).is_err() {
         return Ok(());
@@ -1674,9 +1686,9 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
         sink,
         cancellation_generation,
         None,
-        activity,
+        instruments.activity,
         ExecutionOrigin::Autonomous,
-        observations,
+        instruments.observations,
     )
     .await;
     integration.finish_prompt(session_id);
@@ -3562,8 +3574,10 @@ mod tests {
             &busy,
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await
         .unwrap();
@@ -3620,8 +3634,10 @@ mod tests {
             &busy,
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await
         .unwrap();
@@ -3638,8 +3654,10 @@ mod tests {
                 &busy,
                 &mut driver,
                 &sink,
-                &activity,
-                &crate::effects::Observations::local_session(),
+                SessionInstruments {
+                    activity: &activity,
+                    observations: &crate::effects::Observations::local_session(),
+                },
             )
             .await
             .unwrap();
@@ -3705,8 +3723,10 @@ mod tests {
             &busy,
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await;
 
@@ -3780,8 +3800,10 @@ mod tests {
             &busy,
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await
         .unwrap();
@@ -3838,8 +3860,10 @@ mod tests {
             &AtomicBool::new(false),
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await;
         assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
@@ -3908,8 +3932,10 @@ mod tests {
             &busy,
             &mut driver,
             &sink,
-            &activity,
-            &crate::effects::Observations::local_session(),
+            SessionInstruments {
+                activity: &activity,
+                observations: &crate::effects::Observations::local_session(),
+            },
         )
         .await;
 
