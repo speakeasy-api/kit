@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -626,6 +629,13 @@ async fn execute_compose_cancelled(
     script: &str,
     cancellation: Option<TurnCancellation>,
 ) -> ToolExecutionOutcome {
+    // Artifact paths are HOME/session/call scoped. Parallel tests must not
+    // remove a spill directory still in use by another invocation.
+    static NEXT_CALL: AtomicUsize = AtomicUsize::new(0);
+    let call_id = ToolCallId::new(format!(
+        "compose-test-{}",
+        NEXT_CALL.fetch_add(1, Ordering::Relaxed)
+    ));
     let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
     let executor = Arc::new(BasicToolExecutor::new([source]));
     let scope = ToolExecutionScope {
@@ -638,7 +648,7 @@ async fn execute_compose_cancelled(
     };
     scope
         .execute_child(ToolRequest {
-            call_id: ToolCallId::new("compose-test"),
+            call_id,
             tool_name: ToolName::new("compose"),
             input: json!({"script": script}),
             session_id: SessionId::new("test"),

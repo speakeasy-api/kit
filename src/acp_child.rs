@@ -394,23 +394,56 @@ impl ChildConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ChildError {
     Cancelled,
     Failed(String),
     TerminalCancelled,
     TerminalFailed(String),
+    Observed {
+        error: Box<ChildError>,
+        effects: crate::effects::PossibleEffects,
+    },
 }
 impl std::fmt::Display for ChildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled | Self::TerminalCancelled => f.write_str("nested agent cancelled"),
             Self::Failed(e) | Self::TerminalFailed(e) => f.write_str(e),
+            Self::Observed { error, .. } => error.fmt(f),
+        }
+    }
+}
+
+impl ChildError {
+    pub(crate) fn root(&self) -> &Self {
+        match self {
+            Self::Observed { error, .. } => error.root(),
+            error => error,
+        }
+    }
+
+    pub(crate) fn possible_effects(&self) -> crate::effects::PossibleEffects {
+        match self {
+            Self::Observed { effects, .. } => *effects,
+            _ => crate::effects::PossibleEffects::default(),
+        }
+    }
+
+    fn observed(self, observations: &crate::effects::Observations) -> Self {
+        self.with_effects(observations.snapshot())
+    }
+
+    pub(crate) fn with_effects(self, effects: crate::effects::PossibleEffects) -> Self {
+        Self::Observed {
+            error: Box::new(self),
+            effects,
         }
     }
 }
 
 struct Prompt {
+    observations: crate::effects::Observations,
     session_id: SessionId,
     text: String,
     cancellation: TurnCancellation,
@@ -440,6 +473,7 @@ struct Ready {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChildOutput {
+    observations: crate::effects::Observations,
     pub text: String,
     pub updates: Vec<Value>,
     pub updates_truncated: bool,
@@ -447,7 +481,12 @@ pub(crate) struct ChildOutput {
 }
 
 impl ChildOutput {
+    pub(crate) fn possible_effects(&self) -> crate::effects::PossibleEffects {
+        self.observations.snapshot()
+    }
+
     fn record(&mut self, update: SessionUpdate) {
+        self.observations.record(&update);
         if let SessionUpdate::AgentMessageChunk(chunk) = &update
             && let ContentBlock::Text(text) = &chunk.content
         {
@@ -728,24 +767,30 @@ impl ChildSession {
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
-        let _serial = tokio::select! {
-            serial = self.serial.lock() => serial,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        };
-        let (reply, response) = oneshot::channel();
-        let request = Request::Prompt(Prompt {
-            session_id: self.session_id.clone(),
-            text,
-            cancellation: cancellation.clone(),
-            reply,
-        });
-        tokio::select! {
-            sent = self.tx.send(request) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        }
-        response.await.map_err(|_| {
-            ChildError::TerminalFailed("nested agent process exited without a response".into())
-        })?
+        // This owner outlives the prompt task, including channel loss/abort.
+        let observations = crate::effects::Observations::default();
+        let outcome = async {
+            let _serial = tokio::select! {
+                serial = self.serial.lock() => serial,
+                () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            };
+            let (reply, response) = oneshot::channel();
+            let request = Request::Prompt(Prompt {
+                observations: observations.clone(),
+                session_id: self.session_id.clone(),
+                text,
+                cancellation: cancellation.clone(),
+                reply,
+            });
+            tokio::select! {
+                sent = self.tx.send(request) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
+                () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            }
+            response.await.map_err(|_| {
+                ChildError::TerminalFailed("nested agent process exited without a response".into())
+            })?
+        }.await;
+        outcome.map_err(|error| error.observed(&observations))
     }
 }
 
@@ -1051,7 +1096,10 @@ async fn run(
                         let fatal = fatal_tx.clone();
                         tasks.spawn(async move {
                             let session_id = prompt.session_id.clone();
-                            let output = Arc::new(Mutex::new(ChildOutput::default()));
+                            let output = Arc::new(Mutex::new(ChildOutput {
+                                observations: prompt.observations.clone(),
+                                ..ChildOutput::default()
+                            }));
                             if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
                             let request = connection.send_request(agentkit_acp::PromptRequest::new(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
@@ -1230,6 +1278,63 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn effect_observations_survive_output_retention_limits() {
+        let mut output = ChildOutput {
+            updates: vec![Value::Null; MAX_CAPTURED_UPDATES],
+            ..ChildOutput::default()
+        };
+        output.record(update(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "secret-id",
+            "title": "secret command", "status": "in_progress"
+        })));
+        assert!(output.updates_truncated);
+        assert!(output.observations.snapshot().tool_execution_start_reported);
+        output.record(update(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "private assistant output"}
+        })));
+        let failure = ChildError::TerminalCancelled.observed(&output.observations);
+        assert!(failure.possible_effects().assistant_output_observed);
+        assert!(matches!(failure.root(), ChildError::TerminalCancelled));
+        assert!(failure.possible_effects().observation_incomplete);
+    }
+
+    #[tokio::test]
+    async fn reply_channel_loss_preserves_positive_observations() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_closed, closed) = watch::channel(false);
+        let child = ChildSession {
+            tx,
+            session_id: "test".into(),
+            capabilities: agentkit_acp::AgentCapabilities::default(),
+            serial: Arc::new(tokio::sync::Mutex::new(())),
+            closed,
+            descendant_parent: None,
+        };
+        let actor = tokio::spawn(async move {
+            let Some(Request::Prompt(prompt)) = rx.recv().await else {
+                panic!("prompt expected")
+            };
+            prompt.observations.record(&update(json!({
+                "sessionUpdate": "tool_call", "toolCallId": "t",
+                "title": "tool", "status": "completed"
+            })));
+            // Simulate transport/task loss before the response is delivered.
+            drop(prompt.reply);
+        });
+        let error = child
+            .prompt("private prompt".into(), TurnCancellation::default())
+            .await
+            .unwrap_err();
+        actor.await.unwrap();
+        assert!(matches!(error.root(), ChildError::TerminalFailed(_)));
+        let effects = error.possible_effects();
+        assert!(effects.tool_execution_completion_reported);
+        assert!(!effects.tool_execution_start_reported);
+        assert!(effects.observation_incomplete);
+    }
 
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()

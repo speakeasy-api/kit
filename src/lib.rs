@@ -6,6 +6,7 @@ mod compose_output;
 pub mod config_files;
 mod credentials;
 pub mod docs;
+mod effects;
 pub mod events;
 mod fatal;
 mod file_search;

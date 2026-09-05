@@ -625,12 +625,15 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
 
     let branch = manager
         .fork(
-            source.clone(),
-            "MOCK_CWD".into(),
-            None,
+            session::new_id(),
+            super::ForkRequest {
+                prior: source.clone(),
+                prompt: "MOCK_CWD".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap();
@@ -844,12 +847,15 @@ impl MockAcpScenario {
         tokio::spawn(async move {
             manager
                 .fork(
-                    source,
-                    prompt.into(),
-                    None,
+                    session::new_id(),
+                    super::ForkRequest {
+                        prior: source,
+                        prompt: prompt.into(),
+                        name: None,
+                        contract: None,
+                    },
                     0,
                     TurnCancellation::default(),
-                    None,
                 )
                 .await
         })
@@ -1197,12 +1203,15 @@ async fn failed_create_and_fork_startup_record_failed_removed_transitions() {
     assert!(
         failed_fork
             .fork(
-                source,
-                "fork".into(),
-                None,
+                session::new_id(),
+                super::ForkRequest {
+                    prior: source,
+                    prompt: "fork".into(),
+                    name: None,
+                    contract: None,
+                },
                 0,
                 TurnCancellation::default(),
-                None,
             )
             .await
             .is_err()
@@ -1350,12 +1359,15 @@ async fn native_fork_releases_the_source_before_the_branch_prompt() {
     let fork_error = scenario
         .manager
         .fork(
-            source.clone(),
-            "second branch".into(),
-            None,
+            session::new_id(),
+            super::ForkRequest {
+                prior: source.clone(),
+                prompt: "second branch".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap_err();
@@ -1405,19 +1417,42 @@ async fn native_fork_releases_the_source_before_the_branch_prompt() {
 
 #[tokio::test]
 async fn dropped_fork_with_failed_close_holds_only_its_permit_until_process_exit() {
+    if crate::effects::isolated_test(
+        "tools::subagent::tests::dropped_fork_with_failed_close_holds_only_its_permit_until_process_exit",
+    ) {
+        return;
+    }
     let scenario = MockAcpScenario::new(ScenarioOptions {
-        gate_prompt: Some("branch"),
+        gate_prompt: Some("MOCK_RICH_OUTPUT"),
         fail_close_session: Some("branch-1"),
         ..Default::default()
     });
     let source = scenario.create("source").await;
-    let fork = scenario.spawn_fork(source.clone(), "branch");
+    let parent_session_id = session::new_id();
+    let fork_manager = scenario.manager.clone();
+    let fork_source = source.clone();
+    let parent = parent_session_id.clone();
+    let fork = tokio::spawn(async move {
+        fork_manager
+            .fork(
+                parent,
+                super::ForkRequest {
+                    prior: fork_source,
+                    prompt: "MOCK_RICH_OUTPUT".into(),
+                    name: None,
+                    contract: None,
+                },
+                0,
+                TurnCancellation::default(),
+            )
+            .await
+    });
     scenario
         .wait_for(|request| {
             matches!(
                 request,
                 LoggedRequest::Prompt { session_id, text }
-                    if session_id == "branch-1" && text == "branch"
+                    if session_id == "branch-1" && text == "MOCK_RICH_OUTPUT"
             )
         })
         .await;
@@ -1456,6 +1491,9 @@ async fn dropped_fork_with_failed_close_holds_only_its_permit_until_process_exit
         [source.id.as_str()]
     );
 
+    wait_for_fork_diagnostic(&parent_session_id).await;
+    assert_rich_fork_diagnostic(&parent_session_id);
+
     scenario
         .manager
         .close(&source.id, &TurnCancellation::default())
@@ -1464,30 +1502,217 @@ async fn dropped_fork_with_failed_close_holds_only_its_permit_until_process_exit
     wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
 }
 
-#[tokio::test]
-async fn successful_fork_handoff_cleans_up_if_receipt_is_not_acknowledged() {
-    let scenario = MockAcpScenario::new(ScenarioOptions::default());
-    let branch = scenario.create("branch").await;
-    let (reply, response) = oneshot::channel();
-    let manager = scenario.manager.clone();
-    let cleanup_branch = branch.clone();
-    let handoff = tokio::spawn(async move {
-        manager.handoff_fork_success(reply, cleanup_branch).await;
-    });
+fn fork_diagnostic_count(session_id: &str) -> usize {
+    let directory = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(".kit/errors")
+        .join(session_id);
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count()
+}
 
-    let success = response.await.unwrap().unwrap();
-    assert_eq!(success.value.id, branch.id);
-    drop(success);
-    handoff.await.unwrap();
+async fn wait_for_fork_diagnostic(session_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fork_diagnostic_count(session_id) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached fork did not retain observations");
+}
 
-    assert!(
-        scenario
-            .manager
-            .list(&TurnCancellation::default())
-            .await
-            .unwrap()
-            .is_empty()
+fn assert_rich_fork_diagnostic(session_id: &str) {
+    assert_eq!(fork_diagnostic_count(session_id), 1);
+    let record = crate::effects::test_record(session_id);
+    assert_eq!(record["session_id"], session_id);
+    assert_eq!(record["surface"], "subagent");
+    assert_eq!(record["code"], "subagent_failed");
+    assert_eq!(
+        record["possible_effects"],
+        json!({
+            "source": "acp_notifications",
+            "assistant_output_observed": true,
+            "tool_emission_observed": true,
+            "tool_execution_start_reported": false,
+            "tool_execution_completion_reported": true,
+            "observation_incomplete": true,
+        })
     );
+    let encoded = record.to_string();
+    for private in ["rich done", "call-1", "Inspect files", "MOCK_RICH_OUTPUT"] {
+        assert!(!encoded.contains(private));
+    }
+}
+
+#[tokio::test]
+async fn fork_handoff_retains_observations_only_when_caller_abandons_delivery() {
+    if crate::effects::isolated_test(
+        "tools::subagent::tests::fork_handoff_retains_observations_only_when_caller_abandons_delivery",
+    ) {
+        return;
+    }
+    // Exercise closed delivery, dropped acknowledgment, and normal delivery for
+    // both outcomes. Positive facts come from actual ACP notifications first.
+    for failed in [false, true] {
+        for delivery in ["closed", "unacknowledged", "acknowledged"] {
+            let scenario = MockAcpScenario::new(ScenarioOptions::default());
+            let branch = scenario.create("branch").await;
+            let state = scenario.manager.lookup(&branch).unwrap();
+            let child = state.lock().await.child.clone().unwrap();
+            let effects = child
+                .prompt("MOCK_RICH_OUTPUT".into(), TurnCancellation::default())
+                .await
+                .unwrap()
+                .possible_effects();
+            assert!(effects.tool_execution_completion_reported);
+            let outcome = if failed {
+                Err(scenario
+                    .manager
+                    .cleanup_installed_child(
+                        &branch.id,
+                        &state,
+                        &child,
+                        ChildError::Cancelled.with_effects(effects),
+                    )
+                    .await)
+            } else {
+                Ok((branch.clone(), effects))
+            };
+            let parent_session_id = session::new_id();
+            let parent = parent_session_id.clone();
+            let (reply, response) = oneshot::channel();
+            let manager = scenario.manager.clone();
+            let response = if delivery == "closed" {
+                drop(response);
+                None
+            } else {
+                Some(response)
+            };
+            let handoff = tokio::spawn(async move {
+                manager.handoff_fork_result(&parent, reply, outcome).await;
+            });
+            let mut delivered = None;
+            if let Some(response) = response {
+                let receipt = response.await.unwrap();
+                assert_eq!(receipt.effects, effects);
+                if delivery == "acknowledged" {
+                    receipt.acknowledge.send(()).unwrap();
+                    delivered = Some(receipt.value);
+                }
+            }
+            handoff.await.unwrap();
+            if let Some(value) = delivered {
+                // The detached owner must not duplicate the normal result writer.
+                assert_eq!(fork_diagnostic_count(&parent_session_id), 0);
+                let request = ToolRequest::new(
+                    agentkit_core::ToolCallId::new("fork-call"),
+                    ToolName::new("fork"),
+                    json!({}),
+                    agentkit_core::SessionId::new(parent_session_id.clone()),
+                    agentkit_core::TurnId::new("fork-turn"),
+                );
+                let result = result(request, value);
+                if failed {
+                    assert!(matches!(result, Err(ToolError::Cancelled)));
+                    assert_rich_fork_diagnostic(&parent_session_id);
+                } else {
+                    assert!(result.is_ok());
+                    assert_eq!(fork_diagnostic_count(&parent_session_id), 0);
+                    scenario
+                        .manager
+                        .close(&branch.id, &TurnCancellation::default())
+                        .await
+                        .unwrap();
+                }
+            } else {
+                assert_rich_fork_diagnostic(&parent_session_id);
+            }
+            assert!(
+                scenario
+                    .manager
+                    .list(&TurnCancellation::default())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // The fixture's extra State reference still owns the process permit.
+            drop(child);
+            drop(state);
+            wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn dropped_fork_after_positive_observations_retains_diagnostic() {
+    if crate::effects::isolated_test(
+        "tools::subagent::tests::dropped_fork_after_positive_observations_retains_diagnostic",
+    ) {
+        return;
+    }
+    let mut scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_prompt: Some("MOCK_RICH_OUTPUT"),
+        ..Default::default()
+    });
+    let (manager, events) = observe_events(scenario.manager.clone());
+    scenario.manager = manager;
+    let source = scenario.create("source").await;
+    let parent_session_id = session::new_id();
+    let mut fork = Box::pin(scenario.manager.fork(
+        parent_session_id.clone(),
+        super::ForkRequest {
+            prior: source.clone(),
+            prompt: "MOCK_RICH_OUTPUT".into(),
+            name: None,
+            contract: None,
+        },
+        0,
+        TurnCancellation::default(),
+    ));
+    tokio::select! {
+        _ = &mut fork => panic!("gated fork returned early"),
+        _ = scenario.wait_for(|request| matches!(request,
+            LoggedRequest::Prompt { text, .. } if text == "MOCK_RICH_OUTPUT")) => {}
+    }
+    MockAcpScenario::release(&scenario.prompt_release);
+    // Leave the caller unpolled until run_fork has observed the child output
+    // and published success. Its queued reply has not been acknowledged.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if emitted(&events).iter().any(|event| {
+                matches!(event,
+                events::RuntimeEvent::SubagentStateChanged {
+                    id, status: SubagentStatus::Idle, ..
+                } if id != &source.id)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fork did not observe successful child output");
+    assert_eq!(fork_diagnostic_count(&parent_session_id), 0);
+    drop(fork);
+    wait_for_fork_diagnostic(&parent_session_id).await;
+    assert_rich_fork_diagnostic(&parent_session_id);
+    let listed = scenario
+        .manager
+        .list(&TurnCancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(listing_id).collect::<Vec<_>>(),
+        [source.id.as_str()]
+    );
+    scenario
+        .manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
     wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
 }
 
@@ -1780,12 +2005,15 @@ async fn fork_uses_its_fresh_preferred_name() {
 
     let fork = manager
         .fork(
-            source,
-            "branch".into(),
-            Some("Reviewer".into()),
+            session::new_id(),
+            super::ForkRequest {
+                prior: source,
+                prompt: "branch".into(),
+                name: Some("Reviewer".into()),
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap();
@@ -1840,12 +2068,15 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
 
     let error = manager
         .fork(
-            prior,
-            "branch".into(),
-            None,
+            session::new_id(),
+            super::ForkRequest {
+                prior,
+                prompt: "branch".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap_err();
@@ -1854,4 +2085,131 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         error.to_string(),
         "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
     );
+}
+
+#[tokio::test]
+async fn observed_failures_keep_terminal_and_cancellation_classification() {
+    let (child, _) = ChildSession::closure_probe_for_test();
+    let effects = crate::effects::PossibleEffects {
+        assistant_output_observed: true,
+        ..crate::effects::PossibleEffects::default()
+    };
+    for error in [
+        ChildError::TerminalCancelled,
+        ChildError::TerminalFailed("transport ended".into()),
+    ] {
+        let observed = ChildError::Observed {
+            error: Box::new(error),
+            effects,
+        };
+        assert!(child_error_is_terminal(&observed, &child));
+        assert_eq!(observed.possible_effects(), effects);
+        match observed.root() {
+            ChildError::TerminalCancelled => {
+                assert!(matches!(tool_failure(&observed), ToolError::Cancelled))
+            }
+            _ => assert!(
+                matches!(tool_failure(&observed), ToolError::ExecutionFailed(message) if message == "transport ended")
+            ),
+        }
+    }
+    let observed = ChildError::Observed {
+        error: Box::new(ChildError::Failed("refused".into())),
+        effects,
+    };
+    assert!(!child_error_is_terminal(&observed, &child));
+    assert!(
+        matches!(tool_failure(&observed), ToolError::ExecutionFailed(message) if message == "refused")
+    );
+}
+
+#[tokio::test]
+async fn successful_prompt_after_retirement_keeps_observed_effects() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_prompt: Some("MOCK_RICH_OUTPUT"),
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let prompt_manager = scenario.manager.clone();
+    let prompt_source = source.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_manager
+            .prompt(
+                prompt_source,
+                "MOCK_RICH_OUTPUT".into(),
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+    });
+    scenario
+        .wait_for(|request| {
+            matches!(request, LoggedRequest::Prompt { text, .. } if text == "MOCK_RICH_OUTPUT")
+        })
+        .await;
+    scenario
+        .manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    MockAcpScenario::release(&scenario.prompt_release);
+    let error = prompt.await.unwrap().unwrap_err();
+    let effects = error.possible_effects();
+    assert!(effects.assistant_output_observed);
+    assert!(effects.tool_emission_observed);
+    assert!(effects.tool_execution_completion_reported);
+    assert!(effects.observation_incomplete);
+    assert!(
+        scenario
+            .manager
+            .list(&TurnCancellation::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_cleanup_preserves_cancellation_and_holds_capacity() {
+    for original in [ChildError::Cancelled, ChildError::TerminalCancelled] {
+        let scenario = MockAcpScenario::new(ScenarioOptions {
+            fail_close_session: Some("branch-1"),
+            ..Default::default()
+        });
+        let source = scenario.create("source").await;
+        let branch = scenario
+            .spawn_fork(source.clone(), "branch")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = scenario.manager.lookup(&branch).unwrap();
+        let child = state.lock().await.child.clone().unwrap();
+        let effects = crate::effects::PossibleEffects {
+            assistant_output_observed: true,
+            ..Default::default()
+        };
+        let terminal = matches!(original, ChildError::TerminalCancelled);
+        let error = scenario
+            .manager
+            .cleanup_installed_child(&branch.id, &state, &child, original.with_effects(effects))
+            .await;
+        assert_eq!(
+            matches!(error.root(), ChildError::TerminalCancelled),
+            terminal
+        );
+        assert!(matches!(tool_failure(&error), ToolError::Cancelled));
+        assert_eq!(error.possible_effects(), effects);
+        assert_eq!(
+            scenario.manager.capacity.available_permits(),
+            MAX_LIVE_SUBAGENTS - 2
+        );
+        drop(state);
+        drop(child);
+        scenario
+            .manager
+            .close(&source.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+        wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+    }
 }
