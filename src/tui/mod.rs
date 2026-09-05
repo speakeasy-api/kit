@@ -3546,7 +3546,7 @@ mod tests {
                 &mut app,
                 Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
             );
-            assert!(app.queue_focused);
+            assert_eq!(app.queue_focused, populated);
             app.apply(Update::SessionCatalog(Ok(vec![
                 crate::session::CatalogEntry {
                     id: "saved".into(),
@@ -3567,7 +3567,7 @@ mod tests {
                 Some(SessionRename::Editing(input)) if input == path.to_str().unwrap()
             ));
             assert!(app.attachments.is_empty());
-            assert!(app.queue_focused);
+            assert_eq!(app.queue_focused, populated);
             assert_eq!(app.editor.text(), "parked draft");
         }
     }

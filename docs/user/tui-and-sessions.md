@@ -43,7 +43,7 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 | `Shift+Enter`, `Option+Enter`, `Ctrl+J` | Insert a newline |
 | `Esc` | Cancel a pending-message edit and restore the previous draft; leave the queue selector; otherwise interrupt a running turn or dismiss an idle notice |
 | `F2` | Focus the pending-message queue (or return to the composer) |
-| `Up` / `Down`, `Enter`, `Delete` in the queue | Select a pending message, edit it if supported, or remove it |
+| `Up` / `Down`, `Enter`, `Backspace` / `Delete` in the queue | Select a pending message, edit it if supported, or remove it |
 | `Command+B` | Move the newest running foreground top-level compose call to the background |
 | `Ctrl+C` | Interrupt a running turn; clear a non-empty idle prompt; quit when idle with an empty prompt |
 | `Ctrl+D` | Quit when the prompt is empty |
@@ -69,7 +69,7 @@ When the session is idle, `Enter` starts a normal prompt. While the agent is act
 
 ### Edit or remove a pending message
 
-Press `F2` to focus the queue, then `Up` or `Down` to select a message. The selected row stays visible even when the queue is long. Press `Enter` to edit its text in the composer, or `Delete` to request removal. `Esc` or `F2` returns from the selector without changing your draft. If delivery empties the queue while it is selected, focus stays there until you leave; a stale `Enter` or `Delete` cannot send or alter your draft.
+Press `F2` to focus the queue, then `Up` or `Down` to select a message. The queue opens only when at least one message is pending; otherwise Kit shows `no pending messages` and leaves you in the composer. The selected row stays visible even when the queue is long. Press `Enter` to edit its text in the composer, or `Backspace` / `Delete` to request removal (the normal Mac Delete key works). `Esc` or `F2` returns from the selector without changing your draft. When the last message is delivered or removed, or the turn finishes, the selector closes automatically and keyboard focus returns to the composer. An in-progress text edit remains available to copy or cancel rather than being discarded.
 
 While editing, plain `Enter` saves the replacement with the **same message ID and queue position**. `Esc` cancels the edit. Either a successful save or cancellation restores the previous composer draft, cursor, and attachments. Queue edits do not run slash commands. Editing is available only when the agent advertises ACP `session.inject.pending.replace`; removing a pending injection does not require this optional capability.
 

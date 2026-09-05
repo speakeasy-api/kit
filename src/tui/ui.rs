@@ -2249,17 +2249,15 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     let hints = if app.editing_steer() {
         "⏎ save edit   esc restore draft "
-    } else if app.queue_focused {
-        if app.pending_steers.is_empty() {
-            "queue empty · esc back "
-        } else if app.can_replace_steer
+    } else if app.queue_focused && !app.pending_steers.is_empty() {
+        if app.can_replace_steer
             && app.pending_steers.iter().any(|pending| {
                 app.selected_steer.as_deref() == Some(pending.id.as_str()) && pending.editable
             })
         {
-            "↑/↓ select   ⏎ edit   del remove   esc back "
+            "↑/↓ select   ⏎ edit   ⌫/del remove   esc back "
         } else {
-            "↑/↓ select   del remove   esc back · edit unavailable "
+            "↑/↓ select   ⌫/del remove   esc back · edit unavailable "
         }
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
@@ -3131,7 +3129,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_empty_selector_keeps_its_exit_hint() {
+    fn empty_queue_keeps_the_composer_hint() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = App::new(
             PathBuf::from("/tmp"),
@@ -3141,7 +3139,10 @@ mod tests {
         );
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         let frame = render(&mut app, 100, 18);
-        assert!(frame.contains("queue empty · esc back"), "{frame}");
+        assert!(!app.queue_focused);
+        assert!(frame.contains("no pending messages"), "{frame}");
+        assert!(frame.contains("⏎ send"), "{frame}");
+        assert!(!frame.contains("esc back"), "{frame}");
     }
 
     #[test]

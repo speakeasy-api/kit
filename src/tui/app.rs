@@ -1754,6 +1754,7 @@ impl App {
         self.retired_steers
             .extend(self.pending_steers.drain(..).map(|pending| pending.id));
         self.selected_steer = None;
+        self.queue_focused = false;
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
@@ -2921,7 +2922,10 @@ impl App {
             .iter()
             .position(|pending| pending.id == id);
         self.pending_steers.retain(|pending| pending.id != id);
-        if self.selected_steer.as_deref() == Some(id) {
+        if self.pending_steers.is_empty() {
+            self.selected_steer = None;
+            self.queue_focused = false;
+        } else if self.selected_steer.as_deref() == Some(id) {
             self.selected_steer = index.and_then(|index| {
                 self.pending_steers
                     .get(index.min(self.pending_steers.len().saturating_sub(1)))
@@ -3042,14 +3046,13 @@ impl App {
             self.queue_focused = false;
             return Action::None;
         }
-        // Keep focus even if delivery drained the queue. A stale Enter/Delete
-        // must not unexpectedly send or modify the parked composer draft.
         let Some(index) = self
             .pending_steers
             .iter()
             .position(|pending| Some(&pending.id) == self.selected_steer.as_ref())
         else {
             self.selected_steer = None;
+            self.queue_focused = false;
             return Action::None;
         };
         match key.code {
@@ -3061,7 +3064,7 @@ impl App {
                 };
                 self.selected_steer = Some(self.pending_steers[next].id.clone());
             }
-            KeyCode::Delete => {
+            KeyCode::Backspace | KeyCode::Delete => {
                 if self
                     .steer_mutations
                     .contains_key(&self.pending_steers[index].id)
@@ -3171,14 +3174,12 @@ impl App {
             return self.handle_steer_selection(key);
         }
         if key.code == KeyCode::F(2) && !self.editing_steer() {
-            self.queue_focused = true;
-            self.selected_steer = self
-                .pending_steers
-                .front()
-                .map(|pending| pending.id.clone());
-            if self.selected_steer.is_none() {
+            let Some(pending) = self.pending_steers.front() else {
                 self.toast("no pending messages");
-            }
+                return Action::None;
+            };
+            self.selected_steer = Some(pending.id.clone());
+            self.queue_focused = true;
             self.file_picker = None;
             return Action::None;
         }
@@ -5061,8 +5062,9 @@ mod tests {
             app.latest_agent_source = "answer".into();
             app.handle_key(press(KeyCode::F(2)));
             if drained {
-                app.pending_steers.clear();
-                app.selected_steer = None;
+                for id in ["a", "b", "c"] {
+                    app.steer_revoked(id);
+                }
             }
             // Without background work Ctrl+K is an editor key, so suppress it.
             app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL));
@@ -5095,7 +5097,7 @@ mod tests {
                 app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL)),
                 Action::CancelBackground(id) if id == "background"
             ));
-            assert!(app.queue_focused);
+            assert_eq!(app.queue_focused, !drained);
             assert_eq!(app.editor.text(), "draft");
         }
     }
@@ -5321,32 +5323,80 @@ mod tests {
     }
 
     #[test]
-    fn queued_delivery_of_last_selection_never_sends_or_deletes_the_draft() {
-        let mut app = queued_app();
+    fn empty_queue_does_not_capture_composer_focus() {
+        let mut app = app();
         app.paste("draft");
         app.handle_key(press(KeyCode::F(2)));
-        for id in ["a", "b", "c"] {
-            app.apply(Update::UserMessage {
-                id: id.into(),
-                text: id.into(),
-                images: Vec::new(),
-                append: false,
-            });
-        }
-        assert!(app.queue_focused);
-        assert!(app.selected_steer.is_none());
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Enter)),
-            Action::None
-        ));
-        assert!(matches!(
-            app.handle_key(press(KeyCode::Delete)),
-            Action::None
-        ));
-        assert_eq!(app.editor.text(), "draft");
-        app.handle_key(press(KeyCode::Esc));
         assert!(!app.queue_focused);
-        assert!(app.working());
+        assert!(app.selected_steer.is_none());
+        assert_eq!(app.toast_text(), Some("no pending messages"));
+        app.handle_key(press(KeyCode::Char('!')));
+        assert_eq!(app.editor.text(), "draft!");
+    }
+
+    #[test]
+    fn draining_the_queue_returns_keyboard_focus_to_the_composer() {
+        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            if outcome == "turn_end" {
+                app.apply(Update::State(StateUpdate::Idle(
+                    IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+                )));
+            } else {
+                for id in ["a", "b", "c"] {
+                    match outcome {
+                        "delivery" => app.apply(Update::UserMessage {
+                            id: id.into(),
+                            text: id.into(),
+                            images: Vec::new(),
+                            append: false,
+                        }),
+                        "removal" => app.steer_revoked(id),
+                        "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(app.pending_steers.is_empty(), "{outcome}");
+            assert!(!app.queue_focused, "{outcome}");
+            assert!(app.selected_steer.is_none(), "{outcome}");
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(press(KeyCode::Char('!')));
+            assert_eq!(app.editor.text(), "draft!", "{outcome}");
+        }
+    }
+
+    #[test]
+    fn backspace_and_forward_delete_remove_only_after_acknowledgement() {
+        for key in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            for (index, expected) in ["a", "b", "c"].into_iter().enumerate() {
+                let Action::RevokeSteer { id } = app.handle_key(press(key)) else {
+                    panic!("expected removal from {key:?}");
+                };
+                assert_eq!(id, expected);
+                let token = app.begin_steer_mutation(&id, None).unwrap();
+                assert_eq!(app.pending_steers.len(), 3 - index);
+                assert!(app.queue_focused);
+                assert!(matches!(app.handle_key(press(key)), Action::None));
+                assert_eq!(app.editor.text(), "draft");
+                app.apply(Update::SteerMutationFinished {
+                    id,
+                    token,
+                    result: Ok(()),
+                });
+                assert_eq!(app.pending_steers.len(), 2 - index);
+                assert_eq!(app.queue_focused, index < 2);
+            }
+            assert!(app.selected_steer.is_none());
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(press(KeyCode::Char('!')));
+            assert_eq!(app.editor.text(), "draft!");
+        }
     }
 
     #[test]
