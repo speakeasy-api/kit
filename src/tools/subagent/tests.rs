@@ -1472,7 +1472,9 @@ async fn successful_fork_handoff_cleans_up_if_receipt_is_not_acknowledged() {
     let manager = scenario.manager.clone();
     let cleanup_branch = branch.clone();
     let handoff = tokio::spawn(async move {
-        manager.handoff_fork_success(reply, cleanup_branch).await;
+        manager
+            .handoff_fork_success(reply, cleanup_branch, Default::default())
+            .await;
     });
 
     let success = response.await.unwrap().unwrap();
@@ -1854,4 +1856,131 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         error.to_string(),
         "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
     );
+}
+
+#[tokio::test]
+async fn observed_failures_keep_terminal_and_cancellation_classification() {
+    let (child, _) = ChildSession::closure_probe_for_test();
+    let effects = crate::effects::PossibleEffects {
+        assistant_output_observed: true,
+        ..crate::effects::PossibleEffects::default()
+    };
+    for error in [
+        ChildError::TerminalCancelled,
+        ChildError::TerminalFailed("transport ended".into()),
+    ] {
+        let observed = ChildError::Observed {
+            error: Box::new(error),
+            effects,
+        };
+        assert!(child_error_is_terminal(&observed, &child));
+        assert_eq!(observed.possible_effects(), effects);
+        match observed.root() {
+            ChildError::TerminalCancelled => {
+                assert!(matches!(tool_failure(&observed), ToolError::Cancelled))
+            }
+            _ => assert!(
+                matches!(tool_failure(&observed), ToolError::ExecutionFailed(message) if message == "transport ended")
+            ),
+        }
+    }
+    let observed = ChildError::Observed {
+        error: Box::new(ChildError::Failed("refused".into())),
+        effects,
+    };
+    assert!(!child_error_is_terminal(&observed, &child));
+    assert!(
+        matches!(tool_failure(&observed), ToolError::ExecutionFailed(message) if message == "refused")
+    );
+}
+
+#[tokio::test]
+async fn successful_prompt_after_retirement_keeps_observed_effects() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_prompt: Some("MOCK_RICH_OUTPUT"),
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let prompt_manager = scenario.manager.clone();
+    let prompt_source = source.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_manager
+            .prompt(
+                prompt_source,
+                "MOCK_RICH_OUTPUT".into(),
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+    });
+    scenario
+        .wait_for(|request| {
+            matches!(request, LoggedRequest::Prompt { text, .. } if text == "MOCK_RICH_OUTPUT")
+        })
+        .await;
+    scenario
+        .manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    MockAcpScenario::release(&scenario.prompt_release);
+    let error = prompt.await.unwrap().unwrap_err();
+    let effects = error.possible_effects();
+    assert!(effects.assistant_output_observed);
+    assert!(effects.tool_emission_observed);
+    assert!(effects.tool_execution_completion_reported);
+    assert!(effects.observation_incomplete);
+    assert!(
+        scenario
+            .manager
+            .list(&TurnCancellation::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_cleanup_preserves_cancellation_and_holds_capacity() {
+    for original in [ChildError::Cancelled, ChildError::TerminalCancelled] {
+        let scenario = MockAcpScenario::new(ScenarioOptions {
+            fail_close_session: Some("branch-1"),
+            ..Default::default()
+        });
+        let source = scenario.create("source").await;
+        let branch = scenario
+            .spawn_fork(source.clone(), "branch")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = scenario.manager.lookup(&branch).unwrap();
+        let child = state.lock().await.child.clone().unwrap();
+        let effects = crate::effects::PossibleEffects {
+            assistant_output_observed: true,
+            ..Default::default()
+        };
+        let terminal = matches!(original, ChildError::TerminalCancelled);
+        let error = scenario
+            .manager
+            .cleanup_installed_child(&branch.id, &state, &child, original.with_effects(effects))
+            .await;
+        assert_eq!(
+            matches!(error.root(), ChildError::TerminalCancelled),
+            terminal
+        );
+        assert!(matches!(tool_failure(&error), ToolError::Cancelled));
+        assert_eq!(error.possible_effects(), effects);
+        assert_eq!(
+            scenario.manager.capacity.available_permits(),
+            MAX_LIVE_SUBAGENTS - 2
+        );
+        drop(state);
+        drop(child);
+        scenario
+            .manager
+            .close(&source.id, &TurnCancellation::default())
+            .await
+            .unwrap();
+        wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+    }
 }

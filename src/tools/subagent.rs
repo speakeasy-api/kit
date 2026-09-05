@@ -68,7 +68,8 @@ fn reserve_name(used: &mut HashSet<String>, name: &str) -> bool {
 }
 
 fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
-    match error {
+    match error.root() {
+        ChildError::Observed { .. } => unreachable!("root unwraps observations"),
         ChildError::TerminalCancelled | ChildError::TerminalFailed(_) => true,
         ChildError::Cancelled | ChildError::Failed(_) => child.is_closed(),
     }
@@ -237,6 +238,7 @@ struct CreateOptions {
 }
 
 struct ForkSuccess {
+    effects: crate::effects::PossibleEffects,
     value: SubagentValue,
     acknowledge: oneshot::Sender<()>,
 }
@@ -440,9 +442,11 @@ impl Subagents {
                 return Err(error);
             }
         };
+        let effects = output.possible_effects();
         let (output, updates) = turn_output(output, contract);
         let mut locked = state.lock().await;
-        self.check_active(&locked)?;
+        self.check_active(&locked)
+            .map_err(|error| error.with_effects(effects))?;
         locked.status = SubagentStatus::Idle;
         locked.outcome = Some(GenerationOutcome::Success);
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
@@ -503,9 +507,11 @@ impl Subagents {
             .await
         {
             Ok(output) => {
+                let effects = output.possible_effects();
                 let (output, updates) = turn_output(output, contract);
                 let mut locked = state.lock().await;
-                self.check_active(&locked)?;
+                self.check_active(&locked)
+                    .map_err(|error| error.with_effects(effects))?;
                 locked.status = SubagentStatus::Idle;
                 locked.handle_generation = generation;
                 locked.outcome = Some(GenerationOutcome::Success);
@@ -614,7 +620,7 @@ impl Subagents {
             let result = manager.run_fork(operation, &reply).await;
             manager.finish_forking(&source_state, &reservation).await;
             match result {
-                Ok(value) => manager.handoff_fork_success(reply, value).await,
+                Ok((value, effects)) => manager.handoff_fork_success(reply, value, effects).await,
                 Err(error) => {
                     let _ = reply.send(Err(error));
                 }
@@ -628,6 +634,7 @@ impl Subagents {
                     ChildError::Failed(
                         "subagent fork task stopped before transferring ownership".into(),
                     )
+                    .with_effects(success.effects)
                 })?;
                 Ok(success.value)
             }
@@ -639,7 +646,7 @@ impl Subagents {
         &self,
         operation: ForkOperation,
         reply: &oneshot::Sender<Result<ForkSuccess, ChildError>>,
-    ) -> Result<SubagentValue, ChildError> {
+    ) -> Result<(SubagentValue, crate::effects::PossibleEffects), ChildError> {
         let ForkOperation {
             source_id,
             source_state,
@@ -789,18 +796,24 @@ impl Subagents {
                     .await);
             }
         };
+        let effects = output.possible_effects();
         let (output, updates) = turn_output(output, contract.as_deref());
         let mut locked = state.lock().await;
         if reply.is_closed() {
             drop(locked);
             return Err(self
-                .cleanup_installed_child(&id, &state, &child, ChildError::Cancelled)
+                .cleanup_installed_child(
+                    &id,
+                    &state,
+                    &child,
+                    ChildError::Cancelled.with_effects(effects),
+                )
                 .await);
         }
         if let Err(error) = self.check_active(&locked) {
             drop(locked);
             return Err(self
-                .cleanup_installed_child(&id, &state, &child, error)
+                .cleanup_installed_child(&id, &state, &child, error.with_effects(effects))
                 .await);
         }
         locked.status = SubagentStatus::Idle;
@@ -812,13 +825,16 @@ impl Subagents {
         let event = locked.runtime_event(id.clone());
         drop(locked);
         self.emit_event(event);
-        Ok(SubagentValue {
-            id,
-            name: Some(name),
-            output,
-            generation,
-            updates,
-        })
+        Ok((
+            SubagentValue {
+                id,
+                name: Some(name),
+                output,
+                generation,
+                updates,
+            },
+            effects,
+        ))
     }
 
     async fn list(
@@ -973,10 +989,17 @@ impl Subagents {
         &self,
         reply: oneshot::Sender<Result<ForkSuccess, ChildError>>,
         value: SubagentValue,
+        effects: crate::effects::PossibleEffects,
     ) {
         let cleanup = value.clone();
         let (acknowledge, acknowledged) = oneshot::channel();
-        let sent = reply.send(Ok(ForkSuccess { value, acknowledge })).is_ok();
+        let sent = reply
+            .send(Ok(ForkSuccess {
+                value,
+                effects,
+                acknowledge,
+            }))
+            .is_ok();
         if !sent || acknowledged.await.is_err() {
             self.cleanup_abandoned_fork(&cleanup).await;
         }
@@ -1035,11 +1058,10 @@ impl Subagents {
         match child.close().await {
             Ok(()) => error,
             Err(cleanup) if child_error_is_terminal(&cleanup, &child) => error,
-            Err(cleanup) => {
+            Err(_) => {
                 Self::watch_permit_until_process_exit(permit, &child);
-                ChildError::Failed(format!(
-                    "{error}; failed to clean up retired subagent session: {cleanup}"
-                ))
+                tracing::warn!("failed to clean up retired subagent session");
+                error
             }
         }
     }
@@ -1070,11 +1092,10 @@ impl Subagents {
         match child.close().await {
             Ok(()) => error,
             Err(cleanup) if child_error_is_terminal(&cleanup, child) => error,
-            Err(cleanup) => {
+            Err(_) => {
                 self.retain_permit_until_process_exit(state, child).await;
-                ChildError::Failed(format!(
-                    "{error}; failed to clean up retired subagent session: {cleanup}"
-                ))
+                tracing::warn!("failed to clean up retired subagent session");
+                error
             }
         }
     }
@@ -1087,6 +1108,7 @@ impl Subagents {
         error: ChildError,
     ) -> ChildError {
         let manager = self.clone();
+        let fallback = error.clone();
         match tokio::spawn(async move {
             manager
                 .cleanup_installed_child(&id, &state, &child, error)
@@ -1095,8 +1117,9 @@ impl Subagents {
         .await
         {
             Ok(error) => error,
-            Err(error) => {
-                ChildError::Failed(format!("retired subagent cleanup task failed: {error}"))
+            Err(_) => {
+                tracing::warn!("retired subagent cleanup task failed");
+                fallback
             }
         }
     }
@@ -1459,15 +1482,26 @@ fn cancellation(context: &ToolContext<'_>) -> TurnCancellation {
         .map(|value| value.handle().checkpoint())
         .unwrap_or_default()
 }
+fn tool_failure(error: &ChildError) -> ToolError {
+    match error.root() {
+        ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
+        ChildError::Failed(message) | ChildError::TerminalFailed(message) => {
+            ToolError::ExecutionFailed(message.clone())
+        }
+        ChildError::Observed { .. } => unreachable!("root unwraps observations"),
+    }
+}
+
 fn result(
     request: ToolRequest,
     value: Result<SubagentValue, ChildError>,
 ) -> Result<ToolResult, ToolError> {
-    let value = value.map_err(|error| match error {
-        ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
-        ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
-            ToolError::ExecutionFailed(error)
+    let value = value.map_err(|error| {
+        let effects = error.possible_effects();
+        if let Err(log_error) = crate::fatal::record_child_failure(&request.session_id.0, effects) {
+            tracing::warn!(%log_error, "could not store child failure observations");
         }
+        tool_failure(&error)
     })?;
     Ok(ToolResult::new(ToolResultPart::success(
         request.call_id,
