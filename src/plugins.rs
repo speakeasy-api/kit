@@ -343,7 +343,7 @@ impl PluginRuntime {
     }
 
     pub(crate) async fn stage(&self) -> Result<StagedPlugins, String> {
-        let contents = match fs::read_to_string(&self.inner.config_path) {
+        let contents = match crate::config_files::read_to_string(&self.inner.config_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => {
@@ -5125,11 +5125,19 @@ mod tests {
             object_store_limit: Some(&objects),
         });
         invalidator.join().unwrap();
-        assert_eq!(
-            result,
-            Err(GitFailure::ObjectStoreInspection(
-                io::ErrorKind::InvalidData
-            ))
+        // Inspection can observe either the replacement file or the race
+        // between metadata and read_dir (including the remove/create gap).
+        // Every case must stop the live Git process rather than bypass limits.
+        assert!(
+            matches!(
+                result,
+                Err(GitFailure::ObjectStoreInspection(
+                    io::ErrorKind::InvalidData
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::NotFound
+                ))
+            ),
+            "{result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(4));
     }

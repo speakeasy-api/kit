@@ -19,6 +19,7 @@ fn pending_replacement() -> (tempfile::TempDir, PathBuf, Arc<Capacity>, Fs) {
     fs::write(&path, b"old generation\n").unwrap();
     let backend = Arc::new(Capacity {
         exhausted: AtomicBool::new(true),
+        exhaust_on_write: AtomicBool::new(false),
         repaired: directory.path().join("capacity-repaired"),
     });
     let filesystem = Fs::new(Arc::new(CapacityDisk(backend.clone())));

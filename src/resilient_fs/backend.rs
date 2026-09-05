@@ -448,6 +448,8 @@ mod native {
         }
         // SAFETY: successful fstatat initialized the structure.
         let info = unsafe { info.assume_init() };
+        // dev_t is signed on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
         Ok(FileIdentity {
             volume: info.st_dev as u64,
             file: info.st_ino,

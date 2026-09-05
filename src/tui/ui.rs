@@ -127,6 +127,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     } else if app.effort_dialog.is_some() {
         draw_effort_dialog(frame, app);
     }
+    // Durability stays visible on the start screen and over session pickers.
+    // Pending data belongs to the process, not the currently selected session.
+    if app.storage_pending || app.storage_exhausted {
+        let area = frame.area();
+        let warning = if app.storage_exhausted {
+            " Storage exhausted: shutting down; unpersisted data is at risk"
+        } else {
+            " Memory-only storage: awaiting disk recovery; data at risk on exit"
+        };
+        frame.render_widget(
+            Paragraph::new(warning).style(Style::default().fg(theme::warn_color())),
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                u16::from(area.height > 0),
+            ),
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2828,6 +2847,36 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn storage_warning_is_visible_without_logs_and_clears_on_recovery() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai".into(),
+            "gpt".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: false,
+        }));
+        assert!(!app.show_logs);
+        assert!(render(&mut app, 80, 24).contains("Memory-only storage"));
+        app.blocks.push(Block::Agent("response".into()));
+        assert!(render(&mut app, 80, 24).contains("Memory-only storage"));
+        app.start_session("next".into());
+        assert!(render(&mut app, 80, 24).contains("Memory-only storage"));
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: false,
+        }));
+        assert!(!render(&mut app, 80, 24).contains("Memory-only storage"));
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: true,
+        }));
+        assert!(render(&mut app, 80, 24).contains("Storage exhausted"));
     }
 
     #[test]

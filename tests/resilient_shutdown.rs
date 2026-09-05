@@ -15,6 +15,7 @@ async fn exhausted_storage_requests_orderly_process_shutdown() {
     let directory = tempfile::tempdir().unwrap();
     let capacity = Arc::new(Capacity {
         exhausted: AtomicBool::new(true),
+        exhaust_on_write: AtomicBool::new(false),
         repaired: directory.path().join("repair"),
     });
     fs::initialize_global(Fs::with_budget(Arc::new(CapacityDisk(capacity)), 0, 0)).unwrap();

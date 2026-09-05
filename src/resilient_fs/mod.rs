@@ -504,7 +504,6 @@ impl Fs {
     ) -> io::Result<Lease> {
         let path = self.norm(path.as_ref())?;
         let scope = self.norm(scope.as_ref())?;
-        self.require_disk(&path)?;
         let mut state = lock(&self.service.state);
         state
             .leases
@@ -539,6 +538,18 @@ impl Fs {
                 state.leases[index].2 = Arc::downgrade(&owner);
                 return Ok(Lease { inner: owner });
             }
+        }
+        // Retained authority precedes recovery: parent sync touches the lock.
+        let report = self.recover_locked(&mut state);
+        self.rebase(&mut state);
+        Self::prune(&mut state);
+        if state.pending.iter().any(|p| p.action.touches(&path)) {
+            return Err(report.blocked.unwrap_or_else(|| {
+                error(
+                    io::ErrorKind::WouldBlock,
+                    "bounded recovery has pending work",
+                )
+            }));
         }
         state.leases.try_reserve(1).map_err(|_| allocation_oom())?;
         let native = self.service.backend.acquire_lease(&LeaseRequest {
@@ -768,10 +779,36 @@ impl Fs {
                 ..Default::default()
             },
         )?;
-        let object = Arc::new(Mutex::new(Object::native(native, path.to_path_buf())?));
+        let opened = Object::native(native, path.to_path_buf())?;
+        // Share logical identity only while the named inode still matches.
+        // Explicit and external replacements must remain distinct.
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let held = lock(&object);
+            if held.path.as_deref() == Some(path)
+                && same_disk_identity(held.meta.disk_identity, opened.meta.disk_identity)
+            {
+                drop(held);
+                return Ok(object);
+            }
+        }
+        let object = Arc::new(Mutex::new(opened));
         s.objects.try_reserve(1).map_err(|_| allocation_oom())?;
         s.objects.push(Arc::downgrade(&object));
         Ok(object)
+    }
+    fn live_object(&self, s: &State, path: &Path) -> io::Result<Option<Obj>> {
+        if let Some(entry) = s.entries.iter().find(|e| e.path == path) {
+            return Ok(entry.object.clone());
+        }
+        let identity = match self.service.backend.identity(path, false) {
+            Ok(identity) => identity,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(s.objects.iter().filter_map(|w| w.upgrade()).find(|o| {
+            let o = lock(o);
+            o.path.as_deref() == Some(path) && same_disk_identity(o.meta.disk_identity, identity)
+        }))
     }
     fn entry(s: &mut State, path: PathBuf, object: Option<Obj>) {
         if let Some(o) = &object {
@@ -797,8 +834,70 @@ impl Fs {
     ) -> io::Result<Permissions> {
         #[cfg(unix)]
         {
-            let _ = (s, path);
-            Ok(permissions(private, dir))
+            if private || dir {
+                return Ok(permissions(private, dir));
+            }
+            // Let the kernel apply umask without changing process-global state.
+            // Probe an empty exclusive file; never broaden its mode.
+            let mut parent = path
+                .parent()
+                .ok_or_else(|| error(io::ErrorKind::InvalidInput, "no parent"))?;
+            while s.entries.iter().any(|e| {
+                e.path == parent && e.object.as_ref().is_some_and(|o| lock(o).meta.is_dir())
+            }) && matches!(self.service.backend.metadata(parent, false),
+                Err(e) if e.kind() == io::ErrorKind::NotFound)
+            {
+                parent = parent
+                    .parent()
+                    .ok_or_else(|| error(io::ErrorKind::InvalidInput, "no disk ancestor"))?;
+            }
+            for _ in 0..8 {
+                let mut random = [0u8; 16];
+                getrandom::fill(&mut random).map_err(io::Error::other)?;
+                let probe = parent.join(format!(
+                    ".kit-mode-{:032x}.tmp",
+                    u128::from_ne_bytes(random)
+                ));
+                match self.service.backend.open(
+                    &probe,
+                    &DiskOpenOptions {
+                        write: true,
+                        create_new: true,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(file) => {
+                        let result = file.metadata().map(|m| m.permissions());
+                        // Never unlink another actor's replacement, including a
+                        // symlink. Keep the descriptor alive through cleanup.
+                        if !same_disk_identity(
+                            file.identity()?,
+                            self.service.backend.identity(&probe, false)?,
+                        ) {
+                            return Err(error(
+                                io::ErrorKind::PermissionDenied,
+                                "permission probe identity changed",
+                            ));
+                        }
+                        match self.service.backend.remove_file(&probe) {
+                            Ok(()) => {}
+                            // An empty probe may remain, but no user bytes are
+                            // exposed and capacity failure must permit fallback.
+                            Err(e) if capacity(&e) => {}
+                            Err(e) => return Err(e),
+                        }
+                        return result;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    // Only capacity failure allows fallback; use a restrictive mode.
+                    Err(e) if capacity(&e) => return Ok(permissions(true, false)),
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(error(
+                io::ErrorKind::AlreadyExists,
+                "permission probe collisions",
+            ))
         }
         #[cfg(not(unix))]
         {
@@ -1002,8 +1101,9 @@ impl Fs {
                         len,
                         patches: Arc::new(Vec::new()),
                     };
-                    object.meta.disk_identity = disk_identity;
-                    object.meta.disk = Some(meta);
+                    let identity = object.meta.identity;
+                    object.meta = Metadata::disk(meta, disk_identity);
+                    object.meta.identity = identity;
                     object.dirty = false;
                 }
             } else if let Ok(native) = self.service.backend.open(
@@ -1017,8 +1117,9 @@ impl Fs {
                 && let Ok(image) = Image::native(native)
             {
                 object.image = image;
-                object.meta.disk_identity = disk_identity;
-                object.meta.disk = Some(meta);
+                let identity = object.meta.identity;
+                object.meta = Metadata::disk(meta, disk_identity);
+                object.meta.identity = identity;
                 object.dirty = false;
             }
         }
@@ -1318,10 +1419,7 @@ impl Fs {
         };
         let data = Arc::new(bytes(contents)?);
         let object = if !new_object {
-            s.entries
-                .iter()
-                .find(|e| e.path == path)
-                .and_then(|e| e.object.clone())
+            self.live_object(&s, &path)?
         } else {
             None
         };
@@ -1974,11 +2072,7 @@ impl OpenOptions {
                 permissions: perms.clone(),
                 modified: SystemTime::now(),
             };
-            let obj = s
-                .entries
-                .iter()
-                .find(|e| e.path == p)
-                .and_then(|e| e.object.clone());
+            let obj = fs.live_object(&s, &p)?;
             let a = Fs::put_action(&mut s, &p, Image::memory(data.clone()), perms);
             let (accepted, result) = fs.submit(&mut s, a);
             if !accepted {
@@ -2039,7 +2133,7 @@ impl File {
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
         let object = lock(&self.object);
-        if object.image.patches.is_empty()
+        if !object.dirty
             && let Source::Native(file) = &object.image.source
         {
             let file = lock(file);
@@ -2167,15 +2261,36 @@ impl File {
     pub fn set_permissions(&self, p: Permissions) -> io::Result<()> {
         let mut s = lock(&self.fs.service.state);
         self.fs.recover_before(&mut s)?;
-        let path = lock(&self.object).path.clone();
-        let (accepted, result) = if let Some(path) = path {
-            self.fs.authority(&path)?;
-            self.fs.secure_path(&s, &path, false)?;
-            Fs::prepare(&mut s, 0)?;
-            self.fs.enqueue(
+        let path = {
+            let mut object = lock(&self.object);
+            if let Some(path) = &object.path
+                && !s.pending.iter().any(|p| p.action.touches(path))
+                && let Source::Native(native) = &object.image.source
+            {
+                let held = lock(native).identity()?;
+                match self.fs.service.backend.identity(path, false) {
+                    Ok(named) if same_disk_identity(held, named) => {}
+                    Ok(None) => {
+                        return Err(error(
+                            io::ErrorKind::PermissionDenied,
+                            "native identity unavailable",
+                        ));
+                    }
+                    Ok(_) => object.path = None,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => object.path = None,
+                    Err(e) => return Err(e),
+                }
+            }
+            object.path.clone()
+        };
+        let (accepted, result) = if let Some(path) = &path {
+            self.fs.authority(path)?;
+            self.fs.secure_path(&s, path, false)?;
+            Fs::prepare(&mut s, 1)?;
+            self.fs.submit(
                 &mut s,
                 Action::Chmod {
-                    path,
+                    path: path.clone(),
                     permissions: p.clone(),
                 },
             )
@@ -2189,6 +2304,12 @@ impl File {
             let mut object = lock(&self.object);
             object.meta.permissions = p;
             object.meta.disk = None;
+            object.dirty = true;
+            drop(object);
+            if let Some(path) = path {
+                Fs::entry(&mut s, path, Some(self.object.clone()));
+            }
+            self.fs.rebase(&mut s);
         }
         result
     }
@@ -2202,10 +2323,11 @@ impl Read for File {
             ));
         }
         let mut cursor = lock(&self.cursor);
-        let image = lock(&self.object).image.clone();
-        let n = if image.patches.is_empty()
-            && let Source::Native(file) = &image.source
-        {
+        let (image, dirty) = {
+            let object = lock(&self.object);
+            (object.image.clone(), object.dirty)
+        };
+        let n = if !dirty && let Source::Native(file) = &image.source {
             let mut file = lock(file);
             file.seek(SeekFrom::Start(*cursor))?;
             file.read(buf)?

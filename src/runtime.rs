@@ -2295,7 +2295,7 @@ async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<V
         let ancestors = root.ancestors().collect::<Vec<_>>();
         for directory in ancestors.into_iter().rev() {
             let path = directory.join("AGENTS.md");
-            let body = match crate::resilient_fs::read_to_string(&path) {
+            let body = match crate::config_files::read_to_string(&path) {
                 Ok(body) => body,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {

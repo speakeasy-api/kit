@@ -12,6 +12,7 @@ use std::{
 };
 pub struct Capacity {
     pub exhausted: AtomicBool,
+    pub exhaust_on_write: AtomicBool,
     pub repaired: PathBuf,
 }
 impl Capacity {
@@ -40,6 +41,9 @@ impl Seek for CapacityFile {
 }
 impl Write for CapacityFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.capacity.exhaust_on_write.swap(false, Ordering::SeqCst) {
+            self.capacity.exhausted.store(true, Ordering::SeqCst);
+        }
         self.capacity.check()?;
         self.inner.write(bytes)
     }

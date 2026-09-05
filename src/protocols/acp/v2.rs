@@ -1838,30 +1838,17 @@ fn replay_tool_output_content(output: &ToolOutput) -> Option<Vec<wire::ToolCallC
 }
 
 pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
-    serve_transport(runtime, agent_client_protocol::Stdio::new()).await
+    let registry = SessionRegistry::new();
+    let result = serve_with_registry(runtime, registry.clone()).await;
+    registry.shutdown().await;
+    result
 }
 
 pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    v2_router(runtime, registry)?
-        .connect_to(agent_client_protocol::Stdio::new())
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
-}
-
-async fn serve_transport(
-    runtime: Arc<Runtime>,
-    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
-) -> Result<(), AcpRuntimeError> {
-    let registry = SessionRegistry::new();
-    let result = v2_router(runtime, registry.clone())?
-        .connect_to(transport)
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
-    registry.shutdown().await;
-    result
+    super::connect_stdio(v2_router(runtime, registry)?).await
 }
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {

@@ -2154,8 +2154,69 @@ async fn drive_until_pause<S: ModelSession>(
     }
 }
 
+/// The SDK can retain its outgoing task after input EOF. Observe EOF ourselves
+/// so the serve supervisor can stop HTTP and perform final storage recovery.
+async fn connect_stdio(component: impl ConnectTo<Client>) -> Result<(), AcpRuntimeError> {
+    use std::io::{BufRead as _, Write as _};
+    // A dedicated OS thread does not hold Tokio runtime teardown hostage if a
+    // termination signal arrives while stdin is idle.
+    let (send, receive) = tokio::sync::mpsc::channel(16);
+    std::thread::Builder::new()
+        .name("kit-acp-stdin".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                if send.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+    let eof = tokio_util::sync::CancellationToken::new();
+    let incoming =
+        futures_util::stream::unfold((receive, eof.clone()), async |(mut receive, eof)| {
+            match receive.recv().await {
+                Some(line) => Some((line, (receive, eof))),
+                None => {
+                    eof.cancel();
+                    None
+                }
+            }
+        });
+    let (send, mut receive) = tokio::sync::mpsc::channel::<(
+        String,
+        tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    )>(1);
+    std::thread::Builder::new()
+        .name("kit-acp-stdout".into())
+        .spawn(move || {
+            while let Some((line, reply)) = receive.blocking_recv() {
+                let mut stdout = std::io::stdout().lock();
+                let result = writeln!(stdout, "{line}").and_then(|()| stdout.flush());
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+    let outgoing = futures_util::sink::unfold(send, async |send, line: String| {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        send.send((line, reply))
+            .await
+            .map_err(std::io::Error::other)?;
+        result.await.map_err(std::io::Error::other)??;
+        Ok::<_, std::io::Error>(send)
+    });
+    let transport = agent_client_protocol::Lines::new(Box::pin(outgoing), Box::pin(incoming));
+    tokio::select! {
+        result = component.connect_to(transport) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
+        _ = eof.cancelled() => Ok(()),
+    }
+}
+
 pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
-    serve_transport(runtime, agent_client_protocol::Stdio::new()).await
+    serve_with_registry(runtime, SessionRegistry::new()).await
 }
 
 pub async fn serve_with_registry(
@@ -2165,13 +2226,14 @@ pub async fn serve_with_registry(
     let component = component(runtime, registry.clone())?;
     let shutdown = crate::resilient_fs::shutdown_token();
     let result = tokio::select! {
-        result = component.connect_to(agent_client_protocol::Stdio::new()) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
+        result = connect_stdio(component) => result,
         _ = shutdown.cancelled() => Ok(()),
     };
     registry.shutdown().await;
     result
 }
 
+#[cfg(test)]
 async fn serve_transport(
     runtime: Arc<Runtime>,
     transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,

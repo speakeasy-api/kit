@@ -2,6 +2,8 @@ mod acp_child;
 mod artifacts;
 pub mod compaction;
 mod compose_output;
+#[doc(hidden)]
+pub mod config_files;
 mod credentials;
 pub mod docs;
 pub mod events;

@@ -11,9 +11,13 @@ enum Point {
     Rename,
     Mkdir,
     DirectorySync,
+    Chmod,
+    Remove,
+    ProbeCollision,
+    ProbeSwap,
 }
 #[derive(Default)]
-struct Faults(Mutex<Option<(Point, i32)>>);
+struct Faults(Mutex<Option<(Point, i32)>>, AtomicUsize);
 impl Faults {
     fn arm(&self, point: Point, code: i32) {
         *self.0.lock().unwrap() = Some((point, code));
@@ -92,8 +96,20 @@ impl Backend for Injected {
         if o.write || o.append {
             self.faults.check(Point::Open)?;
         }
+        let probe = p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(".kit-mode-"));
+        if probe {
+            self.faults.1.fetch_add(1, Ordering::Relaxed);
+            self.faults.check(Point::ProbeCollision)?;
+        }
+        let disk = self.disk.open(p, o)?;
+        if probe && self.faults.check(Point::ProbeSwap).is_err() {
+            native::rename(p, p.with_extension("held")).unwrap();
+            native::write(p, b"replacement").unwrap();
+        }
         Ok(Box::new(InjectedFile {
-            disk: self.disk.open(p, o)?,
+            disk,
             faults: self.faults.clone(),
             wrote_prefix: false,
         }))
@@ -115,6 +131,7 @@ impl Backend for Injected {
         self.disk.create_dir(p, private)
     }
     fn remove_file(&self, p: &Path) -> io::Result<()> {
+        self.faults.check(Point::Remove)?;
         self.disk.remove_file(p)
     }
     fn remove_dir(&self, p: &Path) -> io::Result<()> {
@@ -125,6 +142,7 @@ impl Backend for Injected {
         self.disk.rename(a, b)
     }
     fn set_permissions(&self, p: &Path, mode: Permissions) -> io::Result<()> {
+        self.faults.check(Point::Chmod)?;
         self.disk.set_permissions(p, mode)
     }
     fn sync_directory(&self, p: &Path) -> io::Result<()> {
@@ -1034,4 +1052,237 @@ fn allocator_failure_invokes_exit_hook_before_returning_an_error() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(73), "{output:?}");
+}
+
+#[test]
+fn independent_append_handles_share_service_mutations() {
+    let t = Fixture::new();
+    native::write(t.path("value"), b"start").unwrap();
+    let mut a = OpenOptions::new()
+        .append(true)
+        .open_in(&t.fs, t.path("value"))
+        .unwrap();
+    let mut b = OpenOptions::new()
+        .append(true)
+        .open_in(&t.fs, t.path("value"))
+        .unwrap();
+    a.write_all(b"A").unwrap();
+    b.write_all(b"B").unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"startAB");
+    t.fs.write(t.path("value"), b"ordinary").unwrap();
+    b.write_all(b"B").unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"ordinaryB");
+    let _truncated = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open_in(&t.fs, t.path("value"))
+        .unwrap();
+    a.write_all(b"after truncate").unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"after truncate");
+    t.fs.replace(t.path("value"), b"replacement").unwrap();
+    b.write_all(b"old inode").unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"replacement");
+}
+
+#[test]
+fn handle_chmod_obeys_operation_budget() {
+    let t = Fixture::budget(1024, 1);
+    native::write(t.path("value"), b"start").unwrap();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open_in(&t.fs, t.path("value"))
+        .unwrap();
+    let before = file.metadata().unwrap().permissions();
+    t.faults.arm(Point::Open, libc::ENOSPC);
+    file.write_all(b"pending").unwrap();
+    let mut changed = before.clone();
+    changed.set_readonly(true);
+    for _ in 0..3 {
+        assert_eq!(
+            file.set_permissions(changed.clone()).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        assert_eq!(t.fs.status().pending_operations, 1);
+        assert_eq!(file.metadata().unwrap().permissions(), before);
+    }
+    t.settle();
+}
+
+#[test]
+fn retained_lease_handoff_with_pending_parent_sync() {
+    let t = Fixture::new();
+    let path = t.path("session.lock");
+    let lease =
+        t.fs.acquire_lease(&path, &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = t.fs.guarded(&lease).unwrap();
+    t.faults.arm(Point::DirectorySync, libc::ENOSPC);
+    guarded.write(t.path("value"), b"published").unwrap();
+    guarded.sync_directory(&t.root).unwrap();
+    assert!(t.fs.status().pending_operations > 0);
+    assert_eq!(
+        t.fs.acquire_lease(&path, &t.root, LeaseMode::ExistingOrNew)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(guarded);
+    drop(lease);
+    let resumed =
+        t.fs.acquire_lease(&path, &t.root, LeaseMode::ExistingOrNew)
+            .unwrap();
+    resumed.check().unwrap();
+    t.settle();
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_creation_honors_restrictive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    const CHILD: &str = "KIT_FS_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Only the isolated child changes umask, before running its sole test.
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        command.args(["--exact", &test_name, "--nocapture"]);
+        command.env(CHILD, "1");
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        assert!(command.status().unwrap().success());
+        return;
+    }
+    let t = Fixture::new();
+    t.fs.write(t.path("write"), b"secret").unwrap();
+    let _file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open_in(&t.fs, t.path("open"))
+        .unwrap();
+    for name in ["write", "open"] {
+        assert_eq!(
+            native::metadata(t.path(name)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    native::set_permissions(t.path("write"), Permissions::from_mode(0o640)).unwrap();
+    t.fs.write(t.path("write"), b"preserved").unwrap();
+    assert_eq!(
+        native::metadata(t.path("write"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    t.faults.arm(Point::Open, libc::ENOSPC);
+    t.fs.write(t.path("fallback"), b"secret").unwrap();
+    t.settle();
+    assert_eq!(
+        native::metadata(t.path("fallback"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_handle_chmod_does_not_change_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    for external in [false, true] {
+        let t = Fixture::new();
+        let path = t.path("value");
+        native::write(&path, b"old").unwrap();
+        let file = OpenOptions::new().read(true).open_in(&t.fs, &path).unwrap();
+        if external {
+            native::write(t.path("new"), b"replacement").unwrap();
+            native::rename(t.path("new"), &path).unwrap();
+        } else {
+            t.fs.replace(&path, b"replacement").unwrap();
+        }
+        native::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+        file.set_permissions(Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            native::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_handle_metadata_and_zero_patch_reads_are_logical() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"baseline").unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_in(&t.fs, &path)
+        .unwrap();
+    t.faults.arm(Point::Chmod, libc::ENOSPC);
+    file.set_permissions(Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        t.fs.metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    t.settle();
+    t.faults.arm(Point::Open, libc::ENOSPC);
+    file.set_len(0).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 0);
+    assert_eq!(file.seek(SeekFrom::End(0)).unwrap(), 0);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    assert!(bytes.is_empty());
+    file.set_len(5).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 5);
+    file.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, [0; 5]);
+    t.settle();
+    assert_eq!(native::read(&path).unwrap(), [0; 5]);
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_probe_retries_collisions_and_preserves_replacements() {
+    let t = Fixture::new();
+    t.faults.arm(Point::ProbeCollision, libc::EEXIST);
+    assert_eq!(
+        t.fs.write(t.path("value"), b"data").unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(t.fs.status().pending_operations, 0);
+    assert_eq!(t.faults.1.load(Ordering::Relaxed), 8);
+    t.faults.arm(Point::ProbeSwap, libc::EIO);
+    assert_eq!(
+        t.fs.write(t.path("value"), b"data").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let replacement = native::read_dir(&t.root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "tmp"))
+        .unwrap();
+    assert_eq!(native::read(replacement).unwrap(), b"replacement");
+}
+
+#[cfg(unix)]
+#[test]
+fn capacity_during_permission_probe_cleanup_does_not_reject_write() {
+    let t = Fixture::new();
+    t.faults.arm(Point::Remove, libc::ENOSPC);
+    t.fs.write(t.path("value"), b"data").unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"data");
+    t.settle();
 }

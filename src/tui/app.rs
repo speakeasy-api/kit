@@ -647,6 +647,9 @@ pub struct App {
     pub usage: Option<ContextUsage>,
     pub logs: Vec<String>,
     pub show_logs: bool,
+    /// Shared child storage outlives individual sessions.
+    pub storage_pending: bool,
+    pub storage_exhausted: bool,
     pub show_thoughts: bool,
     agents_visible: bool,
     agents: HashMap<String, AgentRow>,
@@ -937,6 +940,8 @@ impl App {
             usage: None,
             logs: Vec::new(),
             show_logs: false,
+            storage_pending: false,
+            storage_exhausted: false,
             show_thoughts: false,
             agents_visible: false,
             agents: HashMap::new(),
@@ -2021,6 +2026,11 @@ impl App {
     }
 
     fn apply_runtime(&mut self, event: RuntimeEvent) {
+        if let RuntimeEvent::StorageStatus { pending, exhausted } = event {
+            self.storage_pending = pending;
+            self.storage_exhausted = exhausted;
+            return;
+        }
         if let RuntimeEvent::SessionStarted { session_id } = event {
             self.runtime_session_id = Some(session_id);
             return;
@@ -2074,7 +2084,8 @@ impl App {
                 millis,
                 ..
             } => call.finish_child(&child_call, ok, summary, millis),
-            RuntimeEvent::SessionStarted { .. }
+            RuntimeEvent::StorageStatus { .. }
+            | RuntimeEvent::SessionStarted { .. }
             | RuntimeEvent::CompactionStarted { .. }
             | RuntimeEvent::CompactionFinished { .. }
             | RuntimeEvent::SubagentStateChanged { .. }
@@ -4642,6 +4653,31 @@ mod tests {
             Action::None
         ));
         assert_eq!(app.editor.text(), "/new");
+    }
+
+    #[test]
+    fn storage_status_survives_session_switch_and_clears_after_recovery() {
+        let mut app = app();
+        app.start_session("old".into());
+        // Storage events must bypass the session routing guard.
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: false,
+        }));
+        assert!(app.storage_pending);
+        assert!(!app.show_logs);
+        app.start_session("new".into());
+        assert!(app.storage_pending);
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: false,
+        }));
+        assert!(!app.storage_pending);
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: true,
+        }));
+        assert!(app.storage_exhausted);
     }
 
     #[test]

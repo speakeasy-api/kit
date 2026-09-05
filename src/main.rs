@@ -274,7 +274,7 @@ impl Config {
             env::current_dir()?.join(path)
         };
         let config_dir = absolute_parent(&config_path)?;
-        let contents = match fs::read_to_string(path) {
+        let contents = match kit::config_files::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self {
@@ -1272,6 +1272,28 @@ mod tests {
         supervise_serve_with_trigger, validate_auth_storage,
     };
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_symlink_loads_and_initializes_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&target, "model = \"gpt-5.6-sol\"\n[plugins]\n").unwrap();
+        std::os::unix::fs::symlink("settings.toml", &link).unwrap();
+        let config = Config::load(&link).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(link.as_path()));
+        assert!(
+            config
+                .plugin_runtime(directory.path())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&target, "invalid TOML [").unwrap();
+        assert!(Config::load(&link).is_err());
+        assert!(config.plugin_runtime(directory.path()).await.is_err());
+    }
+
     #[test]
     fn subagent_names_are_rejected_as_unknown_configuration() {
         let directory = tempfile::tempdir().unwrap();
@@ -2101,6 +2123,65 @@ future_option = true
         assert!(
             Cli::try_parse_from(["kit", "serve", "--server-credential-file", "token.txt",]).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_stops_a2a_and_completes_supervision() {
+        const CHILD: &str = "KIT_TEST_STDIO_EOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for version in ["1", "2"] {
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::stdio_eof_stops_a2a_and_completes_supervision",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, version)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+                    .await
+                    .expect("ACP EOF must stop serve even with an A2A listener")
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let address = http.address();
+        supervise_serve_with_trigger(
+            runtime,
+            sessions,
+            false,
+            if std::env::var(CHILD).unwrap() == "1" {
+                super::AcpProtocolVersion::V1
+            } else {
+                super::AcpProtocolVersion::V2
+            },
+            http,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        // The final recovery in main can now run; no listener keeps serve alive.
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
     }
 
     #[tokio::test]

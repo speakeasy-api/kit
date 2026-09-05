@@ -946,7 +946,7 @@ fn prepare_plugins(
 
 async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
     let path = source.path.clone();
-    match tokio::task::spawn_blocking(move || crate::resilient_fs::read(path))
+    match tokio::task::spawn_blocking(move || crate::config_files::read(&path))
         .await
         .map_err(|error| format!("MCP config read task failed: {error}"))?
     {
@@ -2847,6 +2847,98 @@ mod tests {
         validate_server_names,
     };
     use crate::plugins::{PluginRuntime, ResolvedPluginMcp, ResolvedPlugins};
+
+    #[cfg(unix)]
+    mod config_capacity {
+        use crate as kit;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/capacity.rs"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_reads_memory_only_target() {
+        use config_capacity::{Capacity, CapacityDisk};
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let capacity = Arc::new(Capacity {
+            exhausted: AtomicBool::new(true),
+            exhaust_on_write: AtomicBool::new(false),
+            repaired: directory.path().join("repaired"),
+        });
+        let filesystem = crate::resilient_fs::Fs::new(Arc::new(CapacityDisk(capacity)));
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        std::os::unix::fs::symlink("config.json", &link).unwrap();
+        filesystem.write(&target, b"pending").unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &link).unwrap(),
+            b"pending"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_sources_follow_symlinks_and_reload_targets() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        let chained = directory.path().join("explicit.json");
+        std::fs::write(&target, b"first").unwrap();
+        symlink("config.json", &link).unwrap();
+        symlink(&link, &chained).unwrap();
+        for source in [
+            ConfigSource::required(chained),
+            ConfigSource::optional_project(link.clone(), directory.path().to_path_buf()),
+        ] {
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"first".to_vec())
+            );
+            crate::resilient_fs::write(&target, b"second").unwrap();
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"second".to_vec())
+            );
+            std::fs::write(&target, b"first").unwrap();
+        }
+        // Security-sensitive managed reads still reject final symlinks.
+        assert_eq!(
+            crate::resilient_fs::read(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            super::read_source(&ConfigSource::optional_project(
+                link.clone(),
+                directory.path().to_path_buf()
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_source(&ConfigSource::required(link))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_source_rejects_symlink_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("loop.json");
+        std::os::unix::fs::symlink("loop.json", &link).unwrap();
+        let error = super::read_source(&ConfigSource::required(link))
+            .await
+            .unwrap_err();
+        assert!(error.contains("too many symbolic links"), "{error}");
+    }
 
     fn spec(name: &str, description: &str) -> ToolSpec {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))

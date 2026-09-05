@@ -70,8 +70,10 @@ pub fn start_recovery_worker() {
                 let fs = crate::resilient_fs::global();
                 let mut delay = 1;
                 let mut warned = false;
+                let mut emitted_status = None;
                 loop {
                     let status = fs.status();
+                    publish_status(status.pending_operations > 0, status.exhausted, &mut emitted_status);
                     if status.exhausted {
                         let _ = std::io::stderr().write_all(
                             b"kit: internal storage memory budget exhausted; cancelling work and shutting down. Unpersisted data cannot survive process exit.\n",
@@ -85,8 +87,10 @@ pub fn start_recovery_worker() {
                             );
                             warned = true;
                         }
-                        let report = fs.recover();
-                        if report.remaining_operations == 0 {
+                        let _ = fs.recover();
+                        let recovered = fs.status();
+                        publish_status(recovered.pending_operations > 0, recovered.exhausted, &mut emitted_status);
+                        if recovered.pending_operations == 0 {
                             let _ = std::io::stderr().write_all(
                                 b"kit: internal storage recovered; pending changes are persisted.\n",
                             );
@@ -96,6 +100,12 @@ pub fn start_recovery_worker() {
                             delay = (delay * 2).min(30);
                         }
                     } else {
+                        if warned {
+                            let _ = std::io::stderr().write_all(
+                                b"kit: internal storage recovered; pending changes are persisted.\n",
+                            );
+                            warned = false;
+                        }
                         delay = 1;
                     }
                     if shutdown_token().is_cancelled() {
@@ -114,6 +124,13 @@ pub fn start_recovery_worker() {
             request_shutdown();
         }
     });
+}
+
+fn publish_status(pending: bool, exhausted: bool, previous: &mut Option<(bool, bool)>) {
+    if *previous != Some((pending, exhausted)) {
+        crate::events::emit(&crate::events::RuntimeEvent::StorageStatus { pending, exhausted });
+        *previous = Some((pending, exhausted));
+    }
 }
 
 #[cfg(test)]

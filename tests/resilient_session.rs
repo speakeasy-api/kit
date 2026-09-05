@@ -47,6 +47,7 @@ fn session_survives_outage_close_reopen_and_tool_driven_recovery() {
     fs::create_dir(&root).unwrap();
     let capacity = Arc::new(Capacity {
         exhausted: AtomicBool::new(false),
+        exhaust_on_write: AtomicBool::new(false),
         repaired: home.join("repaired"),
     });
     assert!(
@@ -173,4 +174,73 @@ fn session_survives_outage_close_reopen_and_tool_driven_recovery() {
     assert_eq!(durable.matches("accepted after repair").count(), 1);
     assert_eq!(resilient_fs::global().recover().remaining_operations, 0);
     assert_eq!(fs::read_to_string(transcript).unwrap(), durable);
+}
+
+#[test]
+fn legacy_migration_reopens_with_retained_parent_sync_during_outage() {
+    const CHILD: &str = "KIT_RESILIENT_MIGRATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "legacy_migration_reopens_with_retained_parent_sync_during_outage",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let root = home.join("project");
+    let legacy = root.join(".kit/sessions");
+    fs::create_dir_all(&legacy).unwrap();
+    let capacity = Arc::new(Capacity {
+        exhausted: AtomicBool::new(false),
+        exhaust_on_write: AtomicBool::new(false),
+        repaired: home.join("repaired"),
+    });
+    resilient_fs::initialize_global(Fs::new(Arc::new(CapacityDisk(capacity.clone())))).unwrap();
+    // Materialize the workspace's storage directory before the simulated outage.
+    drop(
+        kit::session::open(
+            &root,
+            "bootstrap",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap(),
+    );
+    let record = json!({
+        "schema_version": 2, "session_id": "legacy", "generation": 1,
+        "item": Item::text(ItemKind::System, "legacy history"),
+    });
+    fs::write(legacy.join("legacy.jsonl"), format!("{record}\n")).unwrap();
+    // Acquire real scoped and legacy leases before the first data write fails.
+    capacity.exhaust_on_write.store(true, Ordering::SeqCst);
+    let opened = kit::session::open(&root, "legacy", true, false, vec![]).unwrap();
+    let transcript = opened.transcript.clone();
+    assert!(resilient_fs::global().status().pending_operations > 0);
+    drop(opened);
+    let reopened = kit::session::open(&root, "legacy", true, false, vec![]).unwrap();
+    assert_eq!(reopened.transcript, transcript);
+    assert!(kit::session::open(&root, "legacy", true, true, vec![]).is_err());
+    capacity.exhausted.store(false, Ordering::SeqCst);
+    assert_eq!(resilient_fs::global().recover().remaining_operations, 0);
+    drop(reopened);
+    assert_eq!(
+        kit::session::open(&root, "legacy", true, false, vec![])
+            .unwrap()
+            .transcript,
+        transcript
+    );
 }
