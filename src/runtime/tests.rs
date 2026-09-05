@@ -1539,17 +1539,152 @@ async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispa
     }
 }
 
-#[test]
-fn pending_detach_is_applied_when_compose_registers() {
-    let jobs = BackgroundJobs::default();
+// Hold execution at the external script-engine boundary, after real compose registration.
+struct DelayedComposeBackend {
+    entered: tokio::sync::mpsc::UnboundedSender<agentkit_core::TurnCancellation>,
+    release: Arc<tokio::sync::Notify>,
+}
 
-    assert_eq!(
-        jobs.detach("pending-call"),
-        Some(DetachRegistration::Registered)
+#[async_trait::async_trait]
+impl agentkit_tool_compose::ComposeBackend for DelayedComposeBackend {
+    fn name(&self) -> &'static str {
+        "delayed"
+    }
+
+    fn description(&self, _: Option<&[agentkit_tools_core::ToolSpec]>) -> String {
+        "Controlled script execution".into()
+    }
+
+    fn script_description(&self) -> &'static str {
+        "Script held until released or cancelled"
+    }
+
+    async fn execute(
+        &self,
+        run: agentkit_tool_compose::BackendRun,
+    ) -> Result<Value, agentkit_tool_compose::ComposeOutcome> {
+        let cancellation = run.cancellation.expect("compose installs cancellation");
+        self.entered.send(cancellation.clone()).unwrap();
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(agentkit_tool_compose::ComposeOutcome::Failed(
+                agentkit_tools_core::ToolError::Cancelled,
+            )),
+            _ = self.release.notified() => Ok(json!(7)),
+        }
+    }
+}
+
+fn delayed_compose(
+    root: &std::path::Path,
+    jobs: BackgroundJobs,
+) -> (
+    Arc<BackgroundableCompose>,
+    tokio::sync::mpsc::UnboundedReceiver<agentkit_core::TurnCancellation>,
+    Arc<tokio::sync::Notify>,
+) {
+    let (entered, entries) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let inner = agentkit_tool_compose::ComposeTool::new(Default::default()).with_backend(
+        DelayedComposeBackend {
+            entered,
+            release: release.clone(),
+        },
     );
-    jobs.register_foreground_for_test("pending-call");
+    (
+        Arc::new(BackgroundableCompose::new(
+            inner,
+            jobs,
+            root.to_path_buf(),
+            agentkit_tools_core::ToolRegistry::new(),
+        )),
+        entries,
+        release,
+    )
+}
 
-    assert!(jobs.is_detached_for_test("pending-call"));
+fn invoke_delayed_compose(
+    compose: Arc<BackgroundableCompose>,
+    call_id: &'static str,
+    background: bool,
+) -> tokio::task::JoinHandle<ToolExecutionOutcome> {
+    tokio::spawn(async move {
+        let session_id = SessionId::new("registration-session");
+        let turn_id = TurnId::new("registration-turn");
+        let permissions = Arc::new(AllowAllPermissions);
+        let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+        let owned = OwnedToolContext {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            metadata: MetadataMap::new(),
+            permissions: permissions.clone(),
+            resources: resources.clone(),
+            cancellation: None,
+            execution_scope: Some(ToolExecutionScope {
+                executor: Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new())),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                permissions,
+                resources,
+                cancellation: None,
+            }),
+            approved_request: None,
+        };
+        compose
+            .invoke_outcome(
+                ToolRequest::new(
+                    ToolCallId::new(call_id),
+                    ToolName::new("compose"),
+                    json!({"script": "return 7", "background": background}),
+                    session_id,
+                    turn_id,
+                ),
+                &mut owned.borrowed(),
+            )
+            .await
+    })
+}
+
+#[tokio::test]
+async fn pending_detach_is_applied_when_compose_registers() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let root = tempfile::tempdir().unwrap();
+        let jobs = BackgroundJobs::default();
+        let (compose, mut entries, release) = delayed_compose(root.path(), jobs.clone());
+        let initial = jobs.activity();
+        let call_id = ToolCallId::new("pending-call");
+        assert_eq!(
+            jobs.detach(&call_id.0),
+            Some(DetachRegistration::Registered)
+        );
+
+        let invocation = invoke_delayed_compose(compose, "pending-call", false);
+        let cancellation = entries.recv().await.unwrap();
+        assert!(!cancellation.is_cancelled());
+        // The old accessor also returned true for an unconsumed pending detach.
+        // Inspect the registered job so this cannot pass without applying policy.
+        {
+            let state = jobs.state.lock().unwrap();
+            let job = state.running.get(&call_id).expect("compose registered");
+            assert!(job.detached);
+            assert!(job.manual_detach);
+            assert!(!state.pending_detaches.contains(&call_id));
+        }
+        assert!(jobs.activity().active);
+        assert_eq!(
+            jobs.activity().background_started,
+            initial.background_started + 1
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            invocation.await.unwrap(),
+            ToolExecutionOutcome::Completed(_)
+        ));
+        assert!(!jobs.activity().active);
+        assert!(jobs.activity().unacknowledged_terminals);
+    })
+    .await
+    .expect("pending detach compose invocation did not finish");
 }
 
 #[test]
@@ -1597,28 +1732,50 @@ fn background_terminal_publication_is_acknowledged_by_call_id() {
     assert!(!jobs.activity().unacknowledged_terminals);
 }
 
-#[test]
-fn cancel_all_covers_running_and_late_background_registration() {
-    let jobs = BackgroundJobs::default();
-    let initial = jobs.activity();
-    jobs.register_foreground_for_test("running");
-    assert!(jobs.activity().active);
+#[tokio::test]
+async fn cancel_all_covers_running_and_late_background_registration() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for background in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let jobs = BackgroundJobs::default();
+            let initial = jobs.activity();
+            let (compose, mut entries, release) = delayed_compose(root.path(), jobs.clone());
+            let running = invoke_delayed_compose(compose.clone(), "running", background);
+            let cancellation = entries.recv().await.unwrap();
+            assert!(jobs.activity().active);
+            assert!(!cancellation.is_cancelled());
 
-    jobs.cancel_all();
-    assert!(jobs.is_cancelled_for_test("running"));
-    jobs.register_foreground_for_test("late");
-    assert!(jobs.is_cancelled_for_test("late"));
+            jobs.cancel_all();
+            assert!(cancellation.is_cancelled());
+            assert!(matches!(
+                running.await.unwrap(),
+                ToolExecutionOutcome::Failed(agentkit_tools_core::ToolError::Cancelled)
+            ));
+            // A late registration must be cancelled before the backend is entered.
+            let late = invoke_delayed_compose(compose.clone(), "late", background);
+            assert!(matches!(
+                late.await.unwrap(),
+                ToolExecutionOutcome::Failed(agentkit_tools_core::ToolError::Cancelled)
+            ));
+            assert!(entries.try_recv().is_err());
+            let quiescent = jobs.activity();
+            assert!(!quiescent.active);
+            assert!(quiescent.generation > initial.generation);
 
-    jobs.finish_for_test("running");
-    jobs.finish_for_test("late");
-    let quiescent = jobs.activity();
-    assert!(!quiescent.active);
-    assert!(quiescent.generation > initial.generation);
-
-    jobs.begin_turn();
-    jobs.register_foreground_for_test("next-turn");
-    assert!(!jobs.is_cancelled_for_test("next-turn"));
-    jobs.finish_for_test("next-turn");
+            jobs.begin_turn();
+            let next = invoke_delayed_compose(compose, "next-turn", background);
+            let cancellation = entries.recv().await.unwrap();
+            assert!(!cancellation.is_cancelled());
+            release.notify_one();
+            assert!(matches!(
+                next.await.unwrap(),
+                ToolExecutionOutcome::Completed(_)
+            ));
+            assert!(!jobs.activity().active);
+        }
+    })
+    .await
+    .expect("cancel-all compose invocation did not finish");
 }
 
 #[tokio::test]

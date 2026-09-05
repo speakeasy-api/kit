@@ -157,33 +157,6 @@ impl TokenRecord {
             generation: self.generation.clone(),
         })
     }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn for_test(access_token: &str, account_id: &str) -> Self {
-        Self {
-            access_token: access_token.to_owned(),
-            refresh_token: "test-refresh-token".to_owned(),
-            id_token: "test-id-token".to_owned(),
-            expires_at: i64::MAX,
-            account_id: Some(account_id.to_owned()),
-            email: None,
-            plan_type: None,
-            generation: format!("test-{account_id}"),
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn for_test_generation(
-        access_token: &str,
-        account_id: &str,
-        generation: &str,
-    ) -> Self {
-        let mut record = Self::for_test(access_token, account_id);
-        record.generation = generation.to_owned();
-        record
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
@@ -663,15 +636,24 @@ fn refresh_current(
     rejected_access_token: Option<&str>,
     token_url: &str,
 ) -> Result<TokenRecord, AuthError> {
-    refresh_current_at(store, deadline, rejected_access_token, token_url, JWKS_URL)
+    refresh_with_signing_keys(
+        store,
+        deadline,
+        rejected_access_token,
+        token_url,
+        &SigningKeys {
+            cache: &JWKS_CACHE,
+            source: &OpenAiSigningKeys,
+        },
+    )
 }
 
-fn refresh_current_at(
+fn refresh_with_signing_keys(
     store: &dyn CredentialStore,
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<TokenRecord, AuthError> {
     let current = store.load()?.ok_or_else(|| {
         AuthError::invalid(
@@ -712,7 +694,7 @@ fn refresh_current_at(
             "token endpoint returned malformed JSON",
         )
     })?;
-    let next = token_record(response, None, Some(&current), deadline, jwks_url)?;
+    let next = token_record(response, None, Some(&current), deadline, signing_keys)?;
     store.save(&next)?;
     Ok(next)
 }
@@ -725,25 +707,28 @@ fn exchange_code(
     deadline: Instant,
     token_url: &str,
 ) -> Result<TokenRecord, AuthError> {
-    exchange_code_at(
+    exchange_with_signing_keys(
         code,
         redirect_uri,
         verifier,
         nonce,
         deadline,
         token_url,
-        JWKS_URL,
+        &SigningKeys {
+            cache: &JWKS_CACHE,
+            source: &OpenAiSigningKeys,
+        },
     )
 }
 
-fn exchange_code_at(
+fn exchange_with_signing_keys(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
     nonce: &str,
     deadline: Instant,
     token_url: &str,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<TokenRecord, AuthError> {
     if !matches!(
         redirect_uri,
@@ -781,7 +766,7 @@ fn exchange_code_at(
             "token endpoint returned malformed JSON",
         )
     })?;
-    token_record(response, Some(nonce), None, deadline, jwks_url)
+    token_record(response, Some(nonce), None, deadline, signing_keys)
 }
 
 fn token_record(
@@ -789,7 +774,7 @@ fn token_record(
     nonce: Option<&str>,
     previous: Option<&TokenRecord>,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<TokenRecord, AuthError> {
     if response.access_token.is_empty()
         || response
@@ -807,12 +792,12 @@ fn token_record(
         "https://api.openai.com/v1",
         None,
         deadline,
-        jwks_url,
+        signing_keys,
     )?;
     let access_account = extract_account_id(&access_claims)?;
     let (id_token, id_claims) = match response.id_token.take() {
         Some(id_token) => {
-            let claims = verify_claims(&id_token, CLIENT_ID, nonce, deadline, jwks_url)?;
+            let claims = verify_claims(&id_token, CLIENT_ID, nonce, deadline, signing_keys)?;
             (id_token, Some(claims))
         }
         None if nonce.is_some() => {
@@ -911,7 +896,7 @@ fn verify_claims(
     audience: &str,
     nonce: Option<&str>,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<JwtClaims, AuthError> {
     if token.len() > MAX_CREDENTIAL_BYTES {
         return Err(AuthError::invalid("token_invalid", "JWT exceeds 64 KiB"));
@@ -928,7 +913,7 @@ fn verify_claims(
         .kid
         .filter(|value| !value.is_empty() && value.len() <= 256 && value.is_ascii())
         .ok_or_else(|| AuthError::invalid("token_invalid", "JWT omitted a valid key ID"))?;
-    let key = verification_key(&kid, deadline, jwks_url)?;
+    let key = verification_key(&kid, deadline, signing_keys)?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = CLOCK_SKEW_SECONDS as u64;
     validation.validate_nbf = true;
@@ -1019,10 +1004,10 @@ fn valid_email(value: &str) -> bool {
 fn verification_key(
     kid: &str,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<DecodingKey, AuthError> {
     for refresh in [false, true] {
-        let keys = jwks(deadline, jwks_url, refresh)?;
+        let keys = signing_keys.load(deadline, refresh)?;
         if let Some(jwk) = keys.find(kid) {
             if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256)
                 || !matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
@@ -1052,33 +1037,62 @@ fn verification_key(
     ))
 }
 
-fn jwks(deadline: Instant, jwks_url: &str, refresh: bool) -> Result<JwkSet, AuthError> {
-    if !cfg!(test) && jwks_url != JWKS_URL {
-        return Err(AuthError::invalid(
-            "jwks_invalid",
-            "only the pinned OpenAI JWKS endpoint is permitted",
-        ));
-    }
-    if !refresh {
-        let cache = JWKS_CACHE.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(cached) = cache.get(jwks_url)
-            && cached.fetched_at.elapsed() < JWKS_TTL
-        {
-            return Ok(cached.keys.clone());
+/// Fetches issuer-trusted JWKS documents from an external source.
+trait SigningKeySource {
+    fn fetch(&self, deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError>;
+}
+
+struct OpenAiSigningKeys;
+
+impl SigningKeySource for OpenAiSigningKeys {
+    fn fetch(&self, deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+        let response = http_client(deadline)?
+            .get(JWKS_URL)
+            .send()
+            .map_err(|_| AuthError::unavailable("jwks_fetch_failed", "JWKS fetch failed"))?;
+        if !response.status().is_success() {
+            return Err(AuthError::unavailable(
+                "jwks_fetch_failed",
+                "JWKS endpoint rejected the request",
+            ));
         }
+        bounded_body(response)
     }
-    let response = http_client(deadline)?
-        .get(jwks_url)
-        .send()
-        .map_err(|_| AuthError::unavailable("jwks_fetch_failed", "JWKS fetch failed"))?;
-    if !response.status().is_success() {
-        return Err(AuthError::unavailable(
-            "jwks_fetch_failed",
-            "JWKS endpoint rejected the request",
-        ));
+}
+
+struct SigningKeys<'a> {
+    cache: &'a Mutex<HashMap<String, CachedJwks>>,
+    source: &'a dyn SigningKeySource,
+}
+
+impl SigningKeys<'_> {
+    fn load(&self, deadline: Instant, refresh: bool) -> Result<JwkSet, AuthError> {
+        if !refresh {
+            let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = cache.get(JWKS_URL)
+                && cached.fetched_at.elapsed() < JWKS_TTL
+            {
+                return Ok(cached.keys.clone());
+            }
+        }
+        let body = self.source.fetch(deadline)?;
+        let keys = parse_jwks(body.as_slice())?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                JWKS_URL.to_owned(),
+                CachedJwks {
+                    fetched_at: Instant::now(),
+                    keys: keys.clone(),
+                },
+            );
+        Ok(keys)
     }
-    let body = bounded_body(response)?;
-    let keys: JwkSet = serde_json::from_slice(body.as_slice())
+}
+
+fn parse_jwks(body: &[u8]) -> Result<JwkSet, AuthError> {
+    let keys: JwkSet = serde_json::from_slice(body)
         .map_err(|_| AuthError::invalid("jwks_invalid", "JWKS response is malformed"))?;
     if keys.keys.is_empty() || keys.keys.len() > 64 {
         return Err(AuthError::invalid(
@@ -1097,16 +1111,6 @@ fn jwks(deadline: Instant, jwks_url: &str, refresh: bool) -> Result<JwkSet, Auth
             ));
         }
     }
-    JWKS_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            jwks_url.to_owned(),
-            CachedJwks {
-                fetched_at: Instant::now(),
-                keys: keys.clone(),
-            },
-        );
     Ok(keys)
 }
 
@@ -1387,11 +1391,6 @@ struct ProcessLock {
     _scope: Option<std::sync::Arc<CredentialFilesystemScope>>,
 }
 
-#[cfg(test)]
-fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
-    process_lock_scoped(deadline, None)
-}
-
 fn process_lock_scoped(
     deadline: Instant,
     credential_scope: Option<&std::path::Path>,
@@ -1643,8 +1642,35 @@ fn human(stdout: impl Into<String>) -> Output {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::TokenRecord;
+
+    pub(crate) fn token_record(
+        access_token: &str,
+        account_id: &str,
+        generation: &str,
+    ) -> TokenRecord {
+        TokenRecord {
+            access_token: access_token.to_owned(),
+            refresh_token: "test-refresh-token".to_owned(),
+            id_token: "test-id-token".to_owned(),
+            expires_at: i64::MAX,
+            account_id: Some(account_id.to_owned()),
+            email: None,
+            plan_type: None,
+            generation: generation.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
+        process_lock_scoped(deadline, None)
+    }
+
     use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
 
     const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC3UQBTeVjOtSY4\nHaZHjSpQPlIIUXSiIq+WRInLoWwYEXmloR41HMmwsCQVV1WFZ7z0wUj14vD3/Bl6\nJG2JTU8ur+RvJojm1gXxg/etp4DG2HVtXong4QE7BKqJufHITMVuEhojkTulHIbW\nXfQQjaxQpGsOIuWcRz3YVB7zpAL7yoeHhvFd7RV+IqG9i4fjN4pzlCTv/TQig+s7\n539MsNx1ZakBfeBhx62JUPhFe6pXdPS2hXVUiTQRPMBm3GimDzyuA3WkVKzPyNMB\n2h+BALRFLslqPaFpul7NIifX36KgUPaimntpvFRxahqyDvJ9ATtq6oMeHaRUMZf5\nkRxjLIXLAgMBAAECggEAAIIV+SVDTMINyrwHo6J4NTlnACTm/jK7FTSNbpC8/E1t\nbpBwGqpAw4pJdKcFqAADSGkSFbRnrJhN+HEKE1uxK3+gp3o43kLw80bFX1Lb4DE7\nahkyp/qXsUfbB9S0dIoEm2srbWElWYN8ZYhkeSNGEKx+q3mx9JPx+kaJa2159flh\nis34maBeEr97gwjAvMjLbdVEpoaEIRC/hmem2ckT5jsDd4HS7RKNXwk/S8O7/PQW\n42xKAvL0APk5J53CDoW4DT78y7t4Rj/dVeRZAhdjDUFP+idZ1r9k6PM8vs5tl1P0\njzcOMzUBFmhnb5MKFvBLc4MKJQYzTT06/qdfAV0M2QKBgQDsoUF+pNQuERUKCI9T\nZey7rFgsbBkK2t0XvgpLwwMbF548HgL+QJhAAONaLe5+2GlZSgb5OgoYYspiuzQT\noz2mqeN2MSMnUtntyUt+Y6IzPEEPg6bVGdoCP3FSvz1L/JDJuJq4cqb3OGPe4yEt\nZDymqUJCDTO52vT0GLdZ6S70twKBgQDGUoYrbButBHX5nwE5XnrjgENGT4RauI76\nQ158MuFmRmpgaWlc37ByVyzMG7x9qxcad4Ry19hsG5KYnL/PNs31a2i/BdfLZyFF\nY0dfNExz6tKf4PWxZhhFhX94f7qseSzXLx8eMQqdds4WQsA13JI9qQJ0pVSNyb/V\nXM/n9XMrjQKBgDsKgSz4M3jLClTWjexhIhAxkE6FKjprIX8rC6abocrAudqGInkN\n5O8TSabWjwtXM/HzZooI0TwEajr4OqYrtNZAzWBQIlVNdtK9xvhiI7Zk8lbMonPJ\nX3vwGHZtAP5Upkuuo+whr0c/6qtSQJTyza9HzCBu6tkUqMm+4QCuDelBAoGAax8S\nF4w6WrcJHj7Tg3BUAmQ6clTrEbGUkPsoov88nmi0dsUZQzAT93681La6lkp+nS4n\nXXzXCnXONh6cwElC8CgHGP8H83cOEpOwbm0qSoZxJCh3rU2PGKYmFyku5JBDNyvd\nrAojSLBuWrnNZopwd1u91tGinT93HcEXD5yVi9UCgYBq1sjl5jlliyHzPWMeV3dn\nkJWDLMpCwrpmQzrhkA02PaZO1BB7QgZeIKTYkzECHT44wHflalVOEEsVZpEn2Ivd\nJz6j2JwX7Ke23MA0MDaV6+7syAwPKx3+pOGwdun2uZNgvS74IWeBEfdMhGrGncX0\nQegKxe+skNhLjXJ5SUTdZg==\n-----END PRIVATE KEY-----\n";
@@ -1794,32 +1820,36 @@ mod tests {
         (format!("http://{address}/oauth/token"), handle)
     }
 
-    fn serve_jwks(bodies: Vec<String>) -> (String, std::thread::JoinHandle<usize>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let count = bodies.len();
-        let handle = std::thread::spawn(move || {
-            for body in bodies {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 1024];
-                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    let read = stream.read(&mut chunk).unwrap();
-                    request.extend_from_slice(&chunk[..read]);
-                }
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                )
-                .unwrap();
+    struct SigningKeyFixture {
+        bodies: Mutex<std::collections::VecDeque<String>>,
+        cache: Mutex<HashMap<String, CachedJwks>>,
+    }
+
+    impl SigningKeyFixture {
+        fn new(bodies: Vec<String>) -> Self {
+            Self {
+                bodies: Mutex::new(bodies.into()),
+                cache: Mutex::new(HashMap::new()),
             }
-            count
-        });
-        (format!("http://{address}/.well-known/jwks.json"), handle)
+        }
+
+        fn signing_keys(&self) -> SigningKeys<'_> {
+            SigningKeys {
+                cache: &self.cache,
+                source: self,
+            }
+        }
+    }
+
+    impl SigningKeySource for SigningKeyFixture {
+        fn fetch(&self, _deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|body| Zeroizing::new(body.into_bytes()))
+                .ok_or_else(|| AuthError::unavailable("jwks_fetch_failed", "fixture is offline"))
+        }
     }
 
     #[test]
@@ -1907,7 +1937,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
         let store = BackendCredentialStore::new(&storage);
-        let record = TokenRecord::for_test("access", "account");
+        let record = test_support::token_record("access", "account", "test-account");
 
         store.save(&record).unwrap();
         let loaded = store.load().unwrap().unwrap();
@@ -1941,23 +1971,22 @@ mod tests {
         })
         .to_string();
         let (token_url, server) = serve_once(body);
-        let (jwks_url, jwks_server) = serve_once(test_jwks(kid));
-        let jwks_url = jwks_url.replace("/oauth/token", "/.well-known/jwks.json");
+        let signing_keys = std::sync::Arc::new(SigningKeyFixture::new(vec![test_jwks(kid)]));
         let mut workers = Vec::new();
         for _ in 0..8 {
             let store = std::sync::Arc::clone(&store);
             let token_url = token_url.clone();
-            let jwks_url = jwks_url.clone();
+            let signing_keys = std::sync::Arc::clone(&signing_keys);
             workers.push(std::thread::spawn(move || {
                 let _guard = REFRESH_LOCK
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                refresh_current_at(
+                refresh_with_signing_keys(
                     store.as_ref(),
                     Instant::now() + Duration::from_secs(5),
                     Some("rejected-access-token"),
                     &token_url,
-                    &jwks_url,
+                    &signing_keys.signing_keys(),
                 )
                 .unwrap()
                 .access_token()
@@ -1974,7 +2003,6 @@ mod tests {
         assert_eq!(refreshed.account_id.as_deref(), Some("account-one"));
         assert_eq!(refreshed.id_token, old_id_token);
         let request = server.join().unwrap();
-        jwks_server.join().unwrap();
         assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("grant_type=refresh_token"));
@@ -2003,19 +2031,18 @@ mod tests {
         })
         .to_string();
         let (token_url, token_server) = serve_once(body);
-        let (jwks_url, jwks_server) = serve_once(test_jwks(kid));
-        let record = exchange_code_at(
+        let signing_keys = SigningKeyFixture::new(vec![test_jwks(kid)]);
+        let record = exchange_with_signing_keys(
             "authorization-code",
             "http://localhost:1455/auth/callback",
             "pkce-verifier",
             "expected-nonce",
             Instant::now() + Duration::from_secs(5),
             &token_url,
-            &jwks_url.replace("/oauth/token", "/.well-known/jwks.json"),
+            &signing_keys.signing_keys(),
         )
         .unwrap();
         let request = token_server.join().unwrap();
-        jwks_server.join().unwrap();
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("grant_type=authorization_code"));
         assert!(request.contains("code=authorization-code"));
@@ -2038,22 +2065,37 @@ mod tests {
 
     #[test]
     fn signed_jwt_rejects_bad_signatures_and_refreshes_unknown_kid_once() {
-        JWKS_CACHE.lock().unwrap().clear();
         let token = jwt("https://api.openai.com/v1", None, "rotated-key", 3600, None);
-        let (jwks_url, server) = serve_jwks(vec![test_jwks("old-key"), test_jwks("rotated-key")]);
+        let signing_keys =
+            SigningKeyFixture::new(vec![test_jwks("old-key"), test_jwks("rotated-key")]);
         let claims = verify_claims(
             &token,
             "https://api.openai.com/v1",
             None,
             Instant::now() + Duration::from_secs(5),
-            &jwks_url,
+            &signing_keys.signing_keys(),
         )
         .unwrap();
         assert_eq!(
             extract_account_id(&claims).unwrap().as_deref(),
             Some("account-one")
         );
-        assert_eq!(server.join().unwrap(), 2);
+        // The refresh must replace, not merge, the cached set. With the source
+        // now offline, another successful verification must use the published keys.
+        let cached = signing_keys
+            .signing_keys()
+            .load(Instant::now() + Duration::from_secs(1), false)
+            .unwrap();
+        assert!(cached.find("rotated-key").is_some());
+        assert!(cached.find("old-key").is_none());
+        verify_claims(
+            &token,
+            "https://api.openai.com/v1",
+            None,
+            Instant::now() + Duration::from_secs(1),
+            &signing_keys.signing_keys(),
+        )
+        .unwrap();
 
         let mut bad = token.into_bytes();
         let signature = bad.iter().rposition(|byte| *byte == b'.').unwrap() + 1;
@@ -2064,7 +2106,7 @@ mod tests {
             "https://api.openai.com/v1",
             None,
             Instant::now() + Duration::from_secs(1),
-            &jwks_url,
+            &signing_keys.signing_keys(),
         )
         .err()
         .unwrap();
@@ -2091,7 +2133,7 @@ mod tests {
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(1),
-                &jwks_url,
+                &signing_keys.signing_keys(),
             )
             .is_err()
         );
@@ -2106,10 +2148,46 @@ mod tests {
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(1),
-                &jwks_url,
+                &signing_keys.signing_keys(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unknown_signing_key_stops_after_one_refresh() {
+        let keys = SigningKeyFixture::new(vec![test_jwks("old-key"), test_jwks("other-key")]);
+        let error = verification_key(
+            "missing-key",
+            Instant::now() + Duration::from_secs(1),
+            &keys.signing_keys(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "token_invalid");
+        let cached = keys
+            .signing_keys()
+            .load(Instant::now() + Duration::from_secs(1), false)
+            .unwrap();
+        assert!(cached.find("other-key").is_some());
+        assert!(cached.find("old-key").is_none());
+    }
+
+    #[test]
+    fn jwks_parser_rejects_malformed_empty_oversized_and_duplicate_keys() {
+        let key: Value = serde_json::from_str(&test_jwks("valid-key")).unwrap();
+        for body in [
+            "not json".to_owned(),
+            json!({"keys": []}).to_string(),
+            json!({"keys": vec![key["keys"][0].clone(); 65]}).to_string(),
+            json!({"keys": [key["keys"][0].clone(), key["keys"][0].clone()]}).to_string(),
+            test_jwks(""),
+        ] {
+            assert_eq!(
+                parse_jwks(body.as_bytes()).unwrap_err().code,
+                "jwks_invalid"
+            );
+        }
     }
 
     #[test]
@@ -2123,16 +2201,15 @@ mod tests {
                 3600,
                 Some(not_before_in),
             );
-            let (jwks_url, server) = serve_once(test_jwks(&kid));
+            let signing_keys = SigningKeyFixture::new(vec![test_jwks(&kid)]);
             let result = verify_claims(
                 &token,
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(5),
-                &jwks_url.replace("/oauth/token", "/.well-known/jwks.json"),
+                &signing_keys.signing_keys(),
             );
             assert_eq!(result.is_ok(), accepted);
-            server.join().unwrap();
         }
     }
 

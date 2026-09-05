@@ -648,41 +648,6 @@ impl ChildSession {
         })?
     }
 
-    #[cfg(test)]
-    pub(crate) fn closure_probe_for_test() -> (Self, oneshot::Receiver<()>) {
-        let (tx, mut rx) = mpsc::channel(1);
-        let (closed_tx, closed_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            while rx.recv().await.is_some() {}
-            let _ = closed_tx.send(());
-        });
-        (
-            Self {
-                tx,
-                session_id: "test".into(),
-                capabilities: agentkit_acp::AgentCapabilities::default(),
-                serial: Arc::new(tokio::sync::Mutex::new(())),
-                closed: watch::channel(false).1,
-                descendant_parent: None,
-            },
-            closed_rx,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn disconnected_for_test() -> Self {
-        let (tx, rx) = mpsc::channel(1);
-        drop(rx);
-        Self {
-            tx,
-            session_id: "test".into(),
-            capabilities: agentkit_acp::AgentCapabilities::default(),
-            serial: Arc::new(tokio::sync::Mutex::new(())),
-            closed: watch::channel(false).1,
-            descendant_parent: None,
-        }
-    }
-
     pub async fn fork(
         &self,
         model: Option<&str>,
@@ -1222,6 +1187,46 @@ fn prompt_outcome(
         _ => Err(ChildError::Failed(
             "nested agent returned an unknown stop reason".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl ChildSession {
+        pub(crate) fn closure_probe_for_test() -> (Self, oneshot::Receiver<()>) {
+            let (tx, mut rx) = mpsc::channel(1);
+            let (closed_tx, closed_rx) = oneshot::channel();
+            tokio::spawn(async move {
+                while rx.recv().await.is_some() {}
+                let _ = closed_tx.send(());
+            });
+            (
+                Self {
+                    tx,
+                    session_id: "test".into(),
+                    capabilities: agentkit_acp::AgentCapabilities::default(),
+                    serial: Arc::new(tokio::sync::Mutex::new(())),
+                    closed: watch::channel(false).1,
+                    descendant_parent: None,
+                },
+                closed_rx,
+            )
+        }
+
+        pub(crate) fn disconnected_for_test() -> Self {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            Self {
+                tx,
+                session_id: "test".into(),
+                capabilities: agentkit_acp::AgentCapabilities::default(),
+                serial: Arc::new(tokio::sync::Mutex::new(())),
+                closed: watch::channel(false).1,
+                descendant_parent: None,
+            }
+        }
     }
 }
 

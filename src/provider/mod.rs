@@ -150,9 +150,7 @@ pub fn execute_provider_logout(
 }
 
 #[cfg(test)]
-pub(crate) fn store_openrouter_test_credentials(storage: &crate::credentials::CredentialStorage) {
-    openrouter_auth::store_test_credentials(storage);
-}
+pub(crate) use openrouter_auth::test_support::store_openrouter_test_credentials;
 
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
