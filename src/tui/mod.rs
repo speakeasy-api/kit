@@ -968,6 +968,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 a2a,
             );
             app.can_steer = can_steer;
+            app.can_replace_steer = supports_pending_replace(
+                initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
+            );
             app.auth_methods = auth_methods;
             let mut events = EventStream::new();
             let mut ticker = tokio::time::interval(TICK);
@@ -1183,6 +1186,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             continue;
                                         }
                                     };
+                                    let editable = pending_steer_is_editable(&blocks);
                                     app.clear_attachments();
                                     let outcome = if inject {
                                         connection
@@ -1205,6 +1209,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         Ok(Some(message_id)) => app.apply(Update::SteerAccepted {
                                             id: message_id.to_string(),
                                             text: prompt.text,
+                                            editable,
                                         }),
                                         Ok(None) => {}
                                         Err(error) => {
@@ -1213,6 +1218,48 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             app.note(format!("message was not accepted: {}", error.message));
                                         }
                                     }
+                                }
+                                Action::ReplaceSteer { id, text } => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start pending-message edit");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let Some(token) = app.begin_steer_mutation(&id, Some(text.clone())) else { continue; };
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let request_id = id.clone();
+                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
+                                        connection
+                                            .send_request(wire::ReplaceInjectSessionRequest::new(
+                                                session_id,
+                                                request_id,
+                                                vec![wire::ContentBlock::Text(wire::TextContent::new(text))],
+                                            ))
+                                            .block_task()
+                                            .await
+                                            .map(|_| ())
+                                    });
+                                }
+                                Action::RevokeSteer { id } => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start pending-message removal");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let Some(token) = app.begin_steer_mutation(&id, None) else { continue; };
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let request_id = id.clone();
+                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
+                                        connection
+                                            .send_request(wire::RevokeInjectSessionRequest::new(session_id, request_id))
+                                            .block_task()
+                                            .await
+                                            .map(|_| ())
+                                    });
                                 }
                                 Action::New(first_prompt) => {
                                     connection
@@ -1845,13 +1892,59 @@ fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
+/// Await delivery-sensitive ACP mutations off the terminal event loop. Both
+/// session generation and the app's mutation token must match at completion.
+fn spawn_steer_mutation(
+    generation: u64,
+    id: String,
+    token: u64,
+    updates: mpsc::UnboundedSender<QueuedUpdate>,
+    request: impl std::future::Future<Output = Result<(), agent_client_protocol::Error>>
+    + Send
+    + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = request.await.map_err(|error| app::SteerMutationError {
+            unavailable: pending_message_unavailable(&error),
+            message: format!(
+                "pending-message change failed: {}; retry or Esc to restore draft",
+                error.message
+            ),
+        });
+        let _ = updates.send(QueuedUpdate::for_session(
+            generation,
+            Update::SteerMutationFinished { id, token, result },
+        ));
+    })
+}
+
+fn supports_pending_replace(inject: Option<&wire::SessionInjectCapabilities>) -> bool {
+    inject
+        .and_then(|inject| inject.pending.as_ref())
+        .is_some_and(|pending| pending.replace == Some(true))
+}
+
+fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
+    matches!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("already_delivered" | "unknown_message_id")
+    )
+}
+
 /// Applies one terminal event, returning the work it asks for.
 fn handle(app: &mut App, event: Event) -> Action {
     match event {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            if app.session_rename_active() {
+            if app.queue_focused {
+                return Action::None;
+            }
+            if app.session_rename_active() || app.editing_steer() {
                 app.paste(&text);
             } else if let Some(attachments) = attachments_from_paste(&app.root, &text) {
                 app.prune_attachments();
@@ -1932,6 +2025,12 @@ fn media_attachment(root: &Path, value: &str) -> Option<Attachment> {
         kind,
         size: metadata.len(),
     })
+}
+
+fn pending_steer_is_editable(blocks: &[ContentBlock]) -> bool {
+    blocks
+        .iter()
+        .all(|block| matches!(block, ContentBlock::Text(_)))
 }
 
 fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> {
@@ -2546,7 +2645,7 @@ mod tests {
     };
     use crate::{
         tools::mcp::CredentialStorage,
-        tui::app::{App, SessionDialog, SessionRename, SubmittedPrompt, Update},
+        tui::app::{Action, App, SessionDialog, SessionRename, SubmittedPrompt, Update},
     };
 
     fn command_args(command: &tokio::process::Command) -> Vec<String> {
@@ -3114,6 +3213,224 @@ mod tests {
         assert_eq!(attachments[0].mime_type, "image/png");
     }
 
+    #[tokio::test]
+    async fn queued_mutation_wait_does_not_block_delivery_updates_or_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "pending".into(),
+        });
+        app.paste("draft");
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let token = app.begin_steer_mutation("a", None).unwrap();
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let task = super::spawn_steer_mutation(1, "a".into(), token, updates.clone(), async move {
+            waiting.await.unwrap();
+            Ok(())
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        updates
+            .send(QueuedUpdate::for_session(
+                1,
+                Update::UserMessage {
+                    id: "a".into(),
+                    text: "delivered".into(),
+                    images: vec![],
+                    append: false,
+                },
+            ))
+            .unwrap();
+        let first = receiver.recv().await.unwrap();
+        apply_pending_updates(&mut app, &route, &mut receiver, first);
+        assert!(app.pending_steers.is_empty());
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Cancel
+        ));
+        assert_eq!(app.editor.text(), "draft");
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        task.await.unwrap();
+        let completion = receiver.recv().await.unwrap();
+        apply_pending_updates(&mut app, &route, &mut receiver, completion);
+        assert!(app.pending_steers.is_empty());
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_completion_is_scoped_to_its_starting_session_generation() {
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let task = super::spawn_steer_mutation(1, "a".into(), 7, updates, async move {
+            waiting.await.unwrap();
+            Err(agent_client_protocol::Error::invalid_params()
+                .data(json!({"reason": "already_delivered"})))
+        });
+        super::transition_route(&route, "other-session".into());
+        release.send(()).unwrap();
+        task.await.unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert_eq!(completion.generation, Some(1));
+        assert!(
+            matches!(&completion.update, Update::SteerMutationFinished { token: 7, result: Err(error), .. } if error.unavailable)
+        );
+        assert!(accept_queued_update(&route, completion).is_none());
+    }
+
+    #[test]
+    fn queued_media_editability_uses_actual_submitted_content() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (name, mime, kind) in [
+            ("image.png", "image/png", super::AttachmentKind::Image),
+            ("audio.mp3", "audio/mpeg", super::AttachmentKind::Audio),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(name);
+            std::fs::write(&path, b"media").unwrap();
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.can_steer = true;
+            app.can_replace_steer = true;
+            app.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            app.attach(path, mime, kind, 5);
+            let Action::Submit { prompt, inject } =
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("media steer must remain supported");
+            };
+            assert!(inject);
+            let blocks = prompt_blocks(&prompt).unwrap();
+            assert_eq!(blocks.len(), 2);
+            let editable = super::pending_steer_is_editable(&blocks);
+            assert!(!editable);
+            app.clear_attachments();
+            app.apply(Update::SteerAccepted {
+                id: "media".into(),
+                text: prompt.text,
+                editable,
+            });
+            app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::None
+            ));
+            assert!(!app.editing_steer());
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+                Action::RevokeSteer { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_stale_attachment_metadata_does_not_disable_plain_text_editing() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.can_steer = true;
+        app.can_replace_steer = true;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.attach(
+            PathBuf::from("nonexistent.png"),
+            "image/png",
+            super::AttachmentKind::Image,
+            5,
+        );
+        app.editor.clear(); // Remove the attachment placeholder, leaving stale metadata.
+        app.paste("plain steer");
+        assert_eq!(app.attachments.len(), 1);
+        let Action::Submit { prompt, inject } =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected plain steer");
+        };
+        assert!(inject);
+        assert!(prompt.attachments.is_empty());
+        let blocks = prompt_blocks(&prompt).unwrap();
+        let editable = super::pending_steer_is_editable(&blocks);
+        assert!(editable);
+        app.clear_attachments();
+        app.apply(Update::SteerAccepted {
+            id: "plain".into(),
+            text: prompt.text,
+            editable,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.editing_steer());
+    }
+
+    #[test]
+    fn queued_replace_capability_requires_explicit_true() {
+        use agent_client_protocol::schema::v2::{
+            SessionInjectCapabilities, SessionInjectPendingCapabilities,
+        };
+        assert!(!super::supports_pending_replace(None));
+        for pending in [
+            None,
+            Some(SessionInjectPendingCapabilities::new()),
+            Some(SessionInjectPendingCapabilities::new().replace(false)),
+        ] {
+            let inject = SessionInjectCapabilities::new(vec![]).pending(pending);
+            assert!(!super::supports_pending_replace(Some(&inject)));
+        }
+        let inject = SessionInjectCapabilities::new(vec![])
+            .pending(SessionInjectPendingCapabilities::new().replace(true));
+        assert!(super::supports_pending_replace(Some(&inject)));
+    }
+
+    #[test]
+    fn queued_mutation_errors_retire_only_known_missing_or_delivered_ids() {
+        for reason in [
+            "already_delivered",
+            "unknown_message_id",
+            "replace_not_supported",
+            "temporary_failure",
+        ] {
+            let error = agent_client_protocol::Error::invalid_params()
+                .data(json!({"reason": reason, "messageId": "a"}));
+            assert_eq!(
+                super::pending_message_unavailable(&error),
+                matches!(reason, "already_delivered" | "unknown_message_id")
+            );
+        }
+        assert!(!super::pending_message_unavailable(
+            &agent_client_protocol::Error::invalid_params()
+        ));
+    }
+
     #[test]
     fn multiple_dropped_paths_become_attachments() {
         let directory = tempfile::tempdir().unwrap();
@@ -3160,6 +3477,39 @@ mod tests {
         handle(&mut app, Event::Paste(path.display().to_string()));
 
         assert_eq!(app.attachments.len(), MAX_ATTACHMENTS);
+    }
+
+    #[test]
+    fn queued_edit_media_paste_remains_text_and_preserves_original_attachments() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.can_replace_steer = true;
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "pending".into(),
+        });
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        let draft = app.editor.text().to_owned();
+        let attachments = app.attachments.clone();
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        handle(&mut app, Event::Paste("ignored while selecting".into()));
+        assert_eq!(app.editor.text(), draft);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        assert!(app.attachments.is_empty());
+        assert!(app.editor.text().contains(path.to_str().unwrap()));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.attachments, attachments);
+        assert_eq!(app.editor.text(), draft);
     }
 
     #[test]

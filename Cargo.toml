@@ -90,8 +90,8 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "513e92bb00465a86e5177084f33a130e85705bad" }
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "513e92bb00465a86e5177084f33a130e85705bad" }
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "8e4ee26434a3f847e3613da5bb073ae63a262243" }
+agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "8e4ee26434a3f847e3613da5bb073ae63a262243" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 

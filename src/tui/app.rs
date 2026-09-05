@@ -61,7 +61,16 @@ pub enum Update {
         result: Result<Option<String>, String>,
     },
     /// A steer was accepted but has not been delivered into the transcript yet.
-    SteerAccepted { id: String, text: String },
+    SteerAccepted {
+        id: String,
+        text: String,
+        editable: bool,
+    },
+    SteerMutationFinished {
+        id: String,
+        token: u64,
+        result: Result<(), SteerMutationError>,
+    },
     /// A user message delivered or replayed by the agent.
     UserMessage {
         id: String,
@@ -267,6 +276,28 @@ pub struct SubmittedPrompt {
 pub(super) struct PendingSteer {
     pub id: String,
     pub text: String,
+    /// False if the accepted injection included any non-text content blocks.
+    pub editable: bool,
+}
+
+#[derive(Debug)]
+pub struct SteerMutationError {
+    pub message: String,
+    pub unavailable: bool,
+}
+
+struct SteerMutation {
+    token: u64,
+    edit_token: Option<u64>,
+    text: Option<String>,
+}
+
+struct SteerEdit {
+    id: String,
+    token: u64,
+    draft: Editor,
+    attachments: Vec<Attachment>,
+    next_attachment: usize,
 }
 
 pub enum Action {
@@ -275,6 +306,13 @@ pub enum Action {
     Submit {
         prompt: SubmittedPrompt,
         inject: bool,
+    },
+    ReplaceSteer {
+        id: String,
+        text: String,
+    },
+    RevokeSteer {
+        id: String,
     },
     New(Option<String>),
     ListSessions,
@@ -635,6 +673,13 @@ pub struct App {
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     pub can_steer: bool,
+    pub can_replace_steer: bool,
+    pub(super) selected_steer: Option<String>,
+    pub(super) queue_focused: bool,
+    steer_edit: Option<SteerEdit>,
+    retired_steers: HashSet<String>,
+    steer_mutations: HashMap<String, SteerMutation>,
+    next_steer_token: u64,
     pub(super) pending_steers: VecDeque<PendingSteer>,
     message_blocks: HashMap<String, usize>,
     /// The previous assistant stream ended; the next text starts a new block.
@@ -930,6 +975,13 @@ impl App {
             phase: Phase::Idle,
             turn_started: None,
             can_steer: false,
+            can_replace_steer: false,
+            selected_steer: None,
+            queue_focused: false,
+            steer_edit: None,
+            retired_steers: HashSet::new(),
+            steer_mutations: HashMap::new(),
+            next_steer_token: 0,
             pending_steers: VecDeque::new(),
             message_blocks: HashMap::new(),
             agent_stream_sealed: false,
@@ -975,6 +1027,9 @@ impl App {
     }
 
     fn command_completion_prefix(&self) -> Option<&str> {
+        if self.editing_steer() || self.queue_focused {
+            return None;
+        }
         command::completion_prefix(self.editor.text(), self.editor.cursor())
     }
 
@@ -1696,7 +1751,9 @@ impl App {
     }
 
     fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
-        self.pending_steers.clear();
+        self.retired_steers
+            .extend(self.pending_steers.drain(..).map(|pending| pending.id));
+        self.selected_steer = None;
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
@@ -1813,8 +1870,11 @@ impl App {
                     self.sync_command_completion();
                 }
             }
-            Update::SteerAccepted { id, text } => {
-                if self.message_blocks.contains_key(&id) {
+            Update::SteerMutationFinished { id, token, result } => {
+                self.finish_steer_mutation(&id, token, result);
+            }
+            Update::SteerAccepted { id, text, editable } => {
+                if self.message_blocks.contains_key(&id) || self.retired_steers.contains(&id) {
                     return;
                 }
                 if let Some(pending) = self
@@ -1823,8 +1883,13 @@ impl App {
                     .find(|pending| pending.id == id)
                 {
                     pending.text = text;
+                    pending.editable = editable;
                 } else {
-                    self.pending_steers.push_back(PendingSteer { id, text });
+                    if self.queue_focused && self.selected_steer.is_none() {
+                        self.selected_steer = Some(id.clone());
+                    }
+                    self.pending_steers
+                        .push_back(PendingSteer { id, text, editable });
                 }
             }
             Update::UserMessage {
@@ -1833,7 +1898,7 @@ impl App {
                 images,
                 append,
             } => {
-                self.pending_steers.retain(|pending| pending.id != id);
+                self.remove_pending_steer(&id);
                 self.apply_message(id, text, images, append, MessageRole::User);
             }
             Update::AgentMessage { id, text, append } => {
@@ -2127,6 +2192,11 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.cancel_steer_edit();
+        self.selected_steer = None;
+        self.queue_focused = false;
+        self.retired_steers.clear();
+        self.steer_mutations.clear();
         self.session_catalog_pending = false;
         self.session_id = Some(session_id);
         self.file_picker = None;
@@ -2383,6 +2453,10 @@ impl App {
         kind: AttachmentKind,
         size: u64,
     ) {
+        if self.editing_steer() {
+            self.toast("pending-message edits are text-only");
+            return;
+        }
         self.next_attachment += 1;
         let label = match kind {
             AttachmentKind::Image => "Image",
@@ -2826,6 +2900,212 @@ impl App {
         Action::None
     }
 
+    pub fn editing_steer(&self) -> bool {
+        self.steer_edit.is_some()
+    }
+
+    fn cancel_steer_edit(&mut self) {
+        if let Some(edit) = self.steer_edit.take() {
+            self.editor = edit.draft;
+            self.attachments = edit.attachments;
+            self.next_attachment = edit.next_attachment;
+            self.file_picker = None;
+            self.sync_command_completion();
+        }
+    }
+
+    fn remove_pending_steer(&mut self, id: &str) {
+        self.retired_steers.insert(id.to_owned());
+        let index = self
+            .pending_steers
+            .iter()
+            .position(|pending| pending.id == id);
+        self.pending_steers.retain(|pending| pending.id != id);
+        if self.selected_steer.as_deref() == Some(id) {
+            self.selected_steer = index.and_then(|index| {
+                self.pending_steers
+                    .get(index.min(self.pending_steers.len().saturating_sub(1)))
+                    .map(|pending| pending.id.clone())
+            });
+        }
+    }
+
+    pub fn begin_steer_mutation(&mut self, id: &str, text: Option<String>) -> Option<u64> {
+        if self.steer_mutations.contains_key(id) {
+            self.toast("a change to this pending message is still in progress");
+            return None;
+        }
+        if !self.pending_steers.iter().any(|pending| pending.id == id) {
+            self.toast("message is no longer pending");
+            return None;
+        }
+        if text.is_some()
+            && self
+                .pending_steers
+                .iter()
+                .any(|pending| pending.id == id && !pending.editable)
+        {
+            self.toast("pending messages with media cannot be edited; removal is still available");
+            return None;
+        }
+        self.next_steer_token += 1;
+        let token = self.next_steer_token;
+        let edit_token = self
+            .steer_edit
+            .as_ref()
+            .filter(|edit| edit.id == id)
+            .map(|edit| edit.token);
+        self.steer_mutations.insert(
+            id.to_owned(),
+            SteerMutation {
+                token,
+                edit_token,
+                text,
+            },
+        );
+        self.toast(if self.steer_mutations[id].text.is_some() {
+            "saving pending message…"
+        } else {
+            "removing pending message…"
+        });
+        Some(token)
+    }
+
+    fn finish_steer_mutation(
+        &mut self,
+        id: &str,
+        token: u64,
+        result: Result<(), SteerMutationError>,
+    ) {
+        if self
+            .steer_mutations
+            .get(id)
+            .is_none_or(|mutation| mutation.token != token)
+        {
+            return;
+        }
+        let mutation = self.steer_mutations.remove(id).expect("matched mutation");
+        match result {
+            Ok(()) => {
+                if let Some(text) = mutation.text {
+                    // Delivery may have won the race: update only an existing entry.
+                    if let Some(pending) = self
+                        .pending_steers
+                        .iter_mut()
+                        .find(|pending| pending.id == id)
+                    {
+                        pending.text = text.clone();
+                    }
+                    // Esc/reopen can create another edit for the same ID while this
+                    // request waits. Neither that edit nor newly typed text belongs
+                    // to this completion.
+                    if self
+                        .steer_edit
+                        .as_ref()
+                        .is_some_and(|edit| Some(edit.token) == mutation.edit_token)
+                    {
+                        if self.editor.text() == text {
+                            self.cancel_steer_edit();
+                        } else {
+                            self.toast("earlier revision saved; current edit is still unsaved");
+                        }
+                    }
+                } else {
+                    self.steer_revoked(id);
+                }
+            }
+            Err(error) => self.steer_mutation_failed(id, error.message, error.unavailable),
+        }
+    }
+
+    pub fn steer_revoked(&mut self, id: &str) {
+        self.remove_pending_steer(id);
+    }
+
+    pub fn steer_mutation_failed(&mut self, id: &str, error: String, unavailable: bool) {
+        if unavailable {
+            self.remove_pending_steer(id);
+            self.toast(if self.editing_steer() {
+                "message is no longer pending; copy your edit or Esc to restore draft"
+            } else {
+                "message is no longer pending; it cannot be removed"
+            });
+            return;
+        }
+        // Keep the replacement composer and its parked draft intact for retry/copy/Esc.
+        self.toast(error);
+    }
+
+    fn handle_steer_selection(&mut self, key: KeyEvent) -> Action {
+        if matches!(key.code, KeyCode::Esc | KeyCode::F(2)) {
+            self.selected_steer = None;
+            self.queue_focused = false;
+            return Action::None;
+        }
+        // Keep focus even if delivery drained the queue. A stale Enter/Delete
+        // must not unexpectedly send or modify the parked composer draft.
+        let Some(index) = self
+            .pending_steers
+            .iter()
+            .position(|pending| Some(&pending.id) == self.selected_steer.as_ref())
+        else {
+            self.selected_steer = None;
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                let next = if key.code == KeyCode::Up {
+                    index.saturating_sub(1)
+                } else {
+                    (index + 1).min(self.pending_steers.len() - 1)
+                };
+                self.selected_steer = Some(self.pending_steers[next].id.clone());
+            }
+            KeyCode::Delete => {
+                if self
+                    .steer_mutations
+                    .contains_key(&self.pending_steers[index].id)
+                {
+                    self.toast("a change to this pending message is still in progress");
+                    return Action::None;
+                }
+                return Action::RevokeSteer {
+                    id: self.pending_steers[index].id.clone(),
+                };
+            }
+            KeyCode::Enter => {
+                if !self.can_replace_steer {
+                    self.toast("this agent does not support editing pending messages");
+                    return Action::None;
+                }
+                let pending = &self.pending_steers[index];
+                if !pending.editable {
+                    self.toast(
+                        "pending messages with media cannot be edited; removal is still available",
+                    );
+                    return Action::None;
+                }
+                let mut editor = Editor::default();
+                editor.insert_str(&pending.text);
+                self.next_steer_token += 1;
+                self.steer_edit = Some(SteerEdit {
+                    id: pending.id.clone(),
+                    token: self.next_steer_token,
+                    draft: std::mem::replace(&mut self.editor, editor),
+                    attachments: std::mem::take(&mut self.attachments),
+                    next_attachment: self.next_attachment,
+                });
+                self.next_attachment = 0;
+                self.selected_steer = None;
+                self.queue_focused = false;
+                self.file_picker = None;
+                self.last_key = None;
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
@@ -2843,6 +3123,68 @@ impl App {
         }
         if self.effort_dialog.is_some() {
             return self.handle_effort_key(key);
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.file_picker = None;
+            // A turn that will not stop must still be escapable: the second
+            // ctrl+c leaves, which takes the agent process with it.
+            if self.phase == Phase::Cancelling {
+                return Action::Quit;
+            }
+            if self.working() {
+                return self.request_cancel();
+            }
+            // A stray ctrl+c should not throw away a half-written prompt.
+            if self.editor.text().is_empty() {
+                return Action::Quit;
+            }
+            self.editor.clear();
+            self.toast("prompt cleared — ctrl+c again to quit");
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.editor.is_empty()
+        {
+            self.file_picker = None;
+            return Action::Quit;
+        }
+        // Queue focus owns composer keys, not global task, view, or copy actions.
+        // Ctrl+K is global only when it cancels background work; otherwise it
+        // must not fall through and delete text from the parked composer.
+        let global_key = match key.code {
+            KeyCode::Char('b') => key.modifiers == KeyModifiers::SUPER,
+            KeyCode::Char('k') => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self
+                        .focus_call()
+                        .is_some_and(|call| call.backgrounded && call.running())
+            }
+            KeyCode::Char('y' | 'r' | 'l' | 'o' | 't') | KeyCode::Home | KeyCode::End => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            KeyCode::Up | KeyCode::Down => key.modifiers.contains(KeyModifiers::SHIFT),
+            KeyCode::PageUp | KeyCode::PageDown => true,
+            _ => false,
+        };
+        if self.queue_focused && !global_key {
+            return self.handle_steer_selection(key);
+        }
+        if key.code == KeyCode::F(2) && !self.editing_steer() {
+            self.queue_focused = true;
+            self.selected_steer = self
+                .pending_steers
+                .front()
+                .map(|pending| pending.id.clone());
+            if self.selected_steer.is_none() {
+                self.toast("no pending messages");
+            }
+            self.file_picker = None;
+            return Action::None;
+        }
+        if key.code == KeyCode::Esc && self.editing_steer() {
+            self.cancel_steer_edit();
+            return Action::None;
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
@@ -2917,22 +3259,6 @@ impl App {
                 };
                 return Action::DetachCompose(call_id);
             }
-            KeyCode::Char('c') if control => {
-                // A turn that will not stop must still be escapable: the second
-                // ctrl+c leaves, which takes the agent process with it.
-                if self.phase == Phase::Cancelling {
-                    return Action::Quit;
-                }
-                if self.working() {
-                    return self.request_cancel();
-                }
-                // A stray ctrl+c should not throw away a half-written prompt.
-                if self.editor.text().is_empty() {
-                    return Action::Quit;
-                }
-                self.editor.clear();
-                self.toast("prompt cleared — ctrl+c again to quit");
-            }
             KeyCode::Char('k')
                 if control
                     && self
@@ -2945,7 +3271,6 @@ impl App {
                         .unwrap_or_default(),
                 );
             }
-            KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
             KeyCode::Char('y') if control => {
                 if let Some(text) = self.selection_text() {
                     self.toast("copied selection");
@@ -2967,6 +3292,30 @@ impl App {
             KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
                 if self.editor.is_empty() {
                     return Action::None;
+                }
+                if let Some(edit) = &self.steer_edit {
+                    if self.steer_mutations.contains_key(&edit.id) {
+                        self.toast("a change to this pending message is still in progress");
+                        return Action::None;
+                    }
+                    if !self
+                        .pending_steers
+                        .iter()
+                        .any(|pending| pending.id == edit.id)
+                    {
+                        self.toast(
+                            "message is no longer pending; copy your edit or Esc to restore draft",
+                        );
+                        return Action::None;
+                    }
+                    if !self.can_replace_steer {
+                        self.toast("this agent does not support editing pending messages");
+                        return Action::None;
+                    }
+                    return Action::ReplaceSteer {
+                        id: edit.id.clone(),
+                        text: self.editor.text().to_owned(),
+                    };
                 }
                 let inject = self.working();
                 if inject {
@@ -3157,7 +3506,7 @@ impl App {
                         .next_back()
                         .is_some_and(char::is_whitespace);
                 self.editor.insert_char('@');
-                if eligible {
+                if eligible && !self.editing_steer() {
                     return self.start_file_picker(at..at + 1);
                 }
             }
@@ -4657,6 +5006,7 @@ mod tests {
         );
 
         app.apply(Update::SteerAccepted {
+            editable: true,
             id: "injected-1".into(),
             text: prompt.text,
         });
@@ -4678,6 +5028,558 @@ mod tests {
             matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "change direction")
         );
         assert!(app.working());
+    }
+
+    fn queued_app() -> App {
+        let mut app = app();
+        app.can_steer = true;
+        app.can_replace_steer = true;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        for id in ["a", "b", "c"] {
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: id.into(),
+                text: format!("pending {id}"),
+            });
+        }
+        app
+    }
+
+    fn begin_steer_edit(app: &mut App) {
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.editing_steer());
+    }
+
+    #[test]
+    fn queued_focus_preserves_global_task_view_and_copy_shortcuts() {
+        for drained in [false, true] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.latest_agent_source = "answer".into();
+            app.handle_key(press(KeyCode::F(2)));
+            if drained {
+                app.pending_steers.clear();
+                app.selected_steer = None;
+            }
+            // Without background work Ctrl+K is an editor key, so suppress it.
+            app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(modified_press(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            assert!(app.show_logs);
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+                Action::Copy(text) if text == "answer"
+            ));
+            app.apply(Update::ToolStarted {
+                id: "foreground".into(),
+                title: "compose".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: false,
+            });
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::SUPER)),
+                Action::DetachCompose(id) if id == "foreground"
+            ));
+            app.apply(Update::ToolStarted {
+                id: "background".into(),
+                title: "compose".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: true,
+            });
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+                Action::CancelBackground(id) if id == "background"
+            ));
+            assert!(app.queue_focused);
+            assert_eq!(app.editor.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn queued_selector_navigation_and_revoke_preserve_order_and_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.selected_steer.as_deref(), Some("a"));
+        app.handle_key(press(KeyCode::Down));
+        let Action::RevokeSteer { id } = app.handle_key(press(KeyCode::Delete)) else {
+            panic!("expected revoke");
+        };
+        assert_eq!(id, "b");
+        assert_eq!(
+            app.pending_steers.len(),
+            3,
+            "wait for server acknowledgment"
+        );
+        app.steer_mutation_failed(&id, "temporary failure".into(), false);
+        assert_eq!(app.pending_steers.len(), 3);
+        assert_eq!(app.selected_steer.as_deref(), Some("b"));
+        app.steer_revoked(&id);
+        assert_eq!(
+            app.pending_steers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(app.selected_steer.as_deref(), Some("c"));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.selected_steer.as_deref(), Some("c"));
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.selected_steer.is_none());
+        assert!(app.working(), "Esc in selector must not cancel the turn");
+        assert_eq!(app.editor.text(), "draft");
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id,
+            text: "late acceptance".into(),
+        });
+        assert_eq!(app.pending_steers.len(), 2, "revoked IDs stay retired");
+    }
+
+    #[test]
+    fn queued_edit_cancel_restores_draft_cursor_and_attachments() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.attach(
+            PathBuf::from("image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.move_left();
+        let draft = app.editor.text().to_owned();
+        let cursor = app.editor.cursor();
+        let attachments = app.attachments.clone();
+        let sequence = app.next_attachment;
+        begin_steer_edit(&mut app);
+        assert_eq!(app.editor.text(), "pending a");
+        assert!(app.attachments.is_empty());
+        app.paste(" revised");
+        app.attach(
+            PathBuf::from("other.png"),
+            "image/png",
+            AttachmentKind::Image,
+            4,
+        );
+        assert!(app.attachments.is_empty(), "replacement is text-only");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.editing_steer());
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.editor.cursor(), cursor);
+        assert_eq!(app.attachments, attachments);
+        assert_eq!(app.next_attachment, sequence);
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        assert!(app.working());
+    }
+
+    #[test]
+    fn queued_edit_save_keeps_id_order_and_restores_draft() {
+        let mut app = queued_app();
+        app.paste("next draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        app.paste(" revised");
+        let Action::ReplaceSteer { id, text } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected replacement");
+        };
+        assert_eq!(id, "b");
+        assert_eq!(text, "pending b revised");
+        assert_eq!(app.pending_steers[1].text, "pending b");
+        assert_eq!(app.editor.text(), text, "keep edit until acknowledged");
+        let token = app.begin_steer_mutation(&id, Some(text)).unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: id.clone(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.pending_steers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(app.pending_steers[1].text, "pending b revised");
+        assert_eq!(app.editor.text(), "next draft");
+        assert!(!app.editing_steer());
+    }
+
+    #[test]
+    fn queued_edit_failure_keeps_both_drafts_and_allows_retry() {
+        let mut app = queued_app();
+        app.paste("original draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revision");
+        app.steer_mutation_failed("a", "temporary failure".into(), false);
+        assert_eq!(app.editor.text(), "pending a revision");
+        assert!(app.editing_steer());
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ReplaceSteer { .. }
+        ));
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "original draft");
+    }
+
+    #[test]
+    fn queued_edit_delivery_races_never_resurrect_messages() {
+        for unavailable_error in [false, true] {
+            let mut app = queued_app();
+            app.paste("original draft");
+            begin_steer_edit(&mut app);
+            app.paste(" revision");
+            let token = app
+                .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+                .unwrap();
+            if unavailable_error {
+                app.steer_mutation_failed("a", "unknown message".into(), true);
+            } else {
+                app.apply(Update::UserMessage {
+                    id: "a".into(),
+                    text: "pending a".into(),
+                    images: Vec::new(),
+                    append: false,
+                });
+            }
+            assert_eq!(app.editor.text(), "pending a revision");
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::None
+            ));
+            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
+            app.apply(Update::SteerMutationFinished {
+                id: "a".into(),
+                token,
+                result: Ok(()),
+            });
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: "a".into(),
+                text: "late acceptance".into(),
+            });
+            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
+            assert_eq!(app.editor.text(), "original draft");
+        }
+    }
+
+    #[test]
+    fn queued_delivery_reselects_neighbor_and_session_switch_clears_edit() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.apply(Update::UserMessage {
+            id: "a".into(),
+            text: "pending a".into(),
+            images: Vec::new(),
+            append: false,
+        });
+        assert_eq!(app.selected_steer.as_deref(), Some("b"));
+        app.handle_key(press(KeyCode::Enter));
+        app.start_session("other-session".into());
+        assert!(!app.editing_steer());
+        assert!(app.selected_steer.is_none());
+        assert!(app.pending_steers.is_empty());
+        assert!(app.retired_steers.is_empty());
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_edit_capability_is_required_but_revoke_is_always_available() {
+        let mut app = queued_app();
+        app.can_replace_steer = false;
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(!app.editing_steer());
+        assert_eq!(app.editor.text(), "draft");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Delete)),
+            Action::RevokeSteer { .. }
+        ));
+        app.can_replace_steer = true;
+        app.handle_key(press(KeyCode::Enter));
+        app.can_replace_steer = false;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "pending a");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_delivery_of_last_selection_never_sends_or_deletes_the_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        for id in ["a", "b", "c"] {
+            app.apply(Update::UserMessage {
+                id: id.into(),
+                text: id.into(),
+                images: Vec::new(),
+                append: false,
+            });
+        }
+        assert!(app.queue_focused);
+        assert!(app.selected_steer.is_none());
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Delete)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "draft");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.queue_focused);
+        assert!(app.working());
+    }
+
+    #[test]
+    fn queued_edit_stays_recoverable_when_turn_finishes() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revised");
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(app.pending_steers.is_empty());
+        assert!(app.editing_steer());
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "pending a revised");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_ctrl_c_cancels_then_quits_even_after_delivery_empties_selection() {
+        for empty in [false, true] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            if empty {
+                for id in ["a", "b", "c"] {
+                    app.steer_revoked(id);
+                }
+            }
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Action::Cancel
+            ));
+            assert_eq!(app.editor.text(), "draft");
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Action::Quit
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_ctrl_c_retains_idle_clear_then_quit_semantics() {
+        let mut app = app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert!(app.editor.is_empty());
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn queued_ctrl_d_keeps_empty_composer_exit_semantics() {
+        let mut app = queued_app();
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Action::Quit
+        ));
+        app.paste("draft");
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_inflight_mutations_reject_duplicates_and_keep_newer_edit_text() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let text = app.editor.text().to_owned();
+        let token = app.begin_steer_mutation("a", Some(text.clone())).unwrap();
+        assert!(app.begin_steer_mutation("a", Some(text.clone())).is_none());
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.paste(" newer revision");
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.pending_steers[0].text, text);
+        assert_eq!(app.editor.text(), "pending a newer revision");
+        assert!(app.editing_steer());
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.begin_steer_mutation("a", None).unwrap();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Delete)),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn queued_old_completion_cannot_close_reopened_same_id_edit_or_new_request() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let token = app
+            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+            .unwrap();
+        app.handle_key(press(KeyCode::Esc));
+        begin_steer_edit(&mut app); // Identical text and ID, but a different edit.
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert!(app.editing_steer());
+        let next = app
+            .begin_steer_mutation("a", Some("replacement".into()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.steer_mutations["a"].token, next);
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_async_error_unlocks_retry_without_losing_either_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revision");
+        let token = app
+            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Err(super::SteerMutationError {
+                message: "retry".into(),
+                unavailable: false,
+            }),
+        });
+        assert!(app.steer_mutations.is_empty());
+        assert_eq!(app.editor.text(), "pending a revision");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ReplaceSteer { .. }
+        ));
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_session_switch_clears_inflight_state_and_rejects_old_completion() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let token = app
+            .begin_steer_mutation("a", Some("old replacement".into()))
+            .unwrap();
+        app.start_session("new-session".into());
+        assert!(app.steer_mutations.is_empty());
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "new session message".into(),
+        });
+        begin_steer_edit(&mut app);
+        let next = app
+            .begin_steer_mutation("a", Some("new replacement".into()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.steer_mutations["a"].token, next);
+        assert_eq!(app.pending_steers[0].text, "new session message");
+        assert_eq!(app.editor.text(), "new session message");
+    }
+
+    #[test]
+    fn queued_media_steering_submits_but_only_allows_removal() {
+        let mut app = queued_app();
+        app.attach(
+            PathBuf::from("image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let Action::Submit { prompt, inject } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected media steer submission");
+        };
+        assert!(inject);
+        assert_eq!(prompt.attachments.len(), 1);
+        app.apply(Update::SteerAccepted {
+            id: "media".into(),
+            text: prompt.text,
+            editable: false,
+        });
+        app.selected_steer = Some("media".into());
+        app.queue_focused = true;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(!app.editing_steer());
+        assert!(
+            app.toast_text()
+                .unwrap()
+                .contains("with media cannot be edited")
+        );
+        assert!(
+            app.begin_steer_mutation("media", Some("text replacement".into()))
+                .is_none()
+        );
+        assert!(
+            matches!(app.handle_key(press(KeyCode::Delete)), Action::RevokeSteer { id } if id == "media")
+        );
+        assert!(app.begin_steer_mutation("media", None).is_some());
     }
 
     #[test]
