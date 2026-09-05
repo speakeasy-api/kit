@@ -2579,6 +2579,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum TestOutcome {
+        ToolThenContent,
         Content,
         FinishError,
         ProviderError,
@@ -2693,6 +2694,30 @@ mod tests {
                 handle.interrupt();
             }
             match self.outcome {
+                TestOutcome::ToolThenContent => {
+                    self.outcome = TestOutcome::Content;
+                    let call = agentkit_core::ToolCallPart::new(
+                        "boundary-call",
+                        "missing-tool",
+                        serde_json::json!({}),
+                    );
+                    Ok(TestTurn {
+                        events: VecDeque::from([
+                            ModelTurnEvent::ToolCall(call.clone()),
+                            ModelTurnEvent::Finished(ModelTurnResult {
+                                model: None,
+                                response_id: None,
+                                finish_reason: FinishReason::ToolCall,
+                                output_items: vec![Item::new(
+                                    ItemKind::Assistant,
+                                    vec![agentkit_core::Part::ToolCall(call)],
+                                )],
+                                usage: None,
+                                metadata: MetadataMap::new(),
+                            }),
+                        ]),
+                    })
+                }
                 TestOutcome::Content => {
                     let text = "autonomous content";
                     Ok(TestTurn {
@@ -3152,6 +3177,135 @@ mod tests {
                 .is_err()
         );
         handle.stop_injection_turn();
+    }
+
+    struct BoundaryCancellationControl {
+        before_boundary: bool,
+        boundaries: AtomicU64,
+    }
+
+    #[async_trait]
+    impl TurnControl<TestSession> for BoundaryCancellationControl {
+        fn stop_injection_turn(&self) {}
+
+        fn is_cancelled_since(&self, _generation: u64) -> bool {
+            self.before_boundary
+        }
+
+        async fn handle_injection_boundary(
+            &self,
+            _driver: &mut LoopDriver<TestSession>,
+            terminal: bool,
+        ) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
+            assert!(!terminal, "cancellation must occur at AfterToolResult");
+            self.boundaries.fetch_add(1, Ordering::Relaxed);
+            Ok(AcpInjectionBoundary::Stopped)
+        }
+    }
+
+    async fn assert_boundary_cancellation_retires_turn(before_boundary: bool) {
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("boundary-cancel");
+        let loop_session_id = SessionId::new("boundary-cancel-loop");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let _handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer = ResponseReplacementObserver::new(
+            integration,
+            sink,
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ToolThenContent,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_session_id).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+        let control = BoundaryCancellationControl {
+            before_boundary,
+            boundaries: AtomicU64::new(0),
+        };
+        let reason = activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                drive_prompt(&session_id, &mut driver, &control, 0, None),
+                |reason| Some(reason.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reason, FinishReason::Cancelled);
+        assert_eq!(
+            turns.load(Ordering::Relaxed),
+            1,
+            "must not resume cancelled model work"
+        );
+        assert_eq!(
+            control.boundaries.load(Ordering::Relaxed),
+            u64::from(!before_boundary)
+        );
+        assert!(
+            driver
+                .snapshot()
+                .transcript
+                .iter()
+                .any(|item| item.kind == ItemKind::Tool)
+        );
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::Cancelled,
+        );
+        recording.updates.lock().unwrap().clear();
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "fresh")])
+            .unwrap();
+        activity
+            .execute(
+                ExecutionOrigin::Prompt,
+                drive_prompt(
+                    &session_id,
+                    &mut driver,
+                    &TestTurnControl::new(false),
+                    0,
+                    None,
+                ),
+                |reason| Some(reason.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(turns.load(Ordering::Relaxed), 2);
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::EndTurn,
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_tool_boundary_retires_turn() {
+        assert_boundary_cancellation_retires_turn(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_within_tool_boundary_retires_turn() {
+        assert_boundary_cancellation_retires_turn(false).await;
     }
 
     #[tokio::test]
