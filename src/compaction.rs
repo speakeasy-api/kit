@@ -571,6 +571,8 @@ impl CompactionStrategy for SummarizeForContinuation {
             .rev()
             .find(|item| is_compaction_summary(item))
             .cloned();
+        // Keep bootstrap Items intact: their metadata includes versioned branch
+        // lineage and captured model selection needed to resume after compaction.
         let bootstrap = request
             .transcript
             .iter()
@@ -867,6 +869,59 @@ mod tests {
             panic!("latest user should remain text");
         };
         assert_eq!(text.text, "current request");
+    }
+
+    #[tokio::test]
+    async fn strategy_preserves_prompt_checkout_lineage_and_selection() {
+        use crate::session::branch::{
+            Boundary, BranchMetadata, CapturedSelection, SubmittedRequest, prepare,
+        };
+
+        let prefix = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::Context, "AGENTS"),
+            Item::text(ItemKind::User, "old request"),
+            Item::text(ItemKind::Assistant, "old answer"),
+        ];
+        let selection = CapturedSelection::new(
+            &crate::provider::ModelSelection::new(
+                crate::ProviderKind::OpenRouter,
+                "openai/gpt-5.4",
+            ),
+            Some(crate::ReasoningEffort::High),
+        );
+        let mut transcript = prepare(
+            prefix.clone(),
+            "parent".into(),
+            Boundary::new(0, &prefix).unwrap(),
+            "checkout".into(),
+            SubmittedRequest {
+                id: "request".into(),
+                selection: selection.clone(),
+            },
+            Item::text(ItemKind::User, "edited request"),
+        )
+        .unwrap();
+        let bootstrap = transcript[0].clone();
+        let lineage = BranchMetadata::read(&transcript).unwrap().unwrap();
+        let backend = FixedBackend;
+        // Exercise both summarized and recent-only retention, then compact the
+        // result again. Lineage belongs to the unchanged bootstrap, not summary.
+        for recent_tokens in [1, usize::MAX, 1] {
+            let mut context = CompactionContext::new().with_backend(&backend);
+            transcript = SummarizeForContinuation { recent_tokens }
+                .apply(
+                    CompactionRequest::new(transcript, CompactionReason::TranscriptTooLong),
+                    &mut context,
+                )
+                .await
+                .unwrap()
+                .transcript;
+            assert_eq!(transcript[0], bootstrap);
+            let restored = BranchMetadata::read(&transcript).unwrap().unwrap();
+            assert_eq!(restored, lineage);
+            assert_eq!(restored.request.selection, selection);
+        }
     }
 
     #[tokio::test]

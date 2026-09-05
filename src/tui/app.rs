@@ -133,6 +133,11 @@ pub enum Update {
     State(StateUpdate),
     /// A nested tool call started or finished inside a compose run.
     Runtime(RuntimeEvent),
+    /// Session identity captured from the ordered stderr stream, before queuing.
+    RoutedRuntime {
+        session_id: String,
+        event: RuntimeEvent,
+    },
     /// A diagnostic line from the agent process.
     Log(String),
     /// The ACP process exited while work could still be active.
@@ -301,7 +306,36 @@ struct SteerEdit {
     next_attachment: usize,
 }
 
+pub(super) const BRANCH_WARNING: &str = "Only conversation context changes. Filesystem changes, running processes, and external effects are not rolled back.";
+
+pub(super) struct BranchChooser {
+    pub boundaries: Vec<crate::protocols::acp::prompt_branches::PromptBoundary>,
+    pub selected: usize,
+    pub pending: bool,
+}
+
+struct BranchDraft {
+    original: Box<App>,
+    checkout_token: String,
+    submitting: bool,
+    // stderr can reach the UI before the submit response installs the child.
+    // Keep its session attribution until canonical ACP replay is applied.
+    early_runtime: Vec<(String, RuntimeEvent)>,
+}
+
 pub enum Action {
+    ListPromptBranches {
+        epoch: u64,
+    },
+    PreparePromptBranch {
+        epoch: u64,
+        address: String,
+    },
+    SubmitPromptBranch {
+        epoch: u64,
+        checkout_token: String,
+        text: String,
+    },
     None,
     Redraw,
     Submit {
@@ -636,6 +670,12 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    pub(super) branch_epoch: u64,
+    pub(super) branch_chooser: Option<BranchChooser>,
+    branch_draft: Option<BranchDraft>,
+    // AvailableCommands is emitted after canonical branch replay. stderr may
+    // outrun that ordered ACP stream, so retain diagnostics until it arrives.
+    branch_runtime_replay: Option<Vec<RuntimeEvent>>,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
@@ -954,6 +994,10 @@ impl App {
             session_dialog: None,
             file_picker: None,
             session_catalog_pending: false,
+            branch_epoch: 0,
+            branch_chooser: None,
+            branch_draft: None,
+            branch_runtime_replay: None,
             auth_methods: Vec::new(),
             available_commands: Vec::new(),
             command_completion_selected: 0,
@@ -1033,7 +1077,11 @@ impl App {
     }
 
     fn command_completion_prefix(&self) -> Option<&str> {
-        if self.editing_steer() || self.queue_focused {
+        if self.editing_steer()
+            || self.queue_focused
+            || self.editing_branch()
+            || self.branch_chooser.is_some()
+        {
             return None;
         }
         command::completion_prefix(self.editor.text(), self.editor.cursor())
@@ -1799,6 +1847,65 @@ impl App {
     }
 
     pub fn apply(&mut self, update: Update) {
+        // The source stays loaded while its provisional replacement is visible.
+        if let Some(draft) = &mut self.branch_draft {
+            match update {
+                Update::RoutedRuntime { session_id, event } => {
+                    if draft.original.session_id.as_ref() == Some(&session_id) {
+                        draft
+                            .original
+                            .apply(Update::RoutedRuntime { session_id, event });
+                    } else {
+                        draft.early_runtime.push((session_id, event));
+                    }
+                }
+                Update::Runtime(RuntimeEvent::StorageStatus { pending, exhausted }) => {
+                    // Durability is process-global, not part of the parked view.
+                    self.storage_pending = pending;
+                    self.storage_exhausted = exhausted;
+                    draft
+                        .original
+                        .apply(Update::Runtime(RuntimeEvent::StorageStatus {
+                            pending,
+                            exhausted,
+                        }));
+                }
+                Update::Runtime(RuntimeEvent::SessionStarted { session_id }) => {
+                    self.runtime_session_id = Some(session_id.clone());
+                    if draft.original.session_id.as_ref() == Some(&session_id) {
+                        draft.original.activate_runtime_session();
+                    }
+                }
+                Update::Runtime(event) => {
+                    if self.runtime_session_id == draft.original.session_id {
+                        draft.original.apply(Update::Runtime(event));
+                    } else if let Some(session_id) = &self.runtime_session_id {
+                        draft.early_runtime.push((session_id.clone(), event));
+                    }
+                }
+                update => {
+                    if let Update::ConfigOptions(options) = &update {
+                        super::refresh_config_state(&mut draft.original, Some(options));
+                    }
+                    draft.original.apply(update);
+                }
+            }
+            return;
+        }
+        if let Some(pending) = &mut self.branch_runtime_replay
+            && let Update::Runtime(event) = &update
+            && !matches!(
+                event,
+                RuntimeEvent::StorageStatus { .. } | RuntimeEvent::SessionStarted { .. }
+            )
+        {
+            if self.runtime_session_id == self.session_id {
+                pending.push(event.clone());
+            }
+            return;
+        }
+        let replay_complete = matches!(&update, Update::AvailableCommands { session_id, .. }
+            if self.session_id.as_ref() == Some(session_id));
         match update {
             Update::A2aAddress(address) => self.a2a = address,
             Update::SessionCatalog(result) => {
@@ -2046,6 +2153,14 @@ impl App {
             Update::Usage { used, size } => {
                 self.usage = Some(ContextUsage { used, size });
             }
+            Update::RoutedRuntime { session_id, event } => {
+                if self.session_id.as_ref() == Some(&session_id) {
+                    // A queued marker from an older activation cannot change this
+                    // event's identity or the route established by ACP activation.
+                    self.activate_runtime_session();
+                    self.apply(Update::Runtime(event));
+                }
+            }
             Update::Runtime(event) => self.apply_runtime(event),
             Update::Log(line) => {
                 self.logs.push(line);
@@ -2078,6 +2193,16 @@ impl App {
                 self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
             }
+        }
+        if replay_complete && let Some(events) = self.branch_runtime_replay.take() {
+            // These events were attributed to the active child when queued.
+            let route = self
+                .runtime_session_id
+                .replace(self.session_id.clone().unwrap());
+            for event in events {
+                self.apply_runtime(event);
+            }
+            self.runtime_session_id = route;
         }
         if self.follow {
             self.scroll = usize::MAX;
@@ -2196,10 +2321,19 @@ impl App {
         }
     }
 
+    /// A successful ACP activation establishes the diagnostic route explicitly.
+    /// Stderr markers only label ingress events; ACP owns the visible route.
+    pub(super) fn activate_runtime_session(&mut self) {
+        self.runtime_session_id = self.session_id.clone();
+    }
+
     /// Switches the visible client state to a fresh persisted session. Editor
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.abandon_branch();
+        self.branch_runtime_replay = None;
+        self.branch_epoch = self.branch_epoch.wrapping_add(1);
         self.cancel_steer_edit();
         self.selected_steer = None;
         self.queue_focused = false;
@@ -2466,6 +2600,10 @@ impl App {
         kind: AttachmentKind,
         size: u64,
     ) {
+        if self.branch_draft.is_some() || self.branch_chooser.is_some() {
+            self.toast("prompt branch edits are text-only");
+            return;
+        }
         if self.editing_steer() {
             self.toast("pending-message edits are text-only");
             return;
@@ -2535,6 +2673,14 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.branch_chooser.is_some() || self.branch_submitting() {
+            return;
+        }
+        if self.branch_draft.is_some() {
+            self.last_key = None;
+            self.editor.insert_str(text);
+            return;
+        }
         if let Some(dialog) = &mut self.navigation.dialog {
             dialog.insert(text);
             self.sync_navigation();
@@ -3169,6 +3315,16 @@ impl App {
             .and_then(|dialog| dialog.selected);
         let current = selected.and_then(|id| self.navigation.index(id));
         match key.code {
+            KeyCode::Enter
+                if key.modifiers.is_empty()
+                    && self
+                        .navigation
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.query == "/branch") =>
+            {
+                return self.open_branch_chooser();
+            }
             KeyCode::Esc | KeyCode::F(3) => self.navigation.dialog = None,
             KeyCode::Enter if key.modifiers.is_empty() => {
                 if let Some(index) = current {
@@ -3274,26 +3430,279 @@ impl App {
         self.navigation.reveal_pending = false;
     }
 
-    /// Exclude synchronous navigator work from the inter-key paste gap, without
+    /// Exclude synchronous navigator/checkout work from the inter-key paste gap, without
     /// erasing time actually spent waiting for input. Never wrap an input wait.
     pub(super) fn with_navigation_clock_paused<T>(
         &mut self,
         work: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        let last_key = self.last_key.filter(|_| self.navigation.dialog.is_some());
-        let started = Instant::now();
+        self.with_navigation_clock_paused_using(work, Instant::now)
+    }
+
+    fn with_navigation_clock_paused_using<T>(
+        &mut self,
+        work: impl FnOnce(&mut Self) -> T,
+        mut now: impl FnMut() -> Instant,
+    ) -> T {
+        let last_key = self.last_key.filter(|_| {
+            self.navigation.dialog.is_some()
+                || self.branch_chooser.is_some()
+                || self.branch_draft.is_some()
+        });
+        let started = now();
         let result = work(self);
         // Do not overwrite a clock changed by the work.
         if last_key.is_some() && self.last_key == last_key {
-            self.last_key = last_key.and_then(|last| last.checked_add(started.elapsed()));
+            let elapsed = now().saturating_duration_since(started);
+            self.last_key = last_key.and_then(|last| last.checked_add(elapsed));
         }
         result
     }
 
     /// Applies a key press, returning work for the event loop.
+    pub(super) fn editing_branch(&self) -> bool {
+        self.branch_draft.is_some()
+    }
+
+    pub(super) fn branch_submitting(&self) -> bool {
+        self.branch_draft
+            .as_ref()
+            .is_some_and(|draft| draft.submitting)
+    }
+
+    fn open_branch_chooser(&mut self) -> Action {
+        if self.working() || self.editing_steer() || !self.pending_steers.is_empty() {
+            self.toast(
+                "prompt checkout is available only while idle and outside pending-message edits",
+            );
+            return Action::None;
+        }
+        self.branch_epoch = self.branch_epoch.wrapping_add(1);
+        self.branch_chooser = Some(BranchChooser {
+            boundaries: Vec::new(),
+            selected: 0,
+            pending: true,
+        });
+        Action::ListPromptBranches {
+            epoch: self.branch_epoch,
+        }
+    }
+
+    pub(super) fn branch_listed(
+        &mut self,
+        epoch: u64,
+        result: Result<Vec<crate::protocols::acp::prompt_branches::PromptBoundary>, String>,
+    ) {
+        if epoch != self.branch_epoch {
+            return;
+        }
+        let Some(chooser) = &mut self.branch_chooser else {
+            return;
+        };
+        match result {
+            Ok(boundaries) => {
+                chooser.boundaries = boundaries;
+                chooser.pending = false;
+            }
+            Err(error) => {
+                self.branch_chooser = None;
+                self.toast(format!("could not list prompt checkouts: {error}"));
+            }
+        }
+    }
+
+    pub(super) fn branch_prepared(
+        &mut self,
+        epoch: u64,
+        result: Result<crate::protocols::acp::prompt_branches::PreparePromptBranchResponse, String>,
+    ) {
+        if epoch != self.branch_epoch || self.branch_chooser.is_none() {
+            return;
+        }
+        let response = match result {
+            Ok(response) => response,
+            Err(error) => {
+                self.branch_chooser.as_mut().unwrap().pending = false;
+                self.toast(format!("could not prepare prompt checkout: {error}"));
+                return;
+            }
+        };
+        let mut provisional = App::new(
+            self.root.clone(),
+            self.provider.clone(),
+            self.model.clone(),
+            self.a2a.clone(),
+        );
+        provisional.session_id = self.session_id.clone();
+        provisional.runtime_session_id = self.runtime_session_id.clone();
+        provisional.storage_pending = self.storage_pending;
+        provisional.storage_exhausted = self.storage_exhausted;
+        provisional.last_key = self.last_key;
+        provisional.can_steer = self.can_steer;
+        provisional.can_replace_steer = self.can_replace_steer;
+        provisional.auth_methods = self.auth_methods.clone();
+        provisional.show_thoughts = self.show_thoughts;
+        provisional.branch_epoch = epoch;
+        for update in response.prefix {
+            let (_, updates) = super::translate(
+                agent_client_protocol::schema::v2::UpdateSessionNotification::new(
+                    self.session_id.clone().unwrap_or_default(),
+                    update,
+                ),
+            );
+            for update in updates {
+                provisional.apply(update);
+            }
+        }
+        super::refresh_config_state(&mut provisional, Some(&response.config_options));
+        provisional.editor.insert_str(&response.original_text);
+        self.branch_chooser = None;
+        let original = Box::new(std::mem::replace(self, provisional));
+        self.branch_draft = Some(BranchDraft {
+            original,
+            checkout_token: response.checkout_token,
+            submitting: false,
+            early_runtime: Vec::new(),
+        });
+    }
+
+    pub(super) fn abandon_branch(&mut self) {
+        let epoch = self.branch_epoch.wrapping_add(1);
+        if let Some(draft) = self.branch_draft.take() {
+            *self = *draft.original;
+        }
+        self.branch_chooser = None;
+        self.branch_epoch = epoch;
+    }
+
+    pub(super) fn branch_submit_failed(&mut self, epoch: u64, error: String) {
+        if epoch != self.branch_epoch {
+            return;
+        }
+        if let Some(draft) = &mut self.branch_draft {
+            draft.submitting = false;
+            self.toast(format!("could not submit prompt checkout: {error}"));
+        }
+    }
+
+    pub(super) fn branch_submitted(&mut self, epoch: u64, session_id: String) -> bool {
+        if epoch != self.branch_epoch || !self.branch_submitting() {
+            return false;
+        }
+        // Drop only the parked view, never close the source ACP session. stderr
+        // may precede both the response and canonical replay on the ACP stream.
+        let draft = self.branch_draft.take().expect("checked submitting draft");
+        let early_runtime = draft
+            .early_runtime
+            .into_iter()
+            .filter_map(|(id, event)| (id == session_id).then_some(event))
+            .collect();
+        self.start_session(session_id);
+        self.activate_runtime_session();
+        self.branch_runtime_replay = Some(early_runtime);
+        self.editor.clear();
+        true
+    }
+
+    fn handle_branch_key_at(&mut self, key: KeyEvent, arrival: Instant) -> Action {
+        let pasted = self
+            .last_key
+            .is_some_and(|last| arrival.saturating_duration_since(last) < PASTE_GAP);
+        self.handle_branch_key(key, pasted)
+    }
+
+    fn handle_branch_key(&mut self, key: KeyEvent, pasted: bool) -> Action {
+        if self.branch_submitting() {
+            self.toast("creating branch — wait for the result");
+            return Action::None;
+        }
+        if key.code == KeyCode::Esc {
+            self.abandon_branch();
+            return Action::None;
+        }
+        if let Some(chooser) = &mut self.branch_chooser {
+            if chooser.pending {
+                return Action::None;
+            }
+            match key.code {
+                KeyCode::Up => chooser.selected = chooser.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    chooser.selected =
+                        (chooser.selected + 1).min(chooser.boundaries.len().saturating_sub(1))
+                }
+                KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
+                    if let Some(boundary) = chooser.boundaries.get(chooser.selected) {
+                        let address = boundary.address.clone();
+                        chooser.pending = true;
+                        self.branch_epoch = self.branch_epoch.wrapping_add(1);
+                        return Action::PreparePromptBranch {
+                            epoch: self.branch_epoch,
+                            address,
+                        };
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
+                if !self.attachments.is_empty() {
+                    self.toast("prompt branch edits are text-only");
+                    return Action::None;
+                }
+                if self.editor.text().trim().is_empty() {
+                    return Action::None;
+                }
+                let draft = self.branch_draft.as_mut().unwrap();
+                draft.submitting = true;
+                self.branch_epoch = self.branch_epoch.wrapping_add(1);
+                return Action::SubmitPromptBranch {
+                    epoch: self.branch_epoch,
+                    checkout_token: draft.checkout_token.clone(),
+                    text: self.editor.text().to_string(),
+                };
+            }
+            KeyCode::Enter => self.editor.insert_char('\n'),
+            KeyCode::Char('j') if control => self.editor.insert_char('\n'),
+            KeyCode::Char('a') if control => self.editor.move_line_start(),
+            KeyCode::Char('e') if control => self.editor.move_line_end(),
+            KeyCode::Char('u') if control => self.editor.delete_to_line_start(),
+            KeyCode::Char('k') if control => self.editor.delete_to_line_end(),
+            KeyCode::Char('w') if control => self.editor.delete_word_back(),
+            KeyCode::Backspace if control => self.editor.delete_word_back(),
+            KeyCode::Backspace => self.editor.backspace(),
+            KeyCode::Delete => self.editor.delete_forward(),
+            KeyCode::Left => self.editor.move_left(),
+            KeyCode::Right => self.editor.move_right(),
+            KeyCode::Home => self.editor.move_line_start(),
+            KeyCode::End => self.editor.move_line_end(),
+            KeyCode::Up => {
+                self.editor.move_row_up(self.prompt_width);
+            }
+            KeyCode::Down => {
+                self.editor.move_row_down(self.prompt_width);
+            }
+            KeyCode::PageUp => self.scroll_by(-(self.viewport.max(2) as isize - 1)),
+            KeyCode::PageDown => self.scroll_by(self.viewport.max(2) as isize - 1),
+            KeyCode::Tab => self.editor.insert_str("    "),
+            KeyCode::Char(c) if !control && !key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.editor.insert_char(c)
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if self.branch_chooser.is_some() || self.branch_draft.is_some() {
+            let action = self.handle_branch_key_at(key, Instant::now());
+            self.last_key = Some(Instant::now());
+            return action;
         }
         if self.navigation.dialog.is_some() {
             let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
@@ -3529,6 +3938,12 @@ impl App {
                     self.open_navigation();
                     return Action::None;
                 }
+                if matches!(
+                    parse(self.editor.text(), !self.auth_methods.is_empty()),
+                    Parsed::Branch
+                ) {
+                    return self.open_branch_chooser();
+                }
                 if self.editor.is_empty() {
                     return Action::None;
                 }
@@ -3600,6 +4015,7 @@ impl App {
                             Action::ListSessions
                         }
                     }
+                    Parsed::Branch => self.open_branch_chooser(),
                     Parsed::Transcript => {
                         self.open_navigation();
                         Action::None
@@ -3780,6 +4196,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if self.branch_chooser.is_some() || self.editing_branch() {
+            return Action::None;
+        }
         if self.navigation.dialog.is_some() {
             return Action::None;
         }
@@ -4156,6 +4575,479 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
+    }
+
+    fn apply_stderr_runtime(app: &mut App, route: &mut Option<String>, event: RuntimeEvent) {
+        let line = format!(
+            "{}{}",
+            crate::events::EVENT_MARKER,
+            serde_json::to_string(&event).unwrap()
+        );
+        if let Some(update) =
+            super::super::runtime_diagnostic_update(route, crate::events::parse(&line).unwrap())
+        {
+            app.apply(update);
+        }
+    }
+
+    fn prepare_branch(app: &mut App) {
+        let Action::ListPromptBranches { epoch } = app.open_branch_chooser() else {
+            panic!("expected chooser")
+        };
+        app.branch_prepared(
+            epoch,
+            Ok(
+                crate::protocols::acp::prompt_branches::PreparePromptBranchResponse {
+                    checkout_token: "checkout-one".into(),
+                    original_text: "original prompt".into(),
+                    prefix: Vec::new(),
+                    config_options: Vec::new(),
+                },
+            ),
+        );
+    }
+
+    fn ready_branch_chooser(app: &mut App) -> u64 {
+        let Action::ListPromptBranches { epoch } = app.open_branch_chooser() else {
+            panic!("chooser")
+        };
+        app.branch_listed(
+            epoch,
+            Ok(vec![
+                crate::protocols::acp::prompt_branches::PromptBoundary {
+                    address: "opaque".into(),
+                    text: "original".into(),
+                    historical: false,
+                },
+            ]),
+        );
+        epoch
+    }
+
+    #[test]
+    fn branch_chooser_and_draft_exclude_slow_processing_but_preserve_real_input_gaps() {
+        // Inject a monotonic clock rather than sleeping: rendering/updating takes
+        // five paste gaps while the next Enter is already buffered by the terminal.
+        for draft in [false, true] {
+            for deliberate in [false, true] {
+                let mut app = app();
+                app.start_session("source".into());
+                if draft {
+                    prepare_branch(&mut app);
+                } else {
+                    ready_branch_chooser(&mut app);
+                }
+                assert!(app.navigation.dialog.is_none()); // direct /branch path
+                let before = Instant::now();
+                let after = before + super::PASTE_GAP * 5;
+                app.last_key = Some(if deliberate {
+                    before - super::PASTE_GAP * 2
+                } else {
+                    before
+                });
+                let mut clock = [before, after].into_iter();
+                app.with_navigation_clock_paused_using(|_| {}, || clock.next().unwrap());
+                let action = app.handle_branch_key_at(press(KeyCode::Enter), after);
+                if deliberate {
+                    assert!(matches!(action, Action::SubmitPromptBranch { .. }) == draft);
+                    assert!(matches!(action, Action::PreparePromptBranch { .. }) != draft);
+                } else {
+                    assert!(matches!(action, Action::None));
+                    assert!(!app.branch_submitting());
+                    if draft {
+                        assert_eq!(app.editor.text(), "original prompt\n");
+                    } else {
+                        assert!(!app.branch_chooser.as_ref().unwrap().pending);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn branch_prepare_response_preserves_paste_clock_in_the_fresh_provisional_view() {
+        let mut app = app();
+        app.start_session("source".into());
+        let epoch = ready_branch_chooser(&mut app);
+        let before = Instant::now();
+        let after = before + super::PASTE_GAP * 5;
+        app.last_key = Some(before);
+        let mut clock = [before, after].into_iter();
+        app.with_navigation_clock_paused_using(
+            |app| {
+                app.branch_prepared(
+                    epoch,
+                    Ok(
+                        crate::protocols::acp::prompt_branches::PreparePromptBranchResponse {
+                            checkout_token: "checkout".into(),
+                            original_text: "original".into(),
+                            prefix: Vec::new(),
+                            config_options: Vec::new(),
+                        },
+                    ),
+                );
+            },
+            || clock.next().unwrap(),
+        );
+        assert!(app.editing_branch());
+        assert_eq!(app.last_key, Some(after));
+        assert!(matches!(
+            app.handle_branch_key_at(press(KeyCode::Enter), after),
+            Action::None
+        ));
+        assert!(!app.branch_submitting());
+        assert_eq!(app.editor.text(), "original\n");
+    }
+
+    fn commit_branch_view(app: &mut App, child: &str) {
+        let arrival = Instant::now();
+        app.last_key = Some(arrival - super::PASTE_GAP * 2);
+        let Action::SubmitPromptBranch { epoch, .. } =
+            app.handle_branch_key_at(press(KeyCode::Enter), arrival)
+        else {
+            panic!("submit")
+        };
+        assert!(app.branch_submitted(epoch, child.into()));
+    }
+
+    #[test]
+    fn branch_storage_state_is_visible_before_during_and_after_checkout() {
+        for initial in [(true, false), (false, true), (true, true)] {
+            for activate in [false, true] {
+                let mut app = app();
+                app.start_session("source".into());
+                app.activate_runtime_session();
+                app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+                    pending: initial.0,
+                    exhausted: initial.1,
+                }));
+                prepare_branch(&mut app);
+                assert_eq!((app.storage_pending, app.storage_exhausted), initial);
+                // Even a child diagnostic-route change cannot hide global warnings.
+                app.apply(Update::Runtime(RuntimeEvent::SessionStarted {
+                    session_id: "child".into(),
+                }));
+                for state in [(false, false), (true, true), (false, true), (true, false)] {
+                    app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+                        pending: state.0,
+                        exhausted: state.1,
+                    }));
+                    assert_eq!((app.storage_pending, app.storage_exhausted), state);
+                    let parked = &app.branch_draft.as_ref().unwrap().original;
+                    assert_eq!((parked.storage_pending, parked.storage_exhausted), state);
+                }
+                if activate {
+                    commit_branch_view(&mut app, "child");
+                } else {
+                    app.abandon_branch();
+                }
+                assert!(app.storage_pending);
+                assert!(!app.storage_exhausted);
+                app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+                    pending: false,
+                    exhausted: false,
+                }));
+                assert!(!app.storage_pending);
+                assert!(!app.storage_exhausted);
+            }
+        }
+    }
+
+    #[test]
+    fn branch_early_diagnostics_replay_after_activation_and_route_back_to_loaded_source() {
+        let mut app = app();
+        let mut ingress = None;
+        app.start_session("source".into());
+        app.activate_runtime_session();
+        prepare_branch(&mut app);
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::SessionStarted {
+                session_id: "child".into(),
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::CompactionStarted {
+                reason: "early".into(),
+                at: 0,
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            agent_event(
+                "child-agent",
+                "Child agent",
+                crate::events::SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 1, None),
+            ),
+        );
+        apply_stderr_runtime(&mut app, &mut ingress, child("call-1:compose:1", "shell"));
+        let parked = &app.branch_draft.as_ref().unwrap().original;
+        assert_eq!(parked.runtime_session_id.as_deref(), Some("source"));
+        assert!(!parked.compacting);
+        assert!(parked.agents.is_empty());
+        assert!(!app.compacting); // provisional context is not the child yet
+        commit_branch_view(&mut app, "child");
+        assert_eq!(app.runtime_session_id.as_deref(), Some("child"));
+        assert_eq!(app.branch_runtime_replay.as_ref().unwrap().len(), 3);
+        // A response is not the replay boundary: keep diagnostics even if ACP
+        // replay arrives later than stderr from the newly activated child.
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            child("call-1:compose:extra", "shell"),
+        );
+        assert!(!app.compacting);
+        compose(&mut app, "shell({})");
+        app.apply(Update::AvailableCommands {
+            session_id: "child".into(),
+            commands: Vec::new(),
+        });
+        assert!(app.branch_runtime_replay.is_none());
+        assert!(app.compacting);
+        assert!(app.agents.contains_key("child-agent"));
+        assert_eq!(app.call_mut("call-1").unwrap().children.len(), 2);
+
+        // Loaded resume emits an ordered stderr source boundary before responding.
+        app.start_session("source".into());
+        app.activate_runtime_session();
+        compose(&mut app, "source shell({})");
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::SessionStarted {
+                session_id: "source".into(),
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::CompactionStarted {
+                reason: "source".into(),
+                at: 1,
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            agent_event(
+                "source-agent",
+                "Source agent",
+                crate::events::SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 1, None),
+            ),
+        );
+        apply_stderr_runtime(&mut app, &mut ingress, child("call-1:compose:2", "shell"));
+        assert_eq!(app.runtime_session_id.as_deref(), Some("source"));
+        assert!(app.compacting);
+        assert!(app.agents.contains_key("source-agent"));
+        assert!(!app.agents.contains_key("child-agent"));
+        assert_eq!(app.call_mut("call-1").unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn branch_abandon_does_not_retarget_source_diagnostics_to_an_early_child() {
+        let mut app = app();
+        let mut ingress = None;
+        app.start_session("source".into());
+        app.activate_runtime_session();
+        prepare_branch(&mut app);
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::SessionStarted {
+                session_id: "child".into(),
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::CompactionStarted {
+                reason: "child".into(),
+                at: 0,
+            },
+        );
+        app.abandon_branch();
+        assert_eq!(app.runtime_session_id.as_deref(), Some("source"));
+        assert!(!app.compacting);
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::SessionStarted {
+                session_id: "source".into(),
+            },
+        );
+        apply_stderr_runtime(
+            &mut app,
+            &mut ingress,
+            RuntimeEvent::CompactionStarted {
+                reason: "source".into(),
+                at: 1,
+            },
+        );
+        assert!(app.compacting);
+    }
+
+    #[test]
+    fn prompt_branch_abandon_restores_parked_editor_attachments_transcript_and_config() {
+        let mut app = app();
+        app.start_session("source".into());
+        app.push_block(Block::Agent("original answer".into()));
+        app.paste("unsent draft");
+        app.attach(
+            PathBuf::from("/tmp/parked.png"),
+            "image/png",
+            AttachmentKind::Image,
+            123,
+        );
+        app.editor.move_left();
+        let text = app.editor.text().to_string();
+        let cursor = app.editor.cursor();
+        let attachments = app.attachments.clone();
+        let next_attachment = app.next_attachment;
+        app.reasoning_effort = "high".into();
+        app.scroll = 7;
+        app.follow = false;
+        prepare_branch(&mut app);
+        assert!(app.editing_branch());
+        assert!(app.blocks.is_empty());
+        assert!(app.attachments.is_empty());
+        assert_eq!(app.editor.text(), "original prompt");
+        app.attach(
+            PathBuf::from("/tmp/rejected.png"),
+            "image/png",
+            AttachmentKind::Image,
+            1,
+        );
+        assert!(app.attachments.is_empty());
+        app.paste(" edited");
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        assert!(!app.editing_branch());
+        assert_eq!(app.session_id.as_deref(), Some("source"));
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text == "original answer"));
+        assert_eq!(app.editor.text(), text);
+        assert_eq!(app.editor.cursor(), cursor);
+        assert_eq!(app.attachments, attachments);
+        assert_eq!(app.next_attachment, next_attachment);
+        assert_eq!(app.reasoning_effort, "high");
+        assert_eq!(app.scroll, 7);
+        assert!(!app.follow);
+    }
+
+    #[test]
+    fn prompt_branch_stale_list_prepare_and_submit_cannot_replace_newer_draft_or_route() {
+        use crate::protocols::acp::prompt_branches::{PreparePromptBranchResponse, PromptBoundary};
+        let mut app = app();
+        app.start_session("source".into());
+        let Action::ListPromptBranches { epoch } = app.open_branch_chooser() else {
+            panic!()
+        };
+        app.abandon_branch();
+        app.open_branch_chooser();
+        app.branch_listed(
+            epoch,
+            Ok(vec![PromptBoundary {
+                address: "stale".into(),
+                text: "stale".into(),
+                historical: false,
+            }]),
+        );
+        assert!(app.branch_chooser.as_ref().unwrap().boundaries.is_empty());
+        app.branch_prepared(
+            epoch,
+            Ok(PreparePromptBranchResponse {
+                checkout_token: "stale".into(),
+                original_text: "stale".into(),
+                prefix: Vec::new(),
+                config_options: Vec::new(),
+            }),
+        );
+        assert!(!app.editing_branch());
+        app.abandon_branch();
+        prepare_branch(&mut app);
+        let Action::SubmitPromptBranch { epoch, text, .. } =
+            app.handle_branch_key(press(KeyCode::Enter), false)
+        else {
+            panic!()
+        };
+        assert_eq!(text, "original prompt");
+        app.start_session("other".into());
+        app.branch_submit_failed(epoch, "stale error".into());
+        assert!(!app.branch_submitted(epoch, "stale-child".into()));
+        assert_eq!(app.session_id.as_deref(), Some("other"));
+        assert!(!app.editing_branch());
+    }
+
+    #[test]
+    fn prompt_branch_is_discoverable_without_stealing_navigator_search_characters() {
+        let mut app = app();
+        app.start_session("source".into());
+        app.paste("park this draft");
+        app.open_navigation();
+        assert!(matches!(
+            app.handle_navigation_key(press(KeyCode::Char('e')), false),
+            Action::None
+        ));
+        assert_eq!(app.navigation.dialog.as_ref().unwrap().query, "e");
+        app.handle_navigation_key(press(KeyCode::Backspace), false);
+        app.paste("/branch");
+        assert!(matches!(
+            app.handle_navigation_key(press(KeyCode::Enter), false),
+            Action::ListPromptBranches { .. }
+        ));
+        assert_eq!(app.editor.text(), "park this draft");
+        app.abandon_branch();
+        assert!(app.navigation.dialog.is_some());
+        assert_eq!(app.editor.text(), "park this draft");
+    }
+
+    #[test]
+    fn prompt_branch_submit_is_text_only_and_never_an_ordinary_send() {
+        let mut app = app();
+        app.start_session("source".into());
+        prepare_branch(&mut app);
+        for code in [KeyCode::F(2), KeyCode::F(3)] {
+            assert!(matches!(app.handle_key(press(code)), Action::None));
+            assert!(app.navigation.dialog.is_none());
+            assert!(!app.queue_focused);
+        }
+        app.editor.clear();
+        app.paste("/model literal edited text");
+        assert!(matches!(
+            app.handle_branch_key(press(KeyCode::Enter), true),
+            Action::None
+        ));
+        assert!(app.editor.text().ends_with('\n'));
+        let Action::SubmitPromptBranch {
+            epoch,
+            checkout_token,
+            text,
+        } = app.handle_branch_key(press(KeyCode::Enter), false)
+        else {
+            panic!("must submit branch, not prompt/config")
+        };
+        assert_eq!(checkout_token, "checkout-one");
+        assert_eq!(text, "/model literal edited text\n");
+        assert!(app.branch_submitting());
+        app.paste("ignored while committing");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.branch_submitting());
+        assert_eq!(app.editor.text(), text);
+        app.branch_submit_failed(epoch, "try again".into());
+        assert!(app.editing_branch());
+        assert!(!app.branch_submitting());
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.session_id.as_deref(), Some("source"));
     }
 
     #[test]

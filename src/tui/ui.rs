@@ -82,6 +82,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
         && !app.editing_steer()
+        && !app.editing_branch()
         && !app.queue_focused
         && !app.show_logs;
 
@@ -102,8 +103,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         let minimum_rows = 1 + 3 + logs_rows + pending_rows + prompt_rows + 1;
         let rainbow_fits = frame.area().height >= minimum_rows.saturating_add(1);
         let header_rows = 1 + u16::from(!app.blocks.is_empty() && rainbow_fits);
-        let [header, body, logs, pending, prompt, status] = Layout::vertical([
+        let warning_rows = if app.editing_branch() {
+            (super::app::BRANCH_WARNING.len() as u16 / frame.area().width.max(1) + 2).min(7)
+        } else {
+            0
+        };
+        let [header, warning, body, logs, pending, prompt, status] = Layout::vertical([
             Constraint::Length(header_rows),
+            Constraint::Length(warning_rows),
             Constraint::Min(3),
             Constraint::Length(logs_rows),
             Constraint::Length(pending_rows),
@@ -113,13 +120,23 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         .areas(frame.area());
 
         draw_header(frame, app, header);
+        if app.editing_branch() {
+            frame.render_widget(
+                Paragraph::new(super::app::BRANCH_WARNING)
+                    .style(Style::default().fg(theme::warn_color()))
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                warning,
+            );
+        }
         draw_body(frame, app, images, body);
         if app.show_logs {
             draw_logs(frame, app, logs);
         }
         draw_pending_steers(frame, app, pending);
         let viewport = draw_prompt(frame, app, prompt);
-        draw_command_popup(frame, app, prompt);
+        if !app.editing_branch() {
+            draw_command_popup(frame, app, prompt);
+        }
         draw_status(frame, app, status);
         (prompt, viewport, false)
     };
@@ -134,6 +151,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     }
     if app.navigation.dialog.is_some() {
         draw_navigation(frame, app, &navigation_matches);
+    }
+    if app.branch_chooser.is_some() {
+        draw_branch_chooser(frame, app);
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
@@ -590,6 +610,86 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
+/// Only backend-approved text boundaries are selectable, including archived ones.
+fn draw_branch_chooser(frame: &mut Frame<'_>, app: &App) {
+    let chooser = app.branch_chooser.as_ref().expect("checked above");
+    let outer = frame.area();
+    let width = outer.width.saturating_sub(4).clamp(1, 96);
+    let height = outer.height.saturating_sub(2).clamp(1, 24);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let panel = Panel::bordered().title(" prompt checkout · text only · source preserved ");
+    let inner = panel.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    let [warning, entries, help] = Layout::vertical([
+        Constraint::Length(
+            (super::app::BRANCH_WARNING.len() as u16 / inner.width.max(1) + 2).min(7),
+        ),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(super::app::BRANCH_WARNING)
+            .style(Style::default().fg(theme::warn_color()))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        warning,
+    );
+    let rows = if chooser.pending {
+        vec![Line::from("Loading checkout… Esc cancels")]
+    } else if chooser.boundaries.is_empty() {
+        vec![Line::from("No eligible text prompts in this session.")]
+    } else {
+        let start = chooser
+            .selected
+            .saturating_sub(entries.height.saturating_sub(1) as usize);
+        chooser
+            .boundaries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(entries.height as usize)
+            .map(|(index, boundary)| {
+                let preview: String = boundary
+                    .text
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(inner.width as usize)
+                    .collect();
+                Line::styled(
+                    format!(
+                        "{} {}{}  {}",
+                        if index == chooser.selected {
+                            "›"
+                        } else {
+                            " "
+                        },
+                        if boundary.historical {
+                            "[archived] "
+                        } else {
+                            ""
+                        },
+                        boundary.address,
+                        preview
+                    ),
+                    if index == chooser.selected {
+                        theme::bold(theme::accent_color())
+                    } else {
+                        theme::dim()
+                    },
+                )
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(rows), entries);
+    frame.render_widget(Paragraph::new("↑/↓ select · Enter edit in provisional draft · Esc back\nNo branch is created until the edited draft is submitted."), help);
+}
+
 /// A read-only index of display text. Only visible entries build previews.
 fn draw_navigation(frame: &mut Frame<'_>, app: &App, matches: &[usize]) {
     let outer = frame.area();
@@ -690,7 +790,7 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, matches: &[usize]) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "↑/↓ select · Enter reveal · Esc/F3 close",
+                "↑/↓ · Enter reveal · /branch ↵ edit prompt · Esc/F3 close",
                 theme::dim(),
             )),
             Line::from(Span::styled(
@@ -2195,7 +2295,11 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
         theme::faint()
     };
     let block = Panel::bordered()
-        .title(if app.editing_steer() {
+        .title(if app.branch_submitting() {
+            " creating prompt branch… "
+        } else if app.editing_branch() {
+            " provisional prompt checkout · Enter create branch · Esc abandon "
+        } else if app.editing_steer() {
             " editing pending · Enter save · Esc cancel "
         } else {
             ""
@@ -2387,7 +2491,11 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(theme::warn_color()),
         ));
     }
-    let hints = if app.editing_steer() {
+    let hints = if app.branch_submitting() {
+        "creating branch — source preserved "
+    } else if app.editing_branch() {
+        "⏎ create branch   esc abandon   ⇧⏎ newline · text only "
+    } else if app.editing_steer() {
         "⏎ save edit   esc restore draft "
     } else if app.queue_focused && !app.pending_steers.is_empty() {
         if app.can_replace_steer
@@ -3048,6 +3156,47 @@ mod tests {
         app.navigation.dialog.as_mut().unwrap().selected = app.navigation.id(index);
         app.last_key = None; // Deliberate reveal, not an unbracketed paste burst.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn prompt_branch_chooser_and_provisional_editor_show_warning_and_archived_label() {
+        use crate::protocols::acp::prompt_branches::{PreparePromptBranchResponse, PromptBoundary};
+        let mut app = navigation_app(Vec::new());
+        app.session_id = Some("source".into());
+        app.branch_chooser = Some(crate::tui::app::BranchChooser {
+            boundaries: vec![PromptBoundary {
+                address: "opaque-boundary".into(),
+                text: "editable text".into(),
+                historical: true,
+            }],
+            selected: 0,
+            pending: false,
+        });
+        let output = render(&mut app, 100, 24);
+        assert!(output.contains("[archived] opaque-boundary"), "{output}");
+        assert!(
+            output.contains("Only conversation context changes."),
+            "{output}"
+        );
+        assert!(output.contains("not rolled back."), "{output}");
+        app.branch_prepared(
+            app.branch_epoch,
+            Ok(PreparePromptBranchResponse {
+                checkout_token: "checkout".into(),
+                original_text: "editable text".into(),
+                prefix: Vec::new(),
+                config_options: Vec::new(),
+            }),
+        );
+        let output = render(&mut app, 100, 24);
+        assert!(output.contains("provisional prompt checkout"), "{output}");
+        assert!(output.contains("editable text"), "{output}");
+        assert!(
+            output.contains("Only conversation context changes."),
+            "{output}"
+        );
+        assert!(output.contains("not rolled back."), "{output}");
+        assert!(output.contains("Esc abandon"), "{output}");
     }
 
     #[test]

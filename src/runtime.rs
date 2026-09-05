@@ -142,6 +142,49 @@ impl SessionSelection {
     }
 }
 
+fn acp_branch_selection(
+    transcript: &[Item],
+) -> Result<Option<(ModelSelection, Option<ReasoningEffort>)>, AcpRuntimeError> {
+    crate::session::branch::BranchMetadata::read(transcript)
+        .and_then(|metadata| {
+            metadata
+                .map(|metadata| metadata.request.selection.resolve())
+                .transpose()
+        })
+        .map_err(AcpRuntimeError::Loop)
+}
+
+fn ordinary_acp_fork_transcript(mut transcript: Vec<Item>) -> Result<Vec<Item>, AcpRuntimeError> {
+    crate::session::branch::strip_for_plain_fork(&mut transcript).map_err(AcpRuntimeError::Loop)?;
+    Ok(transcript)
+}
+
+/// A branch's first input is already part of its durable completion snapshot.
+/// The loop must receive it as pending input to activate, but must not append it
+/// to disk a second time. All other transcript events retain normal persistence.
+struct AcpTranscriptObserver {
+    observer: crate::session::SessionObserver,
+    committed_input: Mutex<Option<Item>>,
+}
+
+impl agentkit_loop::TranscriptObserver for AcpTranscriptObserver {
+    fn on_transcript_event(&self, event: agentkit_loop::TranscriptEvent<'_>) {
+        let committed = self
+            .committed_input
+            .lock()
+            .expect("ACP committed input guard poisoned")
+            .take();
+        if let Some(committed) = committed {
+            assert_eq!(
+                &committed, event.item,
+                "branch activation must append its committed prompt first"
+            );
+        } else {
+            self.observer.on_transcript_event(event);
+        }
+    }
+}
+
 pub(crate) struct AcpForkState {
     pub transcript: Vec<Item>,
     pub selection: ModelSelection,
@@ -1020,6 +1063,26 @@ impl Runtime {
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
         let session_id = request.id.clone();
+        let branch = if request.resume {
+            crate::session::branch::validate_resume(&self.root, &request.id)?
+        } else {
+            None
+        };
+        // Noninteractive reloads must honor the same persisted child selection
+        // as ACP, before starting an adapter or changing the transcript.
+        let adapter = if let Some(metadata) = branch {
+            let (selection, reasoning) = metadata.request.selection.resolve()?;
+            SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+                selection.provider,
+                selection.model,
+                self.credential_storage.clone(),
+                reasoning,
+                self.openrouter_api_key.clone(),
+            )?
+        } else {
+            self.adapter.clone()
+        };
+
         if self.plugin_runtime.is_some() {
             self.mcp.refresh().await.map_err(|error| {
                 record_runtime_failure(
@@ -1058,7 +1121,7 @@ impl Runtime {
         let pending_creation = (!request.resume).then(|| opened.observer.clone());
         let skills = self.fresh_skills();
         let compactor = crate::compaction::automatic(
-            self.adapter.clone(),
+            adapter.clone(),
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
             format!("compaction-{}", crate::session::new_id()),
@@ -1073,7 +1136,7 @@ impl Runtime {
         })?;
         let subagents = self.subagents.fresh();
         let agent = Agent::builder()
-            .model(self.adapter.clone())
+            .model(adapter)
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(
                 0,
@@ -1270,6 +1333,40 @@ impl Runtime {
     where
         I: LoopObserver + Clone + 'static,
     {
+        self.start_acp_driver_with_persistence(context, claim, forked, false)
+            .await
+    }
+
+    /// Commit a prepared prompt checkout before any adapter or model startup.
+    /// Unlike ordinary forks, a committed child survives a failed start/response.
+    pub(crate) async fn start_acp_branch_driver_with_initial<I>(
+        self: &Arc<Self>,
+        context: AcpDriverContext<I>,
+        claim: &mut SessionClaim,
+        forked: AcpForkState,
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
+        if !claim.is_fork() {
+            return Err(AcpRuntimeError::Loop(
+                "a prompt checkout requires a fork claim".into(),
+            ));
+        }
+        self.start_acp_driver_with_persistence(context, claim, Some(forked), true)
+            .await
+    }
+
+    async fn start_acp_driver_with_persistence<I>(
+        self: &Arc<Self>,
+        context: AcpDriverContext<I>,
+        claim: &mut SessionClaim,
+        forked: Option<AcpForkState>,
+        commit_branch: bool,
+    ) -> Result<AcpDriver, AcpRuntimeError>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
         let cwd = crate::resilient_fs::canonicalize(&context.cwd)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         if cwd != self.root || !context.additional_directories.is_empty() {
@@ -1295,8 +1392,14 @@ impl Runtime {
                     "a forked transcript requires a new session identity".into(),
                 ));
             }
-            transcript
+            if commit_branch {
+                transcript
+            } else {
+                ordinary_acp_fork_transcript(transcript)?
+            }
         } else if request.resume {
+            crate::session::branch::validate_resume(&self.root, &request.id)
+                .map_err(AcpRuntimeError::Loop)?;
             vec![Item::text(
                 ItemKind::System,
                 self.system_prompt(self.base_depth),
@@ -1316,6 +1419,23 @@ impl Runtime {
         .map_err(AcpRuntimeError::Loop)?;
         if is_fork || !request.resume {
             claim.guard_uncommitted_transcript(&opened.observer);
+        }
+        // Validate the opened payload as well, then restore a resumed checkout's
+        // captured selection. Ordinary forks already cleared validated ancestry.
+        let persisted = acp_branch_selection(&opened.transcript)?;
+        let selected = if request.resume || commit_branch {
+            persisted.or(selected)
+        } else {
+            // Ordinary forks inherit the parent's *current* model, not the
+            // model recorded when an ancestor checkout was created.
+            selected
+        };
+        if commit_branch {
+            crate::session::branch::commit(&opened.observer, &opened.transcript)
+                .map_err(AcpRuntimeError::Loop)?;
+            // commit disarms the observer's creation guard after the disk
+            // barrier. The claim retains its observer, but dropping either
+            // owner after an adapter/start failure cannot delete this child.
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
@@ -1351,6 +1471,18 @@ impl Runtime {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let canonical_transcript = opened.transcript.clone();
+        let mut transcript = opened.transcript;
+        let committed_input = if commit_branch {
+            // branch::commit already checked the complete prefix + user shape.
+            transcript.pop()
+        } else {
+            None
+        };
+        let input = committed_input.iter().cloned().collect();
+        let observer = AcpTranscriptObserver {
+            observer: opened.observer,
+            committed_input: Mutex::new(committed_input),
+        };
         let mut session_config = SessionConfig::new(session_id.clone()).without_cache();
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
@@ -1367,8 +1499,9 @@ impl Runtime {
             .task_manager(task_manager)
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
-            .transcript_observer(opened.observer)
-            .transcript(opened.transcript)
+            .transcript_observer(observer)
+            .transcript(transcript)
+            .input(input)
             .cancellation(context.cancellation)
             .build()
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
@@ -2417,5 +2550,394 @@ impl StorageCancellationBridge {
 impl Drop for StorageCancellationBridge {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod branch_startup_tests {
+    use super::*;
+    use crate::session::branch::{self, Boundary, CapturedSelection, SubmittedRequest};
+
+    fn prepared() -> Vec<Item> {
+        let prefix = vec![Item::text(ItemKind::System, "system")];
+        branch::prepare(
+            prefix.clone(),
+            "parent".into(),
+            Boundary::new(0, &prefix).unwrap(),
+            "checkout".into(),
+            SubmittedRequest {
+                id: "request".into(),
+                selection: CapturedSelection::new(
+                    &ModelSelection::new(ProviderKind::OpenRouter, "openai/gpt-5.4"),
+                    Some(ReasoningEffort::High),
+                ),
+            },
+            Item::text(ItemKind::User, "edited prompt"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn branch_resume_selection_is_read_without_mutation() {
+        let transcript = prepared();
+        let before = transcript.clone();
+        assert_eq!(
+            acp_branch_selection(&transcript).unwrap(),
+            Some((
+                ModelSelection::new(ProviderKind::OpenRouter, "openai/gpt-5.4"),
+                Some(ReasoningEffort::High),
+            ))
+        );
+        assert_eq!(transcript, before);
+        assert!(
+            acp_branch_selection(&[Item::text(ItemKind::System, "legacy")])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn branch_resume_rejects_invalid_payload_without_defaults() {
+        let original = prepared();
+        let payload = original[0].metadata[branch::METADATA_KEY].clone();
+        let mut invalid = vec![Value::Null, json!({ "version": 999 })];
+        for (field, value) in [
+            ("provider", json!("unknown")),
+            ("model", json!("")),
+            ("reasoning", json!("extreme")),
+        ] {
+            let mut changed = payload.clone();
+            changed["request"]["selection"][field] = value;
+            invalid.push(changed);
+        }
+        let mut unknown = payload;
+        unknown["unrecognized"] = json!(true);
+        invalid.push(unknown);
+        for value in invalid {
+            let mut transcript = original.clone();
+            transcript[0]
+                .metadata
+                .insert(branch::METADATA_KEY.into(), value);
+            assert!(acp_branch_selection(&transcript).is_err());
+        }
+    }
+
+    #[derive(Clone)]
+    struct QuietObserver;
+
+    impl LoopObserver for QuietObserver {
+        fn handle_event(&self, _: agentkit_loop::ObservedEvent) {}
+    }
+
+    fn context(root: &Path) -> AcpDriverContext<QuietObserver> {
+        AcpDriverContext {
+            cwd: root.into(),
+            additional_directories: Vec::new(),
+            integration: Arc::new(QuietObserver),
+            cancellation: CancellationController::new().handle(),
+            response_attempt_replacement: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_branch_survives_failed_start_and_restores_selection_on_resume() {
+        let root = tempfile::tempdir().unwrap();
+        // Empty explicit key deterministically fails OpenRouter adapter startup
+        // without credential lookup/network. Runtime defaults differ from child.
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("")),
+        )
+        .unwrap();
+        let mut claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        let committed = prepared();
+        let error = runtime
+            .start_acp_branch_driver_with_initial(
+                context(root.path()),
+                &mut claim,
+                AcpForkState {
+                    transcript: committed.clone(),
+                    selection: ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4"),
+                    reasoning_effort: None,
+                    parent_context: None,
+                },
+            )
+            .await
+            .err()
+            .expect("empty explicit key must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("--openrouter-api-key cannot be empty"),
+            "{error}"
+        );
+        drop(claim);
+        let recovered = branch::lookup_committed(root.path(), &id, "checkout", "request")
+            .unwrap()
+            .expect("failed adapter startup must remain recoverable");
+        assert_eq!(recovered.transcript, committed);
+        let before = branch::load_history(root.path(), &id).unwrap();
+        let path = crate::session::transcript_path_for_test(root.path(), &id);
+        let complete_bytes = std::fs::read(&path).unwrap();
+        let mut torn_bytes = complete_bytes.clone();
+        torn_bytes.extend_from_slice(br#"{"schema_version":3,"item":{"kind":"assistant""#);
+        std::fs::write(&path, &torn_bytes).unwrap();
+        assert_eq!(
+            branch::lookup_committed(root.path(), &id, "checkout", "request")
+                .unwrap()
+                .unwrap()
+                .transcript,
+            committed,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), torn_bytes);
+        let mut resume = runtime.claim_session_load(&id).unwrap();
+        let error = runtime
+            .start_acp_driver(context(root.path()), &mut resume)
+            .await
+            .err()
+            .expect("resume must use the persisted OpenRouter selection");
+        assert!(
+            error
+                .to_string()
+                .contains("--openrouter-api-key cannot be empty"),
+            "{error}"
+        );
+        drop(resume);
+        assert_eq!(branch::load_history(root.path(), &id).unwrap(), before);
+        assert_eq!(crate::session::load(root.path(), &id).unwrap(), committed);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            complete_bytes,
+            "ACP opener only truncates the torn tail; no prompt or generation rerun"
+        );
+    }
+
+    #[tokio::test]
+    async fn noninteractive_branch_reload_validates_completion_and_restores_selection() {
+        let root = tempfile::tempdir().unwrap();
+        for complete in [false, true] {
+            let id = if complete {
+                "complete-print"
+            } else {
+                "partial-print"
+            };
+            let opened =
+                crate::session::open_uncommitted(root.path(), id, false, prepared()).unwrap();
+            if complete {
+                branch::commit(&opened.observer, &opened.transcript).unwrap();
+            } else {
+                opened.observer.commit_creation(); // interrupted initial appends, no completion
+            }
+            drop(opened);
+            let path = crate::session::transcript_path_for_test(root.path(), id);
+            let complete_bytes = std::fs::read(&path).unwrap();
+            let mut torn_bytes = complete_bytes.clone();
+            torn_bytes.extend_from_slice(br#"{"schema_version":3,"item":{"kind":"tool""#);
+            std::fs::write(&path, &torn_bytes).unwrap();
+            assert_eq!(branch::validate_resume(root.path(), id).is_ok(), complete);
+            assert!(
+                std::fs::read(&path).unwrap() == torn_bytes,
+                "resume preflight must not repair"
+            );
+            let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                root.path(),
+                "gpt-5.4",
+                ProviderKind::OpenAiSubscription,
+                SessionRequest {
+                    id: id.into(),
+                    resume: true,
+                    force: false,
+                },
+                crate::credentials::CredentialStorage::Memory,
+                None,
+                Some(crate::provider::OpenRouterApiKey::new("")),
+            )
+            .unwrap();
+            let error = runtime
+                .run_persistent("must not be appended".into())
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(if complete {
+                    "--openrouter-api-key cannot be empty"
+                } else {
+                    "incomplete prompt checkout"
+                }),
+                "{error}"
+            );
+            let expected = if complete { complete_bytes } else { torn_bytes };
+            assert!(
+                std::fs::read(&path).unwrap() == expected,
+                "only a committed resume's locked opener may repair; no generation rerun"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_branch_resume_rejects_before_adapter_or_disk_repair() {
+        use agentkit_loop::{TranscriptEvent, TranscriptObserver};
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("")),
+        )
+        .unwrap();
+        for retained in [1, 2] {
+            let id = format!("partial-{retained}");
+            let transcript = prepared();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                transcript[..retained].to_vec(),
+            )
+            .unwrap();
+            if retained == 2 {
+                // If resume reached open, this unanswered call would cause a
+                // repair append. Read-only preflight must leave it untouched.
+                let mut call = Item::new(
+                    ItemKind::Assistant,
+                    vec![Part::ToolCall(agentkit_core::ToolCallPart::new(
+                        "unanswered",
+                        "compose",
+                        json!({}),
+                    ))],
+                );
+                call.created_at = transcript[1].created_at;
+                opened.observer.on_transcript_event(TranscriptEvent {
+                    session_id: &agentkit_core::SessionId::new(&id),
+                    item: &call,
+                });
+            }
+            // Simulate a crash leaving initial appends, but no branch commit.
+            opened.observer.commit_creation();
+            drop(opened);
+            let before = branch::load_history(root.path(), &id).unwrap();
+            let mut claim = runtime.claim_session_load(&id).unwrap();
+            let error = runtime
+                .start_acp_driver(context(root.path()), &mut claim)
+                .await
+                .err()
+                .expect("initial appends cannot resume a checkout");
+            assert!(
+                error.to_string().contains("incomplete prompt checkout"),
+                "{error}"
+            );
+            assert!(error.to_string().contains(&id), "{error}");
+            drop(claim);
+            assert_eq!(branch::load_history(root.path(), &id).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_branch_descendant_clears_checkout_identity_and_resumes_as_legacy() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("")),
+        )
+        .unwrap();
+        let parent = prepared();
+        let mut claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        let error = runtime
+            .start_acp_driver_with_initial(
+                context(root.path()),
+                &mut claim,
+                Some(AcpForkState {
+                    transcript: parent.clone(),
+                    // Explicit ordinary-fork selection still wins over ancestry.
+                    selection: ModelSelection::new(ProviderKind::OpenRouter, "invalid model"),
+                    reasoning_effort: None,
+                    parent_context: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("explicit invalid model must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("model name is outside canonical bounds"),
+            "{error}"
+        );
+        let child = crate::session::load(root.path(), &id).unwrap();
+        assert!(branch::BranchMetadata::read(&child).unwrap().is_none());
+        assert!(branch::BranchMetadata::read(&parent).unwrap().is_some());
+        // Retain this ordinary fork fixture to exercise its next load. It has
+        // normal creation authority, not a prompt-checkout completion record.
+        claim.commit().unwrap();
+        let mut resume = runtime.claim_session_load(&id).unwrap();
+        let error = runtime
+            .start_acp_driver(context(root.path()), &mut resume)
+            .await
+            .err()
+            .expect("legacy defaults reach the empty-key adapter error");
+        assert!(
+            error
+                .to_string()
+                .contains("--openrouter-api-key cannot be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ordinary_fork_rejects_malformed_ancestry_before_stripping() {
+        let mut source = prepared();
+        source[0].metadata.insert("unrelated".into(), json!(true));
+        let child = ordinary_acp_fork_transcript(source.clone()).unwrap();
+        assert_eq!(child[0].metadata["unrelated"], json!(true));
+        assert!(source[0].metadata.contains_key(branch::METADATA_KEY));
+        source[0]
+            .metadata
+            .insert(branch::METADATA_KEY.into(), Value::Null);
+        assert!(ordinary_acp_fork_transcript(source).is_err());
+    }
+
+    #[test]
+    fn branch_activation_suppresses_only_the_committed_prompt_append() {
+        use agentkit_loop::{TranscriptEvent, TranscriptObserver};
+        let root = tempfile::tempdir().unwrap();
+        let opened =
+            crate::session::open_uncommitted(root.path(), "child", false, prepared()).unwrap();
+        branch::commit(&opened.observer, &opened.transcript).unwrap();
+        let prompt = opened.transcript.last().unwrap().clone();
+        let observer = AcpTranscriptObserver {
+            observer: opened.observer,
+            committed_input: Mutex::new(Some(prompt.clone())),
+        };
+        let session_id = agentkit_core::SessionId::new("child");
+        observer.on_transcript_event(TranscriptEvent {
+            session_id: &session_id,
+            item: &prompt,
+        });
+        assert_eq!(
+            crate::session::load(root.path(), "child").unwrap(),
+            opened.transcript
+        );
+        // An identical later user prompt is a real append, never deduplicated.
+        observer.on_transcript_event(TranscriptEvent {
+            session_id: &session_id,
+            item: &prompt,
+        });
+        let mut expected = opened.transcript;
+        expected.push(prompt);
+        assert_eq!(
+            crate::session::load(root.path(), "child").unwrap(),
+            expected
+        );
     }
 }
