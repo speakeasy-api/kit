@@ -121,6 +121,8 @@ pub(super) fn valid_model_id(value: &str) -> bool {
 pub struct ModelGroup {
     pub provider: ProviderKind,
     pub models: Vec<String>,
+    /// Provider-reported windows only; missing entries are unknown.
+    pub context_windows: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -232,10 +234,10 @@ impl SelectableAdapter {
             .map_err(|_| "session selection lock is poisoned".into())
     }
 
-    async fn discovered_openai_models(&self) -> Vec<String> {
+    async fn discovered_openai_models(&self) -> DiscoveredModels {
         let config = match SubscriptionConfig::new(OPENAI_FALLBACK[0].to_string()) {
             Ok(config) => config.with_credential_storage(self.credential_storage.clone()),
-            Err(_) => return Vec::new(),
+            Err(_) => return DiscoveredModels::default(),
         };
         let adapter = match OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_catalog(
             config,
@@ -243,12 +245,15 @@ impl SelectableAdapter {
             self.openai_model_catalog.clone(),
         ) {
             Ok(adapter) => adapter,
-            Err(_) => return Vec::new(),
+            Err(_) => return DiscoveredModels::default(),
         };
         adapter
             .model_catalog()
             .await
-            .map(|catalog| catalog.visible_models().to_vec())
+            .map(|catalog| DiscoveredModels {
+                models: catalog.visible_models().to_vec(),
+                context_windows: catalog.context_windows().clone(),
+            })
             .unwrap_or_default()
     }
 
@@ -1056,13 +1061,16 @@ fn openai_models(discovered: Vec<String>, current: &ModelSelection) -> Vec<Strin
 pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     match SelectableAdapter::new(current.provider, current.model.clone()) {
         Ok(adapter) => adapter.model_catalog(current).await,
-        Err(_) => model_catalog_with_openai(current, std::future::ready(Vec::new())).await,
+        Err(_) => {
+            model_catalog_with_openai(current, std::future::ready(DiscoveredModels::default()))
+                .await
+        }
     }
 }
 
 async fn model_catalog_with_openai(
     current: &ModelSelection,
-    openai_catalog: impl std::future::Future<Output = Vec<String>>,
+    openai_catalog: impl std::future::Future<Output = DiscoveredModels>,
 ) -> Vec<ModelGroup> {
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
@@ -1074,28 +1082,32 @@ async fn model_catalog_with_openai(
         if same_catalog {
             let models = fetch_model_ids(&public_url)
                 .await
-                .unwrap_or_else(|_| openrouter_fallback());
+                .unwrap_or_else(|_| fallback_catalog());
             (models.clone(), models)
         } else {
             let openrouter_catalog = async {
                 match openrouter_url {
                     Some(url) => fetch_model_ids(&url)
                         .await
-                        .unwrap_or_else(|_| openrouter_fallback()),
-                    None => openrouter_fallback(),
+                        .unwrap_or_else(|_| fallback_catalog()),
+                    None => fallback_catalog(),
                 }
             };
             let speakeasy_catalog = async {
                 fetch_model_ids(&public_url)
                     .await
-                    .unwrap_or_else(|_| openrouter_fallback())
+                    .unwrap_or_else(|_| fallback_catalog())
             };
             tokio::join!(openrouter_catalog, speakeasy_catalog)
         }
     };
-    let (discovered_openai, (mut openrouter, mut speakeasy)) =
-        tokio::join!(openai_catalog, other_catalogs);
-    let openai = openai_models(discovered_openai, current);
+    let (discovered_openai, (openrouter, speakeasy)) = tokio::join!(openai_catalog, other_catalogs);
+    let openai_windows = discovered_openai.context_windows;
+    let openrouter_windows = openrouter.context_windows;
+    let speakeasy_windows = speakeasy.context_windows;
+    let mut openrouter = openrouter.models;
+    let mut speakeasy = speakeasy.models;
+    let openai = openai_models(discovered_openai.models, current);
     let current_is_valid = valid_model_id(&current.model);
     if current_is_valid
         && current.provider == ProviderKind::OpenRouter
@@ -1137,14 +1149,17 @@ async fn model_catalog_with_openai(
         ModelGroup {
             provider: ProviderKind::OpenAiSubscription,
             models: openai,
+            context_windows: openai_windows,
         },
         ModelGroup {
             provider: ProviderKind::OpenRouter,
             models: openrouter,
+            context_windows: openrouter_windows,
         },
         ModelGroup {
             provider: ProviderKind::Speakeasy,
             models: speakeasy,
+            context_windows: speakeasy_windows,
         },
     ]
 }
@@ -1156,7 +1171,20 @@ fn openrouter_fallback() -> Vec<String> {
         .collect()
 }
 
-async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
+#[derive(Clone, Default)]
+struct DiscoveredModels {
+    models: Vec<String>,
+    context_windows: std::collections::HashMap<String, u64>,
+}
+
+fn fallback_catalog() -> DiscoveredModels {
+    DiscoveredModels {
+        models: openrouter_fallback(),
+        ..Default::default()
+    }
+}
+
+async fn fetch_model_ids(url: &str) -> Result<DiscoveredModels, String> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
@@ -1183,6 +1211,10 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| "model catalog is not valid JSON".to_string())?;
+    parse_discovered_models(&value)
+}
+
+fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
     let entries = value
         .get("data")
         .and_then(Value::as_array)
@@ -1190,17 +1222,39 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
     if entries.len() > MAX_MODELS {
         return Err("model catalog has too many entries".into());
     }
-    Ok(entries
+    let models: Vec<String> = entries
         .iter()
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .filter(|id| valid_model_id(id))
         .take(MAX_SELECTOR_MODELS)
         .map(str::to_string)
-        .collect())
+        .collect();
+    let context_windows = models
+        .iter()
+        .filter_map(|id| parse_context_window(value, id).map(|window| (id.clone(), window)))
+        .collect();
+    Ok(DiscoveredModels {
+        models,
+        context_windows,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_switch_catalog_retains_only_reported_positive_windows() {
+        let catalog = super::parse_discovered_models(&serde_json::json!({"data": [
+            {"id": "known", "context_length": 200000},
+            {"id": "unknown"}, {"id": "zero", "context_length": 0},
+            {"id": "bad model", "context_length": 100}
+        ]}))
+        .unwrap();
+        assert_eq!(catalog.models, ["known", "unknown", "zero"]);
+        assert_eq!(catalog.context_windows.len(), 1);
+        assert_eq!(catalog.context_windows["known"], 200000);
+        assert!(super::fallback_catalog().context_windows.is_empty());
+    }
+
     use std::{
         collections::BTreeMap,
         io::{Read, Write},

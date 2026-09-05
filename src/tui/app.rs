@@ -208,6 +208,15 @@ pub struct ModelChoice {
     pub model: String,
 }
 
+pub struct ModelSwitch {
+    pub id: u64,
+    pub choice: ModelChoice,
+    pub save_defaults: bool,
+    pub warning: Option<crate::protocols::acp::model_switch::Warning>,
+    pub selected: usize,
+    pub cancelling: bool,
+}
+
 pub struct ModelDialog {
     pub query: String,
     pub selected: usize,
@@ -326,6 +335,7 @@ pub enum Action {
         choice: ModelChoice,
         save_defaults: bool,
     },
+    ConfirmModelSwitch(crate::protocols::acp::model_switch::Decision),
     SelectEffort {
         effort: String,
         save_defaults: bool,
@@ -640,6 +650,8 @@ pub struct App {
     pub model: String,
     pub model_choices: Vec<ModelChoice>,
     pub model_dialog: Option<ModelDialog>,
+    pub model_switch: Option<ModelSwitch>,
+    next_model_switch: u64,
     pub reasoning_effort: String,
     pub effort_choices: Vec<EffortChoice>,
     pub effort_dialog: Option<EffortDialog>,
@@ -945,6 +957,8 @@ impl App {
             model,
             model_choices: Vec::new(),
             model_dialog: None,
+            model_switch: None,
+            next_model_switch: 0,
             reasoning_effort: "default".into(),
             effort_choices: Vec::new(),
             effort_dialog: None,
@@ -2195,6 +2209,7 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.model_switch = None;
         self.cancel_steer_edit();
         self.selected_steer = None;
         self.queue_focused = false;
@@ -2526,6 +2541,9 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.model_switch.is_some() {
+            return;
+        }
         // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
         self.last_key = None;
         if let Some(rename) = self
@@ -3118,10 +3136,67 @@ impl App {
         Action::None
     }
 
+    pub fn begin_model_switch(&mut self, choice: ModelChoice, save_defaults: bool) -> Option<u64> {
+        if self.model_switch.is_some() || self.working() {
+            self.note("wait for the current operation before changing models");
+            return None;
+        }
+        self.next_model_switch = self.next_model_switch.wrapping_add(1);
+        let id = self.next_model_switch;
+        self.model_switch = Some(ModelSwitch {
+            id,
+            choice,
+            save_defaults,
+            warning: None,
+            selected: 2,
+            cancelling: false,
+        });
+        Some(id)
+    }
+
+    fn handle_model_switch_key(&mut self, key: KeyEvent) -> Action {
+        use crate::protocols::acp::model_switch::Decision;
+        let pending = self.model_switch.as_mut().expect("checked above");
+        let cancel = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if pending.warning.is_none() {
+            if cancel {
+                if pending.cancelling {
+                    return if key.code == KeyCode::Char('c') {
+                        Action::Quit
+                    } else {
+                        Action::None
+                    };
+                }
+                pending.cancelling = true;
+                return Action::Cancel;
+            }
+            return Action::None;
+        }
+        if cancel {
+            self.model_switch = None;
+            return Action::Redraw;
+        }
+        match key.code {
+            KeyCode::Up => pending.selected = pending.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => pending.selected = (pending.selected + 1) % 3,
+            KeyCode::Enter => match pending.selected {
+                0 => return Action::ConfirmModelSwitch(Decision::Continue),
+                1 => return Action::ConfirmModelSwitch(Decision::Compact),
+                _ => self.model_switch = None,
+            },
+            _ => {}
+        }
+        Action::Redraw
+    }
+
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if self.model_switch.is_some() {
+            return self.handle_model_switch_key(key);
         }
         if self.session_dialog.is_some() {
             // Terminals without bracketed paste deliver a paste as a key burst, so
@@ -3583,6 +3658,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if self.model_switch.is_some() {
+            return Action::None;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp if self.mouse_in_agents(mouse.column, mouse.row) => {
                 self.scroll_agents_by(-3);
@@ -3956,6 +4034,82 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
+    }
+
+    #[test]
+    fn model_switch_dialog_actions_preserve_input_and_selection() {
+        use crate::protocols::acp::model_switch::{Decision, Warning};
+        for (selected, expected) in [
+            (0, Some(Decision::Continue)),
+            (1, Some(Decision::Compact)),
+            (2, None),
+        ] {
+            let mut app = app();
+            app.paste("unsent draft");
+            let old_model = app.model.clone();
+            let choice = model_choice("openrouter", "target");
+            app.begin_model_switch(choice, false).unwrap();
+            let pending = app.model_switch.as_mut().unwrap();
+            pending.warning = Some(Warning {
+                token: 1,
+                guarded_tokens: "120".into(),
+                target_window: 150,
+            });
+            pending.selected = selected;
+            app.paste("must not enter composer");
+            let result = app.handle_key(press(KeyCode::Enter));
+            match expected {
+                Some(expected) => assert!(
+                    matches!(result, Action::ConfirmModelSwitch(actual) if actual == expected)
+                ),
+                None => assert!(app.model_switch.is_none()),
+            }
+            assert_eq!(app.editor.text(), "unsent draft");
+            assert_eq!(app.model, old_model);
+            assert!(app.blocks.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_switch_pending_cancel_and_stale_session_do_not_reuse_operation() {
+        let mut app = app();
+        let first = app
+            .begin_model_switch(model_choice("openrouter", "target"), false)
+            .unwrap();
+        assert!(
+            app.begin_model_switch(model_choice("openrouter", "other"), false)
+                .is_none()
+        );
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Esc)),
+            Action::Cancel
+        ));
+        assert!(app.model_switch.as_ref().unwrap().cancelling);
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        app.start_session("new-session".into());
+        assert!(app.model_switch.is_none());
+        let next = app
+            .begin_model_switch(model_choice("openrouter", "other"), false)
+            .unwrap();
+        assert_ne!(first, next);
+    }
+
+    #[test]
+    fn model_switch_dialog_escape_cancels_without_a_request() {
+        use crate::protocols::acp::model_switch::Warning;
+        let mut app = app();
+        app.begin_model_switch(model_choice("openrouter", "target"), false)
+            .unwrap();
+        app.model_switch.as_mut().unwrap().warning = Some(Warning {
+            token: 1,
+            guarded_tokens: "120".into(),
+            target_window: 150,
+        });
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Esc)),
+            Action::Redraw
+        ));
+        assert!(app.model_switch.is_none());
     }
 
     #[test]

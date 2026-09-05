@@ -33,6 +33,7 @@ use crate::{
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
+use super::model_switch;
 
 use super::{
     AuthenticationRequiredData, CancelBackgroundRequest, CancelBackgroundResponse,
@@ -469,7 +470,10 @@ enum Command {
     Prompt(PromptCommand),
     SetConfig {
         request: wire::SetSessionConfigOptionRequest,
-        reply: oneshot::Sender<Result<wire::SetSessionConfigOptionResponse, AcpRuntimeError>>,
+        reply: oneshot::Sender<
+            Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
+        >,
+        cancellation_generation: u64,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -993,14 +997,31 @@ impl Server {
     async fn set_config(
         &self,
         request: wire::SetSessionConfigOptionRequest,
-    ) -> Result<wire::SetSessionConfigOptionResponse, AcpRuntimeError> {
-        let sender = self.sender(&request.session_id)?;
+    ) -> Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error> {
+        let (sender, cancellation_generation) = {
+            let sessions = self.sessions.lock().expect("ACP v2 session map poisoned");
+            let session = sessions.get(&request.session_id).ok_or_else(|| {
+                sdk_error(AcpRuntimeError::SessionNotFound(
+                    request.session_id.to_string(),
+                ))
+            })?;
+            (
+                session.commands.clone(),
+                session.integration.cancellation_handle().generation(),
+            )
+        };
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::SetConfig { request, reply })
+            .send(Command::SetConfig {
+                request,
+                reply,
+                cancellation_generation,
+            })
             .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
+        response
+            .await
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?
     }
 
     async fn cancel(
@@ -1052,18 +1073,6 @@ impl Server {
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         self.registry.remove(session.token);
         Ok(wire::CloseSessionResponse::new())
-    }
-
-    fn sender(
-        &self,
-        session_id: &wire::SessionId,
-    ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
-        self.sessions
-            .lock()
-            .expect("ACP v2 session map poisoned")
-            .get(session_id)
-            .map(|session| session.commands.clone())
-            .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
     }
 
     async fn detach_compose(
@@ -1142,6 +1151,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
+    let mut model_switch = model_switch::Guard::default();
     loop {
         tokio::select! {
             biased;
@@ -1166,8 +1176,37 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
                 }
-                Some(Command::SetConfig { request, reply }) => {
-                    let result = set_v2_config(&adapter, &catalog, request);
+                Some(Command::SetConfig { request, reply, cancellation_generation }) => {
+                    let result = async {
+                        if handle.cancellation_handle().is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
+                        if request.config_id.to_string() == super::MODEL_CONFIG_ID {
+                            let target = request.value.as_id().ok_or_else(|| model_switch::error("selection requires an id value"))?;
+                            let decision = model_switch.check(
+                                (&adapter.selection().map_err(|error| model_switch::error(&error))?, cancellation_generation),
+                                crate::provider::ModelSelection::from_id(&target.to_string()).map_err(|error| model_switch::error(&error))?,
+                                &catalog, driver.snapshot().transcript,
+                                request.meta.as_ref().and_then(|meta| meta.get(model_switch::META)),
+                            )?;
+                            if decision == model_switch::Decision::Compact {
+                                claim_prompt(&busy).map_err(sdk_error)?;
+                                handle.prepare_injection_turn();
+                                handle.start_injection_turn();
+                                let compacted = compact_for_switch(
+                                    &session_id, &integration, &handle, &mut driver, &sink,
+                                    cancellation_generation, &activity,
+                                ).await;
+                                handle.stop_injection_turn();
+                                busy.store(false, Ordering::Release);
+                                compacted?;
+                            }
+                        }
+                        if handle.cancellation_handle().is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
+                        set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
+                    }.await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -1327,7 +1366,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     .await;
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
-    result
+    result.map(|_| ())
 }
 
 #[async_trait]
@@ -1504,6 +1543,52 @@ where
     }
 }
 
+/// Uses the normal manual compactor and lifecycle, while the actor retains the
+/// original selection. Returning success is the only path to publishing a switch.
+async fn compact_for_switch<S: ModelSession + Send + 'static>(
+    session_id: &wire::SessionId,
+    integration: &AcpIntegration,
+    handle: &AcpSessionHandle,
+    driver: &mut LoopDriver<S>,
+    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
+    cancellation_generation: u64,
+    activity: &SessionActivity,
+) -> Result<(), agent_client_protocol::Error> {
+    // Only a successful, persisted standard compaction consumes this marker.
+    // Runtime telemetry cannot acknowledge a pending model switch.
+    let marker = model_switch::compact_marker();
+    let marker_id = marker.id.clone();
+    driver
+        .submit_input(vec![marker])
+        .map_err(|error| sdk_error(map_loop_error(session_id, &error)))?;
+    let reason = run_active_turn(
+        session_id,
+        integration,
+        handle,
+        driver,
+        sink,
+        cancellation_generation,
+        None,
+        activity,
+        ExecutionOrigin::Prompt,
+    )
+    .await
+    .map_err(sdk_error)?;
+    if !model_switch::compaction_completed(
+        &reason,
+        &marker_id,
+        &driver.snapshot().transcript,
+        handle
+            .cancellation_handle()
+            .is_cancelled_since(cancellation_generation),
+    ) {
+        return Err(model_switch::error(
+            "compaction did not complete; model unchanged",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_active_turn<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
@@ -1515,7 +1600,7 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
     activity: &SessionActivity,
     origin: ExecutionOrigin,
-) -> Result<(), AcpRuntimeError> {
+) -> Result<FinishReason, AcpRuntimeError> {
     activity
         .execute(
             origin,
@@ -1548,7 +1633,6 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
             |reason| Some(reason.clone()),
         )
         .await
-        .map(|_| ())
 }
 
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
@@ -1582,7 +1666,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
     busy.store(false, Ordering::Release);
-    result
+    result.map(|_| ())
 }
 
 fn error_diagnostic_notification(
@@ -2039,8 +2123,7 @@ pub(crate) fn component(
                 async move |request: wire::SetSessionConfigOptionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        responder
-                            .respond_with_result(state.set_config(request).await.map_err(sdk_error))
+                        responder.respond_with_result(state.set_config(request).await)
                     })?;
                     Ok(())
                 }
@@ -4269,11 +4352,141 @@ mod tests {
         ));
     }
 
+    #[derive(Clone)]
+    struct SwitchSummaryAdapter {
+        selection: SelectableAdapter,
+        seen: Arc<Mutex<Vec<String>>>,
+        outcome: TestOutcome,
+        interrupt: Option<AcpSessionHandle>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for SwitchSummaryAdapter {
+        type Session = TestSession;
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(self.selection.selection().unwrap().model);
+            Ok(TestSession {
+                outcome: self.outcome,
+                turns: Arc::new(AtomicU64::new(0)),
+                interrupt: self.interrupt.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn model_switch_compacts_with_original_model_before_selecting_and_keeps_it_on_failure_or_cancel()
+     {
+        for mode in ["success", "failure", "cancel"] {
+            let integration = AcpIntegration::default();
+            let sink = ResponseReplacementSink::new(RecordingSink::default());
+            let session_id = wire::SessionId::new(format!("switch-{mode}"));
+            let loop_id = SessionId::new(format!("switch-loop-{mode}"));
+            let activity = native_activity(session_id.clone(), sink.clone());
+            let handle = integration
+                .bind_session(
+                    AcpSessionBinding::new(session_id.clone(), loop_id.clone(), sink.clone())
+                        .cancellation(CancellationController::new()),
+                )
+                .unwrap();
+            let selection =
+                SelectableAdapter::new(ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let summary_adapter = SwitchSummaryAdapter {
+                selection: selection.clone(),
+                seen: seen.clone(),
+                outcome: if mode == "failure" {
+                    TestOutcome::ProviderError
+                } else {
+                    TestOutcome::Content
+                },
+                interrupt: (mode == "cancel").then(|| handle.clone()),
+            };
+            let compactor = crate::compaction::automatic(
+                summary_adapter,
+                Default::default(),
+                None,
+                loop_id.clone(),
+            )
+            .unwrap();
+            let mut driver = Agent::builder()
+                .model(TestAdapter {
+                    outcome: TestOutcome::Content,
+                    turns: Arc::new(AtomicU64::new(0)),
+                    interrupt: None,
+                })
+                .mutator(compactor)
+                .cancellation(handle.cancellation_handle())
+                .transcript(vec![
+                    Item::text(ItemKind::User, "older content ".repeat(20_000)),
+                    Item::text(ItemKind::Assistant, "recent response"),
+                ])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(loop_id).without_cache())
+                .await
+                .unwrap();
+            handle.prepare_injection_turn();
+            handle.start_injection_turn();
+            let generation = handle.cancellation_handle().generation();
+            let compacted = compact_for_switch(
+                &session_id,
+                &integration,
+                &handle,
+                &mut driver,
+                &sink,
+                generation,
+                &activity,
+            )
+            .await;
+            assert_eq!(selection.selection().unwrap().model, "gpt-5.4");
+            assert_eq!(*seen.lock().unwrap(), ["gpt-5.4"]);
+            let catalog = [crate::provider::ModelGroup {
+                provider: ProviderKind::OpenAiSubscription,
+                models: vec!["gpt-5.4-mini".into()],
+                context_windows: Default::default(),
+            }];
+            let result = compacted.and_then(|()| {
+                set_v2_config(
+                    &selection,
+                    &catalog,
+                    wire::SetSessionConfigOptionRequest::new(
+                        session_id,
+                        super::super::MODEL_CONFIG_ID,
+                        "openai-subscription:gpt-5.4-mini",
+                    ),
+                )
+                .map_err(sdk_error)
+            });
+            assert_eq!(result.is_ok(), mode == "success", "{mode}: {result:?}");
+            assert_eq!(
+                selection.selection().unwrap().model,
+                if mode == "success" {
+                    "gpt-5.4-mini"
+                } else {
+                    "gpt-5.4"
+                }
+            );
+            if mode == "success" {
+                assert!(
+                    driver
+                        .snapshot()
+                        .transcript
+                        .iter()
+                        .any(crate::compaction::is_compaction_summary)
+                );
+            }
+        }
+    }
+
     #[test]
     fn v2_config_mapping_uses_v2_ids_categories_and_values() {
         let current =
             crate::provider::ModelSelection::new(crate::ProviderKind::OpenRouter, "test-model");
         let catalog = [crate::provider::ModelGroup {
+            context_windows: Default::default(),
             provider: crate::ProviderKind::OpenRouter,
             models: vec!["test-model".into(), "other-model".into()],
         }];

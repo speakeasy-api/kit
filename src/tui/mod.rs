@@ -58,7 +58,9 @@ use wire::{
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::{FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID},
+    protocols::acp::{
+        FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID, model_switch,
+    },
     tools::mcp::CredentialStorage,
 };
 
@@ -66,6 +68,31 @@ use app::{
     Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
     UserImage,
 };
+
+struct ModelSwitchCompletion {
+    generation: u64,
+    operation: u64,
+    response: Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
+}
+
+fn take_model_switch_completion(
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    generation: u64,
+    operation: u64,
+) -> Option<app::ModelSwitch> {
+    if !route
+        .lock()
+        .is_ok_and(|route| route.generation == generation)
+        || app
+            .model_switch
+            .as_ref()
+            .is_none_or(|pending| pending.id != operation)
+    {
+        return None;
+    }
+    app.model_switch.take()
+}
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
@@ -1135,6 +1162,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             };
             refresh_config_state(&mut app, Some(&config_options));
             let mut saved_model_default = current_model_choice(Some(&config_options));
+            let (switch_tx, mut switch_rx) = mpsc::unbounded_channel::<ModelSwitchCompletion>();
             if let Ok(mut active) = transition_session.lock() {
                 active.id = active_session_id.clone();
             }
@@ -1452,38 +1480,32 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     }
                                 }
                                 Action::Close => return Ok(()),
-                                Action::SelectModel { choice, save_defaults } => {
-                                    let response = connection.send_request(
-                                        SetSessionConfigOptionRequest::new(
-                                            session_id.clone(),
-                                            MODEL_CONFIG_ID,
-                                            choice.id.as_str(),
-                                        ),
-                                    ).block_task().await;
-                                    match response {
-                                        Ok(response) => {
-                                            app.usage = None;
-                                            refresh_config_state(
-                                                &mut app,
-                                                Some(&response.config_options),
-                                            );
-                                            app.note(format!("model changed to {} via {}", choice.model, choice.provider));
-                                            if save_defaults {
-                                                let saved = {
-                                                    let choice = choice.clone();
-                                                    tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
-                                                };
-                                                match saved {
-                                                    Ok(()) => {
-                                                        saved_model_default = Some(choice.clone());
-                                                        app.note(config_save_message("model defaults"));
-                                                    }
-                                                    Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
-                                                }
-                                            }
+                                action @ (Action::SelectModel { .. } | Action::ConfirmModelSwitch(_)) => {
+                                    let confirmation = match action {
+                                        Action::SelectModel { choice, save_defaults } => {
+                                            if app.begin_model_switch(choice, save_defaults).is_none() { continue; }
+                                            None
                                         }
-                                        Err(error) => app.note(format!("model change failed: {}", error.message)),
+                                        Action::ConfirmModelSwitch(decision) => {
+                                            let Some(pending) = app.model_switch.as_mut() else { continue; };
+                                            let Some(warning) = pending.warning.take() else { continue; };
+                                            Some(model_switch::Confirmation { token: warning.token, action: decision })
+                                        }
+                                        _ => unreachable!(),
+                                    };
+                                    let Some(pending) = &app.model_switch else { continue; };
+                                    let operation = pending.id;
+                                    let generation = transition_session.lock().expect("session route").generation;
+                                    let mut request = SetSessionConfigOptionRequest::new(session_id.clone(), MODEL_CONFIG_ID, pending.choice.id.as_str());
+                                    if let Some(confirmation) = confirmation {
+                                        request.meta = Some(serde_json::Map::from_iter([(model_switch::META.into(), serde_json::to_value(confirmation).expect("confirmation serialization"))]));
                                     }
+                                    let connection = connection.clone();
+                                    let completed = switch_tx.clone();
+                                    tokio::task::spawn_local(async move {
+                                        let response = connection.send_request(request).block_task().await;
+                                        let _ = completed.send(ModelSwitchCompletion { generation, operation, response });
+                                    });
                                 }
                                 Action::SelectEffort { effort, save_defaults } => {
                                     let response = connection
@@ -1675,6 +1697,37 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     });
                                 }
                                 Action::None | Action::Redraw => {}
+                            }
+                        },
+                        Some(completion) = switch_rx.recv() => {
+                            let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation) else { continue; };
+                            match completion.response {
+                                Ok(response) => {
+                                    let choice = pending.choice;
+                                    let save_defaults = pending.save_defaults;
+                                    app.usage = None;
+                                    refresh_config_state(&mut app, Some(&response.config_options));
+                                    app.note(format!("model changed to {} via {}", choice.model, choice.provider));
+                                    if save_defaults {
+                                        let saved = {
+                                            let choice = choice.clone();
+                                            tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                        };
+                                        match saved {
+                                            Ok(()) => { saved_model_default = Some(choice); app.note(config_save_message("model defaults")); }
+                                            Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let warning = error.data.as_ref().and_then(|data| data.get(model_switch::META)).and_then(|value| serde_json::from_value::<model_switch::Warning>(value.clone()).ok());
+                                    if let Some(warning) = warning.filter(|_| !pending.cancelling) {
+                                        pending.warning = Some(warning);
+                                        app.model_switch = Some(pending);
+                                    } else {
+                                        app.note(format!("model change failed: {}", error.message));
+                                    }
+                                }
                             }
                         },
                         update = updates_rx.recv() => match update {
@@ -1941,6 +1994,9 @@ fn handle(app: &mut App, event: Event) -> Action {
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
+            if app.model_switch.is_some() {
+                return Action::None;
+            }
             if app.queue_focused && !app.session_rename_active() {
                 return Action::None;
             }
@@ -2939,6 +2995,33 @@ mod tests {
                 .as_deref(),
             Some("current")
         );
+    }
+
+    #[test]
+    fn model_switch_completion_requires_current_session_and_operation() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "first".into(),
+            generation: 0,
+        }));
+        let choice = ModelChoice {
+            id: "openrouter:target".into(),
+            provider: "openrouter".into(),
+            model: "target".into(),
+        };
+        let operation = app.begin_model_switch(choice, false).unwrap();
+        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation + 1).is_none());
+        transition_route(&route, "second".into());
+        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation).is_none());
+        assert!(app.model_switch.is_some());
+        assert!(super::take_model_switch_completion(&mut app, &route, 1, operation).is_some());
+        assert!(super::take_model_switch_completion(&mut app, &route, 1, operation).is_none());
+        assert_eq!(app.model, "original");
     }
 
     #[test]
