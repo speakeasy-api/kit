@@ -499,10 +499,16 @@ async fn child_exit_monitor_keeps_spawn_activation_across_reactivation() {
             manager.monitor_child_exit("source".into(), &state, &child);
             events::DiagnosticScope::default()
         } else {
-            events::scope_diagnostics(&session, async {
-                let expected = events::DiagnosticScope::capture();
-                manager.monitor_child_exit("source".into(), &state, &child);
-                expected
+            events::DiagnosticScope::with_operation(events::DiagnosticOperation::new(format!(
+                "monitor:{route}"
+            )))
+            .scope(async {
+                events::scope_diagnostics(&session, async {
+                    let expected = events::DiagnosticScope::capture();
+                    manager.monitor_child_exit("source".into(), &state, &child);
+                    expected
+                })
+                .await
             })
             .await
         };

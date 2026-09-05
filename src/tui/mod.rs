@@ -270,7 +270,9 @@ fn runtime_diagnostic_envelope_update(
     route: &mut Option<String>,
     diagnostic: events::DiagnosticEvent,
 ) -> Option<QueuedUpdate> {
-    let events::DiagnosticEvent { event, activation } = diagnostic;
+    let events::DiagnosticEvent {
+        event, activation, ..
+    } = diagnostic;
     match event {
         events::RuntimeEvent::SessionStarted { session_id } => {
             *route = Some(session_id);
@@ -303,6 +305,7 @@ fn runtime_diagnostic_update(
     runtime_diagnostic_envelope_update(
         route,
         events::DiagnosticEvent {
+            operation: None,
             event,
             activation: None,
         },
@@ -3723,6 +3726,7 @@ mod tests {
                             format!(
                                 "{EVENT_MARKER}{}\n",
                                 serde_json::to_string(&crate::events::DiagnosticEvent {
+                                    operation: None,
                                     event,
                                     activation: Some(crate::events::DiagnosticActivation {
                                         session_id: session.into(),
@@ -3827,6 +3831,7 @@ mod tests {
                     ),
                 ] {
                     let diagnostic = DiagnosticEvent {
+                        operation: None,
                         event,
                         activation: Some(DiagnosticActivation {
                             session_id: "source".into(),
@@ -3907,6 +3912,7 @@ mod tests {
                     let update = super::runtime_diagnostic_envelope_update(
                         &mut ingress,
                         DiagnosticEvent {
+                            operation: None,
                             event: RuntimeEvent::CompactionStarted {
                                 reason: "unverified".into(),
                                 at: 3,
@@ -4627,6 +4633,7 @@ mod tests {
             let update = super::runtime_diagnostic_envelope_update(
                 &mut None,
                 DiagnosticEvent {
+                    operation: None,
                     event: RuntimeEvent::ChildStarted {
                         call: format!("compose:{epoch}"),
                         tool: "shell".into(),
@@ -4649,6 +4656,7 @@ mod tests {
         let storage = super::runtime_diagnostic_envelope_update(
             &mut None,
             DiagnosticEvent {
+                operation: None,
                 event: RuntimeEvent::StorageStatus {
                     pending: true,
                     exhausted: false,

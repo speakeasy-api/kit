@@ -22,14 +22,82 @@ use agentkit_core::TurnCancellation;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::tools::mcp::CredentialStorage;
+use crate::{
+    events::{
+        DiagnosticOperation, DiagnosticScope, offer_diagnostic_ownership, ownership_supported,
+        set_diagnostic_operation,
+    },
+    tools::mcp::CredentialStorage,
+};
+
+/// Immutable producer ownership, separate from request-lifetime output routes.
+/// Both the process actor and stderr drain retain this registry. Entries are
+/// never removed on response, cancellation, or session close.
+struct DiagnosticOperationRoutes {
+    operations: Mutex<(u64, HashMap<DiagnosticOperation, DiagnosticScope>)>,
+    negotiated: AtomicBool,
+}
+
+impl DiagnosticOperationRoutes {
+    fn new() -> Self {
+        Self {
+            operations: Mutex::new((0, HashMap::new())),
+            negotiated: AtomicBool::new(false),
+        }
+    }
+
+    fn register(&self) -> Result<DiagnosticOperation, ChildError> {
+        let scope = DiagnosticScope::capture();
+        let mut routes = self
+            .operations
+            .lock()
+            .map_err(|_| ChildError::Failed("diagnostic operation registry unavailable".into()))?;
+        routes.0 = routes
+            .0
+            .checked_add(1)
+            .ok_or_else(|| ChildError::Failed("diagnostic operation sequence exhausted".into()))?;
+        let operation = DiagnosticOperation::new(format!("operation-{}", routes.0))
+            .expect("generated diagnostic operation is valid");
+        routes.1.insert(operation.clone(), scope);
+        Ok(operation)
+    }
+
+    fn resolve(&self, operation: &DiagnosticOperation) -> Option<DiagnosticScope> {
+        self.operations.lock().ok()?.1.get(operation).cloned()
+    }
+}
+
+fn owned_close(
+    session_id: SessionId,
+    operation: &DiagnosticOperation,
+    negotiated: bool,
+) -> CloseSessionRequest {
+    let mut request = CloseSessionRequest::new(session_id);
+    if negotiated {
+        set_diagnostic_operation(&mut request.meta, operation);
+    }
+    request
+}
+
+fn owned_model(
+    session_id: SessionId,
+    model: &str,
+    operation: &DiagnosticOperation,
+    negotiated: bool,
+) -> SetSessionConfigOptionRequest {
+    let mut request = SetSessionConfigOptionRequest::new(session_id, "model", model);
+    if negotiated {
+        set_diagnostic_operation(&mut request.meta, operation);
+    }
+    request
+}
 
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
@@ -413,6 +481,7 @@ impl std::fmt::Display for ChildError {
 struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
     serial: tokio::sync::OwnedMutexGuard<()>,
+    operation: DiagnosticOperation,
     session_id: SessionId,
     text: String,
     cancellation: TurnCancellation,
@@ -420,6 +489,7 @@ struct Prompt {
 }
 struct Fork {
     serial: tokio::sync::OwnedMutexGuard<()>,
+    operation: DiagnosticOperation,
     session_id: SessionId,
     model: Option<String>,
     parent: Option<(String, String)>,
@@ -427,6 +497,7 @@ struct Fork {
     reply: oneshot::Sender<Result<SessionId, ChildError>>,
 }
 struct Close {
+    operation: DiagnosticOperation,
     session_id: SessionId,
     reply: oneshot::Sender<Result<(), ChildError>>,
 }
@@ -532,6 +603,7 @@ fn rendered_text_only(value: &Value) -> Option<&str> {
 /// A logical ACP session. Multiple forked sessions may share one child process.
 #[derive(Clone)]
 pub(crate) struct ChildSession {
+    diagnostics: Arc<DiagnosticOperationRoutes>,
     tx: mpsc::Sender<Request>,
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
@@ -551,6 +623,10 @@ impl ChildSession {
     ) -> Result<Self, ChildError> {
         let context = config.harnesses.launch_context(&harness);
         let actor_context = context.clone();
+        let diagnostics = Arc::new(DiagnosticOperationRoutes::new());
+        // Admission ownership must be captured before the actor is spawned.
+        let admission = diagnostics.register()?;
+        let actor_diagnostics = Arc::clone(&diagnostics);
         let (tx, mut rx) = mpsc::channel(1);
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = watch::channel(false);
@@ -564,6 +640,8 @@ impl ChildSession {
                     model,
                     depth,
                     context: actor_context,
+                    diagnostics: actor_diagnostics,
+                    admission,
                 },
                 &mut rx,
                 ready_tx,
@@ -592,6 +670,7 @@ impl ChildSession {
         };
         match result {
             Ok(ready) => Ok(Self {
+                diagnostics,
                 tx: actor_tx,
                 session_id: ready.session_id,
                 capabilities: ready.capabilities,
@@ -620,6 +699,7 @@ impl ChildSession {
     }
 
     pub async fn close(&self) -> Result<(), ChildError> {
+        let operation = self.diagnostics.register()?;
         if let Some(ancestor_id) = &self.descendant_parent {
             // Explicit close belongs to its caller, which may be a new turn
             // using a reused or native-forked child. Deferred cleanup callers
@@ -640,6 +720,7 @@ impl ChildSession {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Request::Close(Close {
+                operation,
                 session_id: self.session_id.clone(),
                 reply,
             }))
@@ -660,6 +741,7 @@ impl ChildSession {
         parent: Option<(String, String)>,
         cancellation: &TurnCancellation,
     ) -> Result<Self, ChildError> {
+        let operation = self.diagnostics.register()?;
         let serial = tokio::select! {
             serial = self.serial.clone().lock_owned() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
@@ -674,6 +756,7 @@ impl ChildSession {
         tokio::select! {
             sent = self.tx.send(Request::Fork(Fork {
                 serial,
+                operation,
                 session_id: self.session_id.clone(),
                 model: model.map(str::to_owned),
                 parent,
@@ -686,6 +769,7 @@ impl ChildSession {
             ChildError::TerminalFailed("nested agent process exited without a fork response".into())
         })??;
         Ok(Self {
+            diagnostics: Arc::clone(&self.diagnostics),
             tx: self.tx.clone(),
             session_id,
             capabilities: self.capabilities.clone(),
@@ -700,6 +784,7 @@ impl ChildSession {
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
+        let operation = self.diagnostics.register()?;
         let serial = tokio::select! {
             serial = self.serial.clone().lock_owned() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
@@ -707,6 +792,7 @@ impl ChildSession {
         let (reply, response) = oneshot::channel();
         let request = Request::Prompt(Prompt {
             serial,
+            operation,
             session_id: self.session_id.clone(),
             text,
             cancellation: cancellation.clone(),
@@ -723,6 +809,8 @@ impl ChildSession {
 }
 
 struct RunConfig {
+    diagnostics: Arc<DiagnosticOperationRoutes>,
+    admission: DiagnosticOperation,
     config: ChildConfig,
     harness: String,
     persisted: Option<(String, bool)>,
@@ -752,6 +840,8 @@ async fn run(
     closed: watch::Sender<bool>,
 ) -> Result<(), String> {
     let RunConfig {
+        diagnostics,
+        admission,
         config,
         harness,
         persisted,
@@ -788,7 +878,15 @@ async fn run(
         .take()
         .ok_or("could not open ACP harness stderr")?;
     let descendant_parent = config.parent_id.clone();
-    spawn_forward_stderr(stderr, harness.clone(), config.parent_id.clone());
+    let (negotiation_tx, negotiation_rx) = watch::channel(None);
+    let _stderr_task = spawn_forward_stderr(
+        stderr,
+        harness.clone(),
+        config.parent_id.clone(),
+        Some((Arc::clone(&diagnostics), negotiation_rx)),
+    );
+    // Retain registrations until this actor exits, even if stderr closes first.
+    let connection_diagnostics = Arc::clone(&diagnostics);
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(
         HashMap::<SessionId, Arc<Mutex<ChildOutput>>>::new(),
@@ -826,10 +924,19 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            let mut initialize = agentkit_acp::InitializeRequest::new(ProtocolVersion::V1);
+            offer_diagnostic_ownership(&mut initialize.meta);
+            let initialized = connection.send_request(initialize).block_task().await?;
+            let negotiated = ownership_supported(initialized.meta.as_ref());
+            connection_diagnostics.negotiated.store(negotiated, Ordering::Release);
+            let _ = negotiation_tx.send(Some(negotiated));
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
-            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            let mut request = agentkit_acp::NewSessionRequest::new(root.clone());
+            if negotiated {
+                set_diagnostic_operation(&mut request.meta, &admission);
+            }
+            let session = connection.send_request(request).block_task().await?;
             if let Some(model) = model {
                 let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
                     option.id.to_string() == "model" && matches!(option.kind, SessionConfigKind::Select(_))
@@ -839,13 +946,13 @@ async fn run(
                     let _ = ready.send(Err(error));
                     return std::future::pending().await;
                 }
-                if let Err(error) = connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
+                if let Err(error) = connection.send_request(owned_model(session.session_id.clone(), model.as_str(), &admission, negotiated)).block_task().await {
                     let error = format!("ACP harness {harness:?} rejected model selection {model:?}: {error}");
                     let _ = ready.send(Err(error));
                     return std::future::pending().await;
                 }
             }
-            let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
+            let sessions = Arc::new(Mutex::new(vec![(session.session_id.clone(), admission.clone())]));
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
             ready_flag.store(true, Ordering::Release);
@@ -874,22 +981,24 @@ async fn run(
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
                                 ]));
                             }
+                            if negotiated {
+                                set_diagnostic_operation(&mut request.meta, &fork.operation);
+                            }
                             let mut request = Box::pin(connection.send_request(request).block_task());
                             let result = tokio::select! {
                                 result = &mut request => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
                                         if let Ok(mut sessions) = sessions.lock() {
-                                            sessions.push(session_id.clone());
+                                            sessions.push((session_id.clone(), fork.operation.clone()));
                                         }
                                         if let Some(model) = fork.model {
                                             let selected = match tokio::time::timeout(
                                                 HANDSHAKE,
                                                 connection
-                                                    .send_request(SetSessionConfigOptionRequest::new(
-                                                        session_id.clone(),
-                                                        "model",
-                                                        model.as_str(),
+                                                    .send_request(owned_model(
+                                                        session_id.clone(), model.as_str(),
+                                                        &fork.operation, negotiated,
                                                     ))
                                                     .block_task(),
                                             )
@@ -905,14 +1014,14 @@ async fn run(
                                             };
                                             if selected.is_err() && supports_close {
                                                 let close = connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), &fork.operation, negotiated))
                                                     .block_task();
                                                 if tokio::time::timeout(CANCEL_SETTLE, close)
                                                     .await
                                                     .is_ok_and(|result| result.is_ok())
                                                     && let Ok(mut sessions) = sessions.lock()
                                                 {
-                                                    sessions.retain(|id| id != &session_id);
+                                                    sessions.retain(|(id, _)| id != &session_id);
                                                 }
                                             }
                                             selected
@@ -937,7 +1046,7 @@ async fn run(
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
                                                 cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), &fork.operation, negotiated))
                                                     .block_task(),
                                             )
                                             .await
@@ -945,7 +1054,7 @@ async fn run(
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
-                                            sessions.push(session_id);
+                                            sessions.push((session_id, fork.operation.clone()));
                                         }
                                     });
                                     Err(ChildError::Cancelled)
@@ -965,7 +1074,7 @@ async fn run(
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
                                                 cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), &fork.operation, negotiated))
                                                     .block_task(),
                                             )
                                             .await
@@ -973,7 +1082,7 @@ async fn run(
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
-                                            sessions.push(session_id);
+                                            sessions.push((session_id, fork.operation.clone()));
                                         }
                                     });
                                     Err(ChildError::Failed(format!(
@@ -990,7 +1099,7 @@ async fn run(
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
                             let request = connection
-                                .send_request(CloseSessionRequest::new(close.session_id.clone()))
+                                .send_request(owned_close(close.session_id.clone(), &close.operation, negotiated))
                                 .block_task();
                             let result = tokio::time::timeout(CANCEL_SETTLE, request)
                                 .await
@@ -1005,7 +1114,7 @@ async fn run(
                             if result.is_ok()
                                 && let Ok(mut sessions) = sessions.lock()
                             {
-                                sessions.retain(|id| id != &close.session_id);
+                                sessions.retain(|(id, _)| id != &close.session_id);
                             }
                             let _ = close.reply.send(result);
                         });
@@ -1019,15 +1128,23 @@ async fn run(
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
-                            let request = connection.send_request(agentkit_acp::PromptRequest::new(
+                            let mut request = agentkit_acp::PromptRequest::new(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
-                            )).block_task();
+                            );
+                            if negotiated {
+                                set_diagnostic_operation(&mut request.meta, &prompt.operation);
+                            }
+                            let request = connection.send_request(request).block_task();
                             tokio::pin!(request);
                             let (response, cancelled) = tokio::select! {
                                 biased;
                                 result = &mut request => (result.map_err(|error| error.to_string()), false),
                                 () = prompt.cancellation.cancelled() => {
-                                    let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+                                    let mut cancel = CancelNotification::new(session_id.clone());
+                                    if negotiated {
+                                        set_diagnostic_operation(&mut cancel.meta, &prompt.operation);
+                                    }
+                                    let _ = connection.send_notification(cancel);
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result.map_err(|error| error.to_string()), true),
                                         Err(_) => {
@@ -1055,9 +1172,9 @@ async fn run(
             }
             let session_ids = sessions.lock().map(|sessions| sessions.clone()).unwrap_or_default();
             if supports_close {
-                for session_id in session_ids {
+                for (session_id, operation) in session_ids {
                     let close = connection
-                        .send_request(CloseSessionRequest::new(session_id))
+                        .send_request(owned_close(session_id, &operation, negotiated))
                         .block_task();
                     if let Ok(result) = tokio::time::timeout(CANCEL_SETTLE, close).await {
                         result?;
@@ -1104,37 +1221,84 @@ async fn run(
     })
 }
 
-// Capture before spawn. ACP v1 stderr is one process-wide stream shared by
-// reused sessions and native forks. Neither a prompt response nor a new request
-// identifies the operation that produced buffered bytes; even child activation
-// IDs belong to another process and have no parent-operation mapping here.
-// Keep the launch scope for this stream and its EOF cleanup. After reactivation,
-// the reader must reject these events, including otherwise-current nested
-// diagnostics. This intentionally sacrifices nested live detail rather than
-// retagging delayed old bytes. Parent-owned Subagents lifecycle events and
-// explicit ChildSession::close use their invocation scope and remain current.
+/// Translate only explicitly negotiated, known operation tokens. Legacy children
+/// retain immutable launch provenance; neither reader timing nor child epochs
+/// authorize retagging their diagnostics after parent reactivation.
 fn spawn_forward_stderr(
     stderr: impl AsyncRead + Unpin + Send + 'static,
     label: String,
     ancestor_id: Option<String>,
+    ownership: Option<(
+        Arc<DiagnosticOperationRoutes>,
+        watch::Receiver<Option<bool>>,
+    )>,
 ) -> tokio::task::JoinHandle<()> {
-    let diagnostics = crate::events::DiagnosticScope::capture();
+    let launch = DiagnosticScope::capture();
     tokio::spawn(async move {
-        forward_stderr(stderr, &label, ancestor_id.as_deref(), |output| {
-            match output {
-                ForwardedStderr::RuntimeLine(line) => {
-                    // Child epochs belong to another process. Re-envelope the
-                    // event with this parent's captured activation at the IPC
-                    // boundary; recursively forwarded roster events keep their
-                    // own subagent/ancestor IDs in the unchanged payload.
-                    if let Some(event) = crate::events::parse(&line) {
-                        diagnostics.emit(&event);
+        let mut stderr = stderr;
+        let mut pending = Vec::new();
+        let routes = if let Some((routes, mut negotiation)) = ownership {
+            // Drain while initialization is pending: waiting without reading can
+            // fill the stderr pipe and prevent the child from replying at all.
+            // Interpret these bytes only after agreement (or failed startup).
+            let mut buffer = [0; 8192];
+            while negotiation.borrow().is_none() {
+                tokio::select! {
+                    biased;
+                    changed = negotiation.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    read = stderr.read(&mut buffer) => match read {
+                        Ok(0) | Err(_) => {
+                            let _ = negotiation.wait_for(Option::is_some).await;
+                            break;
+                        }
+                        Ok(count) => pending.extend_from_slice(&buffer[..count]),
                     }
                 }
-                ForwardedStderr::Diagnostic(line) => eprintln!("{line}"),
-                ForwardedStderr::Cleanup(event) => diagnostics.emit(&event),
             }
-        })
+            Some(routes)
+        } else {
+            None
+        };
+        let negotiated = routes
+            .as_ref()
+            .filter(|routes| routes.negotiated.load(Ordering::Acquire));
+        forward_stderr(
+            pending.as_slice().chain(stderr),
+            &label,
+            ancestor_id.as_deref(),
+            negotiated.map(Arc::as_ref),
+            |output| {
+                match output {
+                    ForwardedStderr::RuntimeLine(line) => {
+                        if let Some(routes) = negotiated {
+                            if let Some(envelope) = crate::events::parse_diagnostic(&line)
+                                && let Some(scope) = envelope
+                                    .operation
+                                    .as_ref()
+                                    .and_then(|op| routes.resolve(op))
+                            {
+                                // Restores both the parent's activation and its
+                                // upstream operation at every descendant hop.
+                                scope.emit(&envelope.event);
+                            }
+                        } else if let Some(event) = crate::events::parse(&line) {
+                            launch.emit(&event);
+                        }
+                    }
+                    ForwardedStderr::Diagnostic(line) => eprintln!("{line}"),
+                    ForwardedStderr::Cleanup(event) => launch.emit(&event),
+                    ForwardedStderr::OwnedCleanup(event, operation) => {
+                        if let Some(scope) =
+                            negotiated.and_then(|routes| routes.resolve(&operation))
+                        {
+                            scope.emit(&event);
+                        }
+                    }
+                }
+            },
+        )
         .await;
     })
 }
@@ -1144,33 +1308,81 @@ enum ForwardedStderr {
     RuntimeLine(String),
     Diagnostic(String),
     Cleanup(crate::events::RuntimeEvent),
+    OwnedCleanup(crate::events::RuntimeEvent, DiagnosticOperation),
 }
 
 async fn forward_stderr(
     stderr: impl AsyncRead + Unpin,
     label: &str,
     ancestor_id: Option<&str>,
+    negotiated: Option<&DiagnosticOperationRoutes>,
     mut output: impl FnMut(ForwardedStderr),
 ) {
-    let mut ancestors = ancestor_id
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    // Legacy cleanup keeps its launch ancestor. Negotiated cleanup is derived
+    // solely from accepted roster provenance, not the most recent invocation.
+    let mut ancestors = if negotiated.is_none() {
+        ancestor_id
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut owned_ancestors =
+        Vec::<(DiagnosticScope, DiagnosticOperation, BTreeSet<String>)>::new();
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(event) = crate::events::parse(&line)
-            && event.forward_from_child()
+        let envelope = if negotiated.is_some() {
+            crate::events::parse_diagnostic(&line)
+        } else {
+            crate::events::parse(&line).map(|event| crate::events::DiagnosticEvent {
+                event,
+                activation: None,
+                operation: None,
+            })
+        };
+        if let Some(envelope) = envelope
+            && envelope.event.forward_from_child()
         {
-            if let crate::events::RuntimeEvent::SubagentStateChanged {
+            if let Some(routes) = negotiated {
+                let Some(operation) = envelope.operation else {
+                    continue;
+                };
+                let Some(scope) = routes.resolve(&operation) else {
+                    // Missing, malformed, or unknown ownership never falls back.
+                    continue;
+                };
+                let index = owned_ancestors
+                    .iter()
+                    .position(|(owner, _, _)| owner == &scope)
+                    .unwrap_or_else(|| {
+                        owned_ancestors.push((scope, operation, BTreeSet::new()));
+                        owned_ancestors.len() - 1
+                    });
+                let ancestors = &mut owned_ancestors[index].2;
+                match &envelope.event {
+                    crate::events::RuntimeEvent::SubagentStateChanged {
+                        parent_id: Some(parent_id),
+                        ..
+                    } => {
+                        ancestors.insert(parent_id.clone());
+                    }
+                    crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
+                        ancestors.remove(ancestor_id);
+                    }
+                    _ => {}
+                }
+            } else if let crate::events::RuntimeEvent::SubagentStateChanged {
                 parent_id: Some(parent_id),
                 ..
-            } = event
+            } = &envelope.event
             {
-                ancestors.insert(parent_id);
+                ancestors.insert(parent_id.clone());
             }
-            // Preserve recursively forwarded private runtime events byte-for-byte.
             output(ForwardedStderr::RuntimeLine(line));
         } else if let Some(line) = harness_diagnostic(label, &line) {
+            // StorageStatus and ordinary external stderr retain existing global
+            // diagnostic behavior, independent of operation negotiation.
             output(ForwardedStderr::Diagnostic(line));
         }
     }
@@ -1178,6 +1390,14 @@ async fn forward_stderr(
         output(ForwardedStderr::Cleanup(
             crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
         ));
+    }
+    for (_, operation, ancestors) in owned_ancestors {
+        for ancestor_id in ancestors {
+            output(ForwardedStderr::OwnedCleanup(
+                crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
+                operation.clone(),
+            ));
+        }
     }
 }
 
@@ -1246,6 +1466,7 @@ mod test_support {
                     serial: Arc::new(tokio::sync::Mutex::new(())),
                     closed: watch::channel(false).1,
                     descendant_parent: None,
+                    diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
                 },
                 closed_rx,
             )
@@ -1261,6 +1482,7 @@ mod test_support {
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
+                diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
             }
         }
     }
@@ -1289,6 +1511,7 @@ mod tests {
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
+                diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
             };
             let caller = child.clone();
             let task = tokio::spawn(async move {
@@ -2181,6 +2404,462 @@ mod tests {
         );
     }
 
+    /// Real stdio requests capture producer tokens; a delayed producer is released
+    /// only by the following request, after the old prompt has already replied.
+    #[test]
+    fn negotiated_stdio_ownership_survives_reuse_and_native_forks() {
+        use crate::events::{self, RuntimeEvent};
+        const PROBE: &str = "KIT_TEST_NEGOTIATED_CHILD_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2).enable_all().build().unwrap().block_on(async {
+                    let root = tempfile::tempdir().unwrap();
+                    let script = root.path().join("ownership.py");
+                    std::fs::write(&script, r#"
+import json, sys, threading
+mode = sys.argv[1]
+marker = sys.argv[2]
+lock = threading.Lock()
+next_session = 0
+delayed = None
+barrier = threading.Barrier(2)
+def send(value):
+    with lock:
+        print(json.dumps(value), flush=True)
+def response(request, result):
+    send({'jsonrpc': '2.0', 'id': request['id'], 'result': result})
+def emit(operation, label):
+    event = {'event': 'child_started', 'call': label, 'tool': label, 'summary': label, 'at': 1}
+    if operation is not None: event['operation'] = operation
+    with lock:
+        print(marker + json.dumps(event), file=sys.stderr, flush=True)
+def prompt(request):
+    global delayed
+    params = request['params']
+    operation = params.get('_meta', {}).get('kitDiagnosticOperation')
+    label = params['prompt'][0]['text']
+    if label == 'old':
+        delayed = (operation, label)
+    else:
+        if label == 'new' and delayed is not None:
+            emit(*delayed)
+        if label.startswith('sibling'): barrier.wait(timeout=5)
+        emit(operation, label)
+        if label == 'new':
+            emit('unknown-token', 'unknown')
+            emit(None, 'missing')
+            emit(42, 'malformed')
+    response(request, {'stopReason': 'end_turn'})
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    params = request.get('params', {})
+    if method == 'initialize':
+        assert params['_meta']['kitDiagnosticOwnership'] == {'version': 1, 'transport': 'stderr'}
+        result = {'protocolVersion': 1, 'agentCapabilities': {'sessionCapabilities': {'fork': {}, 'close': {}}}}
+        if mode != 'absent':
+            result['_meta'] = {'kitDiagnosticOwnership': {'version': 1 if mode == 'supported' else 99, 'transport': 'stderr'}}
+        if mode == 'supported':
+            for _ in range(2048): emit(None, 'before-agreement')
+        response(request, result)
+        continue
+    operation = params.get('_meta', {}).get('kitDiagnosticOperation')
+    assert (operation is not None) == (mode == 'supported'), (method, params)
+    if method in ('session/new', 'session/fork'):
+        if method == 'session/fork':
+            assert params['_meta']['kit.subagent.parent_id'].startswith('fork-')
+            assert params['_meta']['kit.subagent.parent_name'] == 'Fork owner'
+        next_session += 1
+        emit(operation, method + '-' + str(next_session))
+        response(request, {'sessionId': str(next_session)})
+    elif method == 'session/prompt':
+        threading.Thread(target=prompt, args=(request,), daemon=True).start()
+    elif method == 'session/close':
+        emit(operation, 'close-' + params['sessionId'])
+        response(request, {})
+"#).unwrap();
+                    for mode in ["supported", "absent", "unknown-version"] {
+                        let harnesses = AcpHarnesses::new(BTreeMap::from([("ownership".into(), AcpHarnessProfile {
+                            command: "python3".into(),
+                            args: vec![script.to_string_lossy().into_owned(), mode.into(), events::EVENT_MARKER.into()],
+                            permissions: AcpPermissionPolicy::Deny,
+                        })])).unwrap();
+                        let config = ChildConfig {
+                            root: root.path().to_path_buf(), model: "unused".into(),
+                            provider: Default::default(), reasoning_effort: None, openrouter_api_key: None,
+                            configured_mcp_config: None, configured_mcp_config_inherited: false,
+                            legacy_mcp_config: false, mcp_config: None, credential_storage: Default::default(),
+                            telemetry: Default::default(), harnesses, default_harness: "acp.ownership".into(),
+                            parent_id: None, parent_name: None,
+                        };
+                        let base = owned_child_invocation(mode, "launch", ChildSession::start(
+                            config, "acp.ownership".into(), None, None, 1, TurnCancellation::default(),
+                        )).await.unwrap();
+                        assert_eq!(base.diagnostics.negotiated.load(Ordering::Acquire), mode == "supported");
+                        owned_child_invocation(mode, "old", base.prompt("old".into(), TurnCancellation::default())).await.unwrap();
+                        owned_child_invocation(mode, "new", base.prompt("new".into(), TurnCancellation::default())).await.unwrap();
+                        // A→B→A and A→A activate fresh epochs on the same process.
+                        owned_child_invocation(mode, "again", base.prompt("again".into(), TurnCancellation::default())).await.unwrap();
+                        let first = owned_child_invocation(mode, "fork-first", base.fork(None,
+                            Some(("fork-first".into(), "Fork owner".into())), &TurnCancellation::default())).await.unwrap();
+                        let second = owned_child_invocation(mode, "fork-second", base.fork(None,
+                            Some(("fork-second".into(), "Fork owner".into())), &TurnCancellation::default())).await.unwrap();
+                        let (first_result, second_result) = tokio::join!(
+                            owned_child_invocation(mode, "sibling-first", first.prompt("sibling-first".into(), TurnCancellation::default())),
+                            owned_child_invocation(mode, "sibling-second", second.prompt("sibling-second".into(), TurnCancellation::default())),
+                        );
+                        first_result.unwrap(); second_result.unwrap();
+                        owned_child_invocation(mode, "close-first", first.close()).await.unwrap();
+                        owned_child_invocation(mode, "close-second", second.close()).await.unwrap();
+                        owned_child_invocation(mode, "close-base", base.close()).await.unwrap();
+                        // Every completed request still has its immutable registration.
+                        assert_eq!(base.diagnostics.operations.lock().unwrap().1.len(), 11);
+                        let mut closed = base.closed_signal();
+                        let registry = Arc::downgrade(&base.diagnostics);
+                        drop(first); drop(second); drop(base);
+                        tokio::time::timeout(Duration::from_secs(5), closed.wait_for(|closed| *closed)).await.unwrap().unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while registry.upgrade().is_some() {
+                                tokio::task::yield_now().await;
+                            }
+                        }).await.expect("process exit and stderr drain release registrations");
+                    }
+                });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::negotiated_stdio_ownership_survives_reuse_and_native_forks",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let diagnostics = stderr
+            .lines()
+            .filter_map(events::parse_diagnostic)
+            .collect::<Vec<_>>();
+        for (call, owner) in [
+            ("session/new-1", "launch"),
+            ("old", "old"),
+            ("new", "new"),
+            ("again", "again"),
+            ("session/fork-2", "fork-first"),
+            ("session/fork-3", "fork-second"),
+            ("sibling-first", "sibling-first"),
+            ("sibling-second", "sibling-second"),
+            ("close-2", "close-first"),
+            ("close-3", "close-second"),
+            ("close-1", "close-base"),
+        ] {
+            let envelope = diagnostics.iter().find(|envelope| {
+                envelope.operation.as_ref().is_some_and(|op| op.as_str() == format!("supported:{owner}"))
+                    && matches!(&envelope.event, RuntimeEvent::ChildStarted { call: actual, .. } if actual == call)
+            }).unwrap_or_else(|| panic!("missing owned event {call}: {stderr}"));
+            let admission = diagnostics
+                .iter()
+                .find(|event| {
+                    event.operation == envelope.operation
+                        && matches!(event.event, RuntimeEvent::SessionStarted { .. })
+                })
+                .expect("invocation activation marker");
+            assert!(envelope.activation.is_some());
+            assert_eq!(
+                envelope.activation, admission.activation,
+                "wrong epoch for {call}"
+            );
+        }
+        let activations = ["old", "new", "again"].map(|label| {
+            diagnostics.iter().find(|envelope| {
+                envelope.operation.as_ref().is_some_and(|operation| operation.as_str() == format!("supported:{label}"))
+                    && matches!(&envelope.event, RuntimeEvent::ChildStarted { call, .. } if call == label)
+            }).unwrap().activation.as_ref().unwrap()
+        });
+        assert_eq!(activations[0].session_id, "supported:A");
+        assert_eq!(activations[1].session_id, "supported:B");
+        assert_eq!(activations[2].session_id, "supported:A");
+        assert!(activations[0].epoch < activations[1].epoch);
+        assert!(activations[1].epoch < activations[2].epoch);
+        assert!(!diagnostics.iter().any(|envelope| {
+            envelope.operation.as_ref().is_some_and(|op| op.as_str().starts_with("supported:"))
+                && matches!(&envelope.event, RuntimeEvent::ChildStarted { call, .. } if ["unknown", "missing", "malformed", "before-agreement"].contains(&call.as_str()))
+        }));
+        for mode in ["absent", "unknown-version"] {
+            let forwarded = diagnostics
+                .iter()
+                .filter(|envelope| {
+                    matches!(&envelope.event, RuntimeEvent::ChildStarted { .. })
+                        && envelope
+                            .operation
+                            .as_ref()
+                            .is_some_and(|op| op.as_str().starts_with(mode))
+                })
+                .collect::<Vec<_>>();
+            assert!(!forwarded.is_empty());
+            assert!(
+                forwarded
+                    .iter()
+                    .all(|envelope| envelope.operation.as_ref().unwrap().as_str()
+                        == format!("{mode}:launch"))
+            );
+        }
+    }
+
+    async fn owned_child_invocation<T>(
+        mode: &str,
+        label: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let session = format!("{mode}:{}", if label == "new" { "B" } else { "A" });
+        DiagnosticScope::with_operation(DiagnosticOperation::new(format!("{mode}:{label}")))
+            .scope(async {
+                crate::events::activate_diagnostics(&session);
+                crate::events::scope_diagnostics(&session, future).await
+            })
+            .await
+    }
+
+    #[test]
+    fn real_grandchild_emission_restores_ownership_at_both_boundaries() {
+        use crate::events::{self, RuntimeEvent};
+        const MODE: &str = "KIT_TEST_GRANDCHILD_OWNERSHIP";
+        const TOKEN: &str = "KIT_TEST_GRANDCHILD_TOKEN";
+        let mode = std::env::var(MODE).unwrap_or_default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if mode == "grandchild" {
+            runtime.block_on(
+                DiagnosticScope::with_operation(DiagnosticOperation::new(
+                    std::env::var(TOKEN).unwrap(),
+                ))
+                .scope(async {
+                    events::emit(&RuntimeEvent::ChildStarted {
+                        call: "grandchild-producer".into(),
+                        tool: "shell".into(),
+                        summary: "real producer".into(),
+                        at: 1,
+                    });
+                }),
+            );
+            return;
+        }
+        if mode == "child" {
+            runtime.block_on(async {
+                // One reused intermediate process serves two distinct upstream
+                // invocations. Each grandchild has its own connection-local map.
+                for upstream in ["operation-1", "operation-2"] {
+                    DiagnosticScope::with_operation(DiagnosticOperation::new(upstream.into()))
+                        .scope(async {
+                            events::activate_diagnostics("child-local");
+                            events::scope_diagnostics("child-local", async {
+                                let routes = Arc::new(DiagnosticOperationRoutes::new());
+                                routes.negotiated.store(true, Ordering::Release);
+                                let _unrelated = routes.register().unwrap();
+                                let operation = routes.register().unwrap();
+                                let mut producer = tokio::process::Command::new(std::env::current_exe().unwrap())
+                                    .args(["--exact", "acp_child::tests::real_grandchild_emission_restores_ownership_at_both_boundaries", "--nocapture"])
+                                    .env(MODE, "grandchild").env(TOKEN, operation.as_str())
+                                    .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+                                let (_ready, ready) = watch::channel(Some(true));
+                                let forwarding = spawn_forward_stderr(producer.stderr.take().unwrap(),
+                                    "grandchild".into(), None, Some((routes, ready)));
+                                assert!(producer.wait().await.unwrap().success());
+                                forwarding.await.unwrap();
+                            }).await;
+                        }).await;
+                }
+            });
+            return;
+        }
+        let routes = DiagnosticOperationRoutes::new();
+        let original = runtime.block_on(async {
+            let mut expected = Vec::new();
+            for upstream in ["root-old", "root-new"] {
+                DiagnosticScope::with_operation(DiagnosticOperation::new(upstream.into()))
+                    .scope(async {
+                        events::activate_diagnostics("grandchild-parent");
+                        events::scope_diagnostics("grandchild-parent", async {
+                            expected.push(DiagnosticScope::capture());
+                            routes.register().unwrap();
+                        })
+                        .await;
+                    })
+                    .await;
+            }
+            expected
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::real_grandchild_emission_restores_ownership_at_both_boundaries",
+                "--nocapture",
+            ])
+            .env(MODE, "child")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut restored = Vec::new();
+        // All bytes arrive after parent reactivation. Child-local epochs cannot
+        // authorize a parent route; only the second connection's exact map can.
+        runtime.block_on(forward_stderr(
+            output.stderr.as_slice(),
+            "child",
+            None,
+            Some(&routes),
+            |item| {
+                if let ForwardedStderr::RuntimeLine(line) = item {
+                    let envelope = events::parse_diagnostic(&line).unwrap();
+                    assert!(matches!(envelope.event, RuntimeEvent::ChildStarted { .. }));
+                    assert_eq!(envelope.activation.unwrap().session_id, "child-local");
+                    restored.push(
+                        routes
+                            .resolve(envelope.operation.as_ref().unwrap())
+                            .unwrap(),
+                    );
+                }
+            },
+        ));
+        assert_eq!(restored, original);
+        assert_ne!(restored[0], restored[1]);
+    }
+
+    #[tokio::test]
+    async fn negotiated_cleanup_uses_only_accepted_scopes_and_deduplicates() {
+        use crate::events::{DiagnosticEvent, RuntimeEvent, SubagentStatus};
+        use tokio::io::AsyncWriteExt;
+        let routes = Arc::new(DiagnosticOperationRoutes::new());
+        let scope = DiagnosticScope::with_operation(DiagnosticOperation::new("upstream-a".into()));
+        let first = scope.scope(async { routes.register().unwrap() }).await;
+        let duplicate = scope.scope(async { routes.register().unwrap() }).await;
+        let second = DiagnosticScope::with_operation(DiagnosticOperation::new("upstream-b".into()))
+            .scope(async { routes.register().unwrap() })
+            .await;
+        let roster = RuntimeEvent::SubagentStateChanged {
+            id: "descendant".into(),
+            name: "Nested".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "inspect".into(),
+            parent_id: Some("shared-ancestor".into()),
+            parent_name: None,
+            harness: BUILTIN_HARNESS.into(),
+            model: None,
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: None,
+        };
+        for abrupt in [false, true] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let write_first = first.clone();
+            let write_duplicate = duplicate.clone();
+            let write_second = second.clone();
+            let write_roster = roster.clone();
+            let producer = tokio::spawn(async move {
+                for operation in [
+                    Some(write_first),
+                    Some(write_duplicate),
+                    Some(write_second),
+                    None,
+                    DiagnosticOperation::new("unknown".into()),
+                ] {
+                    let line = format!(
+                        "{}{}\n",
+                        crate::events::EVENT_MARKER,
+                        serde_json::to_string(&DiagnosticEvent {
+                            event: write_roster.clone(),
+                            activation: None,
+                            operation,
+                        })
+                        .unwrap()
+                    );
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                }
+                writer.write_all(b"ordinary stderr\n").await.unwrap();
+                let storage = format!(
+                    "{}{}\n",
+                    crate::events::EVENT_MARKER,
+                    serde_json::to_string(&RuntimeEvent::StorageStatus {
+                        pending: true,
+                        exhausted: false
+                    })
+                    .unwrap()
+                );
+                writer.write_all(storage.as_bytes()).await.unwrap();
+                if abrupt {
+                    writer.write_all(&[0xff]).await.unwrap();
+                }
+            });
+            let mut output = Vec::new();
+            forward_stderr(
+                reader,
+                BUILTIN_HARNESS,
+                Some("unrelated-launch"),
+                Some(&routes),
+                |item| output.push(item),
+            )
+            .await;
+            producer.await.unwrap();
+            assert_eq!(
+                output
+                    .iter()
+                    .filter(|item| matches!(item, ForwardedStderr::RuntimeLine(_)))
+                    .count(),
+                3
+            );
+            let cleanups = output
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardedStderr::OwnedCleanup(
+                        RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
+                        operation,
+                    ) => {
+                        assert_eq!(ancestor_id, "shared-ancestor");
+                        Some(operation.clone())
+                    }
+                    ForwardedStderr::Cleanup(_) => {
+                        panic!("negotiated cleanup used launch provenance")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cleanups.len(), 2);
+            assert!(cleanups.contains(&first));
+            assert!(cleanups.contains(&second));
+            assert!(output.iter().any(|item| matches!(item, ForwardedStderr::Diagnostic(line) if line.ends_with("ordinary stderr"))));
+            assert!(output.iter().any(|item| matches!(item, ForwardedStderr::Diagnostic(line) if line.contains("storage_status"))));
+            // EOF and stream errors do not retire registrations while a process
+            // (or a retained logical session) could still own the connection.
+            assert!(routes.resolve(&first).is_some());
+        }
+    }
+
+    #[test]
+    fn diagnostic_operation_sequence_exhaustion_never_reuses_a_token() {
+        let routes = DiagnosticOperationRoutes::new();
+        let first = routes.register().unwrap();
+        routes.operations.lock().unwrap().0 = u64::MAX;
+        assert!(routes.register().is_err());
+        assert!(routes.register().is_err());
+        assert!(routes.resolve(&first).is_some());
+        assert_eq!(routes.operations.lock().unwrap().1.len(), 1);
+    }
+
     mod forwards_subagent_events {
         use super::*;
 
@@ -2208,7 +2887,7 @@ mod tests {
             );
             let input = format!("{line}\n");
             let mut output = Vec::new();
-            forward_stderr(input.as_bytes(), "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(input.as_bytes(), "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;
@@ -2247,7 +2926,7 @@ mod tests {
                         // before awaiting the returned forwarder task.
                         #[allow(clippy::async_yields_async)]
                         let producer = events::scope_diagnostics(&session, async move {
-                            spawn_forward_stderr(reader, "acp.kit".into(), Some(route.into()))
+                            spawn_forward_stderr(reader, "acp.kit".into(), Some(route.into()), None)
                         });
                         let (task, delayed) = if route == "construction" {
                             (None, Some(producer))
@@ -2260,6 +2939,7 @@ mod tests {
                                     reader,
                                     "acp.kit".into(),
                                     Some(route.into()),
+                                    None,
                                 )),
                                 None,
                             )
@@ -2282,6 +2962,7 @@ mod tests {
                             ancestor_id: format!("forward-{route}"),
                         };
                         let child_line = events::DiagnosticEvent {
+                            operation: None,
                             event,
                             activation: Some(DiagnosticActivation {
                                 session_id: "child-process".into(),
@@ -2441,7 +3122,10 @@ mod tests {
             let stderr = child.stderr.take().unwrap();
             let mut output = Vec::new();
 
-            forward_stderr(stderr, "acp.kit", Some("s-owner"), |item| output.push(item)).await;
+            forward_stderr(stderr, "acp.kit", Some("s-owner"), None, |item| {
+                output.push(item)
+            })
+            .await;
             let status = child.wait().await.unwrap();
 
             assert_eq!(status.code(), Some(23));
@@ -2449,7 +3133,9 @@ mod tests {
                 .iter()
                 .filter_map(|item| match item {
                     ForwardedStderr::RuntimeLine(line) => Some(line.clone()),
-                    ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => None,
+                    ForwardedStderr::Diagnostic(_)
+                    | ForwardedStderr::Cleanup(_)
+                    | ForwardedStderr::OwnedCleanup(_, _) => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(forwarded, lines);
@@ -2470,14 +3156,16 @@ mod tests {
                     id,
                     ..
                 }) => id == "s-owner",
-                ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => false,
+                ForwardedStderr::Diagnostic(_)
+                | ForwardedStderr::Cleanup(_)
+                | ForwardedStderr::OwnedCleanup(_, _) => false,
             }));
         }
 
         #[tokio::test]
         async fn emits_cleanup_once_on_normal_eof() {
             let mut output = Vec::new();
-            forward_stderr(&b""[..], "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(&b""[..], "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;
@@ -2487,7 +3175,7 @@ mod tests {
         #[tokio::test]
         async fn emits_cleanup_once_on_abrupt_stream_error() {
             let mut output = Vec::new();
-            forward_stderr(&b"\xff"[..], "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(&b"\xff"[..], "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;

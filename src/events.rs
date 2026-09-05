@@ -14,6 +14,7 @@
 //! ACP hosts never see the extra chatter.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     io::Write,
     sync::{Mutex, OnceLock},
@@ -145,12 +146,80 @@ pub struct DiagnosticEvent {
     pub event: RuntimeEvent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<DiagnosticActivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<DiagnosticOperation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnosticActivation {
     pub session_id: String,
     pub epoch: u64,
+}
+
+/// Private, connection-local diagnostic identity. This is not a persisted ID or
+/// an ACP request ID. Reject malformed values instead of inventing ownership.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct DiagnosticOperation(String);
+
+impl DiagnosticOperation {
+    pub fn new(value: String) -> Option<Self> {
+        (!value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte)))
+        .then_some(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DiagnosticOperation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value)
+            .ok_or_else(|| serde::de::Error::custom("invalid diagnostic operation token"))
+    }
+}
+
+pub(crate) const OWNERSHIP_META_KEY: &str = "kitDiagnosticOwnership";
+pub(crate) const OPERATION_META_KEY: &str = "kitDiagnosticOperation";
+
+/// Both offer and acknowledgement must explicitly select our supported contract.
+pub(crate) fn ownership_supported(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    meta.and_then(|meta| meta.get(OWNERSHIP_META_KEY))
+        == Some(&serde_json::json!({"version": 1, "transport": "stderr"}))
+}
+
+/// Merge our private extension; never replace unrelated ACP metadata.
+pub(crate) fn offer_diagnostic_ownership(meta: &mut Option<serde_json::Map<String, Value>>) {
+    meta.get_or_insert_with(Default::default).insert(
+        OWNERSHIP_META_KEY.into(),
+        serde_json::json!({"version": 1, "transport": "stderr"}),
+    );
+}
+
+pub(crate) fn diagnostic_operation(
+    meta: Option<&serde_json::Map<String, Value>>,
+    negotiated: bool,
+) -> Option<DiagnosticOperation> {
+    if !negotiated {
+        return None;
+    }
+    serde_json::from_value(meta?.get(OPERATION_META_KEY)?.clone()).ok()
+}
+
+pub(crate) fn set_diagnostic_operation(
+    meta: &mut Option<serde_json::Map<String, Value>>,
+    operation: &DiagnosticOperation,
+) {
+    meta.get_or_insert_with(Default::default).insert(
+        OPERATION_META_KEY.into(),
+        Value::String(operation.as_str().to_owned()),
+    );
 }
 
 pub const ACTIVATION_META_KEY: &str = "kitRuntimeActivation";
@@ -185,16 +254,6 @@ pub fn activate_diagnostics(session_id: &str) -> u64 {
     epoch
 }
 
-#[cfg(test)]
-pub(crate) fn diagnostic_epoch(session_id: &str) -> Option<u64> {
-    diagnostic_routes()
-        .lock()
-        .expect("diagnostic routes lock")
-        .sessions
-        .get(session_id)
-        .copied()
-}
-
 /// Restore an actor's route without minting a new activation on each turn.
 pub fn restore_diagnostics(session_id: &str) {
     let mut routes = diagnostic_routes().lock().expect("diagnostic routes lock");
@@ -210,6 +269,10 @@ pub fn restore_diagnostics(session_id: &str) {
 
 tokio::task_local! {
     static DIAGNOSTIC_ACTIVATION: Option<DiagnosticActivation>;
+    static DIAGNOSTIC_OPERATION: Option<DiagnosticOperation>;
+    // Rebound only at actual loop input consumption, before admitting downstream
+    // producers. Captured DiagnosticScopes never retain this mutable cell.
+    static CONSUMED_DIAGNOSTIC_ORIGIN: RefCell<Option<DiagnosticScope>>;
 }
 
 /// Preserve the turn's activation even if another actor restores its route, or
@@ -229,7 +292,11 @@ pub fn scope_diagnostics<F: std::future::Future>(
                 epoch: *epoch,
             })
     };
-    DiagnosticScope(activation).scope(future)
+    DiagnosticScope {
+        activation,
+        ..DiagnosticScope::capture()
+    }
+    .scope(future)
 }
 
 fn write_diagnostic_marker(routes: &DiagnosticRoutes) {
@@ -243,6 +310,7 @@ fn write_diagnostic_marker(routes: &DiagnosticRoutes) {
                     session_id: activation.session_id.clone(),
                 },
                 activation: Some(activation.clone()),
+                operation: DiagnosticScope::capture().operation,
             },
         );
     }
@@ -252,18 +320,67 @@ fn write_diagnostic_marker(routes: &DiagnosticRoutes) {
 /// when that task is first polled. Unscoped producers never borrow the active UI
 /// route, including after a durable session ID is reactivated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DiagnosticScope(Option<DiagnosticActivation>);
+pub(crate) struct DiagnosticScope {
+    activation: Option<DiagnosticActivation>,
+    operation: Option<DiagnosticOperation>,
+}
 
 impl DiagnosticScope {
     pub(crate) fn capture() -> Self {
-        Self(DIAGNOSTIC_ACTIVATION.try_with(Clone::clone).unwrap_or(None))
+        if let Ok(Some(origin)) =
+            CONSUMED_DIAGNOSTIC_ORIGIN.try_with(|origin| origin.borrow().clone())
+        {
+            return origin;
+        }
+        Self {
+            activation: DIAGNOSTIC_ACTIVATION.try_with(Clone::clone).unwrap_or(None),
+            operation: DIAGNOSTIC_OPERATION.try_with(Clone::clone).unwrap_or(None),
+        }
+    }
+
+    /// Incoming operations replace upstream ownership, never local activation.
+    pub(crate) fn with_operation(operation: Option<DiagnosticOperation>) -> Self {
+        Self {
+            operation,
+            ..Self::capture()
+        }
+    }
+
+    pub(crate) fn operation(&self) -> Option<&DiagnosticOperation> {
+        self.operation.as_ref()
     }
 
     pub(crate) fn scope<F: std::future::Future>(
         &self,
         future: F,
     ) -> impl std::future::Future<Output = F::Output> + use<F> {
-        DIAGNOSTIC_ACTIVATION.scope(self.0.clone(), future)
+        DIAGNOSTIC_ACTIVATION.scope(
+            self.activation.clone(),
+            DIAGNOSTIC_OPERATION.scope(
+                self.operation.clone(),
+                CONSUMED_DIAGNOSTIC_ORIGIN.scope(RefCell::new(None), future),
+            ),
+        )
+    }
+
+    /// Preserve identity across blocking filesystem work without an async runtime.
+    pub(crate) fn sync_scope<R>(&self, work: impl FnOnce() -> R) -> R {
+        DIAGNOSTIC_ACTIVATION.sync_scope(self.activation.clone(), || {
+            DIAGNOSTIC_OPERATION.sync_scope(self.operation.clone(), || {
+                CONSUMED_DIAGNOSTIC_ORIGIN.sync_scope(RefCell::new(None), work)
+            })
+        })
+    }
+
+    /// Bind the exact causes consumed by the loop before its next producer.
+    /// This is never called on request arrival. A previously captured scope is
+    /// immutable, and every async/blocking scope starts a separate binding.
+    /// Rebind both fields: root actors without upstream tokens must also retain
+    /// an old background producer's activation rather than the latest UI epoch.
+    pub(crate) fn bind_consumed_origin(&self) {
+        let _ = CONSUMED_DIAGNOSTIC_ORIGIN.try_with(|origin| {
+            *origin.borrow_mut() = Some(self.clone());
+        });
     }
 
     pub(crate) fn emit(&self, event: &RuntimeEvent) {
@@ -277,7 +394,12 @@ impl DiagnosticScope {
                 activation: if matches!(event, RuntimeEvent::StorageStatus { .. }) {
                     None
                 } else {
-                    self.0.clone()
+                    self.activation.clone()
+                },
+                operation: if matches!(event, RuntimeEvent::StorageStatus { .. }) {
+                    None
+                } else {
+                    self.operation().cloned()
                 },
             },
         );
@@ -302,17 +424,6 @@ fn write_diagnostic(writer: &mut impl Write, event: &DiagnosticEvent) {
     if let Ok(line) = serde_json::to_string(event) {
         let _ = writeln!(writer, "{EVENT_MARKER}{line}");
     }
-}
-
-#[cfg(test)]
-fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
-    write_diagnostic(
-        writer,
-        &DiagnosticEvent {
-            event: event.clone(),
-            activation: None,
-        },
-    );
 }
 
 /// Decode both current activation-aware and historical unscoped stderr lines.
@@ -392,6 +503,20 @@ fn truncate(text: &str, limit: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn diagnostic_epoch(session_id: &str) -> Option<u64> {
+        diagnostic_routes()
+            .lock()
+            .expect("diagnostic routes lock")
+            .sessions
+            .get(session_id)
+            .copied()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::{self, Write};
 
@@ -401,8 +526,19 @@ mod tests {
         DIAGNOSTIC_ACTIVATION, DiagnosticActivation, DiagnosticEvent, EVENT_MARKER,
         GenerationOutcome, RuntimeEvent, SubagentStatus, activate_diagnostics, parse,
         parse_diagnostic, restore_diagnostics, scope_diagnostics, summarize_input,
-        summarize_output, write_diagnostic, write_event,
+        summarize_output, write_diagnostic,
     };
+
+    fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
+        write_diagnostic(
+            writer,
+            &DiagnosticEvent {
+                event: event.clone(),
+                activation: None,
+                operation: None,
+            },
+        );
+    }
 
     #[test]
     fn diagnostic_envelope_preserves_legacy_replay_and_rejects_malformed_identity() {
@@ -413,6 +549,7 @@ mod tests {
         let event = parse(&legacy).unwrap();
         assert_eq!(parse_diagnostic(&legacy).unwrap().activation, None);
         let current = DiagnosticEvent {
+            operation: None,
             event: event.clone(),
             activation: Some(DiagnosticActivation {
                 session_id: "source".into(),
@@ -436,6 +573,240 @@ mod tests {
             );
             assert!(parse_diagnostic(&malformed).is_none());
         }
+    }
+
+    #[test]
+    fn ownership_negotiation_is_explicit_and_metadata_is_merged() {
+        use super::*;
+        assert!(!ownership_supported(None));
+        for value in [
+            json!(null),
+            json!(true),
+            json!({"version": 2, "transport": "stderr"}),
+            json!({"version": "1", "transport": "stderr"}),
+            json!({"version": 1, "transport": "stdout"}),
+        ] {
+            let meta = serde_json::Map::from_iter([(OWNERSHIP_META_KEY.into(), value)]);
+            assert!(!ownership_supported(Some(&meta)));
+        }
+        let mut meta = Some(serde_json::Map::from_iter([
+            ("kitForkParent".into(), json!("parent")),
+            (ACTIVATION_META_KEY.into(), json!(7)),
+        ]));
+        offer_diagnostic_ownership(&mut meta);
+        assert!(ownership_supported(meta.as_ref()));
+        let operation = DiagnosticOperation::new("op:1".into()).unwrap();
+        set_diagnostic_operation(&mut meta, &operation);
+        assert_eq!(diagnostic_operation(meta.as_ref(), true), Some(operation));
+        assert_eq!(diagnostic_operation(meta.as_ref(), false), None);
+        assert_eq!(meta.as_ref().unwrap()["kitForkParent"], "parent");
+        assert_eq!(meta.as_ref().unwrap()[ACTIVATION_META_KEY], 7);
+        for bad in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!(""),
+            json!("has space"),
+            json!("bad\nline"),
+            json!("é"),
+            json!("x".repeat(129)),
+            json!({"id":"op:1"}),
+        ] {
+            meta.as_mut()
+                .unwrap()
+                .insert(OPERATION_META_KEY.into(), bad);
+            assert_eq!(diagnostic_operation(meta.as_ref(), true), None);
+        }
+    }
+
+    #[test]
+    fn optional_operation_envelope_is_additive_and_strict() {
+        use super::DiagnosticOperation;
+        let old = json!({"event":"session_started", "session_id":"child",
+            "activation":{"session_id":"child", "epoch":3}, "future_key":true});
+        let decoded: DiagnosticEvent = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.operation, None);
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("operation")
+                .is_none()
+        );
+        let mut owned = old.clone();
+        owned["operation"] = json!("op:123");
+        let decoded: DiagnosticEvent = serde_json::from_value(owned).unwrap();
+        assert_eq!(decoded.operation, DiagnosticOperation::new("op:123".into()));
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap()["operation"],
+            "op:123"
+        );
+        for bad in [
+            json!(12),
+            json!(""),
+            json!("has space"),
+            json!("x".repeat(129)),
+            json!({"operation":"op:123"}),
+            json!([]),
+        ] {
+            let mut malformed = old.clone();
+            malformed["operation"] = bad;
+            assert!(serde_json::from_value::<DiagnosticEvent>(malformed.clone()).is_err());
+            // Historical replay still sees exactly the frozen event payload.
+            assert!(serde_json::from_value::<RuntimeEvent>(malformed).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_survives_local_activation_and_detached_producer() {
+        use super::{DiagnosticOperation, DiagnosticScope, inherit_diagnostics};
+        let incoming = DiagnosticOperation::new("upstream:1".into()).unwrap();
+        let scope = DiagnosticScope::with_operation(Some(incoming.clone()));
+        let (release, released) = tokio::sync::oneshot::channel();
+        activate_diagnostics("owned-operation-test");
+        #[allow(clippy::async_yields_async)]
+        let producer = scope
+            .scope(async {
+                scope_diagnostics("owned-operation-test", async {
+                    let original = DiagnosticScope::capture();
+                    assert_eq!(original.operation(), Some(&incoming));
+                    tokio::spawn(inherit_diagnostics(async move {
+                        released.await.unwrap();
+                        assert_eq!(DiagnosticScope::capture(), original);
+                    }))
+                })
+                .await
+            })
+            .await;
+        activate_diagnostics("owned-operation-test");
+        let next = DiagnosticScope::with_operation(DiagnosticOperation::new("upstream:2".into()));
+        next.scope(async {
+            scope_diagnostics("owned-operation-test", async {
+                assert_eq!(DiagnosticScope::capture().operation(), next.operation());
+                release.send(()).unwrap();
+                producer.await.unwrap();
+            })
+            .await;
+        })
+        .await;
+        let blocking_origin = scope.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            blocking_origin.sync_scope(DiagnosticScope::capture)
+        })
+        .await
+        .unwrap();
+        assert_eq!(actual, scope);
+        assert_eq!(DiagnosticScope::capture().operation(), None);
+    }
+
+    #[tokio::test]
+    async fn consumed_origin_rebind_does_not_mutate_captured_producers() {
+        use super::{DiagnosticOperation, DiagnosticScope, inherit_diagnostics};
+        let old = DiagnosticScope {
+            activation: Some(DiagnosticActivation {
+                session_id: "same".into(),
+                epoch: 1,
+            }),
+            operation: DiagnosticOperation::new("old-operation".into()),
+        };
+        let new = DiagnosticScope {
+            activation: Some(DiagnosticActivation {
+                session_id: "same".into(),
+                epoch: 2,
+            }),
+            operation: DiagnosticOperation::new("new-operation".into()),
+        };
+        old.scope(async {
+            let (release, released) = tokio::sync::oneshot::channel();
+            let detached = tokio::spawn(inherit_diagnostics(async move {
+                released.await.unwrap();
+                DiagnosticScope::capture()
+            }));
+            // A synchronous loop observer binds the actual consumed causes
+            // before the same poll starts a model/tool producer.
+            new.bind_consumed_origin();
+            assert_eq!(DiagnosticScope::capture(), new);
+            release.send(()).unwrap();
+            assert_eq!(detached.await.unwrap(), old);
+            DiagnosticScope::default().bind_consumed_origin();
+            assert_eq!(DiagnosticScope::capture(), DiagnosticScope::default());
+            // Explicit child/blocking scopes never share the mutable binding.
+            assert_eq!(old.scope(async { DiagnosticScope::capture() }).await, old);
+            assert_eq!(new.sync_scope(DiagnosticScope::capture), new);
+            assert_eq!(DiagnosticScope::capture(), DiagnosticScope::default());
+        })
+        .await;
+        assert_eq!(DiagnosticScope::capture(), DiagnosticScope::default());
+    }
+
+    #[test]
+    fn real_emission_keeps_operation_but_storage_status_is_global() {
+        const CHILD: &str = "KIT_EVENTS_OPERATION_EMISSION_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                activate_diagnostics("owned-emission");
+                super::DiagnosticScope::with_operation(super::DiagnosticOperation::new(
+                    "upstream:7".into(),
+                ))
+                .scope(async {
+                    scope_diagnostics("owned-emission", async {
+                        // Use the real async producer/emitter and stderr pipe.
+                        tokio::spawn(super::inherit_diagnostics(async {
+                            super::emit(&RuntimeEvent::CompactionStarted {
+                                reason: "owned".into(),
+                                at: 1,
+                            });
+                            super::emit(&RuntimeEvent::StorageStatus {
+                                pending: true,
+                                exhausted: false,
+                            });
+                        }))
+                        .await
+                        .unwrap();
+                    })
+                    .await;
+                })
+                .await;
+            });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "events::tests::real_emission_keeps_operation_but_storage_status_is_global",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(super::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelopes = String::from_utf8(output.stderr)
+            .unwrap()
+            .lines()
+            .filter_map(parse_diagnostic)
+            .collect::<Vec<_>>();
+        let owned = envelopes
+            .iter()
+            .find(|event| matches!(event.event, RuntimeEvent::CompactionStarted { .. }))
+            .unwrap();
+        assert_eq!(owned.operation.as_ref().unwrap().as_str(), "upstream:7");
+        assert_eq!(
+            owned.activation.as_ref().unwrap().session_id,
+            "owned-emission"
+        );
+        let global = envelopes
+            .iter()
+            .find(|event| matches!(event.event, RuntimeEvent::StorageStatus { .. }))
+            .unwrap();
+        assert_eq!(global.operation, None);
+        assert_eq!(global.activation, None);
     }
 
     #[tokio::test]

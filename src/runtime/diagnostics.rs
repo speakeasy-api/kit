@@ -1,8 +1,12 @@
 //! Carry producer identity through dependency-owned task and Runlet spawns.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-use agentkit_core::{TurnCancellation, TurnId};
+use agentkit_core::{ToolCallId, TurnCancellation, TurnId};
+use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
 use agentkit_task_manager::{
     AsyncTaskManager, PendingLoopUpdates, TaskLaunchRequest, TaskManager, TaskManagerError,
     TaskManagerHandle, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
@@ -15,7 +19,160 @@ use async_trait::async_trait;
 
 use crate::events::DiagnosticScope;
 
-pub(super) struct DiagnosticTaskManager(pub(super) AsyncTaskManager);
+/// Ephemeral producer ownership, shared with the actor through BackgroundJobs.
+/// Retain entries for the driver lifetime: approvals can restart the same call,
+/// and a terminal event can precede consumption by the loop.
+#[derive(Clone, Default)]
+pub(crate) struct TaskOrigins(Arc<Mutex<TaskOriginState>>);
+
+#[derive(Default)]
+struct TaskOriginState {
+    origins: HashMap<ToolCallId, DiagnosticScope>,
+}
+
+impl TaskOrigins {
+    pub(crate) fn get(&self, call_id: &ToolCallId) -> Option<DiagnosticScope> {
+        self.0
+            .lock()
+            .expect("task origins poisoned")
+            .origins
+            .get(call_id)
+            .cloned()
+    }
+
+    fn proposed_origin(&self, call_id: &ToolCallId) -> DiagnosticScope {
+        self.get(call_id).unwrap_or_else(DiagnosticScope::capture)
+    }
+
+    fn accepted(&self, call_id: ToolCallId, origin: DiagnosticScope) {
+        let mut state = self.0.lock().expect("task origins poisoned");
+        state.origins.entry(call_id).or_insert(origin);
+    }
+}
+
+/// A coalesced continuation has an owner only when every cause agrees.
+#[derive(Clone, Default)]
+pub(crate) struct ContinuationOrigin(Option<DiagnosticScope>);
+
+impl ContinuationOrigin {
+    pub(crate) fn include(&mut self, origin: Option<DiagnosticScope>) {
+        let origin = origin.unwrap_or_default();
+        self.0 = Some(match self.0.take() {
+            None => origin,
+            Some(previous) if previous == origin => previous,
+            Some(_) => DiagnosticScope::default(),
+        });
+    }
+
+    pub(crate) fn scope(&self) -> DiagnosticScope {
+        self.0.clone().unwrap_or_default()
+    }
+}
+
+tokio::task_local! {
+    static CONSUMPTION: ConsumptionScope;
+}
+
+/// Ownership of inputs actually presented to this drive. Task-manager handoff
+/// alone is not consumption: LoopDriver buffers updates behind fresh input.
+#[derive(Clone)]
+pub(crate) struct ConsumptionScope {
+    causes: Arc<Mutex<ContinuationOrigin>>,
+    initial: DiagnosticScope,
+    refresh_seed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConsumptionScope {
+    /// None admits background work with no assumed cause; Some seeds a real
+    /// explicit request, or default() for unsolicited external input.
+    pub(crate) fn new(seed: Option<DiagnosticScope>) -> Self {
+        let initial = seed.clone().unwrap_or_default();
+        Self {
+            causes: Arc::new(Mutex::new(ContinuationOrigin(seed))),
+            initial,
+            refresh_seed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// v2 establishes local activation inside run_active_turn, after admission.
+    pub(crate) fn explicit(origin: DiagnosticScope) -> Self {
+        let scope = Self::new(Some(origin));
+        scope
+            .refresh_seed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        scope
+    }
+
+    pub(crate) fn bind_local_seed() {
+        let _ = CONSUMPTION.try_with(|scope| {
+            if scope
+                .refresh_seed
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                *scope.causes.lock().expect("consumption scope poisoned") =
+                    ContinuationOrigin(Some(DiagnosticScope::capture()));
+            }
+            scope.current_scope().bind_consumed_origin();
+        });
+    }
+
+    pub(crate) fn current_scope(&self) -> DiagnosticScope {
+        self.causes
+            .lock()
+            .expect("consumption scope poisoned")
+            .scope()
+    }
+
+    pub(crate) fn scope<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> impl std::future::Future<Output = F::Output> + use<F> {
+        CONSUMPTION.scope(self.clone(), self.initial.scope(future))
+    }
+
+    pub(crate) fn consumed(origin: Option<DiagnosticScope>) {
+        let _ = CONSUMPTION.try_with(|scope| {
+            let mut causes = scope.causes.lock().expect("consumption scope poisoned");
+            causes.include(origin);
+            // LoopDriver can begin the model in the SAME poll after emitting
+            // ToolResultReceived. Rebind here, not at the next host step. This
+            // changes no previously captured executor/descendant producer.
+            causes.scope().bind_consumed_origin();
+        });
+    }
+}
+
+pub(crate) struct ConsumptionObserver(TaskOrigins);
+
+impl ConsumptionObserver {
+    pub(crate) fn new(origins: TaskOrigins) -> Self {
+        Self(origins)
+    }
+}
+
+impl LoopObserver for ConsumptionObserver {
+    fn handle_event(&self, event: ObservedEvent) {
+        let call_id = match &event.event {
+            AgentEvent::ToolResultReceived(result) => Some(&result.call_id),
+            AgentEvent::ApprovalRequired(approval) => approval.call_id.as_ref(),
+            _ => None,
+        };
+        if let Some(call_id) = call_id {
+            ConsumptionScope::consumed(self.0.get(call_id));
+        }
+    }
+}
+
+pub(crate) struct DiagnosticTaskManager {
+    pub(super) inner: AsyncTaskManager,
+    pub(crate) origins: TaskOrigins,
+}
+
+impl DiagnosticTaskManager {
+    pub(crate) fn new(inner: AsyncTaskManager, origins: TaskOrigins) -> Self {
+        Self { inner, origins }
+    }
+}
 
 #[async_trait]
 impl TaskManager for DiagnosticTaskManager {
@@ -27,7 +184,8 @@ impl TaskManager for DiagnosticTaskManager {
         // This runs inside the originating turn, before AsyncTaskManager spawns.
         // Never recover identity from session IDs: the same ID can be reactivated
         // while an old producer is still running.
-        let origin = DiagnosticScope::capture();
+        let call_id = request.request.call_id.clone();
+        let origin = self.origins.proposed_origin(&call_id);
         ctx.executor = Arc::new(DiagnosticExecutor {
             inner: ctx.executor,
             origin: origin.clone(),
@@ -37,10 +195,14 @@ impl TaskManager for DiagnosticTaskManager {
             // this executor. Scoping only the outer compose future is insufficient.
             scope.executor = Arc::new(DiagnosticExecutor {
                 inner: scope.executor.clone(),
-                origin,
+                origin: origin.clone(),
             });
         }
-        self.0.start_task(request, ctx).await
+        let outcome = self.inner.start_task(request, ctx).await?;
+        // Rejected launches must not register phantom causes. The loop cannot
+        // consume the resolution until this accepted outcome is returned.
+        self.origins.accepted(call_id, origin);
+        Ok(outcome)
     }
 
     async fn wait_for_turn(
@@ -48,23 +210,23 @@ impl TaskManager for DiagnosticTaskManager {
         turn_id: &TurnId,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<TurnTaskUpdate>, TaskManagerError> {
-        self.0.wait_for_turn(turn_id, cancellation).await
+        self.inner.wait_for_turn(turn_id, cancellation).await
     }
 
     async fn take_pending_loop_updates(&self) -> Result<PendingLoopUpdates, TaskManagerError> {
-        self.0.take_pending_loop_updates().await
+        self.inner.take_pending_loop_updates().await
     }
 
     async fn wait_for_loop_update(&self) -> Result<(), TaskManagerError> {
-        self.0.wait_for_loop_update().await
+        self.inner.wait_for_loop_update().await
     }
 
     async fn on_turn_interrupted(&self, turn_id: &TurnId) -> Result<(), TaskManagerError> {
-        self.0.on_turn_interrupted(turn_id).await
+        self.inner.on_turn_interrupted(turn_id).await
     }
 
     fn handle(&self) -> TaskManagerHandle {
-        self.0.handle()
+        self.inner.handle()
     }
 }
 
@@ -267,6 +429,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn task_origins_survive_delivery_and_approval_readmission() {
+        let manager = crate::runtime::background_task_manager();
+        let old = DiagnosticScope::with_operation(Some(
+            events::DiagnosticOperation::new("old".into()).unwrap(),
+        ));
+        let new = DiagnosticScope::with_operation(Some(
+            events::DiagnosticOperation::new("new".into()).unwrap(),
+        ));
+        let call_id = ToolCallId::new("retained-call");
+        let tools = ToolRegistry::new().with(Gate {
+            spec: ToolSpec::new("gate", "approval gate", json!({"type": "object"})),
+            entered: Arc::new(Barrier::new(1)),
+            release: Arc::new(Barrier::new(1)),
+        });
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([
+            Arc::new(tools) as Arc<dyn ToolSource>
+        ]));
+        let req = request("retained-call", "gate", json!({"approved": true}));
+        old.scope(manager.start_task(
+            TaskLaunchRequest::plain(None, req.clone()),
+            TaskStartContext {
+                executor: executor.clone(),
+                tool_context: context(executor.clone()),
+            },
+        ))
+        .await
+        .unwrap();
+        let Some(TurnTaskUpdate::Resolution(resolution)) = manager
+            .wait_for_turn(&TurnId::new("turn"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("approval resolution");
+        };
+        let agentkit_task_manager::TaskResolution::Approval(pending) = *resolution else {
+            panic!("real permission checker must require approval");
+        };
+        assert_eq!(manager.origins.get(&call_id), Some(old.clone()));
+        new.scope(manager.start_task(
+            TaskLaunchRequest {
+                task_id: Some(pending.task_id),
+                request: req,
+                kind: TaskLaunchKind::Approved(pending.approval),
+            },
+            TaskStartContext {
+                executor: executor.clone(),
+                tool_context: context(executor),
+            },
+        ))
+        .await
+        .unwrap();
+        let Some(TurnTaskUpdate::Resolution(resolution)) = manager
+            .wait_for_turn(&TurnId::new("turn"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("approved completion");
+        };
+        assert!(matches!(
+            *resolution,
+            agentkit_task_manager::TaskResolution::Item(_)
+        ));
+        assert_eq!(manager.origins.get(&call_id), Some(old));
+        assert!(
+            manager
+                .origins
+                .get(&ToolCallId::new("never-accepted"))
+                .is_none()
+        );
+    }
+
     #[test]
     fn dependency_spawns_keep_origin_on_stderr() {
         for mode in [
@@ -327,9 +561,21 @@ mod tests {
                     };
                     if call.starts_with("current") {
                         assert_eq!(diagnostic.activation, latest, "{mode}/{switch}");
+                        assert_eq!(
+                            diagnostic.operation.as_ref().map(|op| op.as_str()),
+                            Some("current-operation")
+                        );
                         current += 1;
                     } else {
                         assert!(call.starts_with("old"), "{call}");
+                        assert_eq!(
+                            diagnostic.operation.as_ref().map(|op| op.as_str()),
+                            if mode == "unscoped" {
+                                None
+                            } else {
+                                Some("old-operation")
+                            }
+                        );
                         assert_eq!(diagnostic.activation, expected, "{mode}/{switch}: {call}");
                         if started {
                             old_started += 1;
@@ -431,7 +677,10 @@ mod tests {
                     None
                 }
             };
-            let task = if mode == "unscoped" { start.await } else { events::scope_diagnostics("A", start).await };
+            let task = if mode == "unscoped" { start.await } else {
+                DiagnosticScope::with_operation(Some(events::DiagnosticOperation::new("old-operation".into()).unwrap()))
+                    .scope(async { events::scope_diagnostics("A", start).await }).await
+            };
             entered.wait().await;
             if switch { events::activate_diagnostics("B"); }
             events::activate_diagnostics("A");
@@ -442,11 +691,11 @@ mod tests {
                 completed(&manager).await;
             }
             // A newly-created producer still gets the current activation.
-            events::scope_diagnostics("A", manager.start_task(TaskLaunchRequest {
+            DiagnosticScope::with_operation(Some(events::DiagnosticOperation::new("current-operation".into()).unwrap())).scope(async { events::scope_diagnostics("A", manager.start_task(TaskLaunchRequest {
                 task_id: None,
                 request: request("current", "gate", json!({"wait": false})),
                 kind: TaskLaunchKind::Plain,
-            }, TaskStartContext { executor: executor.clone(), tool_context: context(executor) })).await.unwrap();
+            }, TaskStartContext { executor: executor.clone(), tool_context: context(executor) })).await }).await.unwrap();
             completed(&manager).await;
         }).await.expect("barrier-controlled task timed out");
     }

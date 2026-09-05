@@ -701,8 +701,11 @@ impl Subagents {
             let transcript_root = root.clone();
             let source_id = source_id.clone();
             let branch_id = id.clone();
+            let diagnostics = events::DiagnosticScope::capture();
             let cloned = tokio::task::spawn_blocking(move || {
-                session::clone_completed(&transcript_root, &source_id, &branch_id)
+                diagnostics.sync_scope(|| {
+                    session::clone_completed(&transcript_root, &source_id, &branch_id)
+                })
             })
             .await
             .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
@@ -1122,12 +1125,12 @@ impl Subagents {
             return;
         };
         let mut closed = child.closed_signal();
-        tokio::spawn(async move {
+        tokio::spawn(crate::events::inherit_diagnostics(async move {
             if !*closed.borrow() {
                 let _ = closed.changed().await;
             }
             drop(permit);
-        });
+        }));
     }
 
     fn monitor_child_exit(&self, id: String, state: &Arc<AsyncMutex<State>>, child: &ChildSession) {

@@ -140,6 +140,14 @@ Built-in subagent transcripts are durable on disk, but their reusable parent-own
 
 Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
 
+### Private nested diagnostic ownership
+
+Updated Kit parents and children negotiate `_meta.kitDiagnosticOwnership` with the exact value `{"version":1,"transport":"stderr"}` during initialization. The child must acknowledge support explicitly. Each invocation then carries `_meta.kitDiagnosticOperation`, an opaque connection-local token. The child captures it at admission and echoes it as the optional `operation` field of owned runtime diagnostic envelopes on stderr. Tokens are nonempty ASCII letters, digits, or `-_.:`, at most 128 bytes; they are ephemeral and are not saved in transcripts or fork context. Existing metadata keys are preserved.
+
+The parent resolves tokens against immutable caller scopes registered before requests are sent, retained until process exit and stderr drain. Child-local activation IDs remain separate. Each grandchild boundary resolves its own tokens and restores upstream ownership. In negotiated mode, missing, unknown, or malformed tokens cannot acquire launch or current-session attribution. Detached producer ownership survives responses and cancellation. Background continuations recover origins from existing tool-call IDs when their results actually enter the loop. An unrelated live task does not suppress a new prompt. If a continuation actually combines different origins, it has no single attributed owner; previously captured producers retain their individual ownership.
+
+The extension is optional for external agents. Missing or unknown negotiation versions keep legacy ACP operations usable but cannot supply absent diagnostic identity. See [live diagnostic compatibility](tui-and-sessions.md) for the older-agent boundary after session reactivation.
+
 Configure trusted argv profiles in `~/.kit/config.toml`:
 
 ```toml

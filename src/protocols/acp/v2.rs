@@ -29,8 +29,9 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
 use crate::{
+    events::{self, DiagnosticScope},
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
-    runtime::{AcpDriverContext, BackgroundJobs, InputSettlingDriver as LoopDriver, Runtime},
+    runtime::{AcpDriverContext, BackgroundJobs, InputSettlingDriver as LoopDriver, Runtime, diagnostics::ConsumptionScope},
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
@@ -180,8 +181,26 @@ struct ConnectionSink(V2ConnectionTo<Client>, Arc<Mutex<InjectionWork>>);
 struct InjectionWork {
     admitting: usize,
     pending: HashSet<wire::MessageId>,
+    origins: HashMap<wire::MessageId, DiagnosticScope>,
     branch_reserved: bool,
     admission_released: Arc<Notify>,
+}
+
+impl InjectionWork {
+    fn forget(&mut self, id: &wire::MessageId) {
+        self.pending.remove(id);
+        self.origins.remove(id);
+    }
+
+    fn delivered(&mut self, notification: &wire::UpdateSessionNotification) {
+        if let wire::SessionUpdate::UserMessage(message) = &notification.update
+            && self.pending.remove(&message.message_id)
+        {
+            // The SDK has submitted this exact queued input and cannot begin
+            // its next model step until this acknowledgement returns.
+            ConsumptionScope::consumed(self.origins.remove(&message.message_id));
+        }
+    }
 }
 
 struct InjectionAdmission(Arc<Mutex<InjectionWork>>);
@@ -204,8 +223,7 @@ impl Drop for TrackedInjection {
             self.work
                 .lock()
                 .expect("injection work poisoned")
-                .pending
-                .remove(&self.id);
+                .forget(&self.id);
         }
     }
 }
@@ -248,20 +266,13 @@ impl Drop for BranchAdmission {
 #[async_trait]
 impl AcpSessionUpdateSink for ConnectionSink {
     fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
-        let delivered = match &notification.update {
-            wire::SessionUpdate::UserMessage(message) => Some(message.message_id.clone()),
-            _ => None,
-        };
         self.0
-            .send_notification(notification)
+            .send_notification(notification.clone())
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
-        if let Some(id) = delivered {
-            self.1
-                .lock()
-                .expect("injection work poisoned")
-                .pending
-                .remove(&id);
-        }
+        self.1
+            .lock()
+            .expect("injection work poisoned")
+            .delivered(&notification);
         Ok(())
     }
 
@@ -662,6 +673,10 @@ struct PromptCommand {
 }
 
 enum Command {
+    Scoped {
+        origin: DiagnosticScope,
+        command: Box<Command>,
+    },
     Snapshot {
         reply: oneshot::Sender<Result<SessionSnapshot, AcpRuntimeError>>,
     },
@@ -689,6 +704,22 @@ enum Command {
     Close {
         reply: oneshot::Sender<()>,
     },
+}
+
+impl Command {
+    fn scoped(self) -> Self {
+        Self::Scoped {
+            origin: DiagnosticScope::capture(),
+            command: Box::new(self),
+        }
+    }
+
+    fn into_scoped(self) -> (DiagnosticScope, Self) {
+        match self {
+            Self::Scoped { origin, command } => (origin, *command),
+            command => (DiagnosticScope::default(), command),
+        }
+    }
 }
 
 struct SessionHandle {
@@ -785,6 +816,7 @@ struct PendingSessionPublication {
 }
 
 struct Server {
+    diagnostic_ownership: AtomicBool,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
     registry: SessionRegistry,
@@ -795,6 +827,7 @@ struct Server {
 impl Server {
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
+            diagnostic_ownership: AtomicBool::new(false),
             runtime,
             integration: Arc::new(AcpIntegration::default()),
             registry,
@@ -912,7 +945,10 @@ impl Server {
                 "ACP v2 requires protocol version 2 or newer".into(),
             ));
         }
-        Ok(wire::InitializeResponse::new(
+        let negotiated = events::ownership_supported(request.meta.as_ref());
+        self.diagnostic_ownership
+            .store(negotiated, Ordering::Release);
+        let mut response = wire::InitializeResponse::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
@@ -923,7 +959,21 @@ impl Server {
             })
         } else {
             Vec::new()
-        }))
+        });
+        if negotiated {
+            events::offer_diagnostic_ownership(&mut response.meta);
+        }
+        Ok(response)
+    }
+
+    fn diagnostic_scope(
+        &self,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> DiagnosticScope {
+        DiagnosticScope::with_operation(events::diagnostic_operation(
+            meta,
+            self.diagnostic_ownership.load(Ordering::Acquire),
+        ))
     }
 
     async fn new_session(
@@ -1187,7 +1237,7 @@ impl Server {
             token,
             completed,
         };
-        let actor_task = tokio::spawn(async move {
+        let actor_task = tokio::spawn(events::inherit_diagnostics(async move {
             let _guard = guard;
             if activated.await.is_ok() {
                 session_actor(actor).await;
@@ -1195,7 +1245,7 @@ impl Server {
                 // Abandoning response/replay retires the queued input as well.
                 actor.busy.store(false, Ordering::Release);
             }
-        });
+        }));
         let interrupt_handle = handle.clone();
         let interrupt_background_jobs = background_jobs.clone();
         let interrupt = Arc::new(move || {
@@ -1211,15 +1261,19 @@ impl Server {
             let close_background_jobs = close_background_jobs.clone();
             let close_tasks = close_tasks.clone();
             let weak = weak.clone();
-            Box::pin(async move {
+            Box::pin(events::inherit_diagnostics(async move {
                 super::cancel_background_jobs(&close_tasks, &close_background_jobs).await;
                 if let Some(commands) = weak.upgrade() {
                     let (reply, acknowledged) = oneshot::channel();
-                    if commands.send(Command::Close { reply }).await.is_ok() {
+                    if commands
+                        .send(Command::Close { reply }.scoped())
+                        .await
+                        .is_ok()
+                    {
                         let _ = acknowledged.await;
                     }
                 }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            })) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
         // Registration, durable identity commit, and local publication are one
         // critical section so logout cannot reopen admission around a dead actor.
@@ -1282,7 +1336,7 @@ impl Server {
         };
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::Snapshot { reply })
+            .send(Command::Snapshot { reply }.scoped())
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         let SessionSnapshot {
@@ -1323,7 +1377,7 @@ impl Server {
         let (sender, _, _) = self.prompt_route(&request.session_id)?;
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::ListPromptBranches { reply })
+            .send(Command::ListPromptBranches { reply }.scoped())
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -1336,11 +1390,14 @@ impl Server {
         let (sender, admission) = self.branch_admission(&request.session_id)?;
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::PreparePromptBranch {
-                address: request.address,
-                admission,
-                reply,
-            })
+            .send(
+                Command::PreparePromptBranch {
+                    address: request.address,
+                    admission,
+                    reply,
+                }
+                .scoped(),
+            )
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
@@ -1400,11 +1457,14 @@ impl Server {
         let (sender, admission) = self.branch_admission(&request.session_id)?;
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::ReservePromptBranch {
-                checkout_token: request.checkout_token,
-                admission,
-                reply,
-            })
+            .send(
+                Command::ReservePromptBranch {
+                    checkout_token: request.checkout_token,
+                    admission,
+                    reply,
+                }
+                .scoped(),
+            )
             .await
             .map_err(|_| AcpRuntimeError::ClientClosed)?;
         let (checkout, release) = response
@@ -1454,6 +1514,37 @@ impl Server {
         Ok(InjectionAdmission(session.injections.clone()))
     }
 
+    async fn replace_injection(
+        &self,
+        request: wire::ReplaceInjectSessionRequest,
+    ) -> Result<wire::ReplaceInjectSessionResponse, agent_client_protocol::Error> {
+        let tracker = self
+            .sessions
+            .lock()
+            .expect("ACP v2 session map poisoned")
+            .get(&request.session_id)
+            .map(|session| session.injections.clone());
+        let Some(tracker) = tracker else {
+            return self.integration.replace_inject(request).await;
+        };
+        let id = request.message_id.clone();
+        let origin = DiagnosticScope::capture();
+        let replacement = self.integration.replace_inject(request);
+        tokio::pin!(replacement);
+        std::future::poll_fn(|cx| {
+            // Pinned SDK replacement never calls the update sink. Its successful
+            // transition and our scope update must be atomic with that sink;
+            // release this guard after EACH poll, including Pending delivery.
+            let mut work = tracker.lock().expect("injection work poisoned");
+            let result = std::future::Future::poll(replacement.as_mut(), cx);
+            if matches!(&result, std::task::Poll::Ready(Ok(_))) && work.pending.contains(&id) {
+                work.origins.insert(id.clone(), origin.clone());
+            }
+            result
+        })
+        .await
+    }
+
     async fn prepare_prompt(
         &self,
         request: wire::PromptRequest,
@@ -1475,11 +1566,14 @@ impl Server {
         handle.prepare_injection_turn();
         let cancellation_generation = handle.cancellation_handle().generation();
         let (reply, response) = oneshot::channel();
-        permit.send(Command::Prompt(PromptCommand {
-            request,
-            cancellation_generation,
-            reply,
-        }));
+        permit.send(
+            Command::Prompt(PromptCommand {
+                request,
+                cancellation_generation,
+                reply,
+            })
+            .scoped(),
+        );
         match response.await {
             Ok(response) => response,
             Err(_) => {
@@ -1530,11 +1624,14 @@ impl Server {
         };
         let (reply, response) = oneshot::channel();
         sender
-            .send(Command::SetConfig {
-                request,
-                reply,
-                cancellation_generation,
-            })
+            .send(
+                Command::SetConfig {
+                    request,
+                    reply,
+                    cancellation_generation,
+                }
+                .scoped(),
+            )
             .await
             .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
         response
@@ -1546,27 +1643,31 @@ impl Server {
         &self,
         notification: wire::CancelSessionNotification,
     ) -> Result<(), AcpRuntimeError> {
-        let session = self
-            .sessions
-            .lock()
-            .map_err(|_| AcpRuntimeError::ClientClosed)?
-            .get(&notification.session_id)
-            .map(|session| {
-                (
-                    session.integration.clone(),
-                    session.background_jobs.clone(),
-                    session.tasks.clone(),
-                    session.structured_completion,
-                )
-            });
-        if let Some((handle, background_jobs, tasks, structured_completion)) = session {
-            // Interrupt admission before waiting for asynchronous task cleanup.
-            handle.interrupt();
-            if structured_completion {
-                super::cancel_background_jobs(&tasks, &background_jobs).await;
-            }
-        }
-        Ok(())
+        self.diagnostic_scope(notification.meta.as_ref())
+            .scope(async {
+                let session = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?
+                    .get(&notification.session_id)
+                    .map(|session| {
+                        (
+                            session.integration.clone(),
+                            session.background_jobs.clone(),
+                            session.tasks.clone(),
+                            session.structured_completion,
+                        )
+                    });
+                if let Some((handle, background_jobs, tasks, structured_completion)) = session {
+                    // Interrupt admission before waiting for asynchronous task cleanup.
+                    handle.interrupt();
+                    if structured_completion {
+                        super::cancel_background_jobs(&tasks, &background_jobs).await;
+                    }
+                }
+                Ok(())
+            })
+            .await
     }
 
     async fn close(
@@ -1586,7 +1687,7 @@ impl Server {
         // command arrives. A dropped receiver is already a completed close.
         if session
             .commands
-            .send(Command::Close { reply })
+            .send(Command::Close { reply }.scoped())
             .await
             .is_ok()
         {
@@ -1787,20 +1888,22 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
     // Event selection is not admission: a branch may claim busy before its
     // command reaches this actor. Retain the wake until a drive is admitted.
     let mut autonomous_pending = false;
+    let mut autonomous_external = false;
     if let Some(generation) = initial_generation {
         advance_checkout_revision(&mut checkout_revision);
-        let initial = run_initial_branch_turn(
-            &session_id,
-            &integration,
-            &handle,
-            &busy,
-            driver,
-            &sink,
-            generation,
-            structured_completion.then_some((&tasks, &background_jobs)),
-            &activity,
-        )
-        .await;
+        let initial = ConsumptionScope::explicit(DiagnosticScope::capture())
+            .scope(run_initial_branch_turn(
+                &session_id,
+                &integration,
+                &handle,
+                &busy,
+                driver,
+                &sink,
+                generation,
+                structured_completion.then_some((&tasks, &background_jobs)),
+                &activity,
+            ))
+            .await;
         match initial {
             Ok(Some(active)) => driver = active,
             stopped => {
@@ -1811,7 +1914,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                 drop(binding.take());
                 commands.close();
                 while let Some(command) = commands.recv().await {
-                    if let Command::Close { reply } = command {
+                    if let Command::Close { reply } = command.into_scoped().1 {
                         let _ = reply.send(());
                     }
                 }
@@ -1822,7 +1925,17 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
     loop {
         tokio::select! {
             biased;
-            command = commands.recv() => match command {
+            command = commands.recv() => {
+                let (origin, command) = match command {
+                    Some(command) => { let (origin, command) = command.into_scoped(); (origin, Some(command)) },
+                    None => (DiagnosticScope::capture(), None),
+                };
+                let consumption = if autonomous_external && matches!(&command, Some(Command::Prompt(_))) {
+                    ConsumptionScope::new(Some(DiagnosticScope::default()))
+                } else { ConsumptionScope::explicit(origin) };
+                let stop = consumption.scope(async {
+                match command {
+                Some(Command::Scoped { .. }) => unreachable!("command envelopes are not nested"),
                 Some(Command::Snapshot { reply }) => {
                     let result = (|| {
                         let selection = adapter.selection().map_err(AcpRuntimeError::Loop)?;
@@ -1868,7 +1981,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     match result {
                         Ok(checkout) => {
                             hold_branch_reservation(checkout, admission, reply).await;
-                            continue;
+                            return false;
                         }
                         Err(error) => { let _ = reply.send(Err(error)); }
                     }
@@ -1893,6 +2006,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
                     busy.store(false, Ordering::Release);
+                    if driver.snapshot().pending_input.is_empty() { autonomous_external = false; }
                     if let Err(error) = result {
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
@@ -1902,8 +2016,8 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                         // The same pre-step cancellation race applies to a
                         // queued ordinary prompt, not just branch activation.
                         let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                        super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
-                        break;
+                        consumption.current_scope().scope(super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs)).await;
+                        return true;
                     }
                 }
                 Some(Command::SetConfig { request, reply, cancellation_generation }) => {
@@ -1951,7 +2065,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                         // retire this attachment so no later prompt or wake runs it.
                         let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
                         super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
-                        break;
+                        return true;
                     }
                 }
                 Some(Command::Close { reply }) => {
@@ -1959,24 +2073,30 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
                     drop(binding.take());
                     let _ = reply.send(());
-                    break;
+                    return true;
                 }
                 None => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
                     super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
-                    break;
+                    return true;
                 }
+                }
+                false
+                }).await;
+                if stop { break; }
             },
             _ = admission_released.notified(), if autonomous_pending => {}
             _ = std::future::ready(()), if autonomous_pending && !busy.load(Ordering::Acquire) => {
                 let generation = handle.cancellation_handle().generation();
-                let result = drive_autonomous(
+                let consumption = ConsumptionScope::new(autonomous_external.then(DiagnosticScope::default));
+                let result = consumption.scope(drive_autonomous(
                     &session_id, &integration, &handle, &busy,
                     &mut driver, &sink, &activity,
-                )
+                ))
                 .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
                 .await;
                 autonomous_pending = matches!(result, Ok(false));
+                if !autonomous_pending { autonomous_external = false; }
                 if let Err(error) = result {
                     eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                 }
@@ -1985,7 +2105,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     && !driver.snapshot().pending_input.is_empty())
                 {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    consumption.current_scope().scope(super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs)).await;
                     break;
                 }
             }
@@ -1994,6 +2114,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     advance_checkout_revision(&mut checkout_revision);
                     match driver.submit_input(vec![Item::notification(event.message)]) {
                         Ok(()) => {
+                            autonomous_external = true;
                             autonomous_pending = true;
                         }
                         Err(error) => {
@@ -2427,40 +2548,42 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     // after the client returns to its source without sending session/resume.
     // Re-establish identity before activity, model, or cleanup diagnostics.
     establish_diagnostic_route(session_id);
-    crate::events::scope_diagnostics(
-        &session_id.to_string(),
-        activity.execute(
-            origin,
-            async {
-                let result = drive_prompt(
-                    session_id,
-                    driver,
-                    handle,
-                    cancellation_generation,
-                    structured,
-                    &sink.acknowledgements,
-                )
-                .await;
-                let outcome = super::activity::ExecutionOutcome::new(
-                    result,
-                    handle
-                        .cancellation_handle()
-                        .is_cancelled_since(cancellation_generation),
-                );
-                handle.stop_injection_turn();
-                let result = super::activity::finalize(
-                    outcome,
-                    structured,
-                    integration.flush_session_updates(session_id),
-                    |error| sink.update(error_diagnostic_notification(session_id, error)),
-                )
-                .await;
-                integration.finish_prompt(session_id);
-                result
-            },
-            |reason| Some(reason.clone()),
-        ),
-    )
+    crate::events::scope_diagnostics(&session_id.to_string(), async {
+        ConsumptionScope::bind_local_seed();
+        activity
+            .execute(
+                origin,
+                async {
+                    let result = drive_prompt(
+                        session_id,
+                        driver,
+                        handle,
+                        cancellation_generation,
+                        structured,
+                        &sink.acknowledgements,
+                    )
+                    .await;
+                    let outcome = super::activity::ExecutionOutcome::new(
+                        result,
+                        handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation),
+                    );
+                    handle.stop_injection_turn();
+                    let result = super::activity::finalize(
+                        outcome,
+                        structured,
+                        integration.flush_session_updates(session_id),
+                        |error| sink.update(error_diagnostic_notification(session_id, error)),
+                    )
+                    .await;
+                    integration.finish_prompt(session_id);
+                    result
+                },
+                |reason| Some(reason.clone()),
+            )
+            .await
+    })
     .await
 }
 
@@ -2827,7 +2950,10 @@ pub(crate) fn component(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<impl ConnectTo<Client>, AcpRuntimeError> {
-    let state = Arc::new(Server::new(runtime, registry));
+    component_from_state(Arc::new(Server::new(runtime, registry)))
+}
+
+fn component_from_state(state: Arc<Server>) -> Result<impl ConnectTo<Client>, AcpRuntimeError> {
     let agent = agent_client_protocol::Agent
         .v2()
         .name("kit")
@@ -2844,7 +2970,10 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::LoginAuthRequest, responder, _cx| {
-                    responder.respond_with_result(state.login(request))
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
+                    diagnostic_scope
+                        .scope(async { responder.respond_with_result(state.login(request)) })
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2853,10 +2982,11 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |_request: wire::LogoutAuthRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(_request.meta.as_ref());
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(state.logout().await.map_err(sdk_error))
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2866,9 +2996,10 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::NewSessionRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         match state.new_session(request, connection.clone()).await {
                             Ok((response, activation)) => {
                                 let session_id = response.session_id.clone();
@@ -2878,7 +3009,7 @@ pub(crate) fn component(
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2888,15 +3019,16 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::ListSessionsRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(
                             state
                                 .list_sessions(request)
                                 .await
                                 .map_err(list_sessions_error),
                         )
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2906,10 +3038,11 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::ResumeSessionRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
                     let session_id = request.session_id.clone();
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         match state.resume_session(request, connection.clone()).await {
                             Ok((response, replay, activation)) => {
                                 for update in replay {
@@ -2921,7 +3054,7 @@ pub(crate) fn component(
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2931,12 +3064,13 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: ListPromptBranchesRequest, responder, cx| {
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(
                             state.list_prompt_branches(request).await.map_err(sdk_error),
                         )
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2946,15 +3080,16 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: PreparePromptBranchRequest, responder, cx| {
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(
                             state
                                 .prepare_prompt_branch(request)
                                 .await
                                 .map_err(sdk_error),
                         )
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -2966,9 +3101,10 @@ pub(crate) fn component(
                 async move |request: SubmitPromptBranchRequest,
                             responder: Responder<SubmitPromptBranchResponse>,
                             cx| {
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
                     let state = Arc::clone(&state);
                     let connection = cx.clone();
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         match state
                             .submit_prompt_branch(request, connection.clone())
                             .await
@@ -3007,7 +3143,7 @@ pub(crate) fn component(
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -3017,8 +3153,9 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::PromptRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         match state.prepare_prompt(request).await {
                             Ok(start) => {
                                 responder.respond(wire::PromptResponse::new())?;
@@ -3027,7 +3164,7 @@ pub(crate) fn component(
                             }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -3037,10 +3174,11 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::SetSessionConfigOptionRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(state.set_config(request).await)
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -3052,37 +3190,42 @@ pub(crate) fn component(
                 async move |request: wire::InjectSessionRequest,
                             responder: Responder<wire::InjectSessionResponse>,
                             cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
+                    let session_id = request.session_id.to_string();
                     let admission = match state.injection_admission(&request.session_id) {
                         Ok(admission) => admission,
-                        Err(error) => return responder.respond_with_error(sdk_error(error)),
+                        Err(error) => {
+                            return responder.respond_with_error(sdk_error(error));
+                        }
                     };
                     let integration = Arc::clone(&state.integration);
-                    cx.spawn(async move {
-                        let Some(reserved) = integration
-                            .reserve_inject_request(request, responder)
-                            .await?
-                        else {
-                            return Ok(());
-                        };
-                        let id = reserved.response().message_id;
-                        admission
-                            .0
-                            .lock()
-                            .expect("injection work poisoned")
-                            .pending
-                            .insert(id.clone());
-                        let mut pending = TrackedInjection {
-                            work: admission.0.clone(),
-                            id,
-                            retained: false,
-                        };
-                        if let Some(acceptance) = reserved.respond_tracked()? {
-                            acceptance.activate_after_response().await?;
-                            pending.retained = true;
-                        }
-                        drop(admission);
-                        Ok(())
-                    })?;
+                    cx.spawn(diagnostic_scope.sync_scope(|| {
+                        events::scope_diagnostics(&session_id, async move {
+                            let Some(reserved) = integration
+                                .reserve_inject_request(request, responder)
+                                .await?
+                            else {
+                                return Ok(());
+                            };
+                            let id = reserved.response().message_id;
+                            {
+                                let mut work = admission.0.lock().expect("injection work poisoned");
+                                work.pending.insert(id.clone());
+                                work.origins.insert(id.clone(), DiagnosticScope::capture());
+                            }
+                            let mut pending = TrackedInjection {
+                                work: admission.0.clone(),
+                                id,
+                                retained: false,
+                            };
+                            if let Some(acceptance) = reserved.respond_tracked()? {
+                                acceptance.activate_after_response().await?;
+                                pending.retained = true;
+                            }
+                            drop(admission);
+                            Ok(())
+                        })
+                    }))?;
                     Ok(())
                 }
             },
@@ -3092,36 +3235,41 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::RevokeInjectSessionRequest, responder, _cx| {
-                    let tracker = state
-                        .sessions
-                        .lock()
-                        .expect("ACP v2 session map poisoned")
-                        .get(&request.session_id)
-                        .map(|session| session.injections.clone());
-                    let id = request.message_id.clone();
-                    let result = state.integration.revoke_inject(request).await;
-                    if result.is_ok()
-                        && let Some(tracker) = tracker
-                    {
-                        tracker
-                            .lock()
-                            .expect("injection work poisoned")
-                            .pending
-                            .remove(&id);
-                    }
-                    responder.respond_with_result(result)
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
+                    diagnostic_scope
+                        .scope(async {
+                            let tracker = state
+                                .sessions
+                                .lock()
+                                .expect("ACP v2 session map poisoned")
+                                .get(&request.session_id)
+                                .map(|session| session.injections.clone());
+                            let id = request.message_id.clone();
+                            let result = state.integration.revoke_inject(request).await;
+                            if result.is_ok()
+                                && let Some(tracker) = tracker
+                            {
+                                tracker.lock().expect("injection work poisoned").forget(&id);
+                            }
+                            responder.respond_with_result(result)
+                        })
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             {
-                let integration = Arc::clone(&state.integration);
+                let state = Arc::clone(&state);
                 async move |request: wire::ReplaceInjectSessionRequest, responder, cx| {
-                    let integration = Arc::clone(&integration);
-                    cx.spawn(async move {
-                        responder.respond_with_result(integration.replace_inject(request).await)
-                    })?;
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
+                    let state = Arc::clone(&state);
+                    let session_id = request.session_id.to_string();
+                    cx.spawn(diagnostic_scope.sync_scope(|| {
+                        events::scope_diagnostics(&session_id, async move {
+                            responder.respond_with_result(state.replace_injection(request).await)
+                        })
+                    }))?;
                     Ok(())
                 }
             },
@@ -3131,12 +3279,13 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: DetachComposeRequest, responder, cx| {
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(
                             state.detach_compose(request).await.map_err(sdk_error),
                         )
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -3146,8 +3295,14 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: CancelBackgroundRequest, responder, _cx| {
-                    responder
-                        .respond_with_result(state.cancel_background(request).map_err(sdk_error))
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
+                    diagnostic_scope
+                        .scope(async {
+                            responder.respond_with_result(
+                                state.cancel_background(request).map_err(sdk_error),
+                            )
+                        })
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3156,14 +3311,15 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: FileSearchRequest, responder, cx| {
+                    let diagnostic_scope = DiagnosticScope::with_operation(None);
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(
                             state.search_files(request).await.map_err(|error| {
                                 agent_client_protocol::util::internal_error(error)
                             }),
                         )
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -3183,10 +3339,11 @@ pub(crate) fn component(
             {
                 let state = Arc::clone(&state);
                 async move |request: wire::CloseSessionRequest, responder, cx| {
+                    let diagnostic_scope = state.diagnostic_scope(request.meta.as_ref());
                     let state = Arc::clone(&state);
-                    cx.spawn(async move {
+                    cx.spawn(diagnostic_scope.scope(async move {
                         responder.respond_with_result(state.close(request).await.map_err(sdk_error))
-                    })?;
+                    }))?;
                     Ok(())
                 }
             },
@@ -4112,7 +4269,7 @@ mod tests {
                     .await
                     .unwrap();
                 let child_id = submitted.session_id;
-                let retired_commands = state.sender(&child_id).unwrap();
+                let retired_commands = state.prompt_route(&child_id).unwrap().0;
                 state
                     .cancel(wire::CancelSessionNotification::new(child_id.clone()))
                     .await
@@ -4409,6 +4566,10 @@ mod tests {
             .unwrap()
             .pending
             .extend([failed.clone(), retained.clone()]);
+        work.lock().unwrap().origins.extend([
+            (failed.clone(), DiagnosticScope::default()),
+            (retained.clone(), DiagnosticScope::default()),
+        ]);
         drop(TrackedInjection {
             work: work.clone(),
             id: failed.clone(),
@@ -4419,7 +4580,13 @@ mod tests {
             id: retained.clone(),
             retained: true,
         });
-        assert_eq!(work.lock().unwrap().pending, HashSet::from([retained]));
+        assert_eq!(
+            work.lock().unwrap().pending,
+            HashSet::from([retained.clone()])
+        );
+        assert!(!work.lock().unwrap().origins.contains_key(&failed));
+        assert_eq!(work.lock().unwrap().origins.len(), 1);
+        assert!(work.lock().unwrap().origins.contains_key(&retained));
     }
 
     #[tokio::test]
@@ -4459,6 +4626,695 @@ mod tests {
         assert!(!work.lock().unwrap().branch_reserved);
     }
 
+    type InjectionDeliveryGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    #[derive(Clone)]
+    struct InjectionDeliverySink {
+        work: Arc<Mutex<InjectionWork>>,
+        delivered: Arc<Mutex<Vec<wire::UpdateSessionNotification>>>,
+        gate: Arc<Mutex<Option<InjectionDeliveryGate>>>,
+    }
+
+    #[async_trait]
+    impl AcpSessionUpdateSink for InjectionDeliverySink {
+        fn update(
+            &self,
+            notification: wire::UpdateSessionNotification,
+        ) -> Result<(), AcpRuntimeError> {
+            // Same production consumption boundary as ConnectionSink; only the
+            // final transport is an in-memory recording peer.
+            self.work.lock().unwrap().delivered(&notification);
+            self.delivered.lock().unwrap().push(notification);
+            Ok(())
+        }
+        async fn update_acknowledged(
+            &self,
+            notification: wire::UpdateSessionNotification,
+        ) -> Result<(), AcpRuntimeError> {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            self.update(notification)
+        }
+        async fn flush(&self) -> Result<(), AcpRuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn injection_ownership_tracks_actual_delivery_replacement_and_revocation() {
+        for tokens in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+            let server = Arc::new(Server::new(runtime, SessionRegistry::new()));
+            let session_id = wire::SessionId::new(format!("injection-ownership-{tokens}"));
+            events::activate_diagnostics(&session_id.to_string());
+            let work = Arc::new(Mutex::new(InjectionWork::default()));
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let gate = Arc::new(Mutex::new(None));
+            let handle = server
+                .integration
+                .bind_session(AcpSessionBinding::new(
+                    session_id.clone(),
+                    SessionId::new(session_id.to_string()),
+                    InjectionDeliverySink {
+                        work: work.clone(),
+                        delivered: delivered.clone(),
+                        gate: gate.clone(),
+                    },
+                ))
+                .unwrap();
+            let tasks = AsyncTaskManager::new().handle();
+            let (commands, _receiver) = mpsc::channel(1);
+            server.sessions.lock().unwrap().insert(
+                session_id.clone(),
+                SessionHandle {
+                    injections: work.clone(),
+                    token: 0,
+                    commands,
+                    integration: handle.clone(),
+                    busy: Arc::new(AtomicBool::new(true)),
+                    background_jobs: BackgroundJobs::default(),
+                    structured_completion: false,
+                    tasks,
+                },
+            );
+            let model_scopes = Arc::new(Mutex::new(Vec::new()));
+            let mut driver = Agent::builder()
+                .model(OwnershipAdapter {
+                    inner: TestAdapter {
+                        outcome: TestOutcome::Content,
+                        turns: Arc::new(AtomicU64::new(0)),
+                        interrupt: None,
+                    },
+                    model_scopes: model_scopes.clone(),
+                })
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(SessionId::new(session_id.to_string())).without_cache())
+                .await
+                .unwrap();
+            let source = DiagnosticScope::with_operation(
+                tokens.then(|| events::DiagnosticOperation::new("SOURCE".into()).unwrap()),
+            )
+            .scope(async {
+                events::scope_diagnostics(&session_id.to_string(), async {
+                    DiagnosticScope::capture()
+                })
+                .await
+            })
+            .await;
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let router = agent_client_protocol::Agent
+                .protocol_router()
+                .with_v2(component_from_state(server.clone()).unwrap());
+            let serving = tokio::spawn(async move { router.connect_to(agent_transport).await });
+            let client = agent_client_protocol::Client.v2().connect_with(
+                client_transport,
+                async move |cx| {
+                    let mut initialize = terminal_auth_initialize_request();
+                    if tokens {
+                        events::offer_diagnostic_ownership(&mut initialize.meta);
+                    }
+                    let initialized = cx.send_request(initialize).block_task().await?;
+                    assert_eq!(
+                        events::ownership_supported(initialized.meta.as_ref()),
+                        tokens
+                    );
+                    for scenario in [
+                        "same",
+                        "mixed",
+                        "replace-same",
+                        "replace-mixed",
+                        "reject",
+                        "revoke",
+                    ] {
+                        handle.prepare_injection_turn();
+                        handle.start_injection_turn();
+                        let count = model_scopes.lock().unwrap().len();
+                        let consumption = ConsumptionScope::new(Some(source.clone()));
+                        consumption
+                            .scope(async {
+                                driver
+                                    .submit_input(vec![Item::text(
+                                        ItemKind::User,
+                                        "source invocation",
+                                    )])
+                                    .unwrap();
+                                driver.next().await.unwrap();
+                                assert_eq!(model_scopes.lock().unwrap()[count], source);
+                                let original = if scenario == "mixed" || scenario == "replace-same"
+                                {
+                                    "INJECT"
+                                } else {
+                                    "SOURCE"
+                                };
+                                let mut request = wire::InjectSessionRequest::new(
+                                    session_id.clone(),
+                                    wire::SessionInjectMode::Steer,
+                                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                        "original injection",
+                                    ))],
+                                );
+                                if tokens {
+                                    events::set_diagnostic_operation(
+                                        &mut request.meta,
+                                        &events::DiagnosticOperation::new(original.into()).unwrap(),
+                                    );
+                                }
+                                let id = cx
+                                    .send_request(request)
+                                    .block_task()
+                                    .await
+                                    .unwrap()
+                                    .message_id;
+                                assert_eq!(
+                                    work.lock().unwrap().origins[&id]
+                                        .operation()
+                                        .map(|operation| operation.as_str()),
+                                    tokens.then_some(original)
+                                );
+                                if scenario.starts_with("replace") || scenario == "reject" {
+                                    let replacement = if scenario == "replace-mixed" {
+                                        "REPLACED"
+                                    } else {
+                                        "SOURCE"
+                                    };
+                                    let content = if scenario == "reject" {
+                                        "x".repeat(
+                                            agentkit_acp::v2::MAX_PENDING_INJECTION_BYTES + 1,
+                                        )
+                                    } else {
+                                        "accepted replacement".into()
+                                    };
+                                    let mut request = wire::ReplaceInjectSessionRequest::new(
+                                        session_id.clone(),
+                                        id.clone(),
+                                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                            content,
+                                        ))],
+                                    );
+                                    if tokens {
+                                        events::set_diagnostic_operation(
+                                            &mut request.meta,
+                                            &events::DiagnosticOperation::new(replacement.into())
+                                                .unwrap(),
+                                        );
+                                    }
+                                    let result = cx.send_request(request).block_task().await;
+                                    assert_eq!(result.is_err(), scenario == "reject");
+                                    let expected = if scenario == "reject" {
+                                        original
+                                    } else {
+                                        replacement
+                                    };
+                                    assert_eq!(
+                                        work.lock().unwrap().origins[&id]
+                                            .operation()
+                                            .map(|operation| operation.as_str()),
+                                        tokens.then_some(expected)
+                                    );
+                                }
+                                if scenario == "revoke" {
+                                    cx.send_request(wire::RevokeInjectSessionRequest::new(
+                                        session_id.clone(),
+                                        id.clone(),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .unwrap();
+                                    assert!(!work.lock().unwrap().pending.contains(&id));
+                                    assert!(!work.lock().unwrap().origins.contains_key(&id));
+                                    assert!(
+                                        cx.send_request(wire::ReplaceInjectSessionRequest::new(
+                                            session_id.clone(),
+                                            id.clone(),
+                                            vec![]
+                                        ))
+                                        .block_task()
+                                        .await
+                                        .is_err()
+                                    );
+                                }
+                                let boundary = handle
+                                    .handle_injection_boundary(&mut driver, false)
+                                    .await
+                                    .unwrap();
+                                if scenario == "revoke" {
+                                    assert!(matches!(boundary, AcpInjectionBoundary::Continue));
+                                } else {
+                                    assert!(matches!(boundary, AcpInjectionBoundary::Delivered));
+                                    driver.next().await.unwrap();
+                                    let mixed = tokens
+                                        && (scenario == "mixed" || scenario == "replace-mixed");
+                                    assert_eq!(
+                                        model_scopes.lock().unwrap()[count + 1],
+                                        if mixed {
+                                            DiagnosticScope::default()
+                                        } else {
+                                            source.clone()
+                                        },
+                                        "{scenario}"
+                                    );
+                                    let last = delivered.lock().unwrap().last().cloned().unwrap();
+                                    let expected = if scenario.starts_with("replace") {
+                                        "accepted replacement"
+                                    } else {
+                                        "original injection"
+                                    };
+                                    assert!(
+                                        serde_json::to_string(&last).unwrap().contains(expected)
+                                    );
+                                }
+                                assert!(!work.lock().unwrap().origins.contains_key(&id));
+                                assert!(!work.lock().unwrap().pending.contains(&id));
+                            })
+                            .await;
+                    }
+                    // A rejected admission must not leave either a reservation or an origin.
+                    handle.stop_injection_turn();
+                    assert!(
+                        cx.send_request(wire::InjectSessionRequest::new(
+                            session_id.clone(),
+                            wire::SessionInjectMode::Steer,
+                            vec![]
+                        ))
+                        .block_task()
+                        .await
+                        .is_err()
+                    );
+                    assert!(work.lock().unwrap().origins.is_empty());
+                    assert!(work.lock().unwrap().pending.is_empty());
+                    assert_eq!(work.lock().unwrap().admitting, 0);
+
+                    // Poll a replacement while the SDK is delivering that exact ID.
+                    // Its Pending poll must release our lock and preserve old owner.
+                    handle.prepare_injection_turn();
+                    handle.start_injection_turn();
+                    let mut request = wire::InjectSessionRequest::new(
+                        session_id.clone(),
+                        wire::SessionInjectMode::Steer,
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "racing original",
+                        ))],
+                    );
+                    if tokens {
+                        events::set_diagnostic_operation(
+                            &mut request.meta,
+                            source.operation().unwrap(),
+                        );
+                    }
+                    let id = cx.send_request(request).block_task().await?.message_id;
+                    let (entered, at_delivery) = oneshot::channel();
+                    let (release, released) = oneshot::channel();
+                    *gate.lock().unwrap() = Some((entered, released));
+                    let driving_handle = handle.clone();
+                    let expected = source.clone();
+                    let driving = tokio::spawn(ConsumptionScope::new(Some(source.clone())).scope(
+                        async move {
+                            driving_handle
+                                .handle_injection_boundary(&mut driver, false)
+                                .await
+                                .unwrap();
+                            driver.next().await.unwrap();
+                            driver
+                        },
+                    ));
+                    at_delivery.await.unwrap();
+                    let mut replace = wire::ReplaceInjectSessionRequest::new(
+                        session_id.clone(),
+                        id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "must not replace",
+                        ))],
+                    );
+                    if tokens {
+                        events::set_diagnostic_operation(
+                            &mut replace.meta,
+                            &events::DiagnosticOperation::new("RACING".into()).unwrap(),
+                        );
+                    }
+                    let scope = server.diagnostic_scope(replace.meta.as_ref());
+                    let replacement = scope.sync_scope(|| {
+                        events::scope_diagnostics(
+                            &session_id.to_string(),
+                            server.replace_injection(replace),
+                        )
+                    });
+                    tokio::pin!(replacement);
+                    assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+                    assert_eq!(work.try_lock().unwrap().origins[&id], expected);
+                    release.send(()).unwrap();
+                    let _driver = driving.await.unwrap();
+                    assert!(
+                        replacement.await.is_err(),
+                        "delivered input cannot be replaced"
+                    );
+                    assert_eq!(model_scopes.lock().unwrap().last(), Some(&expected));
+                    assert!(work.lock().unwrap().origins.is_empty());
+                    Ok(())
+                },
+            );
+            let result = timeout(Duration::from_secs(10), client).await;
+            serving.abort();
+            let _ = serving.await;
+            result
+                .expect("injection ownership peer timed out")
+                .expect("injection peer failed");
+        }
+    }
+
+    struct OwnershipAdapter<A> {
+        inner: A,
+        model_scopes: Arc<Mutex<Vec<DiagnosticScope>>>,
+    }
+
+    struct OwnershipSession<S> {
+        inner: S,
+        model_scopes: Arc<Mutex<Vec<DiagnosticScope>>>,
+    }
+
+    #[async_trait]
+    impl<A: ModelAdapter> ModelAdapter for OwnershipAdapter<A> {
+        type Session = OwnershipSession<A::Session>;
+        async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(OwnershipSession {
+                inner: self.inner.start_session(config).await?,
+                model_scopes: self.model_scopes.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl<S: ModelSession> ModelSession for OwnershipSession<S> {
+        type Turn = S::Turn;
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            self.model_scopes
+                .lock()
+                .unwrap()
+                .push(DiagnosticScope::capture());
+            self.inner.begin_turn(request, cancellation).await
+        }
+    }
+
+    struct OwnershipTool {
+        spec: ToolSpec,
+        release: Option<Arc<Notify>>,
+        entered: Arc<AtomicBool>,
+        scopes: Arc<Mutex<Vec<DiagnosticScope>>>,
+    }
+
+    #[async_trait]
+    impl agentkit_tools_core::Tool for OwnershipTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+        async fn invoke(
+            &self,
+            request: agentkit_tools_core::ToolRequest,
+            _ctx: &mut agentkit_tools_core::ToolContext<'_>,
+        ) -> Result<agentkit_tools_core::ToolResult, agentkit_tools_core::ToolError> {
+            self.scopes.lock().unwrap().push(DiagnosticScope::capture());
+            self.entered.store(true, Ordering::SeqCst);
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            self.scopes.lock().unwrap().push(DiagnosticScope::capture());
+            Ok(agentkit_tools_core::ToolResult::new(
+                agentkit_core::ToolResultPart::success(
+                    request.call_id,
+                    ToolOutput::Text("owned completion".into()),
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_keeps_new_owner_while_old_task_remains_live() {
+        use agentkit_core::{ToolCallId, TurnId};
+        use agentkit_task_manager::{ContinuePolicy, TaskLaunchRequest, TaskStartContext};
+        use agentkit_tools_core::{
+            AllowAllPermissions, BasicToolExecutor, OwnedToolContext, ToolRequest, ToolSource,
+        };
+        for tokens in [false, true] {
+            timeout(Duration::from_secs(5), async {
+                let root = tempfile::tempdir().unwrap();
+                let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+                let server = Arc::new(Server::new(runtime.clone(), SessionRegistry::new()));
+                let mut initialize = terminal_auth_initialize_request();
+                if tokens {
+                    events::offer_diagnostic_ownership(&mut initialize.meta);
+                }
+                assert_eq!(
+                    events::ownership_supported(
+                        server.initialize(initialize).unwrap().meta.as_ref()
+                    ),
+                    tokens
+                );
+                let session_id = wire::SessionId::new("independent-prompt");
+                let loop_id = SessionId::new(session_id.to_string());
+                let background_jobs = BackgroundJobs::default();
+                let manager = crate::runtime::diagnostics::DiagnosticTaskManager::new(
+                    AsyncTaskManager::new().routing(|request: &ToolRequest| {
+                        if request.tool_name.0 == "old-task" {
+                            RoutingDecision::Background
+                        } else {
+                            RoutingDecision::Foreground
+                        }
+                    }),
+                    background_jobs.task_origins.clone(),
+                );
+                let tasks = manager.handle();
+                let old_scopes = Arc::new(Mutex::new(Vec::new()));
+                let new_scopes = Arc::new(Mutex::new(Vec::new()));
+                let model_scopes = Arc::new(Mutex::new(Vec::new()));
+                let entered = Arc::new(AtomicBool::new(false));
+                let release = Arc::new(Notify::new());
+                let tools = ToolRegistry::new()
+                    .with(OwnershipTool {
+                        spec: ToolSpec::new(
+                            "old-task",
+                            "blocked old task",
+                            json!({"type": "object"}),
+                        ),
+                        release: Some(release.clone()),
+                        entered: entered.clone(),
+                        scopes: old_scopes.clone(),
+                    })
+                    .with(OwnershipTool {
+                        // TestAdapter's first turn invokes this real tool.
+                        spec: ToolSpec::new(
+                            "missing-tool",
+                            "new prompt tool",
+                            json!({"type": "object"}),
+                        ),
+                        release: None,
+                        entered: Arc::new(AtomicBool::new(false)),
+                        scopes: new_scopes.clone(),
+                    });
+                events::activate_diagnostics(&session_id.to_string());
+                let old = DiagnosticScope::with_operation(
+                    tokens.then(|| events::DiagnosticOperation::new("OLD".into()).unwrap()),
+                );
+                let task_id = agentkit_core::TaskId::new("old-task-id");
+                let old_scope = old
+                    .scope(async {
+                        events::scope_diagnostics(&session_id.to_string(), async {
+                            let captured = DiagnosticScope::capture();
+                            manager
+                                .start_task(
+                                    TaskLaunchRequest::plain(
+                                        Some(task_id.clone()),
+                                        ToolRequest::new(
+                                            ToolCallId::new("old-call"),
+                                            ToolName::new("old-task"),
+                                            json!({}),
+                                            loop_id.clone(),
+                                            TurnId::new("old-turn"),
+                                        ),
+                                    ),
+                                    TaskStartContext {
+                                        executor: Arc::new(BasicToolExecutor::new([Arc::new(
+                                            tools.clone(),
+                                        )
+                                            as Arc<dyn ToolSource>])),
+                                        tool_context: OwnedToolContext {
+                                            session_id: loop_id.clone(),
+                                            turn_id: TurnId::new("old-turn"),
+                                            metadata: MetadataMap::new(),
+                                            permissions: Arc::new(AllowAllPermissions),
+                                            resources: Arc::new(()),
+                                            cancellation: None,
+                                            execution_scope: None,
+                                            approved_request: None,
+                                        },
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            captured
+                        })
+                        .await
+                    })
+                    .await;
+                tasks
+                    .set_continue_policy(task_id, ContinuePolicy::RequestContinue)
+                    .await
+                    .unwrap();
+                while !entered.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                // Reactivation changes local authority too; old continuation must
+                // recover its full old scope, not merely its upstream token.
+                events::activate_diagnostics(&session_id.to_string());
+                let integration = server.integration.clone();
+                let recording = RecordingSink::default();
+                let sink = ResponseReplacementSink::new(recording);
+                let activity = SessionActivity::new(|_| Ok(()));
+                let handle = integration
+                    .bind_session(AcpSessionBinding::new(
+                        session_id.clone(),
+                        loop_id.clone(),
+                        sink.clone(),
+                    ))
+                    .unwrap();
+                let turns = Arc::new(AtomicU64::new(0));
+                let driver = Agent::builder()
+                    .model(OwnershipAdapter {
+                        inner: TestAdapter {
+                            outcome: TestOutcome::ToolThenContent,
+                            turns: turns.clone(),
+                            interrupt: None,
+                        },
+                        model_scopes: model_scopes.clone(),
+                    })
+                    .add_tool_source(tools)
+                    .task_manager(manager)
+                    .observer(crate::runtime::diagnostics::ConsumptionObserver::new(
+                        background_jobs.task_origins.clone(),
+                    ))
+                    .observer(ResponseReplacementObserver::new(
+                        integration.as_ref().clone(),
+                        sink.clone(),
+                        session_id.clone(),
+                        activity.clone(),
+                    ))
+                    .build()
+                    .unwrap()
+                    .start(SessionConfig::new(loop_id).without_cache())
+                    .await
+                    .unwrap();
+                let busy = Arc::new(AtomicBool::new(false));
+                let injections = Arc::new(Mutex::new(InjectionWork::default()));
+                let (commands, receiver) = mpsc::channel(8);
+                server.sessions.lock().unwrap().insert(
+                    session_id.clone(),
+                    SessionHandle {
+                        injections: injections.clone(),
+                        token: 0,
+                        commands: commands.clone(),
+                        integration: handle.clone(),
+                        busy: busy.clone(),
+                        background_jobs: background_jobs.clone(),
+                        structured_completion: false,
+                        tasks: tasks.clone(),
+                    },
+                );
+                let actor = tokio::spawn(session_actor(SessionActor {
+                    initial_generation: None,
+                    admission_released: injections.lock().unwrap().admission_released.clone(),
+                    session_id: session_id.clone(),
+                    runtime: runtime.clone(),
+                    integration: integration.clone(),
+                    handle: handle.clone(),
+                    busy: busy.clone(),
+                    binding: BindingGuard {
+                        integration,
+                        session_id: session_id.clone(),
+                    },
+                    sink,
+                    activity,
+                    driver,
+                    tasks: tasks.clone(),
+                    background_jobs,
+                    structured_completion: false,
+                    skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+                    adapter: SelectableAdapter::new_with_credentials(
+                        ProviderKind::OpenAiSubscription,
+                        "gpt-5.4",
+                        crate::credentials::CredentialStorage::Memory,
+                    )
+                    .unwrap(),
+                    catalog: vec![],
+                    commands: receiver,
+                    mcp_events: runtime.subscribe_mcp(session_id.to_string()),
+                }));
+                let mut request = wire::PromptRequest::new(
+                    session_id.clone(),
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                        "new invocation",
+                    ))],
+                );
+                events::set_diagnostic_operation(
+                    &mut request.meta,
+                    &events::DiagnosticOperation::new("NEW".into()).unwrap(),
+                );
+                let admission = server.diagnostic_scope(request.meta.as_ref());
+                let start = admission
+                    .scope(server.prepare_prompt(request))
+                    .await
+                    .unwrap();
+                start.send(()).unwrap();
+                while busy.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(turns.load(Ordering::Relaxed), 2);
+                assert_eq!(
+                    tasks.list_running().await.len(),
+                    1,
+                    "old producer must remain live through the NEW prompt"
+                );
+                let expected_new = admission
+                    .scope(async {
+                        events::scope_diagnostics(&session_id.to_string(), async {
+                            DiagnosticScope::capture()
+                        })
+                        .await
+                    })
+                    .await;
+                assert_eq!(
+                    *model_scopes.lock().unwrap(),
+                    vec![expected_new.clone(), expected_new.clone()]
+                );
+                assert_eq!(
+                    *new_scopes.lock().unwrap(),
+                    vec![expected_new.clone(), expected_new]
+                );
+                assert_eq!(*old_scopes.lock().unwrap(), vec![old_scope.clone()]);
+                release.notify_one();
+                while turns.load(Ordering::Relaxed) < 3 || busy.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(model_scopes.lock().unwrap()[2], old_scope);
+                assert_eq!(
+                    *old_scopes.lock().unwrap(),
+                    vec![old_scope.clone(), old_scope]
+                );
+                let (reply, response) = oneshot::channel();
+                commands.send(Command::Close { reply }).await.unwrap();
+                response.await.unwrap();
+                actor.await.unwrap();
+            })
+            .await
+            .expect("ownership regression timed out");
+        }
+    }
     #[derive(Clone, Copy)]
     enum RacingBranch {
         Prepare,
@@ -4466,7 +5322,11 @@ mod tests {
         Abandon,
     }
 
-    async fn selected_completion_survives_branch_admission(background: bool, branch: RacingBranch) {
+    async fn selected_completion_survives_branch_admission(
+        background: bool,
+        branch: RacingBranch,
+        mixed: bool,
+    ) {
         use agentkit_core::{TaskId, ToolCallId, TurnId};
         use agentkit_task_manager::{ContinuePolicy, TaskLaunchRequest, TaskStartContext};
         use agentkit_tools_core::{
@@ -4481,6 +5341,7 @@ mod tests {
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
         let generations = Arc::new(Mutex::new(Vec::new()));
+        let origins = Arc::new(Mutex::new(Vec::new()));
         let activity = SessionActivity::new({
             let generations = generations.clone();
             move |transition| {
@@ -4499,59 +5360,78 @@ mod tests {
             ))
             .unwrap();
         let cancellation_generation = handle.cancellation_handle().generation();
-        let task_manager =
-            AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background);
+        let background_jobs = BackgroundJobs::default();
+        let task_manager = crate::runtime::diagnostics::DiagnosticTaskManager::new(
+            AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background),
+            background_jobs.task_origins.clone(),
+        );
+        let producer = DiagnosticScope::with_operation(Some(
+            events::DiagnosticOperation::new("background-origin".into()).unwrap(),
+        ));
         let tasks = task_manager.handle();
         let release_task = Arc::new(Notify::new());
+        let mut entered_tasks = Vec::new();
         if background {
-            let tools = ToolRegistry::new().with(BlockingTool {
-                spec: ToolSpec {
-                    name: ToolName::new("race-completion"),
-                    description: "controlled background completion".into(),
-                    input_schema: json!({"type": "object"}),
-                    output_schema: None,
-                    annotations: ToolAnnotations::default(),
-                    metadata: MetadataMap::new(),
-                },
-                entered: Arc::new(AtomicBool::new(false)),
-                release: release_task.clone(),
-            });
-            let task_id = TaskId::new("race-task");
-            task_manager
-                .start_task(
-                    TaskLaunchRequest::plain(
-                        Some(task_id.clone()),
-                        ToolRequest {
-                            call_id: ToolCallId::new("race-call"),
-                            tool_name: ToolName::new("race-completion"),
-                            input: json!({}),
-                            session_id: loop_id.clone(),
-                            turn_id: TurnId::new("background-turn"),
-                            metadata: MetadataMap::new(),
-                        },
-                    ),
-                    TaskStartContext {
-                        executor: Arc::new(BasicToolExecutor::new([
-                            Arc::new(tools) as Arc<dyn ToolSource>
-                        ])),
-                        tool_context: OwnedToolContext {
-                            session_id: loop_id.clone(),
-                            turn_id: TurnId::new("background-turn"),
-                            metadata: MetadataMap::new(),
-                            permissions: Arc::new(AllowAllPermissions),
-                            resources: Arc::new(()),
-                            cancellation: None,
-                            execution_scope: None,
-                            approved_request: None,
-                        },
+            for index in 0..if mixed { 2 } else { 1 } {
+                let producer = if index == 0 {
+                    producer.clone()
+                } else {
+                    DiagnosticScope::with_operation(Some(
+                        events::DiagnosticOperation::new("another-background-origin".into())
+                            .unwrap(),
+                    ))
+                };
+                let entered = Arc::new(AtomicBool::new(false));
+                entered_tasks.push(entered.clone());
+                let tools = ToolRegistry::new().with(BlockingTool {
+                    spec: ToolSpec {
+                        name: ToolName::new("race-completion"),
+                        description: "controlled background completion".into(),
+                        input_schema: json!({"type": "object"}),
+                        output_schema: None,
+                        annotations: ToolAnnotations::default(),
+                        metadata: MetadataMap::new(),
                     },
-                )
-                .await
-                .unwrap();
-            tasks
-                .set_continue_policy(task_id, ContinuePolicy::RequestContinue)
-                .await
-                .unwrap();
+                    entered,
+                    release: release_task.clone(),
+                });
+                let task_id = TaskId::new(format!("race-task-{index}"));
+                producer
+                    .scope(task_manager.start_task(
+                        TaskLaunchRequest::plain(
+                            Some(task_id.clone()),
+                            ToolRequest {
+                                call_id: ToolCallId::new(format!("race-call-{index}")),
+                                tool_name: ToolName::new("race-completion"),
+                                input: json!({}),
+                                session_id: loop_id.clone(),
+                                turn_id: TurnId::new("background-turn"),
+                                metadata: MetadataMap::new(),
+                            },
+                        ),
+                        TaskStartContext {
+                            executor: Arc::new(BasicToolExecutor::new([
+                                Arc::new(tools) as Arc<dyn ToolSource>
+                            ])),
+                            tool_context: OwnedToolContext {
+                                session_id: loop_id.clone(),
+                                turn_id: TurnId::new("background-turn"),
+                                metadata: MetadataMap::new(),
+                                permissions: Arc::new(AllowAllPermissions),
+                                resources: Arc::new(()),
+                                cancellation: None,
+                                execution_scope: None,
+                                approved_request: None,
+                            },
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                tasks
+                    .set_continue_policy(task_id, ContinuePolicy::RequestContinue)
+                    .await
+                    .unwrap();
+            }
         }
         let turns = Arc::new(AtomicU64::new(0));
         let observer = ResponseReplacementObserver::new(
@@ -4563,11 +5443,17 @@ mod tests {
         let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
             .mutator(input_settlement.clone())
-            .model(TestAdapter {
-                outcome: TestOutcome::Content,
-                turns: turns.clone(),
-                interrupt: None,
+            .model(OwnershipAdapter {
+                inner: TestAdapter {
+                    outcome: TestOutcome::Content,
+                    turns: turns.clone(),
+                    interrupt: None,
+                },
+                model_scopes: origins.clone(),
             })
+            .observer(crate::runtime::diagnostics::ConsumptionObserver::new(
+                background_jobs.task_origins.clone(),
+            ))
             .observer(observer)
             .task_manager(task_manager)
             .build()
@@ -4583,37 +5469,53 @@ mod tests {
         let (commands, receiver) = mpsc::channel(8);
         let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
         let completion = tasks.clone();
-        let mut actor = Box::pin(session_actor(SessionActor {
-            initial_generation: None,
-            admission_released: work.lock().unwrap().admission_released.clone(),
-            session_id: session_id.clone(),
-            runtime,
-            integration: integration.clone(),
-            handle: handle.clone(),
-            busy: busy.clone(),
-            binding: BindingGuard {
-                integration,
+        let mut actor = Box::pin(
+            DiagnosticScope::with_operation(Some(
+                events::DiagnosticOperation::new("unrelated-admission".into()).unwrap(),
+            ))
+            .scope(session_actor(SessionActor {
+                initial_generation: None,
+                admission_released: work.lock().unwrap().admission_released.clone(),
                 session_id: session_id.clone(),
-            },
-            sink,
-            activity,
-            driver,
-            tasks,
-            background_jobs: BackgroundJobs::default(),
-            structured_completion: false,
-            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
-            adapter: SelectableAdapter::new_with_credentials(
-                ProviderKind::OpenAiSubscription,
-                "gpt-5.4",
-                crate::credentials::CredentialStorage::Memory,
-            )
-            .unwrap(),
-            catalog: vec![],
-            commands: receiver,
-            mcp_events,
-        }));
+                runtime,
+                integration: integration.clone(),
+                handle: handle.clone(),
+                busy: busy.clone(),
+                binding: BindingGuard {
+                    integration,
+                    session_id: session_id.clone(),
+                },
+                sink,
+                activity,
+                driver,
+                tasks,
+                background_jobs,
+                structured_completion: false,
+                skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+                adapter: SelectableAdapter::new_with_credentials(
+                    ProviderKind::OpenAiSubscription,
+                    "gpt-5.4",
+                    crate::credentials::CredentialStorage::Memory,
+                )
+                .unwrap(),
+                catalog: vec![],
+                commands: receiver,
+                mcp_events,
+            })),
+        );
         if background {
+            while entered_tasks
+                .iter()
+                .any(|entered| !entered.load(Ordering::SeqCst))
+            {
+                tokio::task::yield_now().await;
+            }
             release_task.notify_one();
+            if mixed {
+                release_task.notify_one();
+            }
+            // Complete every real producer before polling the admission-blocked
+            // actor: task completion alone must not claim a continuation owner.
             timeout(Duration::from_secs(5), completion.wait_for_idle())
                 .await
                 .unwrap();
@@ -4710,11 +5612,21 @@ mod tests {
                     "selected MCP completion"
                 })
                 .count(),
-            1
+            if mixed { 2 } else { 1 }
         );
         assert_eq!(transcript.matches("autonomous content").count(), 1);
         assert_eq!(turns.load(Ordering::Relaxed), 1);
         assert_eq!(*generations.lock().unwrap(), vec![(1, true), (1, false)]);
+        for origin in origins.lock().unwrap().iter() {
+            assert_eq!(
+                origin.operation().map(|op| op.as_str()),
+                if background && !mixed {
+                    Some("background-origin")
+                } else {
+                    None
+                }
+            );
+        }
         assert_eq!(
             handle.cancellation_handle().generation(),
             cancellation_generation
@@ -4730,13 +5642,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_actor_mixed_completion_is_unattributed() {
+        selected_completion_survives_branch_admission(true, RacingBranch::Abandon, true).await;
+    }
+
+    #[tokio::test]
     async fn branch_actor_selected_mcp_completion_is_not_stranded() {
         for branch in [
             RacingBranch::Prepare,
             RacingBranch::Reserve,
             RacingBranch::Abandon,
         ] {
-            selected_completion_survives_branch_admission(false, branch).await;
+            selected_completion_survives_branch_admission(false, branch, false).await;
         }
     }
 
@@ -4747,7 +5664,7 @@ mod tests {
             RacingBranch::Reserve,
             RacingBranch::Abandon,
         ] {
-            selected_completion_survives_branch_admission(true, branch).await;
+            selected_completion_survives_branch_admission(true, branch, false).await;
         }
     }
 
@@ -7517,7 +8434,7 @@ mod tests {
                     .as_u64()
                     .unwrap();
                 assert_eq!(
-                    crate::events::diagnostic_epoch(&source_id),
+                    crate::events::test_support::diagnostic_epoch(&source_id),
                     Some(first_epoch)
                 );
                 // Rejected requests must not reactivate a loaded actor. Exercise
@@ -7541,7 +8458,7 @@ mod tests {
                         .await
                         .expect_err("invalid loaded resume");
                     assert_eq!(
-                        crate::events::diagnostic_epoch(&source_id),
+                        crate::events::test_support::diagnostic_epoch(&source_id),
                         Some(first_epoch)
                     );
                 }
@@ -7558,7 +8475,7 @@ mod tests {
                     .unwrap();
                 assert!(same_id_epoch > first_epoch);
                 assert_eq!(
-                    crate::events::diagnostic_epoch(&source_id),
+                    crate::events::test_support::diagnostic_epoch(&source_id),
                     Some(same_id_epoch)
                 );
                 let listed = cx
@@ -7673,7 +8590,7 @@ mod tests {
                     .unwrap();
                 assert!(returned_epoch > same_id_epoch);
                 assert_eq!(
-                    crate::events::diagnostic_epoch(&source_id),
+                    crate::events::test_support::diagnostic_epoch(&source_id),
                     Some(returned_epoch)
                 );
                 assert_eq!(serde_json::to_value(&resumed.config_options).unwrap()[1]["currentValue"], "high");
@@ -7702,7 +8619,7 @@ mod tests {
                 ).block_task().await?;
                 let sibling_epoch = sibling_resume.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY].as_u64().unwrap();
                 assert!(sibling_epoch > returned_epoch);
-                assert_eq!(crate::events::diagnostic_epoch(&sibling_id), Some(sibling_epoch));
+                assert_eq!(crate::events::test_support::diagnostic_epoch(&sibling_id), Some(sibling_epoch));
                 assert_eq!(serde_json::to_value(&sibling_resume.config_options).unwrap()[1]["currentValue"], "default");
                 cx.send_request(wire::CloseSessionRequest::new(sibling_id.clone())).block_task().await?;
                 let source_again = cx.send_request(
@@ -7711,7 +8628,7 @@ mod tests {
                 ).block_task().await?;
                 let source_epoch = source_again.meta.as_ref().unwrap()[crate::events::ACTIVATION_META_KEY].as_u64().unwrap();
                 assert!(source_epoch > sibling_epoch);
-                assert_eq!(crate::events::diagnostic_epoch(&source_id), Some(source_epoch));
+                assert_eq!(crate::events::test_support::diagnostic_epoch(&source_id), Some(source_epoch));
                 assert_eq!(serde_json::to_value(&source_again.config_options).unwrap()[1]["currentValue"], "high");
                 assert!(updates.lock().unwrap().iter().any(|update| {
                     update.session_id.to_string() == sibling_id
@@ -7763,28 +8680,38 @@ mod tests {
 
     #[tokio::test]
     async fn v2_router_advertises_and_routes_pending_injection_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = Runtime::new_with_provider_and_credentials(
-            root.path(),
-            "gpt-5.4",
-            crate::ProviderKind::OpenAiSubscription,
-            crate::credentials::CredentialStorage::Memory,
-        )
-        .unwrap();
-        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
-        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
-        let client =
-            agent_client_protocol::Client
-                .v2()
-                .connect_with(client_transport, async move |cx| {
-                    let initialized = cx
-                        .send_request(wire::InitializeRequest::new(
-                            wire::ProtocolVersion::V2,
-                            wire::Implementation::new("replacement-test", "0"),
-                        ))
-                        .block_task()
-                        .await?;
+        for offered in [
+            None,
+            Some(json!({"kitDiagnosticOwnership": {"version": 99, "transport": "stderr"}})),
+            Some(json!({"kitDiagnosticOwnership": {"version": 1, "transport": "stderr"}})),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new_with_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap();
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+            let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+            let client = agent_client_protocol::Client.v2().connect_with(
+                client_transport,
+                async move |cx| {
+                    let mut initialize = wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("replacement-test", "0"),
+                    );
+                    initialize.meta = offered
+                        .as_ref()
+                        .map(|value| value.as_object().unwrap().clone());
+                    let negotiated = events::ownership_supported(initialize.meta.as_ref());
+                    let initialized = cx.send_request(initialize).block_task().await?;
+                    assert_eq!(
+                        events::ownership_supported(initialized.meta.as_ref()),
+                        negotiated
+                    );
                     let pending = initialized
                         .capabilities
                         .session
@@ -7814,13 +8741,15 @@ mod tests {
                     );
                     assert_eq!(error.data, Some(json!({ "sessionId": "missing-session" })));
                     Ok(())
-                });
-        let result = timeout(Duration::from_secs(2), client).await;
-        server.abort();
-        let _ = server.await;
-        result
-            .expect("replacement client timed out")
-            .expect("replacement client failed");
+                },
+            );
+            let result = timeout(Duration::from_secs(2), client).await;
+            server.abort();
+            let _ = server.await;
+            result
+                .expect("replacement client timed out")
+                .expect("replacement client failed");
+        }
     }
 
     #[test]
@@ -7904,6 +8833,58 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_ownership_negotiates_and_scopes_admission() {
+        for offer in [
+            None,
+            Some(json!({"kitDiagnosticOwnership": {"version": 99, "transport": "stderr"}})),
+            Some(json!({"kitDiagnosticOwnership": {"version": 1, "transport": "stderr"}})),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let server = Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                SessionRegistry::new(),
+            );
+            let mut request = terminal_auth_initialize_request();
+            request.meta = offer
+                .as_ref()
+                .map(|value| value.as_object().unwrap().clone());
+            let expected = events::ownership_supported(request.meta.as_ref());
+            let response = server.initialize(request).unwrap();
+            assert_eq!(
+                events::ownership_supported(response.meta.as_ref()),
+                expected
+            );
+            let meta = json!({"kitDiagnosticOperation": "admission-token", "unrelated": true});
+            let scope = server.diagnostic_scope(meta.as_object());
+            assert_eq!(
+                scope.operation().map(|op| op.as_str()),
+                expected.then_some("admission-token")
+            );
+            // Actual actor envelope crosses a channel and survives request scope exit.
+            let (commands, mut incoming) = mpsc::channel(1);
+            let (reply, _response) = oneshot::channel();
+            scope
+                .scope(async {
+                    commands
+                        .send(Command::Close { reply }.scoped())
+                        .await
+                        .unwrap();
+                })
+                .await;
+            let (producer, _) = incoming.recv().await.unwrap().into_scoped();
+            assert_eq!(producer.operation(), scope.operation());
+            assert!(server.diagnostic_scope(None).operation().is_none());
+            let malformed = json!({"kitDiagnosticOperation": {"token": "admission-token"}});
+            assert!(
+                server
+                    .diagnostic_scope(malformed.as_object())
+                    .operation()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
