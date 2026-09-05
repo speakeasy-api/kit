@@ -1000,9 +1000,15 @@ impl Server {
         &self,
         request: wire::PromptRequest,
     ) -> Result<oneshot::Sender<()>, AcpRuntimeError> {
-        // Wait for capacity before claiming busy/injection state. Cancellation
-        // while a full mailbox is pending must not strand a prompt claim.
         let (sender, busy, handle) = self.prompt_route(&request.session_id)?;
+        // Reject overlaps before waiting: mailbox pressure must not queue another turn.
+        if busy.load(Ordering::Acquire) {
+            return Err(AcpRuntimeError::Unsupported(
+                "session is already running a prompt".into(),
+            ));
+        }
+        // Claim only after capacity is available so cancellation cannot strand
+        // ownership. Recheck atomically afterward in case another request now owns it.
         let permit = sender
             .reserve()
             .await
@@ -4161,6 +4167,61 @@ mod tests {
         );
         original_actor.abort();
         let _ = original_actor.await;
+    }
+
+    #[tokio::test]
+    async fn busy_prompt_is_rejected_before_or_after_mailbox_wait() {
+        for initially_busy in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let registry = SessionRegistry::new();
+            let server = Arc::new(Server::new(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                registry.clone(),
+            ));
+            let mut admission = registry.begin_attachment().unwrap();
+            let (publication, actor, mut received) = pending_publication(&server, "busy-prompt");
+            let busy = Arc::clone(&publication.session.busy);
+            let session_id = publication.session_id.clone();
+            server
+                .publish_session(&mut admission, publication, || Ok(()))
+                .unwrap();
+            let sender = server.sender(&session_id).unwrap();
+            let (reply, _ack) = oneshot::channel();
+            sender.try_send(Command::Close { reply }).unwrap();
+            assert_eq!(sender.capacity(), 0);
+            busy.store(initially_busy, Ordering::Release);
+
+            let mut request =
+                Box::pin(server.prepare_prompt(wire::PromptRequest::new(session_id, Vec::new())));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            if !initially_busy {
+                assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+                assert!(!busy.load(Ordering::Acquire));
+                // Another request wins admission while this one waits for capacity.
+                claim_prompt(&busy).unwrap();
+                assert!(matches!(received.try_recv(), Ok(Command::Close { .. })));
+            }
+            assert!(matches!(
+                std::future::Future::poll(request.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(AcpRuntimeError::Unsupported(message)))
+                    if message == "session is already running a prompt"
+            ));
+            drop(request);
+            assert!(busy.load(Ordering::Acquire));
+            if initially_busy {
+                // Rejection must not wait for or consume the occupied mailbox slot.
+                assert_eq!(sender.capacity(), 0);
+                assert!(matches!(received.try_recv(), Ok(Command::Close { .. })));
+            }
+            busy.store(false, Ordering::Release);
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(sender.capacity(), 1);
+            actor.abort();
+            let _ = actor.await;
+        }
     }
 
     #[tokio::test]
