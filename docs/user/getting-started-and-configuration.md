@@ -211,30 +211,13 @@ For settings exposed by a command, precedence is:
 2. values in `~/.kit/config.toml`;
 3. built-in defaults.
 
-Set `capture_error_spans = true` to include a bounded structured span history
-alongside existing fatal errors in `~/.kit/errors/<session-id>/`. It defaults to
-`false` when omitted. This local collector is independent of OTLP export:
-neither setting enables the other. Disabled collection installs no diagnostic
-layer and retains no diagnostic span history. Built-in TUI and `acp.kit` children
-inherit the resolved setting and must use a compatible Kit executable.
+Set `capture_error_spans = true` when troubleshooting unexpected failures or
+preparing a bug report. Kit adds diagnostic context about recent operations to
+error logs in `~/.kit/errors/<session-id>/`, which can help explain a failure.
 
-The optional `span_context` field contains operation-local parent indexes and
-allowlisted operation names, launch kinds, tool-error classifications, booleans,
-and bounded counts from tracing spans. It excludes external identifiers,
-`Debug`/`Display` values, messages, prompts, tool arguments/results, URLs, and
-provider payloads, even when OTEL message-content capture is enabled. Attributes
-set only through OpenTelemetry APIs are not collected. Histories are limited to
-24 fragments, eight descendant levels, six fields per fragment, 32 bytes per
-string value, and 12 KiB of serialized context. Existing schema-v2 errors remain
-readable; files are not rewritten on read.
-
-Histories cover instrumented prompt and autonomous operation boundaries, including
-already-closed child spans. They are partial operation histories, not proof that
-sibling spans caused an error or that replay is safe. Collection is best-effort;
-missing observations never prove that no effects occurred. Upstream TaskManager
-spawns currently lose tracing ancestry, so tool task bodies and background work
-inside those spawns can be absent even when their dispatch span was observed.
-Remote child-process spans are not transported into the parent's error log.
+It is disabled by default to avoid additional collection overhead and does not
+require OpenTelemetry. The extra context excludes prompts and tool inputs and
+outputs; it is not a complete execution history.
 
 The OpenTelemetry endpoint follows the same CLI-over-TOML precedence, then falls
 back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. If none
