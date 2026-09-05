@@ -120,8 +120,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_status(frame, app, status);
         (prompt, viewport, false)
     };
-    if app.model_switch.is_some() {
-        draw_model_switch_dialog(frame, app);
+    if let Some(pending) = &app.model_switch {
+        draw_model_switch_dialog(frame, pending);
     } else if app.file_picker.is_some() {
         draw_file_picker(frame, app, prompt_area, prompt_viewport, picker_below);
     } else if app.session_dialog.is_some() {
@@ -532,8 +532,7 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-fn draw_model_switch_dialog(frame: &mut Frame<'_>, app: &App) {
-    let pending = app.model_switch.as_ref().expect("checked above");
+fn draw_model_switch_dialog(frame: &mut Frame<'_>, pending: &super::app::ModelSwitch) {
     let outer = frame.area();
     let width = outer.width.min(76);
     let height = outer.height.min(12);
@@ -552,7 +551,7 @@ fn draw_model_switch_dialog(frame: &mut Frame<'_>, app: &App) {
                 pending.choice.model, pending.choice.provider
             )),
             Line::from(format!(
-                "Estimated {} / {} tokens (includes 20% margin).",
+                "Estimated {} / {} tokens.",
                 warning.guarded_tokens, warning.target_window
             )),
             Line::from("At least 80% of the target context is occupied."),
@@ -2998,7 +2997,7 @@ mod tests {
         let screen = render(&mut app, 90, 24);
         for label in [
             "model context warning",
-            "20% margin",
+            "Estimated 120000 / 150000 tokens.",
             "80%",
             "Continue anyway",
             "Compact",
@@ -3006,6 +3005,7 @@ mod tests {
         ] {
             assert!(screen.contains(label), "missing {label}");
         }
+        assert!(!screen.contains("margin"));
         // Small terminals must not panic when a dialog is clipped.
         let _ = render(&mut app, 1, 1);
     }

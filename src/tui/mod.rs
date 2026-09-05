@@ -75,23 +75,83 @@ struct ModelSwitchCompletion {
     response: Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
 }
 
+fn prepare_model_switch_request(
+    app: &mut App,
+    action: Action,
+    session_id: wire::SessionId,
+) -> Result<(u64, SetSessionConfigOptionRequest), agent_client_protocol::Error> {
+    let confirmation = match action {
+        Action::SelectModel {
+            choice,
+            save_defaults,
+        } => {
+            app.begin_model_switch(choice, save_defaults)
+                .ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "wait for the current operation before changing models",
+                    )
+                })?;
+            None
+        }
+        Action::ConfirmModelSwitch(decision) => {
+            let warning = app
+                .model_switch
+                .as_ref()
+                .and_then(|pending| pending.warning.as_ref())
+                .ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "no model-switch warning to confirm",
+                    )
+                })?;
+            Some(
+                serde_json::to_value(model_switch::Confirmation {
+                    token: warning.token,
+                    action: decision,
+                })
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            )
+        }
+        _ => {
+            return Err(agent_client_protocol::util::internal_error(
+                "invalid model-switch action",
+            ));
+        }
+    };
+    let pending = app
+        .model_switch
+        .as_mut()
+        .ok_or_else(|| agent_client_protocol::util::internal_error("no pending model switch"))?;
+    let mut request =
+        SetSessionConfigOptionRequest::new(session_id, MODEL_CONFIG_ID, pending.choice.id.as_str());
+    if let Some(confirmation) = confirmation {
+        request.meta = Some(serde_json::Map::from_iter([(
+            model_switch::META.into(),
+            confirmation,
+        )]));
+        // Keep the warning available if preparing its confirmation fails.
+        pending.warning = None;
+    }
+    Ok((pending.id, request))
+}
+
 fn take_model_switch_completion(
     app: &mut App,
     route: &Arc<Mutex<ActiveSessionRoute>>,
     generation: u64,
     operation: u64,
-) -> Option<app::ModelSwitch> {
-    if !route
-        .lock()
-        .is_ok_and(|route| route.generation == generation)
+) -> Result<Option<app::ModelSwitch>, agent_client_protocol::Error> {
+    let route = route.lock().map_err(|_| {
+        agent_client_protocol::util::internal_error("active session route poisoned")
+    })?;
+    if route.generation != generation
         || app
             .model_switch
             .as_ref()
             .is_none_or(|pending| pending.id != operation)
     {
-        return None;
+        return Ok(None);
     }
-    app.model_switch.take()
+    Ok(app.model_switch.take())
 }
 
 /// Animation and elapsed-time refresh interval.
@@ -1481,25 +1541,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                                 Action::Close => return Ok(()),
                                 action @ (Action::SelectModel { .. } | Action::ConfirmModelSwitch(_)) => {
-                                    let confirmation = match action {
-                                        Action::SelectModel { choice, save_defaults } => {
-                                            if app.begin_model_switch(choice, save_defaults).is_none() { continue; }
-                                            None
+                                    // A poisoned route may pair a session ID with the wrong generation.
+                                    // Stop explicitly rather than send a request with untrusted correlation.
+                                    let generation = transition_session.lock().map_err(|_| {
+                                        agent_client_protocol::util::internal_error("active session route poisoned")
+                                    })?.generation;
+                                    let (operation, request) = match prepare_model_switch_request(&mut app, action, session_id.clone()) {
+                                        Ok(request) => request,
+                                        Err(error) => {
+                                            app.note(format!("could not change model: {}", error.message));
+                                            continue;
                                         }
-                                        Action::ConfirmModelSwitch(decision) => {
-                                            let Some(pending) = app.model_switch.as_mut() else { continue; };
-                                            let Some(warning) = pending.warning.take() else { continue; };
-                                            Some(model_switch::Confirmation { token: warning.token, action: decision })
-                                        }
-                                        _ => unreachable!(),
                                     };
-                                    let Some(pending) = &app.model_switch else { continue; };
-                                    let operation = pending.id;
-                                    let generation = transition_session.lock().expect("session route").generation;
-                                    let mut request = SetSessionConfigOptionRequest::new(session_id.clone(), MODEL_CONFIG_ID, pending.choice.id.as_str());
-                                    if let Some(confirmation) = confirmation {
-                                        request.meta = Some(serde_json::Map::from_iter([(model_switch::META.into(), serde_json::to_value(confirmation).expect("confirmation serialization"))]));
-                                    }
                                     let connection = connection.clone();
                                     let completed = switch_tx.clone();
                                     tokio::task::spawn_local(async move {
@@ -1700,7 +1753,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         Some(completion) = switch_rx.recv() => {
-                            let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation) else { continue; };
+                            let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation)? else { continue; };
                             match completion.response {
                                 Ok(response) => {
                                     let choice = pending.choice;
@@ -2998,6 +3051,77 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_request_rejects_invalid_actions_and_missing_warnings() {
+        use crate::protocols::acp::model_switch::{Confirmation, Decision, META, Warning};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let session = wire::SessionId::new("first");
+        assert!(
+            super::prepare_model_switch_request(&mut app, Action::None, session.clone()).is_err()
+        );
+        assert!(
+            super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(Decision::Continue),
+                session.clone()
+            )
+            .is_err()
+        );
+        assert!(app.model_switch.is_none());
+        let choice = ModelChoice {
+            id: "openrouter:target".into(),
+            provider: "openrouter".into(),
+            model: "target".into(),
+        };
+        let (operation, request) = super::prepare_model_switch_request(
+            &mut app,
+            Action::SelectModel {
+                choice,
+                save_defaults: true,
+            },
+            session.clone(),
+        )
+        .unwrap();
+        assert!(request.meta.is_none());
+        assert!(
+            super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(Decision::Compact),
+                session.clone()
+            )
+            .is_err()
+        );
+        assert_eq!(app.model_switch.as_ref().unwrap().id, operation);
+        for decision in [Decision::Continue, Decision::Compact] {
+            app.model_switch.as_mut().unwrap().warning = Some(Warning {
+                token: 42,
+                guarded_tokens: "120000".into(),
+                target_window: 150000,
+            });
+            let (confirmed_operation, request) = super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(decision),
+                session.clone(),
+            )
+            .unwrap();
+            let confirmation: Confirmation =
+                serde_json::from_value(request.meta.unwrap()[META].clone()).unwrap();
+            assert_eq!(confirmation.token, 42);
+            assert_eq!(confirmation.action, decision);
+            assert_eq!(confirmed_operation, operation);
+            let pending = app.model_switch.as_ref().unwrap();
+            assert!(pending.warning.is_none());
+            assert!(pending.save_defaults);
+            assert_eq!(pending.choice.id, "openrouter:target");
+            assert_eq!(app.model, "original");
+        }
+    }
+
+    #[test]
     fn model_switch_completion_requires_current_session_and_operation() {
         let mut app = App::new(
             PathBuf::from("/tmp"),
@@ -3015,12 +3139,59 @@ mod tests {
             model: "target".into(),
         };
         let operation = app.begin_model_switch(choice, false).unwrap();
-        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation + 1).is_none());
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 0, operation + 1)
+                .unwrap()
+                .is_none()
+        );
         transition_route(&route, "second".into());
-        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation).is_none());
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 0, operation)
+                .unwrap()
+                .is_none()
+        );
         assert!(app.model_switch.is_some());
-        assert!(super::take_model_switch_completion(&mut app, &route, 1, operation).is_some());
-        assert!(super::take_model_switch_completion(&mut app, &route, 1, operation).is_none());
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 1, operation)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 1, operation)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(app.model, "original");
+    }
+
+    #[test]
+    fn model_switch_completion_reports_poisoned_route_without_discarding_switch() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "first".into(),
+            generation: 0,
+        }));
+        let operation = app
+            .begin_model_switch(
+                ModelChoice {
+                    id: "openrouter:target".into(),
+                    provider: "openrouter".into(),
+                    model: "target".into(),
+                },
+                false,
+            )
+            .unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = route.lock().unwrap();
+            panic!("poison session route");
+        });
+        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation).is_err());
+        assert_eq!(app.model_switch.as_ref().unwrap().id, operation);
         assert_eq!(app.model, "original");
     }
 

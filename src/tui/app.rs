@@ -3154,49 +3154,45 @@ impl App {
         Some(id)
     }
 
-    fn handle_model_switch_key(&mut self, key: KeyEvent) -> Action {
-        use crate::protocols::acp::model_switch::Decision;
-        let pending = self.model_switch.as_mut().expect("checked above");
-        let cancel = key.code == KeyCode::Esc
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
-        if pending.warning.is_none() {
-            if cancel {
-                if pending.cancelling {
-                    return if key.code == KeyCode::Char('c') {
-                        Action::Quit
-                    } else {
-                        Action::None
-                    };
-                }
-                pending.cancelling = true;
-                return Action::Cancel;
-            }
-            return Action::None;
-        }
-        if cancel {
-            self.model_switch = None;
-            return Action::Redraw;
-        }
-        match key.code {
-            KeyCode::Up => pending.selected = pending.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => pending.selected = (pending.selected + 1) % 3,
-            KeyCode::Enter => match pending.selected {
-                0 => return Action::ConfirmModelSwitch(Decision::Continue),
-                1 => return Action::ConfirmModelSwitch(Decision::Compact),
-                _ => self.model_switch = None,
-            },
-            _ => {}
-        }
-        Action::Redraw
-    }
-
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
-        if self.model_switch.is_some() {
-            return self.handle_model_switch_key(key);
+        if let Some(pending) = self.model_switch.as_mut() {
+            use crate::protocols::acp::model_switch::Decision;
+            let cancel = key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if pending.warning.is_none() {
+                if cancel {
+                    if pending.cancelling {
+                        return if key.code == KeyCode::Char('c') {
+                            Action::Quit
+                        } else {
+                            Action::None
+                        };
+                    }
+                    pending.cancelling = true;
+                    return Action::Cancel;
+                }
+                return Action::None;
+            }
+            if cancel {
+                self.model_switch = None;
+                return Action::Redraw;
+            }
+            match key.code {
+                KeyCode::Up => pending.selected = pending.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => pending.selected = (pending.selected + 1) % 3,
+                KeyCode::Enter => match pending.selected {
+                    0 => return Action::ConfirmModelSwitch(Decision::Continue),
+                    1 => return Action::ConfirmModelSwitch(Decision::Compact),
+                    _ => self.model_switch = None,
+                },
+                _ => {}
+            }
+            return Action::Redraw;
         }
         if self.session_dialog.is_some() {
             // Terminals without bracketed paste deliver a paste as a key burst, so

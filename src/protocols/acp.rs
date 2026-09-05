@@ -1545,9 +1545,11 @@ impl Server {
         &self,
         session_id: &agentkit_acp::SessionId,
     ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
+        // Publication holds this lock across registry registration and commit.
+        // A poisoned map cannot establish that the session lifecycle is consistent.
         self.sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::Loop("ACP session map poisoned".into()))?
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
@@ -3866,6 +3868,72 @@ pub(super) mod tests {
         .await
         .expect("non-cooperative task did not start");
         (jobs, tasks)
+    }
+
+    #[tokio::test]
+    async fn set_config_rejects_poisoned_session_map_without_queueing_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            AcpIntegration::builder()
+                .name("poison-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        );
+        let session_id = agentkit_acp::SessionId::new("poisoned-session");
+        let (client, _messages) = AcpClientHandle::channel();
+        server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                AgentkitSessionId::new("poisoned-session"),
+                client,
+            ))
+            .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                token: 1,
+                commands,
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = server.sessions.lock().unwrap();
+                panic!("poison session map");
+            }))
+            .is_err()
+        );
+
+        for id in [session_id, agentkit_acp::SessionId::new("missing-session")] {
+            let error = timeout(
+                Duration::from_secs(1),
+                server.set_config(SetSessionConfigOptionRequest::new(
+                    id,
+                    MODEL_CONFIG_ID,
+                    "openai-subscription:gpt-5.4-mini",
+                )),
+            )
+            .await
+            .expect("poison must return an error without waiting for the actor")
+            .unwrap_err();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InternalError);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!("loop error: ACP session map poisoned"))
+            );
+        }
+        assert!(server.sessions.is_poisoned());
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
