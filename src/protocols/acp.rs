@@ -2134,6 +2134,8 @@ async fn drive_domain_until_pause<S: ModelSession>(
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<FinishReason, AcpRuntimeError> {
+    let cancellation = integration.cancellation_handle(session_id)?;
+    let generation = cancellation.generation();
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
@@ -2142,6 +2144,13 @@ async fn drive_domain_until_pause<S: ModelSession>(
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
+        if cancellation.is_cancelled_since(generation) {
+            driver
+                .retire_interrupted_turn()
+                .await
+                .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+            return Ok(FinishReason::Cancelled);
+        }
         match step {
             LoopStep::Finished(result) => {
                 if result.finish_reason == FinishReason::ToolCall {

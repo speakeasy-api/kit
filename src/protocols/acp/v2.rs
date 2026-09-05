@@ -1371,6 +1371,36 @@ where
     S: ModelSession + Send + 'static,
     C: TurnControl<S>,
 {
+    let result = drive_prompt_inner(
+        session_id,
+        driver,
+        control,
+        cancellation_generation,
+        structured,
+    )
+    .await;
+    if matches!(result, Ok(FinishReason::Cancelled)) {
+        // A cooperative interrupt is still a live logical turn. Retire it
+        // without another `next`, which could execute cancelled model work.
+        driver
+            .retire_interrupted_turn()
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+    }
+    result
+}
+
+async fn drive_prompt_inner<S, C>(
+    session_id: &wire::SessionId,
+    driver: &mut LoopDriver<S>,
+    control: &C,
+    cancellation_generation: u64,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+) -> Result<FinishReason, AcpRuntimeError>
+where
+    S: ModelSession + Send + 'static,
+    C: TurnControl<S>,
+{
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
