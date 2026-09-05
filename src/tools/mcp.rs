@@ -1266,29 +1266,6 @@ impl McpRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish(&self, session_id: &str, event: McpEvent) {
-        self.publish_to(session_id, self.event_generation(session_id), event);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn config_source_states(&self) -> Vec<(PathBuf, bool, bool)> {
-        self.inner
-            .reload
-            .lock()
-            .await
-            .sources
-            .iter()
-            .map(|state| {
-                (
-                    state.source.path.clone(),
-                    state.source.required,
-                    state.raw.is_some(),
-                )
-            })
-            .collect()
-    }
-
     pub(crate) async fn refresh(&self) -> Result<(), String> {
         self.reload_config().await
     }
@@ -2809,6 +2786,34 @@ fn render_search(
                 returned.pop().is_some(),
                 "empty search response exceeds byte cap"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl McpRuntime {
+        pub(crate) fn publish(&self, session_id: &str, event: McpEvent) {
+            self.publish_to(session_id, self.event_generation(session_id), event);
+        }
+
+        pub(crate) async fn config_source_states(&self) -> Vec<(PathBuf, bool, bool)> {
+            self.inner
+                .reload
+                .lock()
+                .await
+                .sources
+                .iter()
+                .map(|state| {
+                    (
+                        state.source.path.clone(),
+                        state.source.required,
+                        state.raw.is_some(),
+                    )
+                })
+                .collect()
         }
     }
 }

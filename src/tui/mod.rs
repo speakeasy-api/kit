@@ -374,13 +374,11 @@ enum ConnectedAuthentication {
 
 async fn wait_for_connected_authentication(
     authentication: impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>>,
-    prepare: impl FnOnce(),
     app: &mut App,
     route: &Arc<Mutex<ActiveSessionRoute>>,
     updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
 ) -> ConnectedAuthentication {
-    prepare();
     tokio::pin!(authentication);
     loop {
         tokio::select! {
@@ -1012,12 +1010,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         &method,
                                         &mut stop,
                                     );
+                                    leave(&mut terminal);
+                                    println!("Starting {}…", method.name);
                                     let authenticated = wait_for_connected_authentication(
                                         authentication,
-                                        || {
-                                            leave(&mut terminal);
-                                            println!("Starting {}…", method.name);
-                                        },
                                         &mut app,
                                         &transition_session,
                                         &mut updates_rx,
@@ -1533,12 +1529,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         &method,
                                         &mut stop,
                                     );
+                                    leave(&mut terminal);
+                                    println!("Starting {}…", method.name);
                                     let authenticated = wait_for_connected_authentication(
                                         authentication,
-                                        || {
-                                            leave(&mut terminal);
-                                            println!("Starting {}…", method.name);
-                                        },
                                         &mut app,
                                         &transition_session,
                                         &mut updates_rx,
@@ -3000,7 +2994,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connected_terminal_authentication_prepares_before_observing_agent_exit() {
+    async fn connected_terminal_authentication_observes_agent_exit() {
         let root = tempfile::tempdir().unwrap();
         let mut app = App::new(
             root.path().into(),
@@ -3019,11 +3013,9 @@ mod tests {
             .unwrap();
         let authentication =
             std::future::pending::<Option<std::io::Result<std::process::ExitStatus>>>();
-        let prepared = std::cell::Cell::new(false);
 
         let result = wait_for_connected_authentication(
             authentication,
-            || prepared.set(true),
             &mut app,
             &route,
             &mut updates_rx,
@@ -3031,11 +3023,45 @@ mod tests {
         )
         .await;
 
-        assert!(prepared.get());
         assert!(matches!(
             result,
             ConnectedAuthentication::AgentExited(Ok(Err(_)))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_terminal_authentication_returns_the_process_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let mut stop = super::Stop::new().unwrap();
+        for code in [0, 7] {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            let result = wait_for_connected_authentication(
+                super::wait_for_terminal_auth(command, &mut stop),
+                &mut app,
+                &route,
+                &mut updates_rx,
+                &mut exit_rx,
+            )
+            .await;
+            let ConnectedAuthentication::Completed(Some(Ok(status))) = result else {
+                panic!("authentication did not return its process status");
+            };
+            assert_eq!(status.code(), Some(code));
+        }
     }
 
     #[test]
@@ -3161,6 +3187,117 @@ mod tests {
             [Update::ToolPatched { intent: Some(Some(intent)), script: Some(script), .. }]
                 if intent == "Check the project." && script == "return 1"
         ));
+    }
+
+    #[test]
+    fn replayed_media_uses_safe_display_content_instead_of_raw_payloads() {
+        use crate::tui::app::Block;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        // These are the complete content shapes produced by ACP v2 transcript replay:
+        // URI media becomes resource links; data URLs become structured image payloads.
+        let content = vec![
+            ContentBlock::Text(TextContent::new("inspect these")),
+            ContentBlock::ResourceLink(wire::ResourceLink::new(
+                "file:///tmp/image.png",
+                "file:///tmp/image.png",
+            )),
+            ContentBlock::ResourceLink(wire::ResourceLink::new(
+                "https://example.com/result.png",
+                "https://example.com/result.png",
+            )),
+            ContentBlock::Image(wire::ImageContent::new("c2VjcmV0", "image/png")),
+        ];
+        let notifications = [
+            SessionUpdate::UserMessage(UserMessage::new("user").content(content.clone())),
+            // Tagged compaction summaries are ordinary agent messages on this path.
+            SessionUpdate::AgentMessage(
+                AgentMessage::new("compaction")
+                    .content(vec![ContentBlock::Text(TextContent::new("summary"))]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool-1")
+                    .status(wire::ToolCallStatus::Completed)
+                    .raw_output(Some(json!({"uri": "data:image/png;base64,c2VjcmV0"})))
+                    .content(
+                        content
+                            .into_iter()
+                            .map(|block| {
+                                wire::ToolCallContent::Content(Box::new(wire::Content::new(block)))
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+            ),
+        ];
+        for notification in notifications {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", notification),
+                "session",
+            ) {
+                app.apply(update);
+            }
+        }
+
+        let [Block::User(user), Block::Agent(summary), Block::Tool(tool)] = app.blocks.as_slice()
+        else {
+            panic!("expected user, summary and completed tool blocks");
+        };
+        let links = "inspect these[file:///tmp/image.png](file:///tmp/image.png)[https://example.com/result.png](https://example.com/result.png)";
+        assert_eq!(user.text, format!("{links}\n[Image #1]"));
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(user.images[0].data, "c2VjcmV0");
+        assert_eq!(summary, "summary");
+        assert_eq!(tool.status, wire::ToolCallStatus::Completed);
+        assert_eq!(
+            tool.output,
+            [
+                "inspect these",
+                "[file:///tmp/image.png](file:///tmp/image.png)",
+                "[https://example.com/result.png](https://example.com/result.png)",
+                "[Image]",
+            ]
+        );
+        for text in std::iter::once(&user.text).chain(tool.output.iter()) {
+            assert!(!text.contains("data:"));
+            assert!(!text.contains("c2VjcmV0"));
+        }
+    }
+
+    #[test]
+    fn replayed_media_translation_rejects_unsafe_and_oversized_links() {
+        for uri in [
+            "data:image/png;base64,c2VjcmV0".to_string(),
+            "javascript:alert(1)".to_string(),
+            format!("https://example.com/{}", "x".repeat(2048)),
+        ] {
+            let content = vec![
+                ContentBlock::ResourceLink(wire::ResourceLink::new(uri.clone(), uri.clone())),
+                ContentBlock::Image(
+                    wire::ImageContent::new("c2VjcmV0", "image/png").uri(Some(uri)),
+                ),
+            ];
+            let update = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::UserMessage(UserMessage::new("user").content(content.clone())),
+            );
+            assert!(
+                matches!(translate_for_session(update, "session").as_slice(),
+                [Update::UserMessage { text, images, .. }] if text == "[Image #1]" && images.len() == 1)
+            );
+            let update = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::AgentMessage(AgentMessage::new("agent").content(content)),
+            );
+            assert!(
+                matches!(translate_for_session(update, "session").as_slice(),
+                [Update::AgentMessage { text, .. }] if text == "[Image]")
+            );
+        }
     }
 
     #[test]

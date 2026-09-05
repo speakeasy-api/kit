@@ -121,8 +121,6 @@ fn subscription_resilience() -> ResilienceConfig {
 pub struct SubscriptionConfig {
     pub model: String,
     pub credential_storage: crate::credentials::CredentialStorage,
-    #[cfg(test)]
-    endpoint: Option<String>,
 }
 
 impl SubscriptionConfig {
@@ -133,8 +131,6 @@ impl SubscriptionConfig {
         Ok(Self {
             model,
             credential_storage: Default::default(),
-            #[cfg(test)]
-            endpoint: None,
         })
     }
 
@@ -144,14 +140,6 @@ impl SubscriptionConfig {
     ) -> Self {
         self.credential_storage = storage;
         self
-    }
-
-    fn endpoint(&self) -> &str {
-        #[cfg(test)]
-        if let Some(endpoint) = &self.endpoint {
-            return endpoint;
-        }
-        ENDPOINT
     }
 }
 
@@ -265,7 +253,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
         });
         let mut config =
             OpenAIResponsesConfig::chatgpt_private(self.config.model.clone(), authentication)
-                .with_endpoint(self.config.endpoint())
+                .with_endpoint(ENDPOINT)
                 .with_originator("kit")
                 .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
                 .with_limits(OpenAIResponsesLimits {
@@ -1200,8 +1188,7 @@ mod tests {
 
     #[test]
     fn authentication_attempt_is_bound_and_redacted() {
-        let record =
-            auth::TokenRecord::for_test_generation("secret-token", "account-1", "generation-1");
+        let record = auth::test_support::token_record("secret-token", "account-1", "generation-1");
         let attempt = authentication_attempt(record).unwrap();
         assert_eq!(
             attempt.headers()["ChatGPT-Account-ID"],
@@ -1218,20 +1205,20 @@ mod tests {
 
     #[test]
     fn session_binding_rejects_generation_change() {
-        let expected = auth::TokenRecord::for_test_generation("a", "account", "one")
+        let expected = auth::test_support::token_record("a", "account", "one")
             .binding()
             .unwrap();
         assert!(
             ensure_credential_binding(
                 &expected,
-                &auth::TokenRecord::for_test_generation("b", "account", "one")
+                &auth::test_support::token_record("b", "account", "one")
             )
             .is_ok()
         );
         assert!(
             ensure_credential_binding(
                 &expected,
-                &auth::TokenRecord::for_test_generation("c", "account", "two")
+                &auth::test_support::token_record("c", "account", "two")
             )
             .is_err()
         );
@@ -1240,18 +1227,16 @@ mod tests {
     #[tokio::test]
     async fn model_catalog_cache_is_scoped_to_account_and_generation() {
         let cache = SubscriptionModelCatalogCache::default();
-        let first_binding =
-            auth::TokenRecord::for_test_generation("token", "account-1", "generation-1")
-                .binding()
-                .unwrap();
+        let first_binding = auth::test_support::token_record("token", "account-1", "generation-1")
+            .binding()
+            .unwrap();
         let next_generation =
-            auth::TokenRecord::for_test_generation("token", "account-1", "generation-2")
+            auth::test_support::token_record("token", "account-1", "generation-2")
                 .binding()
                 .unwrap();
-        let next_account =
-            auth::TokenRecord::for_test_generation("token", "account-2", "generation-1")
-                .binding()
-                .unwrap();
+        let next_account = auth::test_support::token_record("token", "account-2", "generation-1")
+            .binding()
+            .unwrap();
 
         let first = cache
             .get_or_try_init(&first_binding, || async {
@@ -1302,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn model_catalog_cache_retries_after_failure() {
         let cache = SubscriptionModelCatalogCache::default();
-        let binding = auth::TokenRecord::for_test_generation("token", "account", "generation")
+        let binding = auth::test_support::token_record("token", "account", "generation")
             .binding()
             .unwrap();
 

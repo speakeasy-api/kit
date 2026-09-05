@@ -416,18 +416,6 @@ fn write_default(
     )
 }
 
-#[cfg(test)]
-fn write_in(
-    base: &Path,
-    session_id: &str,
-    surface: Surface,
-    kind: &str,
-    code: &str,
-    message: &str,
-) -> Result<PathBuf, String> {
-    write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
-}
-
 fn write_in_with_diagnostics(
     base: &Path,
     session_id: &str,
@@ -534,7 +522,10 @@ fn event_order(path: &Path) -> Option<(u64, u32, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use agentkit_loop::LoopError;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -544,8 +535,19 @@ mod tests {
         DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
         MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
         TransportSource, TransportStage, bounded, classify, event_order, record_loop_error,
-        render_loop_error, split_diagnostics, write_in, write_in_with_diagnostics,
+        render_loop_error, split_diagnostics, write_in_with_diagnostics,
     };
+
+    fn write_in(
+        base: &Path,
+        session_id: &str,
+        surface: Surface,
+        kind: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<PathBuf, String> {
+        write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
+    }
 
     fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
         let encoded = serde_json::to_vec(diagnostics).unwrap();

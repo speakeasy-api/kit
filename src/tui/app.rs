@@ -13,21 +13,15 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-#[cfg(test)]
-use agent_client_protocol::schema::v2::RunningStateUpdate;
 use agent_client_protocol::schema::v2::{
     AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
 };
-#[cfg(test)]
-use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{layout::Rect, text::Line};
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(test)]
-use crate::compaction::is_compaction_summary;
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
@@ -98,15 +92,6 @@ pub enum Update {
         script: Option<String>,
         backgrounded: bool,
     },
-    /// A tool call changed status or produced output.
-    #[cfg(test)]
-    ToolUpdated {
-        id: String,
-        status: Option<ToolCallStatus>,
-        script: Option<String>,
-        output: Vec<String>,
-        backgrounded: bool,
-    },
     /// A patchable ACP v2 tool call update or content chunk.
     ToolPatched {
         id: String,
@@ -136,25 +121,6 @@ pub enum Update {
     Log(String),
     /// The ACP process exited while work could still be active.
     ProcessExited(String),
-}
-
-#[cfg(test)]
-impl Update {
-    pub(super) fn test_text(text: String) -> Self {
-        Self::AgentMessage {
-            id: "test-agent".into(),
-            text,
-            append: true,
-        }
-    }
-
-    pub(super) fn test_thought(text: String) -> Self {
-        Self::AgentThought {
-            id: "test-thought".into(),
-            text,
-            append: true,
-        }
-    }
 }
 
 /// Latest provider-reported occupancy of the main model's context window.
@@ -870,64 +836,6 @@ fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
     ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
 }
 
-#[cfg(test)]
-fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
-    let kind = match media.modality {
-        Modality::Image => "Image",
-        Modality::Audio => "Audio",
-        Modality::Video => "Video",
-        Modality::Binary => "Media",
-    };
-    match &media.data {
-        DataRef::Uri(uri) if safe_media_uri(uri) => format!("[{kind} #{index}]({uri})"),
-        _ => format!("[{kind} #{index}]"),
-    }
-}
-
-#[cfg(test)]
-fn safe_media_uri(uri: &str) -> bool {
-    uri.len() <= 2_048
-        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
-}
-
-#[cfg(test)]
-fn persisted_output(output: &ToolOutput) -> Vec<String> {
-    let text = match output {
-        ToolOutput::Text(text) => text.clone(),
-        ToolOutput::Structured(value) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        }
-        ToolOutput::Parts(parts) => {
-            let mut next_media = 0;
-            let mut next_file = 0;
-            parts
-                .iter()
-                .filter_map(|part| match part {
-                    Part::Text(text) => Some(text.text.clone()),
-                    Part::Media(media) => {
-                        next_media += 1;
-                        Some(media_label(media, next_media))
-                    }
-                    Part::File(file) => {
-                        next_file += 1;
-                        Some(match &file.data {
-                            DataRef::Uri(uri) if safe_media_uri(uri) => {
-                                format!("[File #{}]({uri})", next_file)
-                            }
-                            _ => format!("[File #{}]", next_file),
-                        })
-                    }
-                    Part::Structured(value) => Some(value.value.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        ToolOutput::Files(files) => format!("{} files", files.len()),
-    };
-    text.lines().map(str::to_string).collect()
-}
-
 fn agent_status_rank(status: SubagentStatus) -> u8 {
     match status {
         SubagentStatus::Starting => 0,
@@ -1270,117 +1178,6 @@ impl App {
         }
     }
 
-    /// Rebuilds the visible history from the same Items preloaded into the model.
-    #[cfg(test)]
-    pub fn restore_transcript(&mut self, session_id: String, transcript: &[Item]) {
-        self.session_id = Some(session_id);
-        for item in transcript {
-            match item.kind {
-                ItemKind::Developer if is_compaction_summary(item) => {
-                    self.push_block(Block::Notice("context compacted".into()));
-                }
-                ItemKind::System
-                | ItemKind::Developer
-                | ItemKind::Context
-                | ItemKind::Notification => continue,
-                ItemKind::User => {
-                    let mut next_media = 0;
-                    let text = item
-                        .parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            Part::Text(text) => Some(text.text.clone()),
-                            Part::Media(media) => {
-                                next_media += 1;
-                                Some(media_label(media, next_media))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        if item.kind == ItemKind::User {
-                            self.latest_agent_source.clear();
-                            self.push_block(Block::User(UserMessage {
-                                text,
-                                images: Vec::new(),
-                            }));
-                        } else {
-                            self.push_block(Block::Notice(text));
-                        }
-                    }
-                }
-                ItemKind::Assistant => {
-                    let mut next_media = 0;
-                    for part in &item.parts {
-                        match part {
-                            Part::Text(text) if !text.text.is_empty() => {
-                                self.latest_agent_source.push_str(&text.text);
-                                self.push_block(Block::Agent(text.text.clone()))
-                            }
-                            Part::Media(media) => {
-                                next_media += 1;
-                                self.push_block(Block::Agent(media_label(media, next_media)));
-                            }
-                            Part::Reasoning(reasoning) if reasoning.summary.is_some() => self
-                                .push_block(Block::Thought {
-                                    text: reasoning.summary.clone().unwrap_or_default(),
-                                    started: Instant::now(),
-                                    millis: Some(0),
-                                }),
-                            Part::ToolCall(call) => self.push_block(Block::Tool(ToolCall {
-                                id: call.id.to_string(),
-                                title: call.name.clone(),
-                                kind: ToolKind::Other,
-                                status: ToolCallStatus::Completed,
-                                started: Instant::now(),
-                                finished: Some(Instant::now()),
-                                script: call
-                                    .input
-                                    .get("script")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                plan: call
-                                    .input
-                                    .get("script")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(parse_plan)
-                                    .unwrap_or_default(),
-                                children: Vec::new(),
-                                output: Vec::new(),
-                                intent: call
-                                    .input
-                                    .get("intent")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string),
-                                expanded: false,
-                                compose_view: ComposeView::Output,
-                                expansion_explicit: false,
-                                backgrounded: false,
-                            })),
-                            _ => {}
-                        }
-                    }
-                }
-                ItemKind::Tool => {
-                    for part in &item.parts {
-                        if let Part::ToolResult(result) = part
-                            && let Some(call) = self.call_mut(&result.call_id.to_string())
-                        {
-                            call.output = persisted_output(&result.output);
-                            if result.is_error {
-                                call.status = ToolCallStatus::Failed;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.follow = true;
-        self.scroll = usize::MAX;
-    }
-
     /// The tool call the graph pane should show: the running one, else the
     /// most recent, so a finished program stays readable.
     pub fn focus_call(&self) -> Option<&ToolCall> {
@@ -1432,14 +1229,6 @@ impl App {
     pub fn toggle_agents(&mut self) {
         self.agents_visible = !self.agents_visible;
         self.clamp_agents_scroll();
-    }
-
-    #[cfg(test)]
-    pub fn agents(&self) -> Vec<&AgentRow> {
-        self.agent_tree_rows()
-            .into_iter()
-            .map(|tree_row| tree_row.row)
-            .collect()
     }
 
     pub fn agent_tree_rows(&self) -> Vec<AgentTreeRow<'_>> {
@@ -1938,43 +1727,6 @@ impl App {
                     backgrounded,
                 }));
             }
-            #[cfg(test)]
-            Update::ToolUpdated {
-                id,
-                status,
-                script,
-                output,
-                backgrounded,
-            } => {
-                let completed_background = {
-                    let Some(call) = self.call_mut(&id) else {
-                        return;
-                    };
-                    let was_running = call.running();
-                    if let Some(script) = script {
-                        call.plan = parse_plan(&script);
-                        call.script = script;
-                    }
-                    if !output.is_empty() {
-                        call.output = output;
-                    }
-                    call.backgrounded |= backgrounded;
-                    if let Some(status) = status {
-                        call.status = status;
-                        if !call.running() {
-                            call.finalize_terminal_state();
-                        }
-                    }
-                    was_running && !call.running() && call.backgrounded
-                };
-                // Autonomous model output follows the terminal update for a
-                // detached call without a new ACP prompt/TurnEnded pair. Seal
-                // the current stream so that output starts a new agent block.
-                self.agent_stream_sealed |= completed_background;
-                if let Some(index) = self.call_index(&id) {
-                    self.reclassify_dynamic(index);
-                }
-            }
             Update::ToolPatched {
                 id,
                 title,
@@ -1998,6 +1750,7 @@ impl App {
                 let Some(call) = self.call_mut(&id) else {
                     return;
                 };
+                let was_running = call.running();
                 if let Some(title) = title {
                     if title == agentkit_tool_compose::COMPOSE_TOOL_NAME
                         && call.title != agentkit_tool_compose::COMPOSE_TOOL_NAME
@@ -2033,6 +1786,9 @@ impl App {
                         call.finalize_terminal_state();
                     }
                 }
+                let completed_background = was_running && !call.running() && call.backgrounded;
+                // Autonomous output after a detached call starts a new agent stream.
+                self.agent_stream_sealed |= completed_background;
                 if let Some(index) = self.call_index(&id) {
                     self.mark_block_dirty(index);
                     self.reclassify_dynamic(index);
@@ -2250,21 +2006,6 @@ impl App {
         self.press = None;
     }
 
-    #[cfg(test)]
-    pub fn push_user(&mut self, prompt: String) -> u64 {
-        let id = format!("test-user-{}", self.blocks.len());
-        self.apply(Update::UserMessage {
-            id,
-            text: prompt,
-            images: Vec::new(),
-            append: false,
-        });
-        self.apply(Update::State(StateUpdate::Running(
-            RunningStateUpdate::new(),
-        )));
-        self.blocks.len() as u64
-    }
-
     /// Folds a tool call's raw output open or shut. Completed compose calls
     /// cycle through their output and source views before folding closed.
     pub fn toggle_output(&mut self, id: &str) {
@@ -2323,17 +2064,6 @@ impl App {
             }
         }
         self.clamp_agents_scroll();
-    }
-
-    #[cfg(test)]
-    fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-        match event {
-            RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
-                self.apply_agent_runtime_at(event, now_unix_ms);
-            }
-            event => self.apply_runtime(event),
-        }
     }
 
     fn apply_agent_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
@@ -3853,6 +3583,65 @@ fn has_graphical_session(display: Option<&OsStr>, wayland_display: Option<&OsStr
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_url(_url: &str) {}
 
+/// Fixtures and deterministic-clock adapters; not an alternate live event protocol.
+#[cfg(test)]
+mod test_support {
+    use agent_client_protocol::schema::v2::RunningStateUpdate;
+
+    use super::*;
+
+    impl Update {
+        pub(in crate::tui) fn test_text(text: String) -> Self {
+            Self::AgentMessage {
+                id: "test-agent".into(),
+                text,
+                append: true,
+            }
+        }
+
+        pub(in crate::tui) fn test_thought(text: String) -> Self {
+            Self::AgentThought {
+                id: "test-thought".into(),
+                text,
+                append: true,
+            }
+        }
+    }
+
+    impl App {
+        pub(super) fn agents(&self) -> Vec<&AgentRow> {
+            self.agent_tree_rows()
+                .into_iter()
+                .map(|tree_row| tree_row.row)
+                .collect()
+        }
+
+        pub(in crate::tui) fn push_user(&mut self, prompt: String) -> u64 {
+            let id = format!("test-user-{}", self.blocks.len());
+            self.apply(Update::UserMessage {
+                id,
+                text: prompt,
+                images: Vec::new(),
+                append: false,
+            });
+            self.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            self.blocks.len() as u64
+        }
+
+        pub(super) fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+            match event {
+                RuntimeEvent::SubagentStateChanged { .. }
+                | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
+                    self.apply_agent_runtime_at(event, now_unix_ms);
+                }
+                event => self.apply_runtime(event),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3864,7 +3653,6 @@ mod tests {
         AuthMethodTerminal, IdleStateUpdate, RequiresActionStateUpdate, RunningStateUpdate,
         StateUpdate, StopReason, ToolCallStatus, ToolKind,
     };
-    use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -4315,89 +4103,6 @@ mod tests {
     }
 
     #[test]
-    fn restores_only_tagged_developer_items_as_compaction_markers() {
-        let mut metadata = MetadataMap::new();
-        metadata.insert(
-            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
-            true.into(),
-        );
-        let transcript = vec![
-            Item::text(ItemKind::Developer, "ordinary instruction"),
-            Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
-        ];
-        let mut app = app();
-        app.restore_transcript("session".into(), &transcript);
-        assert_eq!(app.blocks.len(), 1);
-        assert!(
-            matches!(app.blocks.first(), Some(Block::Notice(text)) if text == "context compacted")
-        );
-    }
-
-    #[test]
-    fn restored_transcript_hides_internal_notifications() {
-        let transcript = vec![
-            Item::text(ItemKind::User, "run the build"),
-            Item::notification("Background tool call completed: very long raw output"),
-            Item::text(ItemKind::Assistant, "the build passed"),
-        ];
-        let mut app = app();
-
-        app.restore_transcript("session".into(), &transcript);
-
-        assert_eq!(app.blocks.len(), 2);
-        assert!(matches!(&app.blocks[0], Block::User(message) if message.text == "run the build"));
-        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "the build passed"));
-    }
-
-    #[test]
-    fn restored_media_uses_safe_links_and_never_exposes_data_urls() {
-        let transcript = vec![
-            Item::new(
-                ItemKind::User,
-                vec![
-                    Part::text("inspect these"),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("file:///tmp/image.png".into()),
-                    )),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("data:image/png;base64,c2VjcmV0".into()),
-                    )),
-                ],
-            ),
-            Item::new(
-                ItemKind::Assistant,
-                vec![
-                    Part::text("done"),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("https://example.com/result.png".into()),
-                    )),
-                ],
-            ),
-        ];
-        let mut app = app();
-
-        app.restore_transcript("session".into(), &transcript);
-
-        assert!(matches!(
-            &app.blocks[0],
-            Block::User(message)
-                if message.text == "inspect these\n[Image #1](file:///tmp/image.png)\n[Image #2]"
-                    && !message.text.contains("data:")
-        ));
-        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "done"));
-        assert!(matches!(
-            &app.blocks[2],
-            Block::Agent(text) if text == "[Image #1](https://example.com/result.png)"
-        ));
-    }
-
-    #[test]
     fn attributes_nested_calls_to_the_owning_tool_call() {
         let mut app = app();
         compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
@@ -4416,11 +4121,15 @@ mod tests {
         compose(&mut app, "a = shell({ command: \"sleep 60\" })\nreturn a");
         app.apply(Update::Runtime(child("call-1:compose:shell", "shell")));
 
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "call-1".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Failed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            append_output: false,
+            intent: None,
             backgrounded: false,
         });
 
@@ -4542,11 +4251,15 @@ mod tests {
             RunningStateUpdate::new(),
         )));
         let started = app.turn_started;
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "call-1".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            append_output: false,
+            intent: None,
             backgrounded: false,
         });
         assert!(app.working());
@@ -6020,11 +5733,15 @@ mod tests {
             backgrounded: true,
         });
         app.apply(Update::test_text("first completion".into()));
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "background".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            append_output: false,
+            intent: None,
             backgrounded: false,
         });
         app.apply(Update::AgentMessage {
@@ -6047,6 +5764,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(agents, ["first completion", "second completion continued"]);
+        assert_eq!(
+            app.latest_agent_text().as_deref(),
+            Some("second completion continued")
+        );
     }
 
     fn model_choice(provider: &str, model: &str) -> super::ModelChoice {
@@ -6405,11 +6126,15 @@ mod tests {
         app.phase = Phase::Idle;
         assert!(app.needs_redraw_tick());
 
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "background".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            append_output: false,
+            intent: None,
             backgrounded: true,
         });
         assert!(!app.needs_redraw_tick());

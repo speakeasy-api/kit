@@ -56,26 +56,6 @@ impl ImageRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub fn disabled() -> Self {
-        Self {
-            picker: None,
-            cache: HashMap::new(),
-            decoded_backing_bytes: 0,
-            clock: 0,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn with_picker(picker: Picker) -> Self {
-        Self {
-            picker: Some(picker),
-            cache: HashMap::new(),
-            decoded_backing_bytes: 0,
-            clock: 0,
-        }
-    }
-
     pub fn enabled(&self) -> bool {
         self.picker.is_some()
     }
@@ -83,11 +63,6 @@ impl ImageRuntime {
     pub fn clear(&mut self) {
         self.cache.clear();
         self.decoded_backing_bytes = 0;
-    }
-
-    #[cfg(test)]
-    pub fn cached_entries(&self) -> usize {
-        self.cache.len()
     }
 
     pub fn prepare(&mut self, image: &UserImage, width: u16) -> Option<PreparedImage> {
@@ -193,6 +168,35 @@ fn decode(source: &UserImage) -> Option<image::DynamicImage> {
     limits.max_alloc = Some(MAX_DECODED_ALLOCATION);
     reader.limits(limits);
     reader.decode().ok()
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl ImageRuntime {
+        pub fn disabled() -> Self {
+            Self {
+                picker: None,
+                cache: HashMap::new(),
+                decoded_backing_bytes: 0,
+                clock: 0,
+            }
+        }
+
+        pub fn with_picker(picker: Picker) -> Self {
+            Self {
+                picker: Some(picker),
+                cache: HashMap::new(),
+                decoded_backing_bytes: 0,
+                clock: 0,
+            }
+        }
+
+        pub fn cached_entries(&self) -> usize {
+            self.cache.len()
+        }
+    }
 }
 
 #[cfg(test)]

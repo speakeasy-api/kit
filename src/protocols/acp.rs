@@ -696,23 +696,12 @@ impl SessionRegistry {
             .await;
     }
 
-    #[cfg(test)]
-    async fn reset_authentication(&self) -> bool {
-        self.reset_authentication_with(async {}).await.0
-    }
-
     async fn reset_authentication_with<T>(
         &self,
         reset: impl std::future::Future<Output = T>,
     ) -> (bool, Option<T>) {
         self.close_sessions_with_timeout(Duration::from_secs(5), true, || reset)
             .await
-    }
-
-    #[cfg(test)]
-    async fn shutdown_with_timeout(&self, limit: Duration) {
-        self.close_sessions_with_timeout(limit, false, || async {})
-            .await;
     }
 
     async fn close_sessions_with_timeout<T, F, Fut>(
@@ -1967,45 +1956,6 @@ fn record_acp_loop_failure(
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn drive_prompt<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    skills: &[agentkit_tool_skills::Skill],
-    integration: &AcpIntegration,
-    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
-    driver: &mut LoopDriver<S>,
-    request: PromptRequest,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
-    if structured_completion {
-        let _ = settle_background_jobs(tasks, background_jobs).await?;
-    }
-    background_jobs.begin_turn();
-    let items = integration.input_port().prompt_to_items(&request)?;
-    skill_catalog
-        .submit(skills, items, |items| driver.submit_input(items))
-        .map_err(|error| match error {
-            skill_catalog::SubmitError::Catalog(error) => {
-                record_acp_runtime_failure(session_id, "skill_catalog", error)
-            }
-            skill_catalog::SubmitError::Submit(error) => {
-                record_acp_loop_failure(session_id, &error)
-            }
-        })?;
-    drive_submitted_prompt(
-        session_id,
-        integration,
-        driver,
-        tasks,
-        background_jobs,
-        structured_completion,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn drive_runtime_prompt<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
@@ -2048,26 +1998,6 @@ async fn drive_runtime_prompt<S: ModelSession>(
     .await
 }
 
-#[cfg(test)]
-async fn drive_submitted_prompt<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    integration: &AcpIntegration,
-    driver: &mut LoopDriver<S>,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
-    drive_until_pause(
-        session_id,
-        integration,
-        driver,
-        true,
-        structured_completion.then_some((tasks, background_jobs)),
-    )
-    .await?
-    .ok_or_else(|| AcpRuntimeError::Loop("prompt ended without a response".into()))
-}
-
 async fn drive_unsolicited<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
@@ -2082,35 +2012,6 @@ async fn drive_unsolicited<S: ModelSession>(
         )
         .await
         .map(|_| ())
-}
-
-#[cfg(test)]
-async fn drive_autonomous<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    integration: &AcpIntegration,
-    driver: &mut LoopDriver<S>,
-) -> Result<(), AcpRuntimeError> {
-    let _ = drive_until_pause(session_id, integration, driver, false, None).await?;
-    Ok(())
-}
-
-#[cfg(test)]
-async fn drive_until_pause<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    integration: &AcpIntegration,
-    driver: &mut LoopDriver<S>,
-    answer_prompt: bool,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-) -> Result<Option<PromptResponse>, AcpRuntimeError> {
-    let reason =
-        drive_finalized(session_id, integration, driver, answer_prompt, structured).await?;
-    if answer_prompt {
-        Ok(Some(PromptResponse::new(
-            agentkit_acp::finish_reason_to_stop_reason(&reason)?,
-        )))
-    } else {
-        Ok(None)
-    }
 }
 
 async fn drive_finalized<S: ModelSession>(
@@ -2276,20 +2177,6 @@ pub async fn serve_with_registry(
         result = connect_stdio(component) => result,
         _ = shutdown.cancelled() => Ok(()),
     };
-    registry.shutdown().await;
-    result
-}
-
-#[cfg(test)]
-async fn serve_transport(
-    runtime: Arc<Runtime>,
-    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
-) -> Result<(), AcpRuntimeError> {
-    let registry = SessionRegistry::new();
-    let result = component(runtime, registry.clone())?
-        .connect_to(transport)
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
     registry.shutdown().await;
     result
 }
@@ -2625,6 +2512,22 @@ async fn drain_client_messages(
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl SessionRegistry {
+        pub(super) async fn reset_authentication(&self) -> bool {
+            self.reset_authentication_with(async {}).await.0
+        }
+
+        pub(super) async fn shutdown_with_timeout(&self, limit: Duration) {
+            self.close_sessions_with_timeout(limit, false, || async {})
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) mod tests {
     use std::{
         collections::VecDeque,
@@ -2656,6 +2559,19 @@ pub(super) mod tests {
 
     use super::*;
     use agentkit_acp::StopReason;
+
+    async fn serve_transport(
+        runtime: Arc<Runtime>,
+        transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
+    ) -> Result<(), AcpRuntimeError> {
+        let registry = SessionRegistry::new();
+        let result = component(runtime, registry.clone())?
+            .connect_to(transport)
+            .await
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
+        registry.shutdown().await;
+        result
+    }
 
     fn test_activity(
         id: agentkit_acp::SessionId,
@@ -3984,9 +3900,11 @@ pub(super) mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let response = drive_prompt(
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let response = drive_runtime_prompt(
             &acp_session_id,
-            &[],
+            &runtime,
             &integration,
             &mut skill_catalog,
             &mut driver,
@@ -4003,7 +3921,10 @@ pub(super) mod tests {
         .await
         .expect("cancellation must be an ACP response, not an RPC error");
 
-        assert_eq!(response.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::Cancelled
+        );
         drain.abort();
     }
 
@@ -4192,9 +4113,11 @@ pub(super) mod tests {
                 agentkit_acp::TextContent::new("start one background call"),
             )],
         );
-        let prompt = drive_prompt(
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let prompt = drive_runtime_prompt(
             &acp_session_id,
-            &[],
+            &runtime,
             &integration,
             &mut skill_catalog,
             &mut driver,
@@ -4212,12 +4135,12 @@ pub(super) mod tests {
                     while !entered.load(Ordering::SeqCst) {
                         tokio::task::yield_now().await;
                     }
+                    background_jobs.register_foreground_for_test("background-call");
                     assert!(detach_compose_call(
                         &tasks,
                         &background_jobs,
                         "background-call",
                     ).await);
-                    background_jobs.register_foreground_for_test("background-call");
                     while turns.load(Ordering::SeqCst) < 2 {
                         tokio::task::yield_now().await;
                     }
@@ -4246,7 +4169,10 @@ pub(super) mod tests {
             .await
             .expect("structured prompt did not synthesize the background result")
             .unwrap();
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::EndTurn
+        );
         assert_eq!(turns.load(Ordering::SeqCst), 3);
         drain.abort();
     }
@@ -4328,12 +4254,14 @@ pub(super) mod tests {
         driver
             .submit_input(vec![Item::text(ItemKind::User, "foreground")])
             .unwrap();
-        let response = drive_until_pause(&session_id, &integration, &mut driver, true, None)
+        let response = drive_finalized(&session_id, &integration, &mut driver, true, None)
             .await
-            .unwrap()
             .unwrap();
         activity.settle(None, None).unwrap();
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::EndTurn
+        );
         assert!(states.try_recv().is_err());
 
         // Multiple logical turns drained within one autonomous interval do not
@@ -4341,7 +4269,7 @@ pub(super) mod tests {
         activity.begin(activity::ExecutionOrigin::Autonomous);
         for text in ["first continuation", "second continuation"] {
             driver.submit_input(vec![Item::notification(text)]).unwrap();
-            drive_autonomous(&session_id, &integration, &mut driver)
+            drive_finalized(&session_id, &integration, &mut driver, false, None)
                 .await
                 .unwrap();
         }
@@ -4479,8 +4407,8 @@ pub(super) mod tests {
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        assert!(detach_compose_call(&tasks, &background_jobs, "background-call").await);
         background_jobs.register_foreground_for_test("background-call");
+        assert!(detach_compose_call(&tasks, &background_jobs, "background-call").await);
         assert!(background_jobs.is_detached_for_test("background-call"));
         timeout(Duration::from_secs(1), reply_rx)
             .await

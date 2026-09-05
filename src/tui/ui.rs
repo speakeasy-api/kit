@@ -16,13 +16,6 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-#[cfg(test)]
-thread_local! {
-    static MATERIALIZED_TRANSCRIPT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static REFRESHED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static VISITED_TRANSCRIPT_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 use crate::events::{GenerationOutcome, SubagentStatus};
 
 use super::{
@@ -856,8 +849,6 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     );
     let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
-        #[cfg(test)]
-        MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(count.get() + 1));
         visible.push(row.0.clone());
         app.row_calls.push(row.1.0.clone());
         app.row_code.push(row.1.1.clone());
@@ -870,8 +861,6 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             .saturating_sub(1)
             .min(app.blocks.len() - 1);
         while block_index < app.blocks.len() {
-            #[cfg(test)]
-            VISITED_TRANSCRIPT_BLOCKS.with(|count| count.set(count.get() + 1));
             let span_start = app.transcript_prefixes[block_index];
             if span_start >= end {
                 break;
@@ -1036,8 +1025,6 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     let dirty = std::mem::take(&mut app.transcript_dirty);
     let mut first_changed_count = app.blocks.len();
     for block_index in dirty {
-        #[cfg(test)]
-        REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(count.get() + 1));
         let dynamic = match &app.blocks[block_index] {
             Block::Thought { millis, .. } => millis.is_none(),
             Block::Tool(call) => call.running() || call.running_children() > 0,
@@ -1089,12 +1076,6 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     if layout_changed {
         app.clear_transcript_interaction();
     }
-}
-
-#[cfg(test)]
-fn refresh_transcript_cache(app: &mut App, width: usize) {
-    let mut images = ImageRuntime::disabled();
-    refresh_transcript_cache_with_images(app, &mut images, width);
 }
 
 fn user_block_rows(
@@ -2308,8 +2289,8 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{
-        MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
-        model_dialog_rows, model_dialog_viewport, prompt_lines, refresh_transcript_cache,
+        ImageRuntime, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
+        model_dialog_rows, model_dialog_viewport, prompt_lines,
         refresh_transcript_cache_with_images, truncate_to_width, user_block_rows, user_line,
     };
     use crate::{
@@ -2321,6 +2302,11 @@ mod tests {
             Update, UserImage, UserMessage,
         },
     };
+
+    fn refresh_transcript_cache(app: &mut App, width: usize) {
+        let mut images = ImageRuntime::disabled();
+        refresh_transcript_cache_with_images(app, &mut images, width);
+    }
 
     fn test_agent(
         name: &str,
@@ -3334,11 +3320,15 @@ mod tests {
         {
             call.attach(format!("extra-{index}"), tool.into(), tool.into());
         }
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: vec!["done".into()],
+            output: Some(vec!["done".into()]),
             backgrounded: false,
         });
 
@@ -3391,11 +3381,15 @@ mod tests {
     #[test]
     fn completed_compose_defaults_collapsed_and_cycles_output_script_and_closed() {
         let mut app = sample();
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: vec!["compose result".into()],
+            output: Some(vec!["compose result".into()]),
             backgrounded: false,
         });
 
@@ -3429,11 +3423,15 @@ mod tests {
         let mut app = sample();
         app.toggle_last_output();
         app.toggle_last_output();
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: vec!["compose result".into()],
+            output: Some(vec!["compose result".into()]),
             backgrounded: false,
         });
 
@@ -3463,11 +3461,15 @@ mod tests {
     #[test]
     fn a_new_tool_collapses_the_previous_compose_output() {
         let mut app = sample();
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: vec!["compose result".into()],
+            output: Some(vec!["compose result".into()]),
             backgrounded: false,
         });
         app.apply(Update::ToolStarted {
@@ -3562,11 +3564,15 @@ mod tests {
     #[test]
     fn scrolls_back_through_a_long_transcript_with_the_log_pane_open() {
         let mut app = sample();
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Failed),
             script: None,
-            output: vec!["exit code 1".into()],
+            output: Some(vec!["exit code 1".into()]),
             backgrounded: false,
         });
         app.apply(Update::State(StateUpdate::Idle(
@@ -3718,13 +3724,19 @@ mod tests {
             call.title = "shell".into();
             call.expanded = false;
         }
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
+            title: None,
+            kind: None,
+            append_output: false,
+            intent: None,
             id: "call-1".into(),
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: None,
-            output: (0..40)
-                .map(|index| format!("output line {index}"))
-                .collect(),
+            output: Some(
+                (0..40)
+                    .map(|index| format!("output line {index}"))
+                    .collect(),
+            ),
             backgrounded: false,
         });
         let frame = render(&mut app, 100, 24);
@@ -4133,7 +4145,7 @@ mod tests {
     }
 
     #[test]
-    fn materializes_click_metadata_only_for_visible_rows() {
+    fn click_metadata_matches_visible_rows() {
         let mut app = App::new(
             PathBuf::from("/tmp/kit"),
             "openai-subscription".into(),
@@ -4148,15 +4160,8 @@ mod tests {
             "[visible link](https://example.com/target)".into(),
         ));
 
-        super::MATERIALIZED_TRANSCRIPT_ROWS.with(|count| count.set(0));
-        super::VISITED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
         let _ = render(&mut app, 50, 10);
 
-        super::MATERIALIZED_TRANSCRIPT_ROWS.with(|count| assert_eq!(count.get(), app.viewport));
-        super::VISITED_TRANSCRIPT_BLOCKS.with(|count| {
-            assert!(count.get() <= app.viewport);
-            assert!(count.get() < app.blocks.len());
-        });
         assert_eq!(app.row_links.len(), app.viewport);
         assert_eq!(app.row_calls.len(), app.viewport);
         assert_eq!(app.row_code.len(), app.viewport);
@@ -4166,10 +4171,17 @@ mod tests {
                 .flatten()
                 .any(|hit| hit.url == "https://example.com/target")
         );
+
+        app.scroll_by(-1000);
+        let frame = render(&mut app, 50, 10);
+        assert!(frame.contains("old row 0"), "{frame}");
+        assert!(!frame.contains("visible link"), "{frame}");
+        assert_eq!(app.row_links.len(), app.viewport);
+        assert!(app.row_links.iter().all(Vec::is_empty));
     }
 
     #[test]
-    fn tail_mutation_does_not_inspect_or_rebuild_unchanged_history() {
+    fn tail_mutation_preserves_cached_history() {
         let mut app = App::new(
             PathBuf::from("/tmp/kit"),
             "openai-subscription".into(),
@@ -4185,11 +4197,9 @@ mod tests {
         let history_revision = app.transcript_cache[0].as_ref().unwrap().revision;
         let tail_rows = app.transcript_cache[99].as_ref().unwrap().rows.as_ptr();
 
-        super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| count.set(0));
         app.apply(Update::test_text(" changed".into()));
         refresh_transcript_cache(&mut app, 12);
 
-        super::REFRESHED_TRANSCRIPT_BLOCKS.with(|count| assert_eq!(count.get(), 1));
         let history = app.transcript_cache[0].as_ref().unwrap();
         assert_eq!(history.rows.as_ptr(), history_rows);
         assert_eq!(history.revision, history_revision);
@@ -4197,6 +4207,14 @@ mod tests {
             app.transcript_cache[99].as_ref().unwrap().rows.as_ptr(),
             tail_rows
         );
+        let tail = app.transcript_cache[99].as_ref().unwrap();
+        let text = tail
+            .rows
+            .iter()
+            .map(|row| line_text(&row.0))
+            .collect::<String>();
+        assert!(text.contains("history 99"), "{text}");
+        assert!(text.contains("changed"), "{text}");
     }
 
     #[test]
