@@ -1,11 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::resilient_fs as fs;
 use agentkit_loop::LoopError;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -471,43 +470,15 @@ fn write_in_with_diagnostics(
     create_private_directory(base)?;
     create_private_directory(&directory)?;
     let path = directory.join(format!("{event_id}.json"));
-    let temporary = directory.join(format!(".{event_id}.tmp"));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| format!("could not create fatal error log: {error}"))?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_data()) {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("could not write fatal error log: {error}"));
-    }
-    fs::rename(&temporary, &path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        format!("could not commit fatal error log: {error}")
-    })?;
-    #[cfg(unix)]
-    File::open(&directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("could not sync fatal error log directory: {error}"))?;
+    fs::replace_private(&path, &bytes)
+        .map_err(|error| format!("could not retain fatal error log: {error}"))?;
     prune(&directory);
     Ok(path)
 }
 
 fn create_private_directory(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path)
-        .map_err(|error| format!("could not create fatal error log directory: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("could not secure fatal error log directory: {error}"))?;
-    }
-    Ok(())
+    fs::create_private_dir_all(path)
+        .map_err(|error| format!("could not create fatal error log directory: {error}"))
 }
 
 fn prune(directory: &Path) {

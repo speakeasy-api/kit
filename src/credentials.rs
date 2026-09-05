@@ -1,12 +1,12 @@
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
+    io::ErrorKind,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, Weak},
     time::{Duration, Instant},
 };
 
+use crate::resilient_fs as fs;
 use keyring::{Entry, Error as KeyringError};
 use zeroize::Zeroizing;
 
@@ -18,6 +18,78 @@ static MEMORY: LazyLock<Mutex<HashMap<String, Zeroizing<Vec<u8>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static MEMORY_REFRESH_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+// Authority only: credential bytes, tombstones, retry, and lease retention live
+// exclusively in the shared filesystem. Weak references do not extend a caller's
+// refresh guard lifetime. The guarded Fs carried by each mutation retains its lease.
+static FILESYSTEM_SCOPES: LazyLock<Mutex<Vec<Weak<CredentialFilesystemScope>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub(crate) struct CredentialFilesystemScope {
+    path: PathBuf,
+    filesystem: fs::Fs,
+}
+
+impl CredentialFilesystemScope {
+    pub(crate) fn register(
+        lease: &fs::Lease,
+        path: &Path,
+    ) -> Result<Arc<Self>, CredentialStoreError> {
+        let scope = Arc::new(Self {
+            // The final credential file may not exist yet (first login).
+            path: match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => {
+                    fs::canonicalize(parent).map(|parent| parent.join(name))
+                }
+                _ => fs::canonicalize(path),
+            }
+            .map_err(|value| context("could not resolve credential scope", value))?,
+            filesystem: fs::global()
+                .guarded(lease)
+                .map_err(|value| context("could not guard credential scope", value))?,
+        });
+        let mut scopes = FILESYSTEM_SCOPES
+            .lock()
+            .map_err(|_| error("credential lease registry is poisoned"))?;
+        scopes.retain(|scope| scope.strong_count() != 0);
+        scopes.push(Arc::downgrade(&scope));
+        Ok(scope)
+    }
+}
+
+fn mutation_filesystem(path: &Path) -> Result<fs::Fs, CredentialStoreError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| error("credential path has no directory"))?;
+    let normalized = fs::canonicalize(directory)
+        .map_err(|value| context("could not resolve credential directory", value))?
+        .join(
+            path.file_name()
+                .ok_or_else(|| error("credential path has no filename"))?,
+        );
+    {
+        let scopes = FILESYSTEM_SCOPES
+            .lock()
+            .map_err(|_| error("credential lease registry is poisoned"))?;
+        if let Some(scope) = scopes
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|scope| normalized.starts_with(&scope.path))
+            .max_by_key(|scope| scope.path.components().count())
+        {
+            return Ok(scope.filesystem.clone());
+        }
+    }
+    // Standalone login/delete callers also need real authority before a write can
+    // be queued. Never replace an unavailable cross-process lock with a mutex.
+    let guard = acquire_refresh_lock(&directory.join(".refresh.lock"))?;
+    Ok(guard
+        ._scope
+        .as_ref()
+        .expect("filesystem refresh scope")
+        .filesystem
+        .clone())
+}
 
 #[derive(Clone, Debug, Default)]
 pub enum CredentialStorage {
@@ -63,6 +135,7 @@ impl CredentialStorage {
             Self::Memory => {
                 return Ok(CredentialRefreshLock {
                     _file: None,
+                    _scope: None,
                     _memory: Some(Arc::clone(&MEMORY_REFRESH_LOCK).lock_owned().await),
                 });
             }
@@ -126,6 +199,29 @@ impl CredentialEntry {
         }
     }
 
+    pub(crate) fn filesystem_path(&self) -> Option<&Path> {
+        match &self.backend {
+            EntryBackend::Filesystem(path) => Some(path),
+            EntryBackend::Memory | EntryBackend::Keychain { .. } => None,
+        }
+    }
+
+    /// A user-facing persistence barrier, not a requirement for ongoing refresh.
+    pub(crate) fn require_disk(&self) -> Result<(), CredentialStoreError> {
+        match &self.backend {
+            EntryBackend::Filesystem(path) => fs::global().require_disk(path).map_err(|value| {
+                context(
+                    "credential changes are retained only in this process; free disk space or quota and retry before exiting Kit",
+                    value,
+                )
+            }),
+            EntryBackend::Memory => Err(error(
+                "credentials are stored only in memory; select --credential-store file or keychain for durable authentication",
+            )),
+            EntryBackend::Keychain { .. } => Ok(()),
+        }
+    }
+
     pub(crate) fn save(&self, bytes: &[u8]) -> Result<(), CredentialStoreError> {
         match &self.backend {
             EntryBackend::Memory => {
@@ -159,11 +255,21 @@ impl CredentialEntry {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct CredentialRefreshLock {
-    // Dropping either guard releases its process-wide or operating-system lock.
-    _file: Option<fs::File>,
+    // Pending facade mutations retain the real lease after this observer drops.
+    _file: Option<fs::Lease>,
+    _scope: Option<Arc<CredentialFilesystemScope>>,
     _memory: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl std::fmt::Debug for CredentialRefreshLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialRefreshLock")
+            .field("real_lease", &self._file.is_some())
+            .field("memory_backend", &self._memory.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -243,93 +349,38 @@ fn acquire_refresh_lock(path: &Path) -> Result<CredentialRefreshLock, Credential
         .parent()
         .ok_or_else(|| error("credential refresh lock has no directory"))?;
     prepare_directory(directory, true)?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    set_private_mode(&mut options);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Open the reparse point itself instead of following it.
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(path).map_err(|value| {
-        context(
-            &format!("could not open refresh lock {}", path.display()),
-            value,
-        )
-    })?;
-    let metadata = file.metadata().map_err(|value| {
-        context(
-            &format!("could not inspect refresh lock {}", path.display()),
-            value,
-        )
-    })?;
-    if !metadata.is_file() {
-        return Err(error(format!(
-            "OAuth refresh lock must be a regular file: {}",
-            path.display()
-        )));
-    }
-    check_private_file(path, &metadata)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(error(format!(
-                "OAuth refresh lock is owned by another user: {}",
-                path.display()
-            )));
-        }
-    }
     let deadline = Instant::now() + REFRESH_LOCK_TIMEOUT;
     loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+        // The facade owns no-follow/owner/identity validation and real OS locking.
+        // In particular, ENOSPC here must not grant in-process-only authority.
+        match fs::global().acquire_lease(path, directory, fs::LeaseMode::ExistingOrNew) {
+            Ok(lease) => {
+                return Ok(CredentialRefreshLock {
+                    _scope: Some(CredentialFilesystemScope::register(&lease, directory)?),
+                    _file: Some(lease),
+                    _memory: None,
+                });
+            }
+            Err(value) if value.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(fs::TryLockError::WouldBlock) => {
+            Err(value) if value.kind() == ErrorKind::WouldBlock => {
                 return Err(error(format!(
                     "timed out waiting for OAuth refresh lock {}",
                     path.display()
                 )));
             }
-            Err(fs::TryLockError::Error(value)) => {
+            Err(value) => {
                 return Err(context(
-                    &format!("could not lock OAuth refresh {}", path.display()),
+                    &format!(
+                        "could not acquire real OAuth refresh lock {}",
+                        path.display()
+                    ),
                     value,
                 ));
             }
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let path_metadata = fs::symlink_metadata(path).map_err(|value| {
-            context(
-                &format!("could not verify OAuth refresh lock {}", path.display()),
-                value,
-            )
-        })?;
-        if path_metadata.file_type().is_symlink()
-            || path_metadata.dev() != metadata.dev()
-            || path_metadata.ino() != metadata.ino()
-        {
-            return Err(error(format!(
-                "OAuth refresh lock path changed while locking: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(CredentialRefreshLock {
-        _file: Some(file),
-        _memory: None,
-    })
 }
 
 fn namespaced_key(namespace: &str, identity: &str) -> String {
@@ -432,7 +483,8 @@ fn filesystem_delete(path: &Path) -> Result<bool, CredentialStoreError> {
             )))
         }
         Ok(_) => {
-            fs::remove_file(path)
+            mutation_filesystem(path)?
+                .remove_file(path)
                 .map_err(|value| context(&format!("could not remove {}", path.display()), value))?;
             Ok(true)
         }
@@ -449,25 +501,25 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CredentialStoreEr
         .parent()
         .ok_or_else(|| error("credential path has no directory"))?;
     prepare_directory(directory, true)?;
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(error(format!(
-            "OAuth credential path must be a regular file: {}",
-            path.display()
-        )));
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(error(format!(
+                "OAuth credential path must be a regular file: {}",
+                path.display()
+            )));
+        }
+        Ok(metadata) => check_private_file(path, &metadata)?,
+        Err(value) if value.kind() == ErrorKind::NotFound => {}
+        Err(value) => return Err(context("could not inspect credential file", value)),
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    set_private_mode(&mut options);
-    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
-        .write_with_options(|file| file.write_all(bytes), options)
+    mutation_filesystem(path)?
+        .replace_private(path, bytes)
         .map_err(|value| context(&format!("could not replace {}", path.display()), value))
 }
 
 fn prepare_directory(path: &Path, create: bool) -> Result<bool, CredentialStoreError> {
     if create {
-        fs::create_dir_all(path)
+        fs::create_private_dir_all(path)
             .map_err(|value| context(&format!("could not create {}", path.display()), value))?;
     }
     let metadata = match fs::symlink_metadata(path) {
@@ -489,39 +541,29 @@ fn prepare_directory(path: &Path, create: bool) -> Result<bool, CredentialStoreE
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if let Some(disk) = metadata.disk_metadata()
+            && disk.uid() != unsafe { libc::geteuid() }
+        {
             return Err(error(format!(
                 "OAuth credential directory is owned by another user: {}",
                 path.display()
             )));
         }
     }
-    if create {
-        make_directory_private(path)?;
-    }
     Ok(true)
 }
 
 #[cfg(unix)]
-fn set_private_mode(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-#[cfg(not(unix))]
-fn set_private_mode(_: &mut OpenOptions) {}
-#[cfg(unix)]
-fn make_directory_private(path: &Path) -> Result<(), CredentialStoreError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|value| context(&format!("could not protect {}", path.display()), value))
-}
-#[cfg(not(unix))]
-fn make_directory_private(_: &Path) -> Result<(), CredentialStoreError> {
-    Ok(())
-}
-#[cfg(unix)]
 fn check_private_file(path: &Path, metadata: &fs::Metadata) -> Result<(), CredentialStoreError> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if let Some(disk) = metadata.disk_metadata()
+        && (disk.uid() != unsafe { libc::geteuid() } || disk.nlink() != 1)
+    {
+        return Err(error(format!(
+            "OAuth credential file must be owned by this user and have one link: {}",
+            path.display()
+        )));
+    }
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(error(format!(
             "OAuth credential file is accessible by other users: {}",
@@ -605,6 +647,77 @@ mod tests {
     }
 
     #[test]
+    fn memory_acceptance_does_not_claim_durable_credentials() {
+        let entry = CredentialStorage::Memory.entry("durability-test", "memory");
+        entry.save(b"secret").unwrap();
+        assert!(
+            entry
+                .require_disk()
+                .unwrap_err()
+                .to_string()
+                .contains("only in memory")
+        );
+        assert_eq!(entry.load().unwrap().unwrap().as_slice(), b"secret");
+        entry.delete().unwrap();
+    }
+
+    #[test]
+    fn standalone_filesystem_writes_and_deletions_have_durability_barriers() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = CredentialStorage::Filesystem(directory.path().to_path_buf())
+            .entry("durability-test", "file");
+        entry.save(b"secret").unwrap();
+        entry.require_disk().unwrap();
+        assert_eq!(
+            std::fs::read(entry.filesystem_path().unwrap()).unwrap(),
+            b"secret"
+        );
+        assert!(entry.delete().unwrap());
+        entry.require_disk().unwrap();
+        assert!(entry.load().unwrap().is_none());
+        assert!(!entry.filesystem_path().unwrap().exists());
+    }
+
+    #[test]
+    fn refresh_scope_is_reused_for_guarded_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = CredentialStorage::Filesystem(directory.path().to_path_buf())
+            .entry("guard-test", "file");
+        let guard = acquire_refresh_lock(&directory.path().join(".refresh.lock")).unwrap();
+        // Reopening the OS lock here would deadlock against our own refresh guard.
+        entry.save(b"secret").unwrap();
+        assert!(entry.delete().unwrap());
+        entry.require_disk().unwrap();
+        drop(guard);
+        assert!(entry.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_scope_guards_a_credential_outside_the_lock_directory() {
+        let locks = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let entry = CredentialStorage::Filesystem(directory.path().to_path_buf())
+            .entry("native-guard-test", "file");
+        let path = entry.filesystem_path().unwrap();
+        let lease = super::fs::global()
+            .acquire_lease(
+                locks.path().join("native.lock"),
+                path,
+                super::fs::LeaseMode::ExistingOrNew,
+            )
+            .unwrap();
+        let scope = super::CredentialFilesystemScope::register(&lease, path).unwrap();
+        entry.save(b"secret").unwrap();
+        entry.require_disk().unwrap();
+        // A separate .refresh.lock would prove the native authority was not used.
+        assert!(!directory.path().join(".refresh.lock").exists());
+        assert!(entry.delete().unwrap());
+        entry.require_disk().unwrap();
+        drop(scope);
+        drop(lease);
+    }
+
+    #[test]
     fn mcp_files_keep_the_legacy_identity_hash() {
         let directory = tempfile::tempdir().unwrap();
         let identity = "https://example.com\0client\0metadata";
@@ -633,7 +746,17 @@ mod tests {
         second.save(b"two").unwrap();
         assert_eq!(first.load().unwrap().unwrap().as_slice(), b"one");
         assert_eq!(second.load().unwrap().unwrap().as_slice(), b"two");
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "json"))
+                .count(),
+            2
+        );
     }
 
     #[cfg(unix)]
@@ -642,16 +765,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
-        storage
-            .entry("test", "permissions")
-            .save(b"secret")
-            .unwrap();
-        let file = std::fs::read_dir(directory.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let entry = storage.entry("test", "permissions");
+        entry.save(b"secret").unwrap();
+        entry.require_disk().unwrap();
+        let file = entry.filesystem_path().unwrap();
         assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(
             directory.path().metadata().unwrap().permissions().mode() & 0o777,
@@ -674,13 +791,8 @@ mod tests {
         let storage = CredentialStorage::Filesystem(real.clone());
         let entry = storage.entry("test", "server");
         entry.save(b"secret").unwrap();
-        let path = std::fs::read_dir(real)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = entry.filesystem_path().unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(entry.load().is_err());
     }
 }

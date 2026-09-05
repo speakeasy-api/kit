@@ -1,27 +1,34 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
 
-use tokio::fs::File;
+use crate::resilient_fs as fs;
 
-pub(crate) fn directory(root: &Path, session_id: &str, call_id: &str) -> PathBuf {
-    let root = std::env::var_os("HOME")
+pub(crate) fn base(root: &Path) -> PathBuf {
+    std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .map_or_else(
             || root.join(".kit/artifacts"),
             |home| home.join(".kit/artifacts"),
-        );
-    root.join(safe_component(session_id))
-        .join(safe_component(call_id))
+        )
 }
 
-pub(crate) async fn create(path: &Path) -> std::io::Result<(File, PathBuf)> {
+pub(crate) fn session_directory(base: &Path, session_id: &str) -> PathBuf {
+    base.join(safe_component(session_id))
+}
+
+pub(crate) fn directory(root: &Path, session_id: &str, call_id: &str) -> PathBuf {
+    session_directory(&base(root), session_id).join(safe_component(call_id))
+}
+
+/// Retain the complete artifact through the same filesystem as transcripts.
+/// Call from a blocking task; a returned path is readable through ArtifactTool
+/// even when the backing bytes have not yet reached disk.
+pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    tokio::fs::create_dir_all(parent).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
-    }
+    fs::create_private_dir_all(parent)?;
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -36,19 +43,26 @@ pub(crate) async fn create(path: &Path) -> std::io::Result<(File, PathBuf)> {
         } else {
             path.with_file_name(format!("{stem}-{attempt}.{extension}"))
         };
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        match options.open(&candidate).await {
-            Ok(file) => return Ok((file, candidate)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .private(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error);
+                }
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("no available artifact filename under {}", parent.display()),
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no available artifact filename",
     ))
 }
 

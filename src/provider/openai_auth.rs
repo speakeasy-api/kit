@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -9,7 +8,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::credentials::{CredentialEntry, CredentialStorage};
+use crate::credentials::{CredentialEntry, CredentialFilesystemScope, CredentialStorage};
+use crate::resilient_fs as fs;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
@@ -269,6 +269,12 @@ trait CredentialStore: Send + Sync {
     fn load(&self) -> Result<Option<TokenRecord>, AuthError>;
     fn save(&self, record: &TokenRecord) -> Result<(), AuthError>;
     fn delete(&self) -> Result<bool, AuthError>;
+    fn lock_scope(&self) -> Option<&std::path::Path> {
+        None
+    }
+    fn require_disk(&self) -> Result<(), AuthError> {
+        Ok(())
+    }
 }
 
 struct BackendCredentialStore {
@@ -284,6 +290,16 @@ impl BackendCredentialStore {
 }
 
 impl CredentialStore for BackendCredentialStore {
+    fn lock_scope(&self) -> Option<&std::path::Path> {
+        self.entry.filesystem_path()
+    }
+
+    fn require_disk(&self) -> Result<(), AuthError> {
+        self.entry.require_disk().map_err(|value| {
+            AuthError::unavailable("credential_persistence_blocked", value.to_string())
+        })
+    }
+
     fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
         let mut bytes = match self.entry.load() {
             Ok(Some(bytes)) => bytes,
@@ -426,8 +442,9 @@ fn login(
                             TOKEN_URL,
                         )
                         .and_then(|record| {
-                            let _lock = process_lock(deadline)?;
+                            let _lock = process_lock_scoped(deadline, store.lock_scope())?;
                             store.save(&record)?;
+                            store.require_disk()?;
                             Ok(record)
                         });
                         code.zeroize();
@@ -497,13 +514,14 @@ fn logout_at(
     local_only: bool,
     revoke_url: &str,
 ) -> Result<Output, AuthError> {
-    let _lock = process_lock(deadline)?;
+    let _lock = process_lock_scoped(deadline, store.lock_scope())?;
     if let Some(record) = store.load()?
         && !local_only
     {
         revoke_at(&record, deadline, revoke_url)?;
     }
     let removed = store.delete()?;
+    store.require_disk()?;
     if format == OutputFormat::Human {
         Ok(human(if removed && local_only {
             "WARNING: local OpenAI credentials removed without remote revocation.\n"
@@ -575,7 +593,7 @@ pub(crate) fn access_token(
     })?;
     if !valid_generation(&record.generation) {
         let _thread = refresh_guard(deadline)?;
-        let _process = process_lock(deadline)?;
+        let _process = process_lock_scoped(deadline, store.lock_scope())?;
         record = store.load()?.ok_or_else(|| {
             AuthError::invalid(
                 "openai_auth_required",
@@ -618,7 +636,7 @@ fn refresh_locked(
     token_url: &str,
 ) -> Result<TokenRecord, AuthError> {
     let _thread = refresh_guard(deadline)?;
-    let _process = process_lock(deadline)?;
+    let _process = process_lock_scoped(deadline, store.lock_scope())?;
     refresh_current(store, deadline, rejected_access_token, token_url)
 }
 
@@ -1363,97 +1381,69 @@ fn revoke_at(record: &TokenRecord, deadline: Instant, revoke_url: &str) -> Resul
     }
 }
 
-struct ProcessLock(fs::File);
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
+// No explicit unlock in Drop: queued credential mutations retain this real lease.
+struct ProcessLock {
+    _lease: fs::Lease,
+    _scope: Option<std::sync::Arc<CredentialFilesystemScope>>,
 }
 
+#[cfg(test)]
 fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
+    process_lock_scoped(deadline, None)
+}
+
+fn process_lock_scoped(
+    deadline: Instant,
+    credential_scope: Option<&std::path::Path>,
+) -> Result<ProcessLock, AuthError> {
     let path = auth_lock_path()?;
     let parent = path.parent().expect("auth lock path has a parent");
-    fs::create_dir_all(parent).map_err(|_| {
-        AuthError::unavailable("auth_lock_failed", "could not create the state directory")
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let metadata = fs::symlink_metadata(parent).map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not inspect the auth lock directory",
-            )
-        })?;
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(AuthError::unavailable(
-                "auth_lock_failed",
-                "the auth lock directory is not owned by the current OS user",
-            ));
-        }
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not secure the auth lock directory",
-            )
-        })?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(&path).map_err(|_| {
-        AuthError::unavailable("auth_lock_failed", "could not open the authentication lock")
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| {
-                AuthError::unavailable(
-                    "auth_lock_failed",
-                    "could not secure the authentication lock",
-                )
-            })?;
-        let metadata = file.metadata().map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not inspect the authentication lock",
-            )
-        })?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o600
-        {
-            return Err(AuthError::unavailable(
-                "auth_lock_failed",
-                "the authentication lock is not a secure user-owned regular file",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return Err(AuthError::unavailable(
+    fs::create_private_dir_all(parent).map_err(|_| {
+        AuthError::unavailable(
             "auth_lock_failed",
-            "the authentication lock is not a regular file",
-        ));
+            "could not create the private state directory",
+        )
+    })?;
+    // A filesystem store can live outside the OS lock directory. Its pending writes
+    // must retain this same cross-process refresh authority, not a memory mutex.
+    let scope = credential_scope.unwrap_or(parent);
+    if credential_scope.is_some() {
+        let directory = scope.parent().ok_or_else(|| {
+            AuthError::unavailable("auth_lock_failed", "credential path has no directory")
+        })?;
+        fs::create_private_dir_all(directory).map_err(|_| {
+            AuthError::unavailable(
+                "auth_lock_failed",
+                "could not prepare the credential directory",
+            )
+        })?;
     }
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(ProcessLock(file)),
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+        match fs::global().acquire_lease(&path, scope, fs::LeaseMode::ExistingOrNew) {
+            Ok(lease) => {
+                let scope = credential_scope
+                    .map(|path| CredentialFilesystemScope::register(&lease, path))
+                    .transpose()
+                    .map_err(|value| {
+                        AuthError::unavailable("auth_lock_failed", value.to_string())
+                    })?;
+                return Ok(ProcessLock {
+                    _lease: lease,
+                    _scope: scope,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(AuthError::timeout(
+                        "timed out waiting for the authentication lock",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Err(_) => {
-                return Err(AuthError::timeout(
-                    "timed out waiting for the authentication lock",
+                return Err(AuthError::unavailable(
+                    "auth_lock_failed",
+                    "could not acquire a secure real authentication lock; check disk space, quota, ownership and permissions",
                 ));
             }
         }

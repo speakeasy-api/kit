@@ -755,7 +755,7 @@ fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<Pa
     let mut ancestor = path.clone();
     let mut suffix = Vec::new();
     loop {
-        match std::fs::symlink_metadata(&ancestor) {
+        match crate::resilient_fs::symlink_metadata(&ancestor) {
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let component = ancestor
@@ -772,7 +772,7 @@ fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<Pa
             }
         }
     }
-    let mut resolved = ancestor.canonicalize().map_err(|error| {
+    let mut resolved = crate::resilient_fs::canonicalize(&ancestor).map_err(|error| {
         format!(
             "could not resolve plugin MCP {context} path {}: {error}",
             ancestor.display()
@@ -861,13 +861,13 @@ fn prepare_plugins(
                                 &plugin.data_dir,
                                 "data cwd",
                             )?;
-                            std::fs::create_dir_all(&directory).map_err(|error| {
+                            crate::resilient_fs::create_dir_all(&directory).map_err(|error| {
                                 format!(
                                     "could not create cwd for plugin {:?} MCP server {:?} at {}: {error}",
                                     plugin.alias, server.name, directory.display()
                                 )
                             })?;
-                            Some(directory.canonicalize().map_err(|error| {
+                            Some(crate::resilient_fs::canonicalize(&directory).map_err(|error| {
                                 format!(
                                     "could not resolve cwd for plugin {:?} MCP server {:?}: {error}",
                                     plugin.alias, server.name
@@ -887,6 +887,16 @@ fn prepare_plugins(
                         }
                         None => None,
                     };
+                    crate::resilient_fs::global()
+                        .require_disk(&plugin.root)
+                        .map_err(|error| {
+                            format!("plugin MCP files are not available on disk: {error}")
+                        })?;
+                    crate::resilient_fs::global()
+                        .require_disk(&plugin.data_dir)
+                        .map_err(|error| {
+                            format!("plugin MCP data directory is not available on disk: {error}")
+                        })?;
                     (McpTransportBinding::Stdio(transport), None, false)
                 }
                 PluginMcpTransport::StreamableHttp { url, headers } => {
@@ -935,7 +945,11 @@ fn prepare_plugins(
 }
 
 async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
-    match tokio::fs::read(&source.path).await {
+    let path = source.path.clone();
+    match tokio::task::spawn_blocking(move || crate::config_files::read(&path))
+        .await
+        .map_err(|error| format!("MCP config read task failed: {error}"))?
+    {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if !source.required && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
@@ -1007,7 +1021,11 @@ async fn connect_inner(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
-    let (plugin_prepared, plugin_entries) = prepare_plugins(plugins)?;
+    let plugins = plugins.to_vec();
+    let (plugin_prepared, plugin_entries) =
+        tokio::task::spawn_blocking(move || prepare_plugins(&plugins))
+            .await
+            .map_err(|error| error.to_string())??;
     let mut source_states = Vec::with_capacity(sources.len());
     for source in sources {
         let raw = read_source(&source).await?;
@@ -1327,7 +1345,12 @@ impl McpRuntime {
                 None => None,
             };
             let (plugin_prepared, plugin_entries) = match &staged_plugins {
-                Some(staged) => prepare_plugins(&staged.resolved.mcp_plugins)?,
+                Some(staged) => {
+                    let plugins = staged.resolved.mcp_plugins.clone();
+                    tokio::task::spawn_blocking(move || prepare_plugins(&plugins))
+                        .await
+                        .map_err(|error| error.to_string())??
+                }
                 None => (current_plugins, current_plugin_entries),
             };
             let mut next_sources = Vec::with_capacity(current_sources.len());
@@ -2824,6 +2847,147 @@ mod tests {
         validate_server_names,
     };
     use crate::plugins::{PluginRuntime, ResolvedPluginMcp, ResolvedPlugins};
+
+    #[cfg(unix)]
+    mod config_capacity {
+        use crate as kit;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/capacity.rs"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_reads_memory_only_target() {
+        use config_capacity::{Capacity, CapacityDisk};
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let capacity = Arc::new(Capacity {
+            exhausted: AtomicBool::new(true),
+            exhaust_on_write: AtomicBool::new(false),
+            repaired: directory.path().join("repaired"),
+        });
+        let filesystem = crate::resilient_fs::Fs::new(Arc::new(CapacityDisk(capacity)));
+        let project = directory.path().join("project");
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(elsewhere.join("nested")).unwrap();
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        std::os::unix::fs::symlink("config.json", &link).unwrap();
+        filesystem.write(&target, b"pending").unwrap();
+        let parent_link = project.join(".mcp.json");
+        std::os::unix::fs::symlink("../config.json", &parent_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &parent_link).unwrap(),
+            b"pending"
+        );
+
+        // `..` must follow directory symlinks before selecting the parent.
+        std::os::unix::fs::symlink(elsewhere.join("nested"), project.join("directory-link"))
+            .unwrap();
+        let indirect = project.join("indirect.json");
+        std::os::unix::fs::symlink("directory-link/../config.json", &indirect).unwrap();
+        filesystem
+            .write(elsewhere.join("config.json"), b"resolved parent")
+            .unwrap();
+        filesystem
+            .write(project.join("config.json"), b"wrong lexical parent")
+            .unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &indirect).unwrap(),
+            b"resolved parent"
+        );
+
+        // Traversal also works through an accepted, memory-only directory.
+        filesystem
+            .create_dir(directory.path().join("virtual"))
+            .unwrap();
+        let virtual_link = project.join("virtual.json");
+        std::os::unix::fs::symlink("../virtual/../config.json", &virtual_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &virtual_link).unwrap(),
+            b"pending"
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("missing/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("config.json/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &link).unwrap(),
+            b"pending"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_sources_follow_symlinks_and_reload_targets() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        let chained = directory.path().join("explicit.json");
+        std::fs::write(&target, b"first").unwrap();
+        symlink("config.json", &link).unwrap();
+        symlink(&link, &chained).unwrap();
+        for source in [
+            ConfigSource::required(chained),
+            ConfigSource::optional_project(link.clone(), directory.path().to_path_buf()),
+        ] {
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"first".to_vec())
+            );
+            crate::resilient_fs::write(&target, b"second").unwrap();
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"second".to_vec())
+            );
+            std::fs::write(&target, b"first").unwrap();
+        }
+        // Security-sensitive managed reads still reject final symlinks.
+        assert_eq!(
+            crate::resilient_fs::read(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            super::read_source(&ConfigSource::optional_project(
+                link.clone(),
+                directory.path().to_path_buf()
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_source(&ConfigSource::required(link))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_source_rejects_symlink_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("loop.json");
+        std::os::unix::fs::symlink("loop.json", &link).unwrap();
+        let error = super::read_source(&ConfigSource::required(link))
+            .await
+            .unwrap_err();
+        assert!(error.contains("too many symbolic links"), "{error}");
+    }
 
     fn spec(name: &str, description: &str) -> ToolSpec {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))

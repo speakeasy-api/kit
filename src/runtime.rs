@@ -10,7 +10,6 @@ use std::{
 };
 
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
-use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, MetadataMap, Part,
     ToolOutput, ToolResultPart,
@@ -38,8 +37,9 @@ use crate::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
     tools::{
-        A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
-        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
+        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
+        Observed, PromptTool, ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch,
+        observe_shared,
     },
 };
 
@@ -380,11 +380,10 @@ impl Runtime {
         reasoning_effort: Option<crate::provider::ReasoningEffort>,
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ) -> Result<Arc<Self>, String> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        crate::resilient_fs::start_recovery_worker();
+        let root = crate::resilient_fs::canonicalize(root.as_ref())
             .map_err(|error| format!("could not open working directory: {error}"))?;
-        if !root.is_dir() {
+        if !crate::resilient_fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
             return Err(format!(
                 "working directory is not a directory: {}",
                 root.display()
@@ -952,6 +951,9 @@ impl Runtime {
         skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
+            .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
+                &self.root,
+            ))))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())));
@@ -1152,6 +1154,13 @@ impl Runtime {
         depth: usize,
         cancellation: Option<CancellationHandle>,
     ) -> Result<String, LoopError> {
+        if crate::resilient_fs::shutdown_token().is_cancelled() {
+            return Err(LoopError::InvalidState(
+                "storage shutdown in progress".into(),
+            ));
+        }
+        let controller = CancellationController::new();
+        let _shutdown_bridge = StorageCancellationBridge::new(controller.clone(), cancellation);
         if self.plugin_runtime.is_some() {
             self.mcp.refresh().await.map_err(LoopError::InvalidState)?;
         }
@@ -1169,7 +1178,7 @@ impl Runtime {
         )
         .map_err(LoopError::InvalidState)?;
         let subagents = self.subagents.fresh();
-        let mut builder = Agent::builder()
+        let builder = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(
@@ -1182,9 +1191,7 @@ impl Runtime {
             .mutator(compactor)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
-        if let Some(cancellation) = cancellation {
-            builder = builder.cancellation(cancellation);
-        }
+        let builder = builder.cancellation(controller.handle());
         let mut driver = builder
             .build()?
             .start(SessionConfig::new(session).without_cache())
@@ -1263,9 +1270,7 @@ impl Runtime {
     where
         I: LoopObserver + Clone + 'static,
     {
-        let cwd = context
-            .cwd
-            .canonicalize()
+        let cwd = crate::resilient_fs::canonicalize(&context.cwd)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         if cwd != self.root || !context.additional_directories.is_empty() {
             return Err(AcpRuntimeError::Loop(format!(
@@ -1591,20 +1596,23 @@ fn build_skill_registry(
     let default_roots = default_skill_roots(root);
     let canonical_defaults = default_roots
         .iter()
-        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .map(|path| crate::resilient_fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect::<Vec<_>>();
     let canonical_package_roots = package_roots
         .iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| crate::resilient_fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     let canonical_plugin_skills = skill_directories
         .iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| crate::resilient_fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     let mut roots = default_roots;
     roots.extend(skill_directories.iter().cloned());
+    // This dependency is a native path reader. Do not hand it stale disk paths
+    // for a pending generation; it can be discovered on a later refresh.
+    roots.retain(|path| crate::resilient_fs::global().require_disk(path).is_ok());
     SkillRegistry::from_paths(roots).with_filter(move |skill: &agentkit_tool_skills::Skill| {
-        let Ok(base) = skill.base_dir.canonicalize() else {
+        let Ok(base) = crate::resilient_fs::canonicalize(&skill.base_dir) else {
             return false;
         };
         if canonical_defaults
@@ -1613,7 +1621,7 @@ fn build_skill_registry(
         {
             return true;
         }
-        let Ok(location) = skill.location.canonicalize() else {
+        let Ok(location) = crate::resilient_fs::canonicalize(&skill.location) else {
             return false;
         };
         canonical_plugin_skills.contains(&base)
@@ -2130,12 +2138,18 @@ impl BackgroundableCompose {
             }
             self.background_jobs.changed(&mut jobs);
         }
-        if let Some(cancellation) = foreground_cancellation {
+        {
+            let shutdown = crate::resilient_fs::shutdown_token().child_token();
             let jobs = self.background_jobs.clone();
             let relay_call_id = call_id.clone();
             let relay = tokio::spawn(async move {
-                cancellation.cancelled().await;
-                jobs.propagate_foreground_cancellation(&relay_call_id);
+                tokio::select! {
+                    _ = shutdown.cancelled() => { jobs.cancel_running(&relay_call_id.0); },
+                    _ = async {
+                        if let Some(cancellation) = foreground_cancellation { cancellation.cancelled().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => jobs.propagate_foreground_cancellation(&relay_call_id),
+                }
             })
             .abort_handle();
             if let Ok(mut jobs) = self.background_jobs.state.lock()
@@ -2273,14 +2287,44 @@ impl ComposeBackend for HiddenRunletBackend {
 }
 
 async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<Vec<Item>, String> {
-    let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
-    let context = ContextLoader::new()
-        .with_source(AgentsMd::discover_all(root))
-        .load()
-        .await
-        .map_err(|error| format!("could not load AGENTS.md context: {error}"))?;
-    transcript.extend(context);
-    Ok(transcript)
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
+        // Preserve agentkit-context's outermost-to-innermost ordering and item
+        // metadata, while reading through the same view as other internal IO.
+        let ancestors = root.ancestors().collect::<Vec<_>>();
+        for directory in ancestors.into_iter().rev() {
+            let path = directory.join("AGENTS.md");
+            let body = match crate::config_files::read_to_string(&path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not load AGENTS.md context: could not read {}: {error}",
+                        path.display()
+                    ));
+                }
+            };
+            let mut item = Item::text(
+                ItemKind::Context,
+                format!(
+                    "[Loaded AGENTS]\nPath: {}\n\n{}",
+                    path.display(),
+                    body.trim_end()
+                ),
+            );
+            item.metadata
+                .insert("agentkit.context.source".into(), json!("agents_md"));
+            item.metadata.insert(
+                "agentkit.context.path".into(),
+                json!(path.display().to_string()),
+            );
+            transcript.push(item);
+        }
+        Ok(transcript)
+    })
+    .await
+    .map_err(|error| format!("could not load AGENTS.md context: {error}"))?
 }
 
 fn record_runtime_failure(
@@ -2339,5 +2383,39 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
                 ));
             }
         }
+    }
+}
+
+/// Relays process shutdown into agentkit's generation-based cancellation.
+pub(crate) struct StorageCancellationBridge(tokio::task::JoinHandle<()>);
+
+impl StorageCancellationBridge {
+    pub(crate) fn new(
+        controller: CancellationController,
+        external: Option<CancellationHandle>,
+    ) -> Self {
+        let shutdown = crate::resilient_fs::shutdown_token().child_token();
+        let external = external.map(|handle| handle.checkpoint());
+        Self(tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = async {
+                    if let Some(external) = external { external.cancelled().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {},
+            }
+            // A generation snapshot can be created during async startup after
+            // the first interrupt. Keep shutdown asserted until the owner closes.
+            loop {
+                controller.interrupt();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }))
+    }
+}
+
+impl Drop for StorageCancellationBridge {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }

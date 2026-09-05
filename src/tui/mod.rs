@@ -751,6 +751,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             resume_session_id.is_some(),
             force,
         )?;
+        let child_mcp_config = mcp_config.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                crate::resilient_fs::global()
+                    .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
+            }
+            if let Some(path) = child_mcp_config {
+                crate::resilient_fs::global().require_disk(path)?;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await??;
         let auth_invocation = AgentInvocation::from_command(command.as_std());
         detach_from_controlling_terminal(&mut command);
         let mut child = command
@@ -804,16 +816,26 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let (exit_tx, mut exit_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watcher = tokio::spawn(async move {
-            tokio::select! {
+            let status = tokio::select! {
                 status = child.wait() => {
-                    let _ = exit_tx.send(status);
+                    let notification = status.as_ref().copied().map_err(|error| {
+                        std::io::Error::new(error.kind(), error.to_string())
+                    });
+                    let _ = exit_tx.send(notification);
+                    status
                 }
                 _ = shutdown_rx => {
-                    // Unlike dropping a `kill_on_drop` child, `kill().await` waits
-                    // until the process is gone and its OS file locks are released.
-                    let _ = child.kill().await;
+                    // ACP EOF makes serve stop A2A, drain sessions, and run
+                    // final storage recovery before exiting.
+                    wait_for_storage_exit(&mut child, Duration::from_secs(10)).await
                 }
+            }?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!(
+                    "agent exited with {status}; final storage recovery may have failed; unpersisted data may have been lost"
+                )));
             }
+            Ok::<_, std::io::Error>(())
         });
 
         let notifications = updates_tx.clone();
@@ -1114,12 +1136,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id.clone());
+            let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
                 loop {
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     tokio::select! {
+                        _ = storage_shutdown.cancelled() => return Ok(()),
                         terminal_event = events.next() => {
                             // A paste is a burst: one bracketed-paste event, or
                             // thousands of key events where the terminal cannot
@@ -1398,10 +1422,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             );
                                             app.note(format!("model changed to {} via {}", choice.model, choice.provider));
                                             if save_defaults {
-                                                match save_model_defaults(&choice) {
+                                                let saved = {
+                                                    let choice = choice.clone();
+                                                    tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                                };
+                                                match saved {
                                                     Ok(()) => {
                                                         saved_model_default = Some(choice.clone());
-                                                        app.note("saved model defaults to ~/.kit/config.toml");
+                                                        app.note(config_save_message("model defaults"));
                                                     }
                                                     Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
                                                 }
@@ -1429,9 +1457,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                 "reasoning effort changed to {effort}"
                                             ));
                                             if save_defaults {
-                                                match save_effort_default(&effort) {
+                                                let saved = {
+                                                    let effort = effort.clone();
+                                                    tokio::task::spawn_blocking(move || save_effort_default(&effort)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                                };
+                                                match saved {
                                                     Ok(()) => app.note(
-                                                        "saved reasoning effort default to ~/.kit/config.toml",
+                                                        config_save_message("reasoning effort default"),
                                                     ),
                                                     Err(error) => app.note(format!(
                                                         "reasoning effort changed, but default was not saved: {error}"
@@ -1635,19 +1667,49 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         .map_err(explain)
         };
 
-        // The A2A listener keeps the child alive after ACP closes. Stop it only
-        // after CloseSession has unwound the lock owner, then wait for OS locks to
-        // be released rather than relying on `kill_on_drop`.
+        // The client future has dropped its transport. Allow the storage-owning
+        // process to complete graceful shutdown, including its final recovery.
         let _ = shutdown_tx.send(());
-        let _ = watcher.await;
+        let shutdown_result = watcher.await;
         // If the server failed before acknowledging CloseSession, reclaim only a
         // lock that is now provably stale; a live owner's OS lock is never stolen.
         if let Ok(active) = active_persisted_id.lock() {
             let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
         }
 
+        // Keep startup/protocol diagnostics as well as final persistence failure.
+        if let Err(shutdown) = shutdown_result? {
+            return Err(match result {
+                Err(error) => std::io::Error::other(format!("{error}\n{shutdown}")),
+                Ok(()) => shutdown,
+            }
+            .into());
+        }
         result?;
         Ok(())
+    }
+}
+
+async fn wait_for_storage_exit(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let message = "kit: agent graceful shutdown timed out; forcing termination. Final storage recovery may not have completed; unpersisted data may be lost.";
+            eprintln!("{message}");
+            child.kill().await?;
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+        }
+    }
+}
+
+fn config_save_message(setting: &str) -> String {
+    if crate::resilient_fs::global().status().pending_operations > 0 {
+        format!("updated {setting} in memory; disk persistence is pending (not durable)")
+    } else {
+        format!("saved {setting} to ~/.kit/config.toml")
     }
 }
 
@@ -1698,9 +1760,7 @@ fn update_config(
     path: &Path,
     update: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
 ) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match crate::resilient_fs::read_to_string(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
@@ -1720,9 +1780,8 @@ fn update_config(
     let parent = path
         .parent()
         .ok_or_else(|| "config path has no parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
-        .write(|file| file.write_all(output.as_bytes()))
+    crate::resilient_fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    crate::resilient_fs::replace(path, output.as_bytes())
         .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
@@ -1941,6 +2000,7 @@ fn enable_tui_modes() {
 }
 
 fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
+    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
     let terminal = ratatui::try_init()?;
     // Query after entering the alternate screen but before the event stream owns
     // terminal input, as required by ratatui-image. The query has a short bound.
@@ -1960,6 +2020,7 @@ fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
 }
 
 fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::ImageRuntime> {
+    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
     let resumed = (|| {
         crossterm::terminal::enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -1973,6 +2034,31 @@ fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::Ima
         ratatui::restore();
     }
     resumed
+}
+
+/// Avoid terminal escape sequences on protocol stdout when no TUI was entered.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort cleanup for actual allocator failure, without command formatting,
+/// terminal queries, panic hooks, or allocating our own buffers. Raw-mode cleanup
+/// still relies on the platform terminal implementation; arbitrary failures in
+/// that implementation cannot be made allocation-safe by this hook.
+pub(crate) fn restore_after_allocation_failure() {
+    use std::io::Write as _;
+
+    if !TERMINAL_ACTIVE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    if ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = stdout.write_all(b"\x1b[<1u");
+    }
+    // Mouse modes, bracketed paste, cursor visibility, then alternate screen.
+    let _ = stdout.write_all(
+        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[?1049l",
+    );
+    let _ = stdout.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 /// Whether the keyboard enhancement flags were pushed and still need popping.
@@ -2054,6 +2140,7 @@ fn leave(terminal: &mut DefaultTerminal) {
     restore_modes();
     let _ = terminal.show_cursor();
     ratatui::restore();
+    TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 async fn request_resume(
@@ -3692,6 +3779,50 @@ mod signal_tests {
         .await;
 
         assert!(matches!(result, Err(RequestInterrupt::Stopped)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_exit_waits_for_final_flush_and_preserves_failure_status() {
+        use tokio::io::AsyncReadExt;
+        for code in [0, 1] {
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "cat >/dev/null; sleep 0.05; printf recovered; exit {code}"
+                ))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            // Like dropping the ACP transport: EOF initiates child shutdown.
+            drop(child.stdin.take());
+            let status = super::wait_for_storage_exit(&mut child, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(status.code(), Some(code));
+            let mut flushed = String::new();
+            stdout.read_to_string(&mut flushed).await.unwrap();
+            assert_eq!(flushed, "recovered");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_exit_timeout_reports_possible_loss_and_reaps_child() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = super::wait_for_storage_exit(&mut child, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("unpersisted data may be lost"));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[tokio::test]

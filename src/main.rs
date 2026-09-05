@@ -1,12 +1,13 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
     future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use kit::resilient_fs as fs;
 use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
@@ -273,7 +274,7 @@ impl Config {
             env::current_dir()?.join(path)
         };
         let config_dir = absolute_parent(&config_path)?;
-        let contents = match fs::read_to_string(path) {
+        let contents = match kit::config_files::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self {
@@ -863,7 +864,9 @@ async fn supervise_serve_with_trigger(
         };
         tokio::pin!(stdio);
         tokio::pin!(termination);
+        let shutdown = fs::shutdown_token();
         tokio::select! {
+            _ = shutdown.cancelled() => Exit::Signal(Ok(())),
             result = &mut stdio => Exit::Stdio(result),
             result = http.join() => Exit::Http(result),
             result = &mut termination => Exit::Signal(result),
@@ -897,16 +900,34 @@ async fn supervise_serve_with_trigger(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    kit::resilient_fs::start_recovery_worker();
+    let result = run().await;
+    // Finish synchronously: a detached task can be terminated with the process,
+    // and timing out spawn_blocking would still make runtime teardown wait.
+    let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
+    // Always attempt recovery, but preserve the original command error. The
+    // recovery helper separately warns if accepted data remains undurable.
+    result?;
+    recovery?;
+    Ok(())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     if matches!(&cli.command, Command::Init) {
-        init_default_config()?;
+        tokio::task::spawn_blocking(init_default_config).await??;
+        if fs::global().status().pending_operations > 0 {
+            eprintln!(
+                "Config initialized in memory only; persistence is pending and will not survive process termination."
+            );
+        }
         println!(
             "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
     }
-    let config = Config::load_default()?;
+    let config = tokio::task::spawn_blocking(Config::load_default).await??;
     if let Command::Sessions { action, root } = &cli.command {
         let root = config.root(root.clone());
         match action {
@@ -1210,6 +1231,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
             let _ = config.plugin_runtime(&root).await?;
+            let config_path = config.config_path.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Some(path) = config_path {
+                    fs::global().require_disk(path)?;
+                }
+                Ok::<_, io::Error>(())
+            })
+            .await??;
             kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,
@@ -1242,6 +1271,28 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_symlink_loads_and_initializes_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&target, "model = \"gpt-5.6-sol\"\n[plugins]\n").unwrap();
+        std::os::unix::fs::symlink("settings.toml", &link).unwrap();
+        let config = Config::load(&link).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(link.as_path()));
+        assert!(
+            config
+                .plugin_runtime(directory.path())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&target, "invalid TOML [").unwrap();
+        assert!(Config::load(&link).is_err());
+        assert!(config.plugin_runtime(directory.path()).await.is_err());
+    }
 
     #[test]
     fn subagent_names_are_rejected_as_unknown_configuration() {
@@ -2072,6 +2123,65 @@ future_option = true
         assert!(
             Cli::try_parse_from(["kit", "serve", "--server-credential-file", "token.txt",]).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_stops_a2a_and_completes_supervision() {
+        const CHILD: &str = "KIT_TEST_STDIO_EOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for version in ["1", "2"] {
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::stdio_eof_stops_a2a_and_completes_supervision",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, version)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+                    .await
+                    .expect("ACP EOF must stop serve even with an A2A listener")
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let address = http.address();
+        supervise_serve_with_trigger(
+            runtime,
+            sessions,
+            false,
+            if std::env::var(CHILD).unwrap() == "1" {
+                super::AcpProtocolVersion::V1
+            } else {
+                super::AcpProtocolVersion::V2
+            },
+            http,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        // The final recovery in main can now run; no listener keeps serve alive.
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
     }
 
     #[tokio::test]

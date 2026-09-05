@@ -84,6 +84,19 @@ Only the final compose return value crosses the model-context boundary. When its
 
 Kit's working directory is project context, not an operating-system security boundary. A shell command can use absolute paths, `..`, the network, and any credentials or files allowed to the Kit process. Quote untrusted values, inspect destructive commands before running them, and avoid putting secrets into command text or returned output. There is no automatic rollback for shell side effects.
 
+## Read spilled output with `artifact`
+
+Large compose results include an `artifact` path. Read it through `artifact`, which sees both persisted files and output temporarily held in Kit's memory filesystem. Shell commands only see real disk files.
+
+```text
+chunk = artifact({ path: output.artifact, offset: 0, limit: 1024 })
+return chunk
+```
+
+The result contains `content`, `next_offset`, `total_bytes`, and `eof`. Continue from `next_offset` to read another chunk. Reads preserve UTF-8 character boundaries and are limited to 1,024 bytes per call. Only artifacts in the calling session's namespace are accepted; traversal and symlinks are rejected.
+
+An artifact-storage error does not turn an already-completed tool into a failed tool call. Kit returns a bounded preview with `artifact_error` when output cannot be retained. Do not repeat a side-effecting tool merely to obtain its output again.
+
 ## Make exact file changes with `edit`
 
 `edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from Kit's working directory. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.

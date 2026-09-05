@@ -36,6 +36,8 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    /// Process-wide durability state, independent of the active ACP session.
+    StorageStatus { pending: bool, exhausted: bool },
     /// A persisted ACP session was opened by the child runtime.
     SessionStarted { session_id: String },
     /// A nested tool call started running.
@@ -115,7 +117,8 @@ impl RuntimeEvent {
     pub fn parent_call(&self) -> Option<&str> {
         let call = match self {
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::SessionStarted { .. }
+            Self::StorageStatus { .. }
+            | Self::SessionStarted { .. }
             | Self::CompactionStarted { .. }
             | Self::CompactionFinished { .. }
             | Self::SubagentStateChanged { .. }
@@ -227,6 +230,19 @@ mod tests {
         EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
         summarize_output, write_event,
     };
+
+    #[test]
+    fn storage_status_events_round_trip_without_session_affinity() {
+        for (pending, exhausted) in [(true, false), (false, false), (true, true)] {
+            let event = RuntimeEvent::StorageStatus { pending, exhausted };
+            let mut wire = Vec::new();
+            write_event(&mut wire, &event);
+            let wire = String::from_utf8(wire).unwrap();
+            let parsed = parse(wire.trim_end()).unwrap();
+            assert_eq!(parsed, event);
+            assert_eq!(parsed.parent_call(), None);
+        }
+    }
 
     #[test]
     fn reads_back_an_emitted_event_line() {

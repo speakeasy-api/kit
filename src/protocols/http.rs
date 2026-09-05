@@ -18,7 +18,7 @@ struct BearerToken(Vec<u8>);
 
 impl BearerToken {
     fn load(path: &Path) -> io::Result<Self> {
-        let mut token = std::fs::read(path).map_err(|error| {
+        let mut token = crate::resilient_fs::read(path).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
@@ -139,7 +139,14 @@ pub async fn start_with_registry(
         )
         .into());
     }
-    let credential = credential_file.map(BearerToken::load).transpose()?;
+    let credential_file = credential_file.map(Path::to_path_buf);
+    let credential = tokio::task::spawn_blocking(move || {
+        credential_file
+            .as_deref()
+            .map(BearerToken::load)
+            .transpose()
+    })
+    .await??;
     // Bind once so an ephemeral port cannot be stolen between selection and serving.
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let bound = listener.local_addr()?;
@@ -151,9 +158,9 @@ pub async fn start_with_registry(
         crate::protocols::acp::http_router(runtime.clone(), sessions.clone())
             .merge(crate::protocols::acp::v2::http_router(runtime, sessions))
     });
-    let stop_accepting = CancellationToken::new();
+    let stop_accepting = crate::resilient_fs::shutdown_token().child_token();
     let accepts_stopped = CancellationToken::new();
-    let shutdown_connections = CancellationToken::new();
+    let shutdown_connections = crate::resilient_fs::shutdown_token().child_token();
     let task = tokio::spawn(serve_bound(
         listener,
         a2a,

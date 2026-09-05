@@ -646,6 +646,37 @@ fn nonmatching_failed_load_does_not_touch_configured_or_generated_queues() {
     assert_eq!(next.id(), "selected");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn agents_md_symlink_loads_and_rereads_target() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("instructions.md");
+    let link = root.path().join("AGENTS.md");
+    std::os::unix::fs::symlink("instructions.md", &link).unwrap();
+    for body in ["first guidance", "updated guidance"] {
+        std::fs::write(&target, body).unwrap();
+        let transcript = load_initial_transcript(root.path(), "system".into())
+            .await
+            .unwrap();
+        let context = transcript.last().unwrap();
+        assert_eq!(context.kind, ItemKind::Context);
+        let Part::Text(text) = &context.parts[0] else {
+            panic!("expected context text")
+        };
+        assert!(text.text.contains(body));
+        assert_eq!(
+            context.metadata["agentkit.context.path"],
+            serde_json::json!(link.display().to_string())
+        );
+    }
+    std::fs::remove_file(&target).unwrap();
+    assert!(
+        load_initial_transcript(root.path(), "system".into())
+            .await
+            .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn loads_all_agents_md_files_outermost_first() {
     let parent = tempfile::tempdir().unwrap();
