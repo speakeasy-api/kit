@@ -25,7 +25,7 @@ use agentkit_acp::{
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
     SessionConfigSelectOption, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, TextResourceContents, ToolCallStatus,
+    SetSessionConfigOptionResponse, TextContent, TextResourceContents, ToolCallStatus,
     ToolCallUpdateFields,
 };
 use agentkit_core::{
@@ -952,86 +952,29 @@ struct SessionBindingGuard {
     session_id: agentkit_acp::SessionId,
 }
 
-/// Legacy wire projection of the shared activity reducer. Foreground activity
-/// is settled by the standard prompt response; only unsolicited activity needs
-/// the extension notification. Both paths observe the same per-session reducer.
-#[derive(Clone)]
-struct LegacyActivity {
-    state: Arc<Mutex<LegacyActivityProjection>>,
+/// v1 retains standard prompt responses; autonomous intervals use the extension.
+fn legacy_activity(
     session_id: agentkit_acp::SessionId,
-    notifications: mpsc::UnboundedSender<TurnStateNotification>,
-}
-
-#[derive(Default)]
-struct LegacyActivityProjection {
-    activity: activity::SessionActivity,
-    unsolicited: bool,
-    next_id: u64,
-    notification_id: Option<u64>,
-}
-
-impl LegacyActivity {
-    fn new(
-        session_id: agentkit_acp::SessionId,
-        notifications: mpsc::UnboundedSender<TurnStateNotification>,
-    ) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(LegacyActivityProjection::default())),
-            session_id,
-            notifications,
+    notify: impl Fn(TurnStateNotification) -> Result<(), AcpRuntimeError> + Send + Sync + 'static,
+) -> activity::SessionActivity {
+    activity::SessionActivity::new(move |transition| {
+        if transition.origin == activity::ExecutionOrigin::Autonomous {
+            notify(TurnStateNotification {
+                session_id: session_id.clone(),
+                turn_id: transition.id,
+                active: transition.active,
+                error: transition.error,
+            })?;
         }
-    }
-
-    fn begin_unsolicited(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .unsolicited = true;
-    }
-
-    fn settle(&self, error: Option<String>) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let transition = state.activity.settle();
-        state.unsolicited = false;
-        if transition.is_some()
-            && let Some(turn_id) = state.notification_id.take()
-        {
-            let _ = self.notifications.send(TurnStateNotification {
-                session_id: self.session_id.clone(),
-                turn_id,
-                active: false,
-                error,
-            });
-        }
-    }
-
-    fn observe(&self, event: &AgentEvent) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.activity.observe(event) == Some(true) && state.unsolicited {
-            state.next_id = state.next_id.wrapping_add(1);
-            let turn_id = state.next_id;
-            state.notification_id = Some(turn_id);
-            let _ = self.notifications.send(TurnStateNotification {
-                session_id: self.session_id.clone(),
-                turn_id,
-                active: true,
-                error: None,
-            });
-        }
-    }
-}
-
-impl LoopObserver for LegacyActivity {
-    fn handle_event(&self, event: ObservedEvent) {
-        self.observe(&event.event);
-    }
+        Ok(())
+    })
 }
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
     inner: AcpIntegration,
     client: AcpClientHandle,
-    activity: LegacyActivity,
+    activity: activity::SessionActivity,
     session_id: agentkit_acp::SessionId,
 }
 
@@ -1040,7 +983,7 @@ impl ResponseInterruptionNoticeObserver {
         inner: AcpIntegration,
         client: AcpClientHandle,
         session_id: agentkit_acp::SessionId,
-        activity: LegacyActivity,
+        activity: activity::SessionActivity,
     ) -> Self {
         Self {
             activity,
@@ -1337,9 +1280,15 @@ impl Server {
         let cancellation = CancellationController::new();
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
-        let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
-        let activity = LegacyActivity::new(session_id.clone(), turn_states);
-        tokio::spawn(drain_turn_states(turn_state_messages, connection.clone()));
+        // Lifecycle notifications enter the SDK queue synchronously. Running is
+        // enqueued before the observer can produce content; finalization flushes
+        // the content drain before enqueuing Idle on this same SDK queue.
+        let activity_connection = connection.clone();
+        let activity = legacy_activity(session_id.clone(), move |state| {
+            activity_connection
+                .send_notification(state)
+                .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+        });
 
         let mut metadata = MetadataMap::new();
         metadata.insert("acp.cwd".into(), json!(cwd));
@@ -1656,7 +1605,7 @@ struct SessionActor<S: ModelSession> {
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
-    activity: LegacyActivity,
+    activity: activity::SessionActivity,
     mcp_events: crate::tools::mcp::McpSubscription,
 }
 
@@ -1685,7 +1634,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             biased;
             command = commands.recv() => match command {
                 Some(Command::Prompt { request, reply }) => {
-                    let result = drive_runtime_prompt(
+                    let result = activity.execute(activity::ExecutionOrigin::Prompt, drive_runtime_prompt(
                         &session_id,
                         &runtime,
                         &integration,
@@ -1695,9 +1644,11 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         &tasks,
                         &background_jobs,
                         structured_completion,
-                    ).await;
-                    activity.settle(None);
-                    let _ = reply.send(result);
+                    ), |reason| Some(reason.clone())).await;
+                    let response = result.and_then(|reason| {
+                        agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
+                    });
+                    let _ = reply.send(response);
                 }
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
@@ -2060,7 +2011,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
+) -> Result<FinishReason, AcpRuntimeError> {
     if structured_completion {
         let _ = settle_background_jobs(tasks, background_jobs).await?;
     }
@@ -2081,17 +2032,17 @@ async fn drive_runtime_prompt<S: ModelSession>(
             }
         })?;
     drop(current);
-    drive_submitted_prompt(
+    drive_finalized(
         session_id,
         integration,
         driver,
-        tasks,
-        background_jobs,
-        structured_completion,
+        true,
+        structured_completion.then_some((tasks, background_jobs)),
     )
     .await
 }
 
+#[cfg(test)]
 async fn drive_submitted_prompt<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
@@ -2100,48 +2051,34 @@ async fn drive_submitted_prompt<S: ModelSession>(
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
 ) -> Result<PromptResponse, AcpRuntimeError> {
-    let response = match drive_until_pause(
+    drive_until_pause(
         session_id,
         integration,
         driver,
         true,
         structured_completion.then_some((tasks, background_jobs)),
     )
-    .await
-    {
-        Ok(Some(response)) => response,
-        Ok(None) => {
-            return Err(AcpRuntimeError::Loop(
-                "prompt ended without a response".into(),
-            ));
-        }
-        Err(error) => {
-            if structured_completion {
-                cancel_background_jobs(tasks, background_jobs).await;
-                let _ = settle_background_jobs(tasks, background_jobs).await;
-            }
-            return Err(error);
-        }
-    };
-    if structured_completion && response.stop_reason == StopReason::Cancelled {
-        cancel_background_jobs(tasks, background_jobs).await;
-        let _ = settle_background_jobs(tasks, background_jobs).await?;
-    }
-    Ok(response)
+    .await?
+    .ok_or_else(|| AcpRuntimeError::Loop("prompt ended without a response".into()))
 }
 
 async fn drive_unsolicited<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
-    activity: &LegacyActivity,
+    activity: &activity::SessionActivity,
 ) -> Result<(), AcpRuntimeError> {
-    activity.begin_unsolicited();
-    let result = drive_autonomous(session_id, integration, driver).await;
-    activity.settle(result.as_ref().err().map(ToString::to_string));
-    result
+    activity
+        .execute(
+            activity::ExecutionOrigin::Autonomous,
+            drive_finalized(session_id, integration, driver, false, None),
+            |reason| Some(reason.clone()),
+        )
+        .await
+        .map(|_| ())
 }
 
+#[cfg(test)]
 async fn drive_autonomous<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
@@ -2151,6 +2088,7 @@ async fn drive_autonomous<S: ModelSession>(
     Ok(())
 }
 
+#[cfg(test)]
 async fn drive_until_pause<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
@@ -2158,12 +2096,49 @@ async fn drive_until_pause<S: ModelSession>(
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<Option<PromptResponse>, AcpRuntimeError> {
+    let reason =
+        drive_finalized(session_id, integration, driver, answer_prompt, structured).await?;
+    if answer_prompt {
+        Ok(Some(PromptResponse::new(
+            agentkit_acp::finish_reason_to_stop_reason(&reason)?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn drive_finalized<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    answer_prompt: bool,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let cancellation = integration.cancellation_handle(session_id)?;
+    let generation = cancellation.generation();
+    let result =
+        drive_domain_until_pause(session_id, integration, driver, answer_prompt, structured).await;
+    activity::finalize(
+        activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
+        structured,
+        integration.flush_session_updates(session_id),
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn drive_domain_until_pause<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    answer_prompt: bool,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+) -> Result<FinishReason, AcpRuntimeError> {
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
-                integration.flush_session_updates(session_id).await?;
-                return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::Cancelled)));
+                return Ok(FinishReason::Cancelled);
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
@@ -2172,27 +2147,24 @@ async fn drive_until_pause<S: ModelSession>(
                 if result.finish_reason == FinishReason::ToolCall {
                     continue;
                 }
-                integration.flush_session_updates(session_id).await?;
-                if !answer_prompt {
-                    return Ok(None);
+                if result.finish_reason == FinishReason::Error {
+                    return Err(AcpRuntimeError::Loop("model turn failed".into()));
                 }
-                let reason = agentkit_acp::finish_reason_to_stop_reason(&result.finish_reason)?;
                 if let Some((tasks, background_jobs)) = structured
                     && settle_background_jobs(tasks, background_jobs).await?
                 {
                     continue;
                 }
-                return Ok(Some(PromptResponse::new(reason)));
+                return Ok(result.finish_reason);
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                integration.flush_session_updates(session_id).await?;
                 if answer_prompt
                     && let Some((tasks, background_jobs)) = structured
                     && settle_background_jobs(tasks, background_jobs).await?
                 {
                     continue;
                 }
-                return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::EndTurn)));
+                return Ok(FinishReason::Completed);
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
@@ -2541,26 +2513,20 @@ fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities 
     }
 }
 
-async fn drain_turn_states(
-    mut states: mpsc::UnboundedReceiver<TurnStateNotification>,
-    connection: ConnectionTo<Client>,
-) {
-    while let Some(state) = states.recv().await {
-        let _ = connection.send_notification(state);
-    }
-}
-
 async fn drain_client_messages(
     mut messages: mpsc::UnboundedReceiver<AcpClientMessage>,
     connection: ConnectionTo<Client>,
 ) {
+    let mut failed = false;
     while let Some(message) = messages.recv().await {
         match message {
             AcpClientMessage::SessionNotification(notification) => {
-                let _ = connection.send_notification(notification);
+                failed |= connection.send_notification(notification).is_err();
             }
             AcpClientMessage::Flush { response } => {
-                let _ = response.send(());
+                if !failed {
+                    let _ = response.send(());
+                }
             }
             AcpClientMessage::PermissionRequest { request, response } => {
                 let connection = connection.clone();
@@ -2608,6 +2574,104 @@ pub(super) mod tests {
     };
 
     use super::*;
+    use agentkit_acp::StopReason;
+
+    fn test_activity(
+        id: agentkit_acp::SessionId,
+        tx: mpsc::UnboundedSender<TurnStateNotification>,
+    ) -> activity::SessionActivity {
+        legacy_activity(id, move |state| {
+            tx.send(state).map_err(|_| AcpRuntimeError::ClientClosed)
+        })
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transport_orders_running_partial_content_and_error_idle() {
+        let (client_transport, agent_transport) = Channel::duplex();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let content_events = events.clone();
+        let client = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .builder()
+                .on_receive_notification(
+                    async move |state: TurnStateNotification, _cx| {
+                        events
+                            .send(if state.active { "running" } else { "idle" })
+                            .unwrap();
+                        if !state.active {
+                            assert!(state.error.is_some());
+                        }
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_notification(
+                    async move |_content: SessionNotification, _cx| {
+                        content_events.send("content").unwrap();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(client_transport)
+                .await
+        });
+        agent_client_protocol::Agent
+            .builder()
+            .connect_with(agent_transport, async move |connection| {
+                let id = agentkit_acp::SessionId::new("ordered");
+                let lifecycle_connection = connection.clone();
+                let activity = legacy_activity(id.clone(), move |state| {
+                    lifecycle_connection
+                        .send_notification(state)
+                        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+                });
+                let (content, messages) = AcpClientHandle::channel();
+                let result = activity
+                    .execute(
+                        activity::ExecutionOrigin::Autonomous,
+                        async {
+                            activity.observe(&AgentEvent::TurnStarted {
+                                session_id: AgentkitSessionId::new("ordered"),
+                                turn_id: agentkit_core::TurnId::new("first"),
+                            });
+                            content.notify_session(SessionNotification::new(
+                                id,
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("partial")),
+                                )),
+                            ))?;
+                            // Deliberately delay the content drain. Idle must await it,
+                            // including when the operation fails after partial output.
+                            tokio::spawn(drain_client_messages(messages, connection.clone()));
+                            activity::finalize(
+                                activity::ExecutionOutcome::new(
+                                    Err(AcpRuntimeError::Loop("approval failed".into())),
+                                    false,
+                                ),
+                                None,
+                                content.flush(),
+                                |_| Ok(()),
+                            )
+                            .await
+                        },
+                        |reason| Some(reason.clone()),
+                    )
+                    .await;
+                assert!(result.is_err());
+                for expected in ["running", "content", "idle"] {
+                    assert_eq!(
+                        timeout(Duration::from_secs(2), received.recv())
+                            .await
+                            .unwrap(),
+                        Some(expected)
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        client.abort();
+    }
 
     #[test]
     fn terminal_auth_methods_require_client_support() {
@@ -3275,7 +3339,7 @@ pub(super) mod tests {
             integration.clone(),
             client,
             session_id.clone(),
-            LegacyActivity::new(session_id.clone(), mpsc::unbounded_channel().0),
+            test_activity(session_id.clone(), mpsc::unbounded_channel().0),
         );
         let emit = |event| {
             observer.handle_event(ObservedEvent {
@@ -3973,7 +4037,7 @@ pub(super) mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response, FinishReason::Completed);
         assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
         drain.abort();
     }
@@ -4131,7 +4195,7 @@ pub(super) mod tests {
             }
         });
         let (notifications, mut states) = mpsc::unbounded_channel();
-        let activity = LegacyActivity::new(session_id.clone(), notifications);
+        let activity = test_activity(session_id.clone(), notifications);
         // Start the script at its plain content response, with no tool prerequisite.
         let turns = Arc::new(AtomicUsize::new(2));
         let mut driver = Agent::builder()
@@ -4179,7 +4243,7 @@ pub(super) mod tests {
         assert!(states.try_recv().is_err());
 
         // Foreground uses the very same reducer, but retains standard v1 response
-        // semantics without extension notifications (or consuming extension IDs).
+        // semantics without extension notifications (while sharing session activity IDs).
         driver
             .submit_input(vec![Item::text(ItemKind::User, "foreground")])
             .unwrap();
@@ -4187,13 +4251,13 @@ pub(super) mod tests {
             .await
             .unwrap()
             .unwrap();
-        activity.settle(None);
+        activity.settle(None, None).unwrap();
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert!(states.try_recv().is_err());
 
         // Multiple logical turns drained within one autonomous interval do not
         // publish an intermediate terminal state or allocate another turn ID.
-        activity.begin_unsolicited();
+        activity.begin(activity::ExecutionOrigin::Autonomous);
         for text in ["first continuation", "second continuation"] {
             driver.submit_input(vec![Item::notification(text)]).unwrap();
             drive_autonomous(&session_id, &integration, &mut driver)
@@ -4202,14 +4266,16 @@ pub(super) mod tests {
         }
         let started = states.try_recv().unwrap();
         assert!(started.active);
-        assert_eq!(started.turn_id, 2);
+        assert_eq!(started.turn_id, 3);
         assert!(states.try_recv().is_err());
-        activity.settle(Some("terminal error".into()));
+        activity
+            .settle(None, Some("terminal error".into()))
+            .unwrap();
         let ended = states.try_recv().unwrap();
         assert!(!ended.active);
         assert_eq!(ended.turn_id, started.turn_id);
         assert_eq!(ended.error.as_deref(), Some("terminal error"));
-        activity.settle(None);
+        activity.settle(None, None).unwrap();
         assert!(states.try_recv().is_err());
         assert_eq!(turns.load(Ordering::SeqCst), 6);
         drain.abort();
@@ -4274,7 +4340,7 @@ pub(super) mod tests {
             release: Arc::clone(&release),
         });
         let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
-        let activity = LegacyActivity::new(acp_session_id.clone(), turn_states_tx);
+        let activity = test_activity(acp_session_id.clone(), turn_states_tx);
         let driver = Agent::builder()
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
