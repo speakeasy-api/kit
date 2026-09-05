@@ -1,5 +1,9 @@
-//! Transparent lifecycle reporting for the hidden tools behind `compose`.
-//! Effects observations are independent of the opt-in stderr display channel.
+//! Lifecycle reporting for the hidden tools behind `compose`.
+//!
+//! The wrapper is transparent to the model and to compose: it forwards the
+//! spec, permission requests, and invocation untouched, and only publishes
+//! start/finish events on the runtime side channel (see [`crate::events`]) so
+//! a client can draw what a Runlet program is doing while it runs.
 
 use std::{sync::Arc, time::Instant};
 
@@ -9,52 +13,23 @@ use agentkit_tools_core::{
     ToolSpec,
 };
 use async_trait::async_trait;
+
 use serde_json::{Value, json};
 
-use crate::{
-    effects::Observations,
-    events::{self, RuntimeEvent, summarize_input, summarize_output},
-};
+use crate::events::{self, RuntimeEvent, summarize_input, summarize_output};
 
 /// Wraps a tool so its calls appear on the runtime side channel.
-pub struct Observed<T> {
-    tool: T,
-    observations: Option<Observations>,
-}
+pub struct Observed<T>(T);
 
 impl<T: Tool> Observed<T> {
     pub const fn new(tool: T) -> Self {
-        Self {
-            tool,
-            observations: None,
-        }
-    }
-
-    pub(crate) fn with_observations(mut self, observations: Observations) -> Self {
-        self.observations = Some(observations);
-        self
-    }
-
-    fn start(&self, request: &ToolRequest) -> Option<DisplayInvocation> {
-        if let Some(observations) = &self.observations {
-            observations.invocation_started();
-        }
-        DisplayInvocation::start(request)
-    }
-
-    fn finish(&self, display: Option<DisplayInvocation>, result: Result<&ToolResult, &ToolError>) {
-        if let Some(observations) = &self.observations {
-            observations.invocation_completed();
-        }
-        if let Some(display) = display {
-            display.finish(result);
-        }
+        Self(tool)
     }
 }
 
-/// Wraps a dynamically dispatched tool without hiding specs or native outcomes.
-pub(crate) fn shared(tool: Arc<dyn Tool>, observations: Observations) -> impl Tool {
-    Observed::new(SharedTool(tool)).with_observations(observations)
+/// Wraps a dynamically dispatched tool without hiding its changing spec.
+pub(crate) fn shared(tool: Arc<dyn Tool>) -> impl Tool {
+    Observed(SharedTool(tool))
 }
 
 struct SharedTool(Arc<dyn Tool>);
@@ -64,15 +39,18 @@ impl Tool for SharedTool {
     fn spec(&self) -> &ToolSpec {
         self.0.spec()
     }
+
     fn current_spec(&self) -> Option<ToolSpec> {
         self.0.current_spec()
     }
+
     fn proposed_requests(
         &self,
         request: &ToolRequest,
     ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
         self.0.proposed_requests(request)
     }
+
     async fn invoke(
         &self,
         request: ToolRequest,
@@ -80,6 +58,7 @@ impl Tool for SharedTool {
     ) -> Result<ToolResult, ToolError> {
         self.0.invoke(request, context).await
     }
+
     async fn invoke_outcome(
         &self,
         request: ToolRequest,
@@ -92,42 +71,48 @@ impl Tool for SharedTool {
 #[async_trait]
 impl<T: Tool> Tool for Observed<T> {
     fn spec(&self) -> &ToolSpec {
-        self.tool.spec()
+        self.0.spec()
     }
+
     fn current_spec(&self) -> Option<ToolSpec> {
-        self.tool.current_spec()
+        self.0.current_spec()
     }
+
     fn proposed_requests(
         &self,
         request: &ToolRequest,
     ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
-        self.tool.proposed_requests(request)
+        self.0.proposed_requests(request)
     }
+
     async fn invoke(
         &self,
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let display = self.start(&request);
-        let outcome = self.tool.invoke(request, context).await;
-        self.finish(display, outcome.as_ref());
+        let display = DisplayInvocation::start(&request);
+        let outcome = self.0.invoke(request, context).await;
+        if let Some(display) = display {
+            display.finish(outcome.as_ref());
+        }
         outcome
     }
+
     async fn invoke_outcome(
         &self,
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let display = self.start(&request);
-        let outcome = self.tool.invoke_outcome(request, context).await;
-        match &outcome {
-            ToolExecutionOutcome::Completed(result) => self.finish(display, Ok(result)),
-            ToolExecutionOutcome::Failed(error)
-            | ToolExecutionOutcome::FailedBeforeInvocation(error) => {
-                self.finish(display, Err(error))
+        let display = DisplayInvocation::start(&request);
+        let outcome = self.0.invoke_outcome(request, context).await;
+        if let Some(display) = display {
+            match &outcome {
+                ToolExecutionOutcome::Completed(result) => display.finish(Ok(result)),
+                ToolExecutionOutcome::Failed(error)
+                | ToolExecutionOutcome::FailedBeforeInvocation(error) => display.finish(Err(error)),
+                // An approval interruption is not a completed invocation.
+                ToolExecutionOutcome::Interrupted(_) => {}
             }
-            // Neither interruption nor dropping an in-flight future is completion.
-            ToolExecutionOutcome::Interrupted(_) => {}
         }
         outcome
     }
@@ -138,6 +123,7 @@ struct DisplayInvocation {
     tool: String,
     started: Instant,
 }
+
 impl DisplayInvocation {
     fn start(request: &ToolRequest) -> Option<Self> {
         if !events::enabled() {
@@ -157,6 +143,7 @@ impl DisplayInvocation {
             started: Instant::now(),
         })
     }
+
     fn finish(self, result: Result<&ToolResult, &ToolError>) {
         let (ok, summary) = match result {
             Ok(result) => (
@@ -193,161 +180,119 @@ mod tests {
         ToolName,
     };
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Mode {
-        Complete,
-        Pending,
+        Completed,
         Failed,
+        FailedBeforeInvocation,
         Cancelled,
         Interrupted,
     }
-    struct Fixture {
+
+    struct NativeTool {
         spec: ToolSpec,
         mode: Mode,
     }
-    impl Fixture {
-        fn new(mode: Mode) -> Self {
-            Self {
-                spec: ToolSpec::new(ToolName::new("fixture"), "fixture", json!({})),
-                mode,
-            }
-        }
-    }
+
     #[async_trait]
-    impl Tool for Fixture {
+    impl Tool for NativeTool {
         fn spec(&self) -> &ToolSpec {
             &self.spec
         }
+
         async fn invoke(
             &self,
-            request: ToolRequest,
+            _: ToolRequest,
             _: &mut ToolContext<'_>,
         ) -> Result<ToolResult, ToolError> {
-            match self.mode {
-                Mode::Pending => std::future::pending().await,
-                Mode::Complete => Ok(ToolResult::new(ToolResultPart::success(
-                    request.call_id,
-                    ToolOutput::text("private result"),
-                ))),
-                Mode::Failed => Err(ToolError::ExecutionFailed("failed".into())),
-                Mode::Cancelled => Err(ToolError::Cancelled),
-                Mode::Interrupted => panic!("native outcome must not use invoke fallback"),
-            }
+            panic!("wrapper must forward invoke_outcome, not use the invoke fallback")
         }
+
         async fn invoke_outcome(
             &self,
             request: ToolRequest,
-            context: &mut ToolContext<'_>,
+            _: &mut ToolContext<'_>,
         ) -> ToolExecutionOutcome {
-            if matches!(self.mode, Mode::Interrupted) {
-                return ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(
-                    ApprovalRequest::new(
+            match self.mode {
+                Mode::Completed => ToolExecutionOutcome::Completed(ToolResult::new(
+                    ToolResultPart::success(request.call_id, ToolOutput::text("done")),
+                )),
+                Mode::Failed => {
+                    ToolExecutionOutcome::Failed(ToolError::ExecutionFailed("failed".into()))
+                }
+                Mode::FailedBeforeInvocation => ToolExecutionOutcome::FailedBeforeInvocation(
+                    ToolError::Unavailable("not started".into()),
+                ),
+                Mode::Cancelled => ToolExecutionOutcome::Failed(ToolError::Cancelled),
+                Mode::Interrupted => ToolExecutionOutcome::Interrupted(
+                    ToolInterruption::ApprovalRequired(ApprovalRequest::new(
                         "approval",
-                        "fixture",
+                        "native",
                         ApprovalReason::PolicyRequiresConfirmation,
                         "approval",
-                    ),
-                ));
-            }
-            match self.invoke(request, context).await {
-                Ok(result) => ToolExecutionOutcome::Completed(result),
-                Err(error) => ToolExecutionOutcome::Failed(error),
+                    )),
+                ),
             }
         }
     }
-    fn context() -> OwnedToolContext {
-        OwnedToolContext {
-            session_id: SessionId::new("session"),
-            turn_id: TurnId::new("turn"),
-            metadata: MetadataMap::new(),
-            permissions: Arc::new(AllowAllPermissions),
-            resources: Arc::new(()),
-            cancellation: None,
-            execution_scope: None,
-            approved_request: None,
-        }
-    }
-    fn request() -> ToolRequest {
-        ToolRequest::new(
-            ToolCallId::new("private-call"),
-            ToolName::new("fixture"),
-            json!({"secret": "private arguments"}),
-            SessionId::new("session"),
-            TurnId::new("turn"),
-        )
-    }
 
     #[tokio::test]
-    async fn observations_do_not_depend_on_display_events() {
-        if crate::effects::isolated_test(
-            "tools::observed::tests::observations_do_not_depend_on_display_events",
-        ) {
-            return;
-        }
-        assert!(!events::enabled());
-        let observations = Observations::local_session();
-        let tool =
-            Observed::new(Fixture::new(Mode::Complete)).with_observations(observations.clone());
-        tool.invoke(request(), &mut context().borrowed())
-            .await
-            .unwrap();
-        assert!(observations.snapshot().tool_execution_start_reported);
-        assert!(observations.snapshot().tool_execution_completion_reported);
-        assert!(
-            !serde_json::to_string(&observations.snapshot())
-                .unwrap()
-                .contains("private")
-        );
-    }
-
-    #[tokio::test]
-    async fn dropping_running_invocation_does_not_report_completion() {
-        let observations = Observations::local_session();
-        let tool =
-            Observed::new(Fixture::new(Mode::Pending)).with_observations(observations.clone());
-        let owned = context();
-        let mut context = owned.borrowed();
-        let mut invocation = Box::pin(tool.invoke(request(), &mut context));
-        tokio::select! { biased; _ = &mut invocation => panic!("pending"), () = tokio::task::yield_now() => {} }
-        drop(invocation);
-        assert!(observations.snapshot().tool_execution_start_reported);
-        assert!(!observations.snapshot().tool_execution_completion_reported);
-        assert!(observations.snapshot().observation_incomplete);
-    }
-
-    #[tokio::test]
-    async fn shared_wrapper_preserves_native_interruption_failure_and_cancellation() {
+    async fn both_wrappers_preserve_native_outcomes() {
         for mode in [
-            Mode::Complete,
+            Mode::Completed,
             Mode::Failed,
+            Mode::FailedBeforeInvocation,
             Mode::Cancelled,
             Mode::Interrupted,
         ] {
-            let observations = Observations::local_session();
-            let tool = shared(Arc::new(Fixture::new(mode)), observations.clone());
-            let outcome = tool
-                .invoke_outcome(request(), &mut context().borrowed())
-                .await;
-            match mode {
-                Mode::Complete => assert!(matches!(outcome, ToolExecutionOutcome::Completed(_))),
-                Mode::Failed => assert!(matches!(
-                    outcome,
-                    ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(_))
-                )),
-                Mode::Cancelled => assert!(matches!(
-                    outcome,
-                    ToolExecutionOutcome::Failed(ToolError::Cancelled)
-                )),
-                Mode::Interrupted => {
-                    assert!(matches!(outcome, ToolExecutionOutcome::Interrupted(_)))
-                }
-                Mode::Pending => unreachable!(),
+            for dynamic in [false, true] {
+                let native = NativeTool {
+                    spec: ToolSpec::new(ToolName::new("native"), "native", json!({})),
+                    mode,
+                };
+                let tool: Box<dyn Tool> = if dynamic {
+                    Box::new(shared(Arc::new(native)))
+                } else {
+                    Box::new(Observed::new(native))
+                };
+                let context = OwnedToolContext {
+                    session_id: SessionId::new("session"),
+                    turn_id: TurnId::new("turn"),
+                    metadata: MetadataMap::new(),
+                    permissions: Arc::new(AllowAllPermissions),
+                    resources: Arc::new(()),
+                    cancellation: None,
+                    execution_scope: None,
+                    approved_request: None,
+                };
+                let request = ToolRequest::new(
+                    ToolCallId::new("call"),
+                    ToolName::new("native"),
+                    json!({}),
+                    context.session_id.clone(),
+                    context.turn_id.clone(),
+                );
+                let outcome = tool.invoke_outcome(request, &mut context.borrowed()).await;
+                let preserved = match (mode, outcome) {
+                    (Mode::Completed, ToolExecutionOutcome::Completed(result)) => {
+                        result.result.output == ToolOutput::text("done")
+                    }
+                    (
+                        Mode::Failed,
+                        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)),
+                    ) => message == "failed",
+                    (
+                        Mode::FailedBeforeInvocation,
+                        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Unavailable(
+                            message,
+                        )),
+                    ) => message == "not started",
+                    (Mode::Cancelled, ToolExecutionOutcome::Failed(ToolError::Cancelled)) => true,
+                    (Mode::Interrupted, ToolExecutionOutcome::Interrupted(_)) => true,
+                    _ => false,
+                };
+                assert!(preserved, "{mode:?}, shared={dynamic}");
             }
-            assert!(observations.snapshot().tool_execution_start_reported);
-            assert_eq!(
-                observations.snapshot().tool_execution_completion_reported,
-                !matches!(mode, Mode::Interrupted)
-            );
         }
     }
 }

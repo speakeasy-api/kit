@@ -13,34 +13,11 @@ use a2a_protocol_types::{
 };
 
 use sha2::{Digest as _, Sha256};
+use tracing::Instrument as _;
 
 use crate::runtime::Runtime;
 
 struct KitAgent(Arc<Runtime>);
-
-fn record_failure(
-    session_id: &str,
-    error: &agentkit_loop::LoopError,
-    observations: &crate::effects::Observations,
-) -> String {
-    let rendered = crate::fatal::render_loop_error(error);
-    match crate::fatal::record_loop_error_with_effects(
-        session_id,
-        crate::fatal::Surface::A2a,
-        error,
-        observations.snapshot(),
-    ) {
-        Ok(Some(path)) => eprintln!(
-            "stored fatal error log for {session_id}: {}",
-            path.display()
-        ),
-        Ok(None) => {}
-        Err(log_error) => {
-            eprintln!("could not store fatal error log for {session_id}: {log_error}")
-        }
-    }
-    rendered
-}
 
 impl AgentExecutor for KitAgent {
     fn execute<'a>(
@@ -48,53 +25,70 @@ impl AgentExecutor for KitAgent {
         context: &'a RequestContext,
         queue: &'a dyn EventQueueWriter,
     ) -> Pin<Box<dyn Future<Output = A2aResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let emit = EventEmitter::new(context, queue);
-            emit.status(TaskState::Working).await?;
-            let prompt = context
-                .message
-                .parts
-                .iter()
-                .filter_map(Part::text_content)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if prompt.trim().is_empty() {
-                emit.artifact(
-                    "error",
-                    vec![Part::text("A2A request must contain a text part")],
-                    None,
-                    Some(true),
-                )
-                .await?;
-                emit.status(TaskState::Failed).await?;
-                return Ok(());
-            }
-            let observations = crate::effects::Observations::local_session();
-            match self
-                .0
-                .run_cancelled_observed(
-                    prompt,
-                    0,
-                    Some(context.cancellation_token.clone()),
-                    observations.clone(),
-                )
-                .await
-            {
-                Ok(output) => {
-                    emit.artifact("result", vec![Part::text(output)], None, Some(true))
-                        .await?;
-                    emit.status(TaskState::Completed).await?;
-                }
-                Err(error) => {
-                    let session_id = a2a_session_id(context);
-                    let rendered = record_failure(&session_id, &error, &observations);
-                    emit.artifact("error", vec![Part::text(rendered)], None, Some(true))
-                        .await?;
+        Box::pin(
+            async move {
+                let emit = EventEmitter::new(context, queue);
+                emit.status(TaskState::Working).await?;
+                let prompt = context
+                    .message
+                    .parts
+                    .iter()
+                    .filter_map(Part::text_content)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if prompt.trim().is_empty() {
+                    emit.artifact(
+                        "error",
+                        vec![Part::text("A2A request must contain a text part")],
+                        None,
+                        Some(true),
+                    )
+                    .await?;
                     emit.status(TaskState::Failed).await?;
+                    return Ok(());
                 }
+                match self
+                    .0
+                    .run_cancelled(prompt, 0, Some(context.cancellation_token.clone()))
+                    .await
+                {
+                    Ok(output) => {
+                        emit.artifact("result", vec![Part::text(output)], None, Some(true))
+                            .await?;
+                        emit.status(TaskState::Completed).await?;
+                    }
+                    Err(error) => {
+                        let session_id = a2a_session_id(context);
+                        let rendered = crate::fatal::render_loop_error(&error);
+                        let rendered = match crate::fatal::record_loop_error(
+                            &session_id,
+                            crate::fatal::Surface::A2a,
+                            &error,
+                        ) {
+                            Ok(Some(path)) => {
+                                eprintln!(
+                                    "stored fatal error log for {session_id}: {}",
+                                    path.display()
+                                );
+                                rendered
+                            }
+                            Ok(None) => rendered,
+                            Err(log_error) => {
+                                eprintln!(
+                                    "could not store fatal error log for {session_id}: {log_error}"
+                                );
+                                rendered
+                            }
+                        };
+                        emit.artifact("error", vec![Part::text(rendered)], None, Some(true))
+                            .await?;
+                        emit.status(TaskState::Failed).await?;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        })
+            .instrument(crate::telemetry::error_spans::operation("a2a")),
+        )
     }
 }
 
@@ -172,35 +166,4 @@ pub(crate) fn dispatcher(
             .build()?,
     );
     Ok(JsonRpcDispatcher::new(handler))
-}
-
-#[cfg(test)]
-mod effects_tests {
-    #[tokio::test]
-    async fn a2a_cancelled_execution_retains_the_captured_owner() {
-        if crate::effects::isolated_test(
-            "protocols::a2a::effects_tests::a2a_cancelled_execution_retains_the_captured_owner",
-        ) {
-            return;
-        }
-        let observations = crate::effects::Observations::local_session();
-        let executing = observations.clone();
-        let result = async move {
-            executing.invocation_started();
-            tokio::task::yield_now().await;
-            executing.invocation_completed();
-            Err::<(), _>(agentkit_loop::LoopError::Cancelled)
-        }
-        .await;
-        super::record_failure("a2a-effects", &result.unwrap_err(), &observations);
-        let record = crate::effects::test_record("a2a-effects");
-        assert_eq!(record["surface"], "a2a");
-        assert_eq!(record["kind"], "cancelled");
-        assert_eq!(record["possible_effects"]["source"], "local_session");
-        assert_eq!(
-            record["possible_effects"]["tool_execution_completion_reported"],
-            true
-        );
-        assert_eq!(record["possible_effects"]["observation_incomplete"], true);
-    }
 }

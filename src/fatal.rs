@@ -25,7 +25,6 @@ pub(crate) enum Surface {
     A2a,
     Acp,
     Prompt,
-    Subagent,
 }
 
 impl Surface {
@@ -34,7 +33,6 @@ impl Surface {
             Self::A2a => "a2a",
             Self::Acp => "acp",
             Self::Prompt => "prompt",
-            Self::Subagent => "subagent",
         }
     }
 }
@@ -52,8 +50,22 @@ struct FatalRecord {
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diagnostics: Option<TransportDiagnostics>,
-    #[serde(default)]
-    possible_effects: crate::effects::PossibleEffects,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_span_context"
+    )]
+    span_context: Option<crate::telemetry::error_spans::Snapshot>,
+}
+
+fn deserialize_span_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::telemetry::error_spans::Snapshot>, D::Error> {
+    let snapshot = Option::<crate::telemetry::error_spans::Snapshot>::deserialize(deserializer)?;
+    if snapshot.as_ref().is_some_and(|snapshot| !snapshot.valid()) {
+        return Err(serde::de::Error::custom("invalid span context"));
+    }
+    Ok(snapshot)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -230,51 +242,37 @@ fn split_diagnostics(message: &str) -> (&str, Option<TransportDiagnostics>) {
     (plain, Some(diagnostics))
 }
 
-/// Explicit observation owner, including cancellation without reclassifying it.
-pub(crate) fn record_loop_error_with_effects(
+pub(crate) fn record_loop_error(
     session_id: &str,
     surface: Surface,
     error: &LoopError,
-    effects: crate::effects::PossibleEffects,
 ) -> Result<Option<PathBuf>, String> {
-    let (kind, code, message, diagnostics) = if matches!(error, LoopError::Cancelled) {
-        (
-            "cancelled",
-            "cancelled",
-            "execution cancelled; effects and completion are unconfirmed".into(),
-            None,
-        )
-    } else if let Some(classified) = classify(error) {
-        classified
-    } else {
+    let Some((kind, code, message, diagnostics)) = classify(error) else {
         return Ok(None);
     };
-    write_default_with_effects(
+    write_default(
         session_id,
         surface,
         kind,
         code,
         &message,
         diagnostics.as_ref(),
-        effects,
     )
     .map(Some)
 }
 
-pub(crate) fn record_runtime_error_with_effects(
+pub(crate) fn record_runtime_error(
     session_id: &str,
     surface: Surface,
     code: &str,
-    effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
-    write_default_with_effects(
+    write_default(
         session_id,
         surface,
         "runtime",
         canonical_code(code),
         "runtime failed before the session could continue",
         None,
-        effects,
     )
 }
 
@@ -412,29 +410,25 @@ fn canonical_code(code: &str) -> &str {
     }
 }
 
-fn write_default_with_effects(
+fn write_default(
     session_id: &str,
     surface: Surface,
     kind: &str,
     code: &str,
     message: &str,
     diagnostics: Option<&TransportDiagnostics>,
-    effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| "HOME is unset; cannot store fatal error log".to_owned())?;
-    write_in_with_effects(
+    write_in_with_diagnostics(
         &PathBuf::from(home).join(".kit/errors"),
         session_id,
         surface,
-        FatalDetails {
-            kind,
-            code,
-            message,
-        },
+        kind,
+        code,
+        message,
         diagnostics,
-        effects,
     )
 }
 
@@ -450,7 +444,6 @@ fn write_in(
     write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
 }
 
-#[cfg(test)]
 fn write_in_with_diagnostics(
     base: &Path,
     session_id: &str,
@@ -459,49 +452,6 @@ fn write_in_with_diagnostics(
     code: &str,
     message: &str,
     diagnostics: Option<&TransportDiagnostics>,
-) -> Result<PathBuf, String> {
-    write_in_with_effects(
-        base,
-        session_id,
-        surface,
-        FatalDetails {
-            kind,
-            code,
-            message,
-        },
-        diagnostics,
-        crate::effects::PossibleEffects::default(),
-    )
-}
-
-pub(crate) fn record_child_failure(
-    session_id: &str,
-    effects: crate::effects::PossibleEffects,
-) -> Result<PathBuf, String> {
-    write_default_with_effects(
-        session_id,
-        Surface::Subagent,
-        "runtime",
-        "subagent_failed",
-        "nested agent failed; effects and completion are unconfirmed",
-        None,
-        effects,
-    )
-}
-
-struct FatalDetails<'a> {
-    kind: &'a str,
-    code: &'a str,
-    message: &'a str,
-}
-
-fn write_in_with_effects(
-    base: &Path,
-    session_id: &str,
-    surface: Surface,
-    details: FatalDetails<'_>,
-    diagnostics: Option<&TransportDiagnostics>,
-    possible_effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
     crate::session::validate_id(session_id)?;
     let occurred_at_ms = SystemTime::now()
@@ -513,21 +463,26 @@ fn write_in_with_effects(
         std::process::id(),
         NEXT_EVENT.fetch_add(1, Ordering::Relaxed)
     );
-    let record = FatalRecord {
+    let mut record = FatalRecord {
         schema_version: SCHEMA_VERSION,
         event_id: event_id.clone(),
         occurred_at_ms,
         kit_version: env!("CARGO_PKG_VERSION").into(),
         session_id: session_id.into(),
         surface: surface.as_str().into(),
-        kind: details.kind.into(),
-        code: canonical_code(details.code).into(),
-        message: bounded(details.message),
+        kind: kind.into(),
+        code: canonical_code(code).into(),
+        message: bounded(message),
         diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
-        possible_effects,
+        span_context: crate::telemetry::error_spans::snapshot(&tracing::Span::current()),
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    if bytes.len() >= MAX_RECORD_BYTES && record.span_context.take().is_some() {
+        // Optional diagnostics must not displace an otherwise valid ordinary error.
+        bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    }
     bytes.push(b'\n');
     if bytes.len() > MAX_RECORD_BYTES {
         return Err("fatal error log exceeds size limit".into());
@@ -610,8 +565,8 @@ mod tests {
     use super::{
         DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
         MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
-        TransportSource, TransportStage, bounded, classify, event_order, render_loop_error,
-        split_diagnostics, write_in, write_in_with_diagnostics,
+        TransportSource, TransportStage, bounded, classify, event_order, record_loop_error,
+        render_loop_error, split_diagnostics, write_in, write_in_with_diagnostics,
     };
 
     fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
@@ -688,51 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn writes_effects_without_sensitive_content_and_reads_legacy_unknown() {
-        let root = tempfile::tempdir().unwrap();
-        let effects = crate::effects::PossibleEffects {
-            source: crate::effects::ObservationSource::AcpNotifications,
-            assistant_output_observed: true,
-            ..crate::effects::PossibleEffects::default()
-        };
-        let path = super::write_in_with_effects(
-            root.path(),
-            "session-effects",
-            Surface::Subagent,
-            super::FatalDetails {
-                kind: "runtime",
-                code: "subagent_failed",
-                message: "nested agent failed",
-            },
-            None,
-            effects,
-        )
-        .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        let current: FatalRecord = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(current.possible_effects, effects);
-        assert_eq!(current.schema_version, 2);
-        for marker in [1, 2, 3, 4] {
-            value["schema_version"] = json!(marker);
-            value.as_object_mut().unwrap().remove("possible_effects");
-            let legacy: FatalRecord = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(
-                legacy.possible_effects,
-                crate::effects::PossibleEffects::default()
-            );
-            // Presence, not the numeric marker, determines whether observations exist.
-            value["possible_effects"] = serde_json::to_value(effects).unwrap();
-            let extended: FatalRecord = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(extended.possible_effects, effects);
-        }
-    }
-
-    #[test]
-    fn frozen_v2_reader_retains_known_fields_from_extended_records() {
-        // Pre-effects top-level reader; the transport diagnostics shape is unchanged.
-        #[derive(Debug, serde::Deserialize, serde::Serialize)]
-        struct FatalRecordV2 {
+    fn schema_two_readers_preserve_optional_span_context() {
+        use tracing_subscriber::prelude::*;
+        // Frozen shipped schema-v2 shape: unknown top-level fields are ignored.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct ShippedV2 {
             schema_version: u64,
             event_id: String,
             occurred_at_ms: u64,
@@ -743,46 +658,66 @@ mod tests {
             code: String,
             message: String,
             #[serde(default, skip_serializing_if = "Option::is_none")]
-            diagnostics: Option<TransportDiagnostics>,
+            diagnostics: Option<super::TransportDiagnostics>,
         }
-
         let root = tempfile::tempdir().unwrap();
-        let diagnostics = sample_diagnostics();
-        for source in [
-            crate::effects::ObservationSource::Unknown,
-            crate::effects::ObservationSource::AcpNotifications,
-            crate::effects::ObservationSource::LocalSession,
-        ] {
-            let effects = crate::effects::PossibleEffects {
-                source,
-                tool_execution_completion_reported: true,
-                ..Default::default()
-            };
-            let path = super::write_in_with_effects(
-                root.path(),
-                "session-extended",
-                Surface::Subagent,
-                super::FatalDetails {
-                    kind: "runtime",
-                    code: "subagent_failed",
-                    message: "nested agent failed",
-                },
-                Some(&diagnostics),
-                effects,
-            )
-            .unwrap();
-            let bytes = fs::read(path).unwrap();
-            let legacy: FatalRecordV2 = serde_json::from_slice(&bytes).unwrap();
-            let current: FatalRecord = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(legacy.schema_version, 2);
-            assert_eq!(current.possible_effects, effects);
-            let mut known_fields: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            known_fields
-                .as_object_mut()
-                .unwrap()
-                .remove("possible_effects");
-            assert_eq!(serde_json::to_value(legacy).unwrap(), known_fields);
-        }
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(crate::telemetry::error_spans::ErrorSpanLayer),
+            || {
+                let operation = crate::telemetry::error_spans::operation("prompt");
+                operation.in_scope(|| {
+                { let _child = tracing::info_span!(target: "agentkit_loop", "agent.execute_tool", launch_kind = "plain"); }
+                let path = write_in_with_diagnostics(root.path(), "session-context", Surface::Prompt, "provider", "stream_transport", "openai-subscription stream transport failed", Some(&sample_diagnostics())).unwrap();
+                let bytes = fs::read(&path).unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["schema_version"], 2);
+                assert_eq!(value["span_context"]["fragments"][1]["fields"]["launch_kind"], "plain");
+                let current: FatalRecord = serde_json::from_slice(&bytes).unwrap();
+                let legacy: ShippedV2 = serde_json::from_slice(&bytes).unwrap();
+                let mut known = serde_json::to_value(&current).unwrap();
+                known.as_object_mut().unwrap().remove("span_context");
+                assert_eq!(serde_json::to_value(&legacy).unwrap(), known);
+                assert_eq!(current.message, "openai-subscription stream transport failed");
+                let supplied = value["span_context"].clone();
+                for marker in [1, 2, 3, 4] {
+                    value["schema_version"] = json!(marker);
+                    let parsed: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+                    assert_eq!(serde_json::to_value(parsed.span_context).unwrap(), supplied);
+                }
+                value.as_object_mut().unwrap().remove("span_context");
+                assert!(serde_json::from_value::<FatalRecord>(value.clone()).unwrap().span_context.is_none());
+                value["span_context"] = supplied;
+                value["span_context"]["fragments"][1]["fields"]["launch_kind"] = json!("SECRET");
+                assert!(serde_json::from_value::<FatalRecord>(value).is_err());
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert!(bytes.len() < super::MAX_RECORD_BYTES);
+            });
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_writer_omits_disabled_context() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let root = tempfile::tempdir().unwrap();
+            let operation = crate::telemetry::error_spans::operation("prompt");
+            let path = operation
+                .in_scope(|| {
+                    write_in(
+                        root.path(),
+                        "session-disabled",
+                        Surface::Prompt,
+                        "runtime",
+                        "runtime_error",
+                        "ordinary error",
+                    )
+                })
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert!(value.get("span_context").is_none());
+            assert_eq!(value["message"], "ordinary error");
+        });
     }
 
     #[test]
@@ -949,8 +884,9 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_distinct_from_provider_failure_classification() {
-        assert!(classify(&LoopError::Cancelled).is_none());
+    fn cancellation_is_not_recorded() {
+        let result = record_loop_error("session-1", Surface::Acp, &LoopError::Cancelled).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
@@ -1026,80 +962,5 @@ mod tests {
                 & 0o777,
             0o700
         );
-    }
-    #[test]
-    fn local_cancellation_has_conservative_post_cleanup_metadata() {
-        if crate::effects::isolated_test(
-            "fatal::tests::local_cancellation_has_conservative_post_cleanup_metadata",
-        ) {
-            return;
-        }
-        let observations = crate::effects::Observations::local_session();
-        observations.invocation_started();
-        let cleanup = observations.clone();
-        cleanup.invocation_completed();
-        let path = super::record_loop_error_with_effects(
-            "root-cancelled",
-            Surface::Acp,
-            &LoopError::Cancelled,
-            observations.snapshot(),
-        )
-        .unwrap()
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(value["schema_version"], 2);
-        assert_eq!(value["kind"], "cancelled");
-        assert_eq!(value["code"], "cancelled");
-        assert_eq!(value["possible_effects"]["source"], "local_session");
-        assert_eq!(
-            value["possible_effects"]["tool_execution_completion_reported"],
-            true
-        );
-        assert_eq!(value["possible_effects"]["observation_incomplete"], true);
-    }
-
-    #[test]
-    fn supplied_effects_remain_strict() {
-        let root = tempfile::tempdir().unwrap();
-        let path = write_in(
-            root.path(),
-            "session-schema",
-            Surface::Prompt,
-            "runtime",
-            "failed",
-            "failed",
-        )
-        .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        for source in ["unknown", "acp_notifications", "local_session"] {
-            value["possible_effects"]["source"] = json!(source);
-            let record: FatalRecord = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(
-                serde_json::to_value(record.possible_effects).unwrap()["source"],
-                source
-            );
-        }
-        for (field, invalid) in [
-            ("source", json!("unknown-future-source")),
-            ("assistant_output_observed", json!("true")),
-            ("observation_incomplete", json!(false)),
-            ("private_payload", json!("secret")),
-        ] {
-            let mut malformed = value.clone();
-            malformed["possible_effects"][field] = invalid;
-            assert!(
-                serde_json::from_value::<FatalRecord>(malformed).is_err(),
-                "{field}"
-            );
-        }
-        for invalid in [
-            serde_json::Value::Null,
-            json!({"source": "local_session"}),
-            json!([]),
-        ] {
-            value["possible_effects"] = invalid;
-            assert!(serde_json::from_value::<FatalRecord>(value.clone()).is_err());
-        }
     }
 }

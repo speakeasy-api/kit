@@ -629,8 +629,8 @@ async fn execute_compose_cancelled(
     script: &str,
     cancellation: Option<TurnCancellation>,
 ) -> ToolExecutionOutcome {
-    // Artifact paths are HOME/session/call scoped. Parallel tests must not
-    // remove a spill directory still in use by another invocation.
+    // HOME/session/call-scoped artifacts must not share a spill directory with
+    // another parallel invocation that may remove it during cleanup.
     static NEXT_CALL: AtomicUsize = AtomicUsize::new(0);
     let call_id = ToolCallId::new(format!(
         "compose-test-{}",

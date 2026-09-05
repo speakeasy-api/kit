@@ -4105,6 +4105,8 @@ a = [still text]
         assert_eq!(
             args,
             [
+                "--internal-capture-error-spans",
+                "false",
                 "--otel-endpoint",
                 "http://collector:4318/v1/traces",
                 "--otel-protocol",

@@ -1,4 +1,6 @@
-//! Optional OpenTelemetry trace export and resolved host settings.
+//! Independent opt-in local error context and OpenTelemetry trace export.
+
+pub(crate) mod error_spans;
 
 use agentkit_loop::{MessageCapture, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
@@ -57,6 +59,8 @@ impl FromStr for Protocol {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub endpoint: Option<String>,
+    /// Collect bounded local span context in fatal error logs (independent of OTLP).
+    pub capture_error_spans: bool,
     pub protocol: Protocol,
     pub capture_message_content: bool,
     pub message_content_max_messages: usize,
@@ -104,6 +108,7 @@ impl Settings {
             (endpoint, Protocol::Grpc) | (endpoint @ None, _) => endpoint,
         };
         Ok(Self {
+            capture_error_spans: false,
             endpoint,
             protocol,
             capture_message_content,
@@ -143,6 +148,8 @@ impl Settings {
     /// re-enabling export or message capture.
     pub fn append_cli_args(&self, command: &mut tokio::process::Command) {
         command
+            .arg("--internal-capture-error-spans")
+            .arg(self.capture_error_spans.to_string())
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_PROTOCOL")
             .env_remove("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
@@ -163,6 +170,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             endpoint: None,
+            capture_error_spans: false,
             protocol: Protocol::default(),
             capture_message_content: false,
             message_content_max_messages: DEFAULT_MESSAGE_CONTENT_MAX_MESSAGES,
@@ -311,23 +319,44 @@ fn build_provider(
     }
 }
 
-/// Installs OTLP trace export when an endpoint is configured.
+/// Installs local span collection and OTLP export independently.
 pub fn init(settings: &Settings) -> Result<Option<Guard>, Box<dyn std::error::Error>> {
-    let Some(endpoint) = settings.endpoint.as_deref() else {
+    if settings.endpoint.is_none() && !settings.capture_error_spans {
         return Ok(None);
-    };
-    let exporter = build_exporter(endpoint, settings.protocol)?;
-    let provider = build_provider(exporter, settings.protocol);
-    let tracer = provider.tracer(env!("CARGO_PKG_NAME"));
-    let layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_location(false)
-        .with_threads(false)
-        .with_tracked_inactivity(false)
-        .with_target(false)
-        .with_filter(exported_targets());
-    tracing_subscriber::registry().with(layer).try_init()?;
-    Ok(Some(Guard {
+    }
+    let provider = settings
+        .endpoint
+        .as_deref()
+        .map(|endpoint| {
+            build_exporter(endpoint, settings.protocol)
+                .map(|exporter| build_provider(exporter, settings.protocol))
+        })
+        .transpose()?;
+    let export_layer = provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer(env!("CARGO_PKG_NAME")))
+            .with_location(false)
+            .with_threads(false)
+            .with_tracked_inactivity(false)
+            .with_target(false)
+            .with_filter(exported_targets())
+    });
+    let result = tracing_subscriber::registry()
+        .with(export_layer)
+        .with(
+            settings
+                .capture_error_spans
+                .then_some(error_spans::ErrorSpanLayer),
+        )
+        .try_init();
+    // Local diagnostics are best-effort, including when a host owns the subscriber.
+    // Preserve the existing exporter initialization failure behavior.
+    if let Err(error) = result
+        && provider.is_some()
+    {
+        return Err(error.into());
+    }
+    Ok(provider.map(|provider| Guard {
         provider: Some(provider),
         protocol: settings.protocol,
     }))
@@ -539,6 +568,75 @@ mod tests {
     }
 
     #[test]
+    fn child_args_propagate_both_local_capture_values() {
+        for enabled in [false, true] {
+            let settings = Settings {
+                capture_error_spans: enabled,
+                ..Settings::default()
+            };
+            let mut command = tokio::process::Command::new("kit");
+            settings.append_cli_args(&mut command);
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                &args[..2],
+                &[
+                    "--internal-capture-error-spans".to_owned(),
+                    enabled.to_string()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn error_span_initialization_matrix() {
+        // init owns a global subscriber, so exercise each independent combination
+        // in a fresh test process rather than leaking state to parallel tests.
+        const CHILD: &str = "KIT_TEST_ERROR_SPAN_INIT";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in ["00", "01", "10", "11", "occupied"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "telemetry::tests::error_span_initialization_matrix",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _runtime = runtime.enter();
+        if mode == "occupied" {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+        }
+        let settings = Settings {
+            capture_error_spans: mode.starts_with('1') || mode == "occupied",
+            endpoint: mode.ends_with('1').then(|| "http://127.0.0.1:1".into()),
+            ..Settings::default()
+        };
+        let guard = super::init(&settings).unwrap();
+        assert_eq!(guard.is_some(), settings.endpoint.is_some());
+        let operation = super::error_spans::operation("prompt");
+        operation.in_scope(|| { let _child = tracing::info_span!(target: "agentkit_loop", "chat", "gen_ai.operation.name" = "chat"); });
+        assert_eq!(
+            super::error_spans::snapshot(&operation).is_some(),
+            settings.capture_error_spans && mode != "occupied"
+        );
+    }
+
+    #[test]
     fn child_args_propagate_protocol_endpoint_explicit_false_and_bounds() {
         let settings = Settings::try_new_with_protocol(
             Some("http://collector:4318".into()),
@@ -581,6 +679,8 @@ mod tests {
         assert_eq!(
             args,
             [
+                "--internal-capture-error-spans",
+                "false",
                 "--otel-endpoint",
                 "http://collector:4318/v1/traces",
                 "--otel-protocol",
@@ -607,7 +707,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            &args[..4],
+            &args[2..6],
             ["--otel-endpoint", "", "--otel-protocol", "grpc"]
         );
         assert!(
