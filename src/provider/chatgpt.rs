@@ -101,6 +101,10 @@ pub(crate) struct SubscriptionModelCatalog {
 }
 
 impl SubscriptionModelCatalog {
+    pub(crate) fn context_windows(&self) -> &HashMap<String, u64> {
+        &self.context_windows
+    }
+
     pub(crate) fn visible_models(&self) -> &[String] {
         &self.visible_models
     }

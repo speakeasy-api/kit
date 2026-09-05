@@ -47,6 +47,7 @@ use tokio::{
 };
 
 mod activity;
+pub(crate) mod model_switch;
 mod skill_catalog;
 pub mod v2;
 
@@ -461,7 +462,9 @@ enum Command {
     Cancel,
     SetConfig {
         request: SetSessionConfigOptionRequest,
-        reply: oneshot::Sender<Result<SetSessionConfigOptionResponse, AcpRuntimeError>>,
+        cancellation_generation: u64,
+        reply:
+            oneshot::Sender<Result<SetSessionConfigOptionResponse, agent_client_protocol::Error>>,
     },
     Fork {
         parent_context: Option<(String, String)>,
@@ -1464,14 +1467,24 @@ impl Server {
     async fn set_config(
         &self,
         request: SetSessionConfigOptionRequest,
-    ) -> Result<SetSessionConfigOptionResponse, AcpRuntimeError> {
-        let sender = self.sender(&request.session_id).await?;
+    ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
+        let sender = self.sender(&request.session_id).await.map_err(sdk_error)?;
+        let cancellation_generation = self
+            .integration
+            .cancellation_handle(&request.session_id)
+            .map_err(sdk_error)?
+            .generation();
         let (tx, rx) = oneshot::channel();
         sender
-            .send(Command::SetConfig { request, reply: tx })
+            .send(Command::SetConfig {
+                request,
+                reply: tx,
+                cancellation_generation,
+            })
             .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
+        rx.await
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?
     }
 
     async fn cancel(&self, notification: CancelNotification) -> Result<(), AcpRuntimeError> {
@@ -1532,9 +1545,11 @@ impl Server {
         &self,
         session_id: &agentkit_acp::SessionId,
     ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
+        // Publication holds this lock across registry registration and commit.
+        // A poisoned map cannot establish that the session lifecycle is consistent.
         self.sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::Loop("ACP session map poisoned".into()))?
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
@@ -1633,6 +1648,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
+    let mut model_switch = model_switch::Guard::default();
     loop {
         tokio::select! {
             // A queued cancel or close wins over a simultaneously-ready task
@@ -1659,8 +1675,35 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
                 Some(Command::Cancel) => {}
-                Some(Command::SetConfig { request, reply }) => {
-                    let result = set_config(&adapter, &catalog, request);
+                Some(Command::SetConfig { request, reply, cancellation_generation }) => {
+                    let result = async {
+                        let cancellation = integration.cancellation_handle(&session_id).map_err(sdk_error)?;
+                        if cancellation.is_cancelled_since(cancellation_generation) { return Err(model_switch::error("model change cancelled")); }
+                        if request.config_id.to_string() == MODEL_CONFIG_ID {
+                            let target = request.value.as_value_id().ok_or_else(|| model_switch::error("selection requires an id value"))?;
+                            let decision = model_switch.check(
+                                (&adapter.selection().map_err(|error| model_switch::error(&error))?, cancellation_generation),
+                                ModelSelection::from_id(&target.to_string()).map_err(|error| model_switch::error(&error))?,
+                                &catalog, driver.snapshot().transcript,
+                                request.meta.as_ref().and_then(|meta| meta.get(model_switch::META)),
+                            )?;
+                            if decision == model_switch::Decision::Compact {
+                                let marker = model_switch::compact_marker();
+                                let marker_id = marker.id.clone();
+                                driver.submit_input(vec![marker]).map_err(|error| sdk_error(record_acp_loop_failure(&session_id, &error)))?;
+                                let reason = activity.execute(activity::ExecutionOrigin::Prompt,
+                                    drive_finalized(&session_id, &integration, &mut driver, false, None),
+                                    |reason| Some(reason.clone()),
+                                ).await.map_err(sdk_error)?;
+                                if !model_switch::compaction_completed(&reason, &marker_id, &driver.snapshot().transcript,
+                                    cancellation.is_cancelled_since(cancellation_generation)) {
+                                    return Err(model_switch::error("compaction did not complete; model unchanged"));
+                                }
+                            }
+                        }
+                        if cancellation.is_cancelled_since(cancellation_generation) { return Err(model_switch::error("model change cancelled")); }
+                        set_config(&adapter, &catalog, request).map_err(sdk_error)
+                    }.await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Fork {
@@ -2466,8 +2509,7 @@ fn component(
                 async move |request: SetSessionConfigOptionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        responder
-                            .respond_with_result(state.set_config(request).await.map_err(sdk_error))
+                        responder.respond_with_result(state.set_config(request).await)
                     })?;
                     Ok(())
                 }
@@ -3829,6 +3871,72 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn set_config_rejects_poisoned_session_map_without_queueing_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            AcpIntegration::builder()
+                .name("poison-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        );
+        let session_id = agentkit_acp::SessionId::new("poisoned-session");
+        let (client, _messages) = AcpClientHandle::channel();
+        server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                AgentkitSessionId::new("poisoned-session"),
+                client,
+            ))
+            .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                token: 1,
+                commands,
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = server.sessions.lock().unwrap();
+                panic!("poison session map");
+            }))
+            .is_err()
+        );
+
+        for id in [session_id, agentkit_acp::SessionId::new("missing-session")] {
+            let error = timeout(
+                Duration::from_secs(1),
+                server.set_config(SetSessionConfigOptionRequest::new(
+                    id,
+                    MODEL_CONFIG_ID,
+                    "openai-subscription:gpt-5.4-mini",
+                )),
+            )
+            .await
+            .expect("poison must return an error without waiting for the actor")
+            .unwrap_err();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InternalError);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!("loop error: ACP session map poisoned"))
+            );
+        }
+        assert!(server.sessions.is_poisoned());
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn depth_zero_cancel_leaves_detached_background_running() {
         let (jobs, tasks) = start_non_cooperative_background("root-call").await;
         let root = tempfile::tempdir().unwrap();
@@ -4577,6 +4685,7 @@ pub(super) mod tests {
         let adapter =
             SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
         let catalog = vec![ModelGroup {
+            context_windows: Default::default(),
             provider: crate::ProviderKind::OpenAiSubscription,
             models: vec!["gpt-5.4".into(), "gpt-5.4-mini".into()],
         }];
@@ -4602,6 +4711,7 @@ pub(super) mod tests {
         let adapter =
             SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
         let catalog = vec![ModelGroup {
+            context_windows: Default::default(),
             provider: crate::ProviderKind::OpenAiSubscription,
             models: vec!["gpt-5.4".into()],
         }];
