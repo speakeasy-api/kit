@@ -237,6 +237,13 @@ struct CreateOptions {
     cwd: Option<PathBuf>,
 }
 
+struct ForkRequest {
+    prior: SubagentValue,
+    prompt: String,
+    name: Option<String>,
+    contract: Option<Arc<OutputContract>>,
+}
+
 struct ForkReply {
     effects: crate::effects::PossibleEffects,
     value: Result<SubagentValue, ChildError>,
@@ -551,17 +558,19 @@ impl Subagents {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn fork(
         &self,
         parent_session_id: String,
-        prior: SubagentValue,
-        prompt: String,
-        name: Option<String>,
+        request: ForkRequest,
         depth: usize,
         cancellation: TurnCancellation,
-        contract: Option<Arc<OutputContract>>,
     ) -> Result<SubagentValue, ChildError> {
+        let ForkRequest {
+            prior,
+            prompt,
+            name,
+            contract,
+        } = request;
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let source_state = self.lookup(&prior)?;
@@ -1656,12 +1665,14 @@ impl Tool for ForkTool {
             self.manager
                 .fork(
                     parent_session_id,
-                    input.subagent,
-                    input.prompt,
-                    input.name,
+                    ForkRequest {
+                        prior: input.subagent,
+                        prompt: input.prompt,
+                        name: input.name,
+                        contract: contract.map(Arc::new),
+                    },
                     self.depth,
                     cancellation(context),
-                    contract.map(Arc::new),
                 )
                 .await,
         )

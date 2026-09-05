@@ -626,12 +626,14 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
     let branch = manager
         .fork(
             session::new_id(),
-            source.clone(),
-            "MOCK_CWD".into(),
-            None,
+            super::ForkRequest {
+                prior: source.clone(),
+                prompt: "MOCK_CWD".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap();
@@ -846,12 +848,14 @@ impl MockAcpScenario {
             manager
                 .fork(
                     session::new_id(),
-                    source,
-                    prompt.into(),
-                    None,
+                    super::ForkRequest {
+                        prior: source,
+                        prompt: prompt.into(),
+                        name: None,
+                        contract: None,
+                    },
                     0,
                     TurnCancellation::default(),
-                    None,
                 )
                 .await
         })
@@ -1200,12 +1204,14 @@ async fn failed_create_and_fork_startup_record_failed_removed_transitions() {
         failed_fork
             .fork(
                 session::new_id(),
-                source,
-                "fork".into(),
-                None,
+                super::ForkRequest {
+                    prior: source,
+                    prompt: "fork".into(),
+                    name: None,
+                    contract: None,
+                },
                 0,
                 TurnCancellation::default(),
-                None,
             )
             .await
             .is_err()
@@ -1354,12 +1360,14 @@ async fn native_fork_releases_the_source_before_the_branch_prompt() {
         .manager
         .fork(
             session::new_id(),
-            source.clone(),
-            "second branch".into(),
-            None,
+            super::ForkRequest {
+                prior: source.clone(),
+                prompt: "second branch".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap_err();
@@ -1428,12 +1436,14 @@ async fn dropped_fork_with_failed_close_holds_only_its_permit_until_process_exit
         fork_manager
             .fork(
                 parent,
-                fork_source,
-                "MOCK_RICH_OUTPUT".into(),
-                None,
+                super::ForkRequest {
+                    prior: fork_source,
+                    prompt: "MOCK_RICH_OUTPUT".into(),
+                    name: None,
+                    contract: None,
+                },
                 0,
                 TurnCancellation::default(),
-                None,
             )
             .await
     });
@@ -1653,12 +1663,14 @@ async fn dropped_fork_after_positive_observations_retains_diagnostic() {
     let parent_session_id = session::new_id();
     let mut fork = Box::pin(scenario.manager.fork(
         parent_session_id.clone(),
-        source.clone(),
-        "MOCK_RICH_OUTPUT".into(),
-        None,
+        super::ForkRequest {
+            prior: source.clone(),
+            prompt: "MOCK_RICH_OUTPUT".into(),
+            name: None,
+            contract: None,
+        },
         0,
         TurnCancellation::default(),
-        None,
     ));
     tokio::select! {
         _ = &mut fork => panic!("gated fork returned early"),
@@ -1994,12 +2006,14 @@ async fn fork_uses_its_fresh_preferred_name() {
     let fork = manager
         .fork(
             session::new_id(),
-            source,
-            "branch".into(),
-            Some("Reviewer".into()),
+            super::ForkRequest {
+                prior: source,
+                prompt: "branch".into(),
+                name: Some("Reviewer".into()),
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap();
@@ -2055,12 +2069,14 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
     let error = manager
         .fork(
             session::new_id(),
-            prior,
-            "branch".into(),
-            None,
+            super::ForkRequest {
+                prior: prior,
+                prompt: "branch".into(),
+                name: None,
+                contract: None,
+            },
             0,
             TurnCancellation::default(),
-            None,
         )
         .await
         .unwrap_err();

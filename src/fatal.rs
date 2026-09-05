@@ -9,7 +9,7 @@ use agentkit_loop::LoopError;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u64 = 4;
+const SCHEMA_VERSION: u64 = 2;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_RECORD_BYTES: usize = 32 * 1024;
 const MAX_RECORDS_PER_SESSION: usize = 50;
@@ -428,9 +428,11 @@ fn write_default_with_effects(
         &PathBuf::from(home).join(".kit/errors"),
         session_id,
         surface,
-        kind,
-        code,
-        message,
+        FatalDetails {
+            kind,
+            code,
+            message,
+        },
         diagnostics,
         effects,
     )
@@ -462,9 +464,11 @@ fn write_in_with_diagnostics(
         base,
         session_id,
         surface,
-        kind,
-        code,
-        message,
+        FatalDetails {
+            kind,
+            code,
+            message,
+        },
         diagnostics,
         crate::effects::PossibleEffects::default(),
     )
@@ -474,11 +478,7 @@ pub(crate) fn record_child_failure(
     session_id: &str,
     effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or_else(|| "HOME is unset; cannot store fatal error log".to_owned())?;
-    write_in_with_effects(
-        &PathBuf::from(home).join(".kit/errors"),
+    write_default_with_effects(
         session_id,
         Surface::Subagent,
         "runtime",
@@ -489,14 +489,17 @@ pub(crate) fn record_child_failure(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+struct FatalDetails<'a> {
+    kind: &'a str,
+    code: &'a str,
+    message: &'a str,
+}
+
 fn write_in_with_effects(
     base: &Path,
     session_id: &str,
     surface: Surface,
-    kind: &str,
-    code: &str,
-    message: &str,
+    details: FatalDetails<'_>,
     diagnostics: Option<&TransportDiagnostics>,
     possible_effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
@@ -517,9 +520,9 @@ fn write_in_with_effects(
         kit_version: env!("CARGO_PKG_VERSION").into(),
         session_id: session_id.into(),
         surface: surface.as_str().into(),
-        kind: kind.into(),
-        code: canonical_code(code).into(),
-        message: bounded(message),
+        kind: details.kind.into(),
+        code: canonical_code(details.code).into(),
+        message: bounded(details.message),
         diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
         possible_effects,
     };
@@ -678,7 +681,7 @@ mod tests {
         .unwrap();
         assert_eq!(path.parent().unwrap(), root.path().join("session-1"));
         let record: FatalRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(record.schema_version, 4);
+        assert_eq!(record.schema_version, 2);
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.surface, "prompt");
         assert_eq!(record.code, "stream_transport");
@@ -696,9 +699,11 @@ mod tests {
             root.path(),
             "session-effects",
             Surface::Subagent,
-            "runtime",
-            "subagent_failed",
-            "nested agent failed",
+            super::FatalDetails {
+                kind: "runtime",
+                code: "subagent_failed",
+                message: "nested agent failed",
+            },
             None,
             effects,
         )
@@ -707,17 +712,77 @@ mod tests {
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         let current: FatalRecord = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(current.possible_effects, effects);
-        value["schema_version"] = json!(2);
-        value.as_object_mut().unwrap().remove("possible_effects");
-        let legacy: FatalRecord = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(
-            legacy.possible_effects,
-            crate::effects::PossibleEffects::default()
-        );
-        // An additive field on an older version must not be overwritten.
-        value["possible_effects"] = serde_json::to_value(effects).unwrap();
-        let mixed: FatalRecord = serde_json::from_value(value).unwrap();
-        assert_eq!(mixed.possible_effects, effects);
+        assert_eq!(current.schema_version, 2);
+        for marker in [1, 2, 3, 4] {
+            value["schema_version"] = json!(marker);
+            value.as_object_mut().unwrap().remove("possible_effects");
+            let legacy: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                legacy.possible_effects,
+                crate::effects::PossibleEffects::default()
+            );
+            // Presence, not the numeric marker, determines whether observations exist.
+            value["possible_effects"] = serde_json::to_value(effects).unwrap();
+            let extended: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(extended.possible_effects, effects);
+        }
+    }
+
+    #[test]
+    fn frozen_v2_reader_retains_known_fields_from_extended_records() {
+        // Pre-effects top-level reader; the transport diagnostics shape is unchanged.
+        #[derive(Debug, serde::Deserialize, serde::Serialize)]
+        struct FatalRecordV2 {
+            schema_version: u64,
+            event_id: String,
+            occurred_at_ms: u64,
+            kit_version: String,
+            session_id: String,
+            surface: String,
+            kind: String,
+            code: String,
+            message: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            diagnostics: Option<TransportDiagnostics>,
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let diagnostics = sample_diagnostics();
+        for source in [
+            crate::effects::ObservationSource::Unknown,
+            crate::effects::ObservationSource::AcpNotifications,
+            crate::effects::ObservationSource::LocalSession,
+        ] {
+            let effects = crate::effects::PossibleEffects {
+                source,
+                tool_execution_completion_reported: true,
+                ..Default::default()
+            };
+            let path = super::write_in_with_effects(
+                root.path(),
+                "session-extended",
+                Surface::Subagent,
+                super::FatalDetails {
+                    kind: "runtime",
+                    code: "subagent_failed",
+                    message: "nested agent failed",
+                },
+                Some(&diagnostics),
+                effects,
+            )
+            .unwrap();
+            let bytes = fs::read(path).unwrap();
+            let legacy: FatalRecordV2 = serde_json::from_slice(&bytes).unwrap();
+            let current: FatalRecord = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(legacy.schema_version, 2);
+            assert_eq!(current.possible_effects, effects);
+            let mut known_fields: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            known_fields
+                .as_object_mut()
+                .unwrap()
+                .remove("possible_effects");
+            assert_eq!(serde_json::to_value(legacy).unwrap(), known_fields);
+        }
     }
 
     #[test]
@@ -756,7 +821,7 @@ mod tests {
         let encoded = fs::read_to_string(path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["diagnostics"]["response_request_id"], "req_safe-123");
         assert_eq!(value["diagnostics"]["stage"], "stream");
         assert_eq!(value["diagnostics"]["retryable"], true);
@@ -982,7 +1047,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["kind"], "cancelled");
         assert_eq!(value["code"], "cancelled");
         assert_eq!(value["possible_effects"]["source"], "local_session");
@@ -994,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_effects_and_new_local_source_remain_strict() {
+    fn supplied_effects_remain_strict() {
         let root = tempfile::tempdir().unwrap();
         let path = write_in(
             root.path(),
@@ -1007,7 +1072,6 @@ mod tests {
         .unwrap();
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        value["schema_version"] = json!(3);
         for source in ["unknown", "acp_notifications", "local_session"] {
             value["possible_effects"]["source"] = json!(source);
             let record: FatalRecord = serde_json::from_value(value.clone()).unwrap();
@@ -1016,9 +1080,26 @@ mod tests {
                 source
             );
         }
-        value["possible_effects"]["source"] = json!("unknown-future-source");
-        assert!(serde_json::from_value::<FatalRecord>(value.clone()).is_err());
-        value["possible_effects"] = json!({"source": "local_session", "private_payload": "secret"});
-        assert!(serde_json::from_value::<FatalRecord>(value).is_err());
+        for (field, invalid) in [
+            ("source", json!("unknown-future-source")),
+            ("assistant_output_observed", json!("true")),
+            ("observation_incomplete", json!(false)),
+            ("private_payload", json!("secret")),
+        ] {
+            let mut malformed = value.clone();
+            malformed["possible_effects"][field] = invalid;
+            assert!(
+                serde_json::from_value::<FatalRecord>(malformed).is_err(),
+                "{field}"
+            );
+        }
+        for invalid in [
+            serde_json::Value::Null,
+            json!({"source": "local_session"}),
+            json!([]),
+        ] {
+            value["possible_effects"] = invalid;
+            assert!(serde_json::from_value::<FatalRecord>(value.clone()).is_err());
+        }
     }
 }
