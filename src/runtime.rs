@@ -44,6 +44,58 @@ use crate::{
 };
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl Runtime {
+        pub(crate) fn set_ambient_openrouter_api_key_for_test(&mut self, present: bool) {
+            self.ambient_openrouter_api_key = present;
+        }
+    }
+
+    impl BackgroundJobs {
+        /// Seeds a foreground job for lifecycle tests, without applying registration policy.
+        /// Registration-policy tests must invoke `BackgroundableCompose` instead.
+        pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
+            let mut jobs = self.state.lock().expect("background jobs poisoned");
+            jobs.running.insert(
+                agentkit_core::ToolCallId::new(call_id),
+                BackgroundJob {
+                    controller: CancellationController::new(),
+                    foreground_cancellation: None,
+                    cancellation_relay: None,
+                    detached: false,
+                    manual_detach: false,
+                    terminal_published: false,
+                },
+            );
+            self.changed(&mut jobs);
+        }
+
+        pub(crate) fn finish_for_test(&self, call_id: &str) {
+            self.finish(&agentkit_core::ToolCallId::new(call_id));
+        }
+
+        pub(crate) fn is_cancelled_for_test(&self, call_id: &str) -> bool {
+            let call_id = agentkit_core::ToolCallId::new(call_id);
+            self.state.lock().is_ok_and(|jobs| {
+                jobs.running
+                    .get(&call_id)
+                    .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
+            })
+        }
+
+        pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
+            let call_id = agentkit_core::ToolCallId::new(call_id);
+            self.state.lock().is_ok_and(|jobs| {
+                jobs.running.get(&call_id).is_some_and(|job| job.detached)
+                    || jobs.pending_detaches.contains(&call_id)
+            })
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -549,11 +601,6 @@ impl Runtime {
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_ambient_openrouter_api_key_for_test(&mut self, present: bool) {
-        self.ambient_openrouter_api_key = present;
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
@@ -1902,57 +1949,6 @@ impl BackgroundJobs {
             jobs.pending_detaches.remove(call_id);
             self.changed(&mut jobs);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
-        if let Ok(mut jobs) = self.state.lock() {
-            let call_id = agentkit_core::ToolCallId::new(call_id);
-            let manual_detach = jobs.pending_detaches.remove(&call_id);
-            let controller = CancellationController::new();
-            if jobs.cancel_all {
-                controller.interrupt();
-            }
-            jobs.running.insert(
-                call_id,
-                BackgroundJob {
-                    controller,
-                    foreground_cancellation: None,
-                    cancellation_relay: None,
-                    detached: manual_detach,
-                    manual_detach,
-                    terminal_published: false,
-                },
-            );
-            if manual_detach {
-                jobs.background_started = jobs.background_started.wrapping_add(1);
-            }
-            self.changed(&mut jobs);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_for_test(&self, call_id: &str) {
-        self.finish(&agentkit_core::ToolCallId::new(call_id));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_cancelled_for_test(&self, call_id: &str) -> bool {
-        let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running
-                .get(&call_id)
-                .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
-        let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running.get(&call_id).is_some_and(|job| job.detached)
-                || jobs.pending_detaches.contains(&call_id)
-        })
     }
 }
 

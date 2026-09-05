@@ -54,18 +54,6 @@ fn available_commands_update(session_id: wire::SessionId) -> wire::UpdateSession
     )
 }
 
-fn complete_new_session<E>(
-    response: wire::NewSessionResponse,
-    activation: oneshot::Sender<()>,
-    respond: impl FnOnce(wire::NewSessionResponse) -> Result<(), E>,
-    notify: impl FnOnce(wire::UpdateSessionNotification) -> Result<(), E>,
-) -> Result<(), E> {
-    let session_id = response.session_id.clone();
-    respond(response)?;
-    let _ = activation.send(());
-    notify(available_commands_update(session_id))
-}
-
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
     let detail = error.to_string();
     match authentication_method_id(&detail) {
@@ -1149,7 +1137,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 Some(Command::Prompt(command)) => {
                     let result = prepare_prompt(
                         &session_id,
-                        PromptSkillSource::Runtime(&runtime),
+                        &runtime,
                         &integration,
                         &handle,
                         &mut skill_catalog,
@@ -1227,16 +1215,10 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
-enum PromptSkillSource<'a> {
-    #[cfg(test)]
-    Static(&'a [agentkit_tool_skills::Skill]),
-    Runtime(&'a Arc<Runtime>),
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
-    skill_source: PromptSkillSource<'_>,
+    runtime: &Arc<Runtime>,
     integration: &AcpIntegration,
     handle: &AcpSessionHandle,
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
@@ -1260,26 +1242,18 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         let _ = reply.send(Err(error));
         return Ok(());
     }
-    let mut current = None;
-    let skills = match skill_source {
-        #[cfg(test)]
-        PromptSkillSource::Static(skills) => skills,
-        PromptSkillSource::Runtime(runtime) => {
-            let loaded = match runtime.current_skills().await {
-                Ok(current) => current,
-                Err(error) => {
-                    handle.stop_injection_turn();
-                    let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
-                    return Ok(());
-                }
-            };
-            &current.insert(loaded).skills
+    let current = match runtime.current_skills().await {
+        Ok(current) => current,
+        Err(error) => {
+            handle.stop_injection_turn();
+            let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
+            return Ok(());
         }
     };
     background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         skill_catalog
-            .submit(skills, items, |items| driver.submit_input(items))
+            .submit(&current.skills, items, |items| driver.submit_input(items))
             .map_err(|error| match error {
                 skill_catalog::SubmitError::Catalog(error) => {
                     AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
@@ -1330,51 +1304,20 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     result
 }
 
-#[async_trait]
-trait TurnControl<S: ModelSession + Send + 'static>: Sync {
-    fn stop_injection_turn(&self);
-    fn is_cancelled_since(&self, generation: u64) -> bool;
-    async fn handle_injection_boundary(
-        &self,
-        driver: &mut LoopDriver<S>,
-        terminal: bool,
-    ) -> Result<AcpInjectionBoundary, AcpRuntimeError>;
-}
-
-#[async_trait]
-impl<S: ModelSession + Send + 'static> TurnControl<S> for AcpSessionHandle {
-    fn stop_injection_turn(&self) {
-        AcpSessionHandle::stop_injection_turn(self);
-    }
-
-    fn is_cancelled_since(&self, generation: u64) -> bool {
-        self.cancellation_handle().is_cancelled_since(generation)
-    }
-
-    async fn handle_injection_boundary(
-        &self,
-        driver: &mut LoopDriver<S>,
-        terminal: bool,
-    ) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
-        AcpSessionHandle::handle_injection_boundary(self, driver, terminal).await
-    }
-}
-
-async fn drive_prompt<S, C>(
+async fn drive_prompt<S>(
     session_id: &wire::SessionId,
     driver: &mut LoopDriver<S>,
-    control: &C,
+    handle: &AcpSessionHandle,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
-    C: TurnControl<S>,
 {
     let result = drive_prompt_inner(
         session_id,
         driver,
-        control,
+        handle,
         cancellation_generation,
         structured,
     )
@@ -1390,29 +1333,34 @@ where
     result
 }
 
-async fn drive_prompt_inner<S, C>(
+async fn drive_prompt_inner<S>(
     session_id: &wire::SessionId,
     driver: &mut LoopDriver<S>,
-    control: &C,
+    handle: &AcpSessionHandle,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
-    C: TurnControl<S>,
 {
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
             Err(error) => {
-                control.stop_injection_turn();
-                if control.is_cancelled_since(cancellation_generation) {
+                handle.stop_injection_turn();
+                if handle
+                    .cancellation_handle()
+                    .is_cancelled_since(cancellation_generation)
+                {
                     return Ok(FinishReason::Cancelled);
                 }
                 return loop_error_stop_reason(session_id, &error);
             }
         };
-        if control.is_cancelled_since(cancellation_generation) {
+        if handle
+            .cancellation_handle()
+            .is_cancelled_since(cancellation_generation)
+        {
             return Ok(FinishReason::Cancelled);
         }
         match step {
@@ -1421,8 +1369,11 @@ where
                     continue;
                 }
                 if result.finish_reason == FinishReason::Error {
-                    control.stop_injection_turn();
-                    if control.is_cancelled_since(cancellation_generation) {
+                    handle.stop_injection_turn();
+                    if handle
+                        .cancellation_handle()
+                        .is_cancelled_since(cancellation_generation)
+                    {
                         return Ok(FinishReason::Cancelled);
                     }
                     return Err(AcpRuntimeError::Loop("model turn failed".into()));
@@ -1432,7 +1383,7 @@ where
                 {
                     continue;
                 }
-                match control.handle_injection_boundary(driver, true).await {
+                match handle.handle_injection_boundary(driver, true).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -1443,8 +1394,11 @@ where
                         return Ok(result.finish_reason);
                     }
                     Err(error) => {
-                        control.stop_injection_turn();
-                        if control.is_cancelled_since(cancellation_generation) {
+                        handle.stop_injection_turn();
+                        if handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation)
+                        {
                             return Ok(FinishReason::Cancelled);
                         }
                         return Err(error);
@@ -1457,7 +1411,7 @@ where
                 {
                     continue;
                 }
-                match control.handle_injection_boundary(driver, true).await {
+                match handle.handle_injection_boundary(driver, true).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -1468,8 +1422,11 @@ where
                         return Ok(FinishReason::Completed);
                     }
                     Err(error) => {
-                        control.stop_injection_turn();
-                        if control.is_cancelled_since(cancellation_generation) {
+                        handle.stop_injection_turn();
+                        if handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation)
+                        {
                             return Ok(FinishReason::Cancelled);
                         }
                         return Err(error);
@@ -1477,13 +1434,16 @@ where
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-                match control.handle_injection_boundary(driver, false).await {
+                match handle.handle_injection_boundary(driver, false).await {
                     Ok(AcpInjectionBoundary::Stopped) => {
                         return Ok(FinishReason::Cancelled);
                     }
                     Err(error) => {
-                        control.stop_injection_turn();
-                        if control.is_cancelled_since(cancellation_generation) {
+                        handle.stop_injection_turn();
+                        if handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation)
+                        {
                             return Ok(FinishReason::Cancelled);
                         }
                         return Err(error);
@@ -1493,8 +1453,11 @@ where
             }
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_)) => {
                 if let Err(error) = driver.cancel_pending_approvals().await {
-                    control.stop_injection_turn();
-                    if control.is_cancelled_since(cancellation_generation) {
+                    handle.stop_injection_turn();
+                    if handle
+                        .cancellation_handle()
+                        .is_cancelled_since(cancellation_generation)
+                    {
                         return Ok(FinishReason::Cancelled);
                     }
                     return loop_error_stop_reason(session_id, &error);
@@ -1956,12 +1919,12 @@ pub(crate) fn component(
                     let connection = cx.clone();
                     cx.spawn(async move {
                         match state.new_session(request, connection.clone()).await {
-                            Ok((response, activation)) => complete_new_session(
-                                response,
-                                activation,
-                                |response| responder.respond(response),
-                                |notification| connection.send_notification(notification),
-                            ),
+                            Ok((response, activation)) => {
+                                let session_id = response.session_id.clone();
+                                responder.respond(response)?;
+                                let _ = activation.send(());
+                                connection.send_notification(available_commands_update(session_id))
+                            }
                             Err(error) => responder.respond_with_error(sdk_error(error)),
                         }
                     })?;
@@ -2720,7 +2683,7 @@ mod tests {
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Self::Turn, LoopError> {
             self.turns.fetch_add(1, Ordering::Relaxed);
-            if let Some(handle) = &self.interrupt {
+            if let Some(handle) = self.interrupt.take() {
                 handle.interrupt();
             }
             match self.outcome {
@@ -2793,46 +2756,6 @@ mod tests {
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Option<ModelTurnEvent>, LoopError> {
             Ok(self.events.pop_front())
-        }
-    }
-
-    struct TestTurnControl {
-        pending_steer: AtomicBool,
-        boundaries: AtomicU64,
-        stops: AtomicU64,
-    }
-
-    impl TestTurnControl {
-        fn new(pending_steer: bool) -> Self {
-            Self {
-                pending_steer: AtomicBool::new(pending_steer),
-                boundaries: AtomicU64::new(0),
-                stops: AtomicU64::new(0),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl TurnControl<TestSession> for TestTurnControl {
-        fn stop_injection_turn(&self) {
-            self.stops.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn is_cancelled_since(&self, _generation: u64) -> bool {
-            false
-        }
-
-        async fn handle_injection_boundary(
-            &self,
-            _driver: &mut LoopDriver<TestSession>,
-            _terminal: bool,
-        ) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
-            self.boundaries.fetch_add(1, Ordering::Relaxed);
-            if self.pending_steer.swap(false, Ordering::Relaxed) {
-                Ok(AcpInjectionBoundary::Delivered)
-            } else {
-                Ok(AcpInjectionBoundary::Finished)
-            }
         }
     }
 
@@ -2914,33 +2837,96 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn new_session_response_is_enqueued_before_activation_and_notifications() {
-        let (activation, activated) = oneshot::channel();
-        let activated = std::cell::RefCell::new(activated);
-        let events = std::cell::RefCell::new(Vec::new());
-        let response = wire::NewSessionResponse::new(wire::SessionId::new("session"));
+    fn send_wire(
+        channel: &agent_client_protocol::Channel,
+        method: &str,
+        id: i64,
+        params: serde_json::Value,
+    ) {
+        channel
+            .tx
+            .unbounded_send(agent_client_protocol::TransportFrame::Single(
+                agent_client_protocol::RawJsonRpcMessage::request(method.into(), params, id.into())
+                    .unwrap(),
+            ))
+            .unwrap();
+    }
 
-        complete_new_session(
-            response,
-            activation,
-            |_| {
-                assert!(matches!(
-                    activated.borrow_mut().try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                events.borrow_mut().push("response");
-                Ok::<(), ()>(())
-            },
-            |_| {
-                assert_eq!(activated.borrow_mut().try_recv(), Ok(()));
-                events.borrow_mut().push("notification");
-                Ok::<(), ()>(())
-            },
+    async fn receive_wire(channel: &mut agent_client_protocol::Channel) -> serde_json::Value {
+        use futures_util::StreamExt;
+        let frame = timeout(Duration::from_secs(2), channel.rx.next())
+            .await
+            .expect("ACP frame timed out")
+            .expect("ACP transport closed");
+        let agent_client_protocol::TransportFrame::Single(message) = frame else {
+            panic!("expected a single ACP message, got {frame:?}");
+        };
+        serde_json::to_value(message).unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_session_response_precedes_notifications_and_activates_actor() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
         )
         .unwrap();
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent).await });
+        send_wire(
+            &client,
+            "initialize",
+            1,
+            serde_json::to_value(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("ordering-test", "0"),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(receive_wire(&mut client).await["id"], 1);
+        send_wire(
+            &client,
+            "session/new",
+            2,
+            serde_json::to_value(wire::NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
+        );
 
-        assert_eq!(events.into_inner(), ["response", "notification"]);
+        let response = receive_wire(&mut client).await;
+        assert_eq!(
+            response["id"], 2,
+            "session response must be the first frame: {response}"
+        );
+        let response: wire::NewSessionResponse =
+            serde_json::from_value(response["result"].clone()).unwrap();
+        let notification = receive_wire(&mut client).await;
+        assert_eq!(notification["method"], "session/update");
+        let notification: wire::UpdateSessionNotification =
+            serde_json::from_value(notification["params"].clone()).unwrap();
+        assert_eq!(notification.session_id, response.session_id);
+        assert!(matches!(
+            notification.update,
+            wire::SessionUpdate::AvailableCommandsUpdate(_)
+        ));
+
+        // Closing requires the actual session actor to process and acknowledge a command.
+        send_wire(
+            &client,
+            "session/close",
+            3,
+            serde_json::to_value(wire::CloseSessionRequest::new(response.session_id)).unwrap(),
+        );
+        let closed = receive_wire(&mut client).await;
+        assert_eq!(closed["id"], 3);
+        assert!(closed.get("result").is_some(), "close failed: {closed}");
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -2966,6 +2952,8 @@ mod tests {
 
     #[tokio::test]
     async fn foreground_provider_error_after_running_terminalizes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let integration = AcpIntegration::default();
         let recording = RecordingSink::default();
         let sink = ResponseReplacementSink::new(recording.clone());
@@ -3024,7 +3012,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
-                PromptSkillSource::Static(&[]),
+                &runtime,
                 &integration,
                 &handle,
                 &mut skill_catalog,
@@ -3154,12 +3142,12 @@ mod tests {
                     while !entered.load(Ordering::SeqCst) {
                         tokio::task::yield_now().await;
                     }
+                    background_jobs.register_foreground_for_test("background-call");
                     assert!(super::super::detach_compose_call(
                         &tasks,
                         &background_jobs,
                         "background-call",
                     ).await);
-                    background_jobs.register_foreground_for_test("background-call");
                     while turns.load(Ordering::SeqCst) < 2 {
                         tokio::task::yield_now().await;
                     }
@@ -3209,87 +3197,126 @@ mod tests {
         handle.stop_injection_turn();
     }
 
-    struct BoundaryCancellationControl {
-        before_boundary: bool,
-        boundaries: AtomicU64,
-    }
-
-    #[async_trait]
-    impl TurnControl<TestSession> for BoundaryCancellationControl {
-        fn stop_injection_turn(&self) {}
-
-        fn is_cancelled_since(&self, _generation: u64) -> bool {
-            self.before_boundary
-        }
-
-        async fn handle_injection_boundary(
-            &self,
-            _driver: &mut LoopDriver<TestSession>,
-            terminal: bool,
-        ) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
-            assert!(!terminal, "cancellation must occur at AfterToolResult");
-            self.boundaries.fetch_add(1, Ordering::Relaxed);
-            Ok(AcpInjectionBoundary::Stopped)
-        }
-    }
-
-    async fn assert_boundary_cancellation_retires_turn(before_boundary: bool) {
-        let integration = AcpIntegration::default();
-        let recording = RecordingSink::default();
-        let sink = ResponseReplacementSink::new(recording.clone());
-        let session_id = wire::SessionId::new("boundary-cancel");
-        let loop_session_id = SessionId::new("boundary-cancel-loop");
-        let activity = native_activity(session_id.clone(), sink.clone());
-        let _handle = integration
+    fn bind_test_session(
+        integration: &AcpIntegration,
+        session_id: &wire::SessionId,
+        sink: RecordingSink,
+    ) -> AcpSessionHandle {
+        let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                loop_session_id.clone(),
-                sink.clone(),
+                SessionId::new(session_id.to_string()),
+                sink,
             ))
             .unwrap();
-        let turns = Arc::new(AtomicU64::new(0));
-        let observer = ResponseReplacementObserver::new(
-            integration,
-            sink,
-            session_id.clone(),
-            activity.clone(),
+        handle.prepare_injection_turn();
+        handle.start_injection_turn();
+        handle
+    }
+
+    // Hold a real response-committed receipt at the external ACP transport boundary.
+    // Until activation, the real injection coordinator must wait rather than lose the steer.
+    async fn staged_injection(
+        integration: AcpIntegration,
+        session_id: &wire::SessionId,
+    ) -> (
+        agentkit_acp::v2::AcpInjectAcceptance,
+        agent_client_protocol::Channel,
+        tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
+    ) {
+        let (mut client, agent) = agent_client_protocol::Channel::duplex();
+        let (accepted, mut acceptance) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            agent_client_protocol::Agent
+                .v2()
+                .on_receive_request(
+                    async move |request: wire::InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            wire::InitializeResponse::new(
+                                request.protocol_version,
+                                wire::Implementation::new("injection-test", "0"),
+                            )
+                            .capabilities(agentkit_acp::v2::agent_capabilities()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |request: wire::InjectSessionRequest, responder, cx| {
+                        let integration = integration.clone();
+                        let accepted = accepted.clone();
+                        cx.spawn(async move {
+                            let reserved = integration
+                                .reserve_inject_request(request, responder)
+                                .await?
+                                .expect("inject reservation");
+                            let receipt = reserved.respond_tracked()?.expect("inject acceptance");
+                            accepted.send(receipt).ok();
+                            Ok(())
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent)
+                .await
+        });
+        send_wire(
+            &client,
+            "initialize",
+            1,
+            serde_json::to_value(wire::InitializeRequest::new(
+                wire::ProtocolVersion::V2,
+                wire::Implementation::new("injection-test", "0"),
+            ))
+            .unwrap(),
         );
-        let mut driver = Agent::builder()
-            .model(TestAdapter {
-                outcome: TestOutcome::ToolThenContent,
-                turns: turns.clone(),
-                interrupt: None,
-            })
-            .observer(observer)
-            .build()
-            .unwrap()
-            .start(SessionConfig::new(loop_session_id).without_cache())
+        assert!(receive_wire(&mut client).await.get("result").is_some());
+        send_wire(
+            &client,
+            "session/inject",
+            2,
+            serde_json::to_value(wire::InjectSessionRequest::new(
+                session_id.clone(),
+                wire::SessionInjectMode::Steer,
+                vec![wire::ContentBlock::Text(wire::TextContent::new(
+                    "pending steer",
+                ))],
+            ))
+            .unwrap(),
+        );
+        let response = receive_wire(&mut client).await;
+        assert!(
+            response.get("result").is_some(),
+            "injection failed: {response}"
+        );
+        let receipt = timeout(Duration::from_secs(2), acceptance.recv())
             .await
+            .unwrap()
             .unwrap();
+        (receipt, client, server)
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_tool_boundary_retires_turn() {
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("boundary-cancel");
+        let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
+        let generation = handle.cancellation_handle().generation();
+        let (mut driver, _) = test_driver_with_interrupt(
+            TestOutcome::ToolThenContent,
+            "boundary-cancel",
+            Some(handle.clone()),
+        )
+        .await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "first")])
             .unwrap();
-        let control = BoundaryCancellationControl {
-            before_boundary,
-            boundaries: AtomicU64::new(0),
-        };
-        let reason = activity
-            .execute(
-                ExecutionOrigin::Prompt,
-                drive_prompt(&session_id, &mut driver, &control, 0, None),
-                |reason| Some(reason.clone()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(reason, FinishReason::Cancelled);
         assert_eq!(
-            turns.load(Ordering::Relaxed),
-            1,
-            "must not resume cancelled model work"
-        );
-        assert_eq!(
-            control.boundaries.load(Ordering::Relaxed),
-            u64::from(!before_boundary)
+            drive_prompt(&session_id, &mut driver, &handle, generation, None)
+                .await
+                .unwrap(),
+            FinishReason::Cancelled
         );
         assert!(
             driver
@@ -3298,71 +3325,214 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == ItemKind::Tool)
         );
-        assert_running_then_idle(
-            &recording.updates.lock().unwrap(),
-            wire::StopReason::Cancelled,
-        );
-        recording.updates.lock().unwrap().clear();
-
+        handle.prepare_injection_turn();
+        handle.start_injection_turn();
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fresh")])
             .unwrap();
-        activity
-            .execute(
-                ExecutionOrigin::Prompt,
-                drive_prompt(
-                    &session_id,
-                    &mut driver,
-                    &TestTurnControl::new(false),
-                    0,
-                    None,
-                ),
-                |reason| Some(reason.clone()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(turns.load(Ordering::Relaxed), 2);
-        assert_running_then_idle(
-            &recording.updates.lock().unwrap(),
-            wire::StopReason::EndTurn,
+        let generation = handle.cancellation_handle().generation();
+        assert_eq!(
+            drive_prompt(&session_id, &mut driver, &handle, generation, None)
+                .await
+                .unwrap(),
+            FinishReason::Completed
+        );
+        assert!(
+            driver
+                .snapshot()
+                .transcript
+                .iter()
+                .any(|item| item.kind == ItemKind::Assistant
+                    && item.parts.iter().any(
+                        |part| matches!(part, Part::Text(text) if text.text == "autonomous content")
+                    ))
         );
     }
 
-    #[tokio::test]
-    async fn cancellation_before_tool_boundary_retires_turn() {
-        assert_boundary_cancellation_retires_turn(true).await;
+    async fn assert_cancellation_preserves_committed_injection(outcome: TestOutcome) {
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("injection-cancel");
+        let recording = RecordingSink::default();
+        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let (receipt, _client, server) = staged_injection(integration.clone(), &session_id).await;
+        let message_id = receipt.message_id().clone();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let observer = ResponseReplacementObserver::new(
+            integration,
+            sink,
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome,
+                turns: Arc::new(AtomicU64::new(0)),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new("injection-cancel")).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+        let generation = handle.cancellation_handle().generation();
+        {
+            let turn = activity.execute(
+                ExecutionOrigin::Prompt,
+                drive_prompt(&session_id, &mut driver, &handle, generation, None),
+                |reason| Some(reason.clone()),
+            );
+            tokio::pin!(turn);
+            assert!(
+                futures_util::poll!(&mut turn).is_pending(),
+                "unactivated injection must hold the turn open"
+            );
+            handle.interrupt();
+            assert_eq!(
+                timeout(Duration::from_secs(2), &mut turn)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                FinishReason::Cancelled
+            );
+        }
+        let updates = recording.updates.lock().unwrap().clone();
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update.update, wire::SessionUpdate::UserMessage(_)))
+        );
+        let states = updates
+            .into_iter()
+            .filter(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
+            .collect::<Vec<_>>();
+        assert_running_then_idle(&states, wire::StopReason::Cancelled);
+        recording.updates.lock().unwrap().clear();
+        receipt.activate_after_response().await.unwrap();
+        handle.prepare_injection_turn();
+        handle.start_injection_turn();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "fresh")])
+            .unwrap();
+        let generation = handle.cancellation_handle().generation();
+        assert_eq!(
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    drive_prompt(&session_id, &mut driver, &handle, generation, None),
+                    |reason| Some(reason.clone())
+                )
+                .await
+                .unwrap(),
+            FinishReason::Completed
+        );
+        let updates = recording.updates.lock().unwrap().clone();
+        assert!(updates.iter().any(|update| matches!(&update.update,
+            wire::SessionUpdate::UserMessage(message) if message.message_id == message_id)));
+        let states = updates
+            .into_iter()
+            .filter(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
+            .collect::<Vec<_>>();
+        assert_running_then_idle(&states, wire::StopReason::EndTurn);
+        let transcript = driver.snapshot().transcript;
+        for expected in ["fresh", "pending steer"] {
+            assert!(transcript.iter().any(|item| {
+                item.kind == ItemKind::User
+                    && item
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, Part::Text(text) if text.text == expected))
+            }));
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
-    async fn cancellation_within_tool_boundary_retires_turn() {
-        assert_boundary_cancellation_retires_turn(false).await;
+    async fn terminal_injection_waits_for_response_activation_and_delivers_input() {
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("terminal-inject");
+        let recording = RecordingSink::default();
+        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let (receipt, _client, server) = staged_injection(integration, &session_id).await;
+        let message_id = receipt.message_id().clone();
+        let (mut driver, _) = test_driver(TestOutcome::Content, "terminal-inject").await;
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+        let generation = handle.cancellation_handle().generation();
+        {
+            let turn = drive_prompt(&session_id, &mut driver, &handle, generation, None);
+            tokio::pin!(turn);
+            assert!(futures_util::poll!(&mut turn).is_pending());
+            receipt.activate_after_response().await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), &mut turn)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                FinishReason::Completed
+            );
+        }
+        assert!(
+            recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| matches!(&update.update,
+            wire::SessionUpdate::UserMessage(message) if message.message_id == message_id))
+        );
+        assert!(driver.snapshot().transcript.iter().any(|item| {
+            item.kind == ItemKind::User
+                && item
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, Part::Text(text) if text.text == "pending steer"))
+        }));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_within_tool_boundary_preserves_committed_injection() {
+        assert_cancellation_preserves_committed_injection(TestOutcome::ToolThenContent).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_terminal_injection_boundary_preserves_committed_injection() {
+        assert_cancellation_preserves_committed_injection(TestOutcome::Content).await;
     }
 
     #[tokio::test]
     async fn finish_error_stops_before_delivering_pending_steer() {
-        let (mut driver, turns) = test_driver(TestOutcome::FinishError, "finish-error").await;
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("finish-error");
+        let recording = RecordingSink::default();
+        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let (receipt, _client, server) = staged_injection(integration, &session_id).await;
+        let (mut driver, _) = test_driver(TestOutcome::FinishError, "finish-error").await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fail")])
             .unwrap();
-        let control = TestTurnControl::new(true);
-
-        let result = drive_prompt(
-            &wire::SessionId::new("finish-error"),
-            &mut driver,
-            &control,
-            0,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(AcpRuntimeError::Loop(message)) if message == "model turn failed"
-        ));
-        assert_eq!(turns.load(Ordering::Relaxed), 1);
-        assert_eq!(control.boundaries.load(Ordering::Relaxed), 0);
-        assert!(control.pending_steer.load(Ordering::Relaxed));
-        assert_eq!(control.stops.load(Ordering::Relaxed), 1);
+        let generation = handle.cancellation_handle().generation();
+        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        assert!(
+            matches!(result, Err(AcpRuntimeError::Loop(message)) if message == "model turn failed")
+        );
+        assert!(recording.updates.lock().unwrap().is_empty());
+        assert!(!driver.snapshot().transcript.iter().any(|item| {
+            item.parts
+                .iter()
+                .any(|part| matches!(part, Part::Text(text) if text.text == "pending steer"))
+        }));
+        drop(receipt);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -3394,23 +3564,16 @@ mod tests {
 
     #[tokio::test]
     async fn provider_error_without_cancellation_remains_an_error() {
+        let integration = AcpIntegration::default();
+        let session_id = wire::SessionId::new("provider-error");
+        let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
         let (mut driver, _) = test_driver(TestOutcome::ProviderError, "provider-error").await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fail")])
             .unwrap();
-        let control = TestTurnControl::new(false);
-
-        let result = drive_prompt(
-            &wire::SessionId::new("provider-error"),
-            &mut driver,
-            &control,
-            0,
-            None,
-        )
-        .await;
-
+        let generation = handle.cancellation_handle().generation();
+        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
-        assert_eq!(control.stops.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -4242,6 +4405,145 @@ mod tests {
             replay[1].update,
             wire::SessionUpdate::AgentMessage(_)
         ));
+    }
+
+    #[test]
+    fn replay_only_exposes_tagged_developer_compaction_summaries() {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
+            true.into(),
+        );
+        let replay = transcript_replay(
+            &wire::SessionId::new("saved"),
+            &[
+                Item::text(ItemKind::Developer, "ordinary instruction"),
+                Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
+            ],
+        );
+
+        let [notification] = replay.as_slice() else {
+            panic!("only the tagged summary should be replayed");
+        };
+        let wire::SessionUpdate::AgentMessage(message) = &notification.update else {
+            panic!("compaction summaries replay as agent messages, not notices");
+        };
+        assert!(matches!(
+            &message.content,
+            MaybeUndefined::Value(content)
+                if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "summary")
+        ));
+    }
+
+    #[test]
+    fn replay_hides_internal_notifications_and_instructions() {
+        let replay = transcript_replay(
+            &wire::SessionId::new("saved"),
+            &[
+                Item::text(ItemKind::System, "system instruction"),
+                Item::text(ItemKind::Context, "internal context"),
+                Item::text(ItemKind::User, "run the build"),
+                Item::notification("Background tool call completed: very long raw output"),
+                Item::text(ItemKind::Assistant, "the build passed"),
+            ],
+        );
+
+        let [user, agent] = replay.as_slice() else {
+            panic!("only visible conversation messages should be replayed");
+        };
+        assert!(matches!(
+            &user.update,
+            wire::SessionUpdate::UserMessage(message)
+                if matches!(&message.content, MaybeUndefined::Value(content)
+                    if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "run the build"))
+        ));
+        assert!(matches!(
+            &agent.update,
+            wire::SessionUpdate::AgentMessage(message)
+                if matches!(&message.content, MaybeUndefined::Value(content)
+                    if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "the build passed"))
+        ));
+    }
+
+    #[test]
+    fn replay_preserves_media_content_without_inventing_assistant_media() {
+        let parts = vec![
+            Part::text("inspect these"),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::uri("file:///tmp/image.png"),
+            ),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::uri("https://example.com/result.png"),
+            ),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::uri("data:image/png;base64,c2VjcmV0"),
+            ),
+        ];
+        let raw_output = serde_json::to_value(&parts).unwrap();
+        let replay = transcript_replay(
+            &wire::SessionId::new("saved"),
+            &[
+                Item::new(ItemKind::User, parts.clone()),
+                Item::new(ItemKind::Assistant, parts.clone()),
+                Item::new(
+                    ItemKind::Tool,
+                    vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+                        "call-1",
+                        ToolOutput::Parts(parts),
+                    ))],
+                ),
+            ],
+        );
+        let [user, agent, tool] = replay.as_slice() else {
+            panic!("expected user, agent and tool output");
+        };
+        let wire::SessionUpdate::UserMessage(message) = &user.update else {
+            panic!("expected user message");
+        };
+        let MaybeUndefined::Value(content) = &message.content else {
+            panic!("expected replay content");
+        };
+        assert!(matches!(content.as_slice(), [
+            wire::ContentBlock::Text(text),
+            wire::ContentBlock::ResourceLink(file),
+            wire::ContentBlock::ResourceLink(remote),
+            wire::ContentBlock::Image(image),
+        ] if text.text == "inspect these"
+            && file.uri == "file:///tmp/image.png"
+            && remote.uri == "https://example.com/result.png"
+            && image.data == "c2VjcmV0" && image.uri.is_none()));
+        assert!(
+            matches!(&agent.update, wire::SessionUpdate::AgentMessage(message)
+            if matches!(&message.content, MaybeUndefined::Value(content)
+                if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == "inspect these")))
+        );
+        let wire::SessionUpdate::ToolCallUpdate(tool) = &tool.update else {
+            panic!("expected tool result");
+        };
+        assert_eq!(
+            tool.status,
+            MaybeUndefined::Value(wire::ToolCallStatus::Completed)
+        );
+        assert_eq!(tool.raw_output, MaybeUndefined::Value(raw_output));
+        let MaybeUndefined::Value(tool_content) = &tool.content else {
+            panic!("tool replay must provide visible content, not just raw output");
+        };
+        let tool_blocks = tool_content
+            .iter()
+            .map(|entry| {
+                let wire::ToolCallContent::Content(content) = entry else {
+                    panic!("expected tool content block");
+                };
+                content.content.clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&tool_blocks, content);
     }
 
     #[test]

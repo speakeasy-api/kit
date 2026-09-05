@@ -17,31 +17,6 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-/// Renders Markdown source into styled transcript lines.
-#[cfg(test)]
-pub fn render(source: &str) -> Vec<Line<'static>> {
-    render_linked(source)
-        .into_iter()
-        .map(|line| line.line())
-        .collect()
-}
-
-/// Renders Markdown while attaching each URL directly to the spans it owns.
-#[cfg(test)]
-pub fn render_linked(source: &str) -> Vec<LinkedLine> {
-    render_copyable(source)
-        .into_iter()
-        .map(|(line, _)| line)
-        .collect()
-}
-
-/// Renders Markdown and tags every row of a fenced code block with its exact
-/// source content, excluding the fence and language label.
-#[cfg(test)]
-pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> {
-    render_copyable_at_width(source, None)
-}
-
 pub(super) fn render_copyable_at_width(
     source: &str,
     max_width: Option<usize>,
@@ -680,7 +655,29 @@ fn inline_with_link_destinations(
 mod tests {
     use ratatui::style::Modifier;
 
-    use super::{render, render_copyable, render_copyable_at_width, render_linked};
+    use super::*;
+
+    /// Renders Markdown source into styled transcript lines.
+    pub fn render(source: &str) -> Vec<Line<'static>> {
+        render_linked(source)
+            .into_iter()
+            .map(|line| line.line())
+            .collect()
+    }
+
+    /// Renders Markdown while attaching each URL directly to the spans it owns.
+    pub fn render_linked(source: &str) -> Vec<LinkedLine> {
+        render_copyable(source)
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// Renders Markdown and tags every row of a fenced code block with its exact
+    /// source content, excluding the fence and language label.
+    pub fn render_copyable(source: &str) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+        render_copyable_at_width(source, None)
+    }
 
     fn line_text(line: &ratatui::text::Line<'_>) -> String {
         line.spans

@@ -110,27 +110,8 @@ struct PluginRuntimeInner {
     cache_root: PathBuf,
     skill_cache_root: PathBuf,
     data_root: PathBuf,
-    git_mode: GitResolverMode,
     published: RwLock<PublishedPlugins>,
     generation_barrier: Arc<tokio::sync::RwLock<()>>,
-}
-
-#[derive(Clone)]
-enum GitResolverMode {
-    Https,
-    #[cfg(test)]
-    Local {
-        repository: PathBuf,
-        activity: Arc<GitActivity>,
-    },
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct GitActivity {
-    probes: std::sync::atomic::AtomicUsize,
-    fetches: std::sync::atomic::AtomicUsize,
-    archives: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -307,7 +288,6 @@ impl PluginRuntime {
                 cache_root,
                 skill_cache_root,
                 data_root,
-                git_mode: GitResolverMode::Https,
                 published: RwLock::new(PublishedPlugins {
                     resolved: Arc::new(initial),
                     source_fingerprint: None,
@@ -315,17 +295,6 @@ impl PluginRuntime {
                 generation_barrier: Arc::new(tokio::sync::RwLock::new(())),
             }),
         }
-    }
-
-    #[cfg(test)]
-    fn with_local_git_mode(mut self, repository: &Path, activity: Arc<GitActivity>) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.git_mode = GitResolverMode::Local {
-                repository: repository.to_path_buf(),
-                activity,
-            };
-        }
-        self
     }
 
     pub fn snapshot(&self) -> Arc<ResolvedPlugins> {
@@ -343,6 +312,14 @@ impl PluginRuntime {
     }
 
     pub(crate) async fn stage(&self) -> Result<StagedPlugins, String> {
+        self.stage_with_git_runner(Arc::new(SystemGitRunner::default()))
+            .await
+    }
+
+    async fn stage_with_git_runner(
+        &self,
+        runner: Arc<dyn GitRunner + Send>,
+    ) -> Result<StagedPlugins, String> {
         let contents = match crate::config_files::read_to_string(&self.inner.config_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -372,8 +349,8 @@ impl PluginRuntime {
             &self.inner.cache_root,
             &self.inner.skill_cache_root,
             &self.inner.data_root,
-            self.inner.git_mode.clone(),
             self.published(),
+            runner,
         )
         .await
         .map_err(bounded_diagnostic)
@@ -455,8 +432,8 @@ async fn resolve_with_skill_cache(
             &cache_root,
             &skill_cache_root,
             &data_root,
-            &GitResolverMode::Https,
             None,
+            &SystemGitRunner::default(),
         )
     })
     .await
@@ -487,8 +464,8 @@ async fn stage_with_skill_cache(
     cache_root: &Path,
     skill_cache_root: &Path,
     data_root: &Path,
-    git_mode: GitResolverMode,
     published: PublishedPlugins,
+    runner: Arc<dyn GitRunner + Send>,
 ) -> Result<StagedPlugins, String> {
     let configs = configs.clone();
     let runtime_root = runtime_root.to_path_buf();
@@ -496,7 +473,7 @@ async fn stage_with_skill_cache(
     let skill_cache_root = skill_cache_root.to_path_buf();
     let data_root = data_root.to_path_buf();
     let staged = tokio::task::spawn_blocking(move || -> Result<BlockingStage, String> {
-        let source_plan = source_plan(&configs, &runtime_root, &cache_root, &git_mode)?;
+        let source_plan = source_plan(&configs, &runtime_root, &cache_root, runner.as_ref())?;
         if let Some(source_fingerprint) = published
             .source_fingerprint
             .filter(|fingerprint| fingerprint.candidate == source_plan.candidate_fingerprint)
@@ -512,8 +489,8 @@ async fn stage_with_skill_cache(
             &cache_root,
             &skill_cache_root,
             &data_root,
-            &git_mode,
             Some(&source_plan),
+            runner.as_ref(),
         )?;
         source_plan.verify_path_fingerprints(&configs, &runtime_root)?;
         let source_fingerprint = source_plan.verified_fingerprint(&resolution.git_revisions)?;
@@ -555,8 +532,8 @@ fn resolve_blocking(
     cache_root: &Path,
     skill_cache_root: &Path,
     data_root: &Path,
-    git_mode: &GitResolverMode,
     source_plan: Option<&SourcePlan>,
+    runner: &dyn GitRunner,
 ) -> Result<BlockingResolution, String> {
     let mut resolved = ResolvedPlugins::default();
     let mut verified_git_revisions = BTreeMap::new();
@@ -577,11 +554,11 @@ fn resolve_blocking(
                         format!("missing staged Git revision for plugin {alias:?}")
                     })?;
                     let verified =
-                        resolve_git_planned(url, subdir.as_deref(), cache_root, git_mode, planned)?;
+                        resolve_git_planned(url, subdir.as_deref(), cache_root, planned, runner)?;
                     verified_git_revisions.insert(alias.clone(), verified.revision);
                     verified.root
                 }
-                None => resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root)?,
+                None => resolve_git(url, rev.as_deref(), subdir.as_deref(), cache_root, runner)?,
             },
         };
         let plugin = load_plugin(&root).map_err(|error| {
@@ -887,11 +864,6 @@ fn make_tree_writable(root: &Path) {
             paths.extend(entries.flatten().map(|entry| entry.path()));
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn make_tree_writable_for_test(root: &Path) {
-    make_tree_writable(root);
 }
 
 #[cfg(unix)]
@@ -1480,7 +1452,7 @@ fn source_plan(
     configs: &BTreeMap<String, PluginConfig>,
     runtime_root: &Path,
     cache_root: &Path,
-    git_mode: &GitResolverMode,
+    runner: &dyn GitRunner,
 ) -> Result<SourcePlan, String> {
     let mut fingerprint = blake3::Hasher::new();
     let mut path_sources = BTreeMap::new();
@@ -1544,31 +1516,13 @@ fn source_plan(
                         raw_oid: oid.clone(),
                         commit_oid: oid.clone(),
                     },
-                    GitRevision::Ref(_) | GitRevision::DefaultBranch => match git_mode {
-                        GitResolverMode::Https => probe_git_revision(
-                            OsStr::new(url.as_str()),
-                            &sha256_text(url.as_str()),
-                            &revision,
-                            cache_root,
-                            GitProtocol::Https,
-                            &SystemGitRunner::default(),
-                        )?,
-                        #[cfg(test)]
-                        GitResolverMode::Local {
-                            repository,
-                            activity,
-                        } => probe_git_revision(
-                            repository.as_os_str(),
-                            &sha256_text(&repository.to_string_lossy()),
-                            &revision,
-                            cache_root,
-                            GitProtocol::Local,
-                            &TrackingGitRunner {
-                                inner: SystemGitRunner::default(),
-                                activity: activity.clone(),
-                            },
-                        )?,
-                    },
+                    GitRevision::Ref(_) | GitRevision::DefaultBranch => probe_git_revision(
+                        OsStr::new(url.as_str()),
+                        &sha256_text(url.as_str()),
+                        &revision,
+                        cache_root,
+                        runner,
+                    )?,
                 };
                 fingerprint.update(&[1]);
                 hash_fingerprint_field(&mut fingerprint, planned.raw_oid.as_bytes());
@@ -1768,13 +1722,6 @@ enum GitRevision {
     Commit(String),
     Ref(String),
     DefaultBranch,
-}
-
-#[derive(Clone, Copy)]
-enum GitProtocol {
-    Https,
-    #[cfg(test)]
-    Local,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2049,44 +1996,6 @@ impl GitRunner for SystemGitRunner {
     }
 }
 
-#[cfg(test)]
-struct TrackingGitRunner {
-    inner: SystemGitRunner,
-    activity: Arc<GitActivity>,
-}
-
-#[cfg(test)]
-impl GitRunner for TrackingGitRunner {
-    fn run(&self, request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
-        if request
-            .args
-            .iter()
-            .any(|argument| argument == OsStr::new("--exit-code"))
-        {
-            self.activity
-                .probes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if request
-            .args
-            .iter()
-            .any(|argument| argument == OsStr::new("fetch"))
-        {
-            self.activity
-                .fetches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.inner.run(request)
-    }
-
-    fn archive(&self, request: GitRunRequest<'_>, destination: &Path) -> Result<(), GitFailure> {
-        self.activity
-            .archives
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.archive(request, destination)
-    }
-}
-
 fn read_bounded(mut reader: impl Read, limit: u64) -> Result<Vec<u8>, GitFailure> {
     let mut bytes = Vec::new();
     reader
@@ -2282,6 +2191,7 @@ fn resolve_git(
     rev: Option<&str>,
     subdir: Option<&str>,
     cache_root: &Path,
+    runner: &dyn GitRunner,
 ) -> Result<PathBuf, String> {
     let url = validate_git_url(value)?;
     let revision = rev
@@ -2297,8 +2207,7 @@ fn resolve_git(
         GitSourceRevision::Unplanned(&revision),
         subdir.as_deref(),
         cache_root,
-        GitProtocol::Https,
-        &SystemGitRunner::default(),
+        runner,
     )
     .map(|resolved| resolved.root)
 }
@@ -2307,85 +2216,19 @@ fn resolve_git_planned(
     value: &str,
     subdir: Option<&str>,
     cache_root: &Path,
-    mode: &GitResolverMode,
     planned: &PlannedGitRevision,
+    runner: &dyn GitRunner,
 ) -> Result<ResolvedGitSource, String> {
     let url = validate_git_url(value)?;
     let subdir = subdir.map(validate_git_subdir).transpose()?;
-    match mode {
-        GitResolverMode::Https => resolve_git_source(
-            OsStr::new(url.as_str()),
-            &sha256_text(url.as_str()),
-            GitSourceRevision::Planned(planned),
-            subdir.as_deref(),
-            cache_root,
-            GitProtocol::Https,
-            &SystemGitRunner::default(),
-        ),
-        #[cfg(test)]
-        GitResolverMode::Local {
-            repository,
-            activity,
-        } => resolve_git_source(
-            repository.as_os_str(),
-            &sha256_text(&repository.to_string_lossy()),
-            GitSourceRevision::Planned(planned),
-            subdir.as_deref(),
-            cache_root,
-            GitProtocol::Local,
-            &TrackingGitRunner {
-                inner: SystemGitRunner::default(),
-                activity: activity.clone(),
-            },
-        ),
-    }
-}
-
-#[cfg(test)]
-fn resolve_git_local(
-    repository: &Path,
-    rev: &str,
-    subdir: Option<&Path>,
-    cache_root: &Path,
-    runner: &dyn GitRunner,
-) -> Result<PathBuf, String> {
-    resolve_git_local_revision(
-        repository,
-        validate_git_revision(rev)?,
-        subdir,
-        cache_root,
-        runner,
-    )
-}
-
-#[cfg(test)]
-fn resolve_git_local_revision(
-    repository: &Path,
-    revision: GitRevision,
-    subdir: Option<&Path>,
-    cache_root: &Path,
-    runner: &dyn GitRunner,
-) -> Result<PathBuf, String> {
-    let repository = fs::canonicalize(repository)
-        .map_err(|error| format!("could not resolve test Git repository: {error}"))?;
-    let subdir = subdir
-        .map(|path| {
-            path.to_str()
-                .ok_or_else(|| "plugin Git subdir must be valid Unicode".to_string())
-                .and_then(validate_git_subdir)
-        })
-        .transpose()?;
-    let source_key = sha256_text(&repository.to_string_lossy());
     resolve_git_source(
-        repository.as_os_str(),
-        &source_key,
-        GitSourceRevision::Unplanned(&revision),
+        OsStr::new(url.as_str()),
+        &sha256_text(url.as_str()),
+        GitSourceRevision::Planned(planned),
         subdir.as_deref(),
         cache_root,
-        GitProtocol::Local,
         runner,
     )
-    .map(|resolved| resolved.root)
 }
 
 fn validate_git_url(value: &str) -> Result<Url, String> {
@@ -2488,12 +2331,7 @@ fn sha256_text(value: &str) -> String {
         .collect()
 }
 
-fn hardened_git_args(
-    protocol: GitProtocol,
-    hooks: &Path,
-    attributes: &Path,
-    args: &[&OsStr],
-) -> Vec<OsString> {
+fn hardened_git_args(hooks: &Path, attributes: &Path, args: &[&OsStr]) -> Vec<OsString> {
     let mut output = vec![
         OsString::from("-c"),
         OsString::from("protocol.allow=never"),
@@ -2530,15 +2368,6 @@ fn hardened_git_args(
         OsString::from("-c"),
         OsString::from(format!("core.attributesFile={}", attributes.display())),
     ];
-    #[cfg(test)]
-    if matches!(protocol, GitProtocol::Local) {
-        output.extend([
-            OsString::from("-c"),
-            OsString::from("protocol.file.allow=always"),
-        ]);
-    }
-    #[cfg(not(test))]
-    let _ = protocol;
     output.extend(args.iter().map(|value| (*value).to_os_string()));
     output
 }
@@ -2568,7 +2397,6 @@ fn hardened_git_config(remote: Option<&str>) -> Vec<(OsString, OsString)> {
 
 struct GitCommandContext<'a> {
     runner: &'a dyn GitRunner,
-    protocol: GitProtocol,
     hooks: &'a Path,
     attributes: &'a Path,
     remote: Option<&'a str>,
@@ -2586,7 +2414,7 @@ impl GitCommandContext<'_> {
         require_plugin_disk(cwd)?;
         require_plugin_disk(self.hooks)?;
         require_plugin_disk(self.attributes)?;
-        let args = hardened_git_args(self.protocol, self.hooks, self.attributes, args);
+        let args = hardened_git_args(self.hooks, self.attributes, args);
         let config = hardened_git_config(self.remote);
         self.runner
             .run(GitRunRequest {
@@ -2610,7 +2438,7 @@ impl GitCommandContext<'_> {
         require_plugin_disk(cwd)?;
         require_plugin_disk(self.hooks)?;
         require_plugin_disk(self.attributes)?;
-        let args = hardened_git_args(self.protocol, self.hooks, self.attributes, args);
+        let args = hardened_git_args(self.hooks, self.attributes, args);
         let config = hardened_git_config(self.remote);
         self.runner
             .archive(
@@ -2656,7 +2484,6 @@ fn probe_git_revision(
     source_key: &str,
     revision: &GitRevision,
     cache_root: &Path,
-    protocol: GitProtocol,
     runner: &dyn GitRunner,
 ) -> Result<PlannedGitRevision, String> {
     let source_root = cache_root.join(GIT_CACHE_VERSION).join(source_key);
@@ -2676,18 +2503,13 @@ fn probe_git_revision(
         .map_err(|error| {
             format!("could not create Git plugin revision probe attributes: {error}")
         })?;
-    let remote_config = match protocol {
-        GitProtocol::Https => Some(
-            remote
-                .to_str()
-                .ok_or("plugin Git URL must be valid Unicode")?,
-        ),
-        #[cfg(test)]
-        GitProtocol::Local => None,
-    };
+    let remote_config = Some(
+        remote
+            .to_str()
+            .ok_or("plugin Git URL must be valid Unicode")?,
+    );
     let git = GitCommandContext {
         runner,
-        protocol,
         hooks: &hooks,
         attributes: &attributes,
         remote: remote_config,
@@ -2815,7 +2637,6 @@ fn resolve_git_source(
     source_revision: GitSourceRevision<'_>,
     subdir: Option<&Path>,
     cache_root: &Path,
-    protocol: GitProtocol,
     runner: &dyn GitRunner,
 ) -> Result<ResolvedGitSource, String> {
     let (revision, expected_revision) = match source_revision {
@@ -2864,15 +2685,11 @@ fn resolve_git_source(
         }
     }
 
-    let remote_config = match protocol {
-        GitProtocol::Https => Some(
-            remote
-                .to_str()
-                .ok_or("plugin Git URL must be valid Unicode")?,
-        ),
-        #[cfg(test)]
-        GitProtocol::Local => None,
-    };
+    let remote_config = Some(
+        remote
+            .to_str()
+            .ok_or("plugin Git URL must be valid Unicode")?,
+    );
     let staging_guard = StagingDirectory::create(&source_root, ".staging-", "Git plugin")?;
     let staging = staging_guard.path();
     let hooks = staging.join("hooks");
@@ -2888,7 +2705,6 @@ fn resolve_git_source(
         .map_err(|error| format!("could not create controlled Git attributes file: {error}"))?;
     let git = GitCommandContext {
         runner,
-        protocol,
         hooks: &hooks,
         attributes: &attributes,
         remote: remote_config,
@@ -3738,12 +3554,144 @@ fn select_package_root(extraction: &Path, subdir: Option<&Path>) -> Result<PathB
 }
 
 #[cfg(test)]
+pub(crate) use test_support::make_tree_writable_for_test;
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    pub(crate) fn make_tree_writable_for_test(root: &Path) {
+        make_tree_writable(root);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::net::TcpListener;
     use std::thread;
 
     use super::*;
     use std::fs::{self, File};
+
+    fn resolve_git_local(
+        repository: &Path,
+        rev: &str,
+        subdir: Option<&Path>,
+        cache_root: &Path,
+        runner: &dyn GitRunner,
+    ) -> Result<PathBuf, String> {
+        resolve_git_local_revision(
+            repository,
+            validate_git_revision(rev)?,
+            subdir,
+            cache_root,
+            runner,
+        )
+    }
+
+    fn resolve_git_local_revision(
+        repository: &Path,
+        revision: GitRevision,
+        subdir: Option<&Path>,
+        cache_root: &Path,
+        runner: &dyn GitRunner,
+    ) -> Result<PathBuf, String> {
+        let repository = fs::canonicalize(repository)
+            .map_err(|error| format!("could not resolve test Git repository: {error}"))?;
+        let subdir = subdir
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| "plugin Git subdir must be valid Unicode".to_string())
+                    .and_then(validate_git_subdir)
+            })
+            .transpose()?;
+        let source_key = sha256_text(&repository.to_string_lossy());
+        resolve_git_source(
+            repository.as_os_str(),
+            &source_key,
+            GitSourceRevision::Unplanned(&revision),
+            subdir.as_deref(),
+            cache_root,
+            &LocalGitRunner { inner: runner },
+        )
+        .map(|resolved| resolved.root)
+    }
+
+    // Adapt only the external Git transport for local repository fixtures. The
+    // resolver and its HTTPS-only command construction remain production code.
+    struct LocalGitRunner<'a> {
+        inner: &'a dyn GitRunner,
+    }
+
+    impl LocalGitRunner<'_> {
+        fn args(args: &[OsString]) -> Vec<OsString> {
+            args.iter()
+                .map(|arg| {
+                    if arg == "protocol.file.allow=never" {
+                        OsString::from("protocol.file.allow=always")
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect()
+        }
+    }
+
+    impl GitRunner for LocalGitRunner<'_> {
+        fn run(&self, request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
+            let args = Self::args(request.args);
+            self.inner.run(GitRunRequest {
+                args: &args,
+                ..request
+            })
+        }
+
+        fn archive(
+            &self,
+            request: GitRunRequest<'_>,
+            destination: &Path,
+        ) -> Result<(), GitFailure> {
+            let args = Self::args(request.args);
+            self.inner.archive(
+                GitRunRequest {
+                    args: &args,
+                    ..request
+                },
+                destination,
+            )
+        }
+    }
+
+    // Route the fixture HTTPS remote to a real local Git subprocess only at
+    // the transport boundary. URL validation and --get-url still run normally.
+    struct RepositoryGitRunner {
+        repository: PathBuf,
+    }
+
+    impl GitRunner for RepositoryGitRunner {
+        fn run(&self, request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
+            let mut args = LocalGitRunner::args(request.args);
+            if !args.iter().any(|arg| arg == "--get-url") {
+                for arg in &mut args {
+                    if arg == "https://plugins.example/repository.git" {
+                        *arg = self.repository.as_os_str().to_owned();
+                    }
+                }
+            }
+            SystemGitRunner::default().run(GitRunRequest {
+                args: &args,
+                ..request
+            })
+        }
+
+        fn archive(
+            &self,
+            request: GitRunRequest<'_>,
+            destination: &Path,
+        ) -> Result<(), GitFailure> {
+            SystemGitRunner::default().archive(request, destination)
+        }
+    }
 
     const MANIFEST: &str = r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"test-plugin"}"#;
 
@@ -3847,20 +3795,6 @@ mod tests {
 
     struct RewrittenUrlRunner;
 
-    struct RecordingRunner {
-        inner: SystemGitRunner,
-        calls: std::sync::Mutex<Vec<Vec<OsString>>>,
-    }
-
-    impl Default for RecordingRunner {
-        fn default() -> Self {
-            Self {
-                inner: SystemGitRunner::default(),
-                calls: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
     impl GitRunner for TimeoutRunner {
         fn run(&self, _request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
             Err(GitFailure::Timeout)
@@ -3900,22 +3834,6 @@ mod tests {
             _destination: &Path,
         ) -> Result<(), GitFailure> {
             Err(GitFailure::Unavailable(io::ErrorKind::Unsupported))
-        }
-    }
-
-    impl GitRunner for RecordingRunner {
-        fn run(&self, request: GitRunRequest<'_>) -> Result<Vec<u8>, GitFailure> {
-            self.calls.lock().unwrap().push(request.args.to_vec());
-            self.inner.run(request)
-        }
-
-        fn archive(
-            &self,
-            request: GitRunRequest<'_>,
-            destination: &Path,
-        ) -> Result<(), GitFailure> {
-            self.calls.lock().unwrap().push(request.args.to_vec());
-            self.inner.archive(request, destination)
         }
     }
 
@@ -4056,7 +3974,7 @@ mod tests {
             &configs,
             directory.path(),
             directory.path(),
-            &GitResolverMode::Https,
+            &SystemGitRunner::default(),
         )
         .unwrap();
 
@@ -4089,7 +4007,7 @@ mod tests {
             &configs,
             directory.path(),
             directory.path(),
-            &GitResolverMode::Https,
+            &SystemGitRunner::default(),
         )
         .unwrap();
 
@@ -4127,7 +4045,7 @@ mod tests {
             &configs,
             directory.path(),
             directory.path(),
-            &GitResolverMode::Https,
+            &SystemGitRunner::default(),
         )
         .unwrap();
 
@@ -4346,27 +4264,8 @@ mod tests {
         assert!(Arc::ptr_eq(&published, &unchanged.resolved));
     }
 
-    async fn stage_local_git_runtime(
-        config: PathBuf,
-        root: &Path,
-        repository: &Path,
-    ) -> (PluginRuntime, Arc<GitActivity>) {
-        let activity = Arc::new(GitActivity::default());
-        let runtime = PluginRuntime::new(
-            config,
-            root.to_path_buf(),
-            root.join("cache"),
-            root.join("data"),
-            ResolvedPlugins::default(),
-        )
-        .with_local_git_mode(repository, activity.clone());
-        let staged = runtime.stage().await.unwrap();
-        runtime.publish(staged);
-        (runtime, activity)
-    }
-
     #[tokio::test]
-    async fn full_commit_stage_reuses_published_arc_before_git_resolution() {
+    async fn full_commit_runtime_reuses_cached_and_published_content() {
         let repository = TestRepository::new();
         repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
         let commit = repository.commit_file(
@@ -4375,237 +4274,262 @@ mod tests {
             "skill",
         );
         let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let remote = "https://plugins.example/repository.git";
+        // Populate the normal cache from a local repository, then use the real
+        // HTTPS-only runtime without injecting a resolver or subprocess runner.
+        resolve_git_source(
+            repository.path().as_os_str(),
+            &sha256_text(remote),
+            GitSourceRevision::Unplanned(&GitRevision::Commit(commit.clone())),
+            None,
+            &cache,
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
+        )
+        .unwrap();
         let config = directory.path().join("config.toml");
+        fs::write(
+            &config,
+            format!("[plugins.commit]\nsource = 'git'\nurl = '{remote}'\nrev = '{commit}'\n"),
+        )
+        .unwrap();
+        // No repository remains available to fetch from.
+        drop(repository);
+        let runtime = PluginRuntime::new(
+            config.clone(),
+            directory.path().to_path_buf(),
+            cache.clone(),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        let staged = runtime.stage().await.unwrap();
+        assert_eq!(staged.resolved.skills[0].body, "first");
+        runtime.publish(staged);
+        let published = runtime.snapshot();
+        let unchanged = runtime.stage().await.unwrap();
+        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
+        assert_eq!(unchanged.resolved.skills[0].body, "first");
+
+        let fresh_runtime = PluginRuntime::new(
+            config,
+            directory.path().to_path_buf(),
+            cache,
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
+        );
+        assert_eq!(
+            fresh_runtime.stage().await.unwrap().resolved.skills[0].body,
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutable_default_head_runtime_reuses_and_invalidates_published_skills() {
+        assert_mutable_runtime_generations(None).await;
+    }
+
+    #[tokio::test]
+    async fn mutable_annotated_tag_runtime_reuses_and_invalidates_published_skills() {
+        assert_mutable_runtime_generations(Some("refs/tags/stable")).await;
+    }
+
+    async fn assert_mutable_runtime_generations(rev: Option<&str>) {
+        let repository = TestRepository::new();
+        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
+        repository.commit_file(
+            "skills/live/SKILL.md",
+            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
+            "first skill",
+        );
+        repository.git(&["branch", "-M", "main"]);
+        if rev.is_some() {
+            repository.git(&["tag", "-a", "stable", "-m", "first tag"]);
+        }
+        let runner: Arc<dyn GitRunner + Send> = Arc::new(RepositoryGitRunner {
+            repository: repository.path().to_path_buf(),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.toml");
+        let revision = rev
+            .map(|rev| format!("rev = '{rev}'\n"))
+            .unwrap_or_default();
         fs::write(
             &config,
             format!(
-                "[plugins.commit]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\nrev = '{commit}'\n"
+                "[plugins.live]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\n{revision}"
             ),
         )
         .unwrap();
-        let (runtime, activity) =
-            stage_local_git_runtime(config, directory.path(), repository.path()).await;
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            1
+        let runtime = PluginRuntime::new(
+            config,
+            directory.path().to_path_buf(),
+            directory.path().join("cache"),
+            directory.path().join("data"),
+            ResolvedPlugins::default(),
         );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        let published = runtime.snapshot();
-        let unchanged = runtime.stage().await.unwrap();
-        assert!(Arc::ptr_eq(&published, &unchanged.resolved));
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-    }
 
-    #[tokio::test]
-    async fn mutable_default_head_stage_reuses_then_refreshes_on_movement() {
-        let repository = TestRepository::new();
-        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
-        repository.commit_file(
-            "skills/live/SKILL.md",
-            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
-            "skill",
-        );
-        repository.git(&["branch", "-M", "main"]);
-        let directory = tempfile::tempdir().unwrap();
-        let config = directory.path().join("config.toml");
-        fs::write(
-            &config,
-            "[plugins.head]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\n",
-        )
-        .unwrap();
-        let (runtime, activity) =
-            stage_local_git_runtime(config, directory.path(), repository.path()).await;
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        let first = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
+        assert_eq!(first.resolved.skills[0].body, "first");
+        let first_fingerprint = first.source_fingerprint;
+        runtime.publish(first);
         let published = runtime.snapshot();
-        let unchanged = runtime.stage().await.unwrap();
+        let unchanged = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
         assert!(Arc::ptr_eq(&published, &unchanged.resolved));
         assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            1
+            unchanged.source_fingerprint.candidate,
+            first_fingerprint.candidate
         );
         assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            1
+            unchanged.source_fingerprint.resolved,
+            first_fingerprint.resolved
         );
+        assert_eq!(unchanged.resolved.skills[0].body, "first");
 
         repository.commit_file(
             "skills/live/SKILL.md",
             b"---\nname: live\ndescription: Live.\n---\nsecond\n",
-            "move head",
+            "second skill",
         );
-        let changed = runtime.stage().await.unwrap();
+        if rev.is_some() {
+            repository.git(&["tag", "-f", "-a", "stable", "-m", "second tag"]);
+        }
+        // The config is unchanged: only the remote mutable revision moved.
+        let changed = runtime.stage_with_git_runner(runner.clone()).await.unwrap();
+        assert_ne!(
+            changed.source_fingerprint.candidate,
+            first_fingerprint.candidate
+        );
+        assert_ne!(
+            changed.source_fingerprint.resolved,
+            first_fingerprint.resolved
+        );
         assert!(!Arc::ptr_eq(&published, &changed.resolved));
         assert_eq!(changed.resolved.skills[0].body, "second");
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert!(Arc::ptr_eq(&published, &runtime.snapshot()));
+        assert_eq!(published.skills[0].body, "first");
+
+        let second_fingerprint = changed.source_fingerprint;
         runtime.publish(changed);
         let republished = runtime.snapshot();
-        let unchanged_again = runtime.stage().await.unwrap();
+        assert!(!Arc::ptr_eq(&published, &republished));
+        let unchanged_again = runtime.stage_with_git_runner(runner).await.unwrap();
         assert!(Arc::ptr_eq(&republished, &unchanged_again.resolved));
         assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            2
+            unchanged_again.source_fingerprint.candidate,
+            second_fingerprint.candidate
         );
         assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            2
+            unchanged_again.source_fingerprint.resolved,
+            second_fingerprint.resolved
         );
+        assert_eq!(unchanged_again.resolved.skills[0].body, "second");
     }
 
-    #[tokio::test]
-    async fn shared_cache_reuses_probed_mutable_head_then_refreshes_on_movement() {
+    fn resolve_local_plan(
+        repository: &Path,
+        plan: &PlannedGitRevision,
+        cache: &Path,
+        runner: &dyn GitRunner,
+    ) -> ResolvedGitSource {
+        resolve_git_source(
+            repository.as_os_str(),
+            &sha256_text(&repository.to_string_lossy()),
+            GitSourceRevision::Planned(plan),
+            None,
+            cache,
+            &LocalGitRunner { inner: runner },
+        )
+        .unwrap()
+    }
+
+    fn probe_local_revision(
+        repository: &Path,
+        revision: &GitRevision,
+        cache: &Path,
+    ) -> PlannedGitRevision {
+        probe_git_revision(
+            repository.as_os_str(),
+            &sha256_text(&repository.to_string_lossy()),
+            revision,
+            cache,
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn planned_default_head_reuses_cache_and_refreshes_content_on_movement() {
         let repository = TestRepository::new();
         repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
-        repository.commit_file(
-            "skills/live/SKILL.md",
-            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
-            "skill",
-        );
+        repository.commit_file("version.txt", b"first", "first");
         repository.git(&["branch", "-M", "main"]);
-        let directory = tempfile::tempdir().unwrap();
-        let config = directory.path().join("config.toml");
-        fs::write(
-            &config,
-            "[plugins.head]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\n",
-        )
-        .unwrap();
-        let (_first_runtime, first_activity) =
-            stage_local_git_runtime(config.clone(), directory.path(), repository.path()).await;
-        assert_eq!(
-            first_activity
-                .probes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
+        let cache = tempfile::tempdir().unwrap();
+        let plan =
+            probe_local_revision(repository.path(), &GitRevision::DefaultBranch, cache.path());
+        let first = resolve_local_plan(
+            repository.path(),
+            &plan,
+            cache.path(),
+            &SystemGitRunner::default(),
         );
-        assert_eq!(
-            first_activity
-                .fetches
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            first_activity
-                .archives
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(fs::read(first.root.join("version.txt")).unwrap(), b"first");
+        let unchanged =
+            probe_local_revision(repository.path(), &GitRevision::DefaultBranch, cache.path());
+        // A valid planned cache entry remains usable if the Git process fails.
+        let reused =
+            resolve_local_plan(repository.path(), &unchanged, cache.path(), &TimeoutRunner);
+        assert_eq!(reused.root, first.root);
+        assert_eq!(fs::read(reused.root.join("version.txt")).unwrap(), b"first");
 
-        let (runtime, activity) =
-            stage_local_git_runtime(config, directory.path(), repository.path()).await;
+        let second_commit = repository.commit_file("version.txt", b"second", "move head");
+        let moved =
+            probe_local_revision(repository.path(), &GitRevision::DefaultBranch, cache.path());
+        let second = resolve_local_plan(
+            repository.path(),
+            &moved,
+            cache.path(),
+            &SystemGitRunner::default(),
+        );
+        assert_eq!(second.revision.commit_oid, second_commit);
+        assert_ne!(second.root, first.root);
         assert_eq!(
-            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
-            1
+            fs::read(second.root.join("version.txt")).unwrap(),
+            b"second"
         );
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(runtime.snapshot().skills[0].body, "first");
-        let published = runtime.snapshot();
-
-        repository.commit_file(
-            "skills/live/SKILL.md",
-            b"---\nname: live\ndescription: Live.\n---\nsecond\n",
-            "move head",
-        );
-        let changed = runtime.stage().await.unwrap();
-        assert!(!Arc::ptr_eq(&published, &changed.resolved));
-        assert_eq!(changed.resolved.skills[0].body, "second");
-        assert_eq!(
-            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(fs::read(first.root.join("version.txt")).unwrap(), b"first");
+        let reused = resolve_local_plan(repository.path(), &moved, cache.path(), &TimeoutRunner);
+        assert_eq!(reused.root, second.root);
     }
 
-    #[tokio::test]
-    async fn shared_cache_reuses_probed_annotated_tag_without_resolution() {
+    #[test]
+    fn planned_annotated_tag_reuses_cached_commit_content() {
         let repository = TestRepository::new();
-        repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
-        let commit = repository.commit_file(
-            "skills/live/SKILL.md",
-            b"---\nname: live\ndescription: Live.\n---\nfirst\n",
-            "skill",
-        );
+        let commit = repository.commit_file("plugin.json", MANIFEST.as_bytes(), "manifest");
         repository.git(&["tag", "-a", "stable", "-m", "stable"]);
-        assert_ne!(repository.git(&["rev-parse", "stable"]), commit);
-        let directory = tempfile::tempdir().unwrap();
-        let config = directory.path().join("config.toml");
-        fs::write(
-            &config,
-            "[plugins.tag]\nsource = 'git'\nurl = 'https://plugins.example/repository.git'\nrev = 'refs/tags/stable'\n",
-        )
-        .unwrap();
-        let (_first_runtime, first_activity) =
-            stage_local_git_runtime(config.clone(), directory.path(), repository.path()).await;
-        assert_eq!(
-            first_activity
-                .probes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
+        let cache = tempfile::tempdir().unwrap();
+        let revision = GitRevision::Ref("refs/tags/stable".into());
+        let plan = probe_local_revision(repository.path(), &revision, cache.path());
+        assert_ne!(plan.raw_oid, commit);
+        assert_eq!(plan.commit_oid, commit);
+        let first = resolve_local_plan(
+            repository.path(),
+            &plan,
+            cache.path(),
+            &SystemGitRunner::default(),
         );
+        let unchanged = probe_local_revision(repository.path(), &revision, cache.path());
+        let reused =
+            resolve_local_plan(repository.path(), &unchanged, cache.path(), &TimeoutRunner);
+        assert_eq!(reused.root, first.root);
+        assert_eq!(reused.revision.commit_oid, commit);
         assert_eq!(
-            first_activity
-                .fetches
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            fs::read_to_string(reused.root.join("plugin.json")).unwrap(),
+            MANIFEST
         );
-        assert_eq!(
-            first_activity
-                .archives
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-
-        let (runtime, activity) =
-            stage_local_git_runtime(config, directory.path(), repository.path()).await;
-        assert_eq!(
-            activity.probes.load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            activity.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            activity.archives.load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert_eq!(runtime.snapshot().skills[0].body, "first");
     }
 
     #[test]
@@ -4625,7 +4549,7 @@ mod tests {
                 configs,
                 directory.path(),
                 directory.path(),
-                &GitResolverMode::Https,
+                &SystemGitRunner::default(),
             )
             .unwrap()
             .candidate_fingerprint
@@ -4651,8 +4575,9 @@ mod tests {
             &source_key,
             &GitRevision::DefaultBranch,
             cache.path(),
-            GitProtocol::Local,
-            &SystemGitRunner::default(),
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
         )
         .unwrap();
         let unchanged = probe_git_revision(
@@ -4660,8 +4585,9 @@ mod tests {
             &source_key,
             &GitRevision::DefaultBranch,
             cache.path(),
-            GitProtocol::Local,
-            &SystemGitRunner::default(),
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
         )
         .unwrap();
         assert_eq!(first, unchanged);
@@ -4671,8 +4597,9 @@ mod tests {
             &source_key,
             &GitRevision::DefaultBranch,
             cache.path(),
-            GitProtocol::Local,
-            &SystemGitRunner::default(),
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
         )
         .unwrap();
         assert_ne!(first, changed);
@@ -4704,21 +4631,22 @@ mod tests {
             &source_key,
             &GitRevision::Ref("refs/tags/stable".into()),
             cache.path(),
-            GitProtocol::Local,
-            &SystemGitRunner::default(),
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
+            },
         )
         .unwrap();
         let second = repository.commit_file("version.txt", b"second", "second");
         repository.git(&["tag", "--force", "stable", &second]);
-        let error = resolve_git_planned(
-            "https://plugins.example/repository.git",
+        let error = resolve_git_source(
+            repository.path().as_os_str(),
+            &source_key,
+            GitSourceRevision::Planned(&planned),
             None,
             cache.path(),
-            &GitResolverMode::Local {
-                repository: repository.path().to_path_buf(),
-                activity: Arc::new(GitActivity::default()),
+            &LocalGitRunner {
+                inner: &SystemGitRunner::default(),
             },
-            &planned,
         )
         .unwrap_err();
         assert!(error.contains("moved while"));
@@ -4794,12 +4722,7 @@ mod tests {
                 "accepted {invalid}"
             );
         }
-        let args = hardened_git_args(
-            GitProtocol::Https,
-            Path::new("hooks"),
-            Path::new("attributes"),
-            &[],
-        );
+        let args = hardened_git_args(Path::new("hooks"), Path::new("attributes"), &[]);
         let config = hardened_git_config(Some("https://plugins.example/repository=x.git"));
         assert!(config.contains(&(
             OsString::from("http.https://plugins.example/repository=x.git.sslVerify"),
@@ -4853,12 +4776,7 @@ mod tests {
             OsStr::new("--get"),
             OsStr::new(&query),
         ];
-        let args = hardened_git_args(
-            GitProtocol::Https,
-            directory.path(),
-            directory.path(),
-            &command_args,
-        );
+        let args = hardened_git_args(directory.path(), directory.path(), &command_args);
         let config = hardened_git_config(Some(remote));
         let output = SystemGitRunner {
             timeout: Duration::from_secs(5),
@@ -5186,7 +5104,6 @@ mod tests {
             GitSourceRevision::Unplanned(&GitRevision::Commit("01".repeat(20))),
             None,
             cache.path(),
-            GitProtocol::Https,
             &RewrittenUrlRunner,
         )
         .unwrap_err();
@@ -5325,7 +5242,7 @@ mod tests {
     }
 
     #[test]
-    fn forces_sha1_and_preserves_only_committed_git_attributes() {
+    fn preserves_only_committed_git_attributes() {
         let repository = TestRepository::new();
         repository.commit_file(
             ".gitattributes",
@@ -5335,49 +5252,11 @@ mod tests {
         repository.commit_file("plugin.json", MANIFEST.as_bytes(), "plugin");
         let commit = repository.commit_file("secret.txt", b"secret", "secret");
         let cache = tempfile::tempdir().unwrap();
-        let runner = RecordingRunner::default();
+        let runner = SystemGitRunner::default();
         let root =
             resolve_git_local(repository.path(), &commit, None, cache.path(), &runner).unwrap();
         assert!(root.join(".gitattributes").is_file());
         assert!(!root.join("secret.txt").exists());
-
-        let calls = runner.calls.lock().unwrap();
-        assert!(
-            calls
-                .iter()
-                .flatten()
-                .any(|arg| arg == "--object-format=sha1")
-        );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|args| args.iter().any(|arg| arg == "--get-url"))
-                .count(),
-            2
-        );
-        assert!(calls.iter().all(|args| {
-            args.iter()
-                .any(|arg| arg.to_string_lossy().starts_with("core.attributesFile="))
-        }));
-        let fetch = calls
-            .iter()
-            .find(|args| args.iter().any(|arg| arg == "--no-write-fetch-head"))
-            .expect("fetch must suppress FETCH_HEAD");
-        assert!(
-            fetch
-                .iter()
-                .any(|arg| { arg == &OsString::from(format!("{commit}:{GIT_PRIVATE_FETCH_REF}")) })
-        );
-        assert!(calls.iter().any(|args| {
-            args.iter()
-                .any(|arg| arg == &OsString::from(format!("{GIT_PRIVATE_FETCH_REF}^{{commit}}")))
-        }));
-        assert!(
-            calls
-                .iter()
-                .flatten()
-                .all(|arg| arg != OsStr::new("FETCH_HEAD^{commit}"))
-        );
     }
 
     #[test]
@@ -5591,7 +5470,6 @@ mod tests {
                 GitSourceRevision::Unplanned(&GitRevision::Ref("refs/tags/stable".into())),
                 None,
                 cache.path(),
-                GitProtocol::Https,
                 runner,
             )
             .unwrap_err();
