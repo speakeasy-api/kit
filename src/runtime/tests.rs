@@ -446,6 +446,57 @@ fn dropped_uncommitted_session_claim_retries_as_new() {
 }
 
 #[test]
+fn rejected_creation_commit_recreates_configured_and_generated_claims_as_new() {
+    for configured in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = if configured {
+            Runtime::with_session(
+                root.path(),
+                "gpt-5.4",
+                SessionRequest {
+                    id: "selected".into(),
+                    resume: false,
+                    force: false,
+                },
+            )
+            .unwrap()
+        } else {
+            Runtime::new(root.path(), "gpt-5.4").unwrap()
+        };
+        let mut failed = runtime.claim_session().unwrap();
+        let id = failed.id().to_owned();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            &id,
+            false,
+            vec![agentkit_core::Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        failed.guard_uncommitted_transcript(&opened.observer);
+        // Abandon normal response publication: this removes the uncommitted
+        // file and freezes the writer, so its later creation commit must fail.
+        drop(opened.observer.prepare_creation().unwrap());
+        drop(opened);
+        assert!(failed.commit().is_err());
+        assert!(crate::session::load(root.path(), &id).is_err());
+        let mut retry = runtime.claim_session().unwrap();
+        assert_eq!(retry.id(), id);
+        assert!(!retry.request.resume);
+        let recreated = crate::session::open_uncommitted(
+            root.path(),
+            retry.id(),
+            false,
+            vec![agentkit_core::Item::text(ItemKind::System, "recreated")],
+        )
+        .unwrap();
+        retry.guard_uncommitted_transcript(&recreated.observer);
+        retry.commit().unwrap();
+        drop(recreated);
+        assert!(crate::session::load(root.path(), &id).is_ok());
+    }
+}
+
+#[test]
 fn uncommitted_claim_rolls_back_before_waiting_to_publish_retry() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -1274,7 +1325,8 @@ async fn close_tool_can_cancel_a_detached_compose() {
 
     let job = compose
         .backgroundable
-        .begin_background(true, &call_id, &mut context);
+        .begin_background(true, &call_id, &mut context)
+        .unwrap();
     let cancellation = context.cancellation.clone().expect("job cancellation");
     assert!(!cancellation.is_cancelled());
     assert_eq!(
@@ -1334,7 +1386,8 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
     let mut context = owned.borrowed();
     let job = compose
         .backgroundable
-        .begin_background(false, &call_id, &mut context);
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
     let cancellation = context.cancellation.clone().expect("compose cancellation");
 
     assert_eq!(
@@ -1352,11 +1405,10 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
 
     let already_cancelled_id = ToolCallId::new("already-cancelled");
     let mut already_cancelled_context = owned.borrowed();
-    let already_cancelled_job = compose.backgroundable.begin_background(
-        false,
-        &already_cancelled_id,
-        &mut already_cancelled_context,
-    );
+    let already_cancelled_job = compose
+        .backgroundable
+        .begin_background(false, &already_cancelled_id, &mut already_cancelled_context)
+        .unwrap();
     assert!(
         already_cancelled_context
             .cancellation
@@ -1375,11 +1427,10 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
     );
     let pending_detach_id = ToolCallId::new("pending-detach");
     let mut pending_detach_context = owned.borrowed();
-    let pending_detach_job = compose.backgroundable.begin_background(
-        false,
-        &pending_detach_id,
-        &mut pending_detach_context,
-    );
+    let pending_detach_job = compose
+        .backgroundable
+        .begin_background(false, &pending_detach_id, &mut pending_detach_context)
+        .unwrap();
     assert!(
         !pending_detach_context
             .cancellation
@@ -1619,6 +1670,246 @@ fn cancel_all_covers_running_and_late_background_registration() {
     jobs.register_foreground_for_test("next-turn");
     assert!(!jobs.is_cancelled_for_test("next-turn"));
     jobs.finish_for_test("next-turn");
+}
+
+fn background_job_test_context(
+    cancellation: Option<agentkit_core::TurnCancellation>,
+) -> OwnedToolContext {
+    OwnedToolContext {
+        session_id: SessionId::new("background-test"),
+        turn_id: TurnId::new("turn"),
+        metadata: MetadataMap::new(),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation,
+        execution_scope: None,
+        approved_request: None,
+    }
+}
+
+#[test]
+fn background_jobs_poison_preserves_activity_cancellation_and_terminal_debt() {
+    let jobs = BackgroundJobs::default();
+    jobs.register_foreground_for_test("active");
+    jobs.register_foreground_for_test("finished");
+    jobs.detach("finished").unwrap();
+    jobs.finish_for_test("finished");
+    let before = jobs.activity();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = jobs.state.lock().unwrap();
+            panic!("poison intact background bookkeeping");
+        }))
+        .is_err()
+    );
+    assert_eq!(jobs.activity(), before);
+    assert!(jobs.activity().active);
+    assert!(jobs.activity().unacknowledged_terminals);
+    assert!(!jobs.state.is_poisoned());
+    jobs.cancel_all();
+    assert!(jobs.is_cancelled_for_test("active"));
+    jobs.register_foreground_for_test("late");
+    assert!(jobs.is_cancelled_for_test("late"));
+    jobs.acknowledge_terminal(&ToolCallId::new("finished"));
+    jobs.finish_for_test("active");
+    jobs.finish_for_test("late");
+    assert!(!jobs.activity().active);
+    assert!(!jobs.activity().unacknowledged_terminals);
+}
+
+#[tokio::test]
+async fn background_registration_waker_unwind_cleans_up_without_poison() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+    struct ReenterAndPanic(BackgroundJobs, AtomicBool);
+    impl Wake for ReenterAndPanic {
+        fn wake(self: Arc<Self>) {
+            assert!(
+                self.0.state.try_lock().is_ok(),
+                "activity wake held jobs lock"
+            );
+            let _ = self.0.activity();
+            if !self.1.swap(true, Ordering::SeqCst) {
+                panic!("activity waker");
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let wake = Arc::new(ReenterAndPanic(jobs.clone(), AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let owned = background_job_test_context(None);
+    let mut context = owned.borrowed();
+    let call_id = ToolCallId::new("wake-unwind");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _job = compose
+                .backgroundable
+                .begin_background(true, &call_id, &mut context)
+                .unwrap();
+        }))
+        .is_err()
+    );
+    assert!(wake.1.load(Ordering::SeqCst));
+    assert!(!jobs.state.is_poisoned());
+    assert!(
+        !jobs.activity().active,
+        "registration must establish cleanup before waking"
+    );
+    assert!(jobs.activity().unacknowledged_terminals);
+    jobs.acknowledge_terminal(&call_id);
+    assert!(!jobs.activity().unacknowledged_terminals);
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+    );
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    assert!(jobs.activity().active);
+    drop(guard);
+    assert!(!jobs.activity().active);
+}
+
+#[tokio::test]
+async fn background_finish_and_acknowledgement_wake_with_committed_state() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+    struct ObserveDebt(BackgroundJobs, AtomicBool);
+    impl Wake for ObserveDebt {
+        fn wake(self: Arc<Self>) {
+            assert!(self.0.state.try_lock().is_ok());
+            self.1
+                .store(self.0.activity().unacknowledged_terminals, Ordering::SeqCst);
+        }
+    }
+    let jobs = BackgroundJobs::default();
+    jobs.register_foreground_for_test("terminal");
+    jobs.detach("terminal").unwrap();
+    let observe = Arc::new(ObserveDebt(jobs.clone(), AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&observe));
+    let mut context = Context::from_waker(&waker);
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    jobs.finish_for_test("terminal");
+    assert!(observe.1.load(Ordering::SeqCst));
+    assert!(waiting.as_mut().poll(&mut context).is_ready());
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    jobs.acknowledge_terminal(&ToolCallId::new("terminal"));
+    assert!(!observe.1.load(Ordering::SeqCst));
+    assert!(waiting.as_mut().poll(&mut context).is_ready());
+    assert!(!jobs.activity().active);
+    assert!(!jobs.state.is_poisoned());
+}
+
+#[tokio::test]
+async fn background_cancellation_rejects_detach_and_stale_relays_ignore_reused_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let parent = CancellationController::new();
+    let owned = background_job_test_context(Some(parent.handle().checkpoint()));
+    let mut context = owned.borrowed();
+    let call_id = ToolCallId::new("relay");
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    let old_registration = jobs.lock_jobs().running[&call_id].registration.clone();
+    let cancellation = context.cancellation.clone().unwrap();
+    parent.interrupt();
+    tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
+        .await
+        .unwrap();
+    assert_eq!(jobs.detach(&call_id.0), None);
+    assert!(jobs.cancel(&call_id.0));
+    assert!(jobs.cancel(&call_id.0));
+    assert_eq!(
+        cancellation.handle().generation(),
+        1,
+        "signal a job only once"
+    );
+    drop(guard);
+    let owned = background_job_test_context(None);
+    let mut context = owned.borrowed();
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    let cancellation = context.cancellation.clone().unwrap();
+    // The old relay can race abort after finish unlocks; exercise its real handlers.
+    assert!(!jobs.cancel_registration(&call_id.0, Some(&old_registration)));
+    jobs.propagate_foreground_cancellation(&call_id, &old_registration);
+    assert!(!cancellation.is_cancelled());
+    assert!(jobs.cancel(&call_id.0));
+    assert!(cancellation.is_cancelled());
+    drop(guard);
+}
+
+#[tokio::test]
+async fn background_registration_rejection_preserves_owner_and_unwind_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let owned = background_job_test_context(None);
+    let call_id = ToolCallId::new("duplicate");
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut owned.borrowed())
+        .unwrap();
+    let before = jobs.activity();
+    assert!(
+        compose
+            .backgroundable
+            .begin_background(false, &call_id, &mut owned.borrowed())
+            .is_err()
+    );
+    assert_eq!(jobs.activity(), before);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            let _state = jobs.state.lock().unwrap();
+            panic!("execution unwind with poisoned registry");
+        }))
+        .is_err()
+    );
+    assert!(!jobs.state.is_poisoned());
+    assert!(!jobs.activity().active);
+    let guard = compose
+        .backgroundable
+        .begin_background(true, &call_id, &mut owned.borrowed())
+        .unwrap();
+    drop(guard);
+    assert!(jobs.activity().unacknowledged_terminals);
+    assert!(
+        compose
+            .backgroundable
+            .begin_background(true, &call_id, &mut owned.borrowed())
+            .is_err()
+    );
+    jobs.acknowledge_terminal(&call_id);
+    assert!(!jobs.activity().unacknowledged_terminals);
 }
 
 #[tokio::test]

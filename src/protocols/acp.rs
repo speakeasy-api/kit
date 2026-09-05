@@ -513,11 +513,45 @@ struct RegistryState {
     v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
 
+impl RegistryState {
+    fn close_gate(&mut self, permanently: bool) {
+        self.accepting = false;
+        self.permanently_closed |= permanently;
+        if let Some(generation) = self.generation.checked_add(1) {
+            self.generation = generation;
+        } else {
+            // Never let an old admission become current again through wraparound.
+            self.permanently_closed = true;
+        }
+    }
+}
+
 struct SessionRegistryInner {
     next_token: AtomicU64,
     lifecycle: tokio::sync::Mutex<()>,
     attachments_changed: Notify,
     state: Mutex<RegistryState>,
+}
+
+impl SessionRegistryInner {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            // This registry owns only admission bookkeeping and live handle indexes,
+            // not the durable v2 publication commit. All writers below finish their
+            // in-memory transitions without callbacks, wakeups, arbitrary drops, or
+            // awaits: admission counts are checked before incrementing; completion
+            // consumes a validated admission; insertion rejects existing tokens;
+            // removal extracts ownership; gate closure cannot wrap its generation.
+            // Snapshots clone only concrete Arc/channel/handle types. Reopening
+            // happens only after teardown and the external reset have succeeded;
+            // cancellation or panic before then leaves admission closed. Thus unwind
+            // cannot leave a partial transition or imply an external commit succeeded.
+            // In particular, actor/admission destructors must work after poison too.
+            let state = poisoned.into_inner();
+            self.state.clear_poison();
+            state
+        })
+    }
 }
 
 pub(super) struct SessionAdmission {
@@ -530,7 +564,6 @@ impl SessionAdmission {
     fn complete(&mut self, state: &mut RegistryState) {
         state.pending_attachments = state.pending_attachments.saturating_sub(1);
         self.active = false;
-        self.registry.attachments_changed.notify_waiters();
     }
 }
 
@@ -540,10 +573,7 @@ impl Drop for SessionAdmission {
             return;
         }
         let registry = Arc::clone(&self.registry);
-        let mut state = registry
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
+        let mut state = registry.lock_state();
         state.pending_attachments = state.pending_attachments.saturating_sub(1);
         self.active = false;
         drop(state);
@@ -577,19 +607,20 @@ impl SessionRegistry {
     }
 
     pub(super) fn next_token(&self) -> u64 {
-        self.inner.next_token.fetch_add(1, Ordering::Relaxed)
+        self.inner
+            .next_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .expect("ACP session registry token space exhausted")
     }
 
     fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
+        let mut state = self.inner.lock_state();
         if !state.accepting {
             return Err(());
         }
-        state.pending_attachments += 1;
+        state.pending_attachments = state.pending_attachments.checked_add(1).ok_or(())?;
         Ok(SessionAdmission {
             generation: state.generation,
             active: true,
@@ -602,16 +633,20 @@ impl SessionRegistry {
         admission: &mut SessionAdmission,
         session: RegisteredSession,
     ) -> Result<(), ()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        if !state.accepting || state.generation != admission.generation {
+        let mut state = self.inner.lock_state();
+        if !admission.active
+            || !Arc::ptr_eq(&self.inner, &admission.registry)
+            || !state.accepting
+            || state.generation != admission.generation
+            || state.sessions.contains_key(&session.token)
+            || state.v2_sessions.contains_key(&session.token)
+        {
             return Err(());
         }
         state.sessions.insert(session.token, session);
         admission.complete(&mut state);
+        drop(state);
+        self.inner.attachments_changed.notify_waiters();
         Ok(())
     }
 
@@ -624,12 +659,14 @@ impl SessionRegistry {
         actor: AbortHandle,
         completed: watch::Receiver<bool>,
     ) -> Result<(), ()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        if !state.accepting || state.generation != admission.generation {
+        let mut state = self.inner.lock_state();
+        if !admission.active
+            || !Arc::ptr_eq(&self.inner, &admission.registry)
+            || !state.accepting
+            || state.generation != admission.generation
+            || state.sessions.contains_key(&token)
+            || state.v2_sessions.contains_key(&token)
+        {
             return Err(());
         }
         state.v2_sessions.insert(
@@ -643,31 +680,27 @@ impl SessionRegistry {
             },
         );
         admission.complete(&mut state);
+        drop(state);
+        self.inner.attachments_changed.notify_waiters();
         Ok(())
     }
 
     pub(super) fn remove(&self, token: u64) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        state.sessions.remove(&token);
-        state.v2_sessions.remove(&token);
+        let mut state = self.inner.lock_state();
+        let session = state.sessions.remove(&token);
+        let v2_session = state.v2_sessions.remove(&token);
+        drop(state);
+        // Captured callback state can reenter the registry or panic on final drop.
+        drop(session);
+        drop(v2_session);
     }
 
     fn close_gate_and_snapshot(
         &self,
         permanently: bool,
     ) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        state.accepting = false;
-        state.permanently_closed |= permanently;
-        state.generation = state.generation.wrapping_add(1);
+        let mut state = self.inner.lock_state();
+        state.close_gate(permanently);
         (
             state.sessions.values().cloned().collect(),
             state.v2_sessions.values().cloned().collect(),
@@ -677,14 +710,7 @@ impl SessionRegistry {
     async fn wait_for_pending_attachments(&self) {
         loop {
             let changed = self.inner.attachments_changed.notified();
-            if self
-                .inner
-                .state
-                .lock()
-                .expect("ACP session registry poisoned")
-                .pending_attachments
-                == 0
-            {
+            if self.inner.lock_state().pending_attachments == 0 {
                 return;
             }
             changed.await;
@@ -729,14 +755,8 @@ impl SessionRegistry {
             Ok(lifecycle) => lifecycle,
             Err(_) => {
                 if !reopen {
-                    let mut state = self
-                        .inner
-                        .state
-                        .lock()
-                        .expect("ACP session registry poisoned");
-                    state.accepting = false;
-                    state.permanently_closed = true;
-                    state.generation = state.generation.wrapping_add(1);
+                    let mut state = self.inner.lock_state();
+                    state.close_gate(true);
                 }
                 return (false, None);
             }
@@ -752,7 +772,6 @@ impl SessionRegistry {
 
         let mut closing = JoinSet::new();
         for mut session in sessions.iter().cloned() {
-            let registry = self.clone();
             closing.spawn(async move {
                 cancel_background_jobs(&session.tasks, &session.background_jobs).await;
                 if let Some(commands) = session.commands.upgrade() {
@@ -761,31 +780,33 @@ impl SessionRegistry {
                         let _ = acknowledged.await;
                     }
                 }
-                if !*session.completed.borrow() {
-                    let _ = session.completed.changed().await;
-                }
-                registry.remove(session.token);
+                session.completed.wait_for(|done| *done).await.is_ok()
             });
         }
 
         for mut session in v2_sessions.iter().cloned() {
-            let registry = self.clone();
             closing.spawn(async move {
                 (session.close)().await;
-                if !*session.completed.borrow() {
-                    let _ = session.completed.changed().await;
-                }
-                registry.remove(session.token);
+                session.completed.wait_for(|done| *done).await.is_ok()
             });
         }
 
-        let timed_out = timeout(limit, async {
-            while closing.join_next().await.is_some() {}
-            self.wait_for_pending_attachments().await;
-        })
-        .await
-        .is_err();
-        let teardown_complete = if timed_out {
+        let graceful = matches!(
+            timeout(limit, async {
+                let mut completed = true;
+                while let Some(result) = closing.join_next().await {
+                    completed &= matches!(result, Ok(true));
+                }
+                self.wait_for_pending_attachments().await;
+                completed
+            })
+            .await,
+            Ok(true)
+        );
+        let teardown_complete = if !graceful {
+            // A panicking close callback is not successful teardown. Abort any
+            // unfinished actor and require its positive completion signal before
+            // resetting external credentials or reopening admission.
             closing.abort_all();
             for session in &sessions {
                 if !*session.completed.borrow() {
@@ -798,21 +819,24 @@ impl SessionRegistry {
                 }
             }
             while closing.join_next().await.is_some() {}
-            timeout(limit, async {
-                for mut session in sessions.iter().cloned() {
-                    if !*session.completed.borrow() {
-                        let _ = session.completed.changed().await;
+            matches!(
+                timeout(limit, async {
+                    for mut session in sessions.iter().cloned() {
+                        if session.completed.wait_for(|done| *done).await.is_err() {
+                            return false;
+                        }
                     }
-                }
-                for mut session in v2_sessions.iter().cloned() {
-                    if !*session.completed.borrow() {
-                        let _ = session.completed.changed().await;
+                    for mut session in v2_sessions.iter().cloned() {
+                        if session.completed.wait_for(|done| *done).await.is_err() {
+                            return false;
+                        }
                     }
-                }
-                self.wait_for_pending_attachments().await;
-            })
-            .await
-            .is_ok()
+                    self.wait_for_pending_attachments().await;
+                    true
+                })
+                .await,
+                Ok(true)
+            )
         } else {
             true
         };
@@ -823,11 +847,7 @@ impl SessionRegistry {
             self.remove(session.token);
         }
         if !teardown_complete {
-            self.inner
-                .state
-                .lock()
-                .expect("ACP session registry poisoned")
-                .permanently_closed = true;
+            self.inner.lock_state().permanently_closed = true;
         }
         let output = if teardown_complete {
             Some(after_close().await)
@@ -836,11 +856,7 @@ impl SessionRegistry {
         };
         let mut reopened = false;
         if reopen && teardown_complete {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("ACP session registry poisoned");
+            let mut state = self.inner.lock_state();
             state.accepting = !state.permanently_closed;
             reopened = state.accepting;
         }
@@ -945,6 +961,28 @@ struct PreparedFork {
     creation: crate::session::SessionObserver,
 }
 
+impl PreparedFork {
+    /// Validation and cleanup ownership precede submission. Only private,
+    /// infallible publication and actor activation may follow a success response.
+    fn submit<E>(
+        self,
+        respond: impl FnOnce(Result<ForkSessionResponse, agent_client_protocol::Error>) -> Result<(), E>,
+    ) -> Result<Option<agentkit_acp::SessionId>, E> {
+        let creation = match self.creation.prepare_creation() {
+            Ok(creation) => creation,
+            Err(error) => {
+                respond(Err(sdk_error(AcpRuntimeError::Loop(error))))?;
+                return Ok(None);
+            }
+        };
+        let session_id = self.response.session_id.clone();
+        respond(Ok(self.response))?;
+        creation.commit();
+        let _ = self.activation.send(());
+        Ok(Some(session_id))
+    }
+}
+
 /// Owns an ACP integration binding for an in-flight request or live actor.
 /// Dropping either owner must release the durable identity.
 struct SessionBindingGuard {
@@ -1047,6 +1085,35 @@ impl Drop for SessionActorGuard {
     }
 }
 
+#[derive(Debug)]
+enum LegacyPublicationError {
+    AdmissionClosed,
+    Commit(AcpRuntimeError),
+}
+
+// Declared before the map guard: rollback runs after map exclusion is released,
+// including on unwind. Consuming a fresh admission proves registry ownership.
+struct SessionPublicationRollback<'a> {
+    registry: &'a SessionRegistry,
+    admission: &'a mut SessionAdmission,
+    token: u64,
+    actor: AbortHandle,
+    armed: bool,
+}
+
+impl Drop for SessionPublicationRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.actor.abort();
+            // Registration consumes admission before notifying waiters. A
+            // rejection must not unregister a different actor with this token.
+            if !self.admission.active {
+                self.registry.remove(self.token);
+            }
+        }
+    }
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -1099,14 +1166,65 @@ impl Server {
         Ok(LogoutResponse::new())
     }
 
+    fn publish_session<T>(
+        &self,
+        admission: &mut SessionAdmission,
+        registered: RegisteredSession,
+        session: SessionHandle,
+        commit: impl FnOnce() -> Result<T, AcpRuntimeError>,
+    ) -> Result<T, LegacyPublicationError> {
+        if !admission.active || !Arc::ptr_eq(&admission.registry, &self.registry.inner) {
+            return Err(LegacyPublicationError::AdmissionClosed);
+        }
+        let mut rollback = SessionPublicationRollback {
+            registry: &self.registry,
+            admission,
+            token: registered.token,
+            actor: registered.actor.clone(),
+            armed: false,
+        };
+        // The commit coordinates durable identity with this local map. An
+        // unwind leaves that outcome unknown: isolate the connection on poison,
+        // but still abort and unregister the actor after releasing this guard.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| LegacyPublicationError::Commit(AcpRuntimeError::ClientClosed))?;
+        if sessions.contains_key(&registered.session_id) {
+            return Err(LegacyPublicationError::Commit(AcpRuntimeError::Loop(
+                "ACP session is already published".into(),
+            )));
+        }
+        sessions.try_reserve(1).map_err(|error| {
+            LegacyPublicationError::Commit(AcpRuntimeError::Loop(error.to_string()))
+        })?;
+        let session_id = registered.session_id.clone();
+        rollback.armed = true;
+        self.registry
+            .register(rollback.admission, registered)
+            .map_err(|()| LegacyPublicationError::AdmissionClosed)?;
+        let committed = commit().map_err(LegacyPublicationError::Commit)?;
+        sessions.insert(session_id, session);
+        rollback.armed = false;
+        Ok(committed)
+    }
+
     fn remove_session(&self, session_id: &agentkit_acp::SessionId, token: u64) {
-        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        if sessions
+        // Cleanup must still unregister and signal completion after a commit
+        // unwind poisoned the map. Do not inspect uncertain publication state.
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        let removed = if sessions
             .get(session_id)
             .is_some_and(|session| session.token == token)
         {
-            sessions.remove(session_id);
-        }
+            sessions.remove(session_id)
+        } else {
+            None
+        };
+        drop(sessions);
+        drop(removed);
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
@@ -1400,38 +1518,11 @@ impl Server {
             completed: completion,
         };
 
-        // Hold the request-scoped map lock across registration, commit, and publication.
-        // Shutdown either closes the gate before this point or snapshots this actor.
-        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        if self.registry.register(&mut admission, registered).is_err() {
-            drop(sessions);
-            drop(activation);
-            actor_task.abort();
-            let _ = actor_task.await;
-            return Err(AcpRuntimeError::ClientClosed);
-        }
-        let pending_fork_creation = if claim.is_fork() {
-            Some(claim.defer_fork_commit())
-        } else {
-            if let Err(error) = claim.commit() {
-                self.registry.remove(token);
-                drop(sessions);
-                drop(activation);
-                actor_task.abort();
-                let _ = actor_task.await;
-                return Err(record_acp_runtime_failure(
-                    &session_id,
-                    "session_commit",
-                    error,
-                ));
-            }
-            None
-        };
-        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-            session_id: session_id.to_string(),
-        });
-        sessions.insert(
-            session_id.clone(),
+        // Shutdown either closes the gate before registration or snapshots this
+        // actor. The helper rolls back after releasing the local map on failure.
+        let publication = self.publish_session(
+            &mut admission,
+            registered,
             SessionHandle {
                 token,
                 commands: tx,
@@ -1439,8 +1530,32 @@ impl Server {
                 structured_completion,
                 tasks,
             },
+            || {
+                if claim.is_fork() {
+                    Ok(Some(claim.defer_fork_commit()))
+                } else {
+                    claim.commit()?;
+                    Ok(None)
+                }
+            },
         );
-        drop(sessions);
+        let pending_fork_creation = match publication {
+            Ok(creation) => creation,
+            Err(error) => {
+                drop(activation);
+                actor_task.abort();
+                let _ = actor_task.await;
+                return Err(match error {
+                    LegacyPublicationError::AdmissionClosed => AcpRuntimeError::ClientClosed,
+                    LegacyPublicationError::Commit(error) => {
+                        record_acp_runtime_failure(&session_id, "session_commit", error)
+                    }
+                });
+            }
+        };
+        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        });
         drop(actor_task);
         Ok(AttachedSession {
             session_id,
@@ -1481,7 +1596,7 @@ impl Server {
         let (sender, background_jobs, tasks, structured_completion) = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&notification.session_id)
             .map(|session| {
                 (
@@ -1512,7 +1627,7 @@ impl Server {
         let session = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
         cancel_background_jobs(&session.tasks, &session.background_jobs).await;
@@ -1534,7 +1649,7 @@ impl Server {
     ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
         self.sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
@@ -1547,7 +1662,7 @@ impl Server {
         let (background_jobs, tasks) = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&request.session_id)
             .map(|session| (session.background_jobs.clone(), session.tasks.clone()))
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
@@ -1563,7 +1678,7 @@ impl Server {
         let background_jobs = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&request.session_id)
             .map(|session| session.background_jobs.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
@@ -2414,11 +2529,13 @@ fn component(
                     cx.spawn(async move {
                         match state.fork_session(request, connection.clone()).await {
                             Ok(prepared) => {
-                                let session_id = prepared.response.session_id.clone();
-                                responder.respond(prepared.response)?;
-                                prepared.creation.commit_creation();
-                                let _ = prepared.activation.send(());
-                                connection.send_notification(available_commands_update(session_id))
+                                if let Some(session_id) = prepared
+                                    .submit(|response| responder.respond_with_result(response))?
+                                {
+                                    connection
+                                        .send_notification(available_commands_update(session_id))?;
+                                }
+                                Ok(())
                             }
                             Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
@@ -2916,6 +3033,338 @@ pub(super) mod tests {
         ))
     }
 
+    fn legacy_pending_publication(
+        server: &Arc<Server>,
+        id: &str,
+    ) -> (
+        RegisteredSession,
+        SessionHandle,
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Command>,
+    ) {
+        let session_id = agentkit_acp::SessionId::new(id.to_owned());
+        let token = server.registry.next_token();
+        let (completed, completion) = watch::channel(false);
+        let guard = SessionActorGuard {
+            server: Arc::downgrade(server),
+            registry: server.registry.clone(),
+            session_id: session_id.clone(),
+            token,
+            completed,
+        };
+        let actor = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let (commands, received) = mpsc::channel(1);
+        let session = SessionHandle {
+            token,
+            commands,
+            background_jobs: BackgroundJobs::default(),
+            structured_completion: false,
+            tasks: AsyncTaskManager::new().handle(),
+        };
+        let registered = RegisteredSession {
+            token,
+            session_id,
+            integration: Arc::clone(&server.integration),
+            background_jobs: session.background_jobs.clone(),
+            tasks: session.tasks.clone(),
+            commands: session.commands.downgrade(),
+            actor: actor.abort_handle(),
+            completed: completion,
+        };
+        (registered, session, actor, received)
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_commit_error_rolls_back_and_unwind_isolates_map() {
+        for unwind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let registry = SessionRegistry::new();
+            let server = logout_test_server(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                registry.clone(),
+            );
+            let mut admission = registry.begin_attachment().unwrap();
+            let (registered, session, actor, _received) =
+                legacy_pending_publication(&server, "failed");
+            let completed = registered.completed.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                server.publish_session(&mut admission, registered, session, || {
+                    if unwind {
+                        panic!("durable commit unwound");
+                    }
+                    Err::<(), _>(AcpRuntimeError::ClientClosed)
+                })
+            }));
+            if unwind {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert!(registry.inner.lock_state().sessions.is_empty());
+            assert_eq!(server.sessions.is_poisoned(), unwind);
+            let id = agentkit_acp::SessionId::new("failed");
+            let error = server.sender(&id).await.unwrap_err();
+            if unwind {
+                assert!(matches!(error, AcpRuntimeError::ClientClosed));
+                assert!(matches!(
+                    server.cancel(CancelNotification::new(id.clone())).await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server.close(CloseSessionRequest::new(id.clone())).await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server
+                        .detach_compose(DetachComposeRequest {
+                            session_id: id.clone(),
+                            call_id: "call".into(),
+                        })
+                        .await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server
+                        .cancel_background(CancelBackgroundRequest {
+                            session_id: id,
+                            call_id: "call".into(),
+                        })
+                        .await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+            } else {
+                assert!(matches!(error, AcpRuntimeError::SessionNotFound(_)));
+            }
+            // The real actor guard runs against the poisoned map without a
+            // second panic, then unregisters and publishes completion.
+            assert!(
+                timeout(Duration::from_secs(1), actor)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(*completed.borrow());
+            assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_closed_gate_rejects_without_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        registry.close_gate_and_snapshot(false);
+        let (registered, session, actor, _received) = legacy_pending_publication(&server, "closed");
+        assert!(matches!(
+            server.publish_session(&mut admission, registered, session, || -> Result<(), _> {
+                panic!("rejected commit ran")
+            }),
+            Err(LegacyPublicationError::AdmissionClosed)
+        ));
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert!(admission.active);
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        drop(admission);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_rejection_preserves_incumbent_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut consumed = registry.begin_attachment().unwrap();
+        let (registered, session, incumbent, _received) =
+            legacy_pending_publication(&server, "original");
+        let token = registered.token;
+        server
+            .publish_session(&mut consumed, registered, session, || Ok(()))
+            .unwrap();
+        for rejection in ["local-id", "token", "consumed", "foreign"] {
+            let foreign = SessionRegistry::new();
+            let mut fresh = if rejection == "foreign" {
+                foreign.begin_attachment().unwrap()
+            } else {
+                registry.begin_attachment().unwrap()
+            };
+            let id = if rejection == "local-id" {
+                "original"
+            } else {
+                "duplicate"
+            };
+            let (mut registered, mut session, actor, _received) =
+                legacy_pending_publication(&server, id);
+            if rejection != "local-id" {
+                registered.token = token;
+                session.token = token;
+            }
+            let admission = if rejection == "consumed" {
+                &mut consumed
+            } else {
+                &mut fresh
+            };
+            assert!(
+                server
+                    .publish_session(admission, registered, session, || -> Result<(), _> {
+                        panic!("rejected commit ran")
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                registry
+                    .inner
+                    .lock_state()
+                    .sessions
+                    .get(&token)
+                    .unwrap()
+                    .actor
+                    .id(),
+                incumbent.id()
+            );
+            assert!(!incumbent.is_finished());
+            // Pre-registration rejection leaves abort/join to the attachment
+            // caller. This actor's guard retains its separately allocated token.
+            actor.abort();
+            assert!(
+                timeout(Duration::from_secs(1), actor)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(registry.inner.lock_state().sessions.contains_key(&token));
+            assert_eq!(
+                server
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&agentkit_acp::SessionId::new("original"))
+                    .unwrap()
+                    .token,
+                token
+            );
+        }
+        incumbent.abort();
+        assert!(
+            timeout(Duration::from_secs(1), incumbent)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_actor_cleanup_drops_mailbox_outside_map_lock() {
+        struct CheckUnlocked(Weak<Server>, AtomicBool);
+        impl std::task::Wake for CheckUnlocked {
+            fn wake(self: Arc<Self>) {
+                let server = self.0.upgrade().unwrap();
+                assert!(server.sessions.try_lock().is_ok());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        let (registered, session, actor, mut received) =
+            legacy_pending_publication(&server, "mailbox-drop");
+        server
+            .publish_session(&mut admission, registered, session, || Ok(()))
+            .unwrap();
+        let wake = Arc::new(CheckUnlocked(
+            Arc::downgrade(&server),
+            AtomicBool::new(false),
+        ));
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(received.poll_recv(&mut context).is_pending());
+        actor.abort();
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(wake.1.load(Ordering::SeqCst));
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert!(received.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_wakeup_unwind_rolls_back_consumed_admission() {
+        struct PanicOnWake(SessionRegistry);
+        impl std::task::Wake for PanicOnWake {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                panic!("registration waiter unwound");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        let waker = std::task::Waker::from(Arc::new(PanicOnWake(registry.clone())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait_for_pending_attachments());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let (registered, session, actor, _received) = legacy_pending_publication(&server, "wake");
+        let completed = registered.completed.clone();
+        let committed = AtomicBool::new(false);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                server.publish_session(&mut admission, registered, session, || {
+                    committed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            }))
+            .is_err()
+        );
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(!admission.active);
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(server.sessions.is_poisoned());
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(*completed.borrow());
+    }
+
     fn register_close_tracking_session(
         server: &Arc<Server>,
         registry: &SessionRegistry,
@@ -3062,6 +3511,336 @@ pub(super) mod tests {
         assert!(!background_jobs.activity().active);
         late_actor.abort();
         late_actor.await.unwrap_err();
+    }
+
+    fn register_test_v2(
+        registry: &SessionRegistry,
+        admission: &mut SessionAdmission,
+        token: u64,
+        interrupt: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), ()> {
+        let actor = tokio::spawn(std::future::pending::<()>());
+        actor.abort();
+        let (_completed, completion) = watch::channel(true);
+        registry.register_v2(
+            admission,
+            token,
+            interrupt,
+            Arc::new(|| Box::pin(async {})),
+            actor.abort_handle(),
+            completion,
+        )
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_foreign_consumed_duplicate_and_stale_admissions() {
+        let registry = SessionRegistry::new();
+        let other = SessionRegistry::new();
+        let mut admission = registry.begin_attachment().unwrap();
+        let token = registry.next_token();
+        assert!(register_test_v2(&other, &mut admission, token, Arc::new(|| {})).is_err());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        assert_eq!(other.inner.lock_state().pending_attachments, 0);
+        assert!(other.inner.lock_state().v2_sessions.is_empty());
+        register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
+        let second_token = registry.next_token();
+        assert!(
+            register_test_v2(&registry, &mut admission, second_token, Arc::new(|| {})).is_err()
+        );
+        let mut duplicate = registry.begin_attachment().unwrap();
+        assert!(register_test_v2(&registry, &mut duplicate, token, Arc::new(|| {})).is_err());
+        assert!(duplicate.active);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        assert_eq!(registry.inner.lock_state().v2_sessions.len(), 1);
+        registry.remove(token);
+        registry.close_gate_and_snapshot(false);
+        // Reopening never makes an old pending admission current again.
+        registry.inner.lock_state().accepting = true;
+        assert!(
+            register_test_v2(&registry, &mut duplicate, second_token, Arc::new(|| {})).is_err()
+        );
+        drop(duplicate);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(registry.begin_attachment().is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_legacy_registration_obeys_admission_and_cross_version_token_rules() {
+        let registry = SessionRegistry::new();
+        let other = SessionRegistry::new();
+        let token = registry.next_token();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let actor = tokio::spawn(std::future::pending::<()>());
+        actor.abort();
+        let (commands, _received) = mpsc::channel(1);
+        let (_completed, completion) = watch::channel(true);
+        let mut session = RegisteredSession {
+            token,
+            session_id: agentkit_acp::SessionId::new("registry-test"),
+            integration: shutdown_test_integration(),
+            background_jobs: BackgroundJobs::default(),
+            tasks: AsyncTaskManager::new().handle(),
+            commands: commands.downgrade(),
+            actor: actor.abort_handle(),
+            completed: completion,
+        };
+        let mut admission = registry.begin_attachment().unwrap();
+        assert!(registry.register(&mut admission, session.clone()).is_err());
+        assert!(other.register(&mut admission, session.clone()).is_err());
+        assert!(admission.active);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        session.token = registry.next_token();
+        registry.register(&mut admission, session.clone()).unwrap();
+        assert!(registry.register(&mut admission, session.clone()).is_err());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert_eq!(registry.inner.lock_state().sessions.len(), 1);
+        assert!(other.inner.lock_state().sessions.is_empty());
+        registry.remove(token);
+        registry.remove(session.token);
+    }
+
+    #[tokio::test]
+    async fn registry_attachment_wakeup_runs_after_unlock() {
+        struct ReenterOnWake(SessionRegistry, AtomicBool);
+        impl std::task::Wake for ReenterOnWake {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                assert!(self.0.begin_attachment().is_ok());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let registry = SessionRegistry::new();
+        let mut admission = registry.begin_attachment().unwrap();
+        let wake = Arc::new(ReenterOnWake(registry.clone(), AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait_for_pending_attachments());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let token = registry.next_token();
+        register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
+        assert!(wake.1.load(Ordering::SeqCst));
+        assert!(waiting.as_mut().poll(&mut context).is_ready());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        registry.remove(token);
+    }
+
+    #[tokio::test]
+    async fn registry_interrupt_unwind_leaves_gate_closed_without_poison() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        let callback_registry = registry.clone();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(move || {
+                assert!(callback_registry.inner.state.try_lock().is_ok());
+                panic!("interrupt callback");
+            }),
+        )
+        .unwrap();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move { resetting.reset_authentication().await });
+        assert!(reset.await.unwrap_err().is_panic());
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.contains_key(&token));
+        registry.remove(token);
+        assert!(registry.reset_authentication().await);
+    }
+
+    #[tokio::test]
+    async fn registry_callback_destructors_run_after_unlock_on_remove_and_rejection() {
+        struct ReenterOnDrop(SessionRegistry);
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                assert!(self.0.begin_attachment().is_ok());
+                panic!("callback capture destructor");
+            }
+        }
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        let capture = ReenterOnDrop(registry.clone());
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(move || {
+                let _ = &capture;
+            }),
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.remove(token)))
+                .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.is_empty());
+        let other = SessionRegistry::new();
+        let capture = ReenterOnDrop(registry.clone());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = register_test_v2(
+                    &registry,
+                    &mut other.begin_attachment().unwrap(),
+                    token,
+                    Arc::new(move || {
+                        let _ = &capture;
+                    }),
+                );
+            }))
+            .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert_eq!(other.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn registry_poison_does_not_break_unwind_cleanup_or_reopen_closed_gate() {
+        struct RemoveOnDrop(SessionRegistry, u64);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                self.0.remove(self.1);
+            }
+        }
+        let registry = SessionRegistry::new();
+        let token = registry.next_token();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let admission = registry.begin_attachment().unwrap();
+        registry.close_gate_and_snapshot(true);
+        let cleanup = RemoveOnDrop(registry.clone(), token);
+        // Poison injection represents an unwind with the audited state intact.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _admission = admission;
+                let _cleanup = cleanup;
+                let _state = registry.inner.state.lock().unwrap();
+                panic!("unwind while registry guard is held");
+            }))
+            .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.reset_authentication().await);
+    }
+
+    #[tokio::test]
+    async fn registry_counter_exhaustion_does_not_wrap_or_poison() {
+        let registry = SessionRegistry::new();
+        registry
+            .inner
+            .next_token
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(registry.next_token(), u64::MAX - 1);
+        for _ in 0..2 {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.next_token()))
+                    .is_err()
+            );
+            assert_eq!(registry.inner.next_token.load(Ordering::Relaxed), u64::MAX);
+        }
+        registry.inner.lock_state().pending_attachments = usize::MAX;
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.inner.state.is_poisoned());
+        assert_eq!(registry.inner.lock_state().pending_attachments, usize::MAX);
+        registry.inner.lock_state().pending_attachments = 0;
+        registry.inner.lock_state().generation = u64::MAX;
+        assert!(!registry.reset_authentication().await);
+        assert_eq!(registry.inner.lock_state().generation, u64::MAX);
+        assert!(registry.begin_attachment().is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_cancelled_reset_keeps_admission_closed() {
+        let registry = SessionRegistry::new();
+        let started = Arc::new(Notify::new());
+        let resetting = registry.clone();
+        let action_started = Arc::clone(&started);
+        let reset = tokio::spawn(async move {
+            resetting
+                .reset_authentication_with(async move {
+                    action_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        started.notified().await;
+        let generation = registry.inner.lock_state().generation;
+        reset.abort();
+        assert!(reset.await.unwrap_err().is_cancelled());
+        assert!(registry.begin_attachment().is_err());
+        assert_eq!(registry.inner.lock_state().generation, generation);
+        // A later completed reset can reopen; cancellation itself cannot.
+        assert!(registry.reset_authentication().await);
+        assert!(registry.begin_attachment().is_ok());
+        assert!(registry.inner.lock_state().generation > generation);
+    }
+
+    #[tokio::test]
+    async fn registry_close_panic_requires_positive_actor_completion_before_reset() {
+        struct Completion {
+            alive: Arc<AtomicBool>,
+            completed: watch::Sender<bool>,
+            acknowledge: bool,
+        }
+        impl Drop for Completion {
+            fn drop(&mut self) {
+                self.alive.store(false, Ordering::SeqCst);
+                if self.acknowledge {
+                    self.completed.send_replace(true);
+                }
+            }
+        }
+        for acknowledge in [true, false] {
+            let registry = SessionRegistry::new();
+            let alive = Arc::new(AtomicBool::new(true));
+            let (completed, completion) = watch::channel(false);
+            let guard = Completion {
+                alive: Arc::clone(&alive),
+                completed,
+                acknowledge,
+            };
+            let actor = tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            registry
+                .register_v2(
+                    &mut registry.begin_attachment().unwrap(),
+                    registry.next_token(),
+                    Arc::new(|| {}),
+                    Arc::new(|| Box::pin(async { panic!("close callback unwound") })),
+                    actor.abort_handle(),
+                    completion,
+                )
+                .unwrap();
+            let reset_ran = AtomicBool::new(false);
+            let (reopened, _) = registry
+                .close_sessions_with_timeout(Duration::from_millis(100), true, || async {
+                    assert!(!alive.load(Ordering::SeqCst));
+                    reset_ran.store(true, Ordering::SeqCst);
+                })
+                .await;
+            assert_eq!(reopened, acknowledge);
+            assert_eq!(reset_ran.load(Ordering::SeqCst), acknowledge);
+            assert_eq!(registry.begin_attachment().is_ok(), acknowledge);
+            assert!(actor.await.unwrap_err().is_cancelled());
+        }
     }
 
     #[tokio::test]
@@ -4964,6 +5743,78 @@ pub(super) mod tests {
             list_sessions_error(ListSessionsError::InvalidCursor).code,
             agent_client_protocol::ErrorCode::InvalidParams
         );
+    }
+
+    #[test]
+    fn fork_submission_keeps_cleanup_until_response_succeeds() {
+        for delivery in ["success", "failure", "unwind", "rejected"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = crate::session::new_id();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            // A creation already owned by a prepared publication is rejected by
+            // normal APIs, just as poison/write fencing is rejected in session tests.
+            let held = if delivery == "rejected" {
+                Some(opened.observer.prepare_creation().unwrap())
+            } else {
+                None
+            };
+            let (activation, mut activated) = oneshot::channel();
+            let prepared = PreparedFork {
+                response: ForkSessionResponse::new(id.clone()),
+                activation,
+                creation: opened.observer.clone(),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepared.submit(|response| {
+                    if delivery == "rejected" {
+                        assert!(response.is_err(), "invalid creation cannot report success");
+                        return Ok(());
+                    }
+                    assert!(response.is_ok());
+                    // Response callbacks cannot invalidate the prepared writer.
+                    assert!(
+                        opened
+                            .observer
+                            .replace(&[Item::text(ItemKind::User, "reentry")])
+                            .is_err()
+                    );
+                    assert!(crate::session::load(root.path(), &id).is_ok());
+                    match delivery {
+                        "failure" => Err("response closed"),
+                        "unwind" => panic!("response interrupted"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match delivery {
+                "success" => {
+                    assert!(result.unwrap().unwrap().is_some());
+                    assert!(activated.try_recv().is_ok());
+                }
+                "failure" => assert_eq!(result.unwrap().unwrap_err(), "response closed"),
+                "unwind" => assert!(result.is_err()),
+                "rejected" => assert!(result.unwrap().unwrap().is_none()),
+                _ => unreachable!(),
+            }
+            if delivery != "success" {
+                assert!(matches!(
+                    activated.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            }
+            drop(held);
+            drop(opened);
+            assert_eq!(
+                crate::session::load(root.path(), &id).is_ok(),
+                delivery == "success"
+            );
+        }
     }
 
     #[tokio::test]

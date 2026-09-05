@@ -15,10 +15,29 @@ enum Point {
     Remove,
     ProbeCollision,
     ProbeSwap,
+    Read,
+    Seek,
+    Metadata,
+    AfterWrite,
+    AfterRename,
+    LeaseCheck,
+    FileDrop,
 }
 #[derive(Default)]
-struct Faults(Mutex<Option<(Point, i32)>>, AtomicUsize);
+struct Faults(Mutex<Option<(Point, i32)>>, AtomicUsize, AtomicUsize);
 impl Faults {
+    fn arm_panic(&self, point: Point) {
+        self.2.store(point as usize + 1, Ordering::SeqCst);
+    }
+    fn panic_at(&self, point: Point) {
+        if self
+            .2
+            .compare_exchange(point as usize + 1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            panic!("backend panic at {point:?}");
+        }
+    }
     fn arm(&self, point: Point, code: i32) {
         *self.0.lock().unwrap() = Some((point, code));
     }
@@ -43,12 +62,18 @@ struct InjectedFile {
 }
 impl Read for InjectedFile {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        self.disk.read(b)
+        let n = self.disk.read(b)?;
+        self.faults.panic_at(Point::Read);
+        self.faults.check(Point::Read)?;
+        Ok(n)
     }
 }
 impl Seek for InjectedFile {
     fn seek(&mut self, p: SeekFrom) -> io::Result<u64> {
-        self.disk.seek(p)
+        let position = self.disk.seek(p)?;
+        self.faults.panic_at(Point::Seek);
+        self.faults.check(Point::Seek)?;
+        Ok(position)
     }
 }
 impl Write for InjectedFile {
@@ -60,7 +85,9 @@ impl Write for InjectedFile {
             self.wrote_prefix = true;
             return self.disk.write(&b[..b.len().min(3)]);
         }
-        self.disk.write(b)
+        let n = self.disk.write(b)?;
+        self.faults.panic_at(Point::AfterWrite);
+        Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.disk.flush()
@@ -71,7 +98,9 @@ impl BackendFile for InjectedFile {
         self.disk.identity()
     }
     fn metadata(&self) -> io::Result<native::Metadata> {
-        self.disk.metadata()
+        let meta = self.disk.metadata()?;
+        self.faults.panic_at(Point::Metadata);
+        Ok(meta)
     }
     fn set_len(&self, n: u64) -> io::Result<()> {
         self.disk.set_len(n)
@@ -86,6 +115,22 @@ impl BackendFile for InjectedFile {
     }
     fn set_permissions(&self, p: Permissions) -> io::Result<()> {
         self.disk.set_permissions(p)
+    }
+}
+impl Drop for InjectedFile {
+    fn drop(&mut self) {
+        self.faults.panic_at(Point::FileDrop);
+    }
+}
+struct InjectedLease {
+    disk: Box<dyn BackendLease>,
+    faults: Arc<Faults>,
+}
+impl BackendLease for InjectedLease {
+    fn check(&self) -> io::Result<()> {
+        self.disk.check()?;
+        self.faults.panic_at(Point::LeaseCheck);
+        Ok(())
     }
 }
 impl Backend for Injected {
@@ -139,7 +184,9 @@ impl Backend for Injected {
     }
     fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
         self.faults.check(Point::Rename)?;
-        self.disk.rename(a, b)
+        self.disk.rename(a, b)?;
+        self.faults.panic_at(Point::AfterRename);
+        Ok(())
     }
     fn set_permissions(&self, p: &Path, mode: Permissions) -> io::Result<()> {
         self.faults.check(Point::Chmod)?;
@@ -150,7 +197,10 @@ impl Backend for Injected {
         self.disk.sync_directory(p)
     }
     fn acquire_lease(&self, r: &LeaseRequest) -> io::Result<Box<dyn BackendLease>> {
-        self.disk.acquire_lease(r)
+        Ok(Box::new(InjectedLease {
+            disk: self.disk.acquire_lease(r)?,
+            faults: self.faults.clone(),
+        }))
     }
     fn open_beneath(&self, root: &Path, p: &Path) -> io::Result<Box<dyn BackendFile>> {
         self.disk.open_beneath(root, p)
@@ -1441,4 +1491,182 @@ fn capacity_during_permission_probe_cleanup_does_not_reject_write() {
     t.fs.write(t.path("value"), b"data").unwrap();
     assert_eq!(native::read(t.path("value")).unwrap(), b"data");
     t.settle();
+}
+
+fn assert_poison(e: io::Error) {
+    assert_eq!(e.kind(), io::ErrorKind::Other);
+    assert!(e.get_ref().unwrap().is::<PoisonedState>());
+}
+
+fn assert_service_isolated(t: &Fixture) {
+    let report = t.fs.recover();
+    assert_eq!(report.completed_operations, 0);
+    assert_eq!(report.remaining_operations, usize::MAX);
+    assert_poison(report.blocked.unwrap());
+    let status = t.fs.status();
+    assert!(status.exhausted);
+    assert_eq!(status.pending_operations, usize::MAX);
+    assert_eq!(status.retained_bytes, usize::MAX);
+    assert_poison(t.fs.require_disk(&t.root).unwrap_err());
+    assert_poison(t.fs.write(t.path("must-not-appear"), b"no").unwrap_err());
+    assert!(!t.path("must-not-appear").exists());
+    assert!(t.fs.service.state.is_poisoned());
+    // Poison is scoped to this service, not a process-wide recovery default.
+    let other = Fixture::new();
+    other.fs.write(other.path("healthy"), b"yes").unwrap();
+    other.settle();
+}
+
+#[test]
+fn backend_panic_after_disk_effect_is_not_replayed_or_hidden() {
+    for point in [Point::AfterWrite, Point::AfterRename, Point::FileDrop] {
+        let t = Fixture::new();
+        let path = t.path("value");
+        native::write(&path, b"old").unwrap();
+        let held = t.fs.open(&path).unwrap();
+        t.faults.arm_panic(point);
+        let fs = t.fs.clone();
+        let target = path.clone();
+        assert!(
+            std::thread::spawn(move || fs.write(target, b"replacement"))
+                .join()
+                .is_err()
+        );
+        let expected = if point == Point::AfterRename {
+            b"replacement".as_slice()
+        } else {
+            b"old".as_slice()
+        };
+        assert_eq!(native::read(&path).unwrap(), expected);
+        let before: Vec<_> = native::read_dir(&t.root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_service_isolated(&t);
+        assert_poison(held.metadata().unwrap_err());
+        assert_eq!(native::read(&path).unwrap(), expected);
+        let after: Vec<_> = native::read_dir(&t.root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            before, after,
+            "recovery must not clean or replay unknown disk state"
+        );
+    }
+}
+
+#[test]
+fn handle_backend_panics_fence_clones_and_service() {
+    for point in [Point::Read, Point::Seek, Point::Metadata] {
+        let t = Fixture::new();
+        let path = t.path("value");
+        native::write(&path, b"contents").unwrap();
+        let mut held = t.fs.open(&path).unwrap();
+        let mut worker = held.try_clone().unwrap();
+        t.faults.arm_panic(point);
+        assert!(
+            std::thread::spawn(move || {
+                if point == Point::Metadata {
+                    worker.seek(SeekFrom::End(0)).unwrap();
+                } else {
+                    worker.read_exact(&mut [0; 2]).unwrap();
+                }
+            })
+            .join()
+            .is_err()
+        );
+        assert!(held.cursor.is_poisoned());
+        {
+            let object = held.object.lock();
+            if point == Point::Metadata {
+                assert!(object.is_err());
+                drop(object);
+                assert_poison(lock(&held.object).err().unwrap());
+            } else {
+                let object = object.unwrap();
+                let Source::Native(native) = &object.image.source else {
+                    panic!("expected native source")
+                };
+                assert!(native.is_poisoned());
+                assert_poison(lock(native).err().unwrap());
+            }
+        }
+        assert_poison(lock(&held.cursor).err().unwrap());
+        assert_poison(held.read(&mut [0; 2]).unwrap_err());
+        assert_poison(held.seek(SeekFrom::Start(0)).unwrap_err());
+        assert_poison(held.sync_all().unwrap_err());
+        assert_service_isolated(&t);
+        assert_eq!(native::read(&path).unwrap(), b"contents");
+    }
+}
+
+#[test]
+fn lease_callback_panic_permanently_fences_authority() {
+    let t = Fixture::new();
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = t.fs.guarded(&lease).unwrap();
+    let authority = lease.inner.clone();
+    t.faults.arm_panic(Point::LeaseCheck);
+    assert!(
+        std::thread::spawn(move || authority.check())
+            .join()
+            .is_err()
+    );
+    assert_poison(lease.check().unwrap_err());
+    assert_poison(guarded.write(t.path("value"), b"no").unwrap_err());
+    assert!(!t.path("value").exists());
+    assert!(lease.inner.fenced.is_poisoned());
+    assert!(!t.fs.service.state.is_poisoned());
+    // A rejected authority check must not corrupt service accounting.
+    assert_eq!(t.fs.status().pending_operations, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn failed_native_read_and_seek_do_not_commit_logical_cursor() {
+    for point in [Point::Read, Point::Seek] {
+        let t = Fixture::new();
+        let path = t.path("value");
+        native::write(&path, b"abcdef").unwrap();
+        let mut file = t.fs.open(&path).unwrap();
+        file.seek(SeekFrom::Start(2)).unwrap();
+        t.faults.arm(point, libc::EIO);
+        assert_eq!(
+            file.read(&mut [0; 2]).unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert!(!t.fs.service.state.is_poisoned());
+        t.faults.clear();
+        assert_eq!(file.stream_position().unwrap(), 2);
+        let mut clone = file.try_clone().unwrap();
+        let mut data = [0; 2];
+        clone.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"cd");
+        assert_eq!(file.stream_position().unwrap(), 4);
+        t.settle();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn panic_during_pending_publication_blocks_further_recovery() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"old").unwrap();
+    t.faults.arm(Point::Open, libc::ENOSPC);
+    t.fs.write(&path, b"queued").unwrap();
+    assert_eq!(t.fs.status().pending_operations, 1);
+    assert_eq!(native::read(&path).unwrap(), b"old");
+    t.faults.clear();
+    t.faults.arm_panic(Point::AfterRename);
+    let fs = t.fs.clone();
+    assert!(std::thread::spawn(move || fs.recover()).join().is_err());
+    // Native publication happened, but the stage and completion count were not
+    // committed. Replaying this action or claiming durability would be unsound.
+    assert_eq!(native::read(&path).unwrap(), b"queued");
+    assert_service_isolated(&t);
+    assert_eq!(native::read(&path).unwrap(), b"queued");
 }

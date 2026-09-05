@@ -592,7 +592,7 @@ pub(crate) fn access_token(
         )
     })?;
     if !valid_generation(&record.generation) {
-        let _thread = refresh_guard(deadline)?;
+        let _thread = refresh_guard(&REFRESH_LOCK, deadline)?;
         let _process = process_lock_scoped(deadline, store.lock_scope())?;
         record = store.load()?.ok_or_else(|| {
             AuthError::invalid(
@@ -635,16 +635,27 @@ fn refresh_locked(
     rejected_access_token: Option<&str>,
     token_url: &str,
 ) -> Result<TokenRecord, AuthError> {
-    let _thread = refresh_guard(deadline)?;
+    let _thread = refresh_guard(&REFRESH_LOCK, deadline)?;
     let _process = process_lock_scoped(deadline, store.lock_scope())?;
     refresh_current(store, deadline, rejected_access_token, token_url)
 }
 
-fn refresh_guard(deadline: Instant) -> Result<std::sync::MutexGuard<'static, ()>, AuthError> {
+fn refresh_guard(
+    lock: &Mutex<()>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, ()>, AuthError> {
     loop {
-        match REFRESH_LOCK.try_lock() {
+        match lock.try_lock() {
             Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            // This guard also covers backend calls and remote token rotation.
+            // After unwind, the unit value says nothing about whether those
+            // external effects committed; do not silently resume refreshing.
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(AuthError::unavailable(
+                    "credential_refresh_poisoned",
+                    "credential refresh state is unavailable after a panic; restart Kit",
+                ));
+            }
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -1671,6 +1682,39 @@ mod tests {
         fn delete(&self) -> Result<bool, AuthError> {
             Ok(self.0.lock().unwrap().take().is_some())
         }
+    }
+
+    #[test]
+    fn refresh_guard_rejects_backend_unwind_without_retrying() {
+        struct PanickingStore(std::sync::atomic::AtomicUsize);
+
+        impl CredentialStore for PanickingStore {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("credential backend panicked");
+            }
+
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                unreachable!()
+            }
+
+            fn delete(&self) -> Result<bool, AuthError> {
+                unreachable!()
+            }
+        }
+
+        // Isolate the coordinator so this test cannot poison other auth tests.
+        let lock = Mutex::new(());
+        let store = PanickingStore(std::sync::atomic::AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let attempt = || {
+            let _guard = refresh_guard(&lock, deadline)?;
+            store.load()
+        };
+        assert!(std::panic::catch_unwind(attempt).is_err());
+        assert!(lock.is_poisoned());
+        assert_eq!(attempt().unwrap_err().code, "credential_refresh_poisoned");
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     struct FailingStore;
