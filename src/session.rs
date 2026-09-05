@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -79,17 +79,26 @@ impl CatalogEntry {
     }
 }
 
+// The writer serializes generation, open-file identity, and its ownership lease.
+// No guard crosses an await. Backend I/O and replaced file/lease destruction can
+// unwind after external effects, so poison is isolation, never recovery. The
+// infallible observer refuses the mutation; result-bearing callers get an error.
 #[derive(Clone)]
 pub struct SessionObserver(Arc<Mutex<Writer>>);
 
 struct Writer {
     session_id: String,
     generation: u64,
+    // An uncertain append/reconstruction must never reuse a generation.
+    write_failed: bool,
     path: PathBuf,
     workspace_root: PathBuf,
     file: File,
     lock: SessionLock,
     created: Option<CreatedTranscript>,
+    // A prepared response privately owns cleanup. Writers remain frozen until
+    // that owner publishes success, or forever if submission is abandoned.
+    publication: Option<Arc<AtomicBool>>,
 }
 
 struct SessionLock {
@@ -98,10 +107,29 @@ struct SessionLock {
 }
 
 /// Removes an incompletely bootstrapped new transcript unless opening commits.
+/// The guarded filesystem retains the lease through cleanup, independently of
+/// Writer's field drop order, and cannot delete a replacement owner's file.
 struct CreatedTranscript {
     filesystem: Fs,
     path: PathBuf,
     keep: bool,
+}
+
+/// Exclusive ownership of a validated, not-yet-published creation. No writer
+/// mutation is admitted while this exists. Dropping it before commit retains
+/// the original cleanup behavior, including failed response delivery/unwind.
+pub(crate) struct PreparedCreation {
+    created: CreatedTranscript,
+    published: Arc<AtomicBool>,
+}
+
+impl PreparedCreation {
+    /// Called only after response submission. Both steps are infallible and
+    /// require no shared lock or callback; readers resume after cleanup is kept.
+    pub(crate) fn commit(mut self) {
+        self.created.keep = true;
+        self.published.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -402,11 +430,13 @@ fn open_with_initial_timestamps_in(
     let mut writer = Writer {
         session_id: session_id.into(),
         generation,
+        write_failed: false,
         path,
         workspace_root,
         file,
         lock,
         created,
+        publication: None,
     };
     if resume && stored_workspace.is_none() {
         writer.replace(&transcript)?;
@@ -435,7 +465,7 @@ fn open_with_initial_timestamps_in(
         writer.append(&item)?;
     }
     if initial_options.commit_creation {
-        writer.commit_creation();
+        writer.commit_creation()?;
     }
     Ok(OpenSession {
         transcript,
@@ -444,11 +474,31 @@ fn open_with_initial_timestamps_in(
 }
 
 impl SessionObserver {
-    pub(crate) fn commit_creation(&self) {
+    pub(crate) fn prepare_creation(&self) -> Result<PreparedCreation, String> {
+        let published = Arc::new(AtomicBool::new(false));
+        let mut writer = self
+            .0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?;
+        // Validate/reconstruct before extracting cleanup. From this point until
+        // commit, all shared writer APIs reject mutation without touching I/O.
+        writer.ensure_lock()?;
+        let created = writer
+            .created
+            .take()
+            .ok_or_else(|| "session creation is not available for publication".to_string())?;
+        writer.publication = Some(Arc::clone(&published));
+        Ok(PreparedCreation { created, published })
+    }
+
+    pub(crate) fn commit_creation(&self) -> Result<(), String> {
+        // Creation publication cannot bless an uncertain transcript. All
+        // result-bearing APIs isolate poison; the observer trait below has no
+        // error channel and must instead refuse an unpersisted mutation.
         self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .commit_creation();
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .commit_creation()
     }
 
     /// Durably records a complete transcript replacement produced by a mutator.
@@ -467,8 +517,14 @@ impl SessionObserver {
 
 impl TranscriptObserver for SessionObserver {
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
-        let mut writer = self.0.lock().expect("session transcript writer poisoned");
-        if let Err(error) = writer.append(event.item) {
+        // Release the writer before shutdown/logging/panic paths. A rejected
+        // input does not poison a healthy writer; uncertain I/O fences it below.
+        let result = self
+            .0
+            .lock()
+            .expect("session transcript writer poisoned")
+            .append(event.item);
+        if let Err(error) = result {
             if fs::global().status().exhausted || fs::shutdown_token().is_cancelled() {
                 fs::request_shutdown();
                 return;
@@ -482,10 +538,21 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
-    fn commit_creation(&mut self) {
+    fn commit_creation(&mut self) -> Result<(), String> {
+        if self
+            .publication
+            .as_ref()
+            .is_some_and(|published| !published.load(Ordering::Acquire))
+        {
+            return Err("session creation is awaiting publication".into());
+        }
+        if self.write_failed {
+            return Err("session transcript writer is isolated after an uncertain write".into());
+        }
         if let Some(created) = self.created.take() {
             created.keep();
         }
+        Ok(())
     }
 
     fn append(&mut self, item: &Item) -> Result<(), String> {
@@ -537,6 +604,10 @@ impl Writer {
         let mut encoded = serde_json::to_vec(&record)
             .map_err(|error| format!("could not encode transcript record: {error}"))?;
         encoded.push(b'\n');
+        // write_all or sync_data can fail after accepting some or all bytes.
+        // Without a verified rollback, neither retry nor generation reuse is
+        // safe. Only a complete successful append re-enables this writer.
+        self.write_failed = true;
         self.file
             .write_all(&encoded)
             .and_then(|_| self.file.sync_data())
@@ -547,10 +618,21 @@ impl Writer {
                 format!("could not persist transcript record: {error}")
             })?;
         self.generation = generation;
+        self.write_failed = false;
         Ok(())
     }
 
     fn ensure_lock(&mut self) -> Result<(), String> {
+        if self
+            .publication
+            .as_ref()
+            .is_some_and(|published| !published.load(Ordering::Acquire))
+        {
+            return Err("session creation is awaiting publication".into());
+        }
+        if self.write_failed {
+            return Err("session transcript writer is isolated after an uncertain write".into());
+        }
         match self.lock.check() {
             Ok(()) => {
                 if fs::try_exists(&self.path).map_err(|error| {
@@ -594,6 +676,9 @@ impl Writer {
             .create_new(true)
             .open_in(&self.lock.filesystem()?, &self.path)
             .map_err(|error| format!("could not reconstruct {}: {error}", self.path.display()))?;
+        // Cleanup can itself fail. Do not later mistake an incomplete rebuilt
+        // path for the complete history still held by the original open file.
+        self.write_failed = true;
         if let Err(error) = io::copy(&mut source, &mut file).and_then(|_| file.sync_all()) {
             let _ = self.lock.filesystem()?.remove_file(&self.path);
             return Err(format!(
@@ -602,6 +687,7 @@ impl Writer {
             ));
         }
         self.file = file;
+        self.write_failed = false;
         Ok(())
     }
 }
@@ -3924,5 +4010,190 @@ mod tests {
         assert!(error.contains("session lock was lost"), "{error}");
         assert!(!transcript_path(root.path(), "abc").exists());
         drop(other);
+    }
+
+    #[test]
+    fn rejected_observer_input_does_not_poison_or_advance_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let id = agentkit_core::SessionId::new("abc");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                opened.observer.on_transcript_event(TranscriptEvent {
+                    session_id: &id,
+                    item: &Item::text(ItemKind::User, "unstamped"),
+                });
+            }))
+            .is_err()
+        );
+        assert!(!opened.observer.0.is_poisoned());
+        assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
+        let item = Item::text(ItemKind::User, "accepted").with_created_at(Timestamp(123));
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &id,
+            item: &item,
+        });
+        assert_eq!(opened.observer.0.lock().unwrap().generation, 2);
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_write_isolates_replacement_append_and_creation_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let path = {
+            let mut writer = opened.observer.0.lock().unwrap();
+            // A real file boundary rejects writes, without production hooks.
+            writer.file = File::open(&writer.path).unwrap();
+            writer.path.clone()
+        };
+        let original = fs::read(&path).unwrap();
+        let item = Item::text(ItemKind::User, "not accepted").with_created_at(Timestamp(123));
+        assert!(
+            opened
+                .observer
+                .replace(std::slice::from_ref(&item))
+                .is_err()
+        );
+        assert!(!opened.observer.0.is_poisoned());
+        // Even repairing the handle cannot prove what a failed write accepted.
+        opened.observer.0.lock().unwrap().file =
+            OpenOptions::new().append(true).open(&path).unwrap();
+        let error = opened
+            .observer
+            .replace(std::slice::from_ref(&item))
+            .unwrap_err();
+        assert!(error.contains("isolated"), "{error}");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                opened.observer.on_transcript_event(TranscriptEvent {
+                    session_id: &agentkit_core::SessionId::new("abc"),
+                    item: &item,
+                });
+            }))
+            .is_err()
+        );
+        assert!(opened.observer.commit_creation().is_err());
+        assert!(opened.observer.prepare_creation().is_err());
+        assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn poisoned_writer_cannot_publish_creation_or_replace() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_with_initial_timestamps_in(
+            &project_root(root.path()),
+            &session_directory(root.path()),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+            InitialTranscriptOptions {
+                stamp_items: true,
+                commit_creation: false,
+            },
+        )
+        .unwrap();
+        let path = opened.observer.0.lock().unwrap().path.clone();
+        let observer = opened.observer.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _writer = observer.0.lock().unwrap();
+                panic!("writer interrupted");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            opened
+                .observer
+                .replace(&[Item::text(ItemKind::User, "replacement")])
+                .unwrap_err()
+                .contains("poisoned")
+        );
+        assert!(opened.observer.commit_creation().is_err());
+        assert!(opened.observer.prepare_creation().is_err());
+        drop(opened);
+        assert!(!path.exists(), "failed creation must still roll back");
+    }
+
+    #[test]
+    fn prepared_creation_freezes_writers_until_private_commit_or_cleanup() {
+        for commit in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let opened = open_with_initial_timestamps_in(
+                &project_root(root.path()),
+                &session_directory(root.path()),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+                InitialTranscriptOptions {
+                    stamp_items: true,
+                    commit_creation: false,
+                },
+            )
+            .unwrap();
+            let path = opened.observer.0.lock().unwrap().path.clone();
+            let original = fs::read(&path).unwrap();
+            let prepared = opened.observer.prepare_creation().unwrap();
+            let item = Item::text(ItemKind::User, "later").with_created_at(Timestamp(123));
+            assert!(opened.observer.prepare_creation().is_err());
+            assert!(opened.observer.commit_creation().is_err());
+            assert!(
+                opened
+                    .observer
+                    .replace(std::slice::from_ref(&item))
+                    .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    opened.observer.on_transcript_event(TranscriptEvent {
+                        session_id: &agentkit_core::SessionId::new("abc"),
+                        item: &item,
+                    });
+                }))
+                .is_err()
+            );
+            assert!(!opened.observer.0.is_poisoned());
+            assert_eq!(fs::read(&path).unwrap(), original);
+            if commit {
+                prepared.commit();
+                opened
+                    .observer
+                    .replace(std::slice::from_ref(&item))
+                    .unwrap();
+                drop(opened);
+                assert!(path.exists());
+            } else {
+                drop(prepared);
+                assert!(!path.exists());
+                assert!(
+                    opened
+                        .observer
+                        .replace(std::slice::from_ref(&item))
+                        .is_err()
+                );
+                assert!(
+                    !path.exists(),
+                    "abandoned publication must never reconstruct"
+                );
+            }
+        }
     }
 }

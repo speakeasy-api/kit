@@ -50,6 +50,22 @@ struct FatalRecord {
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diagnostics: Option<TransportDiagnostics>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_span_context"
+    )]
+    span_context: Option<crate::telemetry::error_spans::Snapshot>,
+}
+
+fn deserialize_span_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::telemetry::error_spans::Snapshot>, D::Error> {
+    let snapshot = Option::<crate::telemetry::error_spans::Snapshot>::deserialize(deserializer)?;
+    if snapshot.as_ref().is_some_and(|snapshot| !snapshot.valid()) {
+        return Err(serde::de::Error::custom("invalid span context"));
+    }
+    Ok(snapshot)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -447,7 +463,7 @@ fn write_in_with_diagnostics(
         std::process::id(),
         NEXT_EVENT.fetch_add(1, Ordering::Relaxed)
     );
-    let record = FatalRecord {
+    let mut record = FatalRecord {
         schema_version: SCHEMA_VERSION,
         event_id: event_id.clone(),
         occurred_at_ms,
@@ -458,9 +474,15 @@ fn write_in_with_diagnostics(
         code: canonical_code(code).into(),
         message: bounded(message),
         diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
+        span_context: crate::telemetry::error_spans::snapshot(&tracing::Span::current()),
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    if bytes.len() >= MAX_RECORD_BYTES && record.span_context.take().is_some() {
+        // Optional diagnostics must not displace an otherwise valid ordinary error.
+        bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    }
     bytes.push(b'\n');
     if bytes.len() > MAX_RECORD_BYTES {
         return Err("fatal error log exceeds size limit".into());
@@ -618,6 +640,84 @@ mod tests {
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.surface, "prompt");
         assert_eq!(record.code, "stream_transport");
+    }
+
+    #[test]
+    fn schema_two_readers_preserve_optional_span_context() {
+        use tracing_subscriber::prelude::*;
+        // Frozen shipped schema-v2 shape: unknown top-level fields are ignored.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct ShippedV2 {
+            schema_version: u64,
+            event_id: String,
+            occurred_at_ms: u64,
+            kit_version: String,
+            session_id: String,
+            surface: String,
+            kind: String,
+            code: String,
+            message: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            diagnostics: Option<super::TransportDiagnostics>,
+        }
+        let root = tempfile::tempdir().unwrap();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(crate::telemetry::error_spans::ErrorSpanLayer),
+            || {
+                let operation = crate::telemetry::error_spans::operation("prompt");
+                operation.in_scope(|| {
+                { let _child = tracing::info_span!(target: "agentkit_loop", "agent.execute_tool", launch_kind = "plain"); }
+                let path = write_in_with_diagnostics(root.path(), "session-context", Surface::Prompt, "provider", "stream_transport", "openai-subscription stream transport failed", Some(&sample_diagnostics())).unwrap();
+                let bytes = fs::read(&path).unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["schema_version"], 2);
+                assert_eq!(value["span_context"]["fragments"][1]["fields"]["launch_kind"], "plain");
+                let current: FatalRecord = serde_json::from_slice(&bytes).unwrap();
+                let legacy: ShippedV2 = serde_json::from_slice(&bytes).unwrap();
+                let mut known = serde_json::to_value(&current).unwrap();
+                known.as_object_mut().unwrap().remove("span_context");
+                assert_eq!(serde_json::to_value(&legacy).unwrap(), known);
+                assert_eq!(current.message, "openai-subscription stream transport failed");
+                let supplied = value["span_context"].clone();
+                for marker in [1, 2, 3, 4] {
+                    value["schema_version"] = json!(marker);
+                    let parsed: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+                    assert_eq!(serde_json::to_value(parsed.span_context).unwrap(), supplied);
+                }
+                value.as_object_mut().unwrap().remove("span_context");
+                assert!(serde_json::from_value::<FatalRecord>(value.clone()).unwrap().span_context.is_none());
+                value["span_context"] = supplied;
+                value["span_context"]["fragments"][1]["fields"]["launch_kind"] = json!("SECRET");
+                assert!(serde_json::from_value::<FatalRecord>(value).is_err());
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert!(bytes.len() < super::MAX_RECORD_BYTES);
+            });
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_writer_omits_disabled_context() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let root = tempfile::tempdir().unwrap();
+            let operation = crate::telemetry::error_spans::operation("prompt");
+            let path = operation
+                .in_scope(|| {
+                    write_in(
+                        root.path(),
+                        "session-disabled",
+                        Surface::Prompt,
+                        "runtime",
+                        "runtime_error",
+                        "ordinary error",
+                    )
+                })
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert!(value.get("span_context").is_none());
+            assert_eq!(value["message"], "ordinary error");
+        });
     }
 
     #[test]

@@ -52,6 +52,9 @@ fn resolve_openrouter_api_key(
 
 #[derive(Args)]
 struct TelemetryArgs {
+    /// Resolved local diagnostic setting inherited by built-in Kit children.
+    #[arg(long, hide = true, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
+    internal_capture_error_spans: Option<bool>,
     /// OTLP collector endpoint for OpenTelemetry trace export.
     #[arg(long, global = true)]
     otel_endpoint: Option<String>,
@@ -232,6 +235,7 @@ struct Config {
     provider: Option<kit::ProviderKind>,
     reasoning_effort: Option<kit::ReasoningEffort>,
     a2a: Option<String>,
+    capture_error_spans: Option<bool>,
     otel_endpoint: Option<String>,
     otel_protocol: Option<kit::telemetry::Protocol>,
     otel_capture_message_content: Option<bool>,
@@ -409,6 +413,13 @@ impl Config {
             max_messages,
             max_bytes,
         )
+        .map(|mut settings| {
+            settings.capture_error_spans = args
+                .internal_capture_error_spans
+                .or(self.capture_error_spans)
+                .unwrap_or(false);
+            settings
+        })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
 
@@ -1677,6 +1688,61 @@ credential_store = "keychain"
             .unwrap_err();
         assert!(error.to_string().contains(OTEL_TRACES_PROTOCOL_ENV));
         assert!(toml::from_str::<Config>("otel_protocol = 'http'").is_err());
+    }
+
+    #[test]
+    fn inherited_error_capture_overrides_config_without_rewriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        for inherited in [false, true] {
+            let text = format!(
+                "# User-owned settings\ncapture_error_spans = {}\n",
+                !inherited
+            );
+            fs::write(&path, &text).unwrap();
+            let config = Config::load(&path).unwrap();
+            let cli = Cli::try_parse_from([
+                "kit",
+                "prompt",
+                "--internal-capture-error-spans",
+                &inherited.to_string(),
+                "hello",
+            ])
+            .unwrap();
+            let settings = config
+                .telemetry_settings(&cli.telemetry, None, None, None, None)
+                .unwrap();
+            assert_eq!(settings.capture_error_spans, inherited);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn error_span_capture_defaults_off_and_is_independent_of_export() {
+        let cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
+        for (text, expected) in [
+            ("", false),
+            ("capture_error_spans = false", false),
+            ("capture_error_spans = true", true),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            for endpoint in [None, Some("http://localhost:4317".to_owned())] {
+                let settings = config
+                    .telemetry_settings(
+                        &cli.telemetry,
+                        endpoint.clone(),
+                        Some("true".into()),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(settings.capture_error_spans, expected);
+                assert_eq!(settings.endpoint, endpoint);
+                assert!(settings.capture_message_content);
+            }
+        }
+        assert!(toml::from_str::<Config>("capture_error_spans = 'true'").is_err());
+        assert!(toml::from_str::<Config>("capture_error_spans = 1").is_err());
     }
 
     #[test]

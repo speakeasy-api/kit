@@ -411,12 +411,15 @@ impl std::fmt::Display for ChildError {
 }
 
 struct Prompt {
+    // The worker, not the waiting caller, owns serialization until settlement.
+    serial: tokio::sync::OwnedMutexGuard<()>,
     session_id: SessionId,
     text: String,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
 struct Fork {
+    serial: tokio::sync::OwnedMutexGuard<()>,
     session_id: SessionId,
     model: Option<String>,
     parent: Option<(String, String)>,
@@ -689,8 +692,8 @@ impl ChildSession {
         parent: Option<(String, String)>,
         cancellation: &TurnCancellation,
     ) -> Result<Self, ChildError> {
-        let _serial = tokio::select! {
-            serial = self.serial.lock() => serial,
+        let serial = tokio::select! {
+            serial = self.serial.clone().lock_owned() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         if !self.supports_native_fork() {
@@ -702,6 +705,7 @@ impl ChildSession {
         let (reply, response) = oneshot::channel();
         tokio::select! {
             sent = self.tx.send(Request::Fork(Fork {
+                serial,
                 session_id: self.session_id.clone(),
                 model: model.map(str::to_owned),
                 parent,
@@ -728,12 +732,13 @@ impl ChildSession {
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
-        let _serial = tokio::select! {
-            serial = self.serial.lock() => serial,
+        let serial = tokio::select! {
+            serial = self.serial.clone().lock_owned() => serial,
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
         };
         let (reply, response) = oneshot::channel();
         let request = Request::Prompt(Prompt {
+            serial,
             session_id: self.session_id.clone(),
             text,
             cancellation: cancellation.clone(),
@@ -908,6 +913,7 @@ async fn run(
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
                         tasks.spawn(async move {
+                            let serial = fork.serial;
                             let mut request = ForkSessionRequest::new(fork.session_id, root);
                             if let Some((id, name)) = fork.parent {
                                 request.meta = Some(serde_json::Map::from_iter([
@@ -967,6 +973,9 @@ async fn run(
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
+                                        // The remote fork still owns source-session
+                                        // serialization until its response and cleanup.
+                                        let _serial = serial;
                                         let Ok(response) = request.await else {
                                             return;
                                         };
@@ -992,6 +1001,9 @@ async fn run(
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
+                                        // The remote fork still owns source-session
+                                        // serialization until its response and cleanup.
+                                        let _serial = serial;
                                         let Ok(response) = request.await else {
                                             return;
                                         };
@@ -1050,6 +1062,7 @@ async fn run(
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
                         tasks.spawn(async move {
+                            let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
@@ -1233,6 +1246,61 @@ mod tests {
 
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_child_request_serialization() {
+        for fork in [false, true] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut capabilities = agentkit_acp::AgentCapabilities::default();
+            capabilities.session_capabilities.fork = Some(Default::default());
+            let child = ChildSession {
+                tx,
+                session_id: "test".into(),
+                capabilities,
+                serial: Arc::new(tokio::sync::Mutex::new(())),
+                closed: watch::channel(false).1,
+                descendant_parent: None,
+            };
+            let caller = child.clone();
+            let task = tokio::spawn(async move {
+                if fork {
+                    caller
+                        .fork(None, None, &TurnCancellation::default())
+                        .await
+                        .map(|_| ())
+                } else {
+                    caller
+                        .prompt("first".into(), TurnCancellation::default())
+                        .await
+                        .map(|_| ())
+                }
+            });
+            // The actor has accepted the request but has not settled it.
+            let request = rx.recv().await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(child.serial.try_lock().is_err());
+            drop(request);
+            assert!(child.serial.try_lock().is_ok());
+
+            // Settlement releases the same gate for a subsequent prompt.
+            let answer = async {
+                let Some(Request::Prompt(prompt)) = rx.recv().await else {
+                    panic!("expected a prompt");
+                };
+                prompt.reply.send(Ok(ChildOutput::default())).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    child.prompt("next".into(), TurnCancellation::default()),
+                    answer
+                )
+            })
+            .await
+            .unwrap();
+            assert!(result.is_ok());
+        }
     }
 
     #[test]
@@ -1961,69 +2029,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_native_fork_keeps_the_shared_process_usable() {
-        let root = tempfile::tempdir().unwrap();
-        let release = root.path().join("release-fork");
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "mock".into(),
-            AcpHarnessProfile {
-                command: "python3".into(),
-                args: vec![
-                    format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
-                    format!("--fork-release={}", release.display()),
-                ],
-                permissions: AcpPermissionPolicy::Deny,
-            },
-        );
-        let config = ChildConfig {
-            root: root.path().to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses: AcpHarnesses::new(profiles).unwrap(),
-            default_harness: "acp.mock".into(),
-            parent_id: None,
-            parent_name: None,
-        };
-        let base = ChildSession::start(
-            config,
-            "acp.mock".into(),
-            None,
-            None,
-            1,
-            TurnCancellation::default(),
-        )
-        .await
-        .unwrap();
-        let controller = agentkit_core::CancellationController::new();
-        let cancellation = controller.handle().checkpoint();
-        let child = base.clone();
-        let fork = tokio::spawn(async move { child.fork(None, None, &cancellation).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        controller.interrupt();
-
-        assert!(matches!(fork.await.unwrap(), Err(ChildError::Cancelled)));
-        assert_eq!(
-            base.prompt(
-                "source survives cancellation".into(),
+    async fn cancelled_or_timed_out_fork_retains_serialization_until_remote_settlement() {
+        for cancel in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let release = root.path().join("release-fork");
+            let mut profiles = BTreeMap::new();
+            profiles.insert(
+                "mock".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: vec![
+                        format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+                        format!("--fork-release={}", release.display()),
+                    ],
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            );
+            let config = ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: AcpHarnesses::new(profiles).unwrap(),
+                default_harness: "acp.mock".into(),
+                parent_id: None,
+                parent_name: None,
+            };
+            let base = ChildSession::start(
+                config,
+                "acp.mock".into(),
+                None,
+                None,
+                1,
                 TurnCancellation::default(),
             )
             .await
-            .unwrap()
-            .text,
-            "source survives cancellation"
-        );
-        std::fs::write(release, b"ready").unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        base.close().await.unwrap();
+            .unwrap();
+            let controller = agentkit_core::CancellationController::new();
+            let cancellation = controller.handle().checkpoint();
+            let child = base.clone();
+            let fork = tokio::spawn(async move { child.fork(None, None, &cancellation).await });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if cancel {
+                controller.interrupt();
+            }
+            let outcome = tokio::time::timeout(HANDSHAKE + Duration::from_secs(5), fork)
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                assert!(matches!(outcome, Err(ChildError::Cancelled)));
+            } else {
+                assert!(matches!(outcome, Err(ChildError::Failed(_))));
+            }
+            assert!(base.serial.try_lock().is_err());
+            let mut next = Box::pin(base.prompt(
+                "source survives cancellation".into(),
+                TurnCancellation::default(),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut next)
+                    .await
+                    .is_err()
+            );
+            std::fs::write(release, b"ready").unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), next)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .text,
+                "source survives cancellation"
+            );
+            base.close().await.unwrap();
+        }
     }
 
     #[test]

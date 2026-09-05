@@ -157,6 +157,7 @@ provider = "openai-subscription" # or "openrouter" or "speakeasy"
 model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
+capture_error_spans = false # optional local context in fatal error logs
 otel_endpoint = "http://localhost:4317"
 otel_protocol = "grpc" # grpc, http/protobuf, or http/json
 otel_capture_message_content = false
@@ -209,6 +210,14 @@ For settings exposed by a command, precedence is:
 1. command-line options, such as `--root`, `--provider`, or `--model`;
 2. values in `~/.kit/config.toml`;
 3. built-in defaults.
+
+Set `capture_error_spans = true` when troubleshooting unexpected failures or
+preparing a bug report. Kit adds diagnostic context about recent operations to
+error logs in `~/.kit/errors/<session-id>/`, which can help explain a failure.
+
+It is disabled by default to avoid additional collection overhead and does not
+require OpenTelemetry. The extra context excludes prompts and tool inputs and
+outputs; it is not a complete execution history.
 
 The OpenTelemetry endpoint follows the same CLI-over-TOML precedence, then falls
 back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. If none
