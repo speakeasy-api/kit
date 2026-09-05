@@ -405,6 +405,10 @@ pub(crate) struct McpSubscription {
 }
 
 impl McpSubscription {
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.receiver.is_empty()
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<McpEvent> {
         self.receiver.recv().await
     }

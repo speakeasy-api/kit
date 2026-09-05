@@ -49,6 +49,7 @@ use tracing::Instrument as _;
 
 mod activity;
 pub(crate) mod model_switch;
+pub(crate) mod prompt_branches;
 mod skill_catalog;
 pub mod v2;
 
