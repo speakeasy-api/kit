@@ -606,13 +606,13 @@ impl SessionRegistry {
         }
     }
 
-    pub(super) fn next_token(&self) -> u64 {
+    pub(super) fn next_token(&self) -> Result<u64, AcpRuntimeError> {
         self.inner
             .next_token
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
             })
-            .expect("ACP session registry token space exhausted")
+            .map_err(|_| AcpRuntimeError::Loop("ACP session registry token space exhausted".into()))
     }
 
     fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
@@ -1387,6 +1387,8 @@ impl Server {
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        // Reject exhaustion before admission or any binding, driver, or actor effects.
+        let token = self.registry.next_token()?;
         let mut admission = self
             .registry
             .begin_attachment()
@@ -1490,7 +1492,6 @@ impl Server {
             activity,
             mcp_events,
         };
-        let token = self.registry.next_token();
         let (activation, activated) = oneshot::channel();
         let (completed, completion) = watch::channel(false);
         let guard = SessionActorGuard {
@@ -3043,7 +3044,7 @@ pub(super) mod tests {
         mpsc::Receiver<Command>,
     ) {
         let session_id = agentkit_acp::SessionId::new(id.to_owned());
-        let token = server.registry.next_token();
+        let token = server.registry.next_token().unwrap();
         let (completed, completion) = watch::channel(false);
         let guard = SessionActorGuard {
             server: Arc::downgrade(server),
@@ -3369,7 +3370,7 @@ pub(super) mod tests {
         server: &Arc<Server>,
         registry: &SessionRegistry,
     ) -> (mpsc::Sender<Command>, Arc<AtomicBool>) {
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (commands, mut received) = mpsc::channel(1);
         let (completed, completion) = watch::channel(false);
         let closed = Arc::new(AtomicBool::new(false));
@@ -3433,7 +3434,7 @@ pub(super) mod tests {
         let integration = shutdown_test_integration();
         let (background_jobs, tasks) = start_non_cooperative_background("shutdown-call").await;
         let session_id = agentkit_acp::SessionId::new("close-me");
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (commands, mut received) = mpsc::channel(1);
         let weak_commands = commands.downgrade();
         let (completed, completion) = watch::channel(false);
@@ -3480,7 +3481,7 @@ pub(super) mod tests {
             tokio::task::yield_now().await;
         }
 
-        let late_token = registry.next_token();
+        let late_token = registry.next_token().unwrap();
         let (late_commands, _late_received) = mpsc::channel(1);
         let (late_completed, late_completion) = watch::channel(false);
         let late_actor = tokio::spawn(async move {
@@ -3537,13 +3538,13 @@ pub(super) mod tests {
         let registry = SessionRegistry::new();
         let other = SessionRegistry::new();
         let mut admission = registry.begin_attachment().unwrap();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         assert!(register_test_v2(&other, &mut admission, token, Arc::new(|| {})).is_err());
         assert_eq!(registry.inner.lock_state().pending_attachments, 1);
         assert_eq!(other.inner.lock_state().pending_attachments, 0);
         assert!(other.inner.lock_state().v2_sessions.is_empty());
         register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
-        let second_token = registry.next_token();
+        let second_token = registry.next_token().unwrap();
         assert!(
             register_test_v2(&registry, &mut admission, second_token, Arc::new(|| {})).is_err()
         );
@@ -3568,7 +3569,7 @@ pub(super) mod tests {
     async fn registry_legacy_registration_obeys_admission_and_cross_version_token_rules() {
         let registry = SessionRegistry::new();
         let other = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         register_test_v2(
             &registry,
             &mut registry.begin_attachment().unwrap(),
@@ -3595,7 +3596,7 @@ pub(super) mod tests {
         assert!(other.register(&mut admission, session.clone()).is_err());
         assert!(admission.active);
         assert_eq!(registry.inner.lock_state().pending_attachments, 1);
-        session.token = registry.next_token();
+        session.token = registry.next_token().unwrap();
         registry.register(&mut admission, session.clone()).unwrap();
         assert!(registry.register(&mut admission, session.clone()).is_err());
         assert_eq!(registry.inner.lock_state().pending_attachments, 0);
@@ -3622,7 +3623,7 @@ pub(super) mod tests {
         let mut context = std::task::Context::from_waker(&waker);
         let mut waiting = Box::pin(registry.wait_for_pending_attachments());
         assert!(waiting.as_mut().poll(&mut context).is_pending());
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
         assert!(wake.1.load(Ordering::SeqCst));
         assert!(waiting.as_mut().poll(&mut context).is_ready());
@@ -3633,7 +3634,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn registry_interrupt_unwind_leaves_gate_closed_without_poison() {
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let callback_registry = registry.clone();
         register_test_v2(
             &registry,
@@ -3666,7 +3667,7 @@ pub(super) mod tests {
             }
         }
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let capture = ReenterOnDrop(registry.clone());
         register_test_v2(
             &registry,
@@ -3711,7 +3712,7 @@ pub(super) mod tests {
             }
         }
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         register_test_v2(
             &registry,
             &mut registry.begin_attachment().unwrap(),
@@ -3740,20 +3741,109 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_token_exhaustion_rejects_attachment_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let runtime = Runtime::with_session_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::runtime::SessionRequest {
+                id: session_id.clone(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        registry
+            .inner
+            .next_token
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = component(runtime.clone(), registry.clone()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let workspace = root.path().to_path_buf();
+        let client = agent_client_protocol::Client.builder().connect_with(
+            client_transport,
+            async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                for _ in 0..2 {
+                    let error = connection
+                        .send_request(NewSessionRequest::new(workspace.clone()))
+                        .block_task()
+                        .await
+                        .expect_err("exhausted registry must reject attachment");
+                    assert!(
+                        error
+                            .data
+                            .unwrap()
+                            .to_string()
+                            .contains("ACP session registry token space exhausted")
+                    );
+                    assert_eq!(
+                        registry
+                            .inner
+                            .next_token
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        u64::MAX
+                    );
+                    assert!(!registry.inner.state.is_poisoned());
+                    {
+                        let state = registry.inner.lock_state();
+                        assert!(state.accepting);
+                        assert_eq!(state.pending_attachments, 0);
+                        assert!(state.sessions.is_empty());
+                        assert!(state.v2_sessions.is_empty());
+                    }
+                    // Failed attachment releases its claim without creating a transcript.
+                    let claim = runtime.claim_session().unwrap();
+                    assert_eq!(claim.id(), session_id);
+                    assert!(claim.is_configured());
+                    drop(claim);
+                    assert_eq!(
+                        crate::session::load(&workspace, &session_id).unwrap_err(),
+                        format!("session {session_id:?} does not exist")
+                    );
+                }
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(2), client).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("exhaustion client timed out").unwrap();
+    }
+
+    #[tokio::test]
     async fn registry_counter_exhaustion_does_not_wrap_or_poison() {
         let registry = SessionRegistry::new();
         registry
             .inner
             .next_token
             .store(u64::MAX - 1, Ordering::Relaxed);
-        assert_eq!(registry.next_token(), u64::MAX - 1);
+        assert_eq!(registry.next_token().unwrap(), u64::MAX - 1);
         for _ in 0..2 {
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.next_token()))
-                    .is_err()
-            );
+            assert!(matches!(
+                registry.next_token(),
+                Err(AcpRuntimeError::Loop(message))
+                    if message == "ACP session registry token space exhausted"
+            ));
             assert_eq!(registry.inner.next_token.load(Ordering::Relaxed), u64::MAX);
+            assert!(!registry.inner.state.is_poisoned());
+            let state = registry.inner.lock_state();
+            assert!(state.accepting);
+            assert_eq!(state.pending_attachments, 0);
+            assert!(state.sessions.is_empty());
+            assert!(state.v2_sessions.is_empty());
         }
+        // Allocation failure does not corrupt admission or its drop cleanup.
+        drop(registry.begin_attachment().unwrap());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
         registry.inner.lock_state().pending_attachments = usize::MAX;
         assert!(registry.begin_attachment().is_err());
         assert!(!registry.inner.state.is_poisoned());
@@ -3822,7 +3912,7 @@ pub(super) mod tests {
             registry
                 .register_v2(
                     &mut registry.begin_attachment().unwrap(),
-                    registry.next_token(),
+                    registry.next_token().unwrap(),
                     Arc::new(|| {}),
                     Arc::new(|| Box::pin(async { panic!("close callback unwound") })),
                     actor.abort_handle(),
@@ -3846,7 +3936,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn authentication_reset_closes_shared_v2_sessions_and_reopens_registration() {
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let closed = Arc::new(AtomicBool::new(false));
         let close_flag = Arc::clone(&closed);
         let (completed, completion) = watch::channel(false);
@@ -3949,7 +4039,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn failed_authentication_reset_cannot_reopen_on_retry() {
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (_completed, completion) = watch::channel(false);
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
@@ -4011,7 +4101,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn shutdown_aborts_actor_at_the_shared_deadline() {
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (commands, _received) = mpsc::channel(1);
         let (_completed, completion) = watch::channel(false);
         let actor = tokio::spawn(std::future::pending::<()>());
@@ -5117,24 +5207,33 @@ pub(super) mod tests {
 
         // Multiple logical turns drained within one autonomous interval do not
         // publish an intermediate terminal state or allocate another turn ID.
-        activity.begin(activity::ExecutionOrigin::Autonomous);
-        for text in ["first continuation", "second continuation"] {
-            driver.submit_input(vec![Item::notification(text)]).unwrap();
-            drive_autonomous(&session_id, &integration, &mut driver)
-                .await
-                .unwrap();
-        }
-        let started = states.try_recv().unwrap();
-        assert!(started.active);
-        assert_eq!(started.turn_id, 3);
-        assert!(states.try_recv().is_err());
+        let mut started = None;
         activity
-            .settle(None, Some("terminal error".into()))
-            .unwrap();
+            .execute(
+                activity::ExecutionOrigin::Autonomous,
+                async {
+                    for text in ["first continuation", "second continuation"] {
+                        driver.submit_input(vec![Item::notification(text)]).unwrap();
+                        drive_autonomous(&session_id, &integration, &mut driver)
+                            .await
+                            .unwrap();
+                    }
+                    let event = states.try_recv().unwrap();
+                    assert!(event.active);
+                    assert_eq!(event.turn_id, 3);
+                    assert!(states.try_recv().is_err());
+                    started = Some(event);
+                    Err::<(), _>(AcpRuntimeError::Loop("terminal error".into()))
+                },
+                |_| None,
+            )
+            .await
+            .unwrap_err();
+        let started = started.unwrap();
         let ended = states.try_recv().unwrap();
         assert!(!ended.active);
         assert_eq!(ended.turn_id, started.turn_id);
-        assert_eq!(ended.error.as_deref(), Some("terminal error"));
+        assert!(ended.error.as_deref().unwrap().contains("terminal error"));
         activity.settle(None, None).unwrap();
         assert!(states.try_recv().is_err());
         assert_eq!(turns.load(Ordering::SeqCst), 6);

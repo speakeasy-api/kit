@@ -847,6 +847,8 @@ impl Server {
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        // Reject exhaustion before admission or any binding, driver, or actor effects.
+        let token = self.registry.next_token()?;
         let mut admission = self
             .registry
             .begin_attachment()
@@ -912,7 +914,6 @@ impl Server {
             commands: rx,
             mcp_events,
         };
-        let token = self.registry.next_token();
         let (activation, activated) = oneshot::channel();
         let (completed, completion) = watch::channel(false);
         let guard = ActorGuard {
@@ -3980,7 +3981,7 @@ mod tests {
                 RecordingSink::default(),
             ))
             .unwrap();
-        let token = server.registry.next_token();
+        let token = server.registry.next_token().unwrap();
         let (completed, completion) = watch::channel(false);
         let guard = ActorGuard {
             server: Arc::downgrade(server),
@@ -4215,7 +4216,7 @@ mod tests {
                 RecordingSink::default(),
             ))
             .unwrap();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (completed, completion) = watch::channel(false);
         let release = Arc::new(Notify::new());
         let actor_release = Arc::clone(&release);
@@ -4358,6 +4359,88 @@ mod tests {
                 assert!(server.logout().await.is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn v2_token_exhaustion_rejects_attachment_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let runtime = Runtime::with_session_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::runtime::SessionRequest {
+                id: session_id.clone(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        registry
+            .inner
+            .next_token
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime.clone(), registry.clone()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let workspace = root.path().to_path_buf();
+        let client = agent_client_protocol::Client.v2().connect_with(
+            client_transport,
+            async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("exhaustion-test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                for _ in 0..2 {
+                    let error = connection
+                        .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                        .block_task()
+                        .await
+                        .expect_err("exhausted registry must reject attachment");
+                    assert!(
+                        error
+                            .data
+                            .unwrap()
+                            .to_string()
+                            .contains("ACP session registry token space exhausted")
+                    );
+                    assert_eq!(
+                        registry
+                            .inner
+                            .next_token
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        u64::MAX
+                    );
+                    assert!(!registry.inner.state.is_poisoned());
+                    {
+                        let state = registry.inner.lock_state();
+                        assert!(state.accepting);
+                        assert_eq!(state.pending_attachments, 0);
+                        assert!(state.sessions.is_empty());
+                        assert!(state.v2_sessions.is_empty());
+                    }
+                    // Failed attachment releases its claim without creating a transcript.
+                    let claim = runtime.claim_session().unwrap();
+                    assert_eq!(claim.id(), session_id);
+                    assert!(claim.is_configured());
+                    drop(claim);
+                    assert_eq!(
+                        crate::session::load(&workspace, &session_id).unwrap_err(),
+                        format!("session {session_id:?} does not exist")
+                    );
+                }
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(2), client).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("exhaustion client timed out").unwrap();
     }
 
     #[tokio::test]

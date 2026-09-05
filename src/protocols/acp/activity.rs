@@ -64,17 +64,6 @@ impl SessionActivity {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn begin(&self, origin: ExecutionOrigin) {
-        let Ok(mut state) = self.state.lock() else {
-            return; // A poisoned owner is never reused.
-        };
-        // Continuations cannot redefine the origin of an existing interval.
-        if state.state == State::Idle && !state.projecting && !state.executing {
-            state.origin = origin;
-        }
-    }
-
     pub(super) fn observe(&self, event: &AgentEvent) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -345,7 +334,16 @@ mod tests {
                         assert!(transitions.lock().unwrap().last().unwrap().active);
                         activity.observe(&finished(FinishReason::ToolCall));
                         // Steering and background synthesis cannot redefine the interval.
-                        activity.begin(ExecutionOrigin::Autonomous);
+                        assert!(
+                            activity
+                                .execute(
+                                    ExecutionOrigin::Autonomous,
+                                    async { panic!("overlapping operation must not run") },
+                                    |_: &()| None,
+                                )
+                                .await
+                                .is_err()
+                        );
                         activity.observe(&started("continuation"));
                         activity.observe(&finished(reason.clone()));
                         assert_eq!(transitions.lock().unwrap().len(), index * 2 + 1);
@@ -464,8 +462,8 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 2);
     }
 
-    #[test]
-    fn projection_unwind_isolates_without_poison_or_replay() {
+    #[tokio::test]
+    async fn projection_unwind_isolates_without_poison_or_replay() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for fail_active in [true, false] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -481,7 +479,16 @@ mod tests {
             }));
             assert!(result.is_err());
             assert!(!activity.state.is_poisoned());
-            activity.begin(ExecutionOrigin::Autonomous);
+            assert!(
+                activity
+                    .execute(
+                        ExecutionOrigin::Autonomous,
+                        async { panic!("isolated operation must not run") },
+                        |_: &()| None,
+                    )
+                    .await
+                    .is_err()
+            );
             activity.observe(&started("later"));
             assert!(matches!(
                 activity.settle(None, None),
@@ -563,8 +570,8 @@ mod tests {
         assert!(!activity.state.is_poisoned());
     }
 
-    #[test]
-    fn exhausted_identity_and_poison_never_resume_projection() {
+    #[tokio::test]
+    async fn exhausted_identity_and_poison_never_resume_projection() {
         let activity = SessionActivity::new(|_| panic!("must not project"));
         activity.state.lock().unwrap().next_id = u64::MAX;
         activity.observe(&started("overflow"));
@@ -578,7 +585,16 @@ mod tests {
             .join()
             .is_err()
         );
-        activity.begin(ExecutionOrigin::Prompt);
+        assert!(
+            activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async { panic!("isolated operation must not run") },
+                    |_: &()| None,
+                )
+                .await
+                .is_err()
+        );
         activity.observe(&started("after-poison"));
         assert!(matches!(
             activity.settle(None, None),
