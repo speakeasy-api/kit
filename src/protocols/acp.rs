@@ -1325,20 +1325,10 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = match self
+        let driver = self
             .runtime
             .start_acp_driver_with_initial(context, &mut claim, forked)
-            .await
-        {
-            Ok(driver) => driver,
-            Err(error) => {
-                return Err(record_acp_runtime_failure(
-                    &session_id,
-                    "session_start",
-                    error,
-                ));
-            }
-        };
+            .await?;
         let current = driver
             .adapter
             .selection()
@@ -1705,6 +1695,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             &integration,
                             &mut driver,
                             &activity,
+                            &background_jobs.observations,
                         ).await,
                         Err(error) => Err(error),
                     };
@@ -1724,6 +1715,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             &integration,
                             &mut driver,
                             &activity,
+                            &background_jobs.observations,
                         ).await;
                         if let Err(error) = result {
                             eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
@@ -1932,11 +1924,26 @@ fn record_acp_runtime_failure(
     code: &str,
     error: impl ToString,
 ) -> AcpRuntimeError {
+    record_acp_runtime_failure_observed(
+        session_id,
+        code,
+        error,
+        &crate::effects::Observations::default(),
+    )
+}
+
+fn record_acp_runtime_failure_observed(
+    session_id: &agentkit_acp::SessionId,
+    code: &str,
+    error: impl ToString,
+    observations: &crate::effects::Observations,
+) -> AcpRuntimeError {
     let rendered = error.to_string();
-    match crate::fatal::record_runtime_error(
+    match crate::fatal::record_runtime_error_with_effects(
         &session_id.to_string(),
         crate::fatal::Surface::Acp,
         code,
+        observations.snapshot(),
     ) {
         Ok(path) => AcpRuntimeError::Loop(format!("{rendered}; fatal log: {}", path.display())),
         Err(log_error) => {
@@ -1949,12 +1956,14 @@ fn record_acp_runtime_failure(
 fn record_acp_loop_failure(
     session_id: &agentkit_acp::SessionId,
     error: &LoopError,
+    observations: &crate::effects::Observations,
 ) -> AcpRuntimeError {
     let rendered = crate::fatal::render_loop_error(error);
-    match crate::fatal::record_loop_error(
+    match crate::fatal::record_loop_error_with_effects(
         &session_id.to_string(),
         crate::fatal::Surface::Acp,
         error,
+        observations.snapshot(),
     ) {
         Ok(Some(path)) => {
             AcpRuntimeError::Loop(format!("{rendered}; fatal log: {}", path.display()))
@@ -1988,11 +1997,14 @@ async fn drive_prompt<S: ModelSession>(
     skill_catalog
         .submit(skills, items, |items| driver.submit_input(items))
         .map_err(|error| match error {
-            skill_catalog::SubmitError::Catalog(error) => {
-                record_acp_runtime_failure(session_id, "skill_catalog", error)
-            }
+            skill_catalog::SubmitError::Catalog(error) => record_acp_runtime_failure_observed(
+                session_id,
+                "skill_catalog",
+                error,
+                &background_jobs.observations,
+            ),
             skill_catalog::SubmitError::Submit(error) => {
-                record_acp_loop_failure(session_id, &error)
+                record_acp_loop_failure(session_id, &error, &background_jobs.observations)
             }
         })?;
     drive_submitted_prompt(
@@ -2019,22 +2031,38 @@ async fn drive_runtime_prompt<S: ModelSession>(
     structured_completion: bool,
 ) -> Result<FinishReason, AcpRuntimeError> {
     if structured_completion {
-        let _ = settle_background_jobs(tasks, background_jobs).await?;
+        let _ = settle_background_jobs(tasks, background_jobs)
+            .await
+            .map_err(|error| {
+                record_acp_runtime_failure_observed(
+                    session_id,
+                    "prompt_preparation_settlement",
+                    error,
+                    &background_jobs.observations,
+                )
+            })?;
     }
-    let current = runtime
-        .current_skills()
-        .await
-        .map_err(AcpRuntimeError::Loop)?;
+    let current = runtime.current_skills().await.map_err(|error| {
+        record_acp_runtime_failure_observed(
+            session_id,
+            "skill_refresh",
+            error,
+            &background_jobs.observations,
+        )
+    })?;
     background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
     skill_catalog
         .submit(&current.skills, items, |items| driver.submit_input(items))
         .map_err(|error| match error {
-            skill_catalog::SubmitError::Catalog(error) => {
-                record_acp_runtime_failure(session_id, "skill_catalog", error)
-            }
+            skill_catalog::SubmitError::Catalog(error) => record_acp_runtime_failure_observed(
+                session_id,
+                "skill_catalog",
+                error,
+                &background_jobs.observations,
+            ),
             skill_catalog::SubmitError::Submit(error) => {
-                record_acp_loop_failure(session_id, &error)
+                record_acp_loop_failure(session_id, &error, &background_jobs.observations)
             }
         })?;
     drop(current);
@@ -2044,6 +2072,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
         driver,
         true,
         structured_completion.then_some((tasks, background_jobs)),
+        &background_jobs.observations,
     )
     .await
 }
@@ -2073,11 +2102,12 @@ async fn drive_unsolicited<S: ModelSession>(
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     activity: &activity::SessionActivity,
+    observations: &crate::effects::Observations,
 ) -> Result<(), AcpRuntimeError> {
     activity
         .execute(
             activity::ExecutionOrigin::Autonomous,
-            drive_finalized(session_id, integration, driver, false, None),
+            drive_finalized(session_id, integration, driver, false, None, observations),
             |reason| Some(reason.clone()),
         )
         .await
@@ -2102,8 +2132,19 @@ async fn drive_until_pause<S: ModelSession>(
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<Option<PromptResponse>, AcpRuntimeError> {
-    let reason =
-        drive_finalized(session_id, integration, driver, answer_prompt, structured).await?;
+    let fallback = crate::effects::Observations::local_session();
+    let observations = structured
+        .map(|(_, jobs)| &jobs.observations)
+        .unwrap_or(&fallback);
+    let reason = drive_finalized(
+        session_id,
+        integration,
+        driver,
+        answer_prompt,
+        structured,
+        observations,
+    )
+    .await?;
     if answer_prompt {
         Ok(Some(PromptResponse::new(
             agentkit_acp::finish_reason_to_stop_reason(&reason)?,
@@ -2119,18 +2160,51 @@ async fn drive_finalized<S: ModelSession>(
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    observations: &crate::effects::Observations,
 ) -> Result<FinishReason, AcpRuntimeError> {
     let cancellation = integration.cancellation_handle(session_id)?;
     let generation = cancellation.generation();
-    let result =
-        drive_domain_until_pause(session_id, integration, driver, answer_prompt, structured).await;
-    activity::finalize(
+    let mut failure_recorded = false;
+    let result = drive_domain_until_pause(
+        session_id,
+        integration,
+        driver,
+        answer_prompt,
+        structured,
+        observations,
+        &mut failure_recorded,
+    )
+    .await;
+    let result = activity::finalize(
         activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
         structured,
         integration.flush_session_updates(session_id),
-        |_| Ok(()),
+        |_, origin| {
+            if (!failure_recorded || origin == activity::FailureOrigin::Finalization)
+                && let Err(error) = crate::fatal::record_runtime_error_with_effects(
+                    &session_id.to_string(),
+                    crate::fatal::Surface::Acp,
+                    "session_finalization",
+                    observations.snapshot(),
+                )
+            {
+                tracing::warn!(%error, "could not record finalization observations");
+            }
+            Ok(())
+        },
     )
-    .await
+    .await;
+    if matches!(result, Ok(FinishReason::Cancelled))
+        && let Err(error) = crate::fatal::record_loop_error_with_effects(
+            &session_id.to_string(),
+            crate::fatal::Surface::Acp,
+            &LoopError::Cancelled,
+            observations.snapshot(),
+        )
+    {
+        tracing::warn!(%error, "could not record cancellation observations");
+    }
+    result
 }
 
 async fn drive_domain_until_pause<S: ModelSession>(
@@ -2139,6 +2213,8 @@ async fn drive_domain_until_pause<S: ModelSession>(
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    observations: &crate::effects::Observations,
+    failure_recorded: &mut bool,
 ) -> Result<FinishReason, AcpRuntimeError> {
     let cancellation = integration.cancellation_handle(session_id)?;
     let generation = cancellation.generation();
@@ -2148,13 +2224,16 @@ async fn drive_domain_until_pause<S: ModelSession>(
             Err(LoopError::Cancelled) => {
                 return Ok(FinishReason::Cancelled);
             }
-            Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
+            Err(error) => {
+                *failure_recorded = true;
+                return Err(record_acp_loop_failure(session_id, &error, observations));
+            }
         };
         if cancellation.is_cancelled_since(generation) {
-            driver
-                .retire_interrupted_turn()
-                .await
-                .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+            driver.retire_interrupted_turn().await.map_err(|error| {
+                *failure_recorded = true;
+                record_acp_loop_failure(session_id, &error, observations)
+            })?;
             return Ok(FinishReason::Cancelled);
         }
         match step {
@@ -2731,7 +2810,7 @@ pub(super) mod tests {
                                 ),
                                 None,
                                 content.flush(),
-                                |_| Ok(()),
+                                |_, _| Ok(()),
                             )
                             .await
                         },
@@ -4009,6 +4088,11 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn live_prompt_boundary_refreshes_plugin_skill_catalog() {
+        if crate::effects::isolated_test(
+            "protocols::acp::tests::live_prompt_boundary_refreshes_plugin_skill_catalog",
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("config.toml");
         std::fs::write(&config, "").unwrap();
@@ -4100,6 +4184,7 @@ pub(super) mod tests {
             .unwrap();
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
         let response = drive_runtime_prompt(
             &acp_session_id,
             &runtime,
@@ -4113,13 +4198,52 @@ pub(super) mod tests {
                 )],
             ),
             &tasks,
-            &BackgroundJobs::default(),
+            &background_jobs,
             false,
         )
         .await
         .unwrap();
         assert_eq!(response, FinishReason::Completed);
         assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
+        // Retained facts from earlier work must survive next-prompt preparation failure.
+        background_jobs.observations.invocation_started();
+        std::fs::write(&config, "invalid = [").unwrap();
+        let error = drive_runtime_prompt(
+            &acp_session_id,
+            &runtime,
+            &integration,
+            &mut skill_catalog,
+            &mut driver,
+            PromptRequest::new(
+                acp_session_id.clone(),
+                vec![agentkit_acp::ContentBlock::Text(
+                    agentkit_acp::TextContent::new("next prompt"),
+                )],
+            ),
+            &tasks,
+            &background_jobs,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string().matches("fatal log:").count(), 1);
+        let record = crate::effects::test_record(&acp_session_id.to_string());
+        assert_eq!(record["code"], "skill_refresh");
+        assert_eq!(record["possible_effects"]["source"], "local_session");
+        assert_eq!(
+            record["possible_effects"]["tool_execution_start_reported"],
+            true
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                    .join(".kit/errors")
+                    .join(acp_session_id.to_string())
+            )
+            .unwrap()
+            .count(),
+            1
+        );
         drain.abort();
     }
 
@@ -4298,9 +4422,15 @@ pub(super) mod tests {
             .unwrap();
 
         for _ in 0..2 {
-            drive_unsolicited(&session_id, &integration, &mut driver, &activity)
-                .await
-                .unwrap();
+            drive_unsolicited(
+                &session_id,
+                &integration,
+                &mut driver,
+                &activity,
+                &crate::effects::Observations::local_session(),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(turns.load(Ordering::SeqCst), 2);
         assert!(states.try_recv().is_err());
@@ -4308,18 +4438,30 @@ pub(super) mod tests {
         driver
             .submit_input(vec![Item::notification("background result")])
             .unwrap();
-        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
-            .await
-            .unwrap();
+        drive_unsolicited(
+            &session_id,
+            &integration,
+            &mut driver,
+            &activity,
+            &crate::effects::Observations::local_session(),
+        )
+        .await
+        .unwrap();
         let started = states.try_recv().unwrap();
         let ended = states.try_recv().unwrap();
         assert!(started.active && !ended.active);
         assert_eq!(started.turn_id, 1);
         assert_eq!(started.turn_id, ended.turn_id);
         assert!(ended.error.is_none());
-        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
-            .await
-            .unwrap();
+        drive_unsolicited(
+            &session_id,
+            &integration,
+            &mut driver,
+            &activity,
+            &crate::effects::Observations::local_session(),
+        )
+        .await
+        .unwrap();
         assert_eq!(turns.load(Ordering::SeqCst), 3);
         assert!(states.try_recv().is_err());
 
@@ -4754,6 +4896,108 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn startup_failure_records_once_with_original_classification_and_source() {
+        if crate::effects::isolated_test(
+            "protocols::acp::tests::startup_failure_records_once_with_original_classification_and_source",
+        ) {
+            return;
+        }
+        for before_owner in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let other_root = tempfile::tempdir().unwrap();
+            let session_id = crate::session::new_id();
+            let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                root.path(),
+                "test/model",
+                crate::ProviderKind::OpenRouter,
+                crate::runtime::SessionRequest {
+                    id: session_id.clone(),
+                    resume: false,
+                    force: false,
+                },
+                crate::credentials::CredentialStorage::Memory,
+                None,
+                // SelectableAdapter accepts the selection, but starting its
+                // model session fails deterministically without network I/O.
+                Some(crate::provider::OpenRouterApiKey::new("")),
+            )
+            .unwrap();
+            let workspace = if before_owner {
+                other_root.path()
+            } else {
+                root.path()
+            }
+            .to_path_buf();
+            let (client_transport, agent_transport) = Channel::duplex();
+            let server = tokio::spawn(serve_transport(runtime, agent_transport));
+            agent_client_protocol::Client
+                .builder()
+                .connect_with(client_transport, async move |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let error = connection
+                        .send_request(NewSessionRequest::new(workspace))
+                        .block_task()
+                        .await
+                        .expect_err("startup must fail");
+                    let rendered = error.to_string();
+                    assert_eq!(rendered.matches("fatal log:").count(), 1, "{rendered}");
+                    assert!(
+                        rendered.contains(if before_owner {
+                            "this Kit runtime is fixed to"
+                        } else {
+                            "--openrouter-api-key cannot be empty"
+                        }),
+                        "{rendered}"
+                    );
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+
+            let directory = PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".kit/errors")
+                .join(&session_id);
+            let records: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            assert_eq!(records.len(), 1, "startup must record exactly once");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&records[0]).unwrap()).unwrap();
+            assert_eq!(record["surface"], "acp");
+            assert_eq!(record["kind"], "runtime");
+            assert_eq!(
+                record["code"],
+                if before_owner {
+                    "session_start"
+                } else {
+                    "invalid_state"
+                }
+            );
+            assert_eq!(
+                record["possible_effects"]["source"],
+                if before_owner {
+                    "unknown"
+                } else {
+                    "local_session"
+                }
+            );
+            assert_eq!(record["possible_effects"]["observation_incomplete"], true);
+            assert_eq!(
+                record["possible_effects"]["tool_execution_start_reported"],
+                false
+            );
+            assert!(crate::session::load(root.path(), &session_id).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn registry_shutdown_closes_real_session_and_rejects_reattach() {
         let root = tempfile::tempdir().unwrap();
         let session_id = crate::session::new_id();
@@ -5056,5 +5300,90 @@ pub(super) mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn root_cancellation_keeps_owner_in_unstructured_and_unsolicited_drives() {
+        if crate::effects::isolated_test(
+            "protocols::acp::tests::root_cancellation_keeps_owner_in_unstructured_and_unsolicited_drives",
+        ) {
+            return;
+        }
+        for autonomous in [false, true] {
+            let session_id = agentkit_acp::SessionId::new(if autonomous {
+                "effects-autonomous"
+            } else {
+                "effects-prompt"
+            });
+            let loop_id = AgentkitSessionId::new(session_id.to_string());
+            let integration = AcpIntegration::builder()
+                .name("effects-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap();
+            let (client, mut messages) = AcpClientHandle::channel();
+            integration
+                .bind_session(AcpSessionBinding::new(
+                    session_id.clone(),
+                    loop_id.clone(),
+                    client,
+                ))
+                .unwrap();
+            let drain = tokio::spawn(async move {
+                while let Some(message) = messages.recv().await {
+                    if let AcpClientMessage::Flush { response } = message {
+                        let _ = response.send(());
+                    }
+                }
+            });
+            let observations = crate::effects::Observations::local_session();
+            // Evidence from a local background invocation in this live session.
+            observations.invocation_started();
+            let mut driver = Agent::builder()
+                .model(CancelAdapter)
+                .observer(observations.clone())
+                .input(vec![Item::text(ItemKind::User, "cancel")])
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(loop_id).without_cache())
+                .await
+                .unwrap();
+            if autonomous {
+                let (notifications, _) = mpsc::unbounded_channel();
+                let activity = test_activity(session_id.clone(), notifications);
+                drive_unsolicited(
+                    &session_id,
+                    &integration,
+                    &mut driver,
+                    &activity,
+                    &observations,
+                )
+                .await
+                .unwrap();
+            } else {
+                let reason = drive_finalized(
+                    &session_id,
+                    &integration,
+                    &mut driver,
+                    true,
+                    None,
+                    &observations,
+                )
+                .await
+                .unwrap();
+                assert_eq!(reason, FinishReason::Cancelled);
+            }
+            let record = crate::effects::test_record(&session_id.to_string());
+            assert_eq!(record["kind"], "cancelled");
+            assert_eq!(record["possible_effects"]["source"], "local_session");
+            assert_eq!(
+                record["possible_effects"]["tool_execution_start_reported"],
+                true
+            );
+            assert_eq!(
+                record["possible_effects"]["tool_execution_completion_reported"],
+                false
+            );
+            drain.abort();
+        }
     }
 }

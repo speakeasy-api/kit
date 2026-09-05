@@ -164,6 +164,13 @@ impl ExecutionOutcome {
     }
 }
 
+/// Identifies whether finalization replaced the execution's original error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FailureOrigin {
+    Execution,
+    Finalization,
+}
+
 /// Shared finalization order: cancel/drain structured work, drain all content even
 /// on failure, render a diagnostic, then return the outcome for single settlement.
 /// Hooks are transport only; neither hook chooses lifecycle or cleanup policy.
@@ -174,22 +181,25 @@ pub(super) async fn finalize(
         &crate::runtime::BackgroundJobs,
     )>,
     flush: impl std::future::Future<Output = Result<(), AcpRuntimeError>>,
-    diagnostic: impl FnOnce(&AcpRuntimeError) -> Result<(), AcpRuntimeError>,
+    diagnostic: impl FnOnce(&AcpRuntimeError, FailureOrigin) -> Result<(), AcpRuntimeError>,
 ) -> Result<FinishReason, AcpRuntimeError> {
     let mut result = outcome.result;
+    let mut origin = FailureOrigin::Execution;
     if (result.is_err() || matches!(result, Ok(FinishReason::Cancelled)))
         && let Some((tasks, jobs)) = structured
     {
         super::cancel_background_jobs(tasks, jobs).await;
         if let Err(error) = super::settle_background_jobs(tasks, jobs).await {
             result = Err(error);
+            origin = FailureOrigin::Finalization;
         }
     }
     if let Err(error) = flush.await {
         result = Err(error);
+        origin = FailureOrigin::Finalization;
     }
     if let Err(error) = &result {
-        diagnostic(error)?;
+        diagnostic(error, origin)?;
     }
     result
 }
@@ -296,7 +306,7 @@ mod tests {
             ExecutionOutcome::new(Err(AcpRuntimeError::Loop("provider failed".into())), true),
             None,
             async { Ok(()) },
-            |_| panic!("cancelled model failure is not an error"),
+            |_, _| panic!("cancelled model failure is not an error"),
         )
         .await
         .unwrap();
@@ -323,7 +333,8 @@ mod tests {
                             order.lock().unwrap().push("flush");
                             Err(AcpRuntimeError::ClientClosed)
                         },
-                        |error| {
+                        |error, origin| {
+                            assert_eq!(origin, FailureOrigin::Finalization);
                             order.lock().unwrap().push("diagnostic");
                             diagnostic.lock().unwrap().push(error.to_string());
                             Ok(())
@@ -341,6 +352,37 @@ mod tests {
             ["running", "flush", "diagnostic", "idle"]
         );
         assert_eq!(diagnostic.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn finalization_marks_replacement_of_an_already_recorded_failure() {
+        for flush_fails in [false, true] {
+            let result = finalize(
+                ExecutionOutcome::new(Err(AcpRuntimeError::Loop("driver failed".into())), false),
+                None,
+                async {
+                    if flush_fails {
+                        Err(AcpRuntimeError::ClientClosed)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |error, origin| {
+                    assert_eq!(
+                        origin,
+                        if flush_fails {
+                            FailureOrigin::Finalization
+                        } else {
+                            FailureOrigin::Execution
+                        }
+                    );
+                    assert_eq!(matches!(error, AcpRuntimeError::ClientClosed), flush_fails);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
     }
 
     #[tokio::test]

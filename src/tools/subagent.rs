@@ -237,9 +237,9 @@ struct CreateOptions {
     cwd: Option<PathBuf>,
 }
 
-struct ForkSuccess {
+struct ForkReply {
     effects: crate::effects::PossibleEffects,
-    value: SubagentValue,
+    value: Result<SubagentValue, ChildError>,
     acknowledge: oneshot::Sender<()>,
 }
 
@@ -551,8 +551,10 @@ impl Subagents {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fork(
         &self,
+        parent_session_id: String,
         prior: SubagentValue,
         prompt: String,
         name: Option<String>,
@@ -619,33 +621,29 @@ impl Subagents {
             let reservation = operation.id.clone();
             let result = manager.run_fork(operation, &reply).await;
             manager.finish_forking(&source_state, &reservation).await;
-            match result {
-                Ok((value, effects)) => manager.handoff_fork_success(reply, value, effects).await,
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                }
-            }
+            manager
+                .handoff_fork_result(&parent_session_id, reply, result)
+                .await;
         });
-        match response.await.map_err(|_| {
+        let response = response.await.map_err(|_| {
             ChildError::Failed("subagent fork task stopped before returning a result".into())
-        })? {
-            Ok(success) => {
-                success.acknowledge.send(()).map_err(|_| {
-                    ChildError::Failed(
-                        "subagent fork task stopped before transferring ownership".into(),
-                    )
-                    .with_effects(success.effects)
-                })?;
-                Ok(success.value)
-            }
-            Err(error) => Err(error),
+        })?;
+        if response.acknowledge.send(()).is_err() {
+            return Err(match response.value {
+                Err(error) => error,
+                Ok(_) => ChildError::Failed(
+                    "subagent fork task stopped before transferring ownership".into(),
+                )
+                .with_effects(response.effects),
+            });
         }
+        response.value
     }
 
     async fn run_fork(
         &self,
         operation: ForkOperation,
-        reply: &oneshot::Sender<Result<ForkSuccess, ChildError>>,
+        reply: &oneshot::Sender<ForkReply>,
     ) -> Result<(SubagentValue, crate::effects::PossibleEffects), ChildError> {
         let ForkOperation {
             source_id,
@@ -985,23 +983,32 @@ impl Subagents {
         })
     }
 
-    async fn handoff_fork_success(
+    async fn handoff_fork_result(
         &self,
-        reply: oneshot::Sender<Result<ForkSuccess, ChildError>>,
-        value: SubagentValue,
-        effects: crate::effects::PossibleEffects,
+        parent_session_id: &str,
+        reply: oneshot::Sender<ForkReply>,
+        result: Result<(SubagentValue, crate::effects::PossibleEffects), ChildError>,
     ) {
-        let cleanup = value.clone();
+        let (cleanup, effects) = match &result {
+            Ok((value, effects)) => (Some(value.clone()), *effects),
+            Err(error) => (None, error.possible_effects()),
+        };
         let (acknowledge, acknowledged) = oneshot::channel();
         let sent = reply
-            .send(Ok(ForkSuccess {
-                value,
+            .send(ForkReply {
+                value: result.map(|(value, _)| value),
                 effects,
                 acknowledge,
-            }))
+            })
             .is_ok();
+        // Both outcomes need acknowledgment: send can succeed while the caller
+        // drops its future before receiving the reply. Only an acknowledged
+        // caller owns failure recording through result().
         if !sent || acknowledged.await.is_err() {
-            self.cleanup_abandoned_fork(&cleanup).await;
+            if let Some(value) = cleanup {
+                self.cleanup_abandoned_fork(&value).await;
+            }
+            record_child_failure(parent_session_id, effects);
         }
     }
 
@@ -1492,15 +1499,18 @@ fn tool_failure(error: &ChildError) -> ToolError {
     }
 }
 
+fn record_child_failure(session_id: &str, effects: crate::effects::PossibleEffects) {
+    if let Err(log_error) = crate::fatal::record_child_failure(session_id, effects) {
+        tracing::warn!(%log_error, "could not store child failure observations");
+    }
+}
+
 fn result(
     request: ToolRequest,
     value: Result<SubagentValue, ChildError>,
 ) -> Result<ToolResult, ToolError> {
     let value = value.map_err(|error| {
-        let effects = error.possible_effects();
-        if let Err(log_error) = crate::fatal::record_child_failure(&request.session_id.0, effects) {
-            tracing::warn!(%log_error, "could not store child failure observations");
-        }
+        record_child_failure(&request.session_id.0, error.possible_effects());
         tool_failure(&error)
     })?;
     Ok(ToolResult::new(ToolResultPart::success(
@@ -1640,10 +1650,12 @@ impl Tool for ForkTool {
         let input: ForkInput = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let contract = input.output_schema.map(OutputContract::new).transpose()?;
+        let parent_session_id = request.session_id.0.clone();
         result(
             request,
             self.manager
                 .fork(
+                    parent_session_id,
                     input.subagent,
                     input.prompt,
                     input.name,

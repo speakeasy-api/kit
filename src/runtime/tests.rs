@@ -1722,3 +1722,90 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     let max_depth_prompt = runtime.system_prompt(runtime.max_subagent_depth());
     assert!(max_depth_prompt.contains("This task was delegated to you by the primary agent."));
 }
+
+#[tokio::test]
+async fn root_compose_receipts_preserve_both_entry_points_and_background_lifetime() {
+    for native in [false, true] {
+        for failing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+            let compose = runtime.compose(0);
+            let jobs = compose.backgroundable.background_jobs.clone();
+            let source: Arc<dyn ToolSource> = Arc::new(compose.compose.clone());
+            let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([source]));
+            let session_id = SessionId::new("root-effects");
+            let turn_id = TurnId::new("first");
+            let permissions = Arc::new(AllowAllPermissions);
+            let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+            let owned = OwnedToolContext {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                metadata: MetadataMap::new(),
+                permissions: permissions.clone(),
+                resources: resources.clone(),
+                cancellation: None,
+                execution_scope: Some(ToolExecutionScope {
+                    executor,
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    permissions,
+                    resources,
+                    cancellation: None,
+                }),
+                approved_request: None,
+            };
+            let request = ToolRequest::new(
+                ToolCallId::new("effects-compose"),
+                ToolName::new("compose"),
+                json!({
+                    "script": if failing { "return fail(\"FAILED\", \"private failure text\")" } else { "return shell({ command: \"sleep 0.05\" })" }, "background": true,
+                }),
+                session_id,
+                turn_id,
+            );
+            let invocation = async {
+                if native {
+                    match compose
+                        .backgroundable
+                        .invoke_outcome(request, &mut owned.borrowed())
+                        .await
+                    {
+                        ToolExecutionOutcome::Completed(_) => assert!(!failing),
+                        ToolExecutionOutcome::Failed(_) => assert!(failing),
+                        other => panic!("unexpected native outcome: {other:?}"),
+                    }
+                } else {
+                    assert_eq!(
+                        compose
+                            .backgroundable
+                            .invoke(request, &mut owned.borrowed())
+                            .await
+                            .is_err(),
+                        failing
+                    );
+                }
+            };
+            let later_prompt = async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !jobs.observations.snapshot().tool_execution_start_reported {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                jobs.begin_turn();
+                assert!(jobs.observations.snapshot().tool_execution_start_reported);
+            };
+            tokio::join!(invocation, later_prompt);
+            let effects = jobs.observations.snapshot();
+            assert_eq!(
+                effects.source,
+                crate::effects::ObservationSource::LocalSession
+            );
+            assert!(effects.tool_execution_start_reported);
+            assert!(effects.tool_execution_completion_reported);
+            assert!(effects.observation_incomplete);
+            assert!(!serde_json::to_string(&effects).unwrap().contains("private"));
+        }
+    }
+}

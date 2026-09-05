@@ -266,6 +266,19 @@ impl Drop for SessionClaim {
     }
 }
 
+// Preserve startup classification until the single recording boundary, including
+// failures that occur before a local observation owner has been created.
+enum AcpStartupFailure {
+    Runtime(AcpRuntimeError),
+    Loop(LoopError, crate::effects::Observations),
+}
+
+impl From<AcpRuntimeError> for AcpStartupFailure {
+    fn from(error: AcpRuntimeError) -> Self {
+        Self::Runtime(error)
+    }
+}
+
 pub(crate) struct AcpDriver {
     pub driver: LoopDriver<SelectableSession>,
     pub skills: Vec<Skill>,
@@ -951,40 +964,83 @@ impl Runtime {
         skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
-            .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
-                &self.root,
-            ))))
-            .with(Observed::new(DocsTool::new()))
-            .with(Observed::new(ShellTool::new(self.root.clone())))
-            .with(Observed::new(EditTool::new(self.root.clone())));
+            .with(
+                Observed::new(ArtifactTool::new(crate::artifacts::base(&self.root)))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .with(
+                Observed::new(DocsTool::new())
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .with(
+                Observed::new(ShellTool::new(self.root.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .with(
+                Observed::new(EditTool::new(self.root.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            );
         if depth < self.max_subagent_depth {
             children
-                .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
-                .register(Observed::new(ForkTool::new(subagents.clone(), depth)));
+                .register(
+                    Observed::new(SubagentTool::new(subagents.clone(), depth))
+                        .with_observations(background_jobs.observations.clone()),
+                )
+                .register(
+                    Observed::new(ForkTool::new(subagents.clone(), depth))
+                        .with_observations(background_jobs.observations.clone()),
+                );
         }
         children
-            .register(Observed::new(PromptTool::new(subagents.clone())))
-            .register(Observed::new(SubagentsTool::new(subagents.clone())))
-            .register(Observed::new(CloseTool::new(subagents, {
-                let background_jobs = background_jobs.clone();
-                move |call_id, allow_pending| {
-                    if allow_pending {
-                        background_jobs.cancel(call_id)
-                    } else {
-                        background_jobs.cancel_running(call_id)
+            .register(
+                Observed::new(PromptTool::new(subagents.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(SubagentsTool::new(subagents.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(CloseTool::new(subagents, {
+                    let background_jobs = background_jobs.clone();
+                    move |call_id, allow_pending| {
+                        if allow_pending {
+                            background_jobs.cancel(call_id)
+                        } else {
+                            background_jobs.cancel_running(call_id)
+                        }
                     }
-                }
-            })))
-            .register(Observed::new(A2aTool::new()))
-            .register(Observed::new(ToolSearch::new(self.mcp.clone())))
-            .register(Observed::new(AuthTool::new(self.mcp.clone())))
-            .register(Observed::new(McpTool::new(self.mcp.clone())));
+                }))
+                .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(A2aTool::new())
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(ToolSearch::new(self.mcp.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(AuthTool::new(self.mcp.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            )
+            .register(
+                Observed::new(McpTool::new(self.mcp.clone()))
+                    .with_observations(background_jobs.observations.clone()),
+            );
         if let Some(skill_tool) = &self.dynamic_skill_tool {
-            children.register(observe_shared(Arc::clone(skill_tool)));
+            children.register(observe_shared(
+                Arc::clone(skill_tool),
+                background_jobs.observations.clone(),
+            ));
         } else {
             let skill_tools = skills.tool_registry();
             if let Some(skill_tool) = skill_tools.get(&ToolName::new("skill")) {
-                children.register(observe_shared(skill_tool));
+                children.register(observe_shared(
+                    skill_tool,
+                    background_jobs.observations.clone(),
+                ));
             }
         }
         let hidden_tools = children.clone();
@@ -1072,27 +1128,25 @@ impl Runtime {
             )
         })?;
         let subagents = self.subagents.fresh();
+        let background_jobs = BackgroundJobs::default();
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
-                0,
-                subagents,
-                BackgroundJobs::default(),
-                skills,
-            ))
+            .add_tool_source(self.compose_with_jobs(0, subagents, background_jobs.clone(), skills))
             .task_manager(background_task_manager())
             .mutator(compactor)
+            .observer(background_jobs.observations.clone())
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
             .input(vec![Item::text(ItemKind::User, prompt)])
             .build()
             .map_err(|error| {
-                record_runtime_failure(
+                record_runtime_failure_observed(
                     &session_id,
                     crate::fatal::Surface::Prompt,
                     "agent_build",
                     error.to_string(),
+                    &background_jobs.observations,
                 )
             })?;
         let mut driver = match agent
@@ -1110,6 +1164,7 @@ impl Runtime {
                     &session_id,
                     crate::fatal::Surface::Prompt,
                     &error,
+                    &background_jobs.observations,
                 ));
             }
         };
@@ -1119,6 +1174,7 @@ impl Runtime {
                 &session_id,
                 crate::fatal::Surface::Prompt,
                 &error,
+                &background_jobs.observations,
             )),
         }
     }
@@ -1129,6 +1185,22 @@ impl Runtime {
         depth: usize,
         cancellation: Option<CancellationToken>,
     ) -> Result<String, LoopError> {
+        self.run_cancelled_observed(
+            prompt,
+            depth,
+            cancellation,
+            crate::effects::Observations::local_session(),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_cancelled_observed(
+        self: &Arc<Self>,
+        prompt: String,
+        depth: usize,
+        cancellation: Option<CancellationToken>,
+        observations: crate::effects::Observations,
+    ) -> Result<String, LoopError> {
         let controller = CancellationController::new();
         let bridge = cancellation.map(|token| {
             let controller = controller.clone();
@@ -1138,7 +1210,7 @@ impl Runtime {
             })
         });
         let result = self
-            .run_interruptible(prompt, depth, Some(controller.handle()))
+            .run_interruptible_observed(prompt, depth, Some(controller.handle()), observations)
             .await;
         if let Some(bridge) = bridge {
             bridge.abort();
@@ -1153,6 +1225,22 @@ impl Runtime {
         prompt: String,
         depth: usize,
         cancellation: Option<CancellationHandle>,
+    ) -> Result<String, LoopError> {
+        self.run_interruptible_observed(
+            prompt,
+            depth,
+            cancellation,
+            crate::effects::Observations::local_session(),
+        )
+        .await
+    }
+
+    async fn run_interruptible_observed(
+        self: &Arc<Self>,
+        prompt: String,
+        depth: usize,
+        cancellation: Option<CancellationHandle>,
+        observations: crate::effects::Observations,
     ) -> Result<String, LoopError> {
         if crate::resilient_fs::shutdown_token().is_cancelled() {
             return Err(LoopError::InvalidState(
@@ -1178,17 +1266,17 @@ impl Runtime {
         )
         .map_err(LoopError::InvalidState)?;
         let subagents = self.subagents.fresh();
+        let background_jobs = BackgroundJobs {
+            observations: observations.clone(),
+            ..Default::default()
+        };
         let builder = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
-                depth,
-                subagents,
-                BackgroundJobs::default(),
-                skills,
-            ))
+            .add_tool_source(self.compose_with_jobs(depth, subagents, background_jobs, skills))
             .task_manager(background_task_manager())
             .mutator(compactor)
+            .observer(observations)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
         let builder = builder.cancellation(controller.handle());
@@ -1261,6 +1349,8 @@ impl Runtime {
             .await
     }
 
+    // All callers receive an already-recorded error. Do not record it again at
+    // a protocol boundary: that would discard the typed loop classification.
     pub(crate) async fn start_acp_driver_with_initial<I>(
         self: &Arc<Self>,
         context: AcpDriverContext<I>,
@@ -1270,13 +1360,43 @@ impl Runtime {
     where
         I: LoopObserver + Clone + 'static,
     {
+        self.prepare_acp_driver_with_initial(context, claim, forked)
+            .await
+            .map_err(|failure| {
+                AcpRuntimeError::Loop(match failure {
+                    AcpStartupFailure::Runtime(error) => record_runtime_failure(
+                        claim.id(),
+                        crate::fatal::Surface::Acp,
+                        "session_start",
+                        error.to_string(),
+                    ),
+                    AcpStartupFailure::Loop(error, observations) => record_loop_failure(
+                        claim.id(),
+                        crate::fatal::Surface::Acp,
+                        &error,
+                        &observations,
+                    ),
+                })
+            })
+    }
+
+    async fn prepare_acp_driver_with_initial<I>(
+        self: &Arc<Self>,
+        context: AcpDriverContext<I>,
+        claim: &mut SessionClaim,
+        forked: Option<AcpForkState>,
+    ) -> Result<AcpDriver, AcpStartupFailure>
+    where
+        I: LoopObserver + Clone + 'static,
+    {
         let cwd = crate::resilient_fs::canonicalize(&context.cwd)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         if cwd != self.root || !context.additional_directories.is_empty() {
             return Err(AcpRuntimeError::Loop(format!(
                 "this Kit runtime is fixed to {} and does not accept additional directories",
                 self.root.display()
-            )));
+            ))
+            .into());
         }
         let request = claim.request.clone();
         let session_id = request.id.clone();
@@ -1293,7 +1413,8 @@ impl Runtime {
             if request.resume {
                 return Err(AcpRuntimeError::Loop(
                     "a forked transcript requires a new session identity".into(),
-                ));
+                )
+                .into());
             }
             transcript
         } else if request.resume {
@@ -1367,14 +1488,17 @@ impl Runtime {
             .task_manager(task_manager)
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
+            .observer(background_jobs.observations.clone())
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
             .cancellation(context.cancellation)
             .build()
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+            .map_err(|error| AcpStartupFailure::Loop(error, background_jobs.observations.clone()))?
             .start(session_config)
             .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+            .map_err(|error| {
+                AcpStartupFailure::Loop(error, background_jobs.observations.clone())
+            })?;
         let driver = AcpDriver {
             driver,
             skills: skill_catalog,
@@ -1704,6 +1828,7 @@ pub(crate) struct BackgroundActivity {
 
 #[derive(Clone)]
 pub(crate) struct BackgroundJobs {
+    pub(crate) observations: crate::effects::Observations,
     state: Arc<Mutex<BackgroundJobState>>,
     activity: watch::Sender<u64>,
 }
@@ -1712,6 +1837,7 @@ impl Default for BackgroundJobs {
     fn default() -> Self {
         let (activity, _) = watch::channel(0);
         Self {
+            observations: crate::effects::Observations::local_session(),
             state: Arc::new(Mutex::new(BackgroundJobState::default())),
             activity,
         }
@@ -2050,7 +2176,10 @@ impl Tool for BackgroundableCompose {
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
         let request = Self::sanitized(request)?;
         let _job = self.begin_background(background, &call_id, ctx);
-        match self.inner.invoke(request, ctx).await {
+        self.background_jobs.observations.invocation_started();
+        let outcome = self.inner.invoke(request, ctx).await;
+        self.background_jobs.observations.invocation_completed();
+        match outcome {
             Ok(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
                 {
@@ -2079,7 +2208,12 @@ impl Tool for BackgroundableCompose {
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
         let _job = self.begin_background(background, &call_id, ctx);
-        match self.inner.invoke_outcome(request, ctx).await {
+        self.background_jobs.observations.invocation_started();
+        let outcome = self.inner.invoke_outcome(request, ctx).await;
+        if !matches!(outcome, ToolExecutionOutcome::Interrupted(_)) {
+            self.background_jobs.observations.invocation_completed();
+        }
+        match outcome {
             ToolExecutionOutcome::Completed(mut result) => {
                 match crate::compose_output::guard(&artifact_directory, result.result.output).await
                 {
@@ -2333,7 +2467,28 @@ fn record_runtime_failure(
     code: &str,
     rendered: String,
 ) -> String {
-    match crate::fatal::record_runtime_error(session_id, surface, code) {
+    record_runtime_failure_observed(
+        session_id,
+        surface,
+        code,
+        rendered,
+        &crate::effects::Observations::default(),
+    )
+}
+
+fn record_runtime_failure_observed(
+    session_id: &str,
+    surface: crate::fatal::Surface,
+    code: &str,
+    rendered: String,
+    observations: &crate::effects::Observations,
+) -> String {
+    match crate::fatal::record_runtime_error_with_effects(
+        session_id,
+        surface,
+        code,
+        observations.snapshot(),
+    ) {
         Ok(path) => format!("{rendered}; fatal log: {}", path.display()),
         Err(log_error) => {
             eprintln!("could not store fatal error log for {session_id}: {log_error}");
@@ -2346,9 +2501,15 @@ fn record_loop_failure(
     session_id: &str,
     surface: crate::fatal::Surface,
     error: &LoopError,
+    observations: &crate::effects::Observations,
 ) -> String {
     let rendered = crate::fatal::render_loop_error(error);
-    match crate::fatal::record_loop_error(session_id, surface, error) {
+    match crate::fatal::record_loop_error_with_effects(
+        session_id,
+        surface,
+        error,
+        observations.snapshot(),
+    ) {
         Ok(Some(path)) => format!("{rendered}; fatal log: {}", path.display()),
         Ok(None) => rendered,
         Err(log_error) => {

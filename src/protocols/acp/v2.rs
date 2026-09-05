@@ -119,23 +119,40 @@ fn list_sessions_error(error: ListSessionsError) -> agent_client_protocol::Error
     }
 }
 
+#[cfg(test)]
 fn map_loop_error(session_id: &wire::SessionId, error: &LoopError) -> AcpRuntimeError {
-    if matches!(error, LoopError::Cancelled) {
-        AcpRuntimeError::Cancelled
-    } else {
-        let session_id = agentkit_acp::SessionId::new(session_id.to_string());
-        super::record_acp_loop_failure(&session_id, error)
-    }
+    map_loop_error_observed(session_id, error, &crate::effects::Observations::default())
 }
-
+#[cfg(test)]
 fn loop_error_stop_reason(
     session_id: &wire::SessionId,
     error: &LoopError,
 ) -> Result<FinishReason, AcpRuntimeError> {
+    loop_error_stop_reason_observed(session_id, error, &crate::effects::Observations::default())
+}
+
+fn map_loop_error_observed(
+    session_id: &wire::SessionId,
+    error: &LoopError,
+    observations: &crate::effects::Observations,
+) -> AcpRuntimeError {
+    if matches!(error, LoopError::Cancelled) {
+        AcpRuntimeError::Cancelled
+    } else {
+        let session_id = agentkit_acp::SessionId::new(session_id.to_string());
+        super::record_acp_loop_failure(&session_id, error, observations)
+    }
+}
+
+fn loop_error_stop_reason_observed(
+    session_id: &wire::SessionId,
+    error: &LoopError,
+    observations: &crate::effects::Observations,
+) -> Result<FinishReason, AcpRuntimeError> {
     if matches!(error, LoopError::Cancelled) {
         Ok(FinishReason::Cancelled)
     } else {
-        Err(map_loop_error(session_id, error))
+        Err(map_loop_error_observed(session_id, error, observations))
     }
 }
 
@@ -1193,8 +1210,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity,).await,
-                        Err(error) => Err(map_loop_error(&session_id, &error)),
+                        &activity, &background_jobs.observations,).await,
+                        Err(error) => Err(map_loop_error_observed(&session_id, &error, &background_jobs.observations)),
                     };
                     if let Err(error) = result {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
@@ -1212,7 +1229,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity,).await
+                        &activity, &background_jobs.observations,).await
                     {
                         eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                     }
@@ -1257,6 +1274,12 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         && let Err(error) = super::settle_background_jobs(tasks, background_jobs).await
     {
         handle.stop_injection_turn();
+        let error = super::record_acp_runtime_failure_observed(
+            &agentkit_acp::SessionId::new(session_id.to_string()),
+            "prompt_preparation_settlement",
+            error,
+            &background_jobs.observations,
+        );
         let _ = reply.send(Err(error));
         return Ok(());
     }
@@ -1269,7 +1292,13 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
                 Ok(current) => current,
                 Err(error) => {
                     handle.stop_injection_turn();
-                    let _ = reply.send(Err(AcpRuntimeError::Loop(error)));
+                    let error = super::record_acp_runtime_failure_observed(
+                        &agentkit_acp::SessionId::new(session_id.to_string()),
+                        "skill_refresh",
+                        error,
+                        &background_jobs.observations,
+                    );
+                    let _ = reply.send(Err(error));
                     return Ok(());
                 }
             };
@@ -1282,9 +1311,16 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
             .submit(skills, items, |items| driver.submit_input(items))
             .map_err(|error| match error {
                 skill_catalog::SubmitError::Catalog(error) => {
-                    AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
+                    super::record_acp_runtime_failure_observed(
+                        &agentkit_acp::SessionId::new(session_id.to_string()),
+                        "skill_catalog",
+                        error,
+                        &background_jobs.observations,
+                    )
                 }
-                skill_catalog::SubmitError::Submit(error) => map_loop_error(session_id, &error),
+                skill_catalog::SubmitError::Submit(error) => {
+                    map_loop_error_observed(session_id, &error, &background_jobs.observations)
+                }
             })?;
         integration.begin_prompt(session_id)
     });
@@ -1321,6 +1357,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
             structured_completion.then_some((tasks, background_jobs)),
             activity,
             ExecutionOrigin::Prompt,
+            &background_jobs.observations,
         )
         .await
     }
@@ -1360,6 +1397,7 @@ impl<S: ModelSession + Send + 'static> TurnControl<S> for AcpSessionHandle {
     }
 }
 
+#[cfg(test)]
 async fn drive_prompt<S, C>(
     session_id: &wire::SessionId,
     driver: &mut LoopDriver<S>,
@@ -1371,12 +1409,41 @@ where
     S: ModelSession + Send + 'static,
     C: TurnControl<S>,
 {
+    let observations = crate::effects::Observations::local_session();
+    let mut recorded = false;
+    drive_prompt_observed(
+        session_id,
+        driver,
+        control,
+        cancellation_generation,
+        structured,
+        &observations,
+        &mut recorded,
+    )
+    .await
+}
+
+async fn drive_prompt_observed<S, C>(
+    session_id: &wire::SessionId,
+    driver: &mut LoopDriver<S>,
+    control: &C,
+    cancellation_generation: u64,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    observations: &crate::effects::Observations,
+    failure_recorded: &mut bool,
+) -> Result<FinishReason, AcpRuntimeError>
+where
+    S: ModelSession + Send + 'static,
+    C: TurnControl<S>,
+{
     let result = drive_prompt_inner(
         session_id,
         driver,
         control,
         cancellation_generation,
         structured,
+        observations,
+        failure_recorded,
     )
     .await;
     if matches!(result, Ok(FinishReason::Cancelled)) {
@@ -1396,6 +1463,8 @@ async fn drive_prompt_inner<S, C>(
     control: &C,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    observations: &crate::effects::Observations,
+    failure_recorded: &mut bool,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
@@ -1409,7 +1478,8 @@ where
                 if control.is_cancelled_since(cancellation_generation) {
                     return Ok(FinishReason::Cancelled);
                 }
-                return loop_error_stop_reason(session_id, &error);
+                *failure_recorded = !matches!(error, LoopError::Cancelled);
+                return loop_error_stop_reason_observed(session_id, &error, observations);
             }
         };
         if control.is_cancelled_since(cancellation_generation) {
@@ -1497,7 +1567,8 @@ where
                     if control.is_cancelled_since(cancellation_generation) {
                         return Ok(FinishReason::Cancelled);
                     }
-                    return loop_error_stop_reason(session_id, &error);
+                    *failure_recorded = !matches!(error, LoopError::Cancelled);
+                    return loop_error_stop_reason_observed(session_id, &error, observations);
                 }
             }
         }
@@ -1515,17 +1586,21 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
     activity: &SessionActivity,
     origin: ExecutionOrigin,
+    observations: &crate::effects::Observations,
 ) -> Result<(), AcpRuntimeError> {
     activity
         .execute(
             origin,
             async {
-                let result = drive_prompt(
+                let mut failure_recorded = false;
+                let result = drive_prompt_observed(
                     session_id,
                     driver,
                     handle,
                     cancellation_generation,
                     structured,
+                    observations,
+                    &mut failure_recorded,
                 )
                 .await;
                 let outcome = super::activity::ExecutionOutcome::new(
@@ -1539,9 +1614,31 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
                     outcome,
                     structured,
                     integration.flush_session_updates(session_id),
-                    |error| sink.update(error_diagnostic_notification(session_id, error)),
+                    |error, origin| {
+                        if (!failure_recorded || origin == super::activity::FailureOrigin::Finalization)
+                            && let Err(log_error) = crate::fatal::record_runtime_error_with_effects(
+                                &session_id.to_string(),
+                                crate::fatal::Surface::Acp,
+                                "session_finalization",
+                                observations.snapshot(),
+                            )
+                        {
+                            tracing::warn!(%log_error, "could not record v2 finalization observations");
+                        }
+                        sink.update(error_diagnostic_notification(session_id, error))
+                    },
                 )
                 .await;
+                if matches!(result, Ok(FinishReason::Cancelled))
+                    && let Err(error) = crate::fatal::record_loop_error_with_effects(
+                        &session_id.to_string(),
+                        crate::fatal::Surface::Acp,
+                        &LoopError::Cancelled,
+                        observations.snapshot(),
+                    )
+                {
+                    tracing::warn!(%error, "could not record v2 cancellation observations");
+                }
                 integration.finish_prompt(session_id);
                 result
             },
@@ -1551,6 +1648,7 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
         .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
     session_id: &wire::SessionId,
     integration: &AcpIntegration,
@@ -1559,6 +1657,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     driver: &mut LoopDriver<S>,
     sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
     activity: &SessionActivity,
+    observations: &crate::effects::Observations,
 ) -> Result<(), AcpRuntimeError> {
     if claim_prompt(busy).is_err() {
         return Ok(());
@@ -1577,6 +1676,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
         None,
         activity,
         ExecutionOrigin::Autonomous,
+        observations,
     )
     .await;
     integration.finish_prompt(session_id);
@@ -3134,6 +3234,7 @@ mod tests {
         handle.start_injection_turn();
         let generation = handle.cancellation_handle().generation();
         let background_jobs = BackgroundJobs::default();
+        let observations = crate::effects::Observations::local_session();
         let prompt = run_active_turn(
             &session_id,
             &integration,
@@ -3144,6 +3245,7 @@ mod tests {
             Some((&tasks, &background_jobs)),
             &activity,
             ExecutionOrigin::Prompt,
+            &observations,
         );
         tokio::pin!(prompt);
 
@@ -3461,6 +3563,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await
         .unwrap();
@@ -3518,6 +3621,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await
         .unwrap();
@@ -3535,6 +3639,7 @@ mod tests {
                 &mut driver,
                 &sink,
                 &activity,
+                &crate::effects::Observations::local_session(),
             )
             .await
             .unwrap();
@@ -3601,6 +3706,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await;
 
@@ -3675,6 +3781,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await
         .unwrap();
@@ -3732,6 +3839,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await;
         assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
@@ -3801,6 +3909,7 @@ mod tests {
             &mut driver,
             &sink,
             &activity,
+            &crate::effects::Observations::local_session(),
         )
         .await;
 
@@ -4376,5 +4485,200 @@ mod tests {
             server.list_sessions(request).await,
             Err(ListSessionsError::InvalidCursor)
         ));
+    }
+    #[tokio::test]
+    async fn root_stream_cancellation_records_the_same_local_owner() {
+        if crate::effects::isolated_test(
+            "protocols::acp::v2::tests::root_stream_cancellation_records_the_same_local_owner",
+        ) {
+            return;
+        }
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("effects-v2-cancel");
+        let loop_id = SessionId::new("effects-v2-loop");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(
+                AcpSessionBinding::new(session_id.clone(), loop_id.clone(), sink.clone())
+                    .cancellation(CancellationController::new()),
+            )
+            .unwrap();
+        let observations = crate::effects::Observations::local_session();
+        let observer = ResponseReplacementObserver::new(
+            integration.clone(),
+            sink.clone(),
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(StreamingCancellationAdapter {
+                interrupt: handle.clone(),
+            })
+            .observer(observer)
+            .observer(observations.clone())
+            .cancellation(handle.cancellation_handle())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "private prompt")])
+            .unwrap();
+        handle.prepare_injection_turn();
+        let generation = handle.cancellation_handle().generation();
+        handle.start_injection_turn();
+        run_active_turn(
+            &session_id,
+            &integration,
+            &handle,
+            &mut driver,
+            &sink,
+            generation,
+            None,
+            &activity,
+            ExecutionOrigin::Prompt,
+            &observations,
+        )
+        .await
+        .unwrap();
+        let record = crate::effects::test_record(&session_id.to_string());
+        assert_eq!(record["kind"], "cancelled");
+        assert_eq!(record["possible_effects"]["source"], "local_session");
+        assert_eq!(
+            record["possible_effects"]["assistant_output_observed"],
+            true
+        );
+        assert_eq!(
+            record["possible_effects"]["tool_execution_start_reported"],
+            false
+        );
+        assert!(
+            !serde_json::to_string(&record)
+                .unwrap()
+                .contains("private prompt")
+        );
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::Cancelled,
+        );
+    }
+    #[tokio::test]
+    async fn preparation_failure_retains_previous_prompt_observations() {
+        if crate::effects::isolated_test(
+            "protocols::acp::v2::tests::preparation_failure_retains_previous_prompt_observations",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let plugins = crate::plugins::PluginRuntime::load(
+            config.clone(),
+            root.path().to_path_buf(),
+            root.path().join("cache"),
+            root.path().join("data"),
+        )
+        .await
+        .unwrap();
+        let runtime = Runtime::with_plugin_runtime(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            Some(plugins),
+        )
+        .unwrap();
+        let runtime = Runtime::with_mcp_config(
+            runtime,
+            None,
+            Vec::new(),
+            false,
+            crate::tools::mcp::CredentialStorage::Memory,
+        )
+        .await
+        .unwrap();
+        let baseline = runtime.current_skills().await.unwrap();
+        let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&baseline.skills).unwrap();
+        drop(baseline);
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("effects-v2-preparation");
+        let loop_id = SessionId::new("effects-v2-preparation-loop");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let turns = Arc::new(AtomicU64::new(0));
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ProviderError,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let jobs = BackgroundJobs::default();
+        // A prior invocation's observations are cumulative, not attributed to this rejected prompt.
+        jobs.observations.invocation_started();
+        jobs.begin_turn();
+        std::fs::write(&config, "invalid = [").unwrap();
+        handle.prepare_injection_turn();
+        let (reply, response) = oneshot::channel();
+        prepare_prompt(
+            &session_id,
+            PromptSkillSource::Runtime(&runtime),
+            &integration,
+            &handle,
+            &mut skill_catalog,
+            &mut driver,
+            PromptCommand {
+                request: wire::PromptRequest::new(
+                    session_id.clone(),
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                        "next prompt",
+                    ))],
+                ),
+                cancellation_generation: handle.cancellation_handle().generation(),
+                reply,
+            },
+            &sink,
+            &tasks,
+            &jobs,
+            false,
+            &activity,
+        )
+        .await
+        .unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string().matches("fatal log:").count(), 1);
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(recording.updates.lock().unwrap().is_empty());
+        let record = crate::effects::test_record(&session_id.to_string());
+        assert_eq!(record["code"], "skill_refresh");
+        assert_eq!(record["possible_effects"]["source"], "local_session");
+        assert_eq!(
+            record["possible_effects"]["tool_execution_start_reported"],
+            true
+        );
+        assert_eq!(
+            std::fs::read_dir(
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                    .join(".kit/errors")
+                    .join(session_id.to_string())
+            )
+            .unwrap()
+            .count(),
+            1
+        );
     }
 }

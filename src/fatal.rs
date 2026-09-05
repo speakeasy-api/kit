@@ -9,7 +9,7 @@ use agentkit_loop::LoopError;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u64 = 3;
+const SCHEMA_VERSION: u64 = 4;
 const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 const MAX_RECORD_BYTES: usize = 32 * 1024;
 const MAX_RECORDS_PER_SESSION: usize = 50;
@@ -230,37 +230,51 @@ fn split_diagnostics(message: &str) -> (&str, Option<TransportDiagnostics>) {
     (plain, Some(diagnostics))
 }
 
-pub(crate) fn record_loop_error(
+/// Explicit observation owner, including cancellation without reclassifying it.
+pub(crate) fn record_loop_error_with_effects(
     session_id: &str,
     surface: Surface,
     error: &LoopError,
+    effects: crate::effects::PossibleEffects,
 ) -> Result<Option<PathBuf>, String> {
-    let Some((kind, code, message, diagnostics)) = classify(error) else {
+    let (kind, code, message, diagnostics) = if matches!(error, LoopError::Cancelled) {
+        (
+            "cancelled",
+            "cancelled",
+            "execution cancelled; effects and completion are unconfirmed".into(),
+            None,
+        )
+    } else if let Some(classified) = classify(error) {
+        classified
+    } else {
         return Ok(None);
     };
-    write_default(
+    write_default_with_effects(
         session_id,
         surface,
         kind,
         code,
         &message,
         diagnostics.as_ref(),
+        effects,
     )
     .map(Some)
 }
 
-pub(crate) fn record_runtime_error(
+pub(crate) fn record_runtime_error_with_effects(
     session_id: &str,
     surface: Surface,
     code: &str,
+    effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
-    write_default(
+    write_default_with_effects(
         session_id,
         surface,
         "runtime",
         canonical_code(code),
         "runtime failed before the session could continue",
         None,
+        effects,
     )
 }
 
@@ -398,18 +412,19 @@ fn canonical_code(code: &str) -> &str {
     }
 }
 
-fn write_default(
+fn write_default_with_effects(
     session_id: &str,
     surface: Surface,
     kind: &str,
     code: &str,
     message: &str,
     diagnostics: Option<&TransportDiagnostics>,
+    effects: crate::effects::PossibleEffects,
 ) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| "HOME is unset; cannot store fatal error log".to_owned())?;
-    write_in_with_diagnostics(
+    write_in_with_effects(
         &PathBuf::from(home).join(".kit/errors"),
         session_id,
         surface,
@@ -417,6 +432,7 @@ fn write_default(
         code,
         message,
         diagnostics,
+        effects,
     )
 }
 
@@ -432,6 +448,7 @@ fn write_in(
     write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
 }
 
+#[cfg(test)]
 fn write_in_with_diagnostics(
     base: &Path,
     session_id: &str,
@@ -590,8 +607,8 @@ mod tests {
     use super::{
         DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
         MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
-        TransportSource, TransportStage, bounded, classify, event_order, record_loop_error,
-        render_loop_error, split_diagnostics, write_in, write_in_with_diagnostics,
+        TransportSource, TransportStage, bounded, classify, event_order, render_loop_error,
+        split_diagnostics, write_in, write_in_with_diagnostics,
     };
 
     fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
@@ -661,7 +678,7 @@ mod tests {
         .unwrap();
         assert_eq!(path.parent().unwrap(), root.path().join("session-1"));
         let record: FatalRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(record.schema_version, 3);
+        assert_eq!(record.schema_version, 4);
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.surface, "prompt");
         assert_eq!(record.code, "stream_transport");
@@ -739,7 +756,7 @@ mod tests {
         let encoded = fs::read_to_string(path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(value["schema_version"], 3);
+        assert_eq!(value["schema_version"], 4);
         assert_eq!(value["diagnostics"]["response_request_id"], "req_safe-123");
         assert_eq!(value["diagnostics"]["stage"], "stream");
         assert_eq!(value["diagnostics"]["retryable"], true);
@@ -867,9 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_not_recorded() {
-        let result = record_loop_error("session-1", Surface::Acp, &LoopError::Cancelled).unwrap();
-        assert!(result.is_none());
+    fn cancellation_is_distinct_from_provider_failure_classification() {
+        assert!(classify(&LoopError::Cancelled).is_none());
     }
 
     #[test]
@@ -945,5 +961,64 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+    #[test]
+    fn local_cancellation_has_conservative_post_cleanup_metadata() {
+        if crate::effects::isolated_test(
+            "fatal::tests::local_cancellation_has_conservative_post_cleanup_metadata",
+        ) {
+            return;
+        }
+        let observations = crate::effects::Observations::local_session();
+        observations.invocation_started();
+        let cleanup = observations.clone();
+        cleanup.invocation_completed();
+        let path = super::record_loop_error_with_effects(
+            "root-cancelled",
+            Surface::Acp,
+            &LoopError::Cancelled,
+            observations.snapshot(),
+        )
+        .unwrap()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 4);
+        assert_eq!(value["kind"], "cancelled");
+        assert_eq!(value["code"], "cancelled");
+        assert_eq!(value["possible_effects"]["source"], "local_session");
+        assert_eq!(
+            value["possible_effects"]["tool_execution_completion_reported"],
+            true
+        );
+        assert_eq!(value["possible_effects"]["observation_incomplete"], true);
+    }
+
+    #[test]
+    fn schema_v3_effects_and_new_local_source_remain_strict() {
+        let root = tempfile::tempdir().unwrap();
+        let path = write_in(
+            root.path(),
+            "session-schema",
+            Surface::Prompt,
+            "runtime",
+            "failed",
+            "failed",
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        value["schema_version"] = json!(3);
+        for source in ["unknown", "acp_notifications", "local_session"] {
+            value["possible_effects"]["source"] = json!(source);
+            let record: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(record.possible_effects).unwrap()["source"],
+                source
+            );
+        }
+        value["possible_effects"]["source"] = json!("unknown-future-source");
+        assert!(serde_json::from_value::<FatalRecord>(value.clone()).is_err());
+        value["possible_effects"] = json!({"source": "local_session", "private_payload": "secret"});
+        assert!(serde_json::from_value::<FatalRecord>(value).is_err());
     }
 }
