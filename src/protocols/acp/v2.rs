@@ -32,6 +32,8 @@ use crate::{
     runtime::{AcpDriverContext, BackgroundJobs, Runtime},
 };
 
+use super::activity::SessionActivity;
+
 use super::{
     AuthenticationRequiredData, CancelBackgroundRequest, CancelBackgroundResponse,
     DetachComposeRequest, DetachComposeResponse, FileSearchRequest, FileSearchResponse,
@@ -137,6 +139,9 @@ fn loop_error_stop_reason(
     }
 }
 
+// Admission excludes competing requests while the actor prepares or drains work.
+// It is not observable activity: an admitted autonomous drive may find no work.
+// SessionActivity alone owns the ACP lifecycle projected to clients.
 fn claim_prompt(busy: &AtomicBool) -> Result<(), AcpRuntimeError> {
     busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map(|_| ())
@@ -209,6 +214,7 @@ impl ReplacementGeneration {
 struct ResponseReplacementSink<S> {
     inner: S,
     current: Arc<Mutex<CurrentReplacementMessages>>,
+    activity: Arc<Mutex<SessionActivity>>,
 }
 
 impl<S> ResponseReplacementSink<S> {
@@ -216,6 +222,7 @@ impl<S> ResponseReplacementSink<S> {
         Self {
             inner,
             current: Arc::new(Mutex::new(CurrentReplacementMessages::default())),
+            activity: Arc::new(Mutex::new(SessionActivity::default())),
         }
     }
 
@@ -322,6 +329,35 @@ impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
     }
 }
 
+impl<S: AcpSessionUpdateSink> ResponseReplacementSink<S> {
+    fn transition_activity(
+        &self,
+        session_id: &wire::SessionId,
+        transition: impl FnOnce(&mut SessionActivity) -> Option<wire::StateUpdate>,
+    ) -> Result<(), AcpRuntimeError> {
+        let mut activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(state) = transition(&mut activity) {
+            send_state(&self.inner, session_id, state)?;
+        }
+        Ok(())
+    }
+
+    fn settle_activity(
+        &self,
+        session_id: &wire::SessionId,
+        reason: wire::StopReason,
+    ) -> Result<(), AcpRuntimeError> {
+        self.transition_activity(session_id, |activity| {
+            activity
+                .settle()
+                .map(|_| wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(reason)))
+        })
+    }
+}
+
 #[async_trait]
 impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S> {
     fn update(
@@ -396,6 +432,13 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        if let Err(error) = self.sink.transition_activity(&self.session_id, |activity| {
+            activity
+                .observe(&event.event)
+                .map(|_| wire::StateUpdate::Running(wire::RunningStateUpdate::new()))
+        }) {
+            tracing::debug!(%error, "failed to queue ACP v2 activity update");
+        }
         if let AgentEvent::UsageUpdated(usage) = &event.event {
             let Some(update) = usage_update(usage) else {
                 return;
@@ -1210,7 +1253,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
-    sink: &impl AcpSessionUpdateSink,
+    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
@@ -1448,16 +1491,11 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     integration: &AcpIntegration,
     handle: &AcpSessionHandle,
     driver: &mut LoopDriver<S>,
-    sink: &impl AcpSessionUpdateSink,
+    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
 ) -> Result<(), AcpRuntimeError> {
-    send_state(
-        sink,
-        session_id,
-        wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
-    )?;
-    let stop_reason = match drive_prompt(
+    let mut result = match drive_prompt(
         session_id,
         driver,
         handle,
@@ -1466,36 +1504,42 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
     )
     .await
     {
-        Ok(stop_reason) => stop_reason,
         Err(_)
             if handle
                 .cancellation_handle()
                 .is_cancelled_since(cancellation_generation) =>
         {
-            wire::StopReason::Cancelled
+            Ok(wire::StopReason::Cancelled)
         }
-        Err(error) => {
-            if let Some((tasks, background_jobs)) = structured {
-                super::cancel_background_jobs(tasks, background_jobs).await;
-                let _ = super::settle_background_jobs(tasks, background_jobs).await;
-            }
-            terminalize_running_error(session_id, integration, handle, sink, &error).await?;
-            return Err(error);
-        }
+        result => result,
     };
-    if stop_reason == wire::StopReason::Cancelled
+    if (result.is_err() || matches!(&result, Ok(wire::StopReason::Cancelled)))
         && let Some((tasks, background_jobs)) = structured
     {
         super::cancel_background_jobs(tasks, background_jobs).await;
-        let _ = super::settle_background_jobs(tasks, background_jobs).await?;
+        if let Err(error) = super::settle_background_jobs(tasks, background_jobs).await
+            && result.is_ok()
+        {
+            result = Err(error);
+        }
     }
+    handle.stop_injection_turn();
     let _ = integration.flush_session_updates(session_id).await;
     integration.finish_prompt(session_id);
-    send_state(
-        sink,
-        session_id,
-        wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(stop_reason)),
-    )
+
+    // Every exit goes through the same state settlement, including cleanup errors.
+    // Diagnostic delivery failure must not prevent the Idle transition.
+    let diagnostic = match &result {
+        Err(error) => sink.update(error_diagnostic_notification(session_id, error)),
+        Ok(_) => Ok(()),
+    };
+    let stop_reason = result
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|_| error_stop_reason());
+    let settled = sink.settle_activity(session_id, stop_reason);
+    diagnostic.and(settled)?;
+    result.map(|_| ())
 }
 
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
@@ -1504,7 +1548,7 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     handle: &AcpSessionHandle,
     busy: &AtomicBool,
     driver: &mut LoopDriver<S>,
-    sink: &impl AcpSessionUpdateSink,
+    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
 ) -> Result<(), AcpRuntimeError> {
     if claim_prompt(busy).is_err() {
         return Ok(());
@@ -1527,26 +1571,6 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     handle.stop_injection_turn();
     busy.store(false, Ordering::Release);
     result
-}
-
-async fn terminalize_running_error(
-    session_id: &wire::SessionId,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
-    sink: &impl AcpSessionUpdateSink,
-    error: &AcpRuntimeError,
-) -> Result<(), AcpRuntimeError> {
-    handle.stop_injection_turn();
-    let _ = integration.flush_session_updates(session_id).await;
-    integration.finish_prompt(session_id);
-
-    let diagnostic_result = sink.update(error_diagnostic_notification(session_id, error));
-    let idle_result = send_state(
-        sink,
-        session_id,
-        wire::StateUpdate::Idle(wire::IdleStateUpdate::new().stop_reason(error_stop_reason())),
-    );
-    diagnostic_result.and(idle_result)
 }
 
 fn error_diagnostic_notification(
@@ -2369,7 +2393,12 @@ mod tests {
             chunk: "answer".into(),
         }));
 
-        let updates = recording.updates.lock().unwrap();
+        let recorded = recording.updates.lock().unwrap();
+        assert!(matches!(
+            recorded[0].update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+        ));
+        let updates = &recorded[1..];
         assert_eq!(updates.len(), 6);
         let stale_message_id = match &updates[0].update {
             wire::SessionUpdate::AgentMessageChunk(chunk) => chunk.message_id.clone(),
@@ -2400,7 +2429,7 @@ mod tests {
             wire::SessionUpdate::AgentMessageChunk(chunk)
                 if chunk.message_id == replacement_message_id
         ));
-        drop(updates);
+        drop(recorded);
 
         emit(AgentEvent::ResponseAttemptSuperseded);
         emit(AgentEvent::ContentDelta(agentkit_core::Delta::BeginPart {
@@ -2411,7 +2440,12 @@ mod tests {
             part_id: agentkit_core::PartId::new("message-3"),
             chunk: "third answer".into(),
         }));
-        let updates = recording.updates.lock().unwrap();
+        let recorded = recording.updates.lock().unwrap();
+        assert!(matches!(
+            recorded[0].update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+        ));
+        let updates = &recorded[1..];
         assert_eq!(updates.len(), 9);
         assert!(matches!(
             &updates[6].update,
@@ -2431,14 +2465,14 @@ mod tests {
                 if chunk.message_id != replacement_message_id
                     && chunk.message_id != stale_message_id
         ));
-        drop(updates);
+        drop(recorded);
 
         emit(AgentEvent::TurnStarted {
             session_id: loop_session_id.clone(),
             turn_id: agentkit_core::TurnId::new("turn-2"),
         });
         emit(AgentEvent::ResponseAttemptSuperseded);
-        assert_eq!(recording.updates.lock().unwrap().len(), 9);
+        assert_eq!(recording.updates.lock().unwrap().len(), 10);
     }
 
     #[test]
@@ -2490,7 +2524,12 @@ mod tests {
         emit_part("thought-1", agentkit_core::PartKind::Reasoning, "thinking");
         emit(finish("turn-1", FinishReason::Cancelled));
 
-        let updates = recording.updates.lock().unwrap();
+        let recorded = recording.updates.lock().unwrap();
+        assert!(matches!(
+            recorded[0].update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+        ));
+        let updates = &recorded[1..];
         assert_eq!(updates.len(), 2);
         assert!(matches!(
             &updates[0].update,
@@ -2502,7 +2541,7 @@ mod tests {
             wire::SessionUpdate::AgentThoughtChunk(chunk)
                 if chunk.content == wire::ContentBlock::Text(wire::TextContent::new("thinking"))
         ));
-        drop(updates);
+        drop(recorded);
 
         emit(AgentEvent::TurnStarted {
             session_id: loop_session_id.clone(),
@@ -2510,7 +2549,7 @@ mod tests {
         });
         emit_part("message-2", agentkit_core::PartKind::Text, "completed");
         emit(finish("turn-2", FinishReason::Completed));
-        assert_eq!(recording.updates.lock().unwrap().len(), 3);
+        assert_eq!(recording.updates.lock().unwrap().len(), 4);
 
         emit(AgentEvent::TurnStarted {
             session_id: loop_session_id.clone(),
@@ -2524,7 +2563,12 @@ mod tests {
         );
         emit(finish("turn-3", FinishReason::Cancelled));
 
-        let updates = recording.updates.lock().unwrap();
+        let recorded = recording.updates.lock().unwrap();
+        assert!(matches!(
+            recorded[0].update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+        ));
+        let updates = &recorded[1..];
         assert_eq!(updates.len(), 4);
         assert!(matches!(
             &updates[3].update,
@@ -2800,7 +2844,12 @@ mod tests {
         };
         assert_eq!(result.finish_reason, FinishReason::Cancelled);
 
-        let updates = recording.updates.lock().unwrap();
+        let recorded = recording.updates.lock().unwrap();
+        assert!(matches!(
+            recorded[0].update,
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+        ));
+        let updates = &recorded[1..];
         assert_eq!(updates.len(), 1);
         assert!(matches!(
             &updates[0].update,
@@ -2862,19 +2911,38 @@ mod tests {
     #[tokio::test]
     async fn foreground_provider_error_after_running_terminalizes_once() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("foreground-provider-error");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                SessionId::new("foreground-provider-error-loop"),
+                SessionId::new("foreground_provider_error_after_running_terminalizes_once-loop"),
                 sink.clone(),
             ))
             .unwrap();
         handle.prepare_injection_turn();
         let cancellation_generation = handle.cancellation_handle().generation();
-        let (mut driver, turns) =
-            test_driver(TestOutcome::ProviderError, "foreground-provider-error-loop").await;
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ProviderError,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(
+                SessionConfig::new(SessionId::new(
+                    "foreground_provider_error_after_running_terminalizes_once-loop",
+                ))
+                .without_cache(),
+            )
+            .await
+            .unwrap();
         let (reply, response) = oneshot::channel();
         let command = PromptCommand {
             request: wire::PromptRequest::new(
@@ -2911,8 +2979,8 @@ mod tests {
 
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
         assert_eq!(turns.load(Ordering::Relaxed), 1);
-        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        let updates = sink.updates.lock().unwrap();
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        let updates = recording.updates.lock().unwrap();
         assert_eq!(updates.len(), 4);
         assert!(matches!(
             updates[1].update,
@@ -2964,12 +3032,26 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("v2-structured");
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                SessionId::new("v2-structured-loop"),
+                sink.clone(),
+            ))
+            .unwrap();
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
         let mut driver = Agent::builder()
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
                 user_items_seen: Arc::new(AtomicUsize::new(0)),
                 notification_items_seen: Arc::new(AtomicUsize::new(0)),
             })
+            .observer(observer)
             .add_tool_source(tools)
             .task_manager(task_manager)
             .build()
@@ -2981,23 +3063,16 @@ mod tests {
             .submit_input(vec![Item::text(ItemKind::User, "start background")])
             .unwrap();
 
-        let integration = AcpIntegration::default();
-        let session_id = wire::SessionId::new("v2-structured");
-        let handle = integration
-            .bind_session(AcpSessionBinding::new(
-                session_id.clone(),
-                SessionId::new("v2-structured-loop"),
-                RecordingSink::default(),
-            ))
-            .unwrap();
         handle.prepare_injection_turn();
         handle.start_injection_turn();
         let generation = handle.cancellation_handle().generation();
         let background_jobs = BackgroundJobs::default();
-        let prompt = drive_prompt(
+        let prompt = run_active_turn(
             &session_id,
-            &mut driver,
+            &integration,
             &handle,
+            &mut driver,
+            &sink,
             generation,
             Some((&tasks, &background_jobs)),
         );
@@ -3030,6 +3105,16 @@ mod tests {
                 .is_err()
         );
 
+        assert_eq!(
+            recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update.update, wire::SessionUpdate::StateUpdate(_)))
+                .count(),
+            1
+        );
         background_jobs.finish_for_test("background-call");
         assert!(
             timeout(Duration::from_millis(20), &mut prompt)
@@ -3038,11 +3123,14 @@ mod tests {
             "structured v2 prompt crossed the terminal publication handoff early"
         );
         release.notify_one();
-        let reason = timeout(Duration::from_secs(1), &mut prompt)
+        timeout(Duration::from_secs(1), &mut prompt)
             .await
             .expect("structured v2 prompt did not synthesize")
             .unwrap();
-        assert_eq!(reason, wire::StopReason::EndTurn);
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::EndTurn,
+        );
         assert_eq!(turns.load(Ordering::SeqCst), 3);
         assert!(
             timeout(Duration::from_millis(20), tasks.next_event())
@@ -3128,19 +3216,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autonomous_no_work_emits_running_then_idle() {
+    async fn autonomous_no_work_emits_no_state_transition() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("autonomous-no-work");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                SessionId::new("autonomous-no-work-loop"),
+                SessionId::new("autonomous_no_work_emits_no_state_transition-loop"),
                 sink.clone(),
             ))
             .unwrap();
-        let (mut driver, turns) =
-            test_driver(TestOutcome::Content, "autonomous-no-work-loop").await;
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(
+                SessionConfig::new(SessionId::new(
+                    "autonomous_no_work_emits_no_state_transition-loop",
+                ))
+                .without_cache(),
+            )
+            .await
+            .unwrap();
         let busy = AtomicBool::new(false);
 
         drive_autonomous(
@@ -3156,8 +3263,8 @@ mod tests {
 
         assert_eq!(turns.load(Ordering::Relaxed), 0);
         assert!(!busy.load(Ordering::Relaxed));
-        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        assert_running_then_idle(&sink.updates.lock().unwrap(), wire::StopReason::EndTurn);
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        assert!(recording.updates.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3208,6 +3315,21 @@ mod tests {
         assert_eq!(turns.load(Ordering::Relaxed), 1);
         assert!(!busy.load(Ordering::Relaxed));
         assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        let update_count = recording.updates.lock().unwrap().len();
+        for _ in 0..2 {
+            drive_autonomous(
+                &session_id,
+                &integration,
+                &handle,
+                &busy,
+                &mut driver,
+                &sink,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(turns.load(Ordering::Relaxed), 1);
+        assert_eq!(recording.updates.lock().unwrap().len(), update_count);
         let updates = recording.updates.lock().unwrap();
         assert!(updates.iter().any(|update| {
             serde_json::to_string(&update.update)
@@ -3220,17 +3342,36 @@ mod tests {
     #[tokio::test]
     async fn autonomous_provider_error_emits_running_error_idle() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("autonomous-provider-error");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                SessionId::new("autonomous-provider-error-loop"),
+                SessionId::new("autonomous_provider_error_emits_running_error_idle-loop"),
                 sink.clone(),
             ))
             .unwrap();
-        let (mut driver, turns) =
-            test_driver(TestOutcome::ProviderError, "autonomous-provider-error-loop").await;
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ProviderError,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(
+                SessionConfig::new(SessionId::new(
+                    "autonomous_provider_error_emits_running_error_idle-loop",
+                ))
+                .without_cache(),
+            )
+            .await
+            .unwrap();
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -3249,8 +3390,8 @@ mod tests {
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
         assert_eq!(turns.load(Ordering::Relaxed), 1);
         assert!(!busy.load(Ordering::Relaxed));
-        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        let updates = sink.updates.lock().unwrap();
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        let updates = recording.updates.lock().unwrap();
         assert_eq!(updates.len(), 3);
         assert!(
             serde_json::to_string(&updates[1].update)
@@ -3267,21 +3408,38 @@ mod tests {
     #[tokio::test]
     async fn autonomous_cancellation_has_no_error_diagnostic_or_continuation() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("autonomous-cancel");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                SessionId::new("autonomous-cancel-loop"),
+                SessionId::new(
+                    "autonomous_cancellation_has_no_error_diagnostic_or_continuation-loop",
+                ),
                 sink.clone(),
             ))
             .unwrap();
-        let (mut driver, turns) = test_driver_with_interrupt(
-            TestOutcome::ProviderError,
-            "autonomous-cancel-loop",
-            Some(handle.clone()),
-        )
-        .await;
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::ProviderError,
+                turns: turns.clone(),
+                interrupt: Some(handle.clone()),
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(
+                SessionConfig::new(SessionId::new(
+                    "autonomous_cancellation_has_no_error_diagnostic_or_continuation-loop",
+                ))
+                .without_cache(),
+            )
+            .await
+            .unwrap();
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -3300,24 +3458,46 @@ mod tests {
 
         assert_eq!(turns.load(Ordering::Relaxed), 1);
         assert!(!busy.load(Ordering::Relaxed));
-        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        assert_running_then_idle(&sink.updates.lock().unwrap(), wire::StopReason::Cancelled);
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        assert_running_then_idle(
+            &recording.updates.lock().unwrap(),
+            wire::StopReason::Cancelled,
+        );
     }
 
     #[tokio::test]
     async fn autonomous_finish_error_emits_running_error_idle() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
         let session_id = wire::SessionId::new("autonomous-error");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
-                SessionId::new("autonomous-error-loop"),
+                SessionId::new("autonomous_finish_error_emits_running_error_idle-loop"),
                 sink.clone(),
             ))
             .unwrap();
-        let (mut driver, turns) =
-            test_driver(TestOutcome::FinishError, "autonomous-error-loop").await;
+        let turns = Arc::new(AtomicU64::new(0));
+        let observer =
+            ResponseReplacementObserver::new(integration.clone(), sink.clone(), session_id.clone());
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::FinishError,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .observer(observer)
+            .build()
+            .unwrap()
+            .start(
+                SessionConfig::new(SessionId::new(
+                    "autonomous_finish_error_emits_running_error_idle-loop",
+                ))
+                .without_cache(),
+            )
+            .await
+            .unwrap();
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -3336,8 +3516,8 @@ mod tests {
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
         assert_eq!(turns.load(Ordering::Relaxed), 1);
         assert!(!busy.load(Ordering::Relaxed));
-        assert_eq!(sink.flushes.load(Ordering::Relaxed), 1);
-        let updates = sink.updates.lock().unwrap();
+        assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+        let updates = recording.updates.lock().unwrap();
         assert_eq!(updates.len(), 3);
         assert!(matches!(
             updates[1].update,

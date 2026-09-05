@@ -46,6 +46,7 @@ use tokio::{
     time::timeout,
 };
 
+mod activity;
 mod skill_catalog;
 pub mod v2;
 
@@ -951,10 +952,86 @@ struct SessionBindingGuard {
     session_id: agentkit_acp::SessionId,
 }
 
+/// Legacy wire projection of the shared activity reducer. Foreground activity
+/// is settled by the standard prompt response; only unsolicited activity needs
+/// the extension notification. Both paths observe the same per-session reducer.
+#[derive(Clone)]
+struct LegacyActivity {
+    state: Arc<Mutex<LegacyActivityProjection>>,
+    session_id: agentkit_acp::SessionId,
+    notifications: mpsc::UnboundedSender<TurnStateNotification>,
+}
+
+#[derive(Default)]
+struct LegacyActivityProjection {
+    activity: activity::SessionActivity,
+    unsolicited: bool,
+    next_id: u64,
+    notification_id: Option<u64>,
+}
+
+impl LegacyActivity {
+    fn new(
+        session_id: agentkit_acp::SessionId,
+        notifications: mpsc::UnboundedSender<TurnStateNotification>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LegacyActivityProjection::default())),
+            session_id,
+            notifications,
+        }
+    }
+
+    fn begin_unsolicited(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unsolicited = true;
+    }
+
+    fn settle(&self, error: Option<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let transition = state.activity.settle();
+        state.unsolicited = false;
+        if transition.is_some()
+            && let Some(turn_id) = state.notification_id.take()
+        {
+            let _ = self.notifications.send(TurnStateNotification {
+                session_id: self.session_id.clone(),
+                turn_id,
+                active: false,
+                error,
+            });
+        }
+    }
+
+    fn observe(&self, event: &AgentEvent) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.activity.observe(event) == Some(true) && state.unsolicited {
+            state.next_id = state.next_id.wrapping_add(1);
+            let turn_id = state.next_id;
+            state.notification_id = Some(turn_id);
+            let _ = self.notifications.send(TurnStateNotification {
+                session_id: self.session_id.clone(),
+                turn_id,
+                active: true,
+                error: None,
+            });
+        }
+    }
+}
+
+impl LoopObserver for LegacyActivity {
+    fn handle_event(&self, event: ObservedEvent) {
+        self.observe(&event.event);
+    }
+}
+
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
     inner: AcpIntegration,
     client: AcpClientHandle,
+    activity: LegacyActivity,
     session_id: agentkit_acp::SessionId,
 }
 
@@ -963,8 +1040,10 @@ impl ResponseInterruptionNoticeObserver {
         inner: AcpIntegration,
         client: AcpClientHandle,
         session_id: agentkit_acp::SessionId,
+        activity: LegacyActivity,
     ) -> Self {
         Self {
+            activity,
             inner,
             client,
             session_id,
@@ -974,6 +1053,7 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        self.activity.observe(&event.event);
         if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             let notification = SessionNotification::new(
                 self.session_id.clone(),
@@ -1258,6 +1338,7 @@ impl Server {
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
         let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
+        let activity = LegacyActivity::new(session_id.clone(), turn_states);
         tokio::spawn(drain_turn_states(turn_state_messages, connection.clone()));
 
         let mut metadata = MetadataMap::new();
@@ -1281,6 +1362,7 @@ impl Server {
             self.integration.as_ref().clone(),
             client,
             session_id.clone(),
+            activity.clone(),
         );
         let context = AcpDriverContext {
             cwd,
@@ -1333,7 +1415,7 @@ impl Server {
             adapter: driver.adapter,
             catalog,
             commands: rx,
-            turn_states,
+            activity,
             mcp_events,
         };
         let token = self.registry.next_token();
@@ -1574,7 +1656,7 @@ struct SessionActor<S: ModelSession> {
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
-    turn_states: mpsc::UnboundedSender<TurnStateNotification>,
+    activity: LegacyActivity,
     mcp_events: crate::tools::mcp::McpSubscription,
 }
 
@@ -1592,11 +1674,10 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         adapter,
         catalog,
         mut commands,
-        turn_states,
+        activity,
         mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
-    let mut next_autonomous_turn_id = 0_u64;
     loop {
         tokio::select! {
             // A queued cancel or close wins over a simultaneously-ready task
@@ -1615,6 +1696,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         &background_jobs,
                         structured_completion,
                     ).await;
+                    activity.settle(None);
                     let _ = reply.send(result);
                 }
                 // The server already interrupted the shared controller; this
@@ -1665,8 +1747,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             &session_id,
                             &integration,
                             &mut driver,
-                            &turn_states,
-                            &mut next_autonomous_turn_id,
+                            &activity,
                         ).await,
                         Err(error) => Err(error),
                     };
@@ -1685,8 +1766,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             &session_id,
                             &integration,
                             &mut driver,
-                            &turn_states,
-                            &mut next_autonomous_turn_id,
+                            &activity,
                         ).await;
                         if let Err(error) = result {
                             eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
@@ -2054,25 +2134,11 @@ async fn drive_unsolicited<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
-    turn_states: &mpsc::UnboundedSender<TurnStateNotification>,
-    next_turn_id: &mut u64,
+    activity: &LegacyActivity,
 ) -> Result<(), AcpRuntimeError> {
-    *next_turn_id = next_turn_id.wrapping_add(1);
-    let turn_id = *next_turn_id;
-    let _ = turn_states.send(TurnStateNotification {
-        session_id: session_id.clone(),
-        turn_id,
-        active: true,
-        error: None,
-    });
+    activity.begin_unsolicited();
     let result = drive_autonomous(session_id, integration, driver).await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    let _ = turn_states.send(TurnStateNotification {
-        session_id: session_id.clone(),
-        turn_id,
-        active: false,
-        error,
-    });
+    activity.settle(result.as_ref().err().map(ToString::to_string));
     result
 }
 
@@ -3209,6 +3275,7 @@ pub(super) mod tests {
             integration.clone(),
             client,
             session_id.clone(),
+            LegacyActivity::new(session_id.clone(), mpsc::unbounded_channel().0),
         );
         let emit = |event| {
             observer.handle_event(ObservedEvent {
@@ -4040,6 +4107,115 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_activity_ignores_empty_wakes_and_coalesces_real_continuations() {
+        let session_id = agentkit_acp::SessionId::new("legacy-activity");
+        let loop_id = AgentkitSessionId::new("legacy-activity-loop");
+        let integration = AcpIntegration::builder()
+            .name("legacy-activity-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let drain = tokio::spawn(async move {
+            while let Some(message) = messages.recv().await {
+                if let AcpClientMessage::Flush { response } = message {
+                    let _ = response.send(());
+                }
+            }
+        });
+        let (notifications, mut states) = mpsc::unbounded_channel();
+        let activity = LegacyActivity::new(session_id.clone(), notifications);
+        // Start the script at its plain content response, with no tool prerequisite.
+        let turns = Arc::new(AtomicUsize::new(2));
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: turns.clone(),
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::new(AtomicUsize::new(0)),
+            })
+            .observer(ResponseInterruptionNoticeObserver::new(
+                integration.clone(),
+                client,
+                session_id.clone(),
+                activity.clone(),
+            ))
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+                .await
+                .unwrap();
+        }
+        assert_eq!(turns.load(Ordering::SeqCst), 2);
+        assert!(states.try_recv().is_err());
+
+        driver
+            .submit_input(vec![Item::notification("background result")])
+            .unwrap();
+        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+            .await
+            .unwrap();
+        let started = states.try_recv().unwrap();
+        let ended = states.try_recv().unwrap();
+        assert!(started.active && !ended.active);
+        assert_eq!(started.turn_id, 1);
+        assert_eq!(started.turn_id, ended.turn_id);
+        assert!(ended.error.is_none());
+        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+            .await
+            .unwrap();
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
+        assert!(states.try_recv().is_err());
+
+        // Foreground uses the very same reducer, but retains standard v1 response
+        // semantics without extension notifications (or consuming extension IDs).
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "foreground")])
+            .unwrap();
+        let response = drive_until_pause(&session_id, &integration, &mut driver, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        activity.settle(None);
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert!(states.try_recv().is_err());
+
+        // Multiple logical turns drained within one autonomous interval do not
+        // publish an intermediate terminal state or allocate another turn ID.
+        activity.begin_unsolicited();
+        for text in ["first continuation", "second continuation"] {
+            driver.submit_input(vec![Item::notification(text)]).unwrap();
+            drive_autonomous(&session_id, &integration, &mut driver)
+                .await
+                .unwrap();
+        }
+        let started = states.try_recv().unwrap();
+        assert!(started.active);
+        assert_eq!(started.turn_id, 2);
+        assert!(states.try_recv().is_err());
+        activity.settle(Some("terminal error".into()));
+        let ended = states.try_recv().unwrap();
+        assert!(!ended.active);
+        assert_eq!(ended.turn_id, started.turn_id);
+        assert_eq!(ended.error.as_deref(), Some("terminal error"));
+        activity.settle(None);
+        assert!(states.try_recv().is_err());
+        assert_eq!(turns.load(Ordering::SeqCst), 6);
+        drain.abort();
+    }
+
+    #[tokio::test]
     async fn foreground_compose_detaches_out_of_band_and_completes_autonomously() {
         let turns = Arc::new(AtomicUsize::new(0));
         let user_items_seen = Arc::new(AtomicUsize::new(0));
@@ -4097,6 +4273,8 @@ pub(super) mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
+        let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
+        let activity = LegacyActivity::new(acp_session_id.clone(), turn_states_tx);
         let driver = Agent::builder()
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
@@ -4106,6 +4284,7 @@ pub(super) mod tests {
             .add_tool_source(tools)
             .task_manager(task_manager)
             .observer(integration.as_ref().clone())
+            .observer(activity.clone())
             .cancellation(cancellation.handle())
             .build()
             .unwrap()
@@ -4113,7 +4292,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let (commands_tx, commands_rx) = mpsc::channel(8);
-        let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
+
         let test_mcp = crate::tools::mcp::empty();
         let mcp_events = test_mcp.subscribe(acp_session_id.to_string());
         let root = tempfile::tempdir().unwrap();
@@ -4133,7 +4312,7 @@ pub(super) mod tests {
                 .unwrap(),
             catalog: Vec::new(),
             commands: commands_rx,
-            turn_states: turn_states_tx,
+            activity,
             mcp_events,
         }));
 

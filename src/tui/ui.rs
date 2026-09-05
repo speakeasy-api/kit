@@ -2219,6 +2219,9 @@ fn compact(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use agent_client_protocol::schema::v2::{
+        IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
+    };
     use std::path::PathBuf;
 
     use agent_client_protocol::schema::v2::ToolKind;
@@ -2940,11 +2943,9 @@ mod tests {
             "127.0.0.1:7331".into(),
         );
         app.can_steer = true;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         app.apply(Update::SteerAccepted {
             id: "first".into(),
             text: "first pending".into(),
@@ -3372,22 +3373,18 @@ mod tests {
             output: vec!["exit code 1".into()],
             backgrounded: false,
         });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         app.apply(Update::Log("warn: retrying provider request".into()));
         app.show_logs = true;
         for index in 0..12 {
             app.push_user(format!("follow-up number {index}"));
             app.apply(Update::test_text(format!("answer number {index}")));
         }
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         let _ = render(&mut app, 100, 24);
         app.scroll_by(-6);
         let frame = render(&mut app, 100, 24);

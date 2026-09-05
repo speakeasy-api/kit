@@ -2215,20 +2215,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             used: usage.used,
             size: usage.size,
         }],
-        SessionUpdate::StateUpdate(state) => match state {
-            wire::StateUpdate::Running(_) => vec![Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false,
-            }],
-            wire::StateUpdate::RequiresAction(_) => vec![Update::State {
-                active: true,
-                steerable: false,
-                cancelled: false,
-            }],
-            wire::StateUpdate::Idle(idle) => vec![Update::Stopped(idle.stop_reason)],
-            _ => Vec::new(),
-        },
+        SessionUpdate::StateUpdate(state) => vec![Update::State(state)],
         _ => Vec::new(),
     };
     (session_id, updates)
@@ -2904,11 +2891,7 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(running, "session").as_slice(),
-            [Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false
-            }]
+            [Update::State(StateUpdate::Running(_))]
         ));
         let idle = UpdateSessionNotification::new(
             "session",
@@ -2916,8 +2899,38 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(idle, "session").as_slice(),
-            [Update::Stopped(None)]
+            [Update::State(StateUpdate::Idle(idle))] if idle.stop_reason.is_none()
         ));
+    }
+
+    #[test]
+    fn preserves_requires_action_and_terminal_state_reasons() {
+        let blocked = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
+                wire::RequiresActionStateUpdate::new(),
+            )),
+        );
+        assert!(matches!(
+            translate_for_session(blocked, "session").as_slice(),
+            [Update::State(StateUpdate::RequiresAction(_))]
+        ));
+        for reason in [
+            wire::StopReason::EndTurn,
+            wire::StopReason::Cancelled,
+            wire::StopReason::Other("custom".into()),
+        ] {
+            let idle = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::StateUpdate(StateUpdate::Idle(
+                    IdleStateUpdate::new().stop_reason(reason.clone()),
+                )),
+            );
+            assert!(matches!(
+                translate_for_session(idle, "session").as_slice(),
+                [Update::State(StateUpdate::Idle(idle))] if idle.stop_reason.as_ref() == Some(&reason)
+            ));
+        }
     }
 
     #[test]
