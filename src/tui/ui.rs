@@ -120,7 +120,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         draw_status(frame, app, status);
         (prompt, viewport, false)
     };
-    if app.file_picker.is_some() {
+    if let Some(pending) = &app.model_switch {
+        draw_model_switch_dialog(frame, pending);
+    } else if app.file_picker.is_some() {
         draw_file_picker(frame, app, prompt_area, prompt_viewport, picker_below);
     } else if app.session_dialog.is_some() {
         draw_session_dialog(frame, app);
@@ -528,6 +530,66 @@ fn draw_session_dialog(frame: &mut Frame<'_>, app: &App) {
         }
         _ => {}
     }
+}
+
+fn draw_model_switch_dialog(frame: &mut Frame<'_>, pending: &super::app::ModelSwitch) {
+    let outer = frame.area();
+    let width = outer.width.min(76);
+    let height = outer.height.min(12);
+    let area = Rect::new(
+        outer.x + outer.width.saturating_sub(width) / 2,
+        outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let panel = Panel::bordered().title(" model context warning ");
+    let inner = panel.inner(area);
+    let mut lines = match &pending.warning {
+        Some(warning) => vec![
+            Line::from(format!(
+                "{} via {}",
+                pending.choice.model, pending.choice.provider
+            )),
+            Line::from(format!(
+                "Estimated {} / {} tokens.",
+                warning.guarded_tokens, warning.target_window
+            )),
+            Line::from("At least 80% of the target context is occupied."),
+            Line::from("Compact uses the current model before switching."),
+            Line::from(""),
+        ],
+        None => vec![
+            Line::from(if pending.cancelling {
+                "Cancelling model change…"
+            } else {
+                "Preparing model change…"
+            }),
+            Line::from("Esc / Ctrl+C cancels; input is preserved."),
+        ],
+    };
+    if pending.warning.is_some() {
+        for (index, label) in ["Continue anyway", "Compact", "Cancel"].iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} {label}",
+                    if index == pending.selected {
+                        "›"
+                    } else {
+                        " "
+                    }
+                ),
+                if index == pending.selected {
+                    theme::accent()
+                } else {
+                    theme::text()
+                },
+            )));
+        }
+        lines.push(Line::from("↑/↓ select · enter confirm · esc cancel"));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(panel, area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
@@ -2907,6 +2969,45 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn model_switch_popup_renders_all_choices_and_defaults_to_cancel() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        app.begin_model_switch(
+            crate::tui::app::ModelChoice {
+                id: "openrouter:target".into(),
+                provider: "openrouter".into(),
+                model: "target".into(),
+            },
+            false,
+        )
+        .unwrap();
+        app.model_switch.as_mut().unwrap().warning =
+            Some(crate::protocols::acp::model_switch::Warning {
+                token: 1,
+                guarded_tokens: "120000".into(),
+                target_window: 150000,
+            });
+        let screen = render(&mut app, 90, 24);
+        for label in [
+            "model context warning",
+            "Estimated 120000 / 150000 tokens.",
+            "80%",
+            "Continue anyway",
+            "Compact",
+            "› Cancel",
+        ] {
+            assert!(screen.contains(label), "missing {label}");
+        }
+        assert!(!screen.contains("margin"));
+        // Small terminals must not panic when a dialog is clipped.
+        let _ = render(&mut app, 1, 1);
     }
 
     #[test]
