@@ -14,6 +14,7 @@ enum Kind {
     Model,
     Effort,
     Agents,
+    Transcript,
     Login,
 }
 
@@ -84,6 +85,11 @@ const LOCAL_COMMANDS: &[Spec] = &[
         kind: Kind::Agents,
     },
     Spec {
+        token: "/transcript",
+        description: "Browse the transcript (F3)",
+        kind: Kind::Transcript,
+    },
+    Spec {
         token: "/login",
         description: "Authenticate with the agent",
         kind: Kind::Login,
@@ -99,6 +105,7 @@ pub enum Parsed<'a> {
     Model { query: Option<&'a str> },
     Effort { value: Option<&'a str> },
     Agents,
+    Transcript,
     Login { method_id: Option<&'a str> },
     Prompt(&'a str),
 }
@@ -134,7 +141,8 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
         Kind::Model => Parsed::Model { query: prompt },
         Kind::Effort => Parsed::Effort { value: prompt },
         Kind::Agents if prompt.is_none() => Parsed::Agents,
-        Kind::Agents => Parsed::Prompt(input),
+        Kind::Transcript if prompt.is_none() => Parsed::Transcript,
+        Kind::Agents | Kind::Transcript => Parsed::Prompt(input),
         Kind::Login => Parsed::Login {
             method_id: prompt.map(str::trim),
         },
@@ -148,7 +156,9 @@ pub fn known_token(
     login_available: bool,
 ) -> Option<Range<usize>> {
     if let Some((spec, token_end)) = recognized_local(input, login_available) {
-        if matches!(spec.kind, Kind::Agents) && !input[token_end..].trim().is_empty() {
+        if matches!(spec.kind, Kind::Agents | Kind::Transcript)
+            && !input[token_end..].trim().is_empty()
+        {
             return None;
         }
         return Some(0..token_end);
@@ -293,6 +303,47 @@ mod tests {
     }
 
     #[test]
+    fn transcript_is_an_exact_highlighted_local_command_without_arguments() {
+        for login_available in [false, true] {
+            for input in ["/transcript", "/transcript ", "/transcript\t\n"] {
+                assert_eq!(parse_command(input, login_available), Parsed::Transcript);
+                assert_eq!(find_known_token(input, &[], login_available), Some(0..11));
+            }
+            for input in [
+                "/transcript query",
+                "/transcript\tquery",
+                "/transcriptx",
+                "/transcript/path",
+                " /transcript",
+            ] {
+                assert_eq!(parse_command(input, login_available), Parsed::Prompt(input));
+                assert_eq!(
+                    find_known_token(
+                        input,
+                        &[Command::new("transcript", "Agent transcript")],
+                        login_available,
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_completion_advertises_f3_with_local_precedence() {
+        let advertised = [Command::new("/transcript", "Agent transcript")];
+        for login_available in [false, true] {
+            for input in ["/tr", "/transcript"] {
+                assert_eq!(
+                    complete_commands(input, input.len(), &advertised, login_available),
+                    [Command::new("/transcript", "Browse the transcript (F3)")]
+                );
+            }
+        }
+        assert!(completions("/transcript query", 11, &advertised).is_empty());
+    }
+
+    #[test]
     fn advertised_commands_are_discovered_but_not_parsed_locally() {
         let advertised = vec![Command::new("compact", ""), Command::new("new", "")];
         assert_eq!(known_token("/compact next", &advertised), Some(0..8));
@@ -353,6 +404,7 @@ mod tests {
                 "/model",
                 "/effort",
                 "/agents",
+                "/transcript",
                 "/compact",
             ]
         );
