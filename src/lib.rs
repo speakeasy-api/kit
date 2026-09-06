@@ -1,3 +1,19 @@
+// Production policy is deliberately non-overridable. Test-only scopes below
+// retain assertions and unwrap ergonomics; placeholder lints remain denied.
+#![cfg_attr(
+    not(test),
+    forbid(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
+
 mod acp_child;
 mod artifacts;
 pub mod compaction;
@@ -20,7 +36,8 @@ pub mod runtime;
 pub mod resilient_fs {
     pub use crate::filesystem::*;
     pub use crate::storage_runtime::{
-        finish_recovery, request_shutdown, shutdown_token, start_recovery_worker,
+        finish_best_effort_recovery, finish_recovery, request_shutdown, shutdown_token,
+        start_recovery_worker,
     };
 }
 pub mod session;

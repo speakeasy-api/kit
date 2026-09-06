@@ -3,10 +3,12 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 
 use crate::credentials::{CredentialEntry, CredentialFilesystemScope, CredentialStorage};
 use crate::resilient_fs as fs;
@@ -16,7 +18,7 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -505,7 +507,12 @@ fn logout_at(
         }))
     } else {
         render_exec_response(
-            json!({"provider":"openai","authenticated":false,"removed":removed,"local_only":local_only}),
+            Value::Object(Map::from_iter([
+                ("provider".into(), Value::from("openai")),
+                ("authenticated".into(), Value::from(false)),
+                ("removed".into(), Value::from(removed)),
+                ("local_only".into(), Value::from(local_only)),
+            ])),
             format,
         )
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
@@ -540,15 +547,19 @@ fn render_status(
             None => human("OpenAI: not authenticated with ChatGPT.\n"),
         });
     }
-    let value = json!({
-        "provider": "openai",
-        "authenticated": record.is_some(),
-        "account": record.as_ref().map(|record| json!({
-            "id": record.account_id,
-            "email": record.email,
-            "plan_type": record.plan_type,
-        })),
+    let authenticated = record.is_some();
+    let account = record.as_ref().map(|record| {
+        Value::Object(Map::from_iter([
+            ("id".into(), Value::from(record.account_id.as_deref())),
+            ("email".into(), Value::from(record.email.as_deref())),
+            ("plan_type".into(), Value::from(record.plan_type.as_deref())),
+        ]))
     });
+    let value = Value::Object(Map::from_iter([
+        ("provider".into(), Value::from("openai")),
+        ("authenticated".into(), Value::from(authenticated)),
+        ("account".into(), Value::from(account)),
+    ]));
     render_exec_response(value, format)
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
 }
@@ -1303,8 +1314,8 @@ fn bind_callback() -> Result<TcpListener, AuthError> {
 }
 
 fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) -> String {
-    let mut url = url::Url::parse("https://auth.openai.com/oauth/authorize").expect("fixed URL");
-    url.query_pairs_mut()
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", redirect_uri)
@@ -1319,7 +1330,7 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) 
         .append_pair("state", state)
         .append_pair("nonce", nonce)
         .append_pair("originator", "kit");
-    url.into()
+    format!("https://auth.openai.com/oauth/authorize?{}", query.finish())
 }
 
 fn http_client(deadline: Instant) -> Result<reqwest::blocking::Client, AuthError> {
@@ -1407,7 +1418,12 @@ fn process_lock_scoped(
     credential_scope: Option<&std::path::Path>,
 ) -> Result<ProcessLock, AuthError> {
     let path = auth_lock_path()?;
-    let parent = path.parent().expect("auth lock path has a parent");
+    let parent = path.parent().ok_or_else(|| {
+        AuthError::unavailable(
+            "auth_lock_failed",
+            "authentication lock path has no parent directory",
+        )
+    })?;
     fs::create_private_dir_all(parent).map_err(|_| {
         AuthError::unavailable(
             "auth_lock_failed",
@@ -1554,7 +1570,11 @@ fn emit_auth_url(url: &str, format: OutputFormat) -> Result<(), AuthError> {
         OutputFormat::Json => format!("Open this URL to authenticate: {url}\n"),
         OutputFormat::Jsonl => format!(
             "{}\n",
-            json!({"type":"authorization_url","provider":"openai","url":url})
+            Value::Object(Map::from_iter([
+                ("type".into(), Value::from("authorization_url")),
+                ("provider".into(), Value::from("openai")),
+                ("url".into(), Value::from(url)),
+            ]))
         ),
     };
     let result = if format == OutputFormat::Json {
@@ -1653,6 +1673,14 @@ fn human(stdout: impl Into<String>) -> Output {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 pub(crate) mod test_support {
     use super::TokenRecord;
 
@@ -1675,6 +1703,14 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
 
@@ -1683,6 +1719,7 @@ mod tests {
     }
 
     use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
+    use serde_json::json;
 
     const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC3UQBTeVjOtSY4\nHaZHjSpQPlIIUXSiIq+WRInLoWwYEXmloR41HMmwsCQVV1WFZ7z0wUj14vD3/Bl6\nJG2JTU8ur+RvJojm1gXxg/etp4DG2HVtXong4QE7BKqJufHITMVuEhojkTulHIbW\nXfQQjaxQpGsOIuWcRz3YVB7zpAL7yoeHhvFd7RV+IqG9i4fjN4pzlCTv/TQig+s7\n539MsNx1ZakBfeBhx62JUPhFe6pXdPS2hXVUiTQRPMBm3GimDzyuA3WkVKzPyNMB\n2h+BALRFLslqPaFpul7NIifX36KgUPaimntpvFRxahqyDvJ9ATtq6oMeHaRUMZf5\nkRxjLIXLAgMBAAECggEAAIIV+SVDTMINyrwHo6J4NTlnACTm/jK7FTSNbpC8/E1t\nbpBwGqpAw4pJdKcFqAADSGkSFbRnrJhN+HEKE1uxK3+gp3o43kLw80bFX1Lb4DE7\nahkyp/qXsUfbB9S0dIoEm2srbWElWYN8ZYhkeSNGEKx+q3mx9JPx+kaJa2159flh\nis34maBeEr97gwjAvMjLbdVEpoaEIRC/hmem2ckT5jsDd4HS7RKNXwk/S8O7/PQW\n42xKAvL0APk5J53CDoW4DT78y7t4Rj/dVeRZAhdjDUFP+idZ1r9k6PM8vs5tl1P0\njzcOMzUBFmhnb5MKFvBLc4MKJQYzTT06/qdfAV0M2QKBgQDsoUF+pNQuERUKCI9T\nZey7rFgsbBkK2t0XvgpLwwMbF548HgL+QJhAAONaLe5+2GlZSgb5OgoYYspiuzQT\noz2mqeN2MSMnUtntyUt+Y6IzPEEPg6bVGdoCP3FSvz1L/JDJuJq4cqb3OGPe4yEt\nZDymqUJCDTO52vT0GLdZ6S70twKBgQDGUoYrbButBHX5nwE5XnrjgENGT4RauI76\nQ158MuFmRmpgaWlc37ByVyzMG7x9qxcad4Ry19hsG5KYnL/PNs31a2i/BdfLZyFF\nY0dfNExz6tKf4PWxZhhFhX94f7qseSzXLx8eMQqdds4WQsA13JI9qQJ0pVSNyb/V\nXM/n9XMrjQKBgDsKgSz4M3jLClTWjexhIhAxkE6FKjprIX8rC6abocrAudqGInkN\n5O8TSabWjwtXM/HzZooI0TwEajr4OqYrtNZAzWBQIlVNdtK9xvhiI7Zk8lbMonPJ\nX3vwGHZtAP5Upkuuo+whr0c/6qtSQJTyza9HzCBu6tkUqMm+4QCuDelBAoGAax8S\nF4w6WrcJHj7Tg3BUAmQ6clTrEbGUkPsoov88nmi0dsUZQzAT93681La6lkp+nS4n\nXXzXCnXONh6cwElC8CgHGP8H83cOEpOwbm0qSoZxJCh3rU2PGKYmFyku5JBDNyvd\nrAojSLBuWrnNZopwd1u91tGinT93HcEXD5yVi9UCgYBq1sjl5jlliyHzPWMeV3dn\nkJWDLMpCwrpmQzrhkA02PaZO1BB7QgZeIKTYkzECHT44wHflalVOEEsVZpEn2Ivd\nJz6j2JwX7Ke23MA0MDaV6+7syAwPKx3+pOGwdun2uZNgvS74IWeBEfdMhGrGncX0\nQegKxe+skNhLjXJ5SUTdZg==\n-----END PRIVATE KEY-----\n";
 
@@ -1931,6 +1968,34 @@ mod tests {
         assert!(secrets.verifier.is_empty());
         assert!(secrets.state.is_empty());
         assert!(secrets.nonce.is_empty());
+    }
+
+    #[test]
+    fn status_json_preserves_nulls_and_omits_credentials() {
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let output = render_status(None, format, false).unwrap();
+            let value: Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "provider": "openai", "authenticated": false, "account": null,
+                })
+            );
+
+            let mut record = test_support::token_record("ACCESS_CANARY", "account-1", "generation");
+            record.email = Some("user@example.com".into());
+            let output = render_status(Some(record), format, true).unwrap();
+            let value: Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "provider": "openai",
+                    "authenticated": true,
+                    "account": {"id": "account-1", "email": "user@example.com", "plan_type": null},
+                })
+            );
+            assert!(!output.stdout.contains("CANARY"));
+        }
     }
 
     #[test]

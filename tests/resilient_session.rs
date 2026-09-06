@@ -1,3 +1,13 @@
+// Integration crate and its helpers are test-only. Placeholders stay denied.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
 //! Exercise public session and tool APIs against a real-disk backend whose
 //! capacity is unavailable until a normal shell tool repairs the condition.
 use std::{
@@ -67,7 +77,13 @@ fn session_survives_outage_close_reopen_and_tool_driven_recovery() {
         session_id: &id,
         item: &Item::text(ItemKind::User, "accepted during outage").with_created_at(Timestamp(123)),
     });
-    assert!(resilient_fs::global().status().pending_operations > 0);
+    assert!(
+        resilient_fs::best_effort_global()
+            .status()
+            .pending_operations
+            > 0
+    );
+    assert_eq!(resilient_fs::global().status().pending_operations, 0);
     drop(opened);
     // Reopening uses retained state and retained real mutation authority, not
     // a test-only SessionLock branch or a second independent memory transcript.
@@ -132,15 +148,19 @@ fn session_survives_outage_close_reopen_and_tool_driven_recovery() {
         item: &Item::text(ItemKind::User, "accepted after repair").with_created_at(Timestamp(124)),
     });
     drop(reopened);
-    for _ in 0..32 {
-        let report = resilient_fs::global().recover();
-        assert!(report.blocked.is_none(), "{:?}", report.blocked);
-        if report.remaining_operations == 0 {
-            break;
+    // Tools retain strict storage semantics; transcripts use the independent
+    // optional domain. Recover both without making one queue own the other.
+    for filesystem in [resilient_fs::global(), resilient_fs::best_effort_global()] {
+        for _ in 0..32 {
+            let report = filesystem.recover();
+            assert!(report.blocked.is_none(), "{:?}", report.blocked);
+            if report.remaining_operations == 0 {
+                break;
+            }
         }
+        filesystem.require_disk(&home).unwrap();
+        assert_eq!(filesystem.status().pending_operations, 0);
     }
-    resilient_fs::global().require_disk(&home).unwrap();
-    assert_eq!(resilient_fs::global().status().pending_operations, 0);
     assert_eq!(fs::read(&virtual_path).unwrap(), b"original");
     assert_eq!(kit::session::load(&root, &id.0).unwrap().len(), 3);
     // Inspect actual disk, not the facade, then replay again and prove exactness.
@@ -172,7 +192,12 @@ fn session_survives_outage_close_reopen_and_tool_driven_recovery() {
     );
     assert_eq!(durable.matches("accepted during outage").count(), 1);
     assert_eq!(durable.matches("accepted after repair").count(), 1);
-    assert_eq!(resilient_fs::global().recover().remaining_operations, 0);
+    assert_eq!(
+        resilient_fs::best_effort_global()
+            .recover()
+            .remaining_operations,
+        0
+    );
     assert_eq!(fs::read_to_string(transcript).unwrap(), durable);
 }
 
@@ -229,13 +254,23 @@ fn legacy_migration_reopens_with_retained_parent_sync_during_outage() {
     capacity.exhaust_on_write.store(true, Ordering::SeqCst);
     let opened = kit::session::open(&root, "legacy", true, false, vec![]).unwrap();
     let transcript = opened.transcript.clone();
-    assert!(resilient_fs::global().status().pending_operations > 0);
+    assert!(
+        resilient_fs::best_effort_global()
+            .status()
+            .pending_operations
+            > 0
+    );
     drop(opened);
     let reopened = kit::session::open(&root, "legacy", true, false, vec![]).unwrap();
     assert_eq!(reopened.transcript, transcript);
     assert!(kit::session::open(&root, "legacy", true, true, vec![]).is_err());
     capacity.exhausted.store(false, Ordering::SeqCst);
-    assert_eq!(resilient_fs::global().recover().remaining_operations, 0);
+    assert_eq!(
+        resilient_fs::best_effort_global()
+            .recover()
+            .remaining_operations,
+        0
+    );
     drop(reopened);
     assert_eq!(
         kit::session::open(&root, "legacy", true, false, vec![])

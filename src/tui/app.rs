@@ -1850,20 +1850,22 @@ impl App {
     }
 
     fn apply_runtime(&mut self, event: RuntimeEvent) {
-        if let RuntimeEvent::StorageStatus { pending, exhausted } = event {
-            self.storage_pending = pending;
-            self.storage_exhausted = exhausted;
-            return;
-        }
-        if let RuntimeEvent::SessionStarted { session_id } = event {
-            self.runtime_session_id = Some(session_id);
-            return;
-        }
-        if self.session_id.is_some() && self.runtime_session_id != self.session_id {
-            return;
-        }
-        let event = match event {
-            RuntimeEvent::SessionStarted { .. } => unreachable!("handled above"),
+        self.apply_runtime_at(event, crate::events::now_millis());
+    }
+
+    fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        let parent = event.parent_call().map(str::to_string);
+        let owner_id = match event {
+            RuntimeEvent::StorageStatus { pending, exhausted } => {
+                self.storage_pending = pending;
+                self.storage_exhausted = exhausted;
+                return;
+            }
+            RuntimeEvent::SessionStarted { session_id } => {
+                self.runtime_session_id = Some(session_id);
+                return;
+            }
+            _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => return,
             RuntimeEvent::CompactionStarted { .. } => {
                 self.compacting = true;
                 return;
@@ -1876,47 +1878,136 @@ impl App {
                 }
                 return;
             }
-            RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
-                self.apply_agent_runtime(event);
+            RuntimeEvent::SubagentStateChanged {
+                id,
+                name,
+                status,
+                outcome,
+                generation,
+                task,
+                parent_id,
+                parent_name,
+                harness,
+                model,
+                created_at_unix_ms,
+                generation_started_at_unix_ms,
+                generation_finished_at_unix_ms,
+            } => {
+                if self.cleaned_agent_ids.contains(&id) {
+                    if status == SubagentStatus::Removed {
+                        self.agents.remove(&id);
+                    }
+                    return;
+                }
+                if parent_id.as_ref().is_some_and(|parent| {
+                    self.cleaned_agent_ancestors.contains(parent)
+                        || self.cleaned_agent_ids.contains(parent)
+                }) {
+                    self.cleaned_agent_ids.insert(id.clone());
+                    self.agents.remove(&id);
+                    return;
+                }
+                let incoming_rank = agent_status_rank(status);
+                if self
+                    .agent_versions
+                    .get(&id)
+                    .is_some_and(|current| (generation, incoming_rank) <= *current)
+                {
+                    return;
+                }
+                self.agent_versions
+                    .insert(id.clone(), (generation, incoming_rank));
+                if status == SubagentStatus::Removed
+                    && (outcome != Some(GenerationOutcome::Failed)
+                        || generation_finished_at_unix_ms
+                            .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
+                {
+                    self.agents.remove(&id);
+                } else {
+                    self.agents.insert(
+                        id.clone(),
+                        AgentRow {
+                            id,
+                            name,
+                            status,
+                            outcome,
+                            generation,
+                            task,
+                            parent_id,
+                            parent_name,
+                            harness,
+                            model,
+                            created_at_unix_ms,
+                            generation_started_at_unix_ms,
+                            generation_finished_at_unix_ms,
+                        },
+                    );
+                }
+                self.clamp_agents_scroll();
                 return;
             }
-            event => event,
-        };
-        let parent = event.parent_call().map(str::to_string);
-        let call = match parent.and_then(|parent| self.call_mut(&parent)) {
-            Some(call) => call,
-            // Compose runs started by a subagent report against a call this
-            // client never saw; fold them into the visible run instead.
-            None => match self.running_call_mut() {
-                Some(call) => call,
-                None => return,
-            },
-        };
-        let owner_id = call.id.clone();
-        match event {
+            RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
+                let mut removed = HashSet::new();
+                loop {
+                    let before = removed.len();
+                    for row in self.agents.values() {
+                        if row.id != ancestor_id
+                            && row.parent_id.as_deref().is_some_and(|parent| {
+                                parent == ancestor_id || removed.contains(parent)
+                            })
+                        {
+                            removed.insert(row.id.clone());
+                        }
+                    }
+                    if removed.len() == before {
+                        break;
+                    }
+                }
+                self.agents.retain(|id, _| !removed.contains(id));
+                self.cleaned_agent_ancestors.insert(ancestor_id);
+                self.cleaned_agent_ids.extend(removed);
+                self.clamp_agents_scroll();
+                return;
+            }
             RuntimeEvent::ChildStarted {
                 call: child_call,
                 tool,
                 summary,
                 ..
-            } => call.attach(child_call, tool, summary),
+            } => {
+                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
+                    return;
+                };
+                call.attach(child_call, tool, summary);
+                call.id.clone()
+            }
             RuntimeEvent::ChildFinished {
                 call: child_call,
                 ok,
                 summary,
                 millis,
                 ..
-            } => call.finish_child(&child_call, ok, summary, millis),
-            RuntimeEvent::StorageStatus { .. }
-            | RuntimeEvent::SessionStarted { .. }
-            | RuntimeEvent::CompactionStarted { .. }
-            | RuntimeEvent::CompactionFinished { .. }
-            | RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => unreachable!("handled above"),
-        }
+            } => {
+                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
+                    return;
+                };
+                call.finish_child(&child_call, ok, summary, millis);
+                call.id.clone()
+            }
+        };
         if let Some(index) = self.call_index(&owner_id) {
             self.reclassify_dynamic(index);
+        }
+    }
+
+    fn runtime_call_mut(&mut self, parent: Option<&str>) -> Option<&mut ToolCall> {
+        // Prefer the explicit owner even when it has already completed. Runs
+        // started by subagents may name an unseen call; fold those into the
+        // visible running call instead.
+        if let Some(parent) = parent.filter(|parent| self.call_index(parent).is_some()) {
+            self.call_mut(parent)
+        } else {
+            self.find_call_mut(ToolCall::running)
         }
     }
 
@@ -1927,24 +2018,26 @@ impl App {
     }
 
     fn call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
-        let index = self.call_index(id)?;
-        self.mark_block_dirty(index);
-        match &mut self.blocks[index] {
-            Block::Tool(call) => Some(call),
-            _ => unreachable!(),
-        }
+        self.find_call_mut(|call| call.id == id)
     }
 
-    fn running_call_mut(&mut self) -> Option<&mut ToolCall> {
-        let index = self
-            .blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.running()))?;
-        self.mark_block_dirty(index);
-        match &mut self.blocks[index] {
-            Block::Tool(call) => Some(call),
-            _ => unreachable!(),
+    fn find_call_mut(&mut self, matches: impl Fn(&ToolCall) -> bool) -> Option<&mut ToolCall> {
+        let (index, call) =
+            self.blocks
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(index, block)| match block {
+                    Block::Tool(call) if matches(call) => Some((index, call)),
+                    _ => None,
+                })?;
+        // Retain the matched variant while updating only cache metadata.
+        if let Some(revision) = self.transcript_revisions.get_mut(index) {
+            self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
+            *revision = self.next_transcript_revision;
+            self.transcript_dirty.insert(index);
         }
+        Some(call)
     }
 
     fn close_thought(&mut self) {
@@ -2058,10 +2151,6 @@ impl App {
         self.push_block(Block::Notice(text.into()));
     }
 
-    fn apply_agent_runtime(&mut self, event: RuntimeEvent) {
-        self.apply_agent_runtime_at(event, crate::events::now_millis());
-    }
-
     fn retire_active_agents_at(&mut self, now_unix_ms: u64) {
         for row in self.agents.values_mut() {
             if matches!(
@@ -2077,100 +2166,6 @@ impl App {
                     (row.generation, agent_status_rank(SubagentStatus::Removed)),
                 );
             }
-        }
-        self.clamp_agents_scroll();
-    }
-
-    fn apply_agent_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-        match event {
-            RuntimeEvent::SubagentStateChanged {
-                id,
-                name,
-                status,
-                outcome,
-                generation,
-                task,
-                parent_id,
-                parent_name,
-                harness,
-                model,
-                created_at_unix_ms,
-                generation_started_at_unix_ms,
-                generation_finished_at_unix_ms,
-            } => {
-                if self.cleaned_agent_ids.contains(&id) {
-                    if status == SubagentStatus::Removed {
-                        self.agents.remove(&id);
-                    }
-                    return;
-                }
-                if parent_id.as_ref().is_some_and(|parent| {
-                    self.cleaned_agent_ancestors.contains(parent)
-                        || self.cleaned_agent_ids.contains(parent)
-                }) {
-                    self.cleaned_agent_ids.insert(id.clone());
-                    self.agents.remove(&id);
-                    return;
-                }
-                let incoming_rank = agent_status_rank(status);
-                if self
-                    .agent_versions
-                    .get(&id)
-                    .is_some_and(|current| (generation, incoming_rank) <= *current)
-                {
-                    return;
-                }
-                self.agent_versions
-                    .insert(id.clone(), (generation, incoming_rank));
-                if status == SubagentStatus::Removed
-                    && (outcome != Some(GenerationOutcome::Failed)
-                        || generation_finished_at_unix_ms
-                            .is_none_or(|finished| now_unix_ms.saturating_sub(finished) >= 4_000))
-                {
-                    self.agents.remove(&id);
-                } else {
-                    self.agents.insert(
-                        id.clone(),
-                        AgentRow {
-                            id,
-                            name,
-                            status,
-                            outcome,
-                            generation,
-                            task,
-                            parent_id,
-                            parent_name,
-                            harness,
-                            model,
-                            created_at_unix_ms,
-                            generation_started_at_unix_ms,
-                            generation_finished_at_unix_ms,
-                        },
-                    );
-                }
-            }
-            RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
-                let mut removed = HashSet::new();
-                loop {
-                    let before = removed.len();
-                    for row in self.agents.values() {
-                        if row.id != ancestor_id
-                            && row.parent_id.as_deref().is_some_and(|parent| {
-                                parent == ancestor_id || removed.contains(parent)
-                            })
-                        {
-                            removed.insert(row.id.clone());
-                        }
-                    }
-                    if removed.len() == before {
-                        break;
-                    }
-                }
-                self.agents.retain(|id, _| !removed.contains(id));
-                self.cleaned_agent_ancestors.insert(ancestor_id);
-                self.cleaned_agent_ids.extend(removed);
-            }
-            _ => unreachable!("only subagent runtime events reach the roster reducer"),
         }
         self.clamp_agents_scroll();
     }
@@ -2565,24 +2560,19 @@ impl App {
         }
     }
 
-    fn refresh_file_picker(&mut self) -> Action {
+    fn refresh_file_picker(&mut self, mut dialog: FilePickerDialog) -> Action {
         let Some(query_range) = self.active_file_query_range() else {
             self.file_picker = None;
             return Action::None;
         };
-        let activation = self
-            .file_picker
-            .as_ref()
-            .expect("active query belongs to a picker")
-            .activation;
+        let activation = dialog.activation;
         let revision = self.next_file_search_revision();
         let query = self.editor.text()[query_range.start + 1..query_range.end].to_string();
-        if let Some(dialog) = &mut self.file_picker {
-            dialog.query_range = query_range;
-            dialog.revision = revision;
-            dialog.selected = 0;
-            dialog.status = FilePickerStatus::Loading;
-        }
+        dialog.query_range = query_range;
+        dialog.revision = revision;
+        dialog.selected = 0;
+        dialog.status = FilePickerStatus::Loading;
+        self.file_picker = Some(dialog);
         Action::SearchFiles {
             query,
             revision,
@@ -2600,57 +2590,50 @@ impl App {
         }
     }
 
-    fn handle_file_picker_key(&mut self, key: KeyEvent) -> Action {
+    fn handle_file_picker_key(&mut self, key: KeyEvent, mut dialog: FilePickerDialog) -> Action {
         match key.code {
-            KeyCode::Esc => self.file_picker = None,
-            KeyCode::Up => {
-                if let Some(dialog) = &mut self.file_picker {
-                    dialog.selected = dialog.selected.saturating_sub(1);
-                }
-            }
+            KeyCode::Esc => return Action::None,
+            KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
             KeyCode::Down => {
-                if let Some(dialog) = &mut self.file_picker {
-                    dialog.selected =
-                        (dialog.selected + 1).min(dialog.matches.len().saturating_sub(1));
-                }
+                dialog.selected = (dialog.selected + 1).min(dialog.matches.len().saturating_sub(1));
             }
             KeyCode::Tab => {
-                let selection = self.file_picker.as_ref().and_then(|dialog| {
-                    dialog
-                        .matches
-                        .get(dialog.selected)
-                        .map(|item| (dialog.query_range.clone(), item.relative_path.clone()))
-                });
-                if let Some((range, path)) = selection {
-                    self.editor.replace_range(range, &format!("@{path}"));
-                    self.file_picker = None;
+                if let Some(item) = dialog.matches.get(dialog.selected) {
+                    self.editor
+                        .replace_range(dialog.query_range, &format!("@{}", item.relative_path));
+                    return Action::None;
                 }
             }
             KeyCode::Backspace => {
                 self.editor.backspace();
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
             KeyCode::Delete => {
                 self.editor.delete_forward();
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
             KeyCode::Left => {
                 self.editor.move_left();
+                self.file_picker = Some(dialog);
                 self.revalidate_file_picker();
+                return Action::None;
             }
             KeyCode::Right => {
                 self.editor.move_right();
+                self.file_picker = Some(dialog);
                 self.revalidate_file_picker();
+                return Action::None;
             }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
                 self.editor.insert_char(character);
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
-            _ => self.file_picker = None,
+            _ => return Action::None,
         }
+        self.file_picker = Some(dialog);
         Action::None
     }
 
@@ -2739,14 +2722,15 @@ impl App {
         token: u64,
         result: Result<(), SteerMutationError>,
     ) {
-        if self
-            .steer_mutations
-            .get(id)
-            .is_none_or(|mutation| mutation.token != token)
-        {
+        let std::collections::hash_map::Entry::Occupied(entry) =
+            self.steer_mutations.entry(id.to_owned())
+        else {
+            return;
+        };
+        if entry.get().token != token {
             return;
         }
-        let mutation = self.steer_mutations.remove(id).expect("matched mutation");
+        let mutation = entry.remove();
         match result {
             Ok(()) => {
                 if let Some(text) = mutation.text {
@@ -3055,8 +3039,11 @@ impl App {
         };
         let pasted_input =
             pasted && matches!(key.code, KeyCode::Char(_) | KeyCode::Tab | KeyCode::Enter);
-        if self.file_picker.is_some() && !pasted_input && file_picker_key {
-            return self.handle_file_picker_key(key);
+        if !pasted_input
+            && file_picker_key
+            && let Some(dialog) = self.file_picker.take()
+        {
+            return self.handle_file_picker_key(key, dialog);
         }
         self.file_picker = None;
         // `cmd` only reaches the client in terminals that speak the Kitty
@@ -3559,11 +3546,13 @@ impl App {
         let selection = self.selection?;
         let (start, end) = selection.ordered();
         let mut lines: Vec<String> = Vec::new();
-        let mut last_logical: Option<(usize, usize)> = None;
+        let mut pending: Option<(Option<(usize, usize)>, String)> = None;
         for line in start.0..=end.0 {
             let Some((block, row)) = self.transcript_row(line) else {
+                if let Some((_, text)) = pending.take() {
+                    lines.push(text);
+                }
                 lines.push(String::new());
-                last_logical = None;
                 continue;
             };
             let text: String = row
@@ -3581,18 +3570,23 @@ impl App {
             }
             let fragment = fragment.trim_end().to_string();
             let logical = row.1.2.map(|index| (block, index));
-            match (logical, last_logical) {
-                (Some(current), Some(previous)) if current == previous => {
-                    let joined = lines.last_mut().expect("a wrapped row follows its first");
+            match &mut pending {
+                Some((Some(previous), joined)) if logical == Some(*previous) => {
                     let fragment = fragment.trim_start();
                     if !fragment.is_empty() {
                         joined.push_str(&row.3);
                         joined.push_str(fragment);
                     }
                 }
-                _ => lines.push(fragment),
+                _ => {
+                    if let Some((_, text)) = pending.replace((logical, fragment)) {
+                        lines.push(text);
+                    }
+                }
             }
-            last_logical = logical;
+        }
+        if let Some((_, text)) = pending {
+            lines.push(text);
         }
         let text = lines.join("\n");
         let text = text.trim_matches('\n');
@@ -3657,8 +3651,16 @@ fn has_graphical_session(display: Option<&OsStr>, wayland_display: Option<&OsStr
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn open_url(_url: &str) {}
 
-/// Fixtures and deterministic-clock adapters; not an alternate live event protocol.
+/// Fixtures and test accessors; not an alternate live event protocol.
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use agent_client_protocol::schema::v2::RunningStateUpdate;
 
@@ -3703,20 +3705,18 @@ mod test_support {
             )));
             self.blocks.len() as u64
         }
-
-        pub(super) fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-            match event {
-                RuntimeEvent::SubagentStateChanged { .. }
-                | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
-                    self.apply_agent_runtime_at(event, now_unix_ms);
-                }
-                event => self.apply_runtime(event),
-            }
-        }
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         path::PathBuf,
@@ -4263,6 +4263,31 @@ mod tests {
         assert_eq!(call.children.len(), 1);
         assert_eq!(call.children[0].node, Some(0));
         assert_eq!(call.running_children(), 1);
+    }
+
+    #[test]
+    fn unknown_child_owner_uses_running_call_and_finishes_the_same_child() {
+        let mut app = app();
+        // No visible owner is a valid event-stream boundary, not a tool variant.
+        app.apply(Update::Runtime(child("unseen:compose:before", "shell")));
+        assert!(app.blocks.is_empty());
+        compose(&mut app, "return shell({ command: \"ls\" })");
+        app.note("intervening non-tool block");
+        app.apply(Update::Runtime(child("unseen:compose:abc", "shell")));
+        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
+            call: "unseen:compose:abc".into(),
+            tool: "shell".into(),
+            ok: true,
+            summary: "done".into(),
+            millis: 12,
+        }));
+        let Block::Tool(call) = &app.blocks[0] else {
+            panic!("expected the visible compose call");
+        };
+        assert_eq!(call.children.len(), 1);
+        assert_eq!(call.running_children(), 0);
+        assert!(call.children[0].ok);
+        assert_eq!(call.children[0].millis, Some(12));
     }
 
     #[test]

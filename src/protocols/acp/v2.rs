@@ -25,6 +25,8 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
+use futures_util::future::{Either, select};
+use serde_json::{Map, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
@@ -183,6 +185,11 @@ struct ReplacementGeneration {
     thought: Option<wire::MessageId>,
 }
 
+enum ReplacementMessageKind {
+    Agent,
+    Thought,
+}
+
 impl ReplacementGeneration {
     fn new() -> Self {
         static NEXT_REPLACEMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -193,11 +200,10 @@ impl ReplacementGeneration {
         }
     }
 
-    fn message_id(&mut self, kind: &'static str) -> wire::MessageId {
-        let current = match kind {
-            "agent" => &mut self.agent,
-            "thought" => &mut self.thought,
-            _ => unreachable!("replacement message kind is fixed"),
+    fn message_id(&mut self, kind: ReplacementMessageKind) -> wire::MessageId {
+        let (current, kind) = match kind {
+            ReplacementMessageKind::Agent => (&mut self.agent, "agent"),
+            ReplacementMessageKind::Thought => (&mut self.thought, "thought"),
         };
         current
             .get_or_insert_with(|| {
@@ -263,7 +269,7 @@ impl<S> ResponseReplacementSink<S> {
         match &mut notification.update {
             wire::SessionUpdate::AgentMessageChunk(chunk) => {
                 if let Some(replacement) = current.replacement.as_mut() {
-                    chunk.message_id = replacement.message_id("agent");
+                    chunk.message_id = replacement.message_id(ReplacementMessageKind::Agent);
                 }
                 current.agent = Some(chunk.message_id.clone());
             }
@@ -271,7 +277,7 @@ impl<S> ResponseReplacementSink<S> {
                 if let Some(message_id) = current.pending_thought.take() {
                     chunk.message_id = message_id;
                 } else if let Some(replacement) = current.replacement.as_mut() {
-                    chunk.message_id = replacement.message_id("thought");
+                    chunk.message_id = replacement.message_id(ReplacementMessageKind::Thought);
                 }
                 if !current.thoughts.contains(&chunk.message_id) {
                     current.thoughts.push(chunk.message_id.clone());
@@ -605,8 +611,12 @@ impl Server {
         } else {
             "authentication method was not advertised by this agent"
         };
-        Err(agent_client_protocol::Error::invalid_params()
-            .data(serde_json::json!({ "detail": detail, "methodId": method_id })))
+        Err(
+            agent_client_protocol::Error::invalid_params().data(Value::Object(Map::from_iter([
+                ("detail".into(), Value::from(detail)),
+                ("methodId".into(), Value::from(method_id)),
+            ]))),
+        )
     }
 
     async fn logout(self: &Arc<Self>) -> Result<wire::LogoutAuthResponse, AcpRuntimeError> {
@@ -847,6 +857,7 @@ impl Server {
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
+        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string())?;
         let cancellation = CancellationController::new();
         let sink = ResponseReplacementSink::new(ConnectionSink(connection));
         let activity = native_activity(session_id.clone(), sink.clone());
@@ -885,7 +896,6 @@ impl Server {
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
         let structured_completion = driver.structured_completion;
-        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
         let (tx, rx) = mpsc::channel(8);
         let busy = Arc::new(AtomicBool::new(false));
         let actor = SessionActor {
@@ -1206,9 +1216,28 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     let mut binding = Some(binding);
     let mut model_switch = model_switch::Guard::default();
     loop {
-        tokio::select! {
-            biased;
-            command = commands.recv() => match command {
+        // Poll in command > MCP > task order. In particular, queued cancellation
+        // must prevent an autonomous continuation from starting.
+        let event = {
+            let command = std::pin::pin!(commands.recv());
+            let mcp = std::pin::pin!(async {
+                match mcp_events.recv().await {
+                    Some(event) => event,
+                    None => std::future::pending().await,
+                }
+            });
+            let task = std::pin::pin!(tasks.next_event());
+            let work = std::pin::pin!(select(mcp, task));
+            match select(command, work).await {
+                Either::Left((command, _pending)) => Either::Left(command),
+                Either::Right((work, _pending)) => Either::Right(match work {
+                    Either::Left((event, _pending)) => Either::Left(event),
+                    Either::Right((event, _pending)) => Either::Right(event),
+                }),
+            }
+        }; // Drop the owning futures before handlers reborrow receivers/driver.
+        match event {
+            Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
                     let result = prepare_prompt(
                         &session_id,
@@ -1222,7 +1251,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &tasks,
                         &background_jobs,
                         structured_completion,
-                    &activity,)
+                        &activity,
+                    )
                     .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
                     busy.store(false, Ordering::Release);
@@ -1230,37 +1260,66 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
                 }
-                Some(Command::SetConfig { request, reply, cancellation_generation }) => {
+                Some(Command::SetConfig {
+                    request,
+                    reply,
+                    cancellation_generation,
+                }) => {
                     let result = async {
-                        if handle.cancellation_handle().is_cancelled_since(cancellation_generation) {
+                        if handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation)
+                        {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         if request.config_id.to_string() == super::MODEL_CONFIG_ID {
-                            let target = request.value.as_id().ok_or_else(|| model_switch::error("selection requires an id value"))?;
+                            let target = request.value.as_id().ok_or_else(|| {
+                                model_switch::error("selection requires an id value")
+                            })?;
                             let decision = model_switch.check(
-                                (&adapter.selection().map_err(|error| model_switch::error(&error))?, cancellation_generation),
-                                crate::provider::ModelSelection::from_id(&target.to_string()).map_err(|error| model_switch::error(&error))?,
-                                &catalog, driver.snapshot().transcript,
-                                request.meta.as_ref().and_then(|meta| meta.get(model_switch::META)),
+                                (
+                                    &adapter
+                                        .selection()
+                                        .map_err(|error| model_switch::error(&error))?,
+                                    cancellation_generation,
+                                ),
+                                crate::provider::ModelSelection::from_id(&target.to_string())
+                                    .map_err(|error| model_switch::error(&error))?,
+                                &catalog,
+                                driver.snapshot().transcript,
+                                request
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
                                 claim_prompt(&busy).map_err(sdk_error)?;
                                 handle.prepare_injection_turn();
                                 handle.start_injection_turn();
                                 let compacted = compact_for_switch(
-                                    &session_id, &integration, &handle, &mut driver, &sink,
-                                    cancellation_generation, &activity,
-                                ).await;
+                                    &session_id,
+                                    &integration,
+                                    &handle,
+                                    &mut driver,
+                                    &sink,
+                                    cancellation_generation,
+                                    &activity,
+                                )
+                                .await;
                                 handle.stop_injection_turn();
                                 busy.store(false, Ordering::Release);
                                 compacted?;
                             }
                         }
-                        if handle.cancellation_handle().is_cancelled_since(cancellation_generation) {
+                        if handle
+                            .cancellation_handle()
+                            .is_cancelled_since(cancellation_generation)
+                        {
                             return Err(model_switch::error("model change cancelled"));
                         }
                         set_v2_config(&adapter, &catalog, request).map_err(sdk_error)
-                    }.await;
+                    }
+                    .await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
@@ -1276,11 +1335,11 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                     break;
                 }
             },
-            event = mcp_events.recv() => {
-                if let Some(event) = event {
-                    let result = async {
-                        match driver.submit_input(vec![Item::notification(event.message)]) {
-                            Ok(()) => drive_autonomous(
+            Either::Right(Either::Left(event)) => {
+                let result = async {
+                    match driver.submit_input(vec![Item::notification(event.message)]) {
+                        Ok(()) => {
+                            drive_autonomous(
                                 &session_id,
                                 &integration,
                                 &handle,
@@ -1288,18 +1347,19 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                                 &mut driver,
                                 &sink,
                                 &activity,
-                            ).await,
-                            Err(error) => Err(map_loop_error(&session_id, &error)),
+                            )
+                            .await
                         }
-                    }
-                    .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
-                    .await;
-                    if let Err(error) = result {
-                        eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                        Err(error) => Err(map_loop_error(&session_id, &error)),
                     }
                 }
+                .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
+                .await;
+                if let Err(error) = result {
+                    eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
+                }
             }
-            event = tasks.next_event() => match event {
+            Either::Right(Either::Right(event)) => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background
@@ -1310,7 +1370,8 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                             &busy,
                             &mut driver,
                             &sink,
-                        &activity,)
+                            &activity,
+                        )
                         .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
                         .await
                     {
@@ -1322,7 +1383,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
                 Some(_) => {}
                 None => break,
-            }
+            },
         }
     }
 }
@@ -2004,13 +2065,12 @@ pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    super::connect_stdio(v2_router(runtime, registry)?).await
+    super::connect_stdio(v2_router(runtime, registry)).await
 }
 
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
         v2_router(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP v2 integration must build")
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         path: "/acp/v2".into(),
@@ -2023,18 +2083,18 @@ pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> a
 fn v2_router(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
-) -> Result<agent_client_protocol::AgentProtocolRouter, AcpRuntimeError> {
-    Ok(agent_client_protocol::Agent
+) -> agent_client_protocol::AgentProtocolRouter {
+    agent_client_protocol::Agent
         .protocol_router()
-        .with_v2(component(runtime, registry)?))
+        .with_v2(component(runtime, registry))
 }
 
 pub(crate) fn component(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
-) -> Result<impl ConnectTo<Client>, AcpRuntimeError> {
+) -> impl ConnectTo<Client> {
     let state = Arc::new(Server::new(runtime, registry));
-    let agent = agent_client_protocol::Agent
+    agent_client_protocol::Agent
         .v2()
         .name("kit")
         .on_receive_request(
@@ -2267,11 +2327,18 @@ pub(crate) fn component(
                 }
             },
             agent_client_protocol::on_receive_request!(),
-        );
-    Ok(agent)
+        )
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         collections::VecDeque,
@@ -3034,7 +3101,7 @@ mod tests {
         )
         .unwrap();
         let (mut client, agent) = agent_client_protocol::Channel::duplex();
-        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+        let router = v2_router(runtime, SessionRegistry::new());
         let server = tokio::spawn(async move { router.connect_to(agent).await });
         send_wire(
             &client,
@@ -4776,7 +4843,7 @@ mod tests {
             .next_token
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-        let router = v2_router(runtime.clone(), registry.clone()).unwrap();
+        let router = v2_router(runtime.clone(), registry.clone());
         let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
         let workspace = root.path().to_path_buf();
         let client = agent_client_protocol::Client.v2().connect_with(
@@ -4837,6 +4904,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_mcp_rejection_releases_attachment_and_claim() {
+        for poison in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let session_id = crate::session::new_id();
+            let runtime = Runtime::with_session_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::runtime::SessionRequest {
+                    id: session_id.clone(),
+                    resume: false,
+                    force: false,
+                },
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap();
+            let registry = SessionRegistry::new();
+            let expected = if poison {
+                let routes = runtime.mcp_for_test().event_route_registry();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = routes.lock().unwrap();
+                        panic!("interrupted event route admission");
+                    }))
+                    .is_err()
+                );
+                "MCP event routes are poisoned"
+            } else {
+                runtime
+                    .mcp_for_test()
+                    .event_route_counter()
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                "MCP event route generation space exhausted"
+            };
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let router = v2_router(runtime.clone(), registry.clone());
+            let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+            let workspace = root.path().to_path_buf();
+            let client = agent_client_protocol::Client.v2().connect_with(
+                client_transport,
+                async move |connection| {
+                    connection
+                        .send_request(wire::InitializeRequest::new(
+                            wire::ProtocolVersion::V2,
+                            wire::Implementation::new("exhaustion-test", "0"),
+                        ))
+                        .block_task()
+                        .await?;
+                    for _ in 0..2 {
+                        let error = connection
+                            .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                            .block_task()
+                            .await
+                            .expect_err("unavailable MCP routes must reject attachment");
+                        assert!(error.data.unwrap().to_string().contains(expected));
+                        assert!(!registry.inner.state.is_poisoned());
+                        {
+                            let state = registry.inner.lock_state();
+                            assert!(state.accepting);
+                            assert_eq!(state.pending_attachments, 0);
+                            assert!(state.sessions.is_empty());
+                            assert!(state.v2_sessions.is_empty());
+                        }
+                        // Failed attachment releases its claim without creating a transcript.
+                        let claim = runtime.claim_session().unwrap();
+                        assert_eq!(claim.id(), session_id);
+                        assert!(claim.is_configured());
+                        drop(claim);
+                        assert_eq!(
+                            crate::session::load(&workspace, &session_id).unwrap_err(),
+                            format!("session {session_id:?} does not exist")
+                        );
+                    }
+                    Ok(())
+                },
+            );
+            let result = timeout(Duration::from_secs(2), client).await;
+            server.abort();
+            let _ = server.await;
+            result.expect("MCP rejection client timed out").unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn v2_router_advertises_and_routes_pending_injection_replacement() {
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new_with_provider_and_credentials(
@@ -4847,7 +4998,7 @@ mod tests {
         )
         .unwrap();
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
-        let router = v2_router(runtime, SessionRegistry::new()).unwrap();
+        let router = v2_router(runtime, SessionRegistry::new());
         let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
         let client =
             agent_client_protocol::Client

@@ -86,7 +86,7 @@ fn mutation_filesystem(path: &Path) -> Result<fs::Fs, CredentialStoreError> {
     Ok(guard
         ._scope
         .as_ref()
-        .expect("filesystem refresh scope")
+        .ok_or_else(|| error("credential refresh lock has no filesystem scope"))?
         .filesystem
         .clone())
 }
@@ -574,6 +574,14 @@ fn context(prefix: &str, value: impl std::fmt::Display) -> CredentialStoreError 
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use super::*;
 
@@ -591,6 +599,14 @@ mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{sync::mpsc, time::Duration};
 
@@ -682,6 +698,44 @@ mod tests {
         entry.require_disk().unwrap();
         assert!(entry.load().unwrap().is_none());
         assert!(!entry.filesystem_path().unwrap().exists());
+    }
+
+    #[test]
+    fn failed_refresh_authority_preserves_credentials_and_allows_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = CredentialStorage::Filesystem(directory.path().to_path_buf())
+            .entry("authority-failure-test", "file");
+        entry.save(b"original").unwrap();
+        entry.require_disk().unwrap();
+        let path = entry.filesystem_path().unwrap();
+        let lock_path = directory.path().join(".refresh.lock");
+
+        // Reject real OS authority acquisition, not a credential write itself.
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        let save_error = entry.save(b"replacement").unwrap_err();
+        let delete_error = entry.delete().unwrap_err();
+        for error in [save_error, delete_error] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("could not acquire real OAuth refresh lock")
+            );
+        }
+        assert_eq!(entry.load().unwrap().unwrap().as_slice(), b"original");
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+
+        // Failed calls must not publish reusable authority or queue mutations.
+        std::fs::remove_dir(&lock_path).unwrap();
+        entry.require_disk().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
+        entry.save(b"replacement").unwrap();
+        entry.require_disk().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+        assert!(entry.delete().unwrap());
+        entry.require_disk().unwrap();
+        assert!(entry.load().unwrap().is_none());
+        assert!(!path.exists());
     }
 
     #[test]

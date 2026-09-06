@@ -69,18 +69,19 @@ impl Editor {
     }
 
     /// Display row and column for a byte offset in the prompt.
-    pub fn display_position(&self, offset: usize, width: usize) -> (usize, usize) {
-        debug_assert!(offset <= self.text.len() && self.text.is_char_boundary(offset));
+    /// Returns `None` if the offset is out of bounds or splits a character.
+    pub fn display_position(&self, offset: usize, width: usize) -> Option<(usize, usize)> {
+        let prefix = self.text.get(..offset)?;
         let width = width.max(1);
         let ranges = self.rows(width);
         let index = self.offset_row(&ranges, offset);
         let (start, _) = ranges[index];
-        let column = self.text[start..offset].width();
-        if column >= width {
+        let column = prefix[start..].width();
+        Some(if column >= width {
             (index + 1, 0)
         } else {
             (index, column)
-        }
+        })
     }
 
     /// Display rows the prompt needs at `width` columns.
@@ -415,6 +416,14 @@ fn char_offset(line: &str, column: usize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::Editor;
 
@@ -510,8 +519,26 @@ mod tests {
     fn locates_an_offset_across_wrapped_unicode_rows() {
         let editor = editor("ok\n界e\u{301} @src");
         let offset = editor.text().find('@').unwrap();
-        assert_eq!(editor.display_position(offset, 20), (1, 4));
-        assert_eq!(editor.display_position(offset, 4), (2, 0));
+        assert_eq!(editor.display_position(offset, 20), Some((1, 4)));
+        assert_eq!(editor.display_position(offset, 4), Some((2, 0)));
+    }
+
+    #[test]
+    fn display_position_rejects_invalid_byte_offsets() {
+        let editor = editor("界");
+        assert_eq!(editor.display_position(1, 4), None);
+        assert_eq!(editor.display_position(2, 4), None);
+        assert_eq!(editor.display_position(4, 4), None);
+        assert_eq!(editor.display_position(usize::MAX, 4), None);
+        assert_eq!(editor.display_position(0, 4), Some((0, 0)));
+        assert_eq!(editor.display_position(3, 4), Some((0, 2)));
+        assert_eq!(editor.display_position(3, 2), Some((1, 0)));
+    }
+
+    #[test]
+    fn display_position_accepts_empty_prompt_and_zero_width() {
+        assert_eq!(editor("").display_position(0, 0), Some((0, 0)));
+        assert_eq!(editor("a").display_position(1, 0), Some((1, 0)));
     }
 
     #[test]

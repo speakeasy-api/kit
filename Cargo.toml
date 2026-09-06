@@ -100,3 +100,15 @@ agentkit-capabilities = "=0.10.5"
 agentkit-core = "=0.10.5"
 agentkit-task-manager = "=0.10.7"
 agentkit-tools-core = "=0.10.5"
+
+# Deny also in test builds; only test-only scopes may relax ergonomics. Crate
+# roots additionally forbid these in production so local allows cannot evade it.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_methods = "deny"
+disallowed_macros = "deny"

@@ -9,7 +9,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value};
 
 /// Reads Kit-owned output through the internal filesystem, not a shell path.
 #[derive(Clone)]
@@ -20,33 +20,83 @@ pub struct ArtifactTool {
 
 impl ArtifactTool {
     pub fn new(artifact_root: PathBuf) -> Self {
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "path".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                            ("minLength".into(), Value::from(1)),
+                            ("maxLength".into(), Value::from(4096)),
+                        ])),
+                    ),
+                    (
+                        "offset".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("integer")),
+                            ("minimum".into(), Value::from(0)),
+                            ("default".into(), Value::from(0)),
+                        ])),
+                    ),
+                    (
+                        "limit".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("integer")),
+                            ("minimum".into(), Value::from(4)),
+                            ("maximum".into(), Value::from(1024)),
+                            ("default".into(), Value::from(1024)),
+                        ])),
+                    ),
+                ])),
+            ),
+            ("required".into(), Value::Array(vec![Value::from("path")])),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
+        let output_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "content".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "next_offset".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                    ),
+                    (
+                        "total_bytes".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                    ),
+                    (
+                        "eof".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("boolean"))])),
+                    ),
+                ])),
+            ),
+            (
+                "required".into(),
+                Value::Array(vec![
+                    Value::from("content"),
+                    Value::from("next_offset"),
+                    Value::from("total_bytes"),
+                    Value::from("eof"),
+                ]),
+            ),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
         Self {
             root: artifact_root,
             spec: ToolSpec::new(
                 ToolName::new("artifact"),
                 "Read a UTF-8 Kit output artifact from this session, including artifacts temporarily retained in memory when disk storage fails. Use the artifact path returned by compose. Continue from next_offset to read another bounded chunk. Shell commands cannot read memory-only artifacts.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "minLength": 1, "maxLength": 4096},
-                        "offset": {"type": "integer", "minimum": 0, "default": 0},
-                        "limit": {"type": "integer", "minimum": 4, "maximum": 1024, "default": 1024}
-                    },
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
+                input_schema,
             )
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "next_offset": {"type": "integer"},
-                    "total_bytes": {"type": "integer"},
-                    "eof": {"type": "boolean"}
-                },
-                "required": ["content", "next_offset", "total_bytes", "eof"],
-                "additionalProperties": false
-            }))
+            .with_output_schema(output_schema)
             .with_annotations(ToolAnnotations::read_only()),
         }
     }
@@ -134,12 +184,12 @@ impl Tool for ArtifactTool {
             let content =
                 String::from_utf8(bytes).map_err(|error| ToolError::Internal(error.to_string()))?;
             let next_offset = input.offset + end as u64;
-            Ok(json!({
-                "content": content,
-                "next_offset": next_offset,
-                "total_bytes": metadata.len(),
-                "eof": next_offset == metadata.len()
-            }))
+            Ok(Value::Object(Map::from_iter([
+                ("content".into(), Value::from(content)),
+                ("next_offset".into(), Value::from(next_offset)),
+                ("total_bytes".into(), Value::from(metadata.len())),
+                ("eof".into(), Value::from(next_offset == metadata.len())),
+            ])))
         })
         .await
         .map_err(|error| ToolError::Internal(error.to_string()))??;
@@ -151,7 +201,16 @@ impl Tool for ArtifactTool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
+    use serde_json::json;
     use std::sync::Arc;
 
     use agentkit_core::{MetadataMap, SessionId, ToolCallId, TurnId};
@@ -197,8 +256,15 @@ mod tests {
         let ToolOutput::Structured(first) = result.result.output else {
             panic!("structured output expected")
         };
-        assert_eq!(first["content"], "abcé");
-        assert_eq!(first["next_offset"], 5);
+        assert_eq!(
+            first,
+            json!({
+                "content": "abcé",
+                "next_offset": 5,
+                "total_bytes": 13,
+                "eof": false,
+            })
+        );
         let result = tool
             .invoke(
                 request(session, json!({"path":path,"offset":5})),
@@ -209,8 +275,15 @@ mod tests {
         let ToolOutput::Structured(last) = result.result.output else {
             panic!("structured output expected")
         };
-        assert_eq!(last["content"], "😀tail");
-        assert_eq!(last["eof"], true);
+        assert_eq!(
+            last,
+            json!({
+                "content": "😀tail",
+                "next_offset": 13,
+                "total_bytes": 13,
+                "eof": true,
+            })
+        );
         assert!(
             tool.invoke(
                 request(SessionId::new("other-session"), json!({"path":path})),

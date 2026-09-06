@@ -146,19 +146,24 @@ impl WorkspaceFileSearch {
             let root = &root;
             Box::new(move |result| {
                 let entry = match result {
-                    Ok(entry) if entry.error().is_none() => entry,
-                    result => {
-                        let error = match result {
-                            Ok(entry) => entry.error().expect("entry has an error").to_string(),
-                            Err(error) => error.to_string(),
-                        };
-                        scan_error
-                            .lock()
-                            .expect("scan error mutex poisoned")
-                            .get_or_insert(error);
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        // A poisoned error slot is reported by into_inner below;
+                        // never accept the partial index after a rejected write.
+                        let error = error.to_string();
+                        if let Ok(mut slot) = scan_error.lock() {
+                            slot.get_or_insert(error);
+                        }
                         return WalkState::Quit;
                     }
                 };
+                if let Some(error) = entry.error() {
+                    let error = error.to_string();
+                    if let Ok(mut slot) = scan_error.lock() {
+                        slot.get_or_insert(error);
+                    }
+                    return WalkState::Quit;
+                }
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     return WalkState::Continue;
                 }
@@ -170,13 +175,23 @@ impl WorkspaceFileSearch {
                     .map(|part| part.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                files
-                    .lock()
-                    .expect("file list mutex poisoned")
-                    .push(relative_path);
+                match files.lock() {
+                    Ok(mut files) => files.push(relative_path),
+                    // The joined scan consumes this lock below and reports poison.
+                    Err(_) => return WalkState::Quit,
+                }
                 WalkState::Continue
             })
         });
+        Self::from_scan(files, scan_error)
+    }
+
+    // Called only after all walkers have joined. A worker can request Quit on
+    // poison because this boundary rejects either poisoned owner, not its data.
+    fn from_scan(
+        files: Mutex<Vec<String>>,
+        scan_error: Mutex<Option<String>>,
+    ) -> Result<Self, String> {
         if let Some(error) = scan_error
             .into_inner()
             .map_err(|error| format!("could not collect workspace scan error: {error}"))?
@@ -266,26 +281,33 @@ pub async fn search_workspace(
         // The activation identifies a picker instance independently of its query.
         // This lets a later query initialize the snapshot if it wins the request
         // race, while older or same-activation requests cannot trigger a rescan.
-        let refresh = state
-            .as_ref()
-            .is_none_or(|cached| activation > cached.activation);
-        if refresh {
-            *state = Some(WorkspaceFileSearchState {
-                activation,
-                search: WorkspaceFileSearch::start(root)?,
-            });
+        if let Some(cached) = state.as_ref()
+            && activation <= cached.activation
+        {
+            return cached.search.search(&query);
         }
-        state
-            .as_ref()
-            .expect("initialized above")
-            .search
-            .search(&query)
+        // Build and query before committing: an error leaves the old snapshot
+        // and activation intact. No callbacks or awaits occur in the commit.
+        let search = WorkspaceFileSearch::start(root)?;
+        let matches = search.search(&query)?;
+        let previous = state.replace(WorkspaceFileSearchState { activation, search });
+        drop(state);
+        drop(previous);
+        Ok(matches)
     })
     .await
     .map_err(|error| format!("file search worker failed: {error}"))?
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{fs, process::Command};
 
@@ -446,6 +468,83 @@ mod tests {
                 .iter()
                 .any(|item| item.relative_path == "later.rs")
         );
+    }
+
+    #[test]
+    fn joined_scan_rejects_either_poisoned_worker_owner() {
+        let files = Mutex::new(vec!["partial.rs".into()]);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _files = files.lock().unwrap();
+                panic!("file collector interrupted");
+            })
+            .is_err()
+        );
+        let error = WorkspaceFileSearch::from_scan(files, Mutex::new(None))
+            .err()
+            .unwrap();
+        assert!(error.contains("could not collect workspace files"));
+
+        let scan_error = Mutex::new(None);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _error = scan_error.lock().unwrap();
+                panic!("error collector interrupted");
+            })
+            .is_err()
+        );
+        let error =
+            WorkspaceFileSearch::from_scan(Mutex::new(vec!["partial.rs".into()]), scan_error)
+                .err()
+                .unwrap();
+        assert!(error.contains("could not collect workspace scan error"));
+    }
+
+    #[tokio::test]
+    async fn failed_activation_keeps_the_previous_snapshot() {
+        let workspace = workspace();
+        let root = workspace.path().canonicalize().unwrap();
+        let state = Arc::new(Mutex::new(None));
+        let original = search_workspace(Arc::clone(&state), root.clone(), String::new(), 1)
+            .await
+            .unwrap();
+        let error = search_workspace(Arc::clone(&state), root.join("missing"), String::new(), 2)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not a directory"));
+        assert_eq!(state.lock().unwrap().as_ref().unwrap().activation, 1);
+        assert_eq!(
+            search_workspace(Arc::clone(&state), root.clone(), String::new(), 1)
+                .await
+                .unwrap(),
+            original
+        );
+        fs::write(root.join("later.rs"), "later").unwrap();
+        let refreshed = search_workspace(state, root, String::new(), 2)
+            .await
+            .unwrap();
+        assert!(
+            refreshed
+                .iter()
+                .any(|item| item.relative_path == "later.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_picker_cache_is_rejected_without_rebuilding() {
+        let workspace = workspace();
+        let state = Arc::new(Mutex::new(None));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _state = state.lock().unwrap();
+                panic!("interrupted cache owner");
+            }))
+            .is_err()
+        );
+        let error = search_workspace(state, workspace.path().to_path_buf(), String::new(), 1)
+            .await
+            .unwrap_err();
+        assert!(error.contains("file search state is unavailable"));
     }
 
     #[test]

@@ -15,8 +15,8 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use agentkit_provider_openai::{
-    OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesLimits, OpenAIResponsesProfile,
-    OpenAIResponsesSession, OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
+    OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesLimits, OpenAIResponsesSession,
+    OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -77,16 +77,27 @@ impl SubscriptionModelCatalogCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<SubscriptionModelCatalog, LoopError>>,
     {
-        let catalog = {
+        // This is the only entry writer. Construct the complete replacement
+        // before publishing it; initialization and retired-value drops run
+        // outside the guard. Cancellation leaves either binding's complete
+        // cell, and OnceCell retries failed or cancelled initialization.
+        let (catalog, retired) = {
             let mut entry = self.entry.lock().await;
-            if entry.as_ref().is_none_or(|entry| entry.binding != *binding) {
-                *entry = Some(SubscriptionModelCatalogCacheEntry {
-                    binding: binding.clone(),
-                    catalog: Arc::new(tokio::sync::OnceCell::new()),
-                });
+            match entry.as_ref() {
+                Some(current) if current.binding == *binding => {
+                    (Arc::clone(&current.catalog), None)
+                }
+                _ => {
+                    let catalog = Arc::new(tokio::sync::OnceCell::new());
+                    let replacement = SubscriptionModelCatalogCacheEntry {
+                        binding: binding.clone(),
+                        catalog: Arc::clone(&catalog),
+                    };
+                    (catalog, entry.replace(replacement))
+                }
             }
-            Arc::clone(&entry.as_ref().expect("catalog cache entry exists").catalog)
         };
+        drop(retired);
         catalog
             .get_or_try_init(|| async { init().await.map(Arc::new) })
             .await
@@ -268,7 +279,6 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
                     max_text_bytes: MAX_FIELD_BYTES,
                 })
                 .with_resilience(resilience);
-        debug_assert_eq!(config.profile, OpenAIResponsesProfile::ChatGptPrivate);
         if let Some(effort) = self.reasoning_effort {
             config = config.with_reasoning_effort(effort.as_str());
         }
@@ -398,20 +408,18 @@ fn serialized_image_bytes(data: &DataRef, mime_type: &str) -> Option<usize> {
 }
 
 fn inline_image_bytes(data: &DataRef, mime_type: &str) -> Result<Option<Vec<u8>>, LoopError> {
-    if let DataRef::InlineBytes(bytes) = data {
-        if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
-            return Err(protocol("Responses image exceeds the 10 MiB source limit"));
-        }
-        return Ok(Some(bytes.clone()));
-    }
-
     let text = match data {
         DataRef::InlineText(text) | DataRef::Uri(text) if text.starts_with("data:") => text
             .strip_prefix(&format!("data:{mime_type};base64,"))
             .ok_or_else(|| protocol("Responses image data URL is not canonical base64"))?,
         DataRef::InlineText(text) => text,
         DataRef::Uri(_) | DataRef::Handle(_) => return Ok(None),
-        DataRef::InlineBytes(_) => unreachable!("handled above"),
+        DataRef::InlineBytes(bytes) => {
+            if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+                return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+            }
+            return Ok(Some(bytes.clone()));
+        }
     };
     let max_base64_bytes = MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4;
     if text.len() > max_base64_bytes {
@@ -542,11 +550,11 @@ impl HttpClient for ChatGptRetryHintsClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         HttpClient::execute(&self.0, request)
             .await
-            .map(normalize_server_delay)
+            .and_then(normalize_server_delay)
     }
 }
 
-fn normalize_server_delay(response: HttpResponse) -> HttpResponse {
+fn normalize_server_delay(response: HttpResponse) -> Result<HttpResponse, HttpError> {
     let generic = agentkit_http::retry_hint(response.headers());
     let chatgpt = (response.status() == agentkit_http::StatusCode::TOO_MANY_REQUESTS)
         .then(|| {
@@ -578,11 +586,16 @@ fn normalize_server_delay(response: HttpResponse) -> HttpResponse {
             headers.remove(name);
         }
         let value = HeaderValue::from_str(&delay.as_secs_f64().to_string())
-            .expect("bounded retry delay is a valid header value");
+            .map_err(|_| HttpError::InvalidHeader("retry-after".into()))?;
         headers.insert("retry-after", value);
-        return HttpResponse::new(status, headers, final_url, response.bytes_stream());
+        return Ok(HttpResponse::new(
+            status,
+            headers,
+            final_url,
+            response.bytes_stream(),
+        ));
     }
-    response
+    Ok(response)
 }
 
 fn parse_chatgpt_reset(value: &str) -> Option<Duration> {
@@ -798,18 +811,21 @@ fn migrate_legacy_continuation(
     if !legacy_continuation_matches_authentication(&account_binding, authentication_binding) {
         return Ok(());
     }
-    let mut migrated = serde_json::json!({
-        "schema_version": 3,
-        "authentication_binding": authentication_binding,
-        "model": model,
-        "session_id": session_id,
-        "item_id": item_id,
-        "kind": expected_kind,
-    });
+    let mut migrated = serde_json::Map::from_iter([
+        ("schema_version".into(), Value::from(3)),
+        (
+            "authentication_binding".into(),
+            Value::from(authentication_binding),
+        ),
+        ("model".into(), Value::from(model)),
+        ("session_id".into(), Value::from(session_id)),
+        ("item_id".into(), Value::from(item_id)),
+        ("kind".into(), Value::from(expected_kind)),
+    ]);
     if let Some(encrypted_content) = encrypted_content {
-        migrated["encrypted_content"] = Value::String(encrypted_content.to_owned());
+        migrated.insert("encrypted_content".into(), Value::from(encrypted_content));
     }
-    metadata.insert(CONTINUATION_METADATA.into(), migrated);
+    metadata.insert(CONTINUATION_METADATA.into(), Value::Object(migrated));
     Ok(())
 }
 
@@ -961,6 +977,14 @@ fn protocol(message: &str) -> LoopError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1055,7 +1079,7 @@ mod tests {
             "https://chatgpt.com".into(),
             Box::pin(futures_util::stream::empty()),
         );
-        let response = normalize_server_delay(response);
+        let response = normalize_server_delay(response).unwrap();
         assert_eq!(
             agentkit_http::retry_hint(response.headers()),
             Some(Duration::from_secs(10 * 60))
@@ -1079,7 +1103,7 @@ mod tests {
             "https://chatgpt.com".into(),
             Box::pin(futures_util::stream::empty()),
         );
-        let response = normalize_server_delay(response);
+        let response = normalize_server_delay(response).unwrap();
         assert_eq!(
             agentkit_http::retry_hint(response.headers()),
             Some(Duration::from_secs(6 * 60 + 30))
@@ -1310,6 +1334,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retry.visible_models, ["recovered"]);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_cancelled_initializer() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::test_support::token_record("token", "account", "generation")
+            .binding()
+            .unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let pending_cache = cache.clone();
+        let pending_binding = binding.clone();
+        let pending = tokio::spawn(async move {
+            pending_cache
+                .get_or_try_init(&pending_binding, || async {
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<SubscriptionModelCatalog, LoopError>>().await
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["retry".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        let reused = cache
+            .get_or_try_init(&binding, || async {
+                Err(protocol("cached initialization must not run"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&retry, &reused));
+        assert_eq!(reused.visible_models, ["retry"]);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_initializer_unwind() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::test_support::token_record("token", "account", "generation")
+            .binding()
+            .unwrap();
+        let failed_cache = cache.clone();
+        let failed_binding = binding.clone();
+        let failed = tokio::spawn(async move {
+            failed_cache
+                .get_or_try_init(&failed_binding, || async {
+                    panic!("catalog initializer interrupted");
+                })
+                .await
+        });
+        assert!(failed.await.unwrap_err().is_panic());
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["retry".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.visible_models, ["retry"]);
+    }
+
+    #[tokio::test]
+    async fn late_catalog_initialization_cannot_replace_a_new_binding() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let old_binding = auth::test_support::token_record("old", "account", "old")
+            .binding()
+            .unwrap();
+        let new_binding = auth::test_support::token_record("new", "account", "new")
+            .binding()
+            .unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let old_cache = cache.clone();
+        let old = tokio::spawn(async move {
+            old_cache
+                .get_or_try_init(&old_binding, || async {
+                    started.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(SubscriptionModelCatalog {
+                        visible_models: vec!["old".into()],
+                        ..Default::default()
+                    })
+                })
+                .await
+                .unwrap()
+        });
+        waiting.await.unwrap();
+        let new = cache
+            .get_or_try_init(&new_binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["new".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(old.await.unwrap().visible_models, ["old"]);
+        let reused = cache
+            .get_or_try_init(&new_binding, || async {
+                Err(protocol("new binding must retain its initialized catalog"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&new, &reused));
+        assert_eq!(reused.visible_models, ["new"]);
     }
 
     #[test]

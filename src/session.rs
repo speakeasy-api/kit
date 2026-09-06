@@ -1,8 +1,9 @@
 //! Append-only session transcripts and their filesystem ownership lease.
 //!
-//! Writes are accepted by the shared resilient filesystem. During capacity
-//! failures, accepted records and their ownership remain process-resident until
-//! recovery persists them; acceptance is not a process-crash durability guarantee.
+//! Writes are accepted by the shared resilient filesystem. During bufferable
+//! storage failures, records and ownership can remain process-resident until
+//! recovery. Exhausting the shared transcript budget permanently disables its
+//! persistence for this process; acceptance is not a durability guarantee.
 
 use std::{
     env,
@@ -82,19 +83,21 @@ impl CatalogEntry {
 // The writer serializes generation, open-file identity, and its ownership lease.
 // No guard crosses an await. Backend I/O and replaced file/lease destruction can
 // unwind after external effects, so poison is isolation, never recovery. The
-// infallible observer refuses the mutation; result-bearing callers get an error.
+// infallible observer skips persistence; result-bearing callers get an error.
 #[derive(Clone)]
 pub struct SessionObserver(Arc<Mutex<Writer>>);
 
 struct Writer {
     session_id: String,
     generation: u64,
-    // An uncertain append/reconstruction must never reuse a generation.
-    write_failed: bool,
     path: PathBuf,
     workspace_root: PathBuf,
-    file: File,
+    // None permanently disables this writer; there is no session retry queue.
+    file: Option<File>,
     lock: SessionLock,
+    // Ephemeral resume cannot seal legacy histories, and buffered redirects
+    // can be lost. Keep source authority until this writer closes.
+    legacy_locks: Vec<SessionLock>,
     created: Option<CreatedTranscript>,
     // A prepared response privately owns cleanup. Writers remain frozen until
     // that owner publishes success, or forever if submission is abandoned.
@@ -111,7 +114,8 @@ struct SessionLock {
 /// Writer's field drop order, and cannot delete a replacement owner's file.
 struct CreatedTranscript {
     filesystem: Fs,
-    path: PathBuf,
+    path: Option<PathBuf>,
+    cleanup: Option<Fs>,
     keep: bool,
 }
 
@@ -139,10 +143,11 @@ struct InitialTranscriptOptions {
 }
 
 impl CreatedTranscript {
-    fn new(path: PathBuf, filesystem: Fs) -> Self {
+    fn new(path: Option<PathBuf>, filesystem: Fs, cleanup: Option<Fs>) -> Self {
         Self {
             path,
             filesystem,
+            cleanup,
             keep: false,
         }
     }
@@ -154,8 +159,16 @@ impl CreatedTranscript {
 
 impl Drop for CreatedTranscript {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = self.filesystem.remove_file(&self.path);
+        if !self.keep
+            && let Some(path) = &self.path
+            && self.filesystem.remove_file(path).is_err()
+            && self.filesystem.abandon_best_effort().is_ok()
+            && let Some(cleanup) = &self.cleanup
+        {
+            // Any rejected unlink can leave creation queued, even while the
+            // domain is Buffered. Fence replay before strict lease-guarded
+            // deletion. Poison prevents abandonment and is never inspected.
+            let _ = cleanup.remove_file(path);
         }
     }
 }
@@ -247,7 +260,10 @@ pub(crate) fn remove_stale_lock_in(
         &workspace_storage_directory(directory, &workspace_root),
         session_id,
     );
-    let path = if fs::try_exists(&scoped)
+    // Locks are native ownership, not optional history. A dropped or poisoned
+    // transcript namespace must not prevent OS-backed stale-owner cleanup.
+    let path = if fs::global()
+        .try_exists(&scoped)
         .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
     {
         scoped
@@ -258,7 +274,10 @@ pub(crate) fn remove_stale_lock_in(
     } else {
         return Ok(());
     };
-    if !fs::try_exists(&path).map_err(|error| format!("could not inspect session lock: {error}"))? {
+    if !fs::global()
+        .try_exists(&path)
+        .map_err(|error| format!("could not inspect session lock: {error}"))?
+    {
         return Ok(());
     }
     // Cleanup requires real interprocess authority, never an overlay-only lock.
@@ -345,13 +364,69 @@ fn open_with_initial_timestamps_in(
     }
     let workspace_root = canonical_workspace(root);
     let scoped_directory = workspace_storage_directory(directory, &workspace_root);
-    fs::create_dir_all(&scoped_directory)
+    fs::global()
+        .create_dir_all(&scoped_directory)
         .map_err(|error| format!("could not create session directory: {error}"))?;
     let path = transcript_path(&scoped_directory, session_id);
     let lock = SessionLock::acquire(lock_path(&scoped_directory, session_id), force)?;
     let filesystem = lock.filesystem()?;
+    if matches!(
+        fs::best_effort_global().best_effort_status(),
+        Some(fs::BestEffortStatus::Dropped | fs::BestEffortStatus::Poisoned)
+    ) {
+        let (legacy_locks, authority) = loop {
+            let sources =
+                lock_migration_sources(fs::global(), directory, &workspace_root, session_id)?;
+            let authority = select_authority_with(
+                fs::global(),
+                directory,
+                &workspace_root,
+                session_id,
+                true,
+                false,
+            )?;
+            if authority.as_ref().is_none_or(|authority| {
+                authority.legacy_histories.iter().all(|path| {
+                    sources
+                        .iter()
+                        .any(|source| source.path == path.with_extension("lock"))
+                })
+            }) {
+                break (sources, authority);
+            }
+        };
+        let transcript = if resume {
+            authority
+                .ok_or_else(|| format!("session {session_id:?} does not exist"))?
+                .items
+        } else {
+            if authority.is_some() {
+                return Err(format!(
+                    "session {session_id:?} already exists; use --resume"
+                ));
+            }
+            Vec::new()
+        };
+        let writer = Writer {
+            session_id: session_id.into(),
+            generation: 0,
+            path,
+            workspace_root,
+            file: None,
+            lock,
+            legacy_locks,
+            created: (!resume).then(|| CreatedTranscript::new(None, filesystem, None)),
+            publication: None,
+        };
+        return finish_open(writer, transcript, initial, resume, false, initial_options);
+    }
     let (migration_locks, authority) = loop {
-        let sources = lock_migration_sources(directory, &workspace_root, session_id)?;
+        let sources = lock_migration_sources(
+            fs::best_effort_global(),
+            directory,
+            &workspace_root,
+            session_id,
+        )?;
         recover_torn_migration_writes(
             &path,
             directory,
@@ -398,7 +473,7 @@ fn open_with_initial_timestamps_in(
             "session {session_id:?} already exists; use --resume"
         ));
     }
-    let (mut transcript, mut generation) = if resume {
+    let (transcript, generation) = if resume {
         read_records(&path, session_id)?
     } else {
         (Vec::new(), 0)
@@ -423,22 +498,73 @@ fn open_with_initial_timestamps_in(
     } else {
         options.create_new(true);
     }
-    let file = options
-        .open_in(&filesystem, &path)
-        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-    let created = (!resume).then(|| CreatedTranscript::new(path.clone(), filesystem.clone()));
-    let mut writer = Writer {
+    if !resume
+        && fs::global()
+            .try_exists(&path)
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
+    {
+        return Err(format!(
+            "session {session_id:?} already exists; use --resume"
+        ));
+    }
+    let file = match options.open_in(&filesystem, &path) {
+        Ok(file) => Some(file),
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                || resume && error.kind() == io::ErrorKind::NotFound =>
+        {
+            return Err(format!("could not open {}: {error}", path.display()));
+        }
+        Err(_) => {
+            lock.check().map_err(|error| error.to_string())?;
+            let _ = filesystem.abandon_best_effort();
+            None
+        }
+    };
+    let created = if !resume {
+        let cleanup = fs::global()
+            .guarded(&lock.lease)
+            .map_err(|error| format!("session lock was lost: {error}"))?;
+        Some(CreatedTranscript::new(
+            // The path was absent under our real lease. An unsuccessful open
+            // can still publish a native file before returning its error.
+            Some(path.clone()),
+            filesystem.clone(),
+            Some(cleanup),
+        ))
+    } else {
+        None
+    };
+    let writer = Writer {
         session_id: session_id.into(),
         generation,
-        write_failed: false,
         path,
         workspace_root,
         file,
         lock,
+        legacy_locks: migration_locks,
         created,
         publication: None,
     };
-    if resume && stored_workspace.is_none() {
+    finish_open(
+        writer,
+        transcript,
+        initial,
+        resume,
+        stored_workspace.is_none(),
+        initial_options,
+    )
+}
+
+fn finish_open(
+    mut writer: Writer,
+    mut transcript: Vec<Item>,
+    initial: Vec<Item>,
+    resume: bool,
+    bind_workspace: bool,
+    initial_options: InitialTranscriptOptions,
+) -> Result<OpenSession, String> {
+    if resume && bind_workspace {
         writer.replace(&transcript)?;
     }
     if !resume {
@@ -451,8 +577,6 @@ fn open_with_initial_timestamps_in(
             }
             transcript.push(item);
         }
-        generation = writer.generation;
-        debug_assert_eq!(generation, transcript.len() as u64);
     }
     // Nothing guards a transcript between sessions: it is a plain file a user
     // can edit, truncate, or lose a write from, and a tool call left unanswered
@@ -492,16 +616,16 @@ impl SessionObserver {
     }
 
     pub(crate) fn commit_creation(&self) -> Result<(), String> {
-        // Creation publication cannot bless an uncertain transcript. All
-        // result-bearing APIs isolate poison; the observer trait below has no
-        // error channel and must instead refuse an unpersisted mutation.
+        // Creation publication still requires trustworthy writer state. These
+        // result-bearing APIs isolate poison; the observer trait below instead
+        // skips persistence without interrupting the in-memory transcript.
         self.0
             .lock()
             .map_err(|_| "session transcript writer poisoned".to_string())?
             .commit_creation()
     }
 
-    /// Durably records a complete transcript replacement produced by a mutator.
+    /// Best-effort records a complete transcript replacement produced by a mutator.
     /// Existing append records remain intact, while readers treat this record as
     /// a new canonical snapshot.
     pub fn replace(&self, transcript: &[Item]) -> Result<(), String> {
@@ -517,22 +641,11 @@ impl SessionObserver {
 
 impl TranscriptObserver for SessionObserver {
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
-        // Release the writer before shutdown/logging/panic paths. A rejected
-        // input does not poison a healthy writer; uncertain I/O fences it below.
-        let result = self
-            .0
-            .lock()
-            .expect("session transcript writer poisoned")
-            .append(event.item);
-        if let Err(error) = result {
-            if fs::global().status().exhausted || fs::shutdown_token().is_cancelled() {
-                fs::request_shutdown();
-                return;
-            }
-            // The loop invokes observers before committing the item in memory.
-            // Refusing that mutation is safer than continuing with history that
-            // was not durably recorded and cannot be resumed faithfully.
-            panic!("session persistence failed: {error}");
+        // Persistence must not prevent the loop from committing its in-memory
+        // transcript. Poison still isolates the writer: never recover a guard
+        // whose file or lease transition may have been interrupted.
+        if let Ok(mut writer) = self.0.lock() {
+            let _ = writer.append(event.item);
         }
     }
 }
@@ -546,9 +659,7 @@ impl Writer {
         {
             return Err("session creation is awaiting publication".into());
         }
-        if self.write_failed {
-            return Err("session transcript writer is isolated after an uncertain write".into());
-        }
+        self.check_ownership()?;
         if let Some(created) = self.created.take() {
             created.keep();
         }
@@ -604,21 +715,29 @@ impl Writer {
         let mut encoded = serde_json::to_vec(&record)
             .map_err(|error| format!("could not encode transcript record: {error}"))?;
         encoded.push(b'\n');
-        // write_all or sync_data can fail after accepting some or all bytes.
-        // Without a verified rollback, neither retry nor generation reuse is
-        // safe. Only a complete successful append re-enables this writer.
-        self.write_failed = true;
-        self.file
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        // A failed append can include a partial record. Abandon the whole loss
+        // domain before allowing any later generation to reach persistence.
+        if file
             .write_all(&encoded)
-            .and_then(|_| self.file.sync_data())
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::OutOfMemory {
-                    fs::request_shutdown();
-                }
-                format!("could not persist transcript record: {error}")
-            })?;
+            .and_then(|_| file.sync_data())
+            .is_err()
+        {
+            let _ = fs::best_effort_global().abandon_best_effort();
+            self.file = None;
+            return Ok(());
+        }
         self.generation = generation;
-        self.write_failed = false;
+        Ok(())
+    }
+
+    fn check_ownership(&self) -> Result<(), String> {
+        self.lock.check().map_err(|error| error.to_string())?;
+        for lock in &self.legacy_locks {
+            lock.check().map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -630,22 +749,44 @@ impl Writer {
         {
             return Err("session creation is awaiting publication".into());
         }
-        if self.write_failed {
-            return Err("session transcript writer is isolated after an uncertain write".into());
+        if self.file.is_none() {
+            return self.check_ownership();
         }
-        match self.lock.check() {
-            Ok(()) => {
-                if fs::try_exists(&self.path).map_err(|error| {
-                    format!("could not inspect {}: {error}", self.path.display())
-                })? {
-                    Ok(())
-                } else {
-                    self.reconstruct()
-                }
+        if matches!(
+            fs::best_effort_global().best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped | fs::BestEffortStatus::Poisoned)
+        ) {
+            self.file = None;
+            return self.check_ownership();
+        }
+        for lock in &self.legacy_locks {
+            if let Err(error) = lock.check() {
+                self.file = None;
+                return Err(error.to_string());
             }
+        }
+        let result = match self.lock.check() {
+            Ok(()) => match fs::best_effort_global().try_exists(&self.path) {
+                Ok(true) => Ok(()),
+                Ok(false) => self.reconstruct(),
+                Err(error) => Err(format!(
+                    "could not inspect {}: {error}",
+                    self.path.display()
+                )),
+            },
             Err(LockError::Missing) => self.recover(),
             Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = result {
+            // The loop can advance after a skipped append or replacement. Never
+            // resume this writer later against the old persisted transcript.
+            self.file = None;
+            if self.lock.check().is_err() {
+                return Err(error);
+            }
+            let _ = fs::best_effort_global().abandon_best_effort();
         }
+        Ok(())
     }
 
     fn recover(&mut self) -> Result<(), String> {
@@ -653,7 +794,8 @@ impl Writer {
             .path
             .parent()
             .ok_or_else(|| "session transcript has no parent directory".to_string())?;
-        fs::create_dir_all(directory)
+        fs::best_effort_global()
+            .create_dir_all(directory)
             .map_err(|error| format!("could not recreate session directory: {error}"))?;
         let lock = SessionLock::acquire(lock_path(directory, &self.session_id), false)?;
         self.lock = lock;
@@ -664,6 +806,8 @@ impl Writer {
     fn reconstruct(&mut self) -> Result<(), String> {
         let mut source = self
             .file
+            .as_ref()
+            .ok_or_else(|| "session persistence is disabled".to_string())?
             .try_clone()
             .and_then(|mut file| {
                 file.rewind()?;
@@ -676,9 +820,8 @@ impl Writer {
             .create_new(true)
             .open_in(&self.lock.filesystem()?, &self.path)
             .map_err(|error| format!("could not reconstruct {}: {error}", self.path.display()))?;
-        // Cleanup can itself fail. Do not later mistake an incomplete rebuilt
-        // path for the complete history still held by the original open file.
-        self.write_failed = true;
+        // The caller retires persistence on any error, including failed cleanup,
+        // rather than mistaking a partial reconstruction for complete history.
         if let Err(error) = io::copy(&mut source, &mut file).and_then(|_| file.sync_all()) {
             let _ = self.lock.filesystem()?.remove_file(&self.path);
             return Err(format!(
@@ -686,8 +829,7 @@ impl Writer {
                 self.path.display()
             ));
         }
-        self.file = file;
-        self.write_failed = false;
+        self.file = Some(file);
         Ok(())
     }
 }
@@ -731,7 +873,7 @@ impl SessionLock {
     }
 
     fn filesystem(&self) -> Result<Fs, String> {
-        fs::global()
+        fs::best_effort_global()
             .guarded(&self.lease)
             .map_err(|error| format!("session lock was lost: {error}"))
     }
@@ -765,28 +907,37 @@ enum StoredTranscript {
 }
 
 fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), String> {
-    read_records_following(path, session_id, 0)
+    read_records_following(fs::best_effort_global(), path, session_id, 0)
 }
 
 fn read_records_following(
+    filesystem: &Fs,
     path: &Path,
     session_id: &str,
     redirects: usize,
 ) -> Result<(Vec<Item>, u64), String> {
-    match read_records_direct(path, session_id)? {
+    match read_records_direct_in(filesystem, path, session_id)? {
         StoredTranscript::History(history) => Ok((history.items, history.generation)),
         StoredTranscript::Redirect(target) => {
             if redirects >= 4 || target.file_name() != path.file_name() || !target.is_absolute() {
                 return Err(format!("invalid session redirect in {}", path.display()));
             }
-            read_records_following(&target, session_id, redirects + 1)
+            read_records_following(filesystem, &target, session_id, redirects + 1)
         }
     }
 }
 
 fn read_records_direct(path: &Path, session_id: &str) -> Result<StoredTranscript, String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    read_records_direct_in(fs::best_effort_global(), path, session_id)
+}
+
+fn read_records_direct_in(
+    filesystem: &Fs,
+    path: &Path,
+    session_id: &str,
+) -> Result<StoredTranscript, String> {
+    let file = File::open_in(filesystem, path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let lines = BufReader::new(file)
         .lines()
         .enumerate()
@@ -930,8 +1081,9 @@ fn workspace_directory(root: &Path) -> PathBuf {
 }
 
 fn transcript_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let bytes = fs::best_effort_global()
+        .read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     transcript_workspace_bytes(path, session_id, &bytes)
 }
 
@@ -1006,7 +1158,8 @@ fn set_display_name_in(
             root.display()
         )
     })?;
-    if !fs::metadata(&root)
+    if !fs::best_effort_global()
+        .metadata(&root)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
     {
@@ -1034,19 +1187,23 @@ fn set_display_name_in(
     output.push(b'\n');
 
     let directory = workspace_storage_directory(global_directory, &root);
-    fs::create_dir_all(&directory).map_err(|error| {
-        format!(
-            "could not create session directory {}: {error}",
-            directory.display()
-        )
-    })?;
+    fs::best_effort_global()
+        .create_dir_all(&directory)
+        .map_err(|error| {
+            format!(
+                "could not create session directory {}: {error}",
+                directory.display()
+            )
+        })?;
     let path = metadata_path(&directory, session_id);
-    fs::replace_private(&path, &output).map_err(|error| {
-        format!(
-            "could not replace session metadata {}: {error}",
-            path.display()
-        )
-    })?;
+    fs::best_effort_global()
+        .replace_private(&path, &output)
+        .map_err(|error| {
+            format!(
+                "could not replace session metadata {}: {error}",
+                path.display()
+            )
+        })?;
     Ok(effective_title)
 }
 
@@ -1055,7 +1212,14 @@ fn select_authority_for_rename(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<Authority>, String> {
-    select_authority_with(directory, root, session_id, false, true)
+    select_authority_with(
+        fs::best_effort_global(),
+        directory,
+        root,
+        session_id,
+        false,
+        true,
+    )
 }
 
 pub(crate) fn is_safe_display_name_character(character: char) -> bool {
@@ -1086,7 +1250,9 @@ fn validate_display_name(value: &str) -> Result<String, String> {
 }
 
 fn read_display_name(directory: &Path, session_id: &str) -> Option<String> {
-    let input = fs::read(metadata_path(directory, session_id)).ok()?;
+    let input = fs::best_effort_global()
+        .read(metadata_path(directory, session_id))
+        .ok()?;
     let metadata: SessionMetadata = serde_json::from_slice(&input).ok()?;
     metadata
         .display_name
@@ -1106,7 +1272,8 @@ fn catalog_for_workspace(
             root.display()
         )
     })?;
-    if !fs::metadata(&root)
+    if !fs::best_effort_global()
+        .metadata(&root)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
     {
@@ -1120,8 +1287,14 @@ fn catalog_for_workspace(
     for id in ids {
         // Discovery is best-effort per transcript: a damaged file or one caught
         // mid-append must not hide every other session in the workspace.
-        let Ok(Some(authority)) = select_authority_with(global_directory, &root, &id, false, false)
-        else {
+        let Ok(Some(authority)) = select_authority_with(
+            fs::best_effort_global(),
+            global_directory,
+            &root,
+            &id,
+            false,
+            false,
+        ) else {
             continue;
         };
         if catalog_is_subagent(&authority.historical_items, &authority.items) {
@@ -1139,7 +1312,8 @@ fn catalog_for_workspace(
             })
             .max()
             .unwrap_or(0);
-        let file_updated = fs::metadata(&authority.path)
+        let file_updated = fs::best_effort_global()
+            .metadata(&authority.path)
             .and_then(|metadata| metadata.modified())
             .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
@@ -1343,7 +1517,7 @@ fn belongs_to_workspace_in(
 }
 
 pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
-    let entries = match fs::read_dir(directory) {
+    let entries = match fs::best_effort_global().read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -1402,12 +1576,24 @@ fn select_authority(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<Authority>, String> {
-    select_authority_with(directory, root, session_id, true, false)
+    select_authority_with(
+        fs::best_effort_global(),
+        directory,
+        root,
+        session_id,
+        true,
+        false,
+    )
 }
 
-fn transcript_snapshot(path: &Path, tolerate_incomplete_tail: bool) -> Result<Vec<u8>, String> {
-    let mut bytes =
-        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+fn transcript_snapshot(
+    filesystem: &Fs,
+    path: &Path,
+    tolerate_incomplete_tail: bool,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = filesystem
+        .read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     if tolerate_incomplete_tail && !bytes.ends_with(b"\n") {
         let tail_start = bytes
             .iter()
@@ -1427,23 +1613,19 @@ fn transcript_snapshot(path: &Path, tolerate_incomplete_tail: bool) -> Result<Ve
 }
 
 fn read_authority_candidate(
+    filesystem: &Fs,
     path: &Path,
     session_id: &str,
     tolerate_incomplete_tail: bool,
 ) -> Result<(Option<PathBuf>, StoredTranscript), String> {
-    if tolerate_incomplete_tail {
-        let bytes = transcript_snapshot(path, true)?;
-        let workspace = transcript_workspace_bytes(path, session_id, &bytes)?;
-        let transcript = read_records_bytes(path, session_id, &bytes)?;
-        Ok((workspace, transcript))
-    } else {
-        let workspace = transcript_workspace(path, session_id)?;
-        let transcript = read_records_direct(path, session_id)?;
-        Ok((workspace, transcript))
-    }
+    let bytes = transcript_snapshot(filesystem, path, tolerate_incomplete_tail)?;
+    let workspace = transcript_workspace_bytes(path, session_id, &bytes)?;
+    let transcript = read_records_bytes(path, session_id, &bytes)?;
+    Ok((workspace, transcript))
 }
 
 fn select_authority_with(
+    filesystem: &Fs,
     directory: &Path,
     root: &Path,
     session_id: &str,
@@ -1462,13 +1644,14 @@ fn select_authority_with(
         (&global, true, true),
         (&local, false, true),
     ] {
-        if !fs::try_exists(path)
+        if !filesystem
+            .try_exists(path)
             .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
         {
             continue;
         }
         let (workspace, transcript) =
-            read_authority_candidate(path, session_id, tolerate_incomplete_tail)?;
+            read_authority_candidate(filesystem, path, session_id, tolerate_incomplete_tail)?;
         if is_global
             && (workspace.as_deref().is_some_and(|stored| stored != root)
                 || workspace.is_none() && !include_unbound_global)
@@ -1476,10 +1659,13 @@ fn select_authority_with(
             continue;
         }
         let is_unbound_global = is_global && workspace.is_none();
-        if !is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
+        if !is_global
+            && let Some(stored) = workspace.as_deref()
+            && stored != root
+        {
             return Err(format!(
                 "session {session_id:?} belongs to workspace {}, not {}",
-                workspace.unwrap().display(),
+                stored.display(),
                 root.display()
             ));
         }
@@ -1504,8 +1690,12 @@ fn select_authority_with(
                 if target != scoped_target {
                     return Err(format!("invalid session redirect in {}", path.display()));
                 }
-                let (target_workspace, target_transcript) =
-                    read_authority_candidate(&target, session_id, tolerate_incomplete_tail)?;
+                let (target_workspace, target_transcript) = read_authority_candidate(
+                    filesystem,
+                    &target,
+                    session_id,
+                    tolerate_incomplete_tail,
+                )?;
                 if let Some(stored) = target_workspace
                     && stored != root
                 {
@@ -1579,9 +1769,14 @@ fn torn_migration_tail_start(bytes: &[u8]) -> Option<usize> {
         .then_some(start)
 }
 
-fn migration_source_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
-    let bytes =
-        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+fn migration_source_workspace(
+    filesystem: &Fs,
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let bytes = filesystem
+        .read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let complete = torn_migration_tail_start(&bytes).unwrap_or(bytes.len());
     transcript_workspace_bytes(path, session_id, &bytes[..complete])
 }
@@ -1607,7 +1802,8 @@ fn recover_torn_migration_writes(
     scoped_lock: &SessionLock,
     source_locks: &[SessionLock],
 ) -> Result<(), String> {
-    let mut paths = applicable_migration_sources(directory, root, session_id)?;
+    let mut paths =
+        applicable_migration_sources(fs::best_effort_global(), directory, root, session_id)?;
     paths.push(scoped.to_path_buf());
     paths.sort();
     paths.dedup();
@@ -1622,12 +1818,14 @@ fn recover_torn_migration_writes(
             continue;
         }
         let filesystem = migration_filesystem(&path, scoped_lock, source_locks)?;
-        let exists = fs::try_exists(&path)
+        let exists = fs::best_effort_global()
+            .try_exists(&path)
             .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
         if !exists {
             continue;
         }
-        let bytes = fs::read(&path)
+        let bytes = fs::best_effort_global()
+            .read(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         if bytes.is_empty() && path == scoped {
             filesystem
@@ -1675,16 +1873,18 @@ fn sync_parent_directory(filesystem: &Fs, path: &Path) -> Result<(), String> {
 }
 
 fn applicable_migration_sources(
+    filesystem: &Fs,
     directory: &Path,
     root: &Path,
     session_id: &str,
 ) -> Result<Vec<PathBuf>, String> {
     let global = transcript_path(directory, session_id);
     let mut sources = vec![legacy_transcript(root, session_id)];
-    let global_exists = fs::try_exists(&global)
+    let global_exists = filesystem
+        .try_exists(&global)
         .map_err(|error| format!("could not inspect {}: {error}", global.display()))?;
     if !global_exists
-        || migration_source_workspace(&global, session_id)?
+        || migration_source_workspace(filesystem, &global, session_id)?
             .as_deref()
             .is_none_or(|stored| stored == root)
     {
@@ -1696,6 +1896,7 @@ fn applicable_migration_sources(
 }
 
 fn lock_migration_sources(
+    filesystem: &Fs,
     directory: &Path,
     root: &Path,
     session_id: &str,
@@ -1703,20 +1904,23 @@ fn lock_migration_sources(
     let mut locks = Vec::new();
     let mut locked_paths = Vec::new();
     loop {
-        let sources = applicable_migration_sources(directory, root, session_id)?;
+        let sources = applicable_migration_sources(filesystem, directory, root, session_id)?;
         let mut pending = Vec::new();
         for source in sources {
             let path = source.with_extension("lock");
             if locked_paths.contains(&path) {
                 continue;
             }
-            let lock_exists = fs::try_exists(&path)
+            let lock_exists = filesystem
+                .try_exists(&path)
                 .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-            let exists = fs::try_exists(&source)
+            let exists = filesystem
+                .try_exists(&source)
                 .map_err(|error| format!("could not inspect {}: {error}", source.display()))?;
             let sealed = exists
                 && matches!(
-                    read_records_direct(&source, session_id),
+                    read_authority_candidate(filesystem, &source, session_id, false)
+                        .map(|(_, transcript)| transcript),
                     Ok(StoredTranscript::Redirect(_))
                 );
             if lock_exists || exists && !sealed {
@@ -1727,7 +1931,14 @@ fn lock_migration_sources(
             return Ok(locks);
         }
         for path in pending {
-            fs::create_dir_all(path.parent().expect("session lock has a parent"))
+            let directory = path.parent().ok_or_else(|| {
+                format!(
+                    "legacy session lock {} has no parent directory",
+                    path.display()
+                )
+            })?;
+            filesystem
+                .create_dir_all(directory)
                 .map_err(|error| format!("could not create legacy session directory: {error}"))?;
             let lock = SessionLock::acquire(path.clone(), true)
                 .map_err(|error| format!("legacy {error}"))?;
@@ -1804,7 +2015,8 @@ fn establish_scoped_authority(
     items: &[Item],
     title_seed: Option<&[Item]>,
 ) -> Result<(), String> {
-    let exists = fs::try_exists(path)
+    let exists = fs::best_effort_global()
+        .try_exists(path)
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
     let (mut generation, existing_items) = if exists {
         match read_records_direct(path, session_id)? {
@@ -1911,20 +2123,28 @@ fn legacy_transcript_for_workspace(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
+    // This discovery is only used for native lock cleanup. Read persisted
+    // workspace bindings and redirect targets through the same strict service.
+    let filesystem = fs::global();
     let global = transcript_path(directory, session_id);
-    if fs::try_exists(&global)
+    if filesystem
+        .try_exists(&global)
         .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
-        && transcript_workspace(&global, session_id)?
+    {
+        let bytes = transcript_snapshot(filesystem, &global, false)?;
+        if transcript_workspace_bytes(&global, session_id, &bytes)?
             .as_deref()
             .is_none_or(|stored| stored == root)
-    {
-        return Ok(Some(global));
+        {
+            return Ok(Some(global));
+        }
     }
     let local = legacy_transcript(root, session_id);
-    if fs::try_exists(&local)
+    if filesystem
+        .try_exists(&local)
         .map_err(|error| format!("could not inspect {}: {error}", local.display()))?
     {
-        read_records(&local, session_id)?;
+        read_records_following(filesystem, &local, session_id, 0)?;
         Ok(Some(local))
     } else {
         Ok(None)
@@ -1966,6 +2186,14 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::io::{BufRead, BufReader};
 
@@ -2094,12 +2322,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let failed = root.path().join("failed.jsonl");
         fs::write(&failed, "partial").unwrap();
-        drop(CreatedTranscript::new(failed.clone(), fs::global().clone()));
+        drop(CreatedTranscript::new(
+            Some(failed.clone()),
+            fs::global().clone(),
+            None,
+        ));
         assert!(!failed.exists());
 
         let committed = root.path().join("committed.jsonl");
         fs::write(&committed, "complete").unwrap();
-        CreatedTranscript::new(committed.clone(), fs::global().clone()).keep();
+        CreatedTranscript::new(Some(committed.clone()), fs::global().clone(), None).keep();
         assert!(committed.exists());
     }
 
@@ -2154,7 +2386,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "transcript item missing created_at before persistence")]
     fn observer_rejects_unstamped_items() {
         let root = tempfile::tempdir().unwrap();
         let opened = open(
@@ -2170,6 +2401,9 @@ mod tests {
             session_id: &agentkit_core::SessionId::new("abc"),
             item: &Item::text(ItemKind::User, "unstamped"),
         });
+        assert!(!opened.observer.0.is_poisoned());
+        assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 1);
     }
 
     #[test]
@@ -2528,6 +2762,141 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn stale_scoped_lock_cleanup_survives_optional_storage_loss() {
+        if isolated_process("stale_scoped_lock_cleanup_survives_optional_storage_loss") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "persisted history")],
+        )
+        .unwrap();
+        let expected = opened.transcript.clone();
+        drop(opened);
+        let path = session_lock_path(root.path(), "abc");
+        std::fs::write(&path, "abandoned").unwrap();
+        fs::best_effort_global().abandon_best_effort().unwrap();
+
+        // Bypass the service registry: rejection must respect an actual native
+        // owner, not merely an in-process SessionObserver reference. Native
+        // entry points require the normalized paths normally supplied by Fs.
+        let native_path = fs::canonicalize(&path).unwrap();
+        let owner = fs::Backend::acquire_lease(
+            &fs::DiskBackend,
+            &fs::LeaseRequest {
+                path: native_path.clone(),
+                scope: native_path.parent().unwrap().to_path_buf(),
+                mode: LeaseMode::ExistingOrNew,
+                remove_on_drop: false,
+            },
+        )
+        .unwrap();
+        let locked = std::fs::read(&path).unwrap();
+        assert!(remove_stale_lock(root.path(), "abc").is_err());
+        owner.check().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), locked);
+        drop(owner);
+
+        remove_stale_lock(root.path(), "abc").unwrap();
+        assert!(!path.exists());
+        let resumed = open(root.path(), "abc", true, false, vec![]).unwrap();
+        assert_eq!(resumed.transcript, expected);
+        assert_eq!(
+            fs::best_effort_global().best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped)
+        );
+    }
+
+    #[test]
+    fn stale_legacy_lock_cleanup_survives_optional_storage_loss() {
+        if isolated_process("stale_legacy_lock_cleanup_survives_optional_storage_loss") {
+            return;
+        }
+        fs::best_effort_global().abandon_best_effort().unwrap();
+        for layout in ["global", "local", "redirect", "foreign-global"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(project_root(root.path())).unwrap();
+            let workspace = canonical_workspace(&project_root(root.path()));
+            let global = super::transcript_path(&session_directory(root.path()), "abc");
+            let path = if layout == "global" {
+                global.clone()
+            } else {
+                legacy_directory(root.path()).join("abc.jsonl")
+            };
+            write_history(
+                &path,
+                SCHEMA_VERSION,
+                "abc",
+                &["history"],
+                Some(workspace.clone()),
+            );
+            if layout == "redirect" {
+                let target = transcript_path(root.path(), "abc");
+                write_history(
+                    &target,
+                    SCHEMA_VERSION,
+                    "abc",
+                    &["history"],
+                    Some(workspace.clone()),
+                );
+                let redirect = Record {
+                    schema_version: REDIRECT_SCHEMA_VERSION,
+                    session_id: "abc".into(),
+                    generation: 2,
+                    workspace_root: Some(workspace.clone()),
+                    item: None,
+                    replacement: None,
+                    redirect: Some(target),
+                };
+                let mut contents = fs::read_to_string(&path).unwrap();
+                contents.push_str(&serde_json::to_string(&redirect).unwrap());
+                contents.push('\n');
+                fs::write(&path, contents).unwrap();
+            }
+            if layout == "foreign-global" {
+                write_history(
+                    &global,
+                    SCHEMA_VERSION,
+                    "abc",
+                    &["other workspace"],
+                    Some(root.path().join("other")),
+                );
+                std::fs::write(global.with_extension("lock"), "unrelated lock").unwrap();
+            }
+            let lock = path.with_extension("lock");
+            std::fs::write(&lock, "abandoned").unwrap();
+            let native_path = fs::canonicalize(&lock).unwrap();
+            let owner = fs::Backend::acquire_lease(
+                &fs::DiskBackend,
+                &fs::LeaseRequest {
+                    path: native_path.clone(),
+                    scope: native_path.parent().unwrap().to_path_buf(),
+                    mode: LeaseMode::ExistingOrNew,
+                    remove_on_drop: false,
+                },
+            )
+            .unwrap();
+            let locked = std::fs::read(&lock).unwrap();
+            assert!(remove_stale_lock(root.path(), "abc").is_err(), "{layout}");
+            owner.check().unwrap();
+            assert_eq!(std::fs::read(&lock).unwrap(), locked, "{layout}");
+            drop(owner);
+            remove_stale_lock(root.path(), "abc").unwrap();
+            assert!(!lock.exists(), "{layout}");
+            if layout == "foreign-global" {
+                assert_eq!(
+                    std::fs::read(global.with_extension("lock")).unwrap(),
+                    b"unrelated lock"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4024,15 +4393,10 @@ mod tests {
         )
         .unwrap();
         let id = agentkit_core::SessionId::new("abc");
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                opened.observer.on_transcript_event(TranscriptEvent {
-                    session_id: &id,
-                    item: &Item::text(ItemKind::User, "unstamped"),
-                });
-            }))
-            .is_err()
-        );
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &id,
+            item: &Item::text(ItemKind::User, "unstamped"),
+        });
         assert!(!opened.observer.0.is_poisoned());
         assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
         let item = Item::text(ItemKind::User, "accepted").with_created_at(Timestamp(123));
@@ -4044,53 +4408,456 @@ mod tests {
         assert_eq!(load(root.path(), "abc").unwrap().len(), 2);
     }
 
+    struct TranscriptOpenFaults {
+        deny_transcript_read: bool,
+        // 0: healthy, 1: bufferable device I/O, 2: nonbufferable rejection.
+        write_failure: Arc<AtomicU64>,
+    }
+
+    impl fs::Backend for TranscriptOpenFaults {
+        fn open(
+            &self,
+            path: &Path,
+            options: &fs::DiskOpenOptions,
+        ) -> io::Result<Box<dyn fs::BackendFile>> {
+            // Atomic creation can publish the target before opening its backing
+            // descriptor. Reject that real boundary, not lease/temp-file I/O.
+            if self.deny_transcript_read
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if options.write
+                || options.append
+                || options.create
+                || options.create_new
+                || options.truncate
+            {
+                match self.write_failure.load(Ordering::SeqCst) {
+                    1 => {
+                        #[cfg(unix)]
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                        #[cfg(not(unix))]
+                        return Err(io::Error::other("device I/O failure"));
+                    }
+                    2 => return Err(io::ErrorKind::PermissionDenied.into()),
+                    _ => {}
+                }
+            }
+            fs::DiskBackend.open(path, options)
+        }
+        fn metadata(&self, path: &Path, follow: bool) -> io::Result<std::fs::Metadata> {
+            fs::DiskBackend.metadata(path, follow)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<fs::DiskEntry>> {
+            fs::DiskBackend.read_dir(path)
+        }
+        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+            fs::DiskBackend.read_link(path)
+        }
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            fs::DiskBackend.canonicalize(path)
+        }
+        fn create_dir(&self, path: &Path, private: bool) -> io::Result<()> {
+            fs::DiskBackend.create_dir(path, private)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            fs::DiskBackend.remove_file(path)
+        }
+        fn remove_dir(&self, path: &Path) -> io::Result<()> {
+            fs::DiskBackend.remove_dir(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            fs::DiskBackend.rename(from, to)
+        }
+        fn set_permissions(
+            &self,
+            path: &Path,
+            permissions: std::fs::Permissions,
+        ) -> io::Result<()> {
+            fs::DiskBackend.set_permissions(path, permissions)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            fs::DiskBackend.sync_directory(path)
+        }
+        fn acquire_lease(
+            &self,
+            request: &fs::LeaseRequest,
+        ) -> io::Result<Box<dyn fs::BackendLease>> {
+            fs::DiskBackend.acquire_lease(request)
+        }
+        fn open_beneath(
+            &self,
+            root: &Path,
+            relative: &Path,
+        ) -> io::Result<Box<dyn fs::BackendFile>> {
+            fs::DiskBackend.open_beneath(root, relative)
+        }
+    }
+
     #[test]
-    fn failed_write_isolates_replacement_append_and_creation_commit() {
+    fn failed_initial_open_keeps_ephemeral_transcript_and_cleans_partial_creation() {
+        if isolated_process(
+            "failed_initial_open_keeps_ephemeral_transcript_and_cleans_partial_creation",
+        ) {
+            return;
+        }
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(TranscriptOpenFaults {
+                deny_transcript_read: true,
+                write_failure: Arc::new(AtomicU64::new(0)),
+            })))
+            .is_ok()
+        );
         let root = tempfile::tempdir().unwrap();
+        let opened = open_with_initial_timestamps_in(
+            &project_root(root.path()),
+            &session_directory(root.path()),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+            InitialTranscriptOptions {
+                stamp_items: true,
+                commit_creation: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(opened.transcript.len(), 1);
+        assert!(opened.observer.0.lock().unwrap().file.is_none());
+        let path = transcript_path(root.path(), "abc");
+        assert!(
+            path.exists(),
+            "fault occurs after publishing the native target"
+        );
+        let prepared = opened.observer.prepare_creation().unwrap();
+        drop(prepared);
+        assert!(
+            !path.exists(),
+            "partial creation must retain cleanup ownership"
+        );
+        assert!(!fs::shutdown_token().is_cancelled());
+    }
+
+    fn rejected_cleanup_case(prepared: bool, replacement: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let write_failure = Arc::new(AtomicU64::new(1));
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(TranscriptOpenFaults {
+                deny_transcript_read: false,
+                write_failure: write_failure.clone(),
+            })))
+            .is_ok()
+        );
+        let opened = open_with_initial_timestamps_in(
+            &project_root(root.path()),
+            &session_directory(root.path()),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "buffered initial")],
+            InitialTranscriptOptions {
+                stamp_items: true,
+                commit_creation: false,
+            },
+        )
+        .unwrap();
+        let path = transcript_path(root.path(), "abc");
+        assert_eq!(load(root.path(), "abc").unwrap().len(), 1);
+        let filesystem = opened.observer.0.lock().unwrap().lock.filesystem().unwrap();
+        let prepared = prepared.then(|| opened.observer.prepare_creation().unwrap());
+        write_failure.store(2, Ordering::SeqCst);
+        // Replay rejects cleanup before its unlink enters the queue. The
+        // Buffered status must not be mistaken for accepted cleanup.
+        assert_eq!(
+            filesystem.remove_file(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            filesystem.best_effort_status(),
+            Some(fs::BestEffortStatus::Buffered)
+        );
+        let replacement_owner = if replacement {
+            std::fs::remove_dir_all(session_directory(root.path())).unwrap();
+            std::fs::create_dir_all(scoped_directory(root.path())).unwrap();
+            // A different service models another process; the original strict
+            // service correctly refuses to replace its own dirty retained lease.
+            let replacement_fs = Fs::new(Arc::new(fs::DiskBackend));
+            let owner = replacement_fs
+                .acquire_lease(
+                    session_lock_path(root.path(), "abc"),
+                    scoped_directory(root.path()),
+                    LeaseMode::CreateNew,
+                )
+                .unwrap();
+            replacement_fs
+                .guarded(&owner)
+                .unwrap()
+                .write(&path, "replacement owner's transcript")
+                .unwrap();
+            Some((replacement_fs, owner))
+        } else {
+            None
+        };
+        drop(opened);
+        drop(prepared);
+        assert_eq!(
+            filesystem.best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped)
+        );
+        write_failure.store(0, Ordering::SeqCst);
+        // Dropped services reject recovery rather than reporting an empty
+        // successful pass. Neither a retained handle nor the worker may replay.
+        assert!(filesystem.recover().blocked.is_some());
+        assert!(fs::best_effort_global().recover().blocked.is_some());
+        if let Some((_replacement_fs, owner)) = replacement_owner {
+            assert!(owner.check().is_ok());
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "replacement owner's transcript"
+            );
+        } else {
+            assert!(
+                !path.exists(),
+                "recovery must not resurrect abandoned creation"
+            );
+        }
+        assert!(!fs::shutdown_token().is_cancelled());
+    }
+
+    #[test]
+    fn rejected_prepared_cleanup_fences_buffered_creation() {
+        if isolated_process("rejected_prepared_cleanup_fences_buffered_creation") {
+            return;
+        }
+        rejected_cleanup_case(true, false);
+    }
+
+    #[test]
+    fn rejected_observer_cleanup_preserves_replacement_owner() {
+        if isolated_process("rejected_observer_cleanup_preserves_replacement_owner") {
+            return;
+        }
+        rejected_cleanup_case(false, true);
+    }
+
+    mod capacity {
+        use crate as kit;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/capacity.rs"
+        ));
+    }
+
+    #[test]
+    fn buffered_initial_records_are_visible_to_load_clone_and_recovery() {
+        if isolated_process("buffered_initial_records_are_visible_to_load_clone_and_recovery") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let capacity = Arc::new(capacity::Capacity {
+            exhausted: AtomicBool::new(false),
+            exhaust_on_write: AtomicBool::new(true),
+            repaired: root.path().join("repaired"),
+        });
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(capacity::CapacityDisk(capacity.clone()))))
+                .is_ok()
+        );
         let opened = open(
             root.path(),
-            "abc",
+            "source",
             false,
             false,
             vec![Item::text(ItemKind::System, "system")],
         )
         .unwrap();
+        let path = transcript_path(root.path(), "source");
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        assert_eq!(load(root.path(), "source").unwrap().len(), 1);
+        assert!(fs::best_effort_global().status().pending_operations > 0);
+        assert_eq!(fs::global().status().pending_operations, 0);
+        drop(opened);
+        // Restore native lease creation, but deliberately do not replay yet.
+        capacity.exhausted.store(false, Ordering::SeqCst);
+        clone_completed(root.path(), "source", "clone").unwrap();
+        assert_eq!(load(root.path(), "clone").unwrap().len(), 1);
+        let reopened = open(root.path(), "source", true, false, vec![]).unwrap();
+        assert_eq!(reopened.transcript.len(), 1);
+        drop(reopened);
+        let _ = fs::best_effort_global().recover();
+        assert_eq!(fs::best_effort_global().status().pending_operations, 0);
+        assert!(!std::fs::read(&path).unwrap().is_empty());
+        assert!(!fs::shutdown_token().is_cancelled());
+    }
+
+    #[test]
+    fn buffered_migration_retains_legacy_authority_after_scope_loss() {
+        if isolated_process("buffered_migration_retains_legacy_authority_after_scope_loss") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let capacity = Arc::new(capacity::Capacity {
+            exhausted: AtomicBool::new(false),
+            exhaust_on_write: AtomicBool::new(false),
+            repaired: root.path().join("repaired"),
+        });
+        assert!(
+            fs::initialize_global(Fs::new(Arc::new(capacity::CapacityDisk(capacity.clone()))))
+                .is_ok()
+        );
+        let legacy = legacy_directory(root.path());
+        write_history(
+            &legacy.join("abc.jsonl"),
+            SCHEMA_VERSION,
+            "abc",
+            &["system"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
+        capacity.exhaust_on_write.store(true, Ordering::SeqCst);
+        let opened = open(root.path(), "abc", true, false, vec![]).unwrap();
+        assert!(fs::best_effort_global().status().pending_operations > 0);
+        fs::best_effort_global().abandon_best_effort().unwrap();
+        capacity.exhausted.store(false, Ordering::SeqCst);
+        assert!(SessionLock::acquire(legacy.join("abc.lock"), true).is_err());
+        drop(opened);
+        drop(SessionLock::acquire(legacy.join("abc.lock"), false).unwrap());
+    }
+
+    fn isolated_process(name: &str) -> bool {
+        const CHILD: &str = "KIT_SESSION_LOSS_TEST";
+        if std::env::var(CHILD).ok().as_deref() == Some(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("session::tests::{name}"), "--nocapture"])
+            .env(CHILD, name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn failed_write_disables_persistence_without_stopping_observer_or_creation() {
+        if isolated_process(
+            "failed_write_disables_persistence_without_stopping_observer_or_creation",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_with_initial_timestamps_in(
+            &project_root(root.path()),
+            &session_directory(root.path()),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+            InitialTranscriptOptions {
+                stamp_items: true,
+                commit_creation: false,
+            },
+        )
+        .unwrap();
         let path = {
             let mut writer = opened.observer.0.lock().unwrap();
             // A real file boundary rejects writes, without production hooks.
-            writer.file = File::open(&writer.path).unwrap();
+            writer.file = Some(File::open(&writer.path).unwrap());
             writer.path.clone()
         };
         let original = fs::read(&path).unwrap();
-        let item = Item::text(ItemKind::User, "not accepted").with_created_at(Timestamp(123));
+        let item = Item::text(ItemKind::User, "not persisted").with_created_at(Timestamp(123));
+        opened
+            .observer
+            .replace(std::slice::from_ref(&item))
+            .unwrap();
+        assert!(!opened.observer.0.is_poisoned());
+        assert!(opened.observer.0.lock().unwrap().file.is_none());
+        opened
+            .observer
+            .replace(std::slice::from_ref(&item))
+            .unwrap();
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("abc"),
+            item: &item,
+        });
+        assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::best_effort_global().best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped)
+        );
+        assert!(!fs::shutdown_token().is_cancelled());
+        let prepared = opened.observer.prepare_creation().unwrap();
         assert!(
             opened
                 .observer
                 .replace(std::slice::from_ref(&item))
                 .is_err()
         );
-        assert!(!opened.observer.0.is_poisoned());
-        // Even repairing the handle cannot prove what a failed write accepted.
-        opened.observer.0.lock().unwrap().file =
-            OpenOptions::new().append(true).open(&path).unwrap();
-        let error = opened
-            .observer
-            .replace(std::slice::from_ref(&item))
-            .unwrap_err();
-        assert!(error.contains("isolated"), "{error}");
+        drop(prepared);
         assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                opened.observer.on_transcript_event(TranscriptEvent {
-                    session_id: &agentkit_core::SessionId::new("abc"),
-                    item: &item,
-                });
-            }))
-            .is_err()
+            !path.exists(),
+            "abandoned creation uses strict fenced cleanup after scope loss"
         );
-        assert!(opened.observer.commit_creation().is_err());
-        assert!(opened.observer.prepare_creation().is_err());
-        assert_eq!(opened.observer.0.lock().unwrap().generation, 1);
-        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn dropped_domain_allows_ephemeral_creation_but_keeps_resume_validation() {
+        if isolated_process("dropped_domain_allows_ephemeral_creation_but_keeps_resume_validation")
+        {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let initial = vec![Item::text(ItemKind::System, "system")];
+        let opened = open(root.path(), "existing", false, false, initial.clone()).unwrap();
+        drop(opened);
+        let malformed = transcript_path(root.path(), "malformed");
+        fs::write(&malformed, "not json\n").unwrap();
+        let legacy = legacy_directory(root.path());
+        write_history(
+            &legacy.join("legacy.jsonl"),
+            SCHEMA_VERSION,
+            "legacy",
+            &["system"],
+            Some(canonical_workspace(&project_root(root.path()))),
+        );
+        let legacy_owner = SessionLock::acquire(legacy.join("legacy.lock"), false).unwrap();
+        fs::best_effort_global().abandon_best_effort().unwrap();
+        assert!(open(root.path(), "legacy", true, false, vec![]).is_err());
+        drop(legacy_owner);
+        let resumed_legacy = open(root.path(), "legacy", true, false, vec![]).unwrap();
+        assert_eq!(resumed_legacy.transcript.len(), 1);
+        assert!(resumed_legacy.observer.0.lock().unwrap().file.is_none());
+        assert!(SessionLock::acquire(legacy.join("legacy.lock"), true).is_err());
+        drop(resumed_legacy);
+        drop(SessionLock::acquire(legacy.join("legacy.lock"), false).unwrap());
+        assert!(
+            open(root.path(), "missing", true, false, vec![])
+                .err()
+                .unwrap()
+                .contains("does not exist")
+        );
+        assert!(open(root.path(), "malformed", true, false, vec![]).is_err());
+        assert!(open(root.path(), "existing", false, false, initial.clone()).is_err());
+        let resumed = open(root.path(), "existing", true, false, vec![]).unwrap();
+        assert_eq!(resumed.transcript.len(), 1);
+        assert!(resumed.observer.0.lock().unwrap().file.is_none());
+        assert!(open(root.path(), "existing", true, true, vec![]).is_err());
+        let opened = open(root.path(), "ephemeral", false, false, initial).unwrap();
+        assert_eq!(opened.transcript.len(), 1);
+        assert!(opened.observer.0.lock().unwrap().file.is_none());
+        assert!(!transcript_path(root.path(), "ephemeral").exists());
+        drop(opened);
+        assert!(!transcript_path(root.path(), "ephemeral").exists());
+        assert!(!fs::shutdown_token().is_cancelled());
     }
 
     #[test]
@@ -4128,6 +4895,13 @@ mod tests {
         );
         assert!(opened.observer.commit_creation().is_err());
         assert!(opened.observer.prepare_creation().is_err());
+        let original = fs::read(&path).unwrap();
+        opened.observer.on_transcript_event(TranscriptEvent {
+            session_id: &agentkit_core::SessionId::new("abc"),
+            item: &Item::text(ItemKind::User, "isolated").with_created_at(Timestamp(123)),
+        });
+        assert!(opened.observer.0.is_poisoned());
+        assert_eq!(fs::read(&path).unwrap(), original);
         drop(opened);
         assert!(!path.exists(), "failed creation must still roll back");
     }
@@ -4161,15 +4935,10 @@ mod tests {
                     .replace(std::slice::from_ref(&item))
                     .is_err()
             );
-            assert!(
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    opened.observer.on_transcript_event(TranscriptEvent {
-                        session_id: &agentkit_core::SessionId::new("abc"),
-                        item: &item,
-                    });
-                }))
-                .is_err()
-            );
+            opened.observer.on_transcript_event(TranscriptEvent {
+                session_id: &agentkit_core::SessionId::new("abc"),
+                item: &item,
+            });
             assert!(!opened.observer.0.is_poisoned());
             assert_eq!(fs::read(&path).unwrap(), original);
             if commit {

@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -19,6 +20,7 @@ use agentkit_acp::{
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
+use futures_util::future::{Either, select};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
@@ -435,6 +437,58 @@ enum Request {
     Fork(Fork),
     Close(Close),
 }
+enum ActorEvent {
+    Request(Option<Request>),
+    Fatal,
+    TaskReaped,
+}
+
+async fn next_actor_event(
+    rx: &mut mpsc::Receiver<Request>,
+    fatal_rx: &mut mpsc::UnboundedReceiver<()>,
+    tasks: &mut JoinSet<()>,
+    next_branch: &mut usize,
+) -> ActorEvent {
+    // Rotate after each winner rather than randomizing ties. A source returning
+    // Ready continuously gets a turn within three selections, even under request
+    // or completion floods (subject to Tokio's cooperative budget). Keep the
+    // cursor across actor iterations. Persistent merged streams would hold the
+    // task-set borrow across spawning handlers.
+    let mut fatal_open = true;
+    std::future::poll_fn(|cx| {
+        for offset in 0..3 {
+            let branch = (*next_branch + offset) % 3;
+            let event = match branch {
+                0 => rx.poll_recv(cx).map(ActorEvent::Request),
+                1 if fatal_open => match fatal_rx.poll_recv(cx) {
+                    Poll::Ready(Some(())) => Poll::Ready(ActorEvent::Fatal),
+                    // Closure disables this source for this wait; it is not a
+                    // fatal message, nor a completed future to poll again.
+                    Poll::Ready(None) => {
+                        fatal_open = false;
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                },
+                2 if !tasks.is_empty() => match tasks.poll_join_next(cx) {
+                    Poll::Ready(Some(_)) => Poll::Ready(ActorEvent::TaskReaped),
+                    Poll::Ready(None) | Poll::Pending => Poll::Pending,
+                },
+                _ => Poll::Pending,
+            };
+            if event.is_ready() {
+                *next_branch = (branch + 1) % 3;
+                return event;
+            }
+        }
+        // Every live source registered this waker. Empty/closed sources never
+        // manufacture a ready event or a self-wake. Direct polling consumes only
+        // the winner, with no losing future or receiver borrow left in handlers.
+        Poll::Pending
+    })
+    .await
+}
+
 struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
@@ -573,22 +627,41 @@ impl ChildSession {
             let _ = closed_tx.send(true);
             result
         });
-        let result = tokio::select! {
-            ready = &mut ready_rx => match ready {
+        // Startup is a one-shot race, not a scheduler: either simultaneous result
+        // was valid before. Prefer readiness, then actor exit, over cancellation
+        // and timeout; abort and join the actor on cancellation/timeout as before.
+        let result = match select(
+            select(&mut ready_rx, &mut task),
+            select(
+                std::pin::pin!(cancellation.cancelled()),
+                std::pin::pin!(tokio::time::sleep(HANDSHAKE)),
+            ),
+        )
+        .await
+        {
+            Either::Left((Either::Left((ready, _)), _)) => match ready {
                 Ok(Ok(ready)) => Ok(ready),
                 Ok(Err(error)) => Err(ChildError::Failed(error)),
-                Err(_) => return Err(ChildError::Failed(match task.await {
-                    Ok(Ok(())) => "nested agent exited during startup".into(),
-                    Ok(Err(error)) => error,
-                    Err(error) => format!("nested agent startup actor failed: {error}"),
-                })),
+                Err(_) => {
+                    return Err(ChildError::Failed(match task.await {
+                        Ok(Ok(())) => "nested agent exited during startup".into(),
+                        Ok(Err(error)) => error,
+                        Err(error) => format!("nested agent startup actor failed: {error}"),
+                    }));
+                }
             },
-            () = cancellation.cancelled() => Err(ChildError::Cancelled),
-            () = tokio::time::sleep(HANDSHAKE) => Err(ChildError::Failed(context.error(
+            Either::Right((Either::Left(((), _)), _)) => Err(ChildError::Cancelled),
+            Either::Right((Either::Right(((), _)), _)) => Err(ChildError::Failed(context.error(
                 "handshake timeout",
                 format!("no response within {} seconds", HANDSHAKE.as_secs()),
             ))),
-            joined = &mut task => return Err(ChildError::Failed(match joined { Ok(Ok(())) => "nested agent exited during startup".into(), Ok(Err(e)) => e, Err(e) => format!("nested agent startup actor failed: {e}") })),
+            Either::Left((Either::Right((joined, _)), _)) => {
+                return Err(ChildError::Failed(match joined {
+                    Ok(Ok(())) => "nested agent exited during startup".into(),
+                    Ok(Err(e)) => e,
+                    Err(e) => format!("nested agent startup actor failed: {e}"),
+                }));
+            }
         };
         match result {
             Ok(ready) => Ok(Self {
@@ -657,9 +730,16 @@ impl ChildSession {
         parent: Option<(String, String)>,
         cancellation: &TurnCancellation,
     ) -> Result<Self, ChildError> {
-        let serial = tokio::select! {
-            serial = self.serial.clone().lock_owned() => serial,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        // A one-shot admission race: an available gate may win concurrent
+        // cancellation. The request retains cancellation after admission.
+        let serial = match select(
+            std::pin::pin!(self.serial.clone().lock_owned()),
+            std::pin::pin!(cancellation.cancelled()),
+        )
+        .await
+        {
+            Either::Left((serial, _)) => serial,
+            Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
         if !self.supports_native_fork() {
             return Err(ChildError::Failed(
@@ -668,16 +748,25 @@ impl ChildSession {
         }
         let descendant_parent = parent.as_ref().map(|(id, _)| id.clone());
         let (reply, response) = oneshot::channel();
-        tokio::select! {
-            sent = self.tx.send(Request::Fork(Fork {
+        // Admission transfers the gate to the actor; cancellation while the
+        // channel is full instead drops the unsent request and releases it.
+        match select(
+            std::pin::pin!(self.tx.send(Request::Fork(Fork {
                 serial,
                 session_id: self.session_id.clone(),
                 model: model.map(str::to_owned),
                 parent,
                 cancellation: cancellation.clone(),
                 reply,
-            })) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            }))),
+            std::pin::pin!(cancellation.cancelled()),
+        )
+        .await
+        {
+            Either::Left((sent, _)) => sent.map_err(|_| {
+                ChildError::TerminalFailed("nested agent process is no longer running".into())
+            })?,
+            Either::Right(((), _)) => return Err(ChildError::Cancelled),
         }
         let session_id = response.await.map_err(|_| {
             ChildError::TerminalFailed("nested agent process exited without a fork response".into())
@@ -697,9 +786,16 @@ impl ChildSession {
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
-        let serial = tokio::select! {
-            serial = self.serial.clone().lock_owned() => serial,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        // A one-shot admission race: an available gate may win concurrent
+        // cancellation. The request retains cancellation after admission.
+        let serial = match select(
+            std::pin::pin!(self.serial.clone().lock_owned()),
+            std::pin::pin!(cancellation.cancelled()),
+        )
+        .await
+        {
+            Either::Left((serial, _)) => serial,
+            Either::Right(((), _)) => return Err(ChildError::Cancelled),
         };
         let (reply, response) = oneshot::channel();
         let request = Request::Prompt(Prompt {
@@ -709,9 +805,18 @@ impl ChildSession {
             cancellation: cancellation.clone(),
             reply,
         });
-        tokio::select! {
-            sent = self.tx.send(request) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        // As with fork, a ready send may win concurrent cancellation. Once
+        // sent, only actor settlement releases the request's serialization gate.
+        match select(
+            std::pin::pin!(self.tx.send(request)),
+            std::pin::pin!(cancellation.cancelled()),
+        )
+        .await
+        {
+            Either::Left((sent, _)) => sent.map_err(|_| {
+                ChildError::TerminalFailed("nested agent process is no longer running".into())
+            })?,
+            Either::Right(((), _)) => return Err(ChildError::Cancelled),
         }
         response.await.map_err(|_| {
             ChildError::TerminalFailed("nested agent process exited without a response".into())
@@ -866,11 +971,13 @@ async fn run(
                 capabilities,
                 descendant_parent,
             }));
+            let mut next_branch = 0;
             loop {
-                let request = tokio::select! {
-                    request = rx.recv() => match request { Some(request) => request, None => break },
-                    Some(()) = fatal_rx.recv() => return Err(agent_client_protocol::Error::internal_error()),
-                    Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+                let request = match next_actor_event(rx, &mut fatal_rx, &mut tasks, &mut next_branch).await {
+                    ActorEvent::Request(Some(request)) => request,
+                    ActorEvent::Request(None) => break,
+                    ActorEvent::Fatal => return Err(agent_client_protocol::Error::internal_error()),
+                    ActorEvent::TaskReaped => continue,
                 };
                 match request {
                     Request::Fork(fork) => {
@@ -887,8 +994,17 @@ async fn run(
                                 ]));
                             }
                             let mut request = Box::pin(connection.send_request(request).block_task());
-                            let result = tokio::select! {
-                                result = &mut request => match result {
+                            // This one-shot race permits a completed fork to win
+                            // simultaneous cancellation/deadline. Keep the owned
+                            // request and gate for remote cleanup when it loses.
+                            let result = match select(
+                                &mut request,
+                                select(
+                                    std::pin::pin!(fork.cancellation.cancelled()),
+                                    std::pin::pin!(tokio::time::sleep(HANDSHAKE)),
+                                ),
+                            ).await {
+                                Either::Left((result, _)) => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
                                         if let Ok(mut sessions) = sessions.lock() {
@@ -934,7 +1050,7 @@ async fn run(
                                     }
                                     Err(error) => Err(ChildError::Failed(error.to_string())),
                                 },
-                                () = fork.cancellation.cancelled() => {
+                                Either::Right((Either::Left(((), _)), _)) => {
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
@@ -962,7 +1078,7 @@ async fn run(
                                     });
                                     Err(ChildError::Cancelled)
                                 },
-                                () = tokio::time::sleep(HANDSHAKE) => {
+                                Either::Right((Either::Right(((), _)), _)) => {
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
@@ -1035,10 +1151,14 @@ async fn run(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
                             )).block_task();
                             tokio::pin!(request);
-                            let (response, cancelled) = tokio::select! {
-                                biased;
-                                result = &mut request => (result.map_err(|error| error.to_string()), false),
-                                () = prompt.cancellation.cancelled() => {
+                            // Response-first matches the original biased race.
+                            // Borrow the request so cancellation can still settle it.
+                            let (response, cancelled) = match select(
+                                &mut request,
+                                std::pin::pin!(prompt.cancellation.cancelled()),
+                            ).await {
+                                Either::Left((result, _)) => (result.map_err(|error| error.to_string()), false),
+                                Either::Right(((), _)) => {
                                     let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result.map_err(|error| error.to_string()), true),
@@ -1079,9 +1199,11 @@ async fn run(
             Ok(())
         });
     tokio::pin!(connected);
-    let connected = tokio::select! {
-        result = &mut connected => result,
-        status = child.wait() => {
+    // One-shot transport/process race: EOF may already win before reaping.
+    // Keep the post-race exit-status check and await transport after process exit.
+    let connected = match select(&mut connected, std::pin::pin!(child.wait())).await {
+        Either::Left((result, _)) => result,
+        Either::Right((status, _)) => {
             let status = status.map_err(|error| context.error("process status failure", error))?;
             let _ = closed.send(true);
             if !startup_complete.load(Ordering::Acquire) && !status.success() {
@@ -1204,6 +1326,14 @@ fn prompt_outcome(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use super::*;
 
@@ -1244,6 +1374,14 @@ mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use serde_json::json;
 
@@ -1253,20 +1391,286 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
-    #[tokio::test]
-    async fn cancelled_caller_does_not_release_child_request_serialization() {
-        for fork in [false, true] {
-            let (tx, mut rx) = mpsc::channel(1);
-            let mut capabilities = agentkit_acp::AgentCapabilities::default();
-            capabilities.session_capabilities.fork = Some(Default::default());
-            let child = ChildSession {
+    fn admission_test_session() -> (ChildSession, mpsc::Receiver<Request>) {
+        let (tx, rx) = mpsc::channel(1);
+        let mut capabilities = agentkit_acp::AgentCapabilities::default();
+        capabilities.session_capabilities.fork = Some(Default::default());
+        (
+            ChildSession {
                 tx,
                 session_id: "test".into(),
                 capabilities,
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn actor_events_share_ready_request_fatal_and_completion_backlogs() {
+        for enabled in [0b011u8, 0b101, 0b110, 0b111] {
+            for first_branch in 0..3 {
+                let (tx, mut rx) = mpsc::channel(8);
+                let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+                let mut tasks = JoinSet::new();
+                let mut replies = Vec::new();
+                let mut completed = Vec::new();
+                for id in 0..8 {
+                    if enabled & 1 != 0 {
+                        let (reply, response) = oneshot::channel();
+                        tx.send(Request::Close(Close {
+                            session_id: id.to_string().into(),
+                            reply,
+                        }))
+                        .await
+                        .unwrap();
+                        replies.push(response);
+                    }
+                    if enabled & 2 != 0 {
+                        fatal_tx.send(()).unwrap();
+                    }
+                    if enabled & 4 != 0 {
+                        completed.push(tasks.spawn(async {}));
+                    }
+                }
+                // Establish simultaneous readiness through real task handles, not
+                // timing assumptions or a replacement scheduler.
+                for task in completed {
+                    while !task.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let mut next_branch = first_branch;
+                for id in 0..8 {
+                    let mut seen = 0;
+                    // Each continuously ready source gets a turn, including when
+                    // the cursor starts at a pending source. This asserts the
+                    // arbitration contract, not internal poll counts.
+                    for _ in 0..enabled.count_ones() {
+                        match next_actor_event(&mut rx, &mut fatal_rx, &mut tasks, &mut next_branch)
+                            .await
+                        {
+                            ActorEvent::Request(Some(Request::Close(close))) => {
+                                assert_eq!(seen & 1, 0);
+                                seen |= 1;
+                                assert_eq!(close.session_id, SessionId::from(id.to_string()));
+                                close.reply.send(Ok(())).unwrap();
+                            }
+                            ActorEvent::Fatal => {
+                                assert_eq!(seen & 2, 0);
+                                seen |= 2;
+                            }
+                            ActorEvent::TaskReaped => {
+                                assert_eq!(seen & 4, 0);
+                                seen |= 4;
+                            }
+                            _ => panic!("unexpected actor event"),
+                        }
+                    }
+                    assert_eq!(seen, enabled);
+                }
+                for reply in replies {
+                    reply.await.unwrap().unwrap();
+                }
+                assert!(tasks.is_empty());
+                drop(tx);
+                assert!(matches!(
+                    next_actor_event(&mut rx, &mut fatal_rx, &mut tasks, &mut next_branch).await,
+                    ActorEvent::Request(None)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_events_wake_for_each_live_source_and_ignore_closed_sources() {
+        for source in 0..3 {
+            let (tx, mut rx) = mpsc::channel(1);
+            let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+            let mut tasks = JoinSet::new();
+            let (finish, finished) = oneshot::channel();
+            if source == 2 {
+                tasks.spawn(async move {
+                    finished.await.unwrap();
+                });
+            }
+            // A closed fatal channel and an empty task set must not spin or
+            // prevent the request channel from registering a wakeup.
+            let fatal_tx = (source == 1).then_some(fatal_tx);
+            let (waiting, wait) = oneshot::channel();
+            let event = tokio::spawn(async move {
+                let mut next_branch = 1;
+                let mut event = Box::pin(next_actor_event(
+                    &mut rx,
+                    &mut fatal_rx,
+                    &mut tasks,
+                    &mut next_branch,
+                ));
+                assert!(futures_util::poll!(&mut event).is_pending());
+                waiting.send(()).unwrap();
+                event.await
+            });
+            // The arbiter is suspended before making a source ready. Its own
+            // registered waker, not a manual re-poll, must resume the task.
+            wait.await.unwrap();
+            match source {
+                0 => {
+                    let (reply, _response) = oneshot::channel();
+                    tx.send(Request::Close(Close {
+                        session_id: "wake".into(),
+                        reply,
+                    }))
+                    .await
+                    .unwrap();
+                }
+                1 => fatal_tx.unwrap().send(()).unwrap(),
+                _ => finish.send(()).unwrap(),
+            }
+            let event = tokio::time::timeout(Duration::from_secs(5), event)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                (source, event),
+                (0, ActorEvent::Request(Some(_)))
+                    | (1, ActorEvent::Fatal)
+                    | (2, ActorEvent::TaskReaped)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_arbitration_leaves_losing_request_and_serialization_owned() {
+        let (child, mut rx) = admission_test_session();
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+        let serial = child.serial.clone().lock_owned().await;
+        let (reply, mut response) = oneshot::channel();
+        let controller = agentkit_core::CancellationController::new();
+        child
+            .tx
+            .send(Request::Prompt(Prompt {
+                serial,
+                session_id: child.session_id.clone(),
+                text: "queued".into(),
+                cancellation: controller.handle().checkpoint(),
+                reply,
+            }))
+            .await
+            .unwrap();
+        controller.interrupt();
+        fatal_tx.send(()).unwrap();
+        let mut next_branch = 1;
+        assert!(matches!(
+            next_actor_event(&mut rx, &mut fatal_rx, &mut tasks, &mut next_branch).await,
+            ActorEvent::Fatal
+        ));
+        assert!(child.serial.try_lock().is_err());
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // Fatal shutdown drops the queued request, releasing both the reply and
+        // its serialization claim exactly as dropping the actor does.
+        drop(rx);
+        assert!(response.await.is_err());
+        assert!(child.serial.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_releases_unsent_serialization() {
+        for fork in [false, true] {
+            for waiting_for_gate in [false, true] {
+                let (child, mut rx) = admission_test_session();
+                let guard = if waiting_for_gate {
+                    Some(child.serial.clone().lock_owned().await)
+                } else {
+                    None
+                };
+                // Reserve all channel capacity without giving the actor a request.
+                let capacity = child.tx.reserve().await.unwrap();
+                let controller = agentkit_core::CancellationController::new();
+                let cancellation = controller.handle().checkpoint();
+                let mut operation = Box::pin(async {
+                    if fork {
+                        child.fork(None, None, &cancellation).await.map(|_| ())
+                    } else {
+                        child
+                            .prompt("blocked".into(), cancellation.clone())
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                assert!(futures_util::poll!(&mut operation).is_pending());
+                assert!(child.serial.try_lock().is_err());
+                controller.interrupt();
+                assert!(matches!(operation.await, Err(ChildError::Cancelled)));
+                assert!(matches!(
+                    rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                drop(guard);
+                assert!(child.serial.try_lock().is_ok());
+                drop(capacity);
+                assert!(child.tx.try_reserve().is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_admission_keeps_cancellation_with_actor_owned_request() {
+        for fork in [false, true] {
+            let (child, mut rx) = admission_test_session();
+            let controller = agentkit_core::CancellationController::new();
+            let cancellation = controller.handle().checkpoint();
+            controller.interrupt();
+            let operation = async {
+                if fork {
+                    child.fork(None, None, &cancellation).await.map(|_| ())
+                } else {
+                    child
+                        .prompt("ready".into(), cancellation.clone())
+                        .await
+                        .map(|_| ())
+                }
             };
+            let answer = async {
+                let request = rx.recv().await.unwrap();
+                assert!(child.serial.try_lock().is_err());
+                match request {
+                    Request::Fork(fork) => {
+                        assert!(
+                            futures_util::poll!(std::pin::pin!(fork.cancellation.cancelled()))
+                                .is_ready()
+                        );
+                        fork.reply.send(Err(ChildError::Cancelled)).unwrap();
+                    }
+                    Request::Prompt(prompt) => {
+                        assert!(
+                            futures_util::poll!(std::pin::pin!(prompt.cancellation.cancelled()))
+                                .is_ready()
+                        );
+                        prompt.reply.send(Err(ChildError::Cancelled)).unwrap();
+                    }
+                    Request::Close(_) => panic!("expected prompt or fork"),
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(operation, answer)
+            })
+            .await
+            .unwrap();
+            assert!(matches!(result, Err(ChildError::Cancelled)));
+            assert!(child.serial.try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_child_request_serialization() {
+        for fork in [false, true] {
+            let (child, mut rx) = admission_test_session();
             let caller = child.clone();
             let task = tokio::spawn(async move {
                 if fork {
@@ -2031,6 +2435,112 @@ mod tests {
             "one logical session was not serialized: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn actor_fatal_shutdown_progresses_during_sibling_request_pressure() {
+        // This is a deadlock watchdog, not a performance assertion. The peer
+        // never settles one cancelled prompt, while serving sibling requests.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let root = tempfile::tempdir().unwrap();
+            let log = root.path().join("requests.jsonl");
+            let harnesses = AcpHarnesses::new(BTreeMap::from([(
+                "mock".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: vec![
+                        format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+                        format!("--request-log={}", log.display()),
+                        format!("--prompt-release={}", root.path().join("never").display()),
+                        "--prompt-release-text=held".into(),
+                    ],
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            )]))
+            .unwrap();
+            let base = ChildSession::start(
+                ChildConfig {
+                    root: root.path().to_path_buf(),
+                    model: "unused".into(),
+                    provider: Default::default(),
+                    reasoning_effort: None,
+                    openrouter_api_key: None,
+                    configured_mcp_config: None,
+                    configured_mcp_config_inherited: false,
+                    legacy_mcp_config: false,
+                    mcp_config: None,
+                    credential_storage: Default::default(),
+                    telemetry: Default::default(),
+                    harnesses,
+                    default_harness: "acp.mock".into(),
+                    parent_id: None,
+                    parent_name: None,
+                },
+                "acp.mock".into(),
+                None,
+                None,
+                1,
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+            let mut producers = JoinSet::new();
+            let mut started = Vec::new();
+            for _ in 0..4 {
+                let sibling = base
+                    .fork(None, None, &TurnCancellation::default())
+                    .await
+                    .unwrap();
+                let (ready, wait) = oneshot::channel();
+                started.push(wait);
+                producers.spawn(async move {
+                    let mut ready = Some(ready);
+                    loop {
+                        match sibling
+                            .prompt("flowing".into(), TurnCancellation::default())
+                            .await
+                        {
+                            Ok(output) => {
+                                assert_eq!(output.text, "flowing");
+                                if let Some(ready) = ready.take() {
+                                    ready.send(()).unwrap();
+                                }
+                            }
+                            Err(error) => return error,
+                        }
+                    }
+                });
+            }
+            for ready in started {
+                ready.await.unwrap();
+            }
+            let controller = agentkit_core::CancellationController::new();
+            let cancellation = controller.handle().checkpoint();
+            let child = base.clone();
+            let held = tokio::spawn(async move { child.prompt("held".into(), cancellation).await });
+            // Observe acceptance at the real protocol boundary before cancelling.
+            while !std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .contains("\"text\":\"held\"")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            controller.interrupt();
+            assert!(matches!(
+                held.await.unwrap(),
+                Err(ChildError::TerminalCancelled)
+            ));
+            let mut closed = base.closed.clone();
+            closed.wait_for(|closed| *closed).await.unwrap();
+            // Producers stop only because the actor shuts down, not because the
+            // test withdraws pressure. Outstanding callers must also settle.
+            while let Some(result) = producers.join_next().await {
+                assert!(matches!(result.unwrap(), ChildError::TerminalFailed(_)));
+            }
+            assert!(base.serial.try_lock().is_ok());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

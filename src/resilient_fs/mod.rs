@@ -240,10 +240,11 @@ impl Image {
         })
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let n = usize::try_from(self.len.saturating_sub(offset).min(buf.len() as u64)).unwrap();
+        // Both lengths are bounded by the addressable output buffer.
+        let n = self.len.saturating_sub(offset).min(buf.len() as u64) as usize;
         let buf = &mut buf[..n];
         buf.fill(0);
-        let base_n = usize::try_from(self.base_len.saturating_sub(offset).min(n as u64)).unwrap();
+        let base_n = self.base_len.saturating_sub(offset).min(n as u64) as usize;
         match &self.source {
             Source::Memory(data) => {
                 if base_n > 0 {
@@ -331,6 +332,7 @@ struct Service {
     state: Mutex<State>,
     max_bytes: usize,
     max_operations: usize,
+    best_effort: bool,
 }
 // Fs and File transitions coordinate namespace entries/redirects, live object
 // images, budget accounting, replay stages, and retained lease authority here.
@@ -342,6 +344,7 @@ struct State {
     pending: VecDeque<Pending>,
     next: u64,
     exhausted: bool,
+    dropped: bool,
     leases: Vec<(
         PathBuf,
         std::sync::Weak<LeaseInner>,
@@ -356,12 +359,36 @@ pub struct Status {
     pub retained_bytes: usize,
     pub exhausted: bool,
 }
+/// Observable state of an opt-in loss scope. `Ready` is not a durability proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BestEffortStatus {
+    Ready,
+    Buffered,
+    /// Permanently fenced. Call `Fs::abandon_best_effort` to release retained
+    /// queue state, or drop all owners. No later recovery can replay this scope.
+    Dropped,
+    Poisoned,
+}
+
+/// The entire best-effort service has been abandoned. No clone or file handle
+/// can resume its writes; create a new scope only for an independent stream.
+#[derive(Debug)]
+pub struct DroppedScope;
+impl std::fmt::Display for DroppedScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("best-effort persistence scope abandoned")
+    }
+}
+impl std::error::Error for DroppedScope {}
+
 #[derive(Debug)]
 pub struct RecoveryReport {
     pub completed_operations: usize,
-    /// `usize::MAX` when poison prevents inspecting the pending queue.
+    /// `usize::MAX` when poison or a dropped scope prevents recovery.
     pub remaining_operations: usize,
     pub blocked: Option<io::Error>,
+    // Native ownership failures are never storage-fallback permission.
+    lease_blocked: bool,
 }
 pub struct Lease {
     inner: Arc<LeaseCaller>,
@@ -380,6 +407,9 @@ struct LeaseInner {
     native: Box<dyn BackendLease>,
     scope: PathBuf,
     service: std::sync::Weak<Service>,
+    // In-flight/queued obligations may live in a best-effort sibling. The originating
+    // registry must not mistake that foreign retained authority for clean state.
+    outstanding_operations: std::sync::atomic::AtomicUsize,
 }
 impl LeaseInner {
     fn check(&self) -> io::Result<()> {
@@ -443,9 +473,38 @@ enum Action {
         path: PathBuf,
     },
 }
+// Exactly one provisional claim per submitted operation, acquired before its
+// authority check/disk effects and transferred to the queue on buffering. It is
+// released on completion, rejection, abandonment, or owner/unwind drop.
+// No foreign service lock is acquired. Each claim owns an authority Arc, whose
+// reference-count limit also bounds this count below usize overflow.
+struct PendingLease {
+    authority: Arc<LeaseInner>,
+}
+impl PendingLease {
+    fn new(authority: Arc<LeaseInner>) -> Self {
+        authority
+            .outstanding_operations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self { authority }
+    }
+}
+impl std::ops::Deref for PendingLease {
+    type Target = LeaseInner;
+    fn deref(&self) -> &LeaseInner {
+        &self.authority
+    }
+}
+impl Drop for PendingLease {
+    fn drop(&mut self) {
+        self.authority
+            .outstanding_operations
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 struct Pending {
     action: Action,
-    lease: Option<Arc<LeaseInner>>,
+    lease: Option<PendingLease>,
 }
 impl Action {
     fn bytes(&self) -> usize {
@@ -468,17 +527,50 @@ impl Action {
     }
 }
 static GLOBAL: OnceLock<Fs> = OnceLock::new();
+static BEST_EFFORT_GLOBAL: OnceLock<Fs> = OnceLock::new();
 pub fn initialize_global(fs: Fs) -> Result<(), Fs> {
     GLOBAL.set(fs)
 }
 pub fn global() -> &'static Fs {
     GLOBAL.get_or_init(|| Fs::new(Arc::new(DiskBackend)))
 }
+/// Process-owned best-effort namespace, with a budget independent of strict
+/// storage. All participating readers and writers use this same service. Loss
+/// retires the whole namespace for this process; it is never silently reset.
+pub fn best_effort_global() -> &'static Fs {
+    BEST_EFFORT_GLOBAL.get_or_init(|| global().best_effort(64 * 1024 * 1024, 4096))
+}
+
 impl Fs {
     pub fn new(backend: Arc<dyn Backend>) -> Self {
         Self::with_budget(backend, 64 * 1024 * 1024, 4096)
     }
     pub fn with_budget(backend: Arc<dyn Backend>, max_bytes: usize, max_operations: usize) -> Self {
+        Self::with_policy(backend, max_bytes, max_operations, false)
+    }
+
+    /// Create an independent best-effort loss scope sharing only this backend.
+    /// All dependent writes (and reads of buffered images) must use this service.
+    /// Leases are not inherited. Explicitly guard a native lease acquired on
+    /// this service or its strict owner sharing the identical backend Arc.
+    /// Do not mix strict and best-effort writers for the same stream. Recovery
+    /// uses the ordinary queue; keep this service alive and call `recover` during
+    /// idle periods. Neither global recovery nor global reads see its memory.
+    pub fn best_effort(&self, max_bytes: usize, max_operations: usize) -> Self {
+        Self::with_policy(
+            self.service.backend.clone(),
+            max_bytes,
+            max_operations,
+            true,
+        )
+    }
+
+    fn with_policy(
+        backend: Arc<dyn Backend>,
+        max_bytes: usize,
+        max_operations: usize,
+        best_effort: bool,
+    ) -> Self {
         Self {
             service: Arc::new(Service {
                 backend,
@@ -489,17 +581,107 @@ impl Fs {
                     pending: VecDeque::new(),
                     next: 0,
                     exhausted: false,
+                    dropped: false,
                     leases: Vec::new(),
                 }),
                 max_bytes,
                 max_operations,
+                best_effort,
             }),
             lease: None,
         }
     }
+    // Fence IO entry points, not just queue submission: reads
+    // must not mistake an abandoned image for a complete transcript either.
+    fn state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
+        let s = lock(&self.service.state)?;
+        if s.dropped {
+            return Err(io::Error::other(DroppedScope));
+        }
+        Ok(s)
+    }
+
+    fn bufferable(&self, e: &io::Error) -> bool {
+        // EIO and device errors are Uncategorized on some Rust targets; that
+        // unstable ErrorKind cannot be named in a portable match.
+        #[cfg(unix)]
+        let device_io = matches!(
+            e.raw_os_error(),
+            Some(libc::EIO | libc::ESTALE | libc::ENODEV | libc::ENXIO | libc::EBUSY)
+        );
+        #[cfg(not(unix))]
+        let device_io = matches!(e.raw_os_error(), Some(21 | 23 | 29 | 30 | 1117 | 1167));
+        capacity(e)
+            || self.service.best_effort
+                && (device_io
+                    || matches!(
+                        e.kind(),
+                        io::ErrorKind::Other
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WriteZero
+                            | io::ErrorKind::ReadOnlyFilesystem
+                    ))
+                && !e
+                    .get_ref()
+                    .is_some_and(|e| e.is::<PoisonedState>() || e.is::<DroppedScope>())
+    }
+
+    pub fn best_effort_status(&self) -> Option<BestEffortStatus> {
+        if !self.service.best_effort {
+            return None;
+        }
+        Some(match lock(&self.service.state) {
+            Err(_) => BestEffortStatus::Poisoned,
+            Ok(s) if s.dropped => BestEffortStatus::Dropped,
+            Ok(s) if !s.pending.is_empty() => BestEffortStatus::Buffered,
+            Ok(_) => BestEffortStatus::Ready,
+        })
+    }
+
+    /// Permanently abandon this entire loss scope, including dependent pending
+    /// operations. Already published disk effects cannot be undone. Budget
+    /// rejection fences automatically; call this to release queued images and
+    /// retained leases promptly. Live handles remain fenced until dropped.
+    /// Poison is isolated, never inspected or repaired. Strict services reject
+    /// this operation. Temporary cleanup is identity-checked and best effort.
+    pub fn abandon_best_effort(&self) -> io::Result<()> {
+        if !self.service.best_effort {
+            return Err(error(
+                io::ErrorKind::InvalidInput,
+                "not a best-effort service",
+            ));
+        }
+        let mut s = lock(&self.service.state)?;
+        s.dropped = true;
+        let pending = std::mem::take(&mut s.pending);
+        let entries = std::mem::take(&mut s.entries);
+        let redirects = std::mem::take(&mut s.redirects);
+        let objects = std::mem::take(&mut s.objects);
+        let leases = std::mem::take(&mut s.leases);
+        drop(s);
+        // Backend callbacks and descriptor/lease destructors run without a
+        // service guard. The tombstone is committed before any can unwind.
+        for p in &pending {
+            self.abandon(&p.action);
+        }
+        drop((pending, entries, redirects, objects, leases));
+        Ok(())
+    }
+
     pub fn guarded(&self, lease: &Lease) -> io::Result<Self> {
         lease.check()?;
-        if !lease.inner.service.ptr_eq(&Arc::downgrade(&self.service)) {
+        let same_service = lease.inner.service.ptr_eq(&Arc::downgrade(&self.service));
+        // A best-effort namespace can retain real authority acquired by its
+        // strict backend owner. This does not synthesize a lease: every replay
+        // still checks the same native lease and path scope. Strict services
+        // never accept foreign leases, nor do unrelated backend instances.
+        let shared_backend = self.service.best_effort
+            && lease.inner.service.upgrade().is_some_and(|owner| {
+                !owner.best_effort && Arc::ptr_eq(&owner.backend, &self.service.backend)
+            });
+        if !same_service && !shared_backend {
             return Err(error(
                 io::ErrorKind::PermissionDenied,
                 "lease belongs to another filesystem",
@@ -528,7 +710,7 @@ impl Fs {
     ) -> io::Result<Lease> {
         let path = self.norm(path.as_ref())?;
         let scope = self.norm(scope.as_ref())?;
-        let mut state = lock(&self.service.state)?;
+        let mut state = self.state()?;
         state
             .leases
             .retain(|(_, authority, _)| authority.strong_count() > 0);
@@ -536,10 +718,10 @@ impl Fs {
             && let Some(authority) = state.leases[index].1.upgrade()
         {
             let valid = authority.check();
-            let dirty = state
-                .pending
-                .iter()
-                .any(|p| p.lease.as_ref().is_some_and(|l| Arc::ptr_eq(l, &authority)));
+            let dirty = authority
+                .outstanding_operations
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0;
             if valid.is_err() && !dirty {
                 // A lost *clean* lease does not reserve a namespace forever.
                 // The old observer remains fenced; reacquisition is real native IO.
@@ -587,6 +769,7 @@ impl Fs {
             native,
             scope,
             service: Arc::downgrade(&self.service),
+            outstanding_operations: std::sync::atomic::AtomicUsize::new(0),
         });
         let caller = Arc::new(LeaseCaller {
             authority: authority.clone(),
@@ -597,7 +780,7 @@ impl Fs {
         Ok(Lease { inner: caller })
     }
     fn norm(&self, path: &Path) -> io::Result<PathBuf> {
-        let _state = lock(&self.service.state)?;
+        let _state = self.state()?;
         // Canonicalize a real ancestor, never collapse `..` through a symlink.
         let absolute = if path.is_absolute() {
             path.to_path_buf()
@@ -717,6 +900,12 @@ impl Fs {
             || s.entries.len().saturating_add(entries)
                 > self.service.max_operations.saturating_mul(4)
         {
+            if self.service.best_effort {
+                // No individual operation may be dropped while its dependent
+                // tail survives. This tombstone also fences existing handles.
+                s.dropped = true;
+                return Err(io::Error::other(DroppedScope));
+            }
             s.exhausted = true;
             return Err(oom());
         }
@@ -731,28 +920,32 @@ impl Fs {
         Ok(())
     }
     fn disk_path(s: &State, path: &Path) -> PathBuf {
-        let mut mapped = if let Some((to, from)) = s
+        let mut mapped = if let Some((_, from, relative)) = s
             .redirects
             .iter()
-            .filter(|(to, _)| path.starts_with(to))
-            .max_by_key(|(to, _)| to.components().count())
+            .filter_map(|(to, from)| {
+                path.strip_prefix(to)
+                    .ok()
+                    .map(|relative| (to, from, relative))
+            })
+            .max_by_key(|(to, _, _)| to.components().count())
         {
-            if path == to {
+            if relative.as_os_str().is_empty() {
                 from.clone()
             } else {
-                from.join(path.strip_prefix(to).unwrap())
+                from.join(relative)
             }
         } else {
             path.to_path_buf()
         };
         for p in &s.pending {
             if let Action::Rename { from, to, stage: 1 } = &p.action
-                && mapped.starts_with(from)
+                && let Ok(relative) = mapped.strip_prefix(from)
             {
-                mapped = if mapped == *from {
+                mapped = if relative.as_os_str().is_empty() {
                     to.clone()
                 } else {
-                    to.join(mapped.strip_prefix(from).unwrap())
+                    to.join(relative)
                 };
             }
         }
@@ -936,14 +1129,14 @@ impl Fs {
                             Ok(()) => {}
                             // An empty probe may remain, but no user bytes are
                             // exposed and capacity failure must permit fallback.
-                            Err(e) if capacity(&e) => {}
+                            Err(e) if self.bufferable(&e) => {}
                             Err(e) => return Err(e),
                         }
                         return result;
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                    // Only capacity failure allows fallback; use a restrictive mode.
-                    Err(e) if capacity(&e) => return Ok(permissions(true, false)),
+                    // Storage fallback uses a restrictive mode; never infer umask.
+                    Err(e) if self.bufferable(&e) => return Ok(permissions(true, false)),
                     Err(e) => return Err(e),
                 }
             }
@@ -1019,7 +1212,7 @@ impl Fs {
                 },
             ) {
                 Ok(_) => {}
-                Err(e) if capacity(&e) => {}
+                Err(e) if self.bufferable(&e) => {}
                 Err(e)
                     if e.kind() == io::ErrorKind::NotFound
                         && s.entries
@@ -1058,23 +1251,29 @@ impl Fs {
     }
     // Healthy IO never consumes the configured fallback budget. Only a
     // complete, unpublished obligation enters the bounded write-back queue.
-    fn submit(&self, s: &mut State, mut action: Action) -> (bool, io::Result<()>) {
+    // Ok means accepted (possibly queued), never durable. Err means rejected;
+    // callers must not publish an image, namespace change, or cursor on rejection.
+    fn submit(&self, s: &mut State, mut action: Action) -> io::Result<()> {
         if s.pending.try_reserve(1).is_err() {
-            return (false, Err(allocation_oom()));
+            return Err(allocation_oom());
         }
-        if !s.pending.is_empty() {
-            if let Err(e) = self.reserve(s, action.bytes().saturating_mul(2), 1) {
-                return (false, Err(e));
-            }
-            return self.enqueue(s, action);
-        }
-        let result = self
+        let lease = self
             .lease
             .as_ref()
-            .map_or(Ok(()), |l| l.check())
-            .and_then(|_| self.replay(&mut action));
+            .map(|c| PendingLease::new(c.authority.clone()));
+        if !s.pending.is_empty() {
+            self.reserve(s, action.bytes().saturating_mul(2), 1)?;
+            return self.enqueue(s, action, lease);
+        }
+        let authority = lease.as_ref().map_or(Ok(()), |l| l.check());
+        let result = if self.service.best_effort {
+            authority?;
+            self.replay(&mut action)
+        } else {
+            authority.and_then(|_| self.replay(&mut action))
+        };
         match result {
-            Ok(()) => (true, Ok(())),
+            Ok(()) => Ok(()),
             Err(e) => {
                 let published = matches!(
                     action,
@@ -1086,19 +1285,18 @@ impl Fs {
                 if published && let Action::Put { image, .. } = &mut action {
                     *image = Image::memory(Arc::new(Zeroizing::new(Vec::new())));
                 }
-                if !capacity(&e) && !published {
+                if !self.bufferable(&e) && !published {
                     self.abandon(&action);
-                    return (false, Err(e));
+                    return Err(e);
                 }
-                if !published && let Err(e) = self.reserve(s, action.bytes().saturating_mul(2), 1) {
+                if (self.service.best_effort || !published)
+                    && let Err(e) = self.reserve(s, action.bytes().saturating_mul(2), 1)
+                {
                     self.abandon(&action);
-                    return (false, Err(e));
+                    return Err(e);
                 }
-                s.pending.push_back(Pending {
-                    action,
-                    lease: self.lease.as_ref().map(|c| c.authority.clone()),
-                });
-                (true, Ok(()))
+                s.pending.push_back(Pending { action, lease });
+                Ok(())
             }
         }
     }
@@ -1179,16 +1377,27 @@ impl Fs {
                 object.dirty = false;
             }
         }
+        // Successful publication (including a pending directory sync) can shed
+        // the action image before the caller installs its logical object. If a
+        // native metadata/identity read above failed, that object still owns
+        // payload memory. Charge the complete retained state after installation,
+        // even with an empty queue; healthy rebases retain no payload charge.
+        if self.service.best_effort && Self::retained(s)? > self.service.max_bytes {
+            s.dropped = true;
+            return Err(io::Error::other(DroppedScope));
+        }
         Ok(())
     }
-    fn enqueue(&self, s: &mut State, action: Action) -> (bool, io::Result<()>) {
-        s.pending.push_back(Pending {
-            action,
-            lease: self.lease.as_ref().map(|c| c.authority.clone()),
-        });
+    fn enqueue(
+        &self,
+        s: &mut State,
+        action: Action,
+        lease: Option<PendingLease>,
+    ) -> io::Result<()> {
+        s.pending.push_back(Pending { action, lease });
         let r = self.recover_locked(s);
         match r.blocked {
-            Some(e) if !capacity(&e) => {
+            Some(e) if (self.service.best_effort && r.lease_blocked) || !self.bufferable(&e) => {
                 // An unpublished temporary image can be abandoned safely. An
                 // already published rename retains its directory-sync obligation.
                 let published = s.pending.len() == 1
@@ -1204,23 +1413,20 @@ impl Fs {
                 if !published && let Some(p) = s.pending.pop_back() {
                     self.abandon(&p.action);
                 }
-                if published {
-                    (true, Ok(()))
-                } else {
-                    (false, Err(e))
-                }
+                if published { Ok(()) } else { Err(e) }
             }
-            _ => (true, Ok(())),
+            _ => Ok(()),
         }
     }
     pub fn recover(&self) -> RecoveryReport {
-        let mut s = match lock(&self.service.state) {
+        let mut s = match self.state() {
             Ok(s) => s,
             Err(e) => {
                 return RecoveryReport {
                     completed_operations: 0,
                     remaining_operations: usize::MAX,
                     blocked: Some(e),
+                    lease_blocked: false,
                 };
             }
         };
@@ -1234,15 +1440,14 @@ impl Fs {
     fn recover_locked(&self, s: &mut State) -> RecoveryReport {
         let mut completed = 0;
         let mut blocked = None;
+        let mut lease_blocked = false;
         for _ in 0..64 {
             let Some(p) = s.pending.front_mut() else {
                 break;
             };
-            let result = p
-                .lease
-                .as_ref()
-                .map_or(Ok(()), |l| l.check())
-                .and_then(|_| self.replay(&mut p.action));
+            let authority = p.lease.as_ref().map_or(Ok(()), |l| l.check());
+            lease_blocked = authority.is_err();
+            let result = authority.and_then(|_| self.replay(&mut p.action));
             match result {
                 Ok(()) => {
                     if let Some(Pending {
@@ -1252,11 +1457,11 @@ impl Fs {
                     {
                         s.redirects.retain(|(path, _)| *path != to);
                         for (_, source) in &mut s.redirects {
-                            if source.starts_with(&from) {
-                                *source = if *source == from {
+                            if let Ok(relative) = source.strip_prefix(&from) {
+                                *source = if relative.as_os_str().is_empty() {
                                     to.clone()
                                 } else {
-                                    to.join(source.strip_prefix(&from).unwrap())
+                                    to.join(relative)
                                 };
                             }
                         }
@@ -1273,6 +1478,7 @@ impl Fs {
             completed_operations: completed,
             remaining_operations: s.pending.len(),
             blocked,
+            lease_blocked,
         }
     }
     fn replay(&self, a: &mut Action) -> io::Result<()> {
@@ -1287,15 +1493,21 @@ impl Fs {
                 permissions,
                 stage,
             } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(
+                        io::ErrorKind::InvalidInput,
+                        "replacement path has no parent",
+                    )
+                })?;
                 if *stage == 0 {
-                    let parent = b.metadata(path.parent().unwrap(), false)?;
+                    let parent = b.metadata(directory, false)?;
                     if !parent.is_dir() {
                         return Err(error(
                             io::ErrorKind::NotADirectory,
                             "replacement parent changed",
                         ));
                     }
-                    *parent_identity = b.identity(path.parent().unwrap(), false)?;
+                    *parent_identity = b.identity(directory, false)?;
                     if parent_identity.is_none() {
                         return Err(error(
                             io::ErrorKind::PermissionDenied,
@@ -1323,10 +1535,7 @@ impl Fs {
                     #[cfg(unix)]
                     let named = b.metadata(temp, false)?;
                     if !same_disk_identity(file.identity()?, b.identity(temp, false)?)
-                        || !same_disk_identity(
-                            *parent_identity,
-                            b.identity(path.parent().unwrap(), false)?,
-                        )
+                        || !same_disk_identity(*parent_identity, b.identity(directory, false)?)
                     {
                         return Err(error(
                             io::ErrorKind::PermissionDenied,
@@ -1356,20 +1565,26 @@ impl Fs {
                         *stage = 3;
                     }
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Mkdir {
                 path,
                 private,
                 stage,
             } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "directory path has no parent")
+                })?;
                 if *stage == 0 {
                     b.create_dir(path, *private)?;
                     *stage = 1;
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Unlink { path, dir, stage } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "removed path has no parent")
+                })?;
                 if *stage == 0 {
                     match if *dir {
                         b.remove_dir(path)
@@ -1381,16 +1596,25 @@ impl Fs {
                     }
                     *stage = 1;
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Rename { from, to, stage } => {
+                let from_parent = from.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "rename source has no parent")
+                })?;
+                let to_parent = to.parent().ok_or_else(|| {
+                    error(
+                        io::ErrorKind::InvalidInput,
+                        "rename destination has no parent",
+                    )
+                })?;
                 if *stage == 0 {
                     b.rename(from, to)?;
                     *stage = 1;
                 }
-                b.sync_directory(to.parent().unwrap())?;
-                if from.parent() != to.parent() {
-                    b.sync_directory(from.parent().unwrap())?;
+                b.sync_directory(to_parent)?;
+                if from_parent != to_parent {
+                    b.sync_directory(from_parent)?;
                 }
                 Ok(())
             }
@@ -1400,7 +1624,7 @@ impl Fs {
     }
     pub fn require_disk<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         let report = self.recover_locked(&mut s);
         self.rebase(&mut s)?;
         Self::prune(&mut s);
@@ -1416,13 +1640,13 @@ impl Fs {
     }
     pub fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state)?;
+        let s = self.state()?;
         self.secure_path(&s, &path, false)?;
         self.lookup(&s, &path)
     }
     pub fn symlink_metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
         let path = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state)?;
+        let s = self.state()?;
         self.secure_path(&s, &path, true)?;
         self.lookup(&s, &path)
     }
@@ -1435,7 +1659,7 @@ impl Fs {
     }
     pub fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<u8>> {
         let file = self.open(path)?;
-        let _state = lock(&self.service.state)?;
+        let _state = self.state()?;
         let image = lock(&file.object)?.image.clone();
         let len = usize::try_from(image.len).map_err(|_| allocation_oom())?;
         let mut data = Zeroizing::new(Vec::new());
@@ -1465,7 +1689,7 @@ impl Fs {
         new_object: bool,
     ) -> io::Result<()> {
         let path = self.norm(path)?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.preflight(&s, &path)?;
         s.entries.try_reserve(1).map_err(|_| allocation_oom())?;
@@ -1506,10 +1730,7 @@ impl Fs {
             modified: SystemTime::now(),
         };
         let a = Self::put_action(&mut s, &path, Image::memory(data.clone()), perms);
-        let (accepted, result) = self.submit(&mut s, a);
-        if !accepted {
-            return result;
-        }
+        self.submit(&mut s, a)?;
         if new_object {
             // Acceptance replaces the logical name even when publication is queued.
             // Old handles must not publish writes or chmod through that name.
@@ -1528,7 +1749,7 @@ impl Fs {
         };
         Self::entry(&mut s, path.clone(), Some(object))?;
         self.rebase(&mut s)?;
-        result
+        Ok(())
     }
     fn prune(s: &mut State) {
         s.entries
@@ -1538,11 +1759,20 @@ impl Fs {
             .retain(|(path, _)| s.pending.iter().any(|p| p.action.touches(path)));
     }
     fn recover_before(&self, s: &mut State) -> io::Result<()> {
+        if self.service.best_effort
+            && let Some(lease) = &self.lease
+        {
+            lease.check()?;
+        }
         let report = self.recover_locked(s);
         self.rebase(s)?;
         Self::prune(s);
         match report.blocked {
-            Some(e) if !capacity(&e) => Err(e),
+            Some(e)
+                if (self.service.best_effort && report.lease_blocked) || !self.bufferable(&e) =>
+            {
+                Err(e)
+            }
             _ => Ok(()),
         }
     }
@@ -1558,7 +1788,7 @@ impl Fs {
     }
     pub fn read_link<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let p = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state)?;
+        let s = self.state()?;
         self.secure_path(&s, &p, true)?;
         if !self.lookup(&s, &p)?.file_type().is_symlink() {
             return Err(error(io::ErrorKind::InvalidInput, "not a symlink"));
@@ -1567,7 +1797,7 @@ impl Fs {
     }
     pub fn canonicalize<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         let p = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state)?;
+        let s = self.state()?;
         match self.service.backend.canonicalize(&p) {
             Ok(p) => Ok(p),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1659,7 +1889,7 @@ impl Fs {
     }
     pub fn read_dir<P: AsRef<Path>>(&self, path: P) -> io::Result<ReadDir> {
         let p = self.norm(path.as_ref())?;
-        let s = lock(&self.service.state)?;
+        let s = self.state()?;
         self.secure_path(&s, &p, false)?;
         let paths = self.list(&s, &p)?;
         let mut entries = Vec::new();
@@ -1683,7 +1913,7 @@ impl Fs {
     }
     fn mkdir(&self, path: &Path, private: bool) -> io::Result<()> {
         let p = self.norm(path)?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1707,17 +1937,14 @@ impl Fs {
             permissions: self.new_permissions(&s, &p, private, true)?,
             modified: SystemTime::now(),
         };
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Mkdir {
                 path: p.clone(),
                 private,
                 stage: 0,
             },
-        );
-        if !accepted {
-            return result;
-        }
+        )?;
         Self::entry(
             &mut s,
             p.clone(),
@@ -1726,7 +1953,7 @@ impl Fs {
                 meta,
             )))),
         )?;
-        result
+        Ok(())
     }
     pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         self.mkdir_all(path.as_ref(), false)
@@ -1770,7 +1997,7 @@ impl Fs {
     }
     fn unlink(&self, path: &Path, dir: bool) -> io::Result<()> {
         let p = self.norm(path)?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1785,24 +2012,23 @@ impl Fs {
             ));
         }
         Self::prepare(&mut s, 1)?;
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Unlink {
                 path: p.clone(),
                 dir,
                 stage: 0,
             },
-        );
-        if accepted {
-            for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object)?;
-                if object.path.as_ref() == Some(&p) {
-                    object.path = None;
-                }
+        )?;
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let mut object = lock(&object)?;
+            if object.path.as_ref() == Some(&p) {
+                object.path = None;
             }
-            Self::entry(&mut s, p, None)?;
         }
-        result
+        Self::entry(&mut s, p, None)?;
+
+        Ok(())
     }
     pub fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
@@ -1819,7 +2045,7 @@ impl Fs {
     pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<()> {
         let from = self.norm(from.as_ref())?;
         let to = self.norm(to.as_ref())?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.authority(&from)?;
         self.authority(&to)?;
@@ -1874,52 +2100,50 @@ impl Fs {
             .map_err(|_| allocation_oom())?;
         moved.push((to.clone(), Some(root.clone())));
         for e in &s.entries {
-            if e.path.starts_with(&from) && e.path != from {
-                moved.push((
-                    to.join(e.path.strip_prefix(&from).unwrap()),
-                    e.object.clone(),
-                ));
+            if e.path != from
+                && let Ok(relative) = e.path.strip_prefix(&from)
+            {
+                moved.push((to.join(relative), e.object.clone()));
             }
         }
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Rename {
                 from: from.clone(),
                 to: to.clone(),
                 stage: 0,
             },
-        );
-        if accepted {
-            for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object)?;
-                if let Some(path) = &object.path {
-                    if path.starts_with(&from) {
-                        object.path = Some(if *path == from {
-                            to.clone()
-                        } else {
-                            to.join(path.strip_prefix(&from).unwrap())
-                        });
-                    } else if path.starts_with(&to) {
-                        object.path = None;
-                    }
+        )?;
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let mut object = lock(&object)?;
+            if let Some(path) = &object.path {
+                if let Ok(relative) = path.strip_prefix(&from) {
+                    object.path = Some(if relative.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(relative)
+                    });
+                } else if path.starts_with(&to) {
+                    object.path = None;
                 }
-            }
-            for e in &mut s.entries {
-                if e.path.starts_with(&from) {
-                    e.object = None;
-                }
-            }
-            Self::entry(&mut s, from.clone(), None)?;
-            for (path, object) in moved {
-                Self::entry(&mut s, path, object)?;
-            }
-            s.redirects
-                .retain(|(path, _)| !path.starts_with(&from) && !path.starts_with(&to));
-            if s.pending.iter().any(|p| p.action.touches(&to)) {
-                s.redirects.push((to, source));
             }
         }
-        result
+        for e in &mut s.entries {
+            if e.path.starts_with(&from) {
+                e.object = None;
+            }
+        }
+        Self::entry(&mut s, from.clone(), None)?;
+        for (path, object) in moved {
+            Self::entry(&mut s, path, object)?;
+        }
+        s.redirects
+            .retain(|(path, _)| !path.starts_with(&from) && !path.starts_with(&to));
+        if s.pending.iter().any(|p| p.action.touches(&to)) {
+            s.redirects.push((to, source));
+        }
+
+        Ok(())
     }
     pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<u64> {
         let data = Zeroizing::new(self.read(&from)?);
@@ -1934,22 +2158,19 @@ impl Fs {
         permissions: Permissions,
     ) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
         self.capture_shallow(&mut s, &p)?;
         Self::prepare(&mut s, 0)?;
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Chmod {
                 path: p.clone(),
                 permissions: permissions.clone(),
             },
-        );
-        if !accepted {
-            return result;
-        }
+        )?;
         if let Some(o) = s
             .entries
             .iter()
@@ -1960,7 +2181,7 @@ impl Fs {
             o.meta.permissions = permissions.clone();
             o.meta.disk = None;
         }
-        result
+        Ok(())
     }
     fn capture_shallow(&self, s: &mut State, p: &Path) -> io::Result<()> {
         let meta = self.lookup(s, p)?;
@@ -1981,7 +2202,7 @@ impl Fs {
     }
     pub fn sync_directory<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         self.recover_before(&mut s)?;
         self.authority(&p)?;
         self.secure_path(&s, &p, false)?;
@@ -1989,16 +2210,16 @@ impl Fs {
             return Err(error(io::ErrorKind::NotADirectory, "not a directory"));
         }
         Self::prepare(&mut s, 0)?;
-        self.submit(&mut s, Action::Sync { path: p }).1
+        self.submit(&mut s, Action::Sync { path: p })
     }
     pub fn open_beneath<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         root: P,
         relative: Q,
     ) -> io::Result<File> {
-        if relative.as_ref().as_os_str().is_empty()
+        let relative = relative.as_ref();
+        if relative.as_os_str().is_empty()
             || relative
-                .as_ref()
                 .components()
                 .any(|c| !matches!(c, Component::Normal(_)))
         {
@@ -2009,7 +2230,7 @@ impl Fs {
         }
         let root = self.norm(root.as_ref())?;
         let p = root.join(relative);
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.state()?;
         let _ = self.recover_locked(&mut s);
         self.rebase(&mut s)?;
         Self::prune(&mut s);
@@ -2028,7 +2249,7 @@ impl Fs {
         let native = self
             .service
             .backend
-            .open_beneath(&Self::disk_path(&s, &root), p.strip_prefix(&root).unwrap())?;
+            .open_beneath(&Self::disk_path(&s, &root), relative)?;
         if !native.metadata()?.is_file() {
             return Err(error(io::ErrorKind::InvalidInput, "not a regular file"));
         }
@@ -2094,7 +2315,7 @@ impl OpenOptions {
         {
             return Err(error(io::ErrorKind::InvalidInput, "invalid open options"));
         }
-        let mut s = lock(&fs.service.state)?;
+        let mut s = fs.state()?;
         if writable {
             fs.recover_before(&mut s)?;
         } else {
@@ -2155,11 +2376,7 @@ impl OpenOptions {
             };
             let obj = fs.live_object(&s, &p)?;
             let a = Fs::put_action(&mut s, &p, Image::memory(data.clone()), perms);
-            let (accepted, result) = fs.submit(&mut s, a);
-            if !accepted {
-                result?;
-                unreachable!();
-            }
+            fs.submit(&mut s, a)?;
             let object = if let Some(obj) = obj {
                 *lock(&obj)? = Object::memory(data.clone(), meta);
                 obj
@@ -2167,7 +2384,6 @@ impl OpenOptions {
                 Arc::new(Mutex::new(Object::memory(data.clone(), meta)))
             };
             Fs::entry(&mut s, p.clone(), Some(object))?;
-            result?;
         }
         fs.rebase(&mut s)?;
         let object = fs.object(&mut s, &p)?;
@@ -2213,7 +2429,7 @@ impl File {
         })
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
-        let _state = lock(&self.fs.service.state)?;
+        let _state = self.fs.state()?;
         self.metadata_locked()
     }
     // Caller holds service state; seek also holds the cursor in lock order.
@@ -2238,9 +2454,12 @@ impl File {
             ));
         }
         if data.is_empty() && size.is_none() {
+            if self.fs.service.best_effort {
+                drop(self.fs.state()?);
+            }
             return Ok(0);
         }
-        let mut s = lock(&self.fs.service.state)?;
+        let mut s = self.fs.state()?;
         self.fs.recover_before(&mut s)?;
         let mut cursor = lock(&self.cursor)?;
         let mut object = lock(&self.object)?;
@@ -2297,19 +2516,15 @@ impl File {
         } else if let Some(lease) = &self.fs.lease {
             lease.check()?;
         }
-        let (accepted, result) = if let Some(path) = &path {
+        if let Some(path) = &path {
             s.entries.try_reserve(1).map_err(|_| allocation_oom())?;
             s.objects.try_reserve(1).map_err(|_| allocation_oom())?;
             let action = Fs::put_action(&mut s, path, image.clone(), perms);
             self.fs.submit(&mut s, action)
         } else {
             self.fs.reserve(&mut s, image.payload_bytes(), 0)?;
-            (true, Ok(()))
-        };
-        if !accepted {
-            result?;
-            unreachable!();
-        }
+            Ok(())
+        }?;
         {
             let mut object = lock(&self.object)?;
             object.image = image;
@@ -2328,7 +2543,6 @@ impl File {
             *cursor = end;
         }
         self.fs.rebase(&mut s)?;
-        result?;
         Ok(data.len())
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
@@ -2337,7 +2551,11 @@ impl File {
     pub fn sync_data(&self) -> io::Result<()> {
         let r = self.fs.recover();
         match r.blocked {
-            Some(e) if !capacity(&e) => Err(e),
+            Some(e)
+                if (self.fs.service.best_effort && r.lease_blocked) || !self.fs.bufferable(&e) =>
+            {
+                Err(e)
+            }
             _ => Ok(()),
         }
     }
@@ -2345,7 +2563,7 @@ impl File {
         self.sync_data()
     }
     pub fn set_permissions(&self, p: Permissions) -> io::Result<()> {
-        let mut s = lock(&self.fs.service.state)?;
+        let mut s = self.fs.state()?;
         self.fs.recover_before(&mut s)?;
         let path = {
             let mut object = lock(&self.object)?;
@@ -2369,7 +2587,7 @@ impl File {
             }
             object.path.clone()
         };
-        let (accepted, result) = if let Some(path) = &path {
+        if let Some(path) = &path {
             self.fs.authority(path)?;
             self.fs.secure_path(&s, path, false)?;
             Fs::prepare(&mut s, 1)?;
@@ -2384,20 +2602,19 @@ impl File {
             if let Some(lease) = &self.fs.lease {
                 lease.check()?;
             }
-            (true, Ok(()))
-        };
-        if accepted {
-            let mut object = lock(&self.object)?;
-            object.meta.permissions = p;
-            object.meta.disk = None;
-            object.dirty = true;
-            drop(object);
-            if let Some(path) = path {
-                Fs::entry(&mut s, path, Some(self.object.clone()))?;
-            }
-            self.fs.rebase(&mut s)?;
+            Ok(())
+        }?;
+        let mut object = lock(&self.object)?;
+        object.meta.permissions = p;
+        object.meta.disk = None;
+        object.dirty = true;
+        drop(object);
+        if let Some(path) = path {
+            Fs::entry(&mut s, path, Some(self.object.clone()))?;
         }
-        result
+        self.fs.rebase(&mut s)?;
+
+        Ok(())
     }
 }
 impl Read for File {
@@ -2408,7 +2625,7 @@ impl Read for File {
                 "handle is not readable",
             ));
         }
-        let _state = lock(&self.fs.service.state)?;
+        let _state = self.fs.state()?;
         let mut cursor = lock(&self.cursor)?;
         let (image, dirty) = {
             let object = lock(&self.object)?;
@@ -2435,7 +2652,7 @@ impl Write for File {
 }
 impl Seek for File {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        let _state = lock(&self.fs.service.state)?;
+        let _state = self.fs.state()?;
         let mut cursor = lock(&self.cursor)?;
         let next = match from {
             SeekFrom::Start(n) => n as i128,
@@ -2474,6 +2691,14 @@ pub fn open_beneath<P: AsRef<Path>, Q: AsRef<Path>>(root: P, relative: Q) -> io:
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests;
 
 #[derive(Default, Debug)]

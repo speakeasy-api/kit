@@ -483,6 +483,14 @@ fn random_urlsafe<const N: usize>() -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 pub(crate) mod test_support {
     use super::*;
 
@@ -498,6 +506,14 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         collections::BTreeMap,

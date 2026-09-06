@@ -14,7 +14,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::events::{self, RuntimeEvent, summarize_input, summarize_output};
 
@@ -150,7 +150,7 @@ impl DisplayInvocation {
                 !result.result.is_error,
                 summarize_output(&output_value(&result.result.output)),
             ),
-            Err(error) => (false, summarize_output(&json!(error.to_string()))),
+            Err(error) => (false, summarize_output(&Value::from(error.to_string()))),
         };
         events::emit(&RuntimeEvent::ChildFinished {
             call: self.call,
@@ -164,14 +164,22 @@ impl DisplayInvocation {
 
 fn output_value(output: &ToolOutput) -> Value {
     match output {
-        ToolOutput::Text(text) => json!(text),
+        ToolOutput::Text(text) => Value::from(text.clone()),
         ToolOutput::Structured(value) => value.clone(),
-        ToolOutput::Parts(parts) => json!(format!("{} parts", parts.len())),
-        ToolOutput::Files(files) => json!(format!("{} files", files.len())),
+        ToolOutput::Parts(parts) => Value::from(format!("{} parts", parts.len())),
+        ToolOutput::Files(files) => Value::from(format!("{} files", files.len())),
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolResultPart, TurnId};
@@ -179,6 +187,22 @@ mod tests {
         AllowAllPermissions, ApprovalReason, ApprovalRequest, OwnedToolContext, ToolInterruption,
         ToolName,
     };
+    use serde_json::json;
+
+    #[test]
+    fn output_summaries_preserve_strings_values_and_counts() {
+        assert_eq!(
+            output_value(&ToolOutput::Text("quoted \"text\"\n".into())),
+            json!("quoted \"text\"\n"),
+        );
+        let structured = json!({"number": 42, "null": null, "array": [true, "text"]});
+        assert_eq!(
+            output_value(&ToolOutput::structured(structured.clone())),
+            structured
+        );
+        assert_eq!(output_value(&ToolOutput::Parts(vec![])), json!("0 parts"));
+        assert_eq!(output_value(&ToolOutput::Files(vec![])), json!("0 files"));
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum Mode {

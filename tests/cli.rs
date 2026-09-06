@@ -1,3 +1,13 @@
+// Integration crate and its helpers are test-only. Placeholders stay denied.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
 use std::{fs, path::Path, process::Command};
 
 use agentkit_core::{Item, ItemKind};

@@ -18,14 +18,36 @@ enum Point {
     Read,
     Seek,
     Metadata,
+    Identity,
     AfterWrite,
     AfterRename,
     LeaseCheck,
     FileDrop,
 }
+type PausedFault = (Point, Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+
 #[derive(Default)]
-struct Faults(Mutex<Option<(Point, i32)>>, AtomicUsize, AtomicUsize);
+struct Faults(
+    Mutex<Vec<(Point, i32)>>,
+    AtomicUsize,
+    AtomicUsize,
+    Mutex<Option<PausedFault>>,
+);
 impl Faults {
+    fn pause_at(&self, point: Point) {
+        let pause = {
+            let mut armed = self.3.lock().unwrap();
+            if armed.as_ref().is_some_and(|(p, _, _)| *p == point) {
+                armed.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered, resume)) = pause {
+            entered.wait();
+            resume.wait();
+        }
+    }
     fn arm_panic(&self, point: Point) {
         self.2.store(point as usize + 1, Ordering::SeqCst);
     }
@@ -39,15 +61,18 @@ impl Faults {
         }
     }
     fn arm(&self, point: Point, code: i32) {
-        *self.0.lock().unwrap() = Some((point, code));
+        self.arm_many(&[(point, code)]);
+    }
+    fn arm_many(&self, faults: &[(Point, i32)]) {
+        *self.0.lock().unwrap() = faults.to_vec();
     }
     fn clear(&self) {
-        *self.0.lock().unwrap() = None;
+        self.0.lock().unwrap().clear();
     }
     fn check(&self, point: Point) -> io::Result<()> {
-        match *self.0.lock().unwrap() {
-            Some((p, code)) if p == point => Err(io::Error::from_raw_os_error(code)),
-            _ => Ok(()),
+        match self.0.lock().unwrap().iter().find(|(p, _)| *p == point) {
+            Some((_, code)) => Err(io::Error::from_raw_os_error(*code)),
+            None => Ok(()),
         }
     }
 }
@@ -78,6 +103,7 @@ impl Seek for InjectedFile {
 }
 impl Write for InjectedFile {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.faults.pause_at(Point::Write);
         if self.faults.check(Point::Write).is_err() && !b.is_empty() {
             if self.wrote_prefix {
                 self.faults.check(Point::Write)?;
@@ -95,11 +121,13 @@ impl Write for InjectedFile {
 }
 impl BackendFile for InjectedFile {
     fn identity(&self) -> io::Result<Option<FileIdentity>> {
+        self.faults.check(Point::Identity)?;
         self.disk.identity()
     }
     fn metadata(&self) -> io::Result<native::Metadata> {
         let meta = self.disk.metadata()?;
         self.faults.panic_at(Point::Metadata);
+        self.faults.check(Point::Metadata)?;
         Ok(meta)
     }
     fn set_len(&self, n: u64) -> io::Result<()> {
@@ -130,7 +158,7 @@ impl BackendLease for InjectedLease {
     fn check(&self) -> io::Result<()> {
         self.disk.check()?;
         self.faults.panic_at(Point::LeaseCheck);
-        Ok(())
+        self.faults.check(Point::LeaseCheck)
     }
 }
 impl Backend for Injected {
@@ -186,6 +214,7 @@ impl Backend for Injected {
         self.faults.check(Point::Rename)?;
         self.disk.rename(a, b)?;
         self.faults.panic_at(Point::AfterRename);
+        self.faults.pause_at(Point::AfterRename);
         Ok(())
     }
     fn set_permissions(&self, p: &Path, mode: Permissions) -> io::Result<()> {
@@ -1669,4 +1698,705 @@ fn panic_during_pending_publication_blocks_further_recovery() {
     assert_eq!(native::read(&path).unwrap(), b"queued");
     assert_service_isolated(&t);
     assert_eq!(native::read(&path).unwrap(), b"queued");
+}
+
+#[test]
+#[cfg(unix)]
+fn rejected_truncation_preserves_shared_image_cursor_and_disk() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    t.fs.write(&path, b"original").unwrap();
+    let mut held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_in(&t.fs, &path)
+        .unwrap();
+    held.seek(SeekFrom::Start(3)).unwrap();
+    let mut clone = held.try_clone().unwrap();
+
+    // The temporary file has been changed when sync fails, but neither API
+    // may commit truncation to the shared object or its logical namespace.
+    t.faults.arm(Point::Sync, libc::EIO);
+    assert_eq!(
+        t.fs.create(&path).unwrap_err().raw_os_error(),
+        Some(libc::EIO)
+    );
+    assert_eq!(held.set_len(2).unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(held.metadata().unwrap().len(), 8);
+    assert_eq!(clone.stream_position().unwrap(), 3);
+    assert_eq!(t.fs.read(&path).unwrap(), b"original");
+    assert_eq!(native::read(&path).unwrap(), b"original");
+    assert_eq!(t.fs.status().pending_operations, 0);
+
+    t.settle();
+    clone.write_all(b"!").unwrap();
+    assert_eq!(held.stream_position().unwrap(), 4);
+    t.settle();
+    assert_eq!(native::read(&path).unwrap(), b"ori!inal");
+    assert_eq!(native::read_dir(&t.root).unwrap().count(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_noncapacity_failures_buffer_and_recover_in_order() {
+    for point in [
+        Point::Open,
+        Point::Write,
+        Point::Sync,
+        Point::Rename,
+        Point::DirectorySync,
+    ] {
+        let t = Fixture::new();
+        let fs = t.fs.best_effort(1024 * 1024, 100);
+        let path = t.path("transcript");
+        fs.replace_private(&path, b"header\n").unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open_in(&fs, &path)
+            .unwrap();
+        t.faults.arm(point, libc::EIO);
+        file.write_all(b"first record\n").unwrap();
+        file.write_all(b"second record\n").unwrap();
+        file.sync_all().unwrap();
+        assert_eq!(
+            fs.best_effort_status(),
+            Some(BestEffortStatus::Buffered),
+            "{point:?}"
+        );
+        assert_eq!(
+            fs.read(&path).unwrap(),
+            b"header\nfirst record\nsecond record\n"
+        );
+        // Another service cannot see this service's uncommitted overlay.
+        if point != Point::DirectorySync {
+            assert_eq!(t.fs.read(&path).unwrap(), b"header\n");
+        }
+        t.faults.clear();
+        fs.require_disk(&path).unwrap();
+        assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Ready));
+        assert_eq!(
+            native::read(&path).unwrap(),
+            b"header\nfirst record\nsecond record\n"
+        );
+        assert_eq!(names(&fs, &t.root), vec![OsString::from("transcript")]);
+        assert!(!t.fs.status().exhausted);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_budget_abandons_entire_stream_and_fences_live_handles() {
+    for (bytes, operations) in [(50, 100), (1024 * 1024, 1)] {
+        let t = Fixture::new();
+        let fs = t.fs.best_effort(bytes, operations);
+        let path = t.path("transcript");
+        fs.replace_private(&path, b"header\n").unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open_in(&fs, &path)
+            .unwrap();
+        t.faults.arm(Point::Write, libc::EIO);
+        file.write_all(b"first record\n").unwrap();
+        let rejected = file.write_all(b"second record\n").unwrap_err();
+        assert!(rejected.get_ref().unwrap().is::<DroppedScope>());
+        assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Dropped));
+        assert!(!fs.status().exhausted);
+        assert!(!t.fs.status().exhausted);
+        t.faults.clear();
+        assert!(
+            fs.recover()
+                .blocked
+                .unwrap()
+                .get_ref()
+                .unwrap()
+                .is::<DroppedScope>()
+        );
+        assert!(file.write_all(b"tail\n").is_err());
+        assert!(file.set_len(0).is_err());
+        assert!(file.sync_all().is_err());
+        assert!(file.sync_data().is_err());
+        assert!(file.flush().is_err());
+        assert!(file.write(&[]).is_err());
+        assert!(file.read(&mut [0; 1]).is_err());
+        assert!(fs.replace_private(&path, b"tail\n").is_err());
+        assert_eq!(native::read(&path).unwrap(), b"header\n");
+        fs.abandon_best_effort().unwrap();
+        assert_eq!(fs.status().pending_operations, 0);
+        assert!(fs.recover().blocked.is_some());
+        assert_eq!(names(&t.fs, &t.root), vec![OsString::from("transcript")]);
+        t.fs.write(t.path("strict"), b"independent").unwrap();
+        assert!(!t.fs.status().exhausted);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_scope_does_not_change_strict_failure_policy() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(1024, 10);
+    t.faults.arm(Point::Write, libc::EIO);
+    fs.replace_private(t.path("best"), b"buffer this").unwrap();
+    assert_eq!(
+        t.fs.replace_private(t.path("strict"), b"reject this")
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EIO)
+    );
+    assert_eq!(t.fs.status().pending_operations, 0);
+    assert!(t.fs.abandon_best_effort().is_err());
+    t.faults.clear();
+    fs.require_disk(t.path("best")).unwrap();
+    assert!(!t.path("strict").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_poison_is_isolated_not_buffered_or_recovered() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(1024, 10);
+    fs.replace_private(t.path("best"), b"old").unwrap();
+    t.faults.arm_panic(Point::AfterRename);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fs.replace_private(t.path("best"), b"published before unwind");
+        }))
+        .is_err()
+    );
+    assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Poisoned));
+    assert_poison(fs.recover().blocked.unwrap());
+    assert_poison(fs.abandon_best_effort().unwrap_err());
+    assert_poison(fs.replace_private(t.path("tail"), b"no").unwrap_err());
+    t.fs.replace_private(t.path("strict"), b"yes").unwrap();
+    assert!(!t.fs.status().exhausted);
+    assert_eq!(
+        native::read(t.path("best")).unwrap(),
+        b"published before unwind"
+    );
+    assert!(!t.path("tail").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_native_authority_and_traversal_failures_remain_real() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(1024, 10);
+    let lease = fs
+        .acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+        .unwrap();
+    let guarded = fs.guarded(&lease).unwrap();
+    assert!(t.fs.guarded(&lease).is_err());
+    std::os::unix::fs::symlink(t.path("target"), t.path("link")).unwrap();
+    assert_eq!(
+        guarded
+            .replace_private(t.path("link"), b"no")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    native::remove_file(t.path("lock")).unwrap();
+    assert!(guarded.replace_private(t.path("value"), b"no").is_err());
+    assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Ready));
+    assert!(!t.path("value").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_retained_lease_io_failure_is_not_storage_fallback() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(4096, 100);
+    let lease = fs
+        .acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+        .unwrap();
+    let guarded = fs.guarded(&lease).unwrap();
+    let path = t.path("transcript");
+    guarded.replace_private(&path, b"old").unwrap();
+    // Keep an unguarded observer to exercise the retained queue authority,
+    // independently of recover_before's check of the caller's own authority.
+    let file = fs.open(&path).unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    guarded.replace_private(&path, b"pending record").unwrap();
+    drop(guarded);
+    drop(lease);
+    t.faults.arm(Point::LeaseCheck, libc::EIO);
+    assert_eq!(file.sync_all().unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert!(fs.replace_private(t.path("tail"), b"no").is_err());
+    t.faults.clear();
+    // A failed native ownership check stays fenced even after IO recovers.
+    assert!(fs.recover().blocked.is_some());
+    assert_eq!(native::read(&path).unwrap(), b"old");
+    assert!(!t.path("tail").exists());
+    fs.abandon_best_effort().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_budget_never_invokes_emergency_allocation_handler() {
+    const CHILD: &str = "KIT_FS_BEST_EFFORT_BUDGET_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        set_allocation_failure_handler(|| std::process::exit(73)).unwrap();
+        let t = Fixture::new();
+        let fs = t.fs.best_effort(0, 0);
+        t.faults.arm(Point::Write, libc::EIO);
+        assert!(
+            fs.replace_private(t.path("value"), b"not retained")
+                .unwrap_err()
+                .get_ref()
+                .unwrap()
+                .is::<DroppedScope>()
+        );
+        assert!(!fs.status().exhausted);
+        assert!(!t.fs.status().exhausted);
+        fs.abandon_best_effort().unwrap();
+        return;
+    }
+    let module = module_path!().split_once("::").unwrap().1;
+    let name = format!("{module}::best_effort_budget_never_invokes_emergency_allocation_handler");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_abandon_commits_fence_before_backend_drop_unwinds() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(4096, 10);
+    fs.replace_private(t.path("value"), b"old").unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    fs.replace_private(t.path("value"), b"unpublished image")
+        .unwrap();
+    t.faults.clear();
+    t.faults.arm_panic(Point::FileDrop);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = fs.abandon_best_effort();
+        }))
+        .is_err()
+    );
+    assert!(!fs.service.state.is_poisoned());
+    assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Dropped));
+    assert_eq!(fs.status().pending_operations, 0);
+    assert!(fs.recover().blocked.is_some());
+    assert!(fs.replace_private(t.path("tail"), b"no").is_err());
+    assert_eq!(native::read(t.path("value")).unwrap(), b"old");
+    t.fs.replace_private(t.path("strict"), b"yes").unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_namespace_dependencies_recover_without_skipping_head() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(4096, 100);
+    t.faults.arm(Point::Mkdir, libc::EIO);
+    fs.create_dir(t.path("before")).unwrap();
+    fs.replace_private(t.path("before/transcript"), b"header\n")
+        .unwrap();
+    fs.rename(t.path("before"), t.path("after")).unwrap();
+    assert_eq!(fs.read(t.path("after/transcript")).unwrap(), b"header\n");
+    assert!(!t.path("before").exists());
+    assert!(!t.path("after").exists());
+    t.faults.clear();
+    fs.require_disk(&t.root).unwrap();
+    assert_eq!(
+        native::read(t.path("after/transcript")).unwrap(),
+        b"header\n"
+    );
+    assert!(!t.path("before").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_published_sync_obligation_cannot_bypass_operation_budget() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(0, 0);
+    t.faults.arm(Point::DirectorySync, libc::EIO);
+    assert!(
+        fs.replace_private(t.path("value"), b"already published")
+            .unwrap_err()
+            .get_ref()
+            .unwrap()
+            .is::<DroppedScope>()
+    );
+    assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Dropped));
+    assert_eq!(native::read(t.path("value")).unwrap(), b"already published");
+    assert!(!fs.status().exhausted);
+    t.faults.clear();
+    assert!(fs.replace_private(t.path("value"), b"tail").is_err());
+    fs.abandon_best_effort().unwrap();
+    assert!(fs.require_disk(t.path("value")).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_guard_requires_identical_backend_and_keeps_scope() {
+    let t = Fixture::new();
+    native::create_dir(t.path("scope")).unwrap();
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), t.path("scope"), LeaseMode::CreateNew)
+            .unwrap();
+    let best = t.fs.best_effort(4096, 100);
+    let guarded = best.guarded(&lease).unwrap();
+    guarded
+        .replace_private(t.path("scope/value"), b"yes")
+        .unwrap();
+    assert_eq!(
+        guarded
+            .replace_private(t.path("outside"), b"no")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let unrelated = Fs::new(Arc::new(Injected {
+        disk: DiskBackend,
+        faults: t.faults.clone(),
+    }))
+    .best_effort(4096, 100);
+    assert_eq!(
+        unrelated.guarded(&lease).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let foreign_strict = Fs::new(t.fs.service.backend.clone());
+    assert_eq!(
+        foreign_strict.guarded(&lease).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    // Retiring optional persistence must not retire the strict native owner.
+    best.abandon_best_effort().unwrap();
+    lease.check().unwrap();
+    t.fs.guarded(&lease)
+        .unwrap()
+        .replace_private(t.path("scope/strict"), b"yes")
+        .unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_queue_retains_native_lock_after_all_source_owners_drop() {
+    let t = Fixture::new();
+    let owner = Fs::new(t.fs.service.backend.clone());
+    let best = owner.best_effort(4096, 100);
+    let lease = owner
+        .acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+        .unwrap();
+    let guarded = best.guarded(&lease).unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    guarded
+        .replace_private(t.path("value"), b"retained record")
+        .unwrap();
+    drop(guarded);
+    drop(lease);
+    drop(owner);
+    assert!(t.path("lock").exists());
+    assert!(
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::ExistingOrNew)
+            .is_err()
+    );
+    t.faults.clear();
+    best.require_disk(t.path("value")).unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"retained record");
+    assert!(!t.path("lock").exists());
+    let fresh =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    fresh.check().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_pending_authority_can_handoff_through_strict_registry() {
+    let t = Fixture::new();
+    let best = t.fs.best_effort(4096, 100);
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = best.guarded(&lease).unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    guarded
+        .replace_private(t.path("value"), b"retained record")
+        .unwrap();
+    drop(lease);
+    assert_eq!(
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(guarded);
+    assert_eq!(
+        t.fs.acquire_lease(t.path("lock"), t.path("different"), LeaseMode::CreateNew)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let handoff =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    best.guarded(&handoff).unwrap();
+    t.faults.clear();
+    best.require_disk(t.path("value")).unwrap();
+    assert!(t.path("lock").exists());
+    handoff.check().unwrap();
+    drop(handoff);
+    assert!(!t.path("lock").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_lease_replacement_fences_replay_and_preserves_new_owner() {
+    let t = Fixture::new();
+    let best = t.fs.best_effort(4096, 100);
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = best.guarded(&lease).unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    guarded
+        .replace_private(t.path("value"), b"must not replay")
+        .unwrap();
+    native::rename(t.path("lock"), t.path("old-lock")).unwrap();
+    let replacement_owner = Fs::new(t.fs.service.backend.clone());
+    let replacement = replacement_owner
+        .acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+        .unwrap();
+    let replacement_bytes = native::read(t.path("lock")).unwrap();
+    t.faults.clear();
+    assert_eq!(
+        best.recover().blocked.unwrap().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        guarded
+            .replace_private(t.path("tail"), b"no")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    drop(guarded);
+    drop(lease);
+    best.abandon_best_effort().unwrap();
+    replacement.check().unwrap();
+    assert_eq!(native::read(t.path("lock")).unwrap(), replacement_bytes);
+    assert!(!t.path("value").exists());
+    assert!(!t.path("tail").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_dirty_lease_cannot_be_reacquired_as_clean() {
+    let t = Fixture::new();
+    let best = t.fs.best_effort(4096, 100);
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = best.guarded(&lease).unwrap();
+    t.faults.arm(Point::Write, libc::EIO);
+    guarded
+        .replace_private(t.path("value"), b"retained record")
+        .unwrap();
+    let sibling = t.fs.best_effort(4096, 100);
+    sibling
+        .guarded(&lease)
+        .unwrap()
+        .replace_private(t.path("sibling-value"), b"another retained record")
+        .unwrap();
+    native::remove_file(t.path("lock")).unwrap();
+    drop(guarded);
+    drop(lease);
+    t.faults.clear();
+    assert!(
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .is_err()
+    );
+    assert!(!t.path("lock").exists());
+    best.abandon_best_effort().unwrap();
+    assert!(
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .is_err()
+    );
+    drop(sibling);
+    let fresh =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    fresh.check().unwrap();
+    assert!(!t.path("value").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_startup_open_and_create_buffer_storage_faults() {
+    for existing in [false, true] {
+        for point in [Point::Open, Point::Write, Point::Sync, Point::Rename] {
+            let t = Fixture::new();
+            let best = t.fs.best_effort(4096, 100);
+            let lease =
+                t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+                    .unwrap();
+            let guarded = best.guarded(&lease).unwrap();
+            if existing {
+                native::write(t.path("value"), b"header\n").unwrap();
+            }
+            t.faults.arm(point, libc::EIO);
+            let mut file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .open_in(&guarded, t.path("value"))
+                .unwrap();
+            file.write_all(b"first record\n").unwrap();
+            let expected = if existing {
+                b"header\nfirst record\n".as_slice()
+            } else {
+                b"first record\n".as_slice()
+            };
+            assert_eq!(best.read(t.path("value")).unwrap(), expected);
+            assert_eq!(best.best_effort_status(), Some(BestEffortStatus::Buffered));
+            lease.check().unwrap();
+            t.faults.clear();
+            best.require_disk(t.path("value")).unwrap();
+            assert_eq!(native::read(t.path("value")).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_inflight_write_reserves_authority_before_buffering() {
+    let t = Fixture::new();
+    let best = t.fs.best_effort(4096, 100);
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = best.guarded(&lease).unwrap();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *t.faults.3.lock().unwrap() = Some((Point::Write, entered.clone(), resume.clone()));
+    t.faults.arm(Point::Write, libc::EIO);
+    let result = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| guarded.replace_private(t.path("value"), b"in-flight record"));
+        entered.wait();
+        let result = native::remove_file(t.path("lock")).and_then(|()| {
+            t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+        });
+        resume.wait();
+        writer.join().unwrap().unwrap();
+        result
+    });
+    assert!(result.is_err());
+    assert!(!t.path("lock").exists());
+    t.faults.clear();
+    assert!(best.recover().blocked.is_some());
+    best.abandon_best_effort().unwrap();
+    assert!(!t.path("value").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_foreign_guard_rejects_best_effort_owners_including_abandoned() {
+    for abandoned in [false, true] {
+        let t = Fixture::new();
+        let source = t.fs.best_effort(4096, 100);
+        let target = t.fs.best_effort(4096, 100);
+        let lease = source
+            .acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+        source.guarded(&lease).unwrap();
+        if abandoned {
+            source.abandon_best_effort().unwrap();
+        }
+        lease.check().unwrap();
+        assert_eq!(
+            target.guarded(&lease).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            t.fs.guarded(&lease).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn best_effort_post_publication_payload_cannot_bypass_retained_budget() {
+    for best_effort in [false, true] {
+        for directory_sync_fails in [false, true] {
+            for fault in [Point::Metadata, Point::Identity] {
+                for through_handle in [false, true] {
+                    let t = Fixture::new();
+                    let fs = if best_effort {
+                        t.fs.best_effort(1, 10)
+                    } else {
+                        Fs::with_budget(t.fs.service.backend.clone(), 1, 10)
+                    };
+                    let path = t.path("value");
+                    fs.replace_private(&path, b"header\n").unwrap();
+                    let mut file = OpenOptions::new().append(true).open_in(&fs, &path).unwrap();
+                    // Pause after real publication so preflight/native baseline
+                    // reads succeed; only rebase's descriptor snapshot fails.
+                    let entered = Arc::new(std::sync::Barrier::new(2));
+                    let resume = Arc::new(std::sync::Barrier::new(2));
+                    *t.faults.3.lock().unwrap() =
+                        Some((Point::AfterRename, entered.clone(), resume.clone()));
+                    let result = std::thread::scope(|scope| {
+                        let writer = scope.spawn(|| {
+                            if through_handle {
+                                file.write_all(b"record larger than budget\n")
+                            } else {
+                                fs.replace_private(&path, b"record larger than budget\n")
+                            }
+                        });
+                        entered.wait();
+                        if directory_sync_fails {
+                            t.faults
+                                .arm_many(&[(Point::DirectorySync, libc::EIO), (fault, libc::EIO)]);
+                        } else {
+                            t.faults.arm(fault, libc::EIO);
+                        }
+                        resume.wait();
+                        writer.join().unwrap()
+                    });
+                    let expected = if through_handle {
+                        b"header\nrecord larger than budget\n".as_slice()
+                    } else {
+                        b"record larger than budget\n".as_slice()
+                    };
+                    assert_eq!(native::read(&path).unwrap(), expected);
+                    assert_eq!(
+                        fs.status().pending_operations,
+                        usize::from(directory_sync_fails)
+                    );
+                    assert!(!fs.status().exhausted);
+                    assert!(!t.fs.status().exhausted);
+                    if best_effort {
+                        assert!(result.unwrap_err().get_ref().unwrap().is::<DroppedScope>());
+                        assert_eq!(fs.best_effort_status(), Some(BestEffortStatus::Dropped));
+                        t.faults.clear();
+                        assert!(
+                            fs.recover()
+                                .blocked
+                                .unwrap()
+                                .get_ref()
+                                .unwrap()
+                                .is::<DroppedScope>()
+                        );
+                        assert!(file.write_all(b"no tail").is_err());
+                        assert!(fs.replace_private(&path, b"no tail").is_err());
+                        fs.abandon_best_effort().unwrap();
+                    } else {
+                        result.unwrap();
+                        t.faults.clear();
+                        fs.require_disk(&path).unwrap();
+                    }
+                    assert_eq!(native::read(&path).unwrap(), expected);
+                }
+            }
+        }
+    }
 }

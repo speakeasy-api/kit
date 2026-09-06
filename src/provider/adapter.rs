@@ -42,18 +42,29 @@ pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
     .find_map(|(code, method_id)| detail.contains(code).then_some(method_id))
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum ProviderKind {
     #[default]
     #[serde(rename = "openai-subscription")]
-    #[value(name = "openai-subscription")]
     OpenAiSubscription,
     #[serde(rename = "openrouter")]
-    #[value(name = "openrouter")]
     OpenRouter,
     #[serde(rename = "speakeasy")]
-    #[value(name = "speakeasy")]
     Speakeasy,
+}
+
+impl ValueEnum for ProviderKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::OpenAiSubscription, Self::OpenRouter, Self::Speakeasy]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::OpenAiSubscription => "openai-subscription",
+            Self::OpenRouter => "openrouter",
+            Self::Speakeasy => "speakeasy",
+        }))
+    }
 }
 
 impl std::str::FromStr for ProviderKind {
@@ -125,12 +136,26 @@ pub struct ModelGroup {
     pub context_windows: std::collections::HashMap<String, u64>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+impl ValueEnum for ReasoningEffort {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Low, Self::Medium, Self::High]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }))
+    }
 }
 
 impl ReasoningEffort {
@@ -1098,10 +1123,11 @@ async fn model_catalog_with_openai(
                     .await
                     .unwrap_or_else(|_| fallback_catalog())
             };
-            tokio::join!(openrouter_catalog, speakeasy_catalog)
+            futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
         }
     };
-    let (discovered_openai, (openrouter, speakeasy)) = tokio::join!(openai_catalog, other_catalogs);
+    let (discovered_openai, (openrouter, speakeasy)) =
+        futures_util::future::join(openai_catalog, other_catalogs).await;
     let openai_windows = discovered_openai.context_windows;
     let openrouter_windows = openrouter.context_windows;
     let speakeasy_windows = speakeasy.context_windows;
@@ -1240,6 +1266,14 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     #[test]
     fn model_switch_catalog_retains_only_reported_positive_windows() {

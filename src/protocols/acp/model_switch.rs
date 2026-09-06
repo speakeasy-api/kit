@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use agent_client_protocol::Error;
 use agentkit_core::{FinishReason, Item, ItemKind, MessageId};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 
 use crate::provider::{ModelGroup, ModelSelection};
 
@@ -102,6 +104,11 @@ impl Guard {
             return Ok(Decision::Continue);
         }
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let warning = Warning {
+            token,
+            guarded_tokens: tokens.to_string(),
+            target_window: window,
+        };
         self.pending = Some(Pending {
             token,
             current: current.clone(),
@@ -109,8 +116,16 @@ impl Guard {
             transcript,
             cancellation_generation,
         });
+        let data = Value::Object(Map::from_iter([(
+            META.into(),
+            Value::Object(Map::from_iter([
+                ("token".into(), Value::from(warning.token)),
+                ("guarded_tokens".into(), Value::from(warning.guarded_tokens)),
+                ("target_window".into(), Value::from(warning.target_window)),
+            ])),
+        )]));
         Err(error("target model context is at least 80% occupied after a 20% tokenizer margin; continue explicitly, compact with the current model, or cancel")
-            .data(json!({ META: Warning { token, guarded_tokens: tokens.to_string(), target_window: window } })))
+            .data(data))
     }
 }
 
@@ -135,6 +150,14 @@ pub(super) fn compaction_completed(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use crate::provider::ProviderKind;

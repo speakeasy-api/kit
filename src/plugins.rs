@@ -886,6 +886,13 @@ fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
 }
 
 #[cfg(not(unix))]
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::permissions_set_readonly_false,
+        reason = "On Windows this clears the readonly file attribute; the Unix helper only adds owner-write permission, avoiding the world-writable hazard."
+    )
+)]
 fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
     let mut permissions = metadata.permissions();
     permissions.set_readonly(false);
@@ -2096,7 +2103,10 @@ fn enforce_git_staging_metadata(git_dir: &Path, remote: &OsStr) -> Result<(), St
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
     let mut builder = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
     builder.create(path)
@@ -3557,6 +3567,14 @@ fn select_package_root(extraction: &Path, subdir: Option<&Path>) -> Result<PathB
 pub(crate) use test_support::make_tree_writable_for_test;
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use super::*;
 
@@ -3566,6 +3584,14 @@ mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::net::TcpListener;
     use std::thread;
