@@ -1803,6 +1803,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     }
                 }
                 Some(Command::SetConfig { request, reply, cancellation_generation }) => {
+                    let mut compaction_started = false;
                     let result = async {
                         if handle.cancellation_handle().is_cancelled_since(cancellation_generation) {
                             return Err(model_switch::error("model change cancelled"));
@@ -1820,6 +1821,7 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                                 handle.prepare_injection_turn();
                                 handle.start_injection_turn();
                                 advance_checkout_revision(&mut checkout_revision);
+                                compaction_started = true;
                                 let compacted = compact_for_switch(
                                     &session_id, &integration, &handle, &mut driver, &sink,
                                     cancellation_generation, &activity,
@@ -1836,6 +1838,17 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     }.await;
                     if result.is_ok() { advance_checkout_revision(&mut checkout_revision); }
                     let _ = reply.send(result);
+                    if compaction_started
+                        && handle.cancellation_handle().is_cancelled_since(cancellation_generation)
+                        && !driver.snapshot().pending_input.is_empty()
+                    {
+                        // Cancellation before the first step leaves the synthetic
+                        // /compact input queued. As with an interrupted prompt,
+                        // retire this attachment so no later prompt or wake runs it.
+                        let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
+                        super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                        break;
+                    }
                 }
                 Some(Command::Close { reply }) => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
@@ -7444,6 +7457,335 @@ mod tests {
                 interrupt: self.interrupt.clone(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn model_switch_cancel_before_first_step_retires_queued_prompt_and_mcp_wake() {
+        use std::io::{Read as _, Write as _};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const CHILD: &str = "KIT_TEST_MODEL_SWITCH_CANCEL_CHILD";
+        const ROUTE: &str = "compact-cancel-io-";
+        if std::env::var_os(CHILD).is_none() {
+            // Like the autonomous regression, isolate process-global diagnostic
+            // I/O. Pipe backpressure gives a stronger handshake than observing
+            // busy: the route is emitted AFTER submit_input returns, and the
+            // actor cannot reach its first next() until this write completes.
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "protocols::acp::v2::tests::model_switch_cancel_before_first_step_retires_queued_prompt_and_mcp_wake", "--nocapture"])
+                .env(CHILD, "1")
+                .env("KIT_RUNTIME_EVENTS", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            timeout(Duration::from_secs(15), async {
+                let needle = format!("\"session_id\":\"{ROUTE}");
+                let mut prefix = Vec::new();
+                let mut chunk = [0; 128];
+                loop {
+                    let read = stderr.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "child never reached the post-submission route");
+                    prefix.extend_from_slice(&chunk[..read]);
+                    if prefix
+                        .windows(needle.len())
+                        .any(|part| part == needle.as_bytes())
+                    {
+                        break;
+                    }
+                }
+                // Stop draining the oversized route until the child confirms
+                // the real interrupt AND both queued wake sources. This holds
+                // the actor at a genuine I/O boundary, not a test-only hook.
+                stdin.write_all(b"!").await.unwrap();
+                let mut output = Vec::new();
+                loop {
+                    let byte = stdout.read_u8().await.unwrap();
+                    output.push(byte);
+                    if byte == 1 {
+                        break;
+                    }
+                }
+                let mut diagnostics = Vec::new();
+                stderr.read_to_end(&mut diagnostics).await.unwrap();
+                stdout.read_to_end(&mut output).await.unwrap();
+                let status = child.wait().await.unwrap();
+                assert!(
+                    status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&diagnostics[diagnostics.len().saturating_sub(2000)..])
+                );
+                assert!(String::from_utf8_lossy(&output).contains("1 passed"));
+            })
+            .await
+            .expect("model-switch cancellation child did not finish");
+            return;
+        }
+
+        assert!(crate::events::enabled());
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let durable_id = crate::session::new_id();
+        let opened = crate::session::open(
+            root.path(),
+            &durable_id,
+            false,
+            false,
+            vec![
+                Item::text(ItemKind::User, "older content ".repeat(20_000)),
+                Item::text(ItemKind::Assistant, "recent response")
+                    .with_usage(Usage::new(agentkit_core::TokenUsage::new(100, 0))),
+            ],
+        )
+        .unwrap();
+        let original = opened.transcript.clone();
+        let path = crate::session::transcript_path_for_test(root.path(), &durable_id);
+        let bytes = std::fs::read(&path).unwrap();
+        // The transport ID need not be the disk ID. Exceed the diagnostic pipe
+        // capacity so its first bytes are observable while emit still blocks.
+        let session_id = wire::SessionId::new(format!("{ROUTE}{}", "x".repeat(2 * 1024 * 1024)));
+        let loop_id = SessionId::new(durable_id.clone());
+        let integration = Arc::new(AcpIntegration::default());
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let selection = SelectableAdapter::new_with_credentials(
+            ProviderKind::OpenAiSubscription,
+            "gpt-5.4",
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        // Only the model-boundary fake appends to seen; readers hold no lock
+        // across an await, I/O, cancellation, or actor cleanup. The production
+        // session observer owns all durable transcript writes/replacements.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let turns = Arc::new(AtomicU64::new(0));
+        let compactor = crate::compaction::automatic(
+            SwitchSummaryAdapter {
+                selection: selection.clone(),
+                seen: seen.clone(),
+                outcome: TestOutcome::Content,
+                interrupt: None,
+            },
+            Default::default(),
+            Some(opened.observer.clone()),
+            loop_id.clone(),
+        )
+        .unwrap();
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .task_manager(manager)
+            .mutator(compactor)
+            .observer(ResponseReplacementObserver::new(
+                (*integration).clone(),
+                sink.clone(),
+                session_id.clone(),
+                activity.clone(),
+            ))
+            .transcript_observer(opened.observer)
+            .transcript(opened.transcript)
+            .cancellation(handle.cancellation_handle())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+        let busy = Arc::new(AtomicBool::new(false));
+        let (commands, receiver) = mpsc::channel(8);
+        let mcp = crate::tools::mcp::empty();
+        let mcp_events = mcp.subscribe(durable_id.clone());
+        let actor = tokio::spawn(session_actor(SessionActor {
+            initial_generation: None,
+            admission_released: Arc::new(Notify::new()),
+            session_id: session_id.clone(),
+            runtime,
+            integration: integration.clone(),
+            handle: handle.clone(),
+            busy: busy.clone(),
+            binding: BindingGuard {
+                integration,
+                session_id: session_id.clone(),
+            },
+            sink,
+            activity,
+            driver,
+            tasks,
+            background_jobs: BackgroundJobs::default(),
+            structured_completion: false,
+            skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+            adapter: selection.clone(),
+            catalog: vec![crate::provider::ModelGroup {
+                provider: ProviderKind::OpenAiSubscription,
+                models: vec!["gpt-5.4-mini".into()],
+                context_windows: [("gpt-5.4-mini".into(), 150)].into_iter().collect(),
+            }],
+            commands: receiver,
+            mcp_events,
+        }));
+        let generation = handle.cancellation_handle().generation();
+        let request = wire::SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            super::super::MODEL_CONFIG_ID,
+            "openai-subscription:gpt-5.4-mini",
+        );
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(Command::SetConfig {
+                request: request.clone(),
+                reply,
+                cancellation_generation: generation,
+            })
+            .await
+            .unwrap();
+        let warning = response.await.unwrap().unwrap_err();
+        let warning: model_switch::Warning =
+            serde_json::from_value(warning.data.unwrap()[model_switch::META].clone()).unwrap();
+        assert_eq!(warning.guarded_tokens, "120");
+        assert_eq!(warning.target_window, 150);
+        assert!(!busy.load(Ordering::Acquire));
+        assert_eq!(selection.selection().unwrap().model, "gpt-5.4");
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        // A warning is not retirement: this confirmation must reach the SAME
+        // actor-owned Guard with its original transcript and generation.
+        let mut request = request;
+        request.meta = Some(serde_json::Map::from_iter([(
+            model_switch::META.into(),
+            serde_json::to_value(model_switch::Confirmation {
+                token: warning.token,
+                action: model_switch::Decision::Compact,
+            })
+            .unwrap(),
+        )]));
+        let (queued_reply, queued_response) = oneshot::channel();
+        let cancellation = {
+            let handle = handle.clone();
+            let busy = busy.clone();
+            let commands = commands.clone();
+            let turns = turns.clone();
+            let seen = seen.clone();
+            let durable_id = durable_id.clone();
+            std::thread::spawn(move || {
+                let mut signal = [0];
+                std::io::stdin().read_exact(&mut signal).unwrap();
+                assert_eq!(signal, *b"!");
+                assert!(busy.load(Ordering::Acquire));
+                assert_eq!(turns.load(Ordering::Relaxed), 0);
+                assert!(seen.lock().unwrap().is_empty());
+                handle.interrupt();
+                assert!(handle.cancellation_handle().is_cancelled_since(generation));
+                // Use a fresh generation: rejection cannot be explained by
+                // ordinary stale-prompt cancellation. Both wake sources are
+                // already queued when the diagnostic write is released.
+                commands
+                    .try_send(Command::Prompt(PromptCommand {
+                        request: wire::PromptRequest::new(
+                            session_id,
+                            vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                "later prompt",
+                            ))],
+                        ),
+                        cancellation_generation: handle.cancellation_handle().generation(),
+                        reply: queued_reply,
+                    }))
+                    .unwrap();
+                mcp.publish(
+                    &durable_id,
+                    crate::tools::mcp::McpEvent {
+                        message: "later MCP wake".into(),
+                    },
+                );
+                std::io::stdout().write_all(&[1]).unwrap();
+                std::io::stdout().flush().unwrap();
+            })
+        };
+        let (reply, response) = oneshot::channel();
+        commands
+            .send(Command::SetConfig {
+                request,
+                reply,
+                cancellation_generation: generation,
+            })
+            .await
+            .unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compaction did not complete; model unchanged")
+        );
+        assert!(
+            queued_response.await.is_err(),
+            "retirement must discard the queued prompt"
+        );
+        timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        cancellation.join().unwrap();
+        assert!(commands.is_closed());
+        assert!(!busy.load(Ordering::Acquire));
+        assert_eq!(selection.selection().unwrap().model, "gpt-5.4");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "cancelled compaction must never start its model"
+        );
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        assert!(
+            !recording
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|update| matches!(
+                    update.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                ))
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let transcript = crate::session::load(root.path(), &durable_id).unwrap();
+        assert_eq!(transcript, original);
+        let mut reloaded = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .transcript(transcript)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(SessionId::new(durable_id)).without_cache())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reloaded.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
