@@ -31,7 +31,10 @@ use tracing::Instrument as _;
 use crate::{
     events::{self, DiagnosticScope},
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
-    runtime::{AcpDriverContext, BackgroundJobs, InputSettlingDriver as LoopDriver, Runtime, diagnostics::ConsumptionScope},
+    runtime::{
+        AcpDriverContext, BackgroundJobs, InputSettlingDriver as LoopDriver, Runtime,
+        diagnostics::ConsumptionScope,
+    },
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
@@ -192,13 +195,11 @@ impl InjectionWork {
         self.origins.remove(id);
     }
 
-    fn delivered(&mut self, notification: &wire::UpdateSessionNotification) {
-        if let wire::SessionUpdate::UserMessage(message) = &notification.update
-            && self.pending.remove(&message.message_id)
-        {
+    fn delivered(&mut self, id: &wire::MessageId) {
+        if self.pending.remove(id) {
             // The SDK has submitted this exact queued input and cannot begin
             // its next model step until this acknowledgement returns.
-            ConsumptionScope::consumed(self.origins.remove(&message.message_id));
+            ConsumptionScope::consumed(self.origins.remove(id));
         }
     }
 }
@@ -266,13 +267,20 @@ impl Drop for BranchAdmission {
 #[async_trait]
 impl AcpSessionUpdateSink for ConnectionSink {
     fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
+        let delivered = match &notification.update {
+            wire::SessionUpdate::UserMessage(message) => Some(message.message_id.clone()),
+            _ => None,
+        };
+        // Retain both admission and ownership until notification succeeds.
         self.0
-            .send_notification(notification.clone())
+            .send_notification(notification)
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
-        self.1
-            .lock()
-            .expect("injection work poisoned")
-            .delivered(&notification);
+        if let Some(id) = delivered {
+            self.1
+                .lock()
+                .expect("injection work poisoned")
+                .delivered(&id);
+        }
         Ok(())
     }
 
@@ -4667,8 +4675,14 @@ mod tests {
         ) -> Result<(), AcpRuntimeError> {
             // Same production consumption boundary as ConnectionSink; only the
             // final transport is an in-memory recording peer.
-            self.work.lock().unwrap().delivered(&notification);
+            let delivered = match &notification.update {
+                wire::SessionUpdate::UserMessage(message) => Some(message.message_id.clone()),
+                _ => None,
+            };
             self.delivered.lock().unwrap().push(notification);
+            if let Some(id) = delivered {
+                self.work.lock().unwrap().delivered(&id);
+            }
             Ok(())
         }
         async fn update_acknowledged(
@@ -5210,7 +5224,9 @@ mod tests {
                     ))
                     .unwrap();
                 let turns = Arc::new(AtomicU64::new(0));
+                let input_settlement = crate::runtime::InputSettlement::default();
                 let driver = Agent::builder()
+                    .mutator(input_settlement.clone())
                     .model(OwnershipAdapter {
                         inner: TestAdapter {
                             outcome: TestOutcome::ToolThenContent,
@@ -5235,6 +5251,7 @@ mod tests {
                     .start(SessionConfig::new(loop_id).without_cache())
                     .await
                     .unwrap();
+                let driver = input_settlement.wrap(driver);
                 let busy = Arc::new(AtomicBool::new(false));
                 let injections = Arc::new(Mutex::new(InjectionWork::default()));
                 let (commands, receiver) = mpsc::channel(8);
@@ -9188,7 +9205,9 @@ mod tests {
                 .unwrap();
                 let manager = AsyncTaskManager::new();
                 let tasks = manager.handle();
+                let input_settlement = crate::runtime::InputSettlement::default();
                 let driver = Agent::builder()
+                    .mutator(input_settlement.clone())
                     .model(OwnershipAdapter {
                         inner: TestAdapter {
                             outcome: TestOutcome::Content,
@@ -9210,6 +9229,7 @@ mod tests {
                     .start(SessionConfig::new(loop_id).without_cache())
                     .await
                     .unwrap();
+                let driver = input_settlement.wrap(driver);
                 let mcp = crate::tools::mcp::empty();
                 let work = Arc::new(Mutex::new(InjectionWork::default()));
                 let busy = Arc::new(AtomicBool::new(false));
