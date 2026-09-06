@@ -483,14 +483,18 @@ fn random_urlsafe<const N: usize>() -> Result<String, String> {
 }
 
 #[cfg(test)]
-pub(crate) fn store_test_credentials(storage: &CredentialStorage) {
-    save(
-        storage,
-        &Credentials {
-            api_key: "test-openrouter-key".into(),
-        },
-    )
-    .unwrap();
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn store_openrouter_test_credentials(storage: &CredentialStorage) {
+        save(
+            storage,
+            &Credentials {
+                api_key: "test-openrouter-key".into(),
+            },
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
