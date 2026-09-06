@@ -1928,6 +1928,8 @@ future_option = true
             title: Some("OAuth token bug".into()),
             preview: Some("Fix tests in the catalog".into()),
             is_subagent: false,
+            lineage: kit::session::CatalogLineage::Root,
+            branch_point: None,
             updated_at: 0,
         }]);
         assert_eq!(

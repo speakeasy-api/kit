@@ -63,6 +63,9 @@ pub(crate) struct SubmitPromptBranchRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
 pub(crate) struct SubmitPromptBranchResponse {
+    /// Ephemeral diagnostic identity; old servers omit this private extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_activation: Option<u64>,
     pub session_id: wire::SessionId,
     pub config_options: Vec<wire::SessionConfigOption>,
 }
@@ -692,6 +695,28 @@ mod tests {
             DataRef::InlineBytes(vec![1]),
         ));
         assert!(checkout_candidate(&source[5]).is_none());
+    }
+
+    #[test]
+    fn submit_response_activation_is_optional_and_roundtrips_without_durable_changes() {
+        let legacy = json!({"session_id": "child", "config_options": []});
+        let parsed: SubmitPromptBranchResponse = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(parsed.runtime_activation, None);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+
+        let mut current = legacy.clone();
+        current["runtime_activation"] = json!(42);
+        let parsed: SubmitPromptBranchResponse = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(parsed.runtime_activation, Some(42));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), current);
+
+        current["runtime_activation"] = serde_json::Value::Null;
+        let parsed: SubmitPromptBranchResponse = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+        for malformed in [json!(-1), json!("42"), json!({"epoch": 42})] {
+            current["runtime_activation"] = malformed;
+            assert!(serde_json::from_value::<SubmitPromptBranchResponse>(current.clone()).is_err());
+        }
     }
 
     #[test]

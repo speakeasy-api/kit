@@ -478,6 +478,223 @@ async fn dropping_a_session_manager_terminates_its_children() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn child_exit_monitor_keeps_spawn_activation_across_reactivation() {
+    for route in ["same", "roundtrip", "unscoped"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut manager, state, _) = manager_with_disconnected_session(directory.path());
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        manager.event_sink = Arc::new(move |event| {
+            events
+                .send((event.clone(), events::DiagnosticScope::capture()))
+                .map_err(|_| ())
+        });
+        let child = ChildSession::disconnected_for_test();
+        // The real exit monitor must acquire the state lock before publishing.
+        // Hold it across the route change instead of adding a test-only pause.
+        let locked = state.lock().await;
+        let session = format!("monitor-{route}");
+        events::activate_diagnostics(&session);
+        let expected = if route == "unscoped" {
+            manager.monitor_child_exit("source".into(), &state, &child);
+            events::DiagnosticScope::default()
+        } else {
+            events::DiagnosticScope::with_operation(events::DiagnosticOperation::new(format!(
+                "monitor:{route}"
+            )))
+            .scope(async {
+                events::scope_diagnostics(&session, async {
+                    let expected = events::DiagnosticScope::capture();
+                    manager.monitor_child_exit("source".into(), &state, &child);
+                    expected
+                })
+                .await
+            })
+            .await
+        };
+        if route == "roundtrip" {
+            events::activate_diagnostics("monitor-other");
+        }
+        events::activate_diagnostics(&session);
+        drop(locked);
+        let (event, actual) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+                .await
+                .expect("child-exit monitor did not publish")
+                .unwrap();
+        assert!(matches!(
+            event,
+            events::RuntimeEvent::SubagentStateChanged {
+                status: SubagentStatus::Removed,
+                ..
+            }
+        ));
+        assert_eq!(actual, expected, "route: {route}");
+    }
+}
+
+#[test]
+fn reused_and_native_forked_children_emit_current_roster_activation() {
+    const PROBE: &str = "KIT_TEST_CURRENT_SUBAGENT_DIAGNOSTICS";
+    if std::env::var_os(PROBE).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for route in ["same", "roundtrip"] {
+                    let root = tempfile::tempdir().unwrap();
+                    let mut config =
+                        manager_with_generic_harness(root.path(), Vec::new()).child_config();
+                    // Use the existing mock transport as a configured Kit profile
+                    // so native forks carry Kit's descendant-parent metadata.
+                    config.harnesses =
+                        crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                            "kit".into(),
+                            crate::acp_child::AcpHarnessProfile {
+                                command: "python3".into(),
+                                args: vec![format!(
+                                    "{}/fixtures/mock-acp.py",
+                                    env!("CARGO_MANIFEST_DIR")
+                                )],
+                                permissions: Default::default(),
+                            },
+                        )]))
+                        .unwrap();
+                    config.default_harness = "acp.kit".into();
+                    let manager = Subagents::new(config, 2);
+                    let session = format!("reuse-{route}");
+                    events::activate_diagnostics(&session);
+                    let (source, branch) = events::scope_diagnostics(&session, async {
+                        let source = manager
+                            .create(
+                                format!("initial-source-{route}"),
+                                CreateOptions::default(),
+                                0,
+                                TurnCancellation::default(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let branch = manager
+                            .fork(
+                                source.clone(),
+                                format!("initial-fork-{route}"),
+                                None,
+                                0,
+                                TurnCancellation::default(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        (source, branch)
+                    })
+                    .await;
+                    if route == "roundtrip" {
+                        events::activate_diagnostics("reuse-other");
+                    }
+                    events::activate_diagnostics(&session);
+                    events::scope_diagnostics(&session, async {
+                        // These are actual ACP prompts on logical sessions sharing
+                        // the old child process, not synthetic roster events.
+                        let source = manager
+                            .prompt(
+                                source,
+                                format!("current-source-{route}"),
+                                TurnCancellation::default(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let branch = manager
+                            .prompt(
+                                branch,
+                                format!("current-fork-{route}"),
+                                TurnCancellation::default(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        let new_branch = manager
+                            .fork(
+                                source.clone(),
+                                format!("current-new-fork-{route}"),
+                                None,
+                                0,
+                                TurnCancellation::default(),
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        for child in [branch, new_branch, source] {
+                            manager
+                                .close(&child.id, &TurnCancellation::default())
+                                .await
+                                .unwrap();
+                        }
+                    })
+                    .await;
+                }
+            });
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tools::subagent::tests::reused_and_native_forked_children_emit_current_roster_activation", "--nocapture"])
+        .env(PROBE, "1").env(events::EVENTS_ENV, "1").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let lines = stderr
+        .lines()
+        .filter_map(events::parse_diagnostic)
+        .collect::<Vec<_>>();
+    for route in ["same", "roundtrip"] {
+        let session = format!("reuse-{route}");
+        let activations = lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                events::RuntimeEvent::SessionStarted { session_id } if session_id == &session => {
+                    line.activation.clone()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(activations.len(), 2);
+        assert_ne!(activations[0], activations[1]);
+        let mut current_ids = HashSet::new();
+        for line in &lines {
+            if let events::RuntimeEvent::SubagentStateChanged { id, task, .. } = &line.event {
+                if !task.ends_with(route) {
+                    continue;
+                }
+                let expected = if task.starts_with("initial-") {
+                    &activations[0]
+                } else {
+                    assert!(task.starts_with("current-"));
+                    current_ids.insert(id.clone());
+                    &activations[1]
+                };
+                assert_eq!(line.activation.as_ref(), Some(expected), "task: {task}");
+            }
+        }
+        assert_eq!(
+            current_ids.len(),
+            3,
+            "missing reused source/fork or current native fork"
+        );
+        for id in current_ids {
+            // Explicit closes of both old and new handles use the current
+            // invocation, unlike lifetime-owned shared-stream EOF cleanup.
+            assert!(lines.iter().any(|line| matches!(&line.event,
+                events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } if ancestor_id == &id)
+                && line.activation.as_ref() == Some(&activations[1])), "missing current close for {id}");
+        }
+    }
+}
+
 #[test]
 fn close_input_accepts_a_handle_subagent_id_or_background_call_id() {
     let handle = json!({"id": "child", "output": "done", "generation": 1});

@@ -610,7 +610,7 @@ impl Subagents {
         let (reply, response) = oneshot::channel();
         let manager = self.clone();
         tokio::spawn(
-            async move {
+            crate::events::inherit_diagnostics(async move {
                 let source_state = Arc::clone(&operation.source_state);
                 let reservation = operation.id.clone();
                 let result = manager.run_fork(operation, &reply).await;
@@ -621,7 +621,7 @@ impl Subagents {
                         let _ = reply.send(Err(error));
                     }
                 }
-            }
+            })
             .instrument(tracing::Span::current()),
         );
         match response.await.map_err(|_| {
@@ -701,8 +701,11 @@ impl Subagents {
             let transcript_root = root.clone();
             let source_id = source_id.clone();
             let branch_id = id.clone();
+            let diagnostics = events::DiagnosticScope::capture();
             let cloned = tokio::task::spawn_blocking(move || {
-                session::clone_completed(&transcript_root, &source_id, &branch_id)
+                diagnostics.sync_scope(|| {
+                    session::clone_completed(&transcript_root, &source_id, &branch_id)
+                })
             })
             .await
             .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
@@ -1092,11 +1095,11 @@ impl Subagents {
     ) -> ChildError {
         let manager = self.clone();
         match tokio::spawn(
-            async move {
+            crate::events::inherit_diagnostics(async move {
                 manager
                     .cleanup_installed_child(&id, &state, &child, error)
                     .await
-            }
+            })
             .instrument(tracing::Span::current()),
         )
         .await
@@ -1122,12 +1125,12 @@ impl Subagents {
             return;
         };
         let mut closed = child.closed_signal();
-        tokio::spawn(async move {
+        tokio::spawn(crate::events::inherit_diagnostics(async move {
             if !*closed.borrow() {
                 let _ = closed.changed().await;
             }
             drop(permit);
-        });
+        }));
     }
 
     fn monitor_child_exit(&self, id: String, state: &Arc<AsyncMutex<State>>, child: &ChildSession) {
@@ -1140,7 +1143,7 @@ impl Subagents {
         let parent_id = self.config.parent_id.clone();
         let parent_name = self.config.parent_name.clone();
         let mut closed = child.closed_signal();
-        tokio::spawn(async move {
+        tokio::spawn(crate::events::inherit_diagnostics(async move {
             if !*closed.borrow() {
                 let _ = closed.changed().await;
             }
@@ -1179,7 +1182,7 @@ impl Subagents {
                 *event_parent_name = parent_name;
             }
             let _ = event_sink(&event);
-        });
+        }));
     }
 
     async fn fail_removed_and_remove(&self, id: &str, state: &Arc<AsyncMutex<State>>) {

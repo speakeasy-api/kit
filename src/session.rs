@@ -23,6 +23,22 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod branch;
 
+pub use branch::{
+    Boundary as BranchBoundary, BranchMetadata as BranchProvenance,
+    CapturedSelection as BranchSelection, Completion as BranchCompletion,
+    SubmittedRequest as BranchRequest,
+};
+
+/// Validated checkout provenance, derived from the already-read transcript.
+/// Invalid or incomplete checkouts remain visible, but must not supply edges.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CatalogLineage {
+    #[default]
+    Root,
+    Branch(Box<BranchProvenance>),
+    Warning(String),
+}
+
 pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -69,6 +85,11 @@ pub struct CatalogEntry {
     pub title: Option<String>,
     pub preview: Option<String>,
     pub is_subagent: bool,
+    pub lineage: CatalogLineage,
+    /// Ephemeral parent-context detail, verified against the original historical
+    /// prefix, or explicitly labeled provenance-only when it cannot be verified.
+    /// Absent for roots and incomplete/malformed checkouts.
+    pub branch_point: Option<String>,
     /// Last activity as milliseconds since the Unix epoch.
     pub updated_at: u64,
 }
@@ -1129,6 +1150,9 @@ fn catalog_for_workspace(
     }
     let ids = list_ids_for_workspace(&root, global_directory)?;
     let mut entries = Vec::with_capacity(ids.len());
+    // Keep the already-read histories until every child's parent is available.
+    // Moving these vectors avoids extra transcript copies and all per-row rereads.
+    let mut histories = std::collections::HashMap::with_capacity(ids.len());
     for id in ids {
         // Discovery is best-effort per transcript: a damaged file or one caught
         // mid-append must not hide every other session in the workspace.
@@ -1159,13 +1183,27 @@ fn catalog_for_workspace(
             .unwrap_or(0);
         let directory = workspace_storage_directory(global_directory, &root);
         let title = read_display_name(&directory, &id).or(title);
+        let lineage = branch::catalog_lineage(&authority, &id);
+        histories.insert(id.clone(), authority.historical_items);
         entries.push(CatalogEntry {
             id,
             title,
             preview,
             is_subagent,
+            lineage,
+            branch_point: None,
             updated_at: item_updated.max(file_updated),
         });
+    }
+    for entry in &mut entries {
+        if let CatalogLineage::Branch(metadata) = &entry.lineage {
+            entry.branch_point = Some(branch::catalog_branch_point(
+                metadata,
+                histories
+                    .get(&metadata.parent_session_id)
+                    .map(Vec::as_slice),
+            ));
+        }
     }
     entries.sort_by(|left, right| {
         right
@@ -1396,6 +1434,7 @@ pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
 struct Authority {
     items: Vec<Item>,
     historical_items: Vec<Vec<Item>>,
+    replacement_boundaries: Vec<(usize, usize)>,
     path: PathBuf,
     legacy_histories: Vec<PathBuf>,
 }
@@ -1574,6 +1613,7 @@ fn select_authority_with(
     Ok(authority.map(|candidate| Authority {
         items: candidate.history.items,
         historical_items: candidate.history.states,
+        replacement_boundaries: candidate.history.replacement_boundaries,
         path: candidate.path,
         legacy_histories,
     }))

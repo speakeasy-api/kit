@@ -45,7 +45,10 @@ pub enum Update {
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
     /// Result of listing sessions without blocking the terminal event loop.
-    SessionCatalog(Result<Vec<crate::session::CatalogEntry>, String>),
+    SessionCatalog {
+        epoch: u64,
+        result: Result<Vec<crate::session::CatalogEntry>, String>,
+    },
     FileMatches {
         revision: u64,
         result: Result<Vec<FileMatch>, String>,
@@ -208,6 +211,8 @@ pub struct EffortDialog {
 }
 
 pub struct SessionDialog {
+    pub query: String,
+    pub searching: bool,
     pub selected: usize,
     pub rename: Option<SessionRename>,
 }
@@ -374,7 +379,9 @@ pub enum Action {
         id: String,
     },
     New(Option<String>),
-    ListSessions,
+    ListSessions {
+        epoch: u64,
+    },
     RenameSession {
         session_id: String,
         display_name: Option<String>,
@@ -711,10 +718,12 @@ pub struct App {
     pub reasoning_effort: String,
     pub effort_choices: Vec<EffortChoice>,
     pub effort_dialog: Option<EffortDialog>,
-    pub session_choices: Vec<crate::session::CatalogEntry>,
+    pub(super) session_forest: super::branches::BranchForest,
+    pub(super) session_matches: Vec<super::branches::BranchMatch>,
     pub session_dialog: Option<SessionDialog>,
     pub file_picker: Option<FilePickerDialog>,
-    session_catalog_pending: bool,
+    pub(super) session_catalog_pending: bool,
+    pub(super) session_catalog_epoch: u64,
     pub auth_methods: Vec<AuthMethodTerminal>,
     pub available_commands: Vec<SlashCommand>,
     pub command_completion_selected: usize,
@@ -722,6 +731,7 @@ pub struct App {
     command_completion_dismissed: Option<String>,
     pub a2a: String,
     pub session_id: Option<String>,
+    pub(super) session_connected: bool,
     /// Session currently associated with the ordered runtime side channel.
     runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
@@ -964,10 +974,12 @@ impl App {
             reasoning_effort: "default".into(),
             effort_choices: Vec::new(),
             effort_dialog: None,
-            session_choices: Vec::new(),
+            session_forest: super::branches::BranchForest::default(),
+            session_matches: Vec::new(),
             session_dialog: None,
             file_picker: None,
             session_catalog_pending: false,
+            session_catalog_epoch: 0,
             branch_epoch: 0,
             branch_chooser: None,
             branch_draft: None,
@@ -979,6 +991,7 @@ impl App {
             command_completion_dismissed: None,
             a2a,
             session_id: None,
+            session_connected: true,
             runtime_session_id: None,
             blocks: Vec::new(),
             transcript_cache: Vec::new(),
@@ -1705,7 +1718,12 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         // The source stays loaded while its provisional replacement is visible.
-        if let Some(draft) = &mut self.branch_draft {
+        if let Some(draft) = &mut self.branch_draft
+            && !matches!(
+                &update,
+                Update::SessionCatalog { .. } | Update::SessionRenamed { .. }
+            )
+        {
             match update {
                 Update::RoutedRuntime { session_id, event } => {
                     if draft.original.session_id.as_ref() == Some(&session_id) {
@@ -1765,19 +1783,18 @@ impl App {
             if self.session_id.as_ref() == Some(session_id));
         match update {
             Update::A2aAddress(address) => self.a2a = address,
-            Update::SessionCatalog(result) => {
+            Update::SessionCatalog { epoch, result } => {
+                if epoch != self.session_catalog_epoch || !self.session_catalog_pending {
+                    return;
+                }
                 self.session_catalog_pending = false;
                 match result {
-                    Ok(entries) if entries.is_empty() => {
-                        self.toast("no sessions found for this workspace");
-                    }
                     Ok(entries) => {
-                        self.session_choices = entries;
-                        self.file_picker = None;
-                        self.session_dialog = Some(SessionDialog {
-                            selected: 0,
-                            rename: None,
-                        });
+                        let empty = entries.is_empty();
+                        self.set_session_choices(entries);
+                        if empty {
+                            self.toast("no sessions found for this workspace");
+                        }
                     }
                     Err(error) => self.toast(format!("could not list sessions: {error}")),
                 }
@@ -1786,29 +1803,48 @@ impl App {
                 session_id,
                 display_name,
                 result,
-            } => match result {
-                Ok(title) => {
-                    if let Some(dialog) = &mut self.session_dialog {
-                        dialog.rename = None;
+            } => {
+                let selected_id = self
+                    .session_dialog
+                    .as_ref()
+                    .and_then(|dialog| self.session_matches.get(dialog.selected))
+                    .map(|matched| self.session_forest.rows[matched.index].entry.id.clone());
+                let saving_selected = selected_id.as_ref() == Some(&session_id)
+                    && self
+                        .session_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| matches!(dialog.rename, Some(SessionRename::Saving)));
+                match result {
+                    Ok(title) => {
+                        if saving_selected && let Some(dialog) = &mut self.session_dialog {
+                            dialog.rename = None;
+                        }
+                        let entries = self
+                            .session_forest
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                let mut entry = row.entry.clone();
+                                if entry.id == session_id {
+                                    entry.title = title.clone();
+                                }
+                                entry
+                            })
+                            .collect();
+                        self.set_session_choices(entries);
+                        self.filter_sessions(selected_id.as_deref());
                     }
-                    if let Some(entry) = self
-                        .session_choices
-                        .iter_mut()
-                        .find(|entry| entry.id == session_id)
-                    {
-                        entry.title = title;
+                    Err(error) => {
+                        if saving_selected && let Some(dialog) = &mut self.session_dialog {
+                            dialog.rename = Some(match display_name {
+                                Some(name) => SessionRename::Editing(name),
+                                None => SessionRename::ConfirmClear,
+                            });
+                        }
+                        self.toast(format!("could not rename session: {error}"));
                     }
                 }
-                Err(error) => {
-                    if let Some(dialog) = &mut self.session_dialog {
-                        dialog.rename = Some(match display_name {
-                            Some(name) => SessionRename::Editing(name),
-                            None => SessionRename::ConfirmClear,
-                        });
-                    }
-                    self.toast(format!("could not rename session: {error}"));
-                }
-            },
+            }
             Update::FileMatches { revision, result } => {
                 if self
                     .file_picker
@@ -2165,8 +2201,10 @@ impl App {
         self.queue_handoff = false;
         self.retired_steers.clear();
         self.steer_mutations.clear();
-        self.session_catalog_pending = false;
+        self.dismiss_sessions();
+        let same_session = self.session_id.as_ref() == Some(&session_id);
         self.session_id = Some(session_id);
+        self.session_connected = true;
         self.file_picker = None;
         self.available_commands.clear();
         self.command_completion_selected = 0;
@@ -2184,7 +2222,9 @@ impl App {
         self.transcript_cache_width = 0;
         self.retained_image_source_bytes = 0;
         self.transcript_focus_index = None;
-        self.clear_attachments();
+        if !same_session {
+            self.clear_attachments();
+        }
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
@@ -2465,31 +2505,13 @@ impl App {
     /// A paste never sends: the newlines in it are part of the text. Multi-line
     /// pastes say so, because the prompt box shows only its last rows and the
     /// rest is easy to miss.
-    pub fn session_rename_active(&self) -> bool {
-        self.session_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.rename.is_some())
-    }
-
     pub fn paste(&mut self, text: &str) {
         if self.model_switch.is_some() {
             return;
         }
-        if self.branch_chooser.is_some() || self.branch_submitting() {
-            return;
-        }
-        if self.branch_draft.is_some() {
+        if self.session_dialog.is_some() {
             self.last_key = None;
-            self.editor.insert_str(text);
-            return;
         }
-        if let Some(dialog) = &mut self.navigation.dialog {
-            dialog.insert(text);
-            self.sync_navigation();
-            return;
-        }
-        // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
-        self.last_key = None;
         if let Some(rename) = self
             .session_dialog
             .as_mut()
@@ -2507,6 +2529,28 @@ impl App {
             }
             return;
         }
+        if self.session_dialog.is_some() {
+            self.session_dialog.as_mut().unwrap().searching = true;
+            self.insert_session_query(text);
+            return;
+        }
+        if self.branch_chooser.is_some() || self.branch_submitting() {
+            return;
+        }
+        if self.branch_draft.is_some() {
+            self.last_key = None;
+            self.editor.insert_str(text);
+            return;
+        }
+        if let Some(dialog) = &mut self.navigation.dialog {
+            dialog.insert(text);
+            self.sync_navigation();
+            return;
+        }
+        // Navigation also routes pasted key controls through this method;
+        // keep their receipt timestamp for the next key in that same burst.
+        // Explicit composer pastes are outside the key-burst heuristic.
+        self.last_key = None;
         self.file_picker = None;
         self.queue_handoff = false;
         self.editor.insert_str(text);
@@ -2652,10 +2696,135 @@ impl App {
         Action::None
     }
 
+    pub(super) fn set_session_choices(&mut self, entries: Vec<crate::session::CatalogEntry>) {
+        self.session_forest = super::branches::BranchForest::new(entries);
+        self.filter_sessions(None);
+    }
+
+    fn filter_sessions(&mut self, preferred_id: Option<&str>) {
+        let query = self
+            .session_dialog
+            .as_ref()
+            .map_or("", |dialog| dialog.query.as_str());
+        self.session_matches = self.session_forest.search(query);
+        if let Some(dialog) = &mut self.session_dialog {
+            dialog.selected = preferred_id
+                .and_then(|id| {
+                    self.session_matches
+                        .iter()
+                        .position(|matched| self.session_forest.rows[matched.index].entry.id == id)
+                })
+                .unwrap_or_else(|| {
+                    dialog
+                        .selected
+                        .min(self.session_matches.len().saturating_sub(1))
+                });
+        }
+    }
+
+    fn insert_session_query(&mut self, text: &str) {
+        if let Some(dialog) = &mut self.session_dialog {
+            for grapheme in text.graphemes(true) {
+                if grapheme.chars().any(char::is_control) {
+                    continue;
+                }
+                if dialog.query.len() + grapheme.len() > 4096 {
+                    break;
+                }
+                dialog.query.push_str(grapheme);
+            }
+            dialog.selected = 0;
+        }
+        self.filter_sessions(None);
+    }
+
+    fn open_sessions(&mut self) -> Action {
+        if self.session_catalog_pending {
+            self.toast("session catalog scan is already in progress — Esc cancels");
+            return Action::None;
+        }
+        self.session_catalog_epoch = self.session_catalog_epoch.wrapping_add(1);
+        self.session_catalog_pending = true;
+        self.file_picker = None;
+        self.session_forest = super::branches::BranchForest::default();
+        self.session_matches.clear();
+        self.session_dialog = Some(SessionDialog {
+            query: String::new(),
+            searching: false,
+            selected: 0,
+            rename: None,
+        });
+        self.toast("loading conversation branches — Esc cancels");
+        Action::ListSessions {
+            epoch: self.session_catalog_epoch,
+        }
+    }
+
+    fn dismiss_sessions(&mut self) {
+        self.session_dialog = None;
+        self.session_catalog_pending = false;
+        self.session_catalog_epoch = self.session_catalog_epoch.wrapping_add(1);
+    }
+
+    pub(super) fn require_session_connection(&mut self) -> bool {
+        if !self.session_connected {
+            self.toast("session disconnected — F4, select current session, Enter to retry; draft preserved");
+        }
+        self.session_connected
+    }
+
+    pub(super) fn session_switch_allowed(&mut self, requested_id: &str) -> bool {
+        if self.phase != Phase::Idle
+            || self.editing_branch()
+            || self.branch_chooser.is_some()
+            || self.editing_steer()
+            || !self.pending_steers.is_empty()
+            || !self.steer_mutations.is_empty()
+            || self.queue_handoff
+        {
+            self.toast(
+                "session switching requires idle state with no checkout or pending-message work",
+            );
+            return false;
+        }
+        let cross_session = self.session_id.as_deref() != Some(requested_id);
+        if cross_session {
+            // Deleting a placeholder explicitly removes that attachment from
+            // the draft. Use the same cleanup as submission, not invisible
+            // stale metadata that could make an empty draft unswitchable.
+            self.prune_attachments();
+        }
+        if cross_session && (!self.editor.is_empty() || !self.attachments.is_empty()) {
+            self.toast(
+                "unsent draft: send or clear the prompt and attachments before switching sessions",
+            );
+            return false;
+        }
+        true
+    }
+
     fn handle_session_key(&mut self, key: KeyEvent, pasted: bool) -> Action {
+        if self.session_catalog_pending {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(4) => {
+                    self.dismiss_sessions();
+                    return Action::None;
+                }
+                KeyCode::Enter => return Action::None,
+                _ => {}
+            }
+        }
+        let selected_id = self
+            .session_dialog
+            .as_ref()
+            .and_then(|dialog| self.session_matches.get(dialog.selected))
+            .map(|matched| self.session_forest.rows[matched.index].entry.id.clone());
         let Some(dialog) = &mut self.session_dialog else {
             return Action::None;
         };
+        if pasted && matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
+            return Action::None;
+        }
 
         if let Some(rename) = &mut dialog.rename {
             match rename {
@@ -2666,11 +2835,10 @@ impl App {
                         dialog.rename = Some(SessionRename::Editing(String::new()));
                     }
                     KeyCode::Enter => {
-                        let selected = dialog.selected;
                         dialog.rename = Some(SessionRename::Saving);
-                        if let Some(entry) = self.session_choices.get(selected) {
+                        if let Some(session_id) = selected_id {
                             return Action::RenameSession {
-                                session_id: entry.id.clone(),
+                                session_id,
                                 display_name: None,
                             };
                         }
@@ -2689,12 +2857,11 @@ impl App {
                         dialog.rename = Some(SessionRename::ConfirmClear);
                     }
                     KeyCode::Enter => {
-                        let selected = dialog.selected;
                         let display_name = input.clone();
                         dialog.rename = Some(SessionRename::Saving);
-                        if let Some(entry) = self.session_choices.get(selected) {
+                        if let Some(session_id) = selected_id {
                             return Action::RenameSession {
-                                session_id: entry.id.clone(),
+                                session_id,
                                 display_name: Some(display_name),
                             };
                         }
@@ -2712,22 +2879,54 @@ impl App {
             return Action::None;
         }
 
+        if dialog.searching {
+            match key.code {
+                KeyCode::F(4) => self.dismiss_sessions(),
+                KeyCode::Esc | KeyCode::Enter => dialog.searching = false,
+                KeyCode::Backspace => {
+                    if let Some((index, _)) = dialog.query.grapheme_indices(true).next_back() {
+                        dialog.query.truncate(index);
+                    }
+                    dialog.selected = 0;
+                    self.filter_sessions(None);
+                }
+                KeyCode::Char(character)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.insert_session_query(&character.to_string());
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         match key.code {
-            KeyCode::Esc => self.session_dialog = None,
+            KeyCode::Esc | KeyCode::F(4) => self.dismiss_sessions(),
             KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
             KeyCode::Down => {
                 dialog.selected =
-                    (dialog.selected + 1).min(self.session_choices.len().saturating_sub(1));
+                    (dialog.selected + 1).min(self.session_matches.len().saturating_sub(1));
             }
-            KeyCode::Char('r' | 'R') => {
+            KeyCode::Char('/') if key.modifiers.is_empty() => dialog.searching = true,
+            KeyCode::Char('r' | 'R')
+                if !pasted
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && selected_id.is_some() =>
+            {
                 dialog.rename = Some(SessionRename::Editing(String::new()));
             }
             KeyCode::Enter => {
-                if let Some(entry) = self.session_choices.get(dialog.selected) {
-                    let id = entry.id.clone();
-                    self.session_dialog = None;
+                if let Some(id) = selected_id
+                    && self.session_switch_allowed(&id)
+                {
+                    self.dismiss_sessions();
                     return Action::Resume(id);
                 }
+            }
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                dialog.searching = true;
+                self.insert_session_query(&character.to_string());
             }
             _ => {}
         }
@@ -3127,6 +3326,9 @@ impl App {
             });
             return Action::None;
         }
+        if key.code == KeyCode::F(2) && key.modifiers.is_empty() && !pasted {
+            return self.open_branch_chooser();
+        }
         let matches = self.sync_navigation();
         let selected = self
             .navigation
@@ -3267,7 +3469,15 @@ impl App {
     }
 
     fn open_branch_chooser(&mut self) -> Action {
-        if self.working() || self.editing_steer() || !self.pending_steers.is_empty() {
+        if !self.require_session_connection() {
+            return Action::None;
+        }
+        if self.working()
+            || self.editing_branch()
+            || self.editing_steer()
+            || !self.pending_steers.is_empty()
+            || !self.steer_mutations.is_empty()
+        {
             self.toast(
                 "prompt checkout is available only while idle and outside pending-message edits",
             );
@@ -3343,6 +3553,7 @@ impl App {
         provisional.auth_methods = self.auth_methods.clone();
         provisional.show_thoughts = self.show_thoughts;
         provisional.branch_epoch = epoch;
+        provisional.session_catalog_epoch = self.session_catalog_epoch.wrapping_add(1);
         for update in response.prefix {
             let (_, updates) = super::translate(
                 agent_client_protocol::schema::v2::UpdateSessionNotification::new(
@@ -3368,6 +3579,7 @@ impl App {
 
     pub(super) fn abandon_branch(&mut self) {
         let epoch = self.branch_epoch.wrapping_add(1);
+        let catalog_epoch = self.session_catalog_epoch;
         if let Some(draft) = self.branch_draft.take() {
             let input_state = (
                 self.input_overflow,
@@ -3380,6 +3592,9 @@ impl App {
                 self.input_recovery_ready,
                 self.last_key,
             ) = input_state;
+            // View restoration must not restore a spent catalog request epoch.
+            self.session_catalog_epoch = catalog_epoch;
+            self.dismiss_sessions();
         }
         self.branch_chooser = None;
         self.branch_epoch = epoch;
@@ -3558,6 +3773,18 @@ impl App {
             }
             return Action::Redraw;
         }
+        if self.session_dialog.is_some() {
+            // Terminals without bracketed paste deliver a paste as a key burst, so
+            // the arrival gap is the only thing separating it from typing.
+            let pasted = self
+                .last_key
+                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+            self.last_key = Some(received_at);
+            return self.handle_session_key(key, pasted);
+        }
+        if key.code == KeyCode::F(4) && key.modifiers.is_empty() {
+            return self.open_sessions();
+        }
         if self.branch_chooser.is_some() || self.branch_draft.is_some() {
             let action = self.handle_branch_key_at(key, received_at);
             self.last_key = Some(received_at);
@@ -3569,15 +3796,6 @@ impl App {
                 .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
             self.last_key = Some(received_at);
             return self.handle_navigation_key(key, pasted);
-        }
-        if self.session_dialog.is_some() {
-            // Terminals without bracketed paste deliver a paste as a key burst, so
-            // the arrival gap is the only thing separating it from typing.
-            let pasted = self
-                .last_key
-                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
-            self.last_key = Some(received_at);
-            return self.handle_session_key(key, pasted);
         }
         if self.model_dialog.is_some() {
             return self.handle_model_key(key);
@@ -3802,9 +4020,27 @@ impl App {
                 }
                 if matches!(
                     parse(self.editor.text(), !self.auth_methods.is_empty()),
+                    Parsed::Sessions
+                ) {
+                    if !self.editing_steer() {
+                        self.editor.clear();
+                    }
+                    return self.open_sessions();
+                }
+                if matches!(
+                    parse(self.editor.text(), !self.auth_methods.is_empty()),
                     Parsed::Branch
                 ) {
                     return self.open_branch_chooser();
+                }
+                if !self.session_connected
+                    && !matches!(
+                        parse(self.editor.text(), !self.auth_methods.is_empty()),
+                        Parsed::Resume { .. } | Parsed::Close | Parsed::Agents
+                    )
+                {
+                    self.require_session_connection();
+                    return Action::None;
                 }
                 if self.editor.is_empty() {
                     return Action::None;
@@ -3868,15 +4104,7 @@ impl App {
                         self.toast("usage: /resume <session-id>");
                         Action::None
                     }
-                    Parsed::Sessions => {
-                        if self.session_catalog_pending {
-                            self.toast("session catalog scan is already in progress");
-                            Action::None
-                        } else {
-                            self.session_catalog_pending = true;
-                            Action::ListSessions
-                        }
-                    }
+                    Parsed::Sessions => self.open_sessions(),
                     Parsed::Branch => self.open_branch_chooser(),
                     Parsed::Transcript => {
                         self.open_navigation();
@@ -4058,7 +4286,8 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
-        if self.model_switch.is_some()
+        if self.session_dialog.is_some()
+            || self.model_switch.is_some()
             || self.navigation.dialog.is_some()
             || self.branch_chooser.is_some()
             || self.editing_branch()
@@ -4361,6 +4590,12 @@ mod test_support {
     }
 
     impl App {
+        pub(in crate::tui) fn session_rename_active(&self) -> bool {
+            self.session_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.rename.is_some())
+        }
+
         pub(super) fn agents(&self) -> Vec<&AgentRow> {
             self.agent_tree_rows()
                 .into_iter()
@@ -7565,16 +7800,550 @@ mod tests {
         ]
     }
 
+    fn explorer_entries() -> Vec<crate::session::CatalogEntry> {
+        ["source", "sibling"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| crate::session::CatalogEntry {
+                id: id.into(),
+                title: Some(format!("{id} title")),
+                preview: Some(format!("latest {id}")),
+                is_subagent: false,
+                lineage: crate::session::CatalogLineage::Root,
+                branch_point: None,
+                updated_at: index as u64,
+            })
+            .collect()
+    }
+
+    fn open_explorer(app: &mut App) {
+        let Action::ListSessions { epoch } = app.handle_key(press(KeyCode::F(4))) else {
+            panic!("catalog requested")
+        };
+        app.apply(Update::SessionCatalog {
+            epoch,
+            result: Ok(explorer_entries()),
+        });
+    }
+
+    #[test]
+    fn loading_explorer_owns_keys_and_paste_without_submitting_or_steering_draft() {
+        for phase in [Phase::Idle, Phase::Working] {
+            let mut app = app();
+            app.start_session("source".into());
+            app.paste("parked draft");
+            app.attach(
+                PathBuf::from("/tmp/image.png"),
+                "image/png",
+                AttachmentKind::Image,
+                12,
+            );
+            app.editor.move_left();
+            let draft = app.editor.text().to_owned();
+            let cursor = app.editor.cursor();
+            let attachments = app.attachments.clone();
+            app.phase = phase;
+            app.can_steer = true;
+            let Action::ListSessions { epoch } = app.handle_key(press(KeyCode::F(4))) else {
+                panic!("catalog requested")
+            };
+            assert!(app.session_dialog.is_some());
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Char('s'))),
+                Action::None
+            ));
+            app.paste("ource");
+            // The response is deliberately not delivered yet. A deliberate
+            // Enter must be harmless even outside the paste timing window.
+            std::thread::sleep(super::PASTE_GAP * 2);
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::None
+            ));
+            assert_eq!(app.editor.text(), draft);
+            assert_eq!(app.editor.cursor(), cursor);
+            assert_eq!(app.attachments, attachments);
+            assert_eq!(app.session_dialog.as_ref().unwrap().query, "source");
+            app.apply(Update::SessionCatalog {
+                epoch,
+                result: Ok(explorer_entries()),
+            });
+            assert_eq!(app.session_dialog.as_ref().unwrap().query, "source");
+            assert_eq!(app.session_matches.len(), 1);
+            assert_eq!(
+                app.session_forest.rows[app.session_matches[0].index]
+                    .entry
+                    .id,
+                "source"
+            );
+            assert_eq!(app.editor.text(), draft);
+            assert_eq!(app.attachments, attachments);
+        }
+    }
+
+    #[test]
+    fn explorer_f4_closes_typed_pasted_and_loading_search_preserving_drafts() {
+        for (pasted, query_before_load) in [(false, false), (true, false), (false, true)] {
+            for pending_edit in [false, true] {
+                let mut app = app();
+                app.start_session("source".into());
+                app.paste("parked draft");
+                app.attach(
+                    PathBuf::from("/tmp/image.png"),
+                    "image/png",
+                    AttachmentKind::Image,
+                    12,
+                );
+                app.editor.move_left();
+                let parked_text = app.editor.text().to_owned();
+                let parked_cursor = app.editor.cursor();
+                let parked_attachments = app.attachments.clone();
+                let received_at = Instant::now();
+                if pending_edit {
+                    app.can_steer = true;
+                    app.can_replace_steer = true;
+                    app.apply(Update::SteerAccepted {
+                        editable: true,
+                        id: "a".into(),
+                        text: "pending a".into(),
+                    });
+                    app.handle_key_at(press(KeyCode::F(2)), received_at);
+                    app.handle_key_at(press(KeyCode::Enter), received_at + super::PASTE_GAP * 2);
+                    assert!(app.editing_steer());
+                    app.paste(" revised");
+                    app.editor.move_left();
+                }
+                let draft = app.editor.text().to_owned();
+                let cursor = app.editor.cursor();
+                let attachments = app.attachments.clone();
+                let Action::ListSessions { epoch } =
+                    app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 4)
+                else {
+                    panic!("catalog requested")
+                };
+                if !query_before_load {
+                    app.apply(Update::SessionCatalog {
+                        epoch,
+                        result: Ok(explorer_entries()),
+                    });
+                }
+                if pasted {
+                    app.paste("source");
+                } else {
+                    for (index, character) in "source".chars().enumerate() {
+                        app.handle_key_at(
+                            press(KeyCode::Char(character)),
+                            received_at + super::PASTE_GAP * (6 + index as u32 * 2),
+                        );
+                    }
+                }
+                if query_before_load {
+                    app.apply(Update::SessionCatalog {
+                        epoch,
+                        result: Ok(explorer_entries()),
+                    });
+                }
+                let dialog = app.session_dialog.as_ref().unwrap();
+                assert!(dialog.searching);
+                assert_eq!(dialog.query, "source");
+                assert_eq!(app.session_matches.len(), 1);
+                assert!(!app.session_catalog_pending);
+                assert!(matches!(
+                    app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 18),
+                    Action::None
+                ));
+                assert!(app.session_dialog.is_none());
+                app.apply(Update::SessionCatalog {
+                    epoch,
+                    result: Ok(explorer_entries()),
+                });
+                assert!(app.session_dialog.is_none());
+                assert!(!app.session_catalog_pending);
+                assert_eq!(app.session_id.as_deref(), Some("source"));
+                assert_eq!(app.editor.text(), draft);
+                assert_eq!(app.editor.cursor(), cursor);
+                assert_eq!(app.attachments, attachments);
+                assert_eq!(app.editing_steer(), pending_edit);
+                if pending_edit {
+                    app.handle_key_at(press(KeyCode::Esc), received_at + super::PASTE_GAP * 20);
+                    assert!(!app.editing_steer());
+                }
+                assert_eq!(app.editor.text(), parked_text);
+                assert_eq!(app.editor.cursor(), parked_cursor);
+                assert_eq!(app.attachments, parked_attachments);
+            }
+        }
+    }
+
+    #[test]
+    fn loading_explorer_f4_dismisses_search_and_rejects_late_catalog() {
+        let mut app = app();
+        let received_at = Instant::now();
+        let Action::ListSessions { epoch } = app.handle_key_at(press(KeyCode::F(4)), received_at)
+        else {
+            panic!("catalog requested")
+        };
+        app.handle_key_at(
+            press(KeyCode::Char('s')),
+            received_at + super::PASTE_GAP * 2,
+        );
+        assert!(app.session_catalog_pending);
+        assert!(app.session_dialog.as_ref().unwrap().searching);
+        assert!(matches!(
+            app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 4),
+            Action::None
+        ));
+        assert!(app.session_dialog.is_none());
+        assert!(!app.session_catalog_pending);
+        app.apply(Update::SessionCatalog {
+            epoch,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_none());
+        assert!(!app.session_catalog_pending);
+    }
+
+    #[test]
+    fn loading_explorer_escape_reopen_retains_new_query_and_ignores_old_result() {
+        let mut app = app();
+        app.paste("parked draft");
+        let Action::ListSessions { epoch: old } = app.handle_key(press(KeyCode::F(4))) else {
+            panic!()
+        };
+        app.paste("obsolete");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.session_dialog.is_none());
+        let Action::ListSessions { epoch: new } = app.handle_key(press(KeyCode::F(4))) else {
+            panic!()
+        };
+        app.paste("source");
+        app.apply(Update::SessionCatalog {
+            epoch: old,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_matches.is_empty());
+        assert_eq!(app.session_dialog.as_ref().unwrap().query, "source");
+        std::thread::sleep(super::PASTE_GAP * 2);
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.apply(Update::SessionCatalog {
+            epoch: new,
+            result: Ok(explorer_entries()),
+        });
+        assert_eq!(app.session_matches.len(), 1);
+        assert_eq!(app.editor.text(), "parked draft");
+    }
+
+    #[test]
+    fn disconnected_editor_and_checkout_preserve_draft_until_explicit_reload() {
+        let mut app = app();
+        app.start_session("source".into());
+        app.paste("parked draft");
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            12,
+        );
+        let draft = app.editor.text().to_owned();
+        let attachments = app.attachments.clone();
+        app.session_connected = false;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.handle_key(press(KeyCode::F(3)));
+        std::thread::sleep(super::PASTE_GAP * 2);
+        assert!(matches!(app.handle_key(press(KeyCode::F(2))), Action::None));
+        assert!(app.branch_chooser.is_none());
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.attachments, attachments);
+        app.handle_key(press(KeyCode::Esc));
+        open_explorer(&mut app);
+        app.paste("source");
+        app.handle_key(press(KeyCode::Enter)); // Finish search, never submit.
+        std::thread::sleep(super::PASTE_GAP * 2);
+        assert!(
+            matches!(app.handle_key(press(KeyCode::Enter)), Action::Resume(id) if id == "source")
+        );
+        assert!(!app.session_connected); // Only successful load can reconnect.
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.attachments, attachments);
+    }
+
+    #[test]
+    fn explorer_request_epochs_reject_dismissed_and_reopened_catalogs() {
+        let mut app = app();
+        let Action::ListSessions { epoch: old } = app.open_sessions() else {
+            panic!()
+        };
+        app.handle_key(press(KeyCode::Esc));
+        app.apply(Update::SessionCatalog {
+            epoch: old,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_none());
+        let Action::ListSessions { epoch: new } = app.open_sessions() else {
+            panic!()
+        };
+        assert_ne!(old, new);
+        app.apply(Update::SessionCatalog {
+            epoch: old,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_catalog_pending);
+        assert!(app.session_dialog.is_some());
+        assert!(app.session_matches.is_empty());
+        app.apply(Update::SessionCatalog {
+            epoch: new,
+            result: Ok(explorer_entries()),
+        });
+        app.handle_key(press(KeyCode::Esc));
+        app.apply(Update::SessionCatalog {
+            epoch: new,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_none());
+    }
+
+    #[test]
+    fn explorer_epochs_remain_unique_across_provisional_view_and_source_restoration() {
+        let mut app = app();
+        let Action::ListSessions {
+            epoch: source_request,
+        } = app.open_sessions()
+        else {
+            panic!()
+        };
+        prepare_branch(&mut app);
+        let Action::ListSessions {
+            epoch: child_request,
+        } = app.open_sessions()
+        else {
+            panic!()
+        };
+        assert_ne!(source_request, child_request);
+        app.apply(Update::SessionCatalog {
+            epoch: source_request,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_some());
+        assert!(app.session_matches.is_empty());
+        app.abandon_branch();
+        let Action::ListSessions {
+            epoch: restored_request,
+        } = app.open_sessions()
+        else {
+            panic!()
+        };
+        assert_ne!(restored_request, source_request);
+        assert_ne!(restored_request, child_request);
+        app.apply(Update::SessionCatalog {
+            epoch: child_request,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_some());
+        assert!(app.session_matches.is_empty());
+        app.apply(Update::SessionCatalog {
+            epoch: restored_request,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_some());
+    }
+
+    #[test]
+    fn explorer_preserves_draft_and_attachments_and_rejects_dirty_cross_session_switch() {
+        let mut app = app();
+        app.start_session("source".into());
+        app.paste("unsent draft");
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            12,
+        );
+        app.editor.move_left();
+        let draft = app.editor.text().to_owned();
+        let cursor = app.editor.cursor();
+        let attachments = app.attachments.clone();
+        open_explorer(&mut app);
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.toast.as_ref().unwrap().0.contains("unsent draft"));
+        assert!(app.session_dialog.is_some());
+        app.phase = Phase::Working;
+        app.paste("source");
+        app.last_key = None;
+        app.handle_key(press(KeyCode::Enter)); // leave search
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.phase = Phase::Idle;
+        app.last_key = None;
+        assert!(
+            matches!(app.handle_key(press(KeyCode::Enter)), Action::Resume(id) if id == "source")
+        );
+        app.start_session("source".into());
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.editor.cursor(), cursor);
+        assert_eq!(app.attachments, attachments);
+        assert!(app.session_dialog.is_none());
+    }
+
+    #[test]
+    fn explicitly_cleared_attachment_draft_no_longer_blocks_cross_session_switch() {
+        let mut app = app();
+        app.start_session("source".into());
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            12,
+        );
+        assert!(!app.session_switch_allowed("sibling"));
+        app.editor.clear(); // Explicitly remove the prompt and its attachment placeholder.
+        assert!(app.session_switch_allowed("sibling"));
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn explorer_filter_rename_targets_visible_id_and_preserves_selection() {
+        let mut app = app();
+        open_explorer(&mut app);
+        app.paste("source");
+        assert_eq!(app.session_matches.len(), 1);
+        app.handle_key(press(KeyCode::Enter));
+        app.last_key = None;
+        app.handle_key(press(KeyCode::Char('r')));
+        app.paste("Renamed source");
+        assert!(
+            matches!(app.handle_key(press(KeyCode::Enter)), Action::RenameSession { session_id, .. } if session_id == "source")
+        );
+        app.apply(Update::SessionRenamed {
+            session_id: "source".into(),
+            display_name: Some("Renamed source".into()),
+            result: Ok(Some("Renamed source".into())),
+        });
+        let selected = app.session_dialog.as_ref().unwrap().selected;
+        assert_eq!(
+            app.session_forest.rows[app.session_matches[selected].index]
+                .entry
+                .id,
+            "source"
+        );
+        assert_eq!(
+            app.session_forest.rows[app.session_matches[selected].index]
+                .entry
+                .title
+                .as_deref(),
+            Some("Renamed source")
+        );
+    }
+
+    #[test]
+    fn explorer_unicode_paste_is_bounded_and_search_uses_receipt_time() {
+        let mut app = app();
+        app.paste("parked");
+        open_explorer(&mut app);
+        app.paste(&format!("\n\t{}", "界👩‍💻".repeat(2000)));
+        let query = &app.session_dialog.as_ref().unwrap().query;
+        assert!(query.len() <= 4096);
+        assert!(!query.contains('\n'));
+        assert!(app.session_matches.is_empty());
+        assert_eq!(app.editor.text(), "parked");
+        let received_at = Instant::now() - super::PASTE_GAP * 4;
+        app.last_key = Some(received_at);
+        app.handle_key_at(press(KeyCode::Enter), received_at + super::PASTE_GAP / 2);
+        assert!(app.session_dialog.as_ref().unwrap().searching);
+        app.session_dialog.as_mut().unwrap().query.clear();
+        app.filter_sessions(None);
+        assert_eq!(app.session_matches.len(), 2);
+        app.last_key = Some(received_at);
+        app.handle_key_at(press(KeyCode::Enter), received_at + super::PASTE_GAP * 2);
+        assert!(!app.session_dialog.as_ref().unwrap().searching);
+    }
+
+    #[test]
+    fn explorer_switch_gates_cover_steer_edit_mutation_handoff_and_all_busy_phases() {
+        let mut app = queued_app();
+        app.paste("parked draft");
+        begin_steer_edit(&mut app);
+        let pending_edit = app.editor.text().to_owned();
+        app.phase = Phase::Idle;
+        open_explorer(&mut app);
+        assert!(!app.session_switch_allowed("source"));
+        app.paste("source");
+        app.handle_key(press(KeyCode::Esc)); // leave search
+        app.handle_key(press(KeyCode::Esc)); // close explorer
+        assert_eq!(app.editor.text(), pending_edit);
+        assert!(app.editing_steer());
+        app.cancel_steer_edit();
+        app.pending_steers.clear();
+        app.editor.clear();
+        app.queue_handoff = true;
+        assert!(!app.session_switch_allowed("source"));
+        app.queue_handoff = false;
+        for phase in [Phase::Working, Phase::Blocked, Phase::Cancelling] {
+            app.phase = phase;
+            assert!(!app.session_switch_allowed("source"));
+        }
+        app.phase = Phase::Idle;
+        assert!(app.session_switch_allowed("source"));
+    }
+
+    #[test]
+    fn explorer_browses_provisional_checkout_but_cannot_switch() {
+        let mut app = app();
+        prepare_branch(&mut app);
+        let text = app.editor.text().to_owned();
+        open_explorer(&mut app);
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.editing_branch());
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), text);
+        assert!(app.editing_branch());
+    }
+
+    #[test]
+    fn transcript_footer_action_opens_authoritative_chooser_with_idle_guard() {
+        let mut app = app();
+        app.paste("parked draft");
+        app.open_navigation();
+        app.phase = Phase::Working;
+        assert!(matches!(
+            app.handle_navigation_key(press(KeyCode::F(2)), false),
+            Action::None
+        ));
+        assert!(app.branch_chooser.is_none());
+        app.phase = Phase::Idle;
+        assert!(matches!(
+            app.handle_navigation_key(press(KeyCode::F(2)), false),
+            Action::ListPromptBranches { .. }
+        ));
+        assert_eq!(app.editor.text(), "parked draft");
+    }
+
     #[test]
     fn sessions_command_defers_catalog_work_to_the_event_loop() {
         let mut app = app();
         app.editor.insert_str("/sessions");
         assert!(matches!(
             app.handle_key(press(KeyCode::Enter)),
-            Action::ListSessions
+            Action::ListSessions { .. }
         ));
-        assert!(app.session_dialog.is_none());
-        app.editor.insert_str("/sessions");
+        assert!(app.session_dialog.is_some());
+        assert!(app.editor.is_empty());
         assert!(matches!(
             app.handle_key(press(KeyCode::Enter)),
             Action::None
@@ -7586,22 +8355,29 @@ mod tests {
     }
 
     #[test]
-    fn session_catalog_update_opens_the_dialog() {
+    fn session_catalog_update_populates_the_immediately_opened_dialog() {
         let mut app = app();
         assert!(matches!(
             app.handle_key(press(KeyCode::Char('@'))),
             Action::SearchFiles { .. }
         ));
-        app.apply(Update::SessionCatalog(Ok(vec![
-            crate::session::CatalogEntry {
+        let Action::ListSessions { epoch } = app.handle_key(press(KeyCode::F(4))) else {
+            panic!("catalog requested")
+        };
+        assert!(app.session_dialog.is_some());
+        app.apply(Update::SessionCatalog {
+            epoch,
+            result: Ok(vec![crate::session::CatalogEntry {
                 id: "saved".into(),
                 title: Some("Saved".into()),
                 preview: None,
                 is_subagent: false,
+                lineage: crate::session::CatalogLineage::Root,
+                branch_point: None,
                 updated_at: 0,
-            },
-        ])));
-        assert_eq!(app.session_choices[0].id, "saved");
+            }]),
+        });
+        assert_eq!(app.session_forest.rows[0].entry.id, "saved");
         assert!(app.session_dialog.is_some());
         assert!(app.file_picker.is_none());
     }
@@ -7609,22 +8385,29 @@ mod tests {
     #[test]
     fn session_dialog_selects_a_catalog_entry_for_existing_resume_flow() {
         let mut app = app();
-        app.session_choices = ["newer", "older"]
-            .into_iter()
-            .map(|id| crate::session::CatalogEntry {
-                id: id.into(),
-                title: Some(format!("{id} title")),
-                preview: None,
-                is_subagent: false,
-                updated_at: 0,
-            })
-            .collect();
+        app.set_session_choices(
+            ["newer", "older"]
+                .into_iter()
+                .map(|id| crate::session::CatalogEntry {
+                    id: id.into(),
+                    title: Some(format!("{id} title")),
+                    preview: None,
+                    is_subagent: false,
+                    lineage: crate::session::CatalogLineage::Root,
+                    branch_point: None,
+                    updated_at: u64::from(id == "newer"),
+                })
+                .collect(),
+        );
         app.session_dialog = Some(super::SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: None,
         });
 
         assert!(matches!(app.handle_key(press(KeyCode::Down)), Action::None));
+        app.last_key = None; // A deliberate activation, not an unbracketed paste burst.
         assert!(matches!(
             app.handle_key(press(KeyCode::Enter)),
             Action::Resume(id) if id == "older"
@@ -7635,17 +8418,23 @@ mod tests {
     #[test]
     fn session_dialog_renames_in_place_and_preserves_selection() {
         let mut app = app();
-        app.session_choices = ["newer", "older"]
-            .into_iter()
-            .map(|id| crate::session::CatalogEntry {
-                id: id.into(),
-                title: Some(format!("{id} title")),
-                preview: None,
-                is_subagent: false,
-                updated_at: 0,
-            })
-            .collect();
+        app.set_session_choices(
+            ["newer", "older"]
+                .into_iter()
+                .map(|id| crate::session::CatalogEntry {
+                    id: id.into(),
+                    title: Some(format!("{id} title")),
+                    preview: None,
+                    is_subagent: false,
+                    lineage: crate::session::CatalogLineage::Root,
+                    branch_point: None,
+                    updated_at: u64::from(id == "newer"),
+                })
+                .collect(),
+        );
         app.session_dialog = Some(super::SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 1,
             rename: None,
         });
@@ -7676,7 +8465,10 @@ mod tests {
             result: Ok(Some("OAuth bug".into())),
         });
         assert_eq!(app.session_dialog.as_ref().unwrap().selected, 1);
-        assert_eq!(app.session_choices[1].title.as_deref(), Some("OAuth bug"));
+        assert_eq!(
+            app.session_forest.rows[1].entry.title.as_deref(),
+            Some("OAuth bug")
+        );
 
         app.session_dialog.as_mut().unwrap().rename = Some(super::SessionRename::Saving);
         app.apply(Update::SessionRenamed {
@@ -7693,14 +8485,18 @@ mod tests {
     #[test]
     fn session_dialog_confirms_before_clearing_a_name() {
         let mut app = app();
-        app.session_choices = vec![crate::session::CatalogEntry {
+        app.set_session_choices(vec![crate::session::CatalogEntry {
             id: "saved".into(),
             title: Some("Generated".into()),
             preview: None,
             is_subagent: false,
+            lineage: crate::session::CatalogLineage::Root,
+            branch_point: None,
             updated_at: 0,
-        }];
+        }]);
         app.session_dialog = Some(super::SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: Some(super::SessionRename::Editing(String::new())),
         });
@@ -7733,6 +8529,8 @@ mod tests {
     fn session_rename_backspace_removes_a_complete_grapheme() {
         let mut app = app();
         app.session_dialog = Some(super::SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: Some(super::SessionRename::Editing("e\u{301} 👨‍👩‍👧".into())),
         });
@@ -7751,6 +8549,8 @@ mod tests {
     fn session_rename_clear_confirmation_ignores_enter_from_a_paste_burst() {
         let mut app = app();
         app.session_dialog = Some(super::SessionDialog {
+            query: String::new(),
+            searching: false,
             selected: 0,
             rename: Some(super::SessionRename::ConfirmClear),
         });
@@ -7771,6 +8571,8 @@ mod tests {
         for input in [String::new(), "Pasted name".into()] {
             let mut app = app();
             app.session_dialog = Some(super::SessionDialog {
+                query: String::new(),
+                searching: false,
                 selected: 0,
                 rename: Some(super::SessionRename::Editing(input.clone())),
             });

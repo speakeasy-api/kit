@@ -44,6 +44,7 @@ use crate::{
     },
 };
 
+pub(crate) mod diagnostics;
 mod input_settlement;
 pub(crate) use input_settlement::{InputSettlement, InputSettlingDriver};
 
@@ -1539,9 +1540,10 @@ impl Runtime {
             Some((id, name)) => self.subagents.fresh_with_parent(id, name),
             None => self.subagents.fresh(),
         };
-        let task_manager = background_task_manager();
-        let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
+        let mut task_manager = background_task_manager();
+        task_manager.origins = background_jobs.task_origins.clone();
+        let tasks = task_manager.handle();
         let canonical_transcript = opened.transcript.clone();
         let mut transcript = opened.transcript;
         let committed_input = if commit_branch {
@@ -1573,6 +1575,9 @@ impl Runtime {
             // Settlement must fence every mutator, including compaction.
             .mutator(input_settlement.clone())
             .mutator(compactor)
+            .observer(diagnostics::ConsumptionObserver::new(
+                background_jobs.task_origins.clone(),
+            ))
             .observer(context.integration.as_ref().clone())
             .transcript_observer(input_settlement.observer(observer))
             .transcript(transcript)
@@ -1915,6 +1920,7 @@ pub(crate) struct BackgroundActivity {
 #[derive(Clone)]
 pub(crate) struct BackgroundJobs {
     state: Arc<Mutex<BackgroundJobState>>,
+    pub(crate) task_origins: diagnostics::TaskOrigins,
     activity: watch::Sender<u64>,
 }
 
@@ -1923,6 +1929,7 @@ impl Default for BackgroundJobs {
         let (activity, _) = watch::channel(0);
         Self {
             state: Arc::new(Mutex::new(BackgroundJobState::default())),
+            task_origins: diagnostics::TaskOrigins::default(),
             activity,
         }
     }
@@ -2452,8 +2459,11 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
     spec
 }
 
-fn background_task_manager() -> AsyncTaskManager {
-    AsyncTaskManager::new().routing(background_route)
+fn background_task_manager() -> diagnostics::DiagnosticTaskManager {
+    diagnostics::DiagnosticTaskManager::new(
+        AsyncTaskManager::new().routing(background_route),
+        diagnostics::TaskOrigins::default(),
+    )
 }
 
 fn background_route(request: &ToolRequest) -> RoutingDecision {

@@ -22,14 +22,95 @@ use agentkit_core::TurnCancellation;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::tools::mcp::CredentialStorage;
+use crate::{
+    events::{
+        DiagnosticOperation, DiagnosticScope, offer_diagnostic_ownership, ownership_supported,
+        set_diagnostic_operation,
+    },
+    tools::mcp::CredentialStorage,
+};
+
+/// Bound retained provenance per process, without evicting issued identities.
+const MAX_DIAGNOSTIC_OPERATIONS: usize = 4096;
+
+/// Immutable producer ownership, separate from request-lifetime output routes.
+/// Both the process actor and stderr drain retain this registry. Entries are
+/// never removed on response, cancellation, or session close.
+struct DiagnosticOperationRoutes {
+    operations: Mutex<(u64, HashMap<DiagnosticOperation, DiagnosticScope>)>,
+    negotiated: AtomicBool,
+}
+
+impl DiagnosticOperationRoutes {
+    fn new() -> Self {
+        Self {
+            operations: Mutex::new((0, HashMap::new())),
+            negotiated: AtomicBool::new(false),
+        }
+    }
+
+    fn register(&self) -> Result<DiagnosticOperation, ChildError> {
+        let scope = DiagnosticScope::capture();
+        let mut routes = self
+            .operations
+            .lock()
+            .map_err(|_| ChildError::Failed("diagnostic operation registry unavailable".into()))?;
+        if routes.1.len() >= MAX_DIAGNOSTIC_OPERATIONS {
+            return Err(ChildError::Failed(format!(
+                "nested diagnostic operation capacity exhausted ({MAX_DIAGNOSTIC_OPERATIONS}); close this subagent and start a new child process",
+            )));
+        }
+        routes.0 = routes
+            .0
+            .checked_add(1)
+            .ok_or_else(|| ChildError::Failed("diagnostic operation sequence exhausted; close this subagent and start a new child process".into()))?;
+        let operation = DiagnosticOperation::new(format!("operation-{}", routes.0))
+            .expect("generated diagnostic operation is valid");
+        routes.1.insert(operation.clone(), scope);
+        Ok(operation)
+    }
+
+    fn register_negotiated(&self) -> Result<Option<DiagnosticOperation>, ChildError> {
+        if !self.negotiated.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.register().map(Some)
+    }
+
+    fn resolve(&self, operation: &DiagnosticOperation) -> Option<DiagnosticScope> {
+        self.operations.lock().ok()?.1.get(operation).cloned()
+    }
+}
+
+fn owned_close(
+    session_id: SessionId,
+    operation: Option<&DiagnosticOperation>,
+) -> CloseSessionRequest {
+    let mut request = CloseSessionRequest::new(session_id);
+    if let Some(operation) = operation {
+        set_diagnostic_operation(&mut request.meta, operation);
+    }
+    request
+}
+
+fn owned_model(
+    session_id: SessionId,
+    model: &str,
+    operation: Option<&DiagnosticOperation>,
+) -> SetSessionConfigOptionRequest {
+    let mut request = SetSessionConfigOptionRequest::new(session_id, "model", model);
+    if let Some(operation) = operation {
+        set_diagnostic_operation(&mut request.meta, operation);
+    }
+    request
+}
 
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
@@ -413,6 +494,7 @@ impl std::fmt::Display for ChildError {
 struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
     serial: tokio::sync::OwnedMutexGuard<()>,
+    operation: Option<DiagnosticOperation>,
     session_id: SessionId,
     text: String,
     cancellation: TurnCancellation,
@@ -420,6 +502,7 @@ struct Prompt {
 }
 struct Fork {
     serial: tokio::sync::OwnedMutexGuard<()>,
+    operation: Option<DiagnosticOperation>,
     session_id: SessionId,
     model: Option<String>,
     parent: Option<(String, String)>,
@@ -427,6 +510,7 @@ struct Fork {
     reply: oneshot::Sender<Result<SessionId, ChildError>>,
 }
 struct Close {
+    operation: Option<DiagnosticOperation>,
     session_id: SessionId,
     reply: oneshot::Sender<Result<(), ChildError>>,
 }
@@ -532,6 +616,7 @@ fn rendered_text_only(value: &Value) -> Option<&str> {
 /// A logical ACP session. Multiple forked sessions may share one child process.
 #[derive(Clone)]
 pub(crate) struct ChildSession {
+    diagnostics: Arc<DiagnosticOperationRoutes>,
     tx: mpsc::Sender<Request>,
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
@@ -549,13 +634,21 @@ impl ChildSession {
         depth: usize,
         cancellation: TurnCancellation,
     ) -> Result<Self, ChildError> {
+        if cancellation.is_cancelled() {
+            return Err(ChildError::Cancelled);
+        }
         let context = config.harnesses.launch_context(&harness);
         let actor_context = context.clone();
+        let diagnostics = Arc::new(DiagnosticOperationRoutes::new());
+        // Capture before spawn, but retain a token only after explicit agreement
+        // and before session/new dispatch. Legacy children need no registrations.
+        let admission = DiagnosticScope::capture();
+        let actor_diagnostics = Arc::clone(&diagnostics);
         let (tx, mut rx) = mpsc::channel(1);
         let (ready_tx, mut ready_rx) = oneshot::channel();
         let (closed_tx, closed_rx) = watch::channel(false);
         let actor_tx = tx.clone();
-        let mut task = tokio::spawn(async move {
+        let mut task = tokio::spawn(crate::events::inherit_diagnostics(async move {
             let result = run(
                 RunConfig {
                     config,
@@ -564,6 +657,8 @@ impl ChildSession {
                     model,
                     depth,
                     context: actor_context,
+                    diagnostics: actor_diagnostics,
+                    admission,
                 },
                 &mut rx,
                 ready_tx,
@@ -572,7 +667,7 @@ impl ChildSession {
             .await;
             let _ = closed_tx.send(true);
             result
-        });
+        }));
         let result = tokio::select! {
             ready = &mut ready_rx => match ready {
                 Ok(Ok(ready)) => Ok(ready),
@@ -592,6 +687,7 @@ impl ChildSession {
         };
         match result {
             Ok(ready) => Ok(Self {
+                diagnostics,
                 tx: actor_tx,
                 session_id: ready.session_id,
                 capabilities: ready.capabilities,
@@ -621,6 +717,9 @@ impl ChildSession {
 
     pub async fn close(&self) -> Result<(), ChildError> {
         if let Some(ancestor_id) = &self.descendant_parent {
+            // Explicit close belongs to its caller, which may be a new turn
+            // using a reused or native-forked child. Deferred cleanup callers
+            // retain their originating scope across their own spawn boundary.
             crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
                 ancestor_id: ancestor_id.clone(),
             });
@@ -634,16 +733,24 @@ impl ChildSession {
                 ))
             };
         }
+        let permit = self.tx.reserve().await.map_err(|_| {
+            ChildError::TerminalFailed("nested agent process is no longer running".into())
+        })?;
+        // Exhaustion must never strand a live process or native-fork sibling.
+        // Omit ownership rather than borrowing an issued token or a current route.
+        let operation = self
+            .diagnostics
+            .register_negotiated()
+            .unwrap_or_else(|error| {
+                eprintln!("ACP harness closing without diagnostic ownership: {error}");
+                None
+            });
         let (reply, response) = oneshot::channel();
-        self.tx
-            .send(Request::Close(Close {
-                session_id: self.session_id.clone(),
-                reply,
-            }))
-            .await
-            .map_err(|_| {
-                ChildError::TerminalFailed("nested agent process is no longer running".into())
-            })?;
+        permit.send(Request::Close(Close {
+            operation,
+            session_id: self.session_id.clone(),
+            reply,
+        }));
         response.await.map_err(|_| {
             ChildError::TerminalFailed(
                 "nested agent process exited without a close response".into(),
@@ -657,9 +764,11 @@ impl ChildSession {
         parent: Option<(String, String)>,
         cancellation: &TurnCancellation,
     ) -> Result<Self, ChildError> {
+        let diagnostics = DiagnosticScope::capture();
         let serial = tokio::select! {
-            serial = self.serial.clone().lock_owned() => serial,
+            biased;
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            serial = self.serial.clone().lock_owned() => serial,
         };
         if !self.supports_native_fork() {
             return Err(ChildError::Failed(
@@ -667,22 +776,23 @@ impl ChildSession {
             ));
         }
         let descendant_parent = parent.as_ref().map(|(id, _)| id.clone());
+        let permit = self.request_permit(cancellation).await?;
+        let operation = diagnostics.sync_scope(|| self.diagnostics.register_negotiated())?;
         let (reply, response) = oneshot::channel();
-        tokio::select! {
-            sent = self.tx.send(Request::Fork(Fork {
-                serial,
-                session_id: self.session_id.clone(),
-                model: model.map(str::to_owned),
-                parent,
-                cancellation: cancellation.clone(),
-                reply,
-            })) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        }
+        permit.send(Request::Fork(Fork {
+            serial,
+            operation,
+            session_id: self.session_id.clone(),
+            model: model.map(str::to_owned),
+            parent,
+            cancellation: cancellation.clone(),
+            reply,
+        }));
         let session_id = response.await.map_err(|_| {
             ChildError::TerminalFailed("nested agent process exited without a fork response".into())
         })??;
         Ok(Self {
+            diagnostics: Arc::clone(&self.diagnostics),
             tx: self.tx.clone(),
             session_id,
             capabilities: self.capabilities.clone(),
@@ -692,27 +802,55 @@ impl ChildSession {
         })
     }
 
+    async fn request_permit(
+        &self,
+        cancellation: &TurnCancellation,
+    ) -> Result<mpsc::Permit<'_, Request>, ChildError> {
+        if self.is_closed() {
+            return Err(ChildError::TerminalFailed(
+                "nested agent process is no longer running".into(),
+            ));
+        }
+        let permit = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            permit = self.tx.reserve() => permit.map_err(|_| {
+                ChildError::TerminalFailed("nested agent process is no longer running".into())
+            })?,
+        };
+        if cancellation.is_cancelled() {
+            return Err(ChildError::Cancelled);
+        }
+        if self.is_closed() {
+            return Err(ChildError::TerminalFailed(
+                "nested agent process is no longer running".into(),
+            ));
+        }
+        Ok(permit)
+    }
+
     pub async fn prompt(
         &self,
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
+        let diagnostics = DiagnosticScope::capture();
         let serial = tokio::select! {
-            serial = self.serial.clone().lock_owned() => serial,
+            biased;
             () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+            serial = self.serial.clone().lock_owned() => serial,
         };
+        let permit = self.request_permit(&cancellation).await?;
+        let operation = diagnostics.sync_scope(|| self.diagnostics.register_negotiated())?;
         let (reply, response) = oneshot::channel();
-        let request = Request::Prompt(Prompt {
+        permit.send(Request::Prompt(Prompt {
             serial,
+            operation,
             session_id: self.session_id.clone(),
             text,
             cancellation: cancellation.clone(),
             reply,
-        });
-        tokio::select! {
-            sent = self.tx.send(request) => sent.map_err(|_| ChildError::TerminalFailed("nested agent process is no longer running".into()))?,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        }
+        }));
         response.await.map_err(|_| {
             ChildError::TerminalFailed("nested agent process exited without a response".into())
         })?
@@ -720,6 +858,8 @@ impl ChildSession {
 }
 
 struct RunConfig {
+    diagnostics: Arc<DiagnosticOperationRoutes>,
+    admission: DiagnosticScope,
     config: ChildConfig,
     harness: String,
     persisted: Option<(String, bool)>,
@@ -749,6 +889,8 @@ async fn run(
     closed: watch::Sender<bool>,
 ) -> Result<(), String> {
     let RunConfig {
+        diagnostics,
+        admission,
         config,
         harness,
         persisted,
@@ -784,23 +926,16 @@ async fn run(
         .stderr
         .take()
         .ok_or("could not open ACP harness stderr")?;
-    let label = harness.clone();
-    let ancestor_id = config.parent_id.clone();
-    let descendant_parent = ancestor_id.clone();
-    tokio::spawn(async move {
-        forward_stderr(
-            stderr,
-            &label,
-            ancestor_id.as_deref(),
-            |output| match output {
-                ForwardedStderr::RuntimeLine(line) | ForwardedStderr::Diagnostic(line) => {
-                    eprintln!("{line}");
-                }
-                ForwardedStderr::Cleanup(event) => crate::events::emit(&event),
-            },
-        )
-        .await;
-    });
+    let descendant_parent = config.parent_id.clone();
+    let (negotiation_tx, negotiation_rx) = watch::channel(None);
+    let _stderr_task = spawn_forward_stderr(
+        stderr,
+        harness.clone(),
+        config.parent_id.clone(),
+        Some((Arc::clone(&diagnostics), negotiation_rx)),
+    );
+    // Retain registrations until this actor exits, even if stderr closes first.
+    let connection_diagnostics = Arc::clone(&diagnostics);
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(
         HashMap::<SessionId, Arc<Mutex<ChildOutput>>>::new(),
@@ -838,10 +973,21 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            let mut initialize = agentkit_acp::InitializeRequest::new(ProtocolVersion::V1);
+            offer_diagnostic_ownership(&mut initialize.meta);
+            let initialized = connection.send_request(initialize).block_task().await?;
+            let negotiated = ownership_supported(initialized.meta.as_ref());
+            connection_diagnostics.negotiated.store(negotiated, Ordering::Release);
+            let _ = negotiation_tx.send(Some(negotiated));
+            let admission = admission.sync_scope(|| connection_diagnostics.register_negotiated())
+                .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))?;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
-            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            let mut request = agentkit_acp::NewSessionRequest::new(root.clone());
+            if let Some(operation) = &admission {
+                set_diagnostic_operation(&mut request.meta, operation);
+            }
+            let session = connection.send_request(request).block_task().await?;
             if let Some(model) = model {
                 let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
                     option.id.to_string() == "model" && matches!(option.kind, SessionConfigKind::Select(_))
@@ -851,13 +997,13 @@ async fn run(
                     let _ = ready.send(Err(error));
                     return std::future::pending().await;
                 }
-                if let Err(error) = connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
+                if let Err(error) = connection.send_request(owned_model(session.session_id.clone(), model.as_str(), admission.as_ref())).block_task().await {
                     let error = format!("ACP harness {harness:?} rejected model selection {model:?}: {error}");
                     let _ = ready.send(Err(error));
                     return std::future::pending().await;
                 }
             }
-            let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
+            let sessions = Arc::new(Mutex::new(vec![(session.session_id.clone(), admission.clone())]));
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
             ready_flag.store(true, Ordering::Release);
@@ -886,22 +1032,24 @@ async fn run(
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
                                 ]));
                             }
+                            if let Some(operation) = &fork.operation {
+                                set_diagnostic_operation(&mut request.meta, operation);
+                            }
                             let mut request = Box::pin(connection.send_request(request).block_task());
                             let result = tokio::select! {
                                 result = &mut request => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
                                         if let Ok(mut sessions) = sessions.lock() {
-                                            sessions.push(session_id.clone());
+                                            sessions.push((session_id.clone(), fork.operation.clone()));
                                         }
                                         if let Some(model) = fork.model {
                                             let selected = match tokio::time::timeout(
                                                 HANDSHAKE,
                                                 connection
-                                                    .send_request(SetSessionConfigOptionRequest::new(
-                                                        session_id.clone(),
-                                                        "model",
-                                                        model.as_str(),
+                                                    .send_request(owned_model(
+                                                        session_id.clone(), model.as_str(),
+                                                        fork.operation.as_ref(),
                                                     ))
                                                     .block_task(),
                                             )
@@ -917,14 +1065,14 @@ async fn run(
                                             };
                                             if selected.is_err() && supports_close {
                                                 let close = connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), fork.operation.as_ref()))
                                                     .block_task();
                                                 if tokio::time::timeout(CANCEL_SETTLE, close)
                                                     .await
                                                     .is_ok_and(|result| result.is_ok())
                                                     && let Ok(mut sessions) = sessions.lock()
                                                 {
-                                                    sessions.retain(|id| id != &session_id);
+                                                    sessions.retain(|(id, _)| id != &session_id);
                                                 }
                                             }
                                             selected
@@ -949,7 +1097,7 @@ async fn run(
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
                                                 cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), fork.operation.as_ref()))
                                                     .block_task(),
                                             )
                                             .await
@@ -957,7 +1105,7 @@ async fn run(
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
-                                            sessions.push(session_id);
+                                            sessions.push((session_id, fork.operation.clone()));
                                         }
                                     });
                                     Err(ChildError::Cancelled)
@@ -977,7 +1125,7 @@ async fn run(
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
                                                 cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
+                                                    .send_request(owned_close(session_id.clone(), fork.operation.as_ref()))
                                                     .block_task(),
                                             )
                                             .await
@@ -985,7 +1133,7 @@ async fn run(
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
-                                            sessions.push(session_id);
+                                            sessions.push((session_id, fork.operation.clone()));
                                         }
                                     });
                                     Err(ChildError::Failed(format!(
@@ -1002,7 +1150,7 @@ async fn run(
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
                             let request = connection
-                                .send_request(CloseSessionRequest::new(close.session_id.clone()))
+                                .send_request(owned_close(close.session_id.clone(), close.operation.as_ref()))
                                 .block_task();
                             let result = tokio::time::timeout(CANCEL_SETTLE, request)
                                 .await
@@ -1017,7 +1165,7 @@ async fn run(
                             if result.is_ok()
                                 && let Ok(mut sessions) = sessions.lock()
                             {
-                                sessions.retain(|id| id != &close.session_id);
+                                sessions.retain(|(id, _)| id != &close.session_id);
                             }
                             let _ = close.reply.send(result);
                         });
@@ -1031,15 +1179,23 @@ async fn run(
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
-                            let request = connection.send_request(agentkit_acp::PromptRequest::new(
+                            let mut request = agentkit_acp::PromptRequest::new(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
-                            )).block_task();
+                            );
+                            if let Some(operation) = &prompt.operation {
+                                set_diagnostic_operation(&mut request.meta, operation);
+                            }
+                            let request = connection.send_request(request).block_task();
                             tokio::pin!(request);
                             let (response, cancelled) = tokio::select! {
                                 biased;
                                 result = &mut request => (result.map_err(|error| error.to_string()), false),
                                 () = prompt.cancellation.cancelled() => {
-                                    let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+                                    let mut cancel = CancelNotification::new(session_id.clone());
+                                    if let Some(operation) = &prompt.operation {
+                                        set_diagnostic_operation(&mut cancel.meta, operation);
+                                    }
+                                    let _ = connection.send_notification(cancel);
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result.map_err(|error| error.to_string()), true),
                                         Err(_) => {
@@ -1067,9 +1223,9 @@ async fn run(
             }
             let session_ids = sessions.lock().map(|sessions| sessions.clone()).unwrap_or_default();
             if supports_close {
-                for session_id in session_ids {
+                for (session_id, operation) in session_ids {
                     let close = connection
-                        .send_request(CloseSessionRequest::new(session_id))
+                        .send_request(owned_close(session_id, operation.as_ref()))
                         .block_task();
                     if let Ok(result) = tokio::time::timeout(CANCEL_SETTLE, close).await {
                         result?;
@@ -1116,38 +1272,240 @@ async fn run(
     })
 }
 
+// Retain at most this many bytes while the child negotiates ownership. Draining
+// must continue after the limit so a noisy child can still finish initialization.
+const PRE_NEGOTIATION_STDERR_LIMIT: usize = 256 * 1024;
+
+#[derive(Default)]
+struct PendingStderr {
+    bytes: Vec<u8>,
+    overflowed: bool,
+    discard_partial: bool,
+}
+
+impl PendingStderr {
+    // Returns true exactly once, when the retention budget is first exceeded.
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if self.overflowed {
+            self.discard_partial = bytes.last() != Some(&b'\n');
+            return false;
+        }
+        if self.bytes.capacity() == 0 {
+            self.bytes.reserve_exact(PRE_NEGOTIATION_STDERR_LIMIT);
+        }
+        let remaining = PRE_NEGOTIATION_STDERR_LIMIT - self.bytes.len();
+        self.bytes
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() <= remaining {
+            return false;
+        }
+        self.overflowed = true;
+        // Keep only whole lines. Discard everything else until negotiation ends,
+        // including the rest of this partial line even if it crosses the ack.
+        let complete = self
+            .bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        self.bytes.truncate(complete);
+        self.discard_partial = bytes.last() != Some(&b'\n');
+        true
+    }
+}
+
+// Only a newline restores a safe line boundary. EOF or an error must not let
+// a later read reinterpret an unconsumed suffix as a fresh runtime event.
+async fn discard_stderr_line(stderr: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> bool {
+    loop {
+        let Ok(bytes) = stderr.fill_buf().await else {
+            return false;
+        };
+        if bytes.is_empty() {
+            return false;
+        }
+        let newline = bytes.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(bytes.len(), |position| position + 1);
+        stderr.consume(count);
+        if newline.is_some() {
+            return true;
+        }
+    }
+}
+
+/// Translate only explicitly negotiated, known operation tokens. Legacy children
+/// retain immutable launch provenance; neither reader timing nor child epochs
+/// authorize retagging their diagnostics after parent reactivation.
+fn spawn_forward_stderr(
+    stderr: impl AsyncRead + Unpin + Send + 'static,
+    label: String,
+    ancestor_id: Option<String>,
+    ownership: Option<(
+        Arc<DiagnosticOperationRoutes>,
+        watch::Receiver<Option<bool>>,
+    )>,
+) -> tokio::task::JoinHandle<()> {
+    let launch = DiagnosticScope::capture();
+    tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut pending = PendingStderr::default();
+        let routes = if let Some((routes, mut negotiation)) = ownership {
+            // Drain while initialization is pending: waiting without reading can
+            // fill the stderr pipe and prevent the child from replying at all.
+            // Interpret these bytes only after agreement (or failed startup).
+            let mut buffer = [0; 8192];
+            while negotiation.borrow().is_none() {
+                tokio::select! {
+                    biased;
+                    changed = negotiation.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    read = stderr.read(&mut buffer) => match read {
+                        Ok(0) | Err(_) => {
+                            let _ = negotiation.wait_for(Option::is_some).await;
+                            break;
+                        }
+                        Ok(count) => {
+                            if pending.push(&buffer[..count]) {
+                                eprintln!("[{label}] pre-negotiation stderr exceeded {PRE_NEGOTIATION_STDERR_LIMIT}-byte limit; discarding remaining pre-negotiation output and any incomplete line");
+                            }
+                        }
+                    }
+                }
+            }
+            Some(routes)
+        } else {
+            None
+        };
+        let negotiated = routes
+            .as_ref()
+            .filter(|routes| routes.negotiated.load(Ordering::Acquire));
+        let mut stderr = BufReader::new(stderr);
+        let resume = !pending.discard_partial || discard_stderr_line(&mut stderr).await;
+        forward_stderr(
+            pending
+                .bytes
+                .as_slice()
+                .chain(stderr.take(if resume { u64::MAX } else { 0 })),
+            &label,
+            ancestor_id.as_deref(),
+            negotiated.map(Arc::as_ref),
+            |output| {
+                match output {
+                    ForwardedStderr::RuntimeLine(line) => {
+                        if let Some(routes) = negotiated {
+                            if let Some(envelope) = crate::events::parse_diagnostic(&line)
+                                && let Some(scope) = envelope
+                                    .operation
+                                    .as_ref()
+                                    .and_then(|op| routes.resolve(op))
+                            {
+                                // Restores both the parent's activation and its
+                                // upstream operation at every descendant hop.
+                                scope.emit(&envelope.event);
+                            }
+                        } else if let Some(event) = crate::events::parse(&line) {
+                            launch.emit(&event);
+                        }
+                    }
+                    ForwardedStderr::Diagnostic(line) => eprintln!("{line}"),
+                    ForwardedStderr::Cleanup(event) => launch.emit(&event),
+                    ForwardedStderr::OwnedCleanup(event, operation) => {
+                        if let Some(scope) =
+                            negotiated.and_then(|routes| routes.resolve(&operation))
+                        {
+                            scope.emit(&event);
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    })
+}
+
 #[derive(Debug, PartialEq)]
 enum ForwardedStderr {
     RuntimeLine(String),
     Diagnostic(String),
     Cleanup(crate::events::RuntimeEvent),
+    OwnedCleanup(crate::events::RuntimeEvent, DiagnosticOperation),
 }
 
 async fn forward_stderr(
     stderr: impl AsyncRead + Unpin,
     label: &str,
     ancestor_id: Option<&str>,
+    negotiated: Option<&DiagnosticOperationRoutes>,
     mut output: impl FnMut(ForwardedStderr),
 ) {
-    let mut ancestors = ancestor_id
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    // Legacy cleanup keeps its launch ancestor. Negotiated cleanup is derived
+    // solely from accepted roster provenance, not the most recent invocation.
+    let mut ancestors = if negotiated.is_none() {
+        ancestor_id
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut owned_ancestors =
+        Vec::<(DiagnosticScope, DiagnosticOperation, BTreeSet<String>)>::new();
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(event) = crate::events::parse(&line)
-            && event.forward_from_child()
+        let envelope = if negotiated.is_some() {
+            crate::events::parse_diagnostic(&line)
+        } else {
+            crate::events::parse(&line).map(|event| crate::events::DiagnosticEvent {
+                event,
+                activation: None,
+                operation: None,
+            })
+        };
+        if let Some(envelope) = envelope
+            && envelope.event.forward_from_child()
         {
-            if let crate::events::RuntimeEvent::SubagentStateChanged {
+            if let Some(routes) = negotiated {
+                let Some(operation) = envelope.operation else {
+                    continue;
+                };
+                let Some(scope) = routes.resolve(&operation) else {
+                    // Missing, malformed, or unknown ownership never falls back.
+                    continue;
+                };
+                let index = owned_ancestors
+                    .iter()
+                    .position(|(owner, _, _)| owner == &scope)
+                    .unwrap_or_else(|| {
+                        owned_ancestors.push((scope, operation, BTreeSet::new()));
+                        owned_ancestors.len() - 1
+                    });
+                let ancestors = &mut owned_ancestors[index].2;
+                match &envelope.event {
+                    crate::events::RuntimeEvent::SubagentStateChanged {
+                        parent_id: Some(parent_id),
+                        ..
+                    } => {
+                        ancestors.insert(parent_id.clone());
+                    }
+                    crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
+                        ancestors.remove(ancestor_id);
+                    }
+                    _ => {}
+                }
+            } else if let crate::events::RuntimeEvent::SubagentStateChanged {
                 parent_id: Some(parent_id),
                 ..
-            } = event
+            } = &envelope.event
             {
-                ancestors.insert(parent_id);
+                ancestors.insert(parent_id.clone());
             }
-            // Preserve recursively forwarded private runtime events byte-for-byte.
             output(ForwardedStderr::RuntimeLine(line));
         } else if let Some(line) = harness_diagnostic(label, &line) {
+            // StorageStatus and ordinary external stderr retain existing global
+            // diagnostic behavior, independent of operation negotiation.
             output(ForwardedStderr::Diagnostic(line));
         }
     }
@@ -1155,6 +1513,14 @@ async fn forward_stderr(
         output(ForwardedStderr::Cleanup(
             crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
         ));
+    }
+    for (_, operation, ancestors) in owned_ancestors {
+        for ancestor_id in ancestors {
+            output(ForwardedStderr::OwnedCleanup(
+                crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
+                operation.clone(),
+            ));
+        }
     }
 }
 
@@ -1223,6 +1589,7 @@ mod test_support {
                     serial: Arc::new(tokio::sync::Mutex::new(())),
                     closed: watch::channel(false).1,
                     descendant_parent: None,
+                    diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
                 },
                 closed_rx,
             )
@@ -1238,6 +1605,7 @@ mod test_support {
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
+                diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
             }
         }
     }
@@ -1266,6 +1634,7 @@ mod tests {
                 serial: Arc::new(tokio::sync::Mutex::new(())),
                 closed: watch::channel(false).1,
                 descendant_parent: None,
+                diagnostics: Arc::new(DiagnosticOperationRoutes::new()),
             };
             let caller = child.clone();
             let task = tokio::spawn(async move {
@@ -2158,6 +2527,813 @@ mod tests {
         );
     }
 
+    /// Real stdio requests capture producer tokens; a delayed producer is released
+    /// only by the following request, after the old prompt has already replied.
+    #[test]
+    fn negotiated_stdio_ownership_survives_reuse_and_native_forks() {
+        use crate::events::{self, RuntimeEvent};
+        const PROBE: &str = "KIT_TEST_NEGOTIATED_CHILD_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2).enable_all().build().unwrap().block_on(async {
+                    let root = tempfile::tempdir().unwrap();
+                    let script = root.path().join("ownership.py");
+                    std::fs::write(&script, r#"
+import json, sys, threading
+mode = sys.argv[1]
+marker = sys.argv[2]
+lock = threading.Lock()
+next_session = 0
+delayed = None
+barrier = threading.Barrier(2)
+def send(value):
+    with lock:
+        print(json.dumps(value), flush=True)
+def response(request, result):
+    send({'jsonrpc': '2.0', 'id': request['id'], 'result': result})
+def emit(operation, label):
+    event = {'event': 'child_started', 'call': label, 'tool': label, 'summary': label, 'at': 1}
+    if operation is not None: event['operation'] = operation
+    with lock:
+        print(marker + json.dumps(event), file=sys.stderr, flush=True)
+def prompt(request):
+    global delayed
+    params = request['params']
+    operation = params.get('_meta', {}).get('kitDiagnosticOperation')
+    label = params['prompt'][0]['text']
+    if label == 'old':
+        delayed = (operation, label)
+    else:
+        if label == 'new' and delayed is not None:
+            emit(*delayed)
+        if label.startswith('sibling'): barrier.wait(timeout=5)
+        emit(operation, label)
+        if label == 'new':
+            emit('unknown-token', 'unknown')
+            emit(None, 'missing')
+            emit(42, 'malformed')
+    response(request, {'stopReason': 'end_turn'})
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    params = request.get('params', {})
+    if method == 'initialize':
+        assert params['_meta']['kitDiagnosticOwnership'] == {'version': 1, 'transport': 'stderr'}
+        result = {'protocolVersion': 1, 'agentCapabilities': {'sessionCapabilities': {'fork': {}, 'close': {}}}}
+        if mode != 'absent':
+            result['_meta'] = {'kitDiagnosticOwnership': {'version': 1 if mode == 'supported' else 99, 'transport': 'stderr'}}
+        if mode == 'supported':
+            for _ in range(2048): emit(None, 'before-agreement')
+        response(request, result)
+        continue
+    operation = params.get('_meta', {}).get('kitDiagnosticOperation')
+    assert (operation is not None) == (mode == 'supported'), (method, params)
+    if method in ('session/new', 'session/fork'):
+        if method == 'session/fork':
+            assert params['_meta']['kit.subagent.parent_id'].startswith('fork-')
+            assert params['_meta']['kit.subagent.parent_name'] == 'Fork owner'
+        next_session += 1
+        emit(operation, method + '-' + str(next_session))
+        response(request, {'sessionId': str(next_session)})
+    elif method == 'session/prompt':
+        threading.Thread(target=prompt, args=(request,), daemon=True).start()
+    elif method == 'session/close':
+        emit(operation, 'close-' + params['sessionId'])
+        response(request, {})
+"#).unwrap();
+                    for mode in ["supported", "absent", "unknown-version"] {
+                        let harnesses = AcpHarnesses::new(BTreeMap::from([("ownership".into(), AcpHarnessProfile {
+                            command: "python3".into(),
+                            args: vec![script.to_string_lossy().into_owned(), mode.into(), events::EVENT_MARKER.into()],
+                            permissions: AcpPermissionPolicy::Deny,
+                        })])).unwrap();
+                        let config = ChildConfig {
+                            root: root.path().to_path_buf(), model: "unused".into(),
+                            provider: Default::default(), reasoning_effort: None, openrouter_api_key: None,
+                            configured_mcp_config: None, configured_mcp_config_inherited: false,
+                            legacy_mcp_config: false, mcp_config: None, credential_storage: Default::default(),
+                            telemetry: Default::default(), harnesses, default_harness: "acp.ownership".into(),
+                            parent_id: None, parent_name: None,
+                        };
+                        let base = owned_child_invocation(mode, "launch", ChildSession::start(
+                            config, "acp.ownership".into(), None, None, 1, TurnCancellation::default(),
+                        )).await.unwrap();
+                        assert_eq!(base.diagnostics.negotiated.load(Ordering::Acquire), mode == "supported");
+                        owned_child_invocation(mode, "old", base.prompt("old".into(), TurnCancellation::default())).await.unwrap();
+                        owned_child_invocation(mode, "new", base.prompt("new".into(), TurnCancellation::default())).await.unwrap();
+                        // A→B→A and A→A activate fresh epochs on the same process.
+                        owned_child_invocation(mode, "again", base.prompt("again".into(), TurnCancellation::default())).await.unwrap();
+                        let first = owned_child_invocation(mode, "fork-first", base.fork(None,
+                            Some(("fork-first".into(), "Fork owner".into())), &TurnCancellation::default())).await.unwrap();
+                        let second = owned_child_invocation(mode, "fork-second", base.fork(None,
+                            Some(("fork-second".into(), "Fork owner".into())), &TurnCancellation::default())).await.unwrap();
+                        let (first_result, second_result) = tokio::join!(
+                            owned_child_invocation(mode, "sibling-first", first.prompt("sibling-first".into(), TurnCancellation::default())),
+                            owned_child_invocation(mode, "sibling-second", second.prompt("sibling-second".into(), TurnCancellation::default())),
+                        );
+                        first_result.unwrap(); second_result.unwrap();
+                        owned_child_invocation(mode, "close-first", first.close()).await.unwrap();
+                        owned_child_invocation(mode, "close-second", second.close()).await.unwrap();
+                        owned_child_invocation(mode, "close-base", base.close()).await.unwrap();
+                        // Every completed request still has its immutable registration.
+                        assert_eq!(base.diagnostics.operations.lock().unwrap().1.len(), if mode == "supported" { 11 } else { 0 });
+                        let mut closed = base.closed_signal();
+                        let registry = Arc::downgrade(&base.diagnostics);
+                        drop(first); drop(second); drop(base);
+                        tokio::time::timeout(Duration::from_secs(5), closed.wait_for(|closed| *closed)).await.unwrap().unwrap();
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while registry.upgrade().is_some() {
+                                tokio::task::yield_now().await;
+                            }
+                        }).await.expect("process exit and stderr drain release registrations");
+                    }
+                });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::negotiated_stdio_ownership_survives_reuse_and_native_forks",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let diagnostics = stderr
+            .lines()
+            .filter_map(events::parse_diagnostic)
+            .collect::<Vec<_>>();
+        for (call, owner) in [
+            ("session/new-1", "launch"),
+            ("old", "old"),
+            ("new", "new"),
+            ("again", "again"),
+            ("session/fork-2", "fork-first"),
+            ("session/fork-3", "fork-second"),
+            ("sibling-first", "sibling-first"),
+            ("sibling-second", "sibling-second"),
+            ("close-2", "close-first"),
+            ("close-3", "close-second"),
+            ("close-1", "close-base"),
+        ] {
+            let envelope = diagnostics.iter().find(|envelope| {
+                envelope.operation.as_ref().is_some_and(|op| op.as_str() == format!("supported:{owner}"))
+                    && matches!(&envelope.event, RuntimeEvent::ChildStarted { call: actual, .. } if actual == call)
+            }).unwrap_or_else(|| panic!("missing owned event {call}: {stderr}"));
+            let admission = diagnostics
+                .iter()
+                .find(|event| {
+                    event.operation == envelope.operation
+                        && matches!(event.event, RuntimeEvent::SessionStarted { .. })
+                })
+                .expect("invocation activation marker");
+            assert!(envelope.activation.is_some());
+            assert_eq!(
+                envelope.activation, admission.activation,
+                "wrong epoch for {call}"
+            );
+        }
+        let activations = ["old", "new", "again"].map(|label| {
+            diagnostics.iter().find(|envelope| {
+                envelope.operation.as_ref().is_some_and(|operation| operation.as_str() == format!("supported:{label}"))
+                    && matches!(&envelope.event, RuntimeEvent::ChildStarted { call, .. } if call == label)
+            }).unwrap().activation.as_ref().unwrap()
+        });
+        assert_eq!(activations[0].session_id, "supported:A");
+        assert_eq!(activations[1].session_id, "supported:B");
+        assert_eq!(activations[2].session_id, "supported:A");
+        assert!(activations[0].epoch < activations[1].epoch);
+        assert!(activations[1].epoch < activations[2].epoch);
+        assert!(!diagnostics.iter().any(|envelope| {
+            envelope.operation.as_ref().is_some_and(|op| op.as_str().starts_with("supported:"))
+                && matches!(&envelope.event, RuntimeEvent::ChildStarted { call, .. } if ["unknown", "missing", "malformed", "before-agreement"].contains(&call.as_str()))
+        }));
+        for mode in ["absent", "unknown-version"] {
+            let forwarded = diagnostics
+                .iter()
+                .filter(|envelope| {
+                    matches!(&envelope.event, RuntimeEvent::ChildStarted { .. })
+                        && envelope
+                            .operation
+                            .as_ref()
+                            .is_some_and(|op| op.as_str().starts_with(mode))
+                })
+                .collect::<Vec<_>>();
+            assert!(!forwarded.is_empty());
+            assert!(
+                forwarded
+                    .iter()
+                    .all(|envelope| envelope.operation.as_ref().unwrap().as_str()
+                        == format!("{mode}:launch"))
+            );
+        }
+    }
+
+    async fn owned_child_invocation<T>(
+        mode: &str,
+        label: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let session = format!("{mode}:{}", if label == "new" { "B" } else { "A" });
+        DiagnosticScope::with_operation(DiagnosticOperation::new(format!("{mode}:{label}")))
+            .scope(async {
+                crate::events::activate_diagnostics(&session);
+                crate::events::scope_diagnostics(&session, future).await
+            })
+            .await
+    }
+
+    #[test]
+    fn real_grandchild_emission_restores_ownership_at_both_boundaries() {
+        use crate::events::{self, RuntimeEvent};
+        const MODE: &str = "KIT_TEST_GRANDCHILD_OWNERSHIP";
+        const TOKEN: &str = "KIT_TEST_GRANDCHILD_TOKEN";
+        let mode = std::env::var(MODE).unwrap_or_default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if mode == "grandchild" {
+            runtime.block_on(
+                DiagnosticScope::with_operation(DiagnosticOperation::new(
+                    std::env::var(TOKEN).unwrap(),
+                ))
+                .scope(async {
+                    events::emit(&RuntimeEvent::ChildStarted {
+                        call: "grandchild-producer".into(),
+                        tool: "shell".into(),
+                        summary: "real producer".into(),
+                        at: 1,
+                    });
+                }),
+            );
+            return;
+        }
+        if mode == "child" {
+            runtime.block_on(async {
+                // One reused intermediate process serves two distinct upstream
+                // invocations. Each grandchild has its own connection-local map.
+                for upstream in ["operation-1", "operation-2"] {
+                    DiagnosticScope::with_operation(DiagnosticOperation::new(upstream.into()))
+                        .scope(async {
+                            events::activate_diagnostics("child-local");
+                            events::scope_diagnostics("child-local", async {
+                                let routes = Arc::new(DiagnosticOperationRoutes::new());
+                                routes.negotiated.store(true, Ordering::Release);
+                                let _unrelated = routes.register().unwrap();
+                                let operation = routes.register().unwrap();
+                                let mut producer = tokio::process::Command::new(std::env::current_exe().unwrap())
+                                    .args(["--exact", "acp_child::tests::real_grandchild_emission_restores_ownership_at_both_boundaries", "--nocapture"])
+                                    .env(MODE, "grandchild").env(TOKEN, operation.as_str())
+                                    .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+                                let (_ready, ready) = watch::channel(Some(true));
+                                let forwarding = spawn_forward_stderr(producer.stderr.take().unwrap(),
+                                    "grandchild".into(), None, Some((routes, ready)));
+                                assert!(producer.wait().await.unwrap().success());
+                                forwarding.await.unwrap();
+                            }).await;
+                        }).await;
+                }
+            });
+            return;
+        }
+        let routes = DiagnosticOperationRoutes::new();
+        let original = runtime.block_on(async {
+            let mut expected = Vec::new();
+            for upstream in ["root-old", "root-new"] {
+                DiagnosticScope::with_operation(DiagnosticOperation::new(upstream.into()))
+                    .scope(async {
+                        events::activate_diagnostics("grandchild-parent");
+                        events::scope_diagnostics("grandchild-parent", async {
+                            expected.push(DiagnosticScope::capture());
+                            routes.register().unwrap();
+                        })
+                        .await;
+                    })
+                    .await;
+            }
+            expected
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::real_grandchild_emission_restores_ownership_at_both_boundaries",
+                "--nocapture",
+            ])
+            .env(MODE, "child")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut restored = Vec::new();
+        // All bytes arrive after parent reactivation. Child-local epochs cannot
+        // authorize a parent route; only the second connection's exact map can.
+        runtime.block_on(forward_stderr(
+            output.stderr.as_slice(),
+            "child",
+            None,
+            Some(&routes),
+            |item| {
+                if let ForwardedStderr::RuntimeLine(line) = item {
+                    let envelope = events::parse_diagnostic(&line).unwrap();
+                    assert!(matches!(envelope.event, RuntimeEvent::ChildStarted { .. }));
+                    assert_eq!(envelope.activation.unwrap().session_id, "child-local");
+                    restored.push(
+                        routes
+                            .resolve(envelope.operation.as_ref().unwrap())
+                            .unwrap(),
+                    );
+                }
+            },
+        ));
+        assert_eq!(restored, original);
+        assert_ne!(restored[0], restored[1]);
+    }
+
+    #[tokio::test]
+    async fn negotiated_cleanup_uses_only_accepted_scopes_and_deduplicates() {
+        use crate::events::{DiagnosticEvent, RuntimeEvent, SubagentStatus};
+        use tokio::io::AsyncWriteExt;
+        let routes = Arc::new(DiagnosticOperationRoutes::new());
+        let scope = DiagnosticScope::with_operation(DiagnosticOperation::new("upstream-a".into()));
+        let first = scope.scope(async { routes.register().unwrap() }).await;
+        let duplicate = scope.scope(async { routes.register().unwrap() }).await;
+        let second = DiagnosticScope::with_operation(DiagnosticOperation::new("upstream-b".into()))
+            .scope(async { routes.register().unwrap() })
+            .await;
+        let roster = RuntimeEvent::SubagentStateChanged {
+            id: "descendant".into(),
+            name: "Nested".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "inspect".into(),
+            parent_id: Some("shared-ancestor".into()),
+            parent_name: None,
+            harness: BUILTIN_HARNESS.into(),
+            model: None,
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: None,
+        };
+        for abrupt in [false, true] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            let write_first = first.clone();
+            let write_duplicate = duplicate.clone();
+            let write_second = second.clone();
+            let write_roster = roster.clone();
+            let producer = tokio::spawn(async move {
+                for operation in [
+                    Some(write_first),
+                    Some(write_duplicate),
+                    Some(write_second),
+                    None,
+                    DiagnosticOperation::new("unknown".into()),
+                ] {
+                    let line = format!(
+                        "{}{}\n",
+                        crate::events::EVENT_MARKER,
+                        serde_json::to_string(&DiagnosticEvent {
+                            event: write_roster.clone(),
+                            activation: None,
+                            operation,
+                        })
+                        .unwrap()
+                    );
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                }
+                writer.write_all(b"ordinary stderr\n").await.unwrap();
+                let storage = format!(
+                    "{}{}\n",
+                    crate::events::EVENT_MARKER,
+                    serde_json::to_string(&RuntimeEvent::StorageStatus {
+                        pending: true,
+                        exhausted: false
+                    })
+                    .unwrap()
+                );
+                writer.write_all(storage.as_bytes()).await.unwrap();
+                if abrupt {
+                    writer.write_all(&[0xff]).await.unwrap();
+                }
+            });
+            let mut output = Vec::new();
+            forward_stderr(
+                reader,
+                BUILTIN_HARNESS,
+                Some("unrelated-launch"),
+                Some(&routes),
+                |item| output.push(item),
+            )
+            .await;
+            producer.await.unwrap();
+            assert_eq!(
+                output
+                    .iter()
+                    .filter(|item| matches!(item, ForwardedStderr::RuntimeLine(_)))
+                    .count(),
+                3
+            );
+            let cleanups = output
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardedStderr::OwnedCleanup(
+                        RuntimeEvent::SubagentDescendantsRemoved { ancestor_id },
+                        operation,
+                    ) => {
+                        assert_eq!(ancestor_id, "shared-ancestor");
+                        Some(operation.clone())
+                    }
+                    ForwardedStderr::Cleanup(_) => {
+                        panic!("negotiated cleanup used launch provenance")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cleanups.len(), 2);
+            assert!(cleanups.contains(&first));
+            assert!(cleanups.contains(&second));
+            assert!(output.iter().any(|item| matches!(item, ForwardedStderr::Diagnostic(line) if line.ends_with("ordinary stderr"))));
+            assert!(output.iter().any(|item| matches!(item, ForwardedStderr::Diagnostic(line) if line.contains("storage_status"))));
+            // EOF and stream errors do not retire registrations while a process
+            // (or a retained logical session) could still own the connection.
+            assert!(routes.resolve(&first).is_some());
+        }
+    }
+
+    #[test]
+    fn operation_capacity_bounds_dispatch_without_stranding_close() {
+        use crate::events::{self, RuntimeEvent};
+        const PROBE: &str = "KIT_TEST_OPERATION_CAPACITY";
+        if std::env::var_os(PROBE).is_some() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let root = tempfile::tempdir().unwrap();
+                    let script = root.path().join("capacity.py");
+                    std::fs::write(
+                        &script,
+                        r#"
+import json, sys, pathlib
+mode, marker, directory = sys.argv[1:]
+root = pathlib.Path(directory)
+entered = root / 'entered'
+entered.unlink(missing_ok=True)
+owned = mode != 'legacy'
+first = None
+cancelled_token = None
+pending = None
+sessions = 0
+prompts = 0
+forks = 0
+closes = []
+def response(request, result):
+    print(json.dumps({'jsonrpc':'2.0', 'id':request['id'], 'result':result}), flush=True)
+def emit(token, label):
+    event = {'event':'child_started', 'call':label, 'tool':'shell', 'summary':label, 'at':1}
+    if token is not None: event['operation'] = token
+    print(marker + json.dumps(event), file=sys.stderr, flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    params = request.get('params', {})
+    token = params.get('_meta', {}).get('kitDiagnosticOperation')
+    if method == 'initialize':
+        caps = {'close': {}}
+        if mode != 'no-fork': caps['fork'] = {}
+        result = {'protocolVersion':1, 'agentCapabilities': {'sessionCapabilities':caps}}
+        if owned: result['_meta'] = {'kitDiagnosticOwnership':{'version':1,'transport':'stderr'}}
+        response(request, result)
+    elif method in ['session/new','session/fork']:
+        assert (token is not None) == owned
+        sessions += 1
+        if method == 'session/fork': forks += 1
+        response(request, {'sessionId':str(sessions)})
+    elif method == 'session/prompt':
+        assert (token is not None) == owned
+        prompts += 1
+        text = params['prompt'][0]['text']
+        if first is None: first = token
+        if text == 'cancel':
+            pending = request
+            cancelled_token = token
+            entered.write_text('ready')
+        else:
+            response(request, {'stopReason':'end_turn'})
+    elif method == 'session/cancel':
+        assert pending is not None and token == cancelled_token
+        response(pending, {'stopReason':'cancelled'})
+        pending = None
+    elif method == 'session/close':
+        closes.append(token)
+        if len(closes) == 1:
+            if first is not None: emit(first, 'old-after-capacity')
+            if cancelled_token is not None: emit(cancelled_token, 'cancelled-after-capacity')
+            emit(token, 'close-diagnostic')
+        response(request, {})
+        if len(closes) == sessions:
+            (root / 'stats').write_text(json.dumps({'prompts':prompts, 'forks':forks,
+                'closes':closes, 'first':first, 'cancelled':cancelled_token}))
+            break
+"#,
+                    )
+                    .unwrap();
+                    for mode in ["supported", "legacy", "no-fork"] {
+                        let harnesses = AcpHarnesses::new(BTreeMap::from([(
+                            "capacity".into(),
+                            AcpHarnessProfile {
+                                command: "python3".into(),
+                                args: vec![
+                                    script.to_string_lossy().into_owned(),
+                                    mode.into(),
+                                    events::EVENT_MARKER.into(),
+                                    root.path().to_string_lossy().into_owned(),
+                                ],
+                                permissions: AcpPermissionPolicy::Deny,
+                            },
+                        )]))
+                        .unwrap();
+                        let config = ChildConfig {
+                            root: root.path().to_path_buf(),
+                            model: "unused".into(),
+                            provider: Default::default(),
+                            reasoning_effort: None,
+                            openrouter_api_key: None,
+                            configured_mcp_config: None,
+                            configured_mcp_config_inherited: false,
+                            legacy_mcp_config: false,
+                            mcp_config: None,
+                            credential_storage: Default::default(),
+                            telemetry: Default::default(),
+                            harnesses,
+                            default_harness: "acp.capacity".into(),
+                            parent_id: None,
+                            parent_name: None,
+                        };
+                        let original = DiagnosticScope::with_operation(DiagnosticOperation::new(
+                            format!("capacity-original-{mode}"),
+                        ));
+                        let base = original
+                            .scope(ChildSession::start(
+                                config.clone(),
+                                "acp.capacity".into(),
+                                None,
+                                None,
+                                1,
+                                TurnCancellation::default(),
+                            ))
+                            .await
+                            .unwrap();
+                        original
+                            .scope(base.prompt("first".into(), TurnCancellation::default()))
+                            .await
+                            .unwrap();
+                        let registry = base.diagnostics.clone();
+                        if mode == "no-fork" {
+                            assert!(matches!(
+                                base.fork(None, None, &TurnCancellation::default()).await,
+                                Err(ChildError::Failed(_))
+                            ));
+                            assert_eq!(registry.operations.lock().unwrap().1.len(), 2);
+                            base.close().await.unwrap();
+                            let mut closed = base.closed_signal();
+                            drop(base);
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                closed.wait_for(|closed| *closed),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            tokio::time::timeout(Duration::from_secs(5), async {
+                                while Arc::strong_count(&registry) != 1 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            continue;
+                        }
+                        let newer = DiagnosticScope::with_operation(DiagnosticOperation::new(
+                            format!("capacity-new-{mode}"),
+                        ));
+                        let sibling = newer
+                            .scope(base.fork(None, None, &TurnCancellation::default()))
+                            .await
+                            .unwrap();
+                        let before_rejection = registry.operations.lock().unwrap().1.len();
+                        // Poll the actual prompt while ordinary serial admission is
+                        // held, then cancel it. No channel or token is consumed.
+                        let serial = base.serial.lock().await;
+                        let controller = agentkit_core::CancellationController::new();
+                        let mut waiting =
+                            Box::pin(base.prompt(
+                                "never-dispatched".into(),
+                                controller.handle().checkpoint(),
+                            ));
+                        std::future::poll_fn(|cx| {
+                            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        controller.interrupt();
+                        assert!(matches!(waiting.await, Err(ChildError::Cancelled)));
+                        drop(serial);
+                        assert_eq!(
+                            registry.operations.lock().unwrap().1.len(),
+                            before_rejection
+                        );
+                        // A dispatched cancellation DOES retain its original token.
+                        let controller = agentkit_core::CancellationController::new();
+                        let cancellation = controller.handle().checkpoint();
+                        let child = base.clone();
+                        let pending = tokio::spawn(newer.scope(async move {
+                            child.prompt("cancel".into(), cancellation).await
+                        }));
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while !root.path().join("entered").exists() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        controller.interrupt();
+                        assert!(matches!(pending.await.unwrap(), Err(ChildError::Cancelled)));
+                        let rounds = if mode == "supported" {
+                            MAX_DIAGNOSTIC_OPERATIONS - 4
+                        } else {
+                            MAX_DIAGNOSTIC_OPERATIONS + 1
+                        };
+                        for _ in 0..rounds {
+                            newer
+                                .scope(base.prompt("fill".into(), TurnCancellation::default()))
+                                .await
+                                .unwrap();
+                        }
+                        let expected = if mode == "supported" {
+                            MAX_DIAGNOSTIC_OPERATIONS
+                        } else {
+                            0
+                        };
+                        assert_eq!(registry.operations.lock().unwrap().1.len(), expected);
+                        if mode == "supported" {
+                            for child in [&base, &sibling] {
+                                let error = child
+                                    .prompt("over-capacity".into(), TurnCancellation::default())
+                                    .await
+                                    .unwrap_err();
+                                assert!(error.to_string().contains("capacity exhausted"));
+                                assert!(error.to_string().contains("new child process"));
+                            }
+                            let error =
+                                match base.fork(None, None, &TurnCancellation::default()).await {
+                                    Err(error) => error,
+                                    Ok(_) => panic!("fork dispatched beyond capacity"),
+                                };
+                            assert!(error.to_string().contains("capacity exhausted"));
+                        }
+                        // Even with shared native sessions and a full registry,
+                        // both closes cross the real transport and are acknowledged.
+                        newer.scope(base.close()).await.unwrap();
+                        newer.scope(sibling.close()).await.unwrap();
+                        let mut closed = base.closed_signal();
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            closed.wait_for(|closed| *closed),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(
+                            base.prompt("already-exited".into(), TurnCancellation::default())
+                                .await
+                                .is_err()
+                        );
+                        assert_eq!(registry.operations.lock().unwrap().1.len(), expected);
+                        drop(sibling);
+                        drop(base);
+                        // The actor and stderr reader must both release their
+                        // references: this observes process exit AND stderr drain.
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            while Arc::strong_count(&registry) != 1 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        let stats: Value = serde_json::from_slice(
+                            &std::fs::read(root.path().join("stats")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(stats["prompts"].as_u64().unwrap(), (rounds + 2) as u64);
+                        assert_eq!(stats["forks"], 1);
+                        assert_eq!(stats["closes"], serde_json::json!([null, null]));
+                        if mode == "supported" {
+                            let first: DiagnosticOperation =
+                                serde_json::from_value(stats["first"].clone()).unwrap();
+                            let cancelled: DiagnosticOperation =
+                                serde_json::from_value(stats["cancelled"].clone()).unwrap();
+                            assert_eq!(registry.resolve(&first), Some(original));
+                            assert_eq!(registry.resolve(&cancelled), Some(newer.clone()));
+                            // Only a NEW connection resets capacity. Keep the old
+                            // full registry alive while the fresh process works.
+                            let fresh = ChildSession::start(
+                                config,
+                                "acp.capacity".into(),
+                                None,
+                                None,
+                                1,
+                                TurnCancellation::default(),
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(fresh.diagnostics.operations.lock().unwrap().1.len(), 1);
+                            fresh
+                                .prompt("restart".into(), TurnCancellation::default())
+                                .await
+                                .unwrap();
+                            fresh.close().await.unwrap();
+                            let mut closed = fresh.closed_signal();
+                            drop(fresh);
+                            tokio::time::timeout(
+                                Duration::from_secs(5),
+                                closed.wait_for(|closed| *closed),
+                            )
+                            .await
+                            .unwrap()
+                            .unwrap();
+                            assert_eq!(
+                                registry.operations.lock().unwrap().1.len(),
+                                MAX_DIAGNOSTIC_OPERATIONS
+                            );
+                        } else {
+                            assert_eq!(registry.operations.lock().unwrap().0, 0);
+                        }
+                    }
+                });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::operation_capacity_bounds_dispatch_without_stranding_close",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let events = stderr
+            .lines()
+            .filter_map(events::parse_diagnostic)
+            .collect::<Vec<_>>();
+        for (label, operation) in [
+            ("old-after-capacity", "capacity-original-supported"),
+            ("cancelled-after-capacity", "capacity-new-supported"),
+        ] {
+            assert!(events.iter().any(|event| {
+                event.operation.as_ref().is_some_and(|owner| owner.as_str() == operation)
+                    && matches!(&event.event, RuntimeEvent::ChildStarted { call, .. } if call == label)
+            }), "missing preserved {label}: {stderr}");
+        }
+        assert!(!events.iter().any(|event| {
+            event.operation.as_ref().is_some_and(|owner| owner.as_str().ends_with("-supported"))
+                && matches!(&event.event, RuntimeEvent::ChildStarted { call, .. } if call == "close-diagnostic")
+        }), "unowned exhausted close borrowed an old/current owner");
+        assert!(stderr.contains("closing without diagnostic ownership"));
+    }
+
+    #[test]
+    fn diagnostic_operation_sequence_exhaustion_never_reuses_a_token() {
+        let routes = DiagnosticOperationRoutes::new();
+        let first = routes.register().unwrap();
+        routes.operations.lock().unwrap().0 = u64::MAX;
+        assert!(routes.register().is_err());
+        assert!(routes.register().is_err());
+        assert!(routes.resolve(&first).is_some());
+        assert_eq!(routes.operations.lock().unwrap().1.len(), 1);
+    }
+
     mod forwards_subagent_events {
         use super::*;
 
@@ -2185,7 +3361,7 @@ mod tests {
             );
             let input = format!("{line}\n");
             let mut output = Vec::new();
-            forward_stderr(input.as_bytes(), "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(input.as_bytes(), "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;
@@ -2196,6 +3372,412 @@ mod tests {
                 ForwardedStderr::Cleanup(crate::events::RuntimeEvent::SubagentDescendantsRemoved { ancestor_id })
                     if ancestor_id == "s-owner"
             ));
+        }
+    }
+
+    #[test]
+    fn spawned_stderr_keeps_origin_activation_and_unscoped_is_none() {
+        use crate::events::{self, DiagnosticActivation, RuntimeEvent};
+        const PROBE: &str = "KIT_TEST_STDERR_ACTIVATION_PROBE";
+        if std::env::var_os(PROBE).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use tokio::io::AsyncWriteExt;
+                    for route in ["same", "roundtrip", "construction", "unscoped", "current"] {
+                        let session = format!("stderr-{route}");
+                        events::activate_diagnostics(&session);
+                        if route == "current" {
+                            events::activate_diagnostics("stderr-current-other");
+                            events::activate_diagnostics(&session);
+                        }
+                        let (mut writer, reader) = tokio::io::duplex(4096);
+                        // Also exercise a future constructed before reactivation
+                        // but first polled afterward (the construction case).
+                        // The parent must reactivate and supply stderr bytes
+                        // before awaiting the returned forwarder task.
+                        #[allow(clippy::async_yields_async)]
+                        let producer = events::scope_diagnostics(&session, async move {
+                            spawn_forward_stderr(reader, "acp.kit".into(), Some(route.into()), None)
+                        });
+                        let (task, delayed) = if route == "construction" {
+                            (None, Some(producer))
+                        } else if route == "unscoped" {
+                            drop(producer);
+                            let (new_writer, reader) = tokio::io::duplex(4096);
+                            writer = new_writer;
+                            (
+                                Some(spawn_forward_stderr(
+                                    reader,
+                                    "acp.kit".into(),
+                                    Some(route.into()),
+                                    None,
+                                )),
+                                None,
+                            )
+                        } else {
+                            (Some(producer.await), None)
+                        };
+                        if route == "roundtrip" {
+                            events::activate_diagnostics("stderr-other");
+                        }
+                        if route != "current" {
+                            events::activate_diagnostics(&session);
+                        }
+                        let task = match task {
+                            Some(task) => task,
+                            None => delayed.unwrap().await,
+                        };
+                        // Actual stderr transport gates both forwarded events
+                        // and EOF cleanup until the new activation is active.
+                        let event = RuntimeEvent::SubagentDescendantsRemoved {
+                            ancestor_id: format!("forward-{route}"),
+                        };
+                        let child_line = events::DiagnosticEvent {
+                            operation: None,
+                            event,
+                            activation: Some(DiagnosticActivation {
+                                session_id: "child-process".into(),
+                                epoch: 999,
+                            }),
+                        };
+                        writer
+                            .write_all(
+                                format!(
+                                    "{}{}\n",
+                                    events::EVENT_MARKER,
+                                    serde_json::to_string(&child_line).unwrap()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        writer.shutdown().await.unwrap();
+                        task.await.unwrap();
+                    }
+                    events::scope_diagnostics("stderr-same", async {
+                        events::emit(&RuntimeEvent::StorageStatus {
+                            pending: true,
+                            exhausted: false,
+                        });
+                    })
+                    .await;
+                    events::emit(&RuntimeEvent::CompactionStarted {
+                        reason: "unscoped".into(),
+                        at: 1,
+                    });
+                });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "acp_child::tests::spawned_stderr_keeps_origin_activation_and_unscoped_is_none",
+                "--nocapture",
+            ])
+            .env(PROBE, "1")
+            .env(events::EVENTS_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let diagnostics = stderr
+            .lines()
+            .filter_map(events::parse_diagnostic)
+            .collect::<Vec<_>>();
+        for route in ["same", "roundtrip", "construction", "unscoped", "current"] {
+            let session = format!("stderr-{route}");
+            let first = diagnostics
+                .iter()
+                .find_map(|line| match &line.event {
+                    RuntimeEvent::SessionStarted { session_id } if session_id == &session => {
+                        line.activation.clone()
+                    }
+                    _ => None,
+                })
+                .expect("missing initial activation");
+            let expected = if route == "current" {
+                diagnostics
+                    .iter()
+                    .rev()
+                    .find_map(|line| match &line.event {
+                        RuntimeEvent::SessionStarted { session_id } if session_id == &session => {
+                            line.activation.clone()
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            } else {
+                first
+            };
+            for ancestor in [route.to_string(), format!("forward-{route}")] {
+                let line = diagnostics.iter().find(|line| matches!(&line.event,
+                    RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } if ancestor_id == &ancestor))
+                    .expect("missing forwarded event or EOF cleanup");
+                assert_eq!(
+                    line.activation,
+                    (route != "unscoped").then(|| expected.clone())
+                );
+            }
+        }
+        for line in diagnostics.iter().filter(|line| {
+            matches!(
+                line.event,
+                RuntimeEvent::StorageStatus { .. } | RuntimeEvent::CompactionStarted { .. }
+            )
+        }) {
+            assert_eq!(line.activation, None);
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| matches!(line.event, RuntimeEvent::StorageStatus { .. }))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| matches!(line.event, RuntimeEvent::CompactionStarted { .. }))
+        );
+    }
+
+    mod pre_negotiation_stderr {
+        use super::*;
+
+        #[test]
+        fn below_budget_retains_partial_lines_and_split_utf8_exactly() {
+            let mut pending = PendingStderr::default();
+            for bytes in [
+                &b"complete\npartial "[..],
+                &b"\xe2"[..],
+                &b"\x82\xac"[..],
+                &b""[..],
+            ] {
+                assert!(!pending.push(bytes));
+            }
+            assert_eq!(pending.bytes, "complete\npartial €".as_bytes());
+            assert!(!pending.overflowed);
+            assert!(!pending.discard_partial);
+        }
+
+        #[test]
+        fn retention_stays_within_production_budget_and_keeps_whole_prefix_lines() {
+            let mut pending = PendingStderr::default();
+            assert!(!pending.push(b"kept\n"));
+            let fill = vec![b'x'; PRE_NEGOTIATION_STDERR_LIMIT - pending.bytes.len()];
+            assert!(!pending.push(&fill));
+            assert_eq!(pending.bytes.len(), PRE_NEGOTIATION_STDERR_LIMIT);
+            assert_eq!(pending.bytes.capacity(), PRE_NEGOTIATION_STDERR_LIMIT);
+            assert!(pending.push(b"overflow"));
+            assert_eq!(pending.bytes, b"kept\n");
+            assert!(pending.discard_partial);
+            for _ in 0..64 {
+                assert!(!pending.push(&fill));
+                assert_eq!(pending.bytes, b"kept\n");
+                assert_eq!(pending.bytes.capacity(), PRE_NEGOTIATION_STDERR_LIMIT);
+            }
+            assert!(!pending.push(b"\ndiscard this complete line too\n"));
+            assert!(!pending.discard_partial);
+            assert_eq!(pending.bytes, b"kept\n");
+        }
+
+        #[test]
+        fn oversized_first_line_is_not_retained_as_a_runtime_prefix() {
+            let mut pending = PendingStderr::default();
+            assert!(!pending.push(crate::events::EVENT_MARKER.as_bytes()));
+            assert!(pending.push(&vec![b' '; PRE_NEGOTIATION_STDERR_LIMIT]));
+            assert!(pending.bytes.is_empty());
+            assert!(pending.discard_partial);
+            assert!(!pending.push(b"\n"));
+            assert!(!pending.discard_partial);
+            assert!(pending.bytes.is_empty());
+        }
+
+        #[tokio::test]
+        async fn discarded_partial_line_preserves_exact_following_bytes() {
+            let mut stderr = BufReader::with_capacity(3, &b"partial suffix\nnext exact line\n"[..]);
+            assert!(discard_stderr_line(&mut stderr).await);
+            let mut remaining = Vec::new();
+            stderr.read_to_end(&mut remaining).await.unwrap();
+            assert_eq!(remaining, b"next exact line\n");
+            let mut stderr = BufReader::with_capacity(3, &b"partial at EOF"[..]);
+            assert!(!discard_stderr_line(&mut stderr).await);
+            assert!(stderr.fill_buf().await.unwrap().is_empty());
+        }
+
+        #[test]
+        fn real_peer_exceeds_production_budget_before_ack_and_keeps_later_ownership() {
+            use crate::events::{self, RuntimeEvent};
+            const PROBE: &str = "KIT_TEST_STDERR_BOUND_PEER";
+            if std::env::var_os(PROBE).is_some() {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let root = tempfile::tempdir().unwrap();
+                        let script = root.path().join("stderr-bound.py");
+                        std::fs::write(&script, r#"
+import json, sys
+mode, marker, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def response(request, result):
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+def event(operation, call):
+    return json.dumps({'event': 'child_started', 'call': call, 'tool': call,
+                       'summary': call, 'at': 1, 'operation': operation})
+def emit(operation, call):
+    sys.stderr.write(marker + event(operation, call) + '\n')
+    sys.stderr.flush()
+for line in sys.stdin:
+    request = json.loads(line)
+    method, params = request['method'], request.get('params', {})
+    if method == 'initialize':
+        assert params['_meta']['kitDiagnosticOwnership'] == {'version': 1, 'transport': 'stderr'}
+        if mode == 'complete':
+            line = marker + event(None, 'discard-before-ack') + '\n'
+            sys.stderr.write(line * (4 * budget // len(line) + 1))
+        else:
+            prefix = marker if mode == 'split-marker' else 'ordinary partial line:'
+            sys.stderr.write(prefix + ' ' * (4 * budget))
+        sys.stderr.flush()  # Cannot acknowledge until the pipe has drained > production cap.
+        response(request, {'protocolVersion': 1, 'agentCapabilities': {'sessionCapabilities': {'close': {}}},
+                           '_meta': {'kitDiagnosticOwnership': {'version': 1, 'transport': 'stderr'}}})
+    elif method == 'session/new':
+        operation = params['_meta']['kitDiagnosticOperation']
+        assert operation
+        # This request proves the parent accepted the initialize response. The
+        # suspicious suffix still belongs to the oversized pre-ack partial line.
+        if mode != 'complete':
+            prefix = '' if mode == 'split-marker' else marker
+            sys.stderr.write(prefix + event(operation, 'suspicious-suffix') + '\n')
+            sys.stderr.flush()
+        emit(operation, 'later-new')
+        response(request, {'sessionId': 'bound-peer'})
+    elif method == 'session/prompt':
+        emit(params['_meta']['kitDiagnosticOperation'], 'later-prompt')
+        response(request, {'stopReason': 'end_turn'})
+    elif method == 'session/close':
+        emit(params['_meta']['kitDiagnosticOperation'], 'later-close')
+        response(request, {})
+"#).unwrap();
+                        for mode in ["complete", "split-marker", "runtime-suffix"] {
+                            let harnesses = AcpHarnesses::new(BTreeMap::from([(
+                                "stderr-bound".into(),
+                                AcpHarnessProfile {
+                                    command: "python3".into(),
+                                    args: vec![
+                                        script.to_string_lossy().into_owned(),
+                                        mode.into(),
+                                        events::EVENT_MARKER.into(),
+                                        PRE_NEGOTIATION_STDERR_LIMIT.to_string(),
+                                    ],
+                                    permissions: AcpPermissionPolicy::Deny,
+                                },
+                            )])).unwrap();
+                            let config = ChildConfig {
+                                root: root.path().to_path_buf(),
+                                model: "unused".into(),
+                                provider: Default::default(),
+                                reasoning_effort: None,
+                                openrouter_api_key: None,
+                                configured_mcp_config: None,
+                                configured_mcp_config_inherited: false,
+                                legacy_mcp_config: false,
+                                mcp_config: None,
+                                credential_storage: Default::default(),
+                                telemetry: Default::default(),
+                                harnesses,
+                                default_harness: "acp.stderr-bound".into(),
+                                parent_id: None,
+                                parent_name: None,
+                            };
+                            tokio::time::timeout(Duration::from_secs(10), async {
+                                let base = owned_child_invocation(mode, "launch", ChildSession::start(
+                                    config, "acp.stderr-bound".into(), None, None, 1, TurnCancellation::default(),
+                                )).await.unwrap();
+                                assert!(base.diagnostics.negotiated.load(Ordering::Acquire));
+                                owned_child_invocation(mode, "new", base.prompt("later".into(), TurnCancellation::default())).await.unwrap();
+                                owned_child_invocation(mode, "close", base.close()).await.unwrap();
+                                let mut closed = base.closed_signal();
+                                let registry = Arc::downgrade(&base.diagnostics);
+                                drop(base);
+                                closed.wait_for(|closed| *closed).await.unwrap();
+                                while registry.upgrade().is_some() {
+                                    tokio::task::yield_now().await;
+                                }
+                            }).await.expect("no stderr backpressure deadlock or negotiation failure");
+                        }
+                    });
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "acp_child::tests::pre_negotiation_stderr::real_peer_exceeds_production_budget_before_ack_and_keeps_later_ownership",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env(events::EVENTS_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let warning = format!(
+                "pre-negotiation stderr exceeded {PRE_NEGOTIATION_STDERR_LIMIT}-byte limit"
+            );
+            assert_eq!(stderr.matches(&warning).count(), 3, "{stderr}");
+            let diagnostics = stderr
+                .lines()
+                .filter_map(events::parse_diagnostic)
+                .collect::<Vec<_>>();
+            for mode in ["complete", "split-marker", "runtime-suffix"] {
+                for (call, owner) in [
+                    ("later-new", "launch"),
+                    ("later-prompt", "new"),
+                    ("later-close", "close"),
+                ] {
+                    let operation = DiagnosticOperation::new(format!("{mode}:{owner}")).unwrap();
+                    let matches = diagnostics.iter().filter(|envelope| {
+                        envelope.operation.as_ref() == Some(&operation)
+                            && matches!(&envelope.event, RuntimeEvent::ChildStarted { call: actual, .. } if actual == call)
+                    }).collect::<Vec<_>>();
+                    assert_eq!(
+                        matches.len(),
+                        1,
+                        "missing or duplicate owned {mode}/{call}: {stderr}"
+                    );
+                    let admission = diagnostics
+                        .iter()
+                        .find(|envelope| {
+                            envelope.operation.as_ref() == Some(&operation)
+                                && matches!(envelope.event, RuntimeEvent::SessionStarted { .. })
+                        })
+                        .unwrap();
+                    assert!(matches[0].activation.is_some());
+                    assert_eq!(matches[0].activation, admission.activation);
+                }
+            }
+            assert!(
+                !diagnostics.iter().any(|envelope| matches!(
+                    &envelope.event, RuntimeEvent::ChildStarted { call, .. }
+                        if call == "suspicious-suffix" || call == "discard-before-ack"
+                )),
+                "discarded bytes must never become owned runtime events: {stderr}"
+            );
+            assert!(
+                !stderr.contains("suspicious-suffix"),
+                "partial suffix must be discarded, not printed"
+            );
         }
     }
 
@@ -2249,7 +3831,10 @@ mod tests {
             let stderr = child.stderr.take().unwrap();
             let mut output = Vec::new();
 
-            forward_stderr(stderr, "acp.kit", Some("s-owner"), |item| output.push(item)).await;
+            forward_stderr(stderr, "acp.kit", Some("s-owner"), None, |item| {
+                output.push(item)
+            })
+            .await;
             let status = child.wait().await.unwrap();
 
             assert_eq!(status.code(), Some(23));
@@ -2257,7 +3842,9 @@ mod tests {
                 .iter()
                 .filter_map(|item| match item {
                     ForwardedStderr::RuntimeLine(line) => Some(line.clone()),
-                    ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => None,
+                    ForwardedStderr::Diagnostic(_)
+                    | ForwardedStderr::Cleanup(_)
+                    | ForwardedStderr::OwnedCleanup(_, _) => None,
                 })
                 .collect::<Vec<_>>();
             assert_eq!(forwarded, lines);
@@ -2278,14 +3865,16 @@ mod tests {
                     id,
                     ..
                 }) => id == "s-owner",
-                ForwardedStderr::Diagnostic(_) | ForwardedStderr::Cleanup(_) => false,
+                ForwardedStderr::Diagnostic(_)
+                | ForwardedStderr::Cleanup(_)
+                | ForwardedStderr::OwnedCleanup(_, _) => false,
             }));
         }
 
         #[tokio::test]
         async fn emits_cleanup_once_on_normal_eof() {
             let mut output = Vec::new();
-            forward_stderr(&b""[..], "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(&b""[..], "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;
@@ -2295,7 +3884,7 @@ mod tests {
         #[tokio::test]
         async fn emits_cleanup_once_on_abrupt_stream_error() {
             let mut output = Vec::new();
-            forward_stderr(&b"\xff"[..], "acp.kit", Some("s-owner"), |item| {
+            forward_stderr(&b"\xff"[..], "acp.kit", Some("s-owner"), None, |item| {
                 output.push(item)
             })
             .await;
