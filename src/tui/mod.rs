@@ -17,12 +17,15 @@ mod ui;
 mod wrap;
 
 use std::{
+    future::{Future, poll_fn},
     path::{Path, PathBuf},
+    pin::pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -41,7 +44,10 @@ use crossterm::{
     style::Print,
     terminal::EnterAlternateScreen,
 };
-use futures_util::StreamExt;
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
 use ratatui::DefaultTerminal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -466,17 +472,39 @@ async fn wait_for_connected_authentication(
     updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
 ) -> ConnectedAuthentication {
-    tokio::pin!(authentication);
+    let mut authentication = pin!(authentication);
+    let mut next_priority = 0;
     loop {
-        tokio::select! {
-            authenticated = &mut authentication => {
-                return ConnectedAuthentication::Completed(authenticated);
+        // Poll only until one source is ready: an update must not be consumed
+        // when authentication or exit wins. Rotate after each delivered update
+        // so a continuously ready update queue cannot starve completion.
+        let outcome = poll_fn(|cx| {
+            for offset in 0..3 {
+                let branch = (next_priority + offset) % 3;
+                let ready = match branch {
+                    0 => authentication
+                        .as_mut()
+                        .poll(cx)
+                        .map(|output| Err(ConnectedAuthentication::Completed(output))),
+                    1 => updates.poll_recv(cx).map(|update| match update {
+                        Some(update) => Ok(update),
+                        None => Err(ConnectedAuthentication::UpdatesClosed),
+                    }),
+                    _ => std::pin::Pin::new(&mut *exit)
+                        .poll(cx)
+                        .map(|status| Err(ConnectedAuthentication::AgentExited(status))),
+                };
+                if ready.is_ready() {
+                    next_priority = (branch + 1) % 3;
+                    return ready;
+                }
             }
-            update = updates.recv() => match update {
-                Some(update) => apply_pending_updates(app, route, updates, update),
-                None => return ConnectedAuthentication::UpdatesClosed,
-            },
-            status = &mut *exit => return ConnectedAuthentication::AgentExited(status),
+            Poll::Pending
+        })
+        .await;
+        match outcome {
+            Ok(update) => apply_pending_updates(app, route, updates, update),
+            Err(outcome) => return outcome,
         }
     }
 }
@@ -489,9 +517,19 @@ async fn wait_for_terminal_auth(
         Ok(child) => child,
         Err(error) => return Some(Err(error)),
     };
-    tokio::select! {
-        status = child.wait() => Some(status),
-        () = stop.requested() => {
+    // Completion wins a simultaneous stop, an outcome the old race allowed.
+    // This scope destroys both wait futures before killing/reborrowing child.
+    let status = {
+        let waited = pin!(child.wait());
+        let stopped = pin!(stop.requested());
+        match select(waited, stopped).await {
+            Either::Left((status, _)) => Some(status),
+            Either::Right(((), _)) => None,
+        }
+    };
+    match status {
+        Some(status) => Some(status),
+        None => {
             let _ = child.kill().await;
             None
         }
@@ -515,13 +553,19 @@ async fn bounded_agent_request<T>(
     stop: impl std::future::Future<Output = ()>,
     timeout: Duration,
 ) -> Result<T, RequestInterrupt> {
-    tokio::select! {
-        output = request => Ok(output),
-        status = &mut *exit => Err(RequestInterrupt::AgentExited(
+    // One-shot ties prefer request, exit, stop, then timeout; each was a
+    // previously allowed winner. All losers are owned here and drop on return.
+    let request = pin!(request);
+    let stop = pin!(stop);
+    let timeout = pin!(tokio::time::sleep(timeout));
+    let interrupted = select(&mut *exit, select(stop, timeout));
+    match select(request, interrupted).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right((Either::Left((status, _)), _)) => Err(RequestInterrupt::AgentExited(
             status.ok().and_then(Result::ok),
         )),
-        () = stop => Err(RequestInterrupt::Stopped),
-        () = tokio::time::sleep(timeout) => Err(RequestInterrupt::TimedOut),
+        Either::Right((Either::Right((Either::Left(_), _)), _)) => Err(RequestInterrupt::Stopped),
+        Either::Right((Either::Right((Either::Right(_), _)), _)) => Err(RequestInterrupt::TimedOut),
     }
 }
 
@@ -530,12 +574,15 @@ async fn bounded_startup_request<T>(
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
     timeout: Duration,
 ) -> Result<T, RequestFailure> {
-    tokio::select! {
-        output = request => Ok(output),
-        status = &mut *exit => Err(RequestFailure::AgentExited(
+    // One-shot ties prefer request, exit, then timeout (all formerly allowed).
+    let request = pin!(request);
+    let timeout = pin!(tokio::time::sleep(timeout));
+    match select(request, select(&mut *exit, timeout)).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right((Either::Left((status, _)), _)) => Err(RequestFailure::AgentExited(
             status.ok().and_then(Result::ok),
         )),
-        () = tokio::time::sleep(timeout) => Err(RequestFailure::TimedOut),
+        Either::Right((Either::Right(_), _)) => Err(RequestFailure::TimedOut),
     }
 }
 
@@ -902,15 +949,25 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let (exit_tx, mut exit_rx) = oneshot::channel();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watcher = tokio::spawn(async move {
-            let status = tokio::select! {
-                status = child.wait() => {
-                    let notification = status.as_ref().copied().map_err(|error| {
-                        std::io::Error::new(error.kind(), error.to_string())
-                    });
+            // A completed child wins a shutdown tie, as it could before.
+            // End the wait borrow before storage cleanup starts another wait.
+            let exited = {
+                let waited = pin!(child.wait());
+                match select(waited, shutdown_rx).await {
+                    Either::Left((status, _)) => Some(status),
+                    Either::Right(_) => None,
+                }
+            };
+            let status = match exited {
+                Some(status) => {
+                    let notification = status
+                        .as_ref()
+                        .copied()
+                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()));
                     let _ = exit_tx.send(notification);
                     status
                 }
-                _ = shutdown_rx => {
+                None => {
                     // ACP EOF makes serve stop A2A, drain sessions, and run
                     // final storage recovery before exiting.
                     wait_for_storage_exit(&mut child, Duration::from_secs(10)).await
@@ -1069,6 +1126,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         "could not start the session: {}; use /login to authenticate",
                         error_detail(&session_error)
                     ));
+                    enum LoginEvent {
+                        Terminal(Option<std::io::Result<Event>>),
+                        Tick,
+                        Stop,
+                    }
+                    let mut next_priority = 0;
                     loop {
                     if let Err(error) =
                         terminal.draw(|frame| ui::draw(frame, &mut app, &mut images))
@@ -1076,8 +1139,33 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         leave(&mut terminal);
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
-                    tokio::select! {
-                        event = events.next() => {
+                    let event = {
+                        let redraw = app.needs_redraw_tick();
+                        let mut stopped = pin!(stop.requested());
+                        // Rotate the first eligible source after every winner.
+                        // If none is ready, poll every eligible source with the
+                        // real task waker. Keep the signal future alive across
+                        // Pending, and drop it before any handler resets input.
+                        poll_fn(|cx| {
+                            for offset in 0..4 {
+                                let branch = (next_priority + offset) % 4;
+                                let ready = match branch {
+                                    0 => events.poll_next_unpin(cx).map(|event| Err(LoginEvent::Terminal(event))),
+                                    1 => updates_rx.poll_recv(cx).map(Ok),
+                                    2 if redraw => ticker.poll_tick(cx).map(|_| Err(LoginEvent::Tick)),
+                                    3 => stopped.as_mut().poll(cx).map(|()| Err(LoginEvent::Stop)),
+                                    _ => Poll::Pending,
+                                };
+                                if ready.is_ready() {
+                                    next_priority = (branch + 1) % 4;
+                                    return ready;
+                                }
+                            }
+                            Poll::Pending
+                        }).await
+                    };
+                    match event {
+                        Err(LoginEvent::Terminal(event)) => {
                             let action = match event {
                                 Some(Ok(event)) => handle(&mut app, event),
                                 Some(Err(_)) | None => {
@@ -1192,15 +1280,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 _ => app.note("authenticate before starting a session"),
                             }
                         }
-                        update = updates_rx.recv() => match update {
+                        Ok(update) => match update {
                             Some(update) => app.apply(update.update),
                             None => {
                                 leave(&mut terminal);
                                 return Ok(());
                             }
                         },
-                        _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
-                        () = stop.requested() => {
+                        Err(LoginEvent::Tick) => app.tick(),
+                        Err(LoginEvent::Stop) => {
                             leave(&mut terminal);
                             return Ok(());
                         }
@@ -1226,13 +1314,63 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             app.start_session(active_session_id.clone());
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let result: Result<(), agent_client_protocol::Error> = async {
+                enum SessionEvent {
+                    StorageShutdown,
+                    Terminal(Option<std::io::Result<Event>>),
+                    ModelSwitch(ModelSwitchCompletion),
+                    Update(Option<QueuedUpdate>),
+                    Tick,
+                    Stop,
+                }
+                let mut next_priority = 0;
+                let mut switches_closed = false;
                 loop {
                     terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
-                    tokio::select! {
-                        _ = storage_shutdown.cancelled() => return Ok(()),
-                        terminal_event = events.next() => {
+                    let event = {
+                        let redraw = app.needs_redraw_tick();
+                        let mut stopped = pin!(stop.requested());
+                        let mut shutdown = pin!(storage_shutdown.cancelled());
+                        // A local round-robin race keeps hot input/update queues
+                        // from starving stop, storage, model switching or ticks.
+                        // Return on the first Ready so no losing source consumes
+                        // an event. Pending registers every eligible source with
+                        // the real task waker; cancellation futures stay pinned
+                        // until this wait ends. This scope drops all losers and
+                        // releases input borrows before handlers drain/reset them.
+                        poll_fn(|cx| {
+                            for offset in 0..6 {
+                                let branch = (next_priority + offset) % 6;
+                                let ready = match branch {
+                                    0 => shutdown.as_mut().poll(cx).map(|()| SessionEvent::StorageShutdown),
+                                    1 => events.poll_next_unpin(cx).map(SessionEvent::Terminal),
+                                    2 if !switches_closed => match switch_rx.poll_recv(cx) {
+                                        Poll::Ready(Some(completion)) => Poll::Ready(SessionEvent::ModelSwitch(completion)),
+                                        Poll::Ready(None) => {
+                                            // Like the former Some pattern, EOF
+                                            // disables this branch, not the loop.
+                                            switches_closed = true;
+                                            Poll::Pending
+                                        }
+                                        Poll::Pending => Poll::Pending,
+                                    },
+                                    3 => updates_rx.poll_recv(cx).map(SessionEvent::Update),
+                                    4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
+                                    5 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
+                                    _ => Poll::Pending,
+                                };
+                                if ready.is_ready() {
+                                    next_priority = (branch + 1) % 6;
+                                    return ready;
+                                }
+                            }
+                            Poll::Pending
+                        }).await
+                    };
+                    match event {
+                        SessionEvent::StorageShutdown => return Ok(()),
+                        SessionEvent::Terminal(terminal_event) => {
                             // A paste is a burst: one bracketed-paste event, or
                             // thousands of key events where the terminal cannot
                             // bracket it. Applying everything the terminal has
@@ -1747,7 +1885,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 Action::None | Action::Redraw => {}
                             }
                         },
-                        Some(completion) = switch_rx.recv() => {
+                        SessionEvent::ModelSwitch(completion) => {
                             let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation)? else { continue; };
                             match completion.response {
                                 Ok(response) => {
@@ -1778,7 +1916,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                             }
                         },
-                        update = updates_rx.recv() => match update {
+                        SessionEvent::Update(update) => match update {
                             Some(update) => apply_pending_updates(
                                 &mut app,
                                 &transition_session,
@@ -1787,8 +1925,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             ),
                             None => return Ok(()),
                         },
-                        _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
-                        () = stop.requested() => return Ok(()),
+                        SessionEvent::Tick => app.tick(),
+                        SessionEvent::Stop => return Ok(()),
                     }
                 }
             }
@@ -2314,11 +2452,11 @@ impl Stop {
 
     #[cfg(unix)]
     async fn requested(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-            _ = self.hangup.recv() => {}
-        }
+        // All signals mean stop; deterministic ties have the same outcome.
+        let interrupt = pin!(self.interrupt.recv());
+        let terminate = pin!(self.terminate.recv());
+        let hangup = pin!(self.hangup.recv());
+        let _ = select(interrupt, select(terminate, hangup)).await;
     }
 
     #[cfg(not(unix))]
@@ -2332,10 +2470,13 @@ async fn bounded_graceful_close<T>(
     stop: impl std::future::Future<Output = ()>,
     grace: Duration,
 ) -> Option<T> {
-    tokio::select! {
-        output = close => Some(output),
-        () = stop => None,
-        () = tokio::time::sleep(grace) => None,
+    // A completed close wins a stop/deadline tie, as the previous race allowed.
+    let close = pin!(close);
+    let stop = pin!(stop);
+    let deadline = pin!(tokio::time::sleep(grace));
+    match select(close, select(stop, deadline)).await {
+        Either::Left((output, _)) => Some(output),
+        Either::Right(_) => None,
     }
 }
 
@@ -3254,6 +3395,143 @@ mod tests {
 
         assert!(updates_rx.try_recv().is_ok());
         assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_authentication_registers_wakes_and_preserves_updates() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        struct TaskWake(AtomicBool);
+        impl Wake for TaskWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+        let wake = Arc::new(TaskWake(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        {
+            let authentication = async {
+                auth_rx.await.unwrap();
+                None
+            };
+            let mut waiting = std::pin::pin!(wait_for_connected_authentication(
+                authentication,
+                &mut app,
+                &route,
+                &mut updates_rx,
+                &mut exit_rx,
+            ));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(
+                    "while authenticating".into(),
+                )))
+                .unwrap();
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            auth_tx.send(()).unwrap();
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            // A simultaneous update must remain queued if authentication wins.
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(
+                    "after authentication".into(),
+                )))
+                .unwrap();
+            assert!(matches!(
+                waiting.as_mut().poll(&mut cx),
+                Poll::Ready(ConnectedAuthentication::Completed(None))
+            ));
+        }
+        assert_eq!(app.logs, ["while authenticating"]);
+        let remaining = updates_rx.try_recv().unwrap();
+        assert!(
+            matches!(remaining.update, Update::Log(message) if message == "after authentication")
+        );
+        assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_authentication_exit_progresses_with_a_ready_update_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Exercise the existing bounded-update API with more than one burst,
+        // without asserting an exact number of scheduler polls or deliveries.
+        let expected: Vec<_> = (0..MAX_BURST * 3).map(|index| index.to_string()).collect();
+        for message in &expected {
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(message.clone())))
+                .unwrap();
+        }
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        drop(exit_tx);
+        let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = wait_for_connected_authentication(
+            async {
+                let _ = auth_rx.await;
+                None
+            },
+            &mut app,
+            &route,
+            &mut updates_rx,
+            &mut exit_rx,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ConnectedAuthentication::AgentExited(Err(_))
+        ));
+        assert!(
+            auth_tx.is_closed(),
+            "losing authentication is dropped before return"
+        );
+        assert!(
+            !updates_rx.is_empty(),
+            "exit progresses before the backlog drains"
+        );
+        // App deliberately caps displayed logs. Verify continuity from its
+        // last retained message through every still-queued update instead.
+        let mut next = app.logs.last().unwrap().parse::<usize>().unwrap() + 1;
+        while let Ok(update) = updates_rx.try_recv() {
+            let Update::Log(message) = update.update else {
+                panic!("unexpected update")
+            };
+            assert_eq!(message, expected[next]);
+            next += 1;
+        }
+        assert_eq!(next, expected.len());
     }
 
     #[tokio::test]
@@ -4336,7 +4614,7 @@ a = [still text]
         )
         .unwrap();
         let registry = crate::protocols::acp::SessionRegistry::new();
-        let agent = crate::protocols::acp::v2::component(runtime, registry).unwrap();
+        let agent = crate::protocols::acp::v2::component(runtime, registry);
         let (client_transport, agent_transport) = Channel::duplex();
         let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
         let workspace = root.path().to_path_buf();
@@ -4565,6 +4843,70 @@ mod signal_tests {
     use std::{future, time::Duration};
 
     use super::{RequestInterrupt, Stop, bounded_agent_request, bounded_graceful_close};
+
+    #[tokio::test]
+    async fn request_ties_preserve_exit_and_drop_losers_before_return() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = bounded_agent_request(
+            future::ready(7),
+            &mut exit_rx,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(result, Ok(7)));
+        assert!(stop_tx.is_closed());
+        assert!(
+            exit_rx.try_recv().unwrap().is_err(),
+            "losing exit was not consumed"
+        );
+
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = bounded_agent_request(
+            request_rx,
+            &mut exit_rx,
+            future::ready(()),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(matches!(result, Err(RequestInterrupt::Stopped)));
+        assert!(
+            request_tx.is_closed(),
+            "cancelled request released before cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_close_drops_the_losing_request_before_cleanup() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(
+            bounded_graceful_close(close_rx, future::ready(()), Duration::from_secs(30))
+                .await
+                .is_none()
+        );
+        assert!(close_tx.is_closed());
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        assert_eq!(
+            bounded_graceful_close(
+                future::ready(7),
+                async move {
+                    let _ = stop_rx.await;
+                },
+                Duration::ZERO
+            )
+            .await,
+            Some(7)
+        );
+        assert!(stop_tx.is_closed());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn startup_requests_preserve_success_timeout_and_agent_exit() {

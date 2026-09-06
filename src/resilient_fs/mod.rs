@@ -240,10 +240,11 @@ impl Image {
         })
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let n = usize::try_from(self.len.saturating_sub(offset).min(buf.len() as u64)).unwrap();
+        // Both lengths are bounded by the addressable output buffer.
+        let n = self.len.saturating_sub(offset).min(buf.len() as u64) as usize;
         let buf = &mut buf[..n];
         buf.fill(0);
-        let base_n = usize::try_from(self.base_len.saturating_sub(offset).min(n as u64)).unwrap();
+        let base_n = self.base_len.saturating_sub(offset).min(n as u64) as usize;
         match &self.source {
             Source::Memory(data) => {
                 if base_n > 0 {
@@ -731,28 +732,32 @@ impl Fs {
         Ok(())
     }
     fn disk_path(s: &State, path: &Path) -> PathBuf {
-        let mut mapped = if let Some((to, from)) = s
+        let mut mapped = if let Some((_, from, relative)) = s
             .redirects
             .iter()
-            .filter(|(to, _)| path.starts_with(to))
-            .max_by_key(|(to, _)| to.components().count())
+            .filter_map(|(to, from)| {
+                path.strip_prefix(to)
+                    .ok()
+                    .map(|relative| (to, from, relative))
+            })
+            .max_by_key(|(to, _, _)| to.components().count())
         {
-            if path == to {
+            if relative.as_os_str().is_empty() {
                 from.clone()
             } else {
-                from.join(path.strip_prefix(to).unwrap())
+                from.join(relative)
             }
         } else {
             path.to_path_buf()
         };
         for p in &s.pending {
             if let Action::Rename { from, to, stage: 1 } = &p.action
-                && mapped.starts_with(from)
+                && let Ok(relative) = mapped.strip_prefix(from)
             {
-                mapped = if mapped == *from {
+                mapped = if relative.as_os_str().is_empty() {
                     to.clone()
                 } else {
-                    to.join(mapped.strip_prefix(from).unwrap())
+                    to.join(relative)
                 };
             }
         }
@@ -1058,14 +1063,14 @@ impl Fs {
     }
     // Healthy IO never consumes the configured fallback budget. Only a
     // complete, unpublished obligation enters the bounded write-back queue.
-    fn submit(&self, s: &mut State, mut action: Action) -> (bool, io::Result<()>) {
+    // Ok means accepted (possibly queued), never durable. Err means rejected;
+    // callers must not publish an image, namespace change, or cursor on rejection.
+    fn submit(&self, s: &mut State, mut action: Action) -> io::Result<()> {
         if s.pending.try_reserve(1).is_err() {
-            return (false, Err(allocation_oom()));
+            return Err(allocation_oom());
         }
         if !s.pending.is_empty() {
-            if let Err(e) = self.reserve(s, action.bytes().saturating_mul(2), 1) {
-                return (false, Err(e));
-            }
+            self.reserve(s, action.bytes().saturating_mul(2), 1)?;
             return self.enqueue(s, action);
         }
         let result = self
@@ -1074,7 +1079,7 @@ impl Fs {
             .map_or(Ok(()), |l| l.check())
             .and_then(|_| self.replay(&mut action));
         match result {
-            Ok(()) => (true, Ok(())),
+            Ok(()) => Ok(()),
             Err(e) => {
                 let published = matches!(
                     action,
@@ -1088,17 +1093,17 @@ impl Fs {
                 }
                 if !capacity(&e) && !published {
                     self.abandon(&action);
-                    return (false, Err(e));
+                    return Err(e);
                 }
                 if !published && let Err(e) = self.reserve(s, action.bytes().saturating_mul(2), 1) {
                     self.abandon(&action);
-                    return (false, Err(e));
+                    return Err(e);
                 }
                 s.pending.push_back(Pending {
                     action,
                     lease: self.lease.as_ref().map(|c| c.authority.clone()),
                 });
-                (true, Ok(()))
+                Ok(())
             }
         }
     }
@@ -1181,7 +1186,7 @@ impl Fs {
         }
         Ok(())
     }
-    fn enqueue(&self, s: &mut State, action: Action) -> (bool, io::Result<()>) {
+    fn enqueue(&self, s: &mut State, action: Action) -> io::Result<()> {
         s.pending.push_back(Pending {
             action,
             lease: self.lease.as_ref().map(|c| c.authority.clone()),
@@ -1204,13 +1209,9 @@ impl Fs {
                 if !published && let Some(p) = s.pending.pop_back() {
                     self.abandon(&p.action);
                 }
-                if published {
-                    (true, Ok(()))
-                } else {
-                    (false, Err(e))
-                }
+                if published { Ok(()) } else { Err(e) }
             }
-            _ => (true, Ok(())),
+            _ => Ok(()),
         }
     }
     pub fn recover(&self) -> RecoveryReport {
@@ -1252,11 +1253,11 @@ impl Fs {
                     {
                         s.redirects.retain(|(path, _)| *path != to);
                         for (_, source) in &mut s.redirects {
-                            if source.starts_with(&from) {
-                                *source = if *source == from {
+                            if let Ok(relative) = source.strip_prefix(&from) {
+                                *source = if relative.as_os_str().is_empty() {
                                     to.clone()
                                 } else {
-                                    to.join(source.strip_prefix(&from).unwrap())
+                                    to.join(relative)
                                 };
                             }
                         }
@@ -1287,15 +1288,21 @@ impl Fs {
                 permissions,
                 stage,
             } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(
+                        io::ErrorKind::InvalidInput,
+                        "replacement path has no parent",
+                    )
+                })?;
                 if *stage == 0 {
-                    let parent = b.metadata(path.parent().unwrap(), false)?;
+                    let parent = b.metadata(directory, false)?;
                     if !parent.is_dir() {
                         return Err(error(
                             io::ErrorKind::NotADirectory,
                             "replacement parent changed",
                         ));
                     }
-                    *parent_identity = b.identity(path.parent().unwrap(), false)?;
+                    *parent_identity = b.identity(directory, false)?;
                     if parent_identity.is_none() {
                         return Err(error(
                             io::ErrorKind::PermissionDenied,
@@ -1323,10 +1330,7 @@ impl Fs {
                     #[cfg(unix)]
                     let named = b.metadata(temp, false)?;
                     if !same_disk_identity(file.identity()?, b.identity(temp, false)?)
-                        || !same_disk_identity(
-                            *parent_identity,
-                            b.identity(path.parent().unwrap(), false)?,
-                        )
+                        || !same_disk_identity(*parent_identity, b.identity(directory, false)?)
                     {
                         return Err(error(
                             io::ErrorKind::PermissionDenied,
@@ -1356,20 +1360,26 @@ impl Fs {
                         *stage = 3;
                     }
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Mkdir {
                 path,
                 private,
                 stage,
             } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "directory path has no parent")
+                })?;
                 if *stage == 0 {
                     b.create_dir(path, *private)?;
                     *stage = 1;
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Unlink { path, dir, stage } => {
+                let directory = path.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "removed path has no parent")
+                })?;
                 if *stage == 0 {
                     match if *dir {
                         b.remove_dir(path)
@@ -1381,16 +1391,25 @@ impl Fs {
                     }
                     *stage = 1;
                 }
-                b.sync_directory(path.parent().unwrap())
+                b.sync_directory(directory)
             }
             Action::Rename { from, to, stage } => {
+                let from_parent = from.parent().ok_or_else(|| {
+                    error(io::ErrorKind::InvalidInput, "rename source has no parent")
+                })?;
+                let to_parent = to.parent().ok_or_else(|| {
+                    error(
+                        io::ErrorKind::InvalidInput,
+                        "rename destination has no parent",
+                    )
+                })?;
                 if *stage == 0 {
                     b.rename(from, to)?;
                     *stage = 1;
                 }
-                b.sync_directory(to.parent().unwrap())?;
-                if from.parent() != to.parent() {
-                    b.sync_directory(from.parent().unwrap())?;
+                b.sync_directory(to_parent)?;
+                if from_parent != to_parent {
+                    b.sync_directory(from_parent)?;
                 }
                 Ok(())
             }
@@ -1506,10 +1525,7 @@ impl Fs {
             modified: SystemTime::now(),
         };
         let a = Self::put_action(&mut s, &path, Image::memory(data.clone()), perms);
-        let (accepted, result) = self.submit(&mut s, a);
-        if !accepted {
-            return result;
-        }
+        self.submit(&mut s, a)?;
         if new_object {
             // Acceptance replaces the logical name even when publication is queued.
             // Old handles must not publish writes or chmod through that name.
@@ -1528,7 +1544,7 @@ impl Fs {
         };
         Self::entry(&mut s, path.clone(), Some(object))?;
         self.rebase(&mut s)?;
-        result
+        Ok(())
     }
     fn prune(s: &mut State) {
         s.entries
@@ -1707,17 +1723,14 @@ impl Fs {
             permissions: self.new_permissions(&s, &p, private, true)?,
             modified: SystemTime::now(),
         };
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Mkdir {
                 path: p.clone(),
                 private,
                 stage: 0,
             },
-        );
-        if !accepted {
-            return result;
-        }
+        )?;
         Self::entry(
             &mut s,
             p.clone(),
@@ -1726,7 +1739,7 @@ impl Fs {
                 meta,
             )))),
         )?;
-        result
+        Ok(())
     }
     pub fn create_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         self.mkdir_all(path.as_ref(), false)
@@ -1785,24 +1798,23 @@ impl Fs {
             ));
         }
         Self::prepare(&mut s, 1)?;
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Unlink {
                 path: p.clone(),
                 dir,
                 stage: 0,
             },
-        );
-        if accepted {
-            for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object)?;
-                if object.path.as_ref() == Some(&p) {
-                    object.path = None;
-                }
+        )?;
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let mut object = lock(&object)?;
+            if object.path.as_ref() == Some(&p) {
+                object.path = None;
             }
-            Self::entry(&mut s, p, None)?;
         }
-        result
+        Self::entry(&mut s, p, None)?;
+
+        Ok(())
     }
     pub fn remove_dir_all<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let p = self.norm(path.as_ref())?;
@@ -1874,52 +1886,50 @@ impl Fs {
             .map_err(|_| allocation_oom())?;
         moved.push((to.clone(), Some(root.clone())));
         for e in &s.entries {
-            if e.path.starts_with(&from) && e.path != from {
-                moved.push((
-                    to.join(e.path.strip_prefix(&from).unwrap()),
-                    e.object.clone(),
-                ));
+            if e.path != from
+                && let Ok(relative) = e.path.strip_prefix(&from)
+            {
+                moved.push((to.join(relative), e.object.clone()));
             }
         }
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Rename {
                 from: from.clone(),
                 to: to.clone(),
                 stage: 0,
             },
-        );
-        if accepted {
-            for object in s.objects.iter().filter_map(|w| w.upgrade()) {
-                let mut object = lock(&object)?;
-                if let Some(path) = &object.path {
-                    if path.starts_with(&from) {
-                        object.path = Some(if *path == from {
-                            to.clone()
-                        } else {
-                            to.join(path.strip_prefix(&from).unwrap())
-                        });
-                    } else if path.starts_with(&to) {
-                        object.path = None;
-                    }
+        )?;
+        for object in s.objects.iter().filter_map(|w| w.upgrade()) {
+            let mut object = lock(&object)?;
+            if let Some(path) = &object.path {
+                if let Ok(relative) = path.strip_prefix(&from) {
+                    object.path = Some(if relative.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(relative)
+                    });
+                } else if path.starts_with(&to) {
+                    object.path = None;
                 }
-            }
-            for e in &mut s.entries {
-                if e.path.starts_with(&from) {
-                    e.object = None;
-                }
-            }
-            Self::entry(&mut s, from.clone(), None)?;
-            for (path, object) in moved {
-                Self::entry(&mut s, path, object)?;
-            }
-            s.redirects
-                .retain(|(path, _)| !path.starts_with(&from) && !path.starts_with(&to));
-            if s.pending.iter().any(|p| p.action.touches(&to)) {
-                s.redirects.push((to, source));
             }
         }
-        result
+        for e in &mut s.entries {
+            if e.path.starts_with(&from) {
+                e.object = None;
+            }
+        }
+        Self::entry(&mut s, from.clone(), None)?;
+        for (path, object) in moved {
+            Self::entry(&mut s, path, object)?;
+        }
+        s.redirects
+            .retain(|(path, _)| !path.starts_with(&from) && !path.starts_with(&to));
+        if s.pending.iter().any(|p| p.action.touches(&to)) {
+            s.redirects.push((to, source));
+        }
+
+        Ok(())
     }
     pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<u64> {
         let data = Zeroizing::new(self.read(&from)?);
@@ -1940,16 +1950,13 @@ impl Fs {
         self.secure_path(&s, &p, false)?;
         self.capture_shallow(&mut s, &p)?;
         Self::prepare(&mut s, 0)?;
-        let (accepted, result) = self.submit(
+        self.submit(
             &mut s,
             Action::Chmod {
                 path: p.clone(),
                 permissions: permissions.clone(),
             },
-        );
-        if !accepted {
-            return result;
-        }
+        )?;
         if let Some(o) = s
             .entries
             .iter()
@@ -1960,7 +1967,7 @@ impl Fs {
             o.meta.permissions = permissions.clone();
             o.meta.disk = None;
         }
-        result
+        Ok(())
     }
     fn capture_shallow(&self, s: &mut State, p: &Path) -> io::Result<()> {
         let meta = self.lookup(s, p)?;
@@ -1989,16 +1996,16 @@ impl Fs {
             return Err(error(io::ErrorKind::NotADirectory, "not a directory"));
         }
         Self::prepare(&mut s, 0)?;
-        self.submit(&mut s, Action::Sync { path: p }).1
+        self.submit(&mut s, Action::Sync { path: p })
     }
     pub fn open_beneath<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         root: P,
         relative: Q,
     ) -> io::Result<File> {
-        if relative.as_ref().as_os_str().is_empty()
+        let relative = relative.as_ref();
+        if relative.as_os_str().is_empty()
             || relative
-                .as_ref()
                 .components()
                 .any(|c| !matches!(c, Component::Normal(_)))
         {
@@ -2028,7 +2035,7 @@ impl Fs {
         let native = self
             .service
             .backend
-            .open_beneath(&Self::disk_path(&s, &root), p.strip_prefix(&root).unwrap())?;
+            .open_beneath(&Self::disk_path(&s, &root), relative)?;
         if !native.metadata()?.is_file() {
             return Err(error(io::ErrorKind::InvalidInput, "not a regular file"));
         }
@@ -2155,11 +2162,7 @@ impl OpenOptions {
             };
             let obj = fs.live_object(&s, &p)?;
             let a = Fs::put_action(&mut s, &p, Image::memory(data.clone()), perms);
-            let (accepted, result) = fs.submit(&mut s, a);
-            if !accepted {
-                result?;
-                unreachable!();
-            }
+            fs.submit(&mut s, a)?;
             let object = if let Some(obj) = obj {
                 *lock(&obj)? = Object::memory(data.clone(), meta);
                 obj
@@ -2167,7 +2170,6 @@ impl OpenOptions {
                 Arc::new(Mutex::new(Object::memory(data.clone(), meta)))
             };
             Fs::entry(&mut s, p.clone(), Some(object))?;
-            result?;
         }
         fs.rebase(&mut s)?;
         let object = fs.object(&mut s, &p)?;
@@ -2297,19 +2299,15 @@ impl File {
         } else if let Some(lease) = &self.fs.lease {
             lease.check()?;
         }
-        let (accepted, result) = if let Some(path) = &path {
+        if let Some(path) = &path {
             s.entries.try_reserve(1).map_err(|_| allocation_oom())?;
             s.objects.try_reserve(1).map_err(|_| allocation_oom())?;
             let action = Fs::put_action(&mut s, path, image.clone(), perms);
             self.fs.submit(&mut s, action)
         } else {
             self.fs.reserve(&mut s, image.payload_bytes(), 0)?;
-            (true, Ok(()))
-        };
-        if !accepted {
-            result?;
-            unreachable!();
-        }
+            Ok(())
+        }?;
         {
             let mut object = lock(&self.object)?;
             object.image = image;
@@ -2328,7 +2326,6 @@ impl File {
             *cursor = end;
         }
         self.fs.rebase(&mut s)?;
-        result?;
         Ok(data.len())
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
@@ -2369,7 +2366,7 @@ impl File {
             }
             object.path.clone()
         };
-        let (accepted, result) = if let Some(path) = &path {
+        if let Some(path) = &path {
             self.fs.authority(path)?;
             self.fs.secure_path(&s, path, false)?;
             Fs::prepare(&mut s, 1)?;
@@ -2384,20 +2381,19 @@ impl File {
             if let Some(lease) = &self.fs.lease {
                 lease.check()?;
             }
-            (true, Ok(()))
-        };
-        if accepted {
-            let mut object = lock(&self.object)?;
-            object.meta.permissions = p;
-            object.meta.disk = None;
-            object.dirty = true;
-            drop(object);
-            if let Some(path) = path {
-                Fs::entry(&mut s, path, Some(self.object.clone()))?;
-            }
-            self.fs.rebase(&mut s)?;
+            Ok(())
+        }?;
+        let mut object = lock(&self.object)?;
+        object.meta.permissions = p;
+        object.meta.disk = None;
+        object.dirty = true;
+        drop(object);
+        if let Some(path) = path {
+            Fs::entry(&mut s, path, Some(self.object.clone()))?;
         }
-        result
+        self.fs.rebase(&mut s)?;
+
+        Ok(())
     }
 }
 impl Read for File {

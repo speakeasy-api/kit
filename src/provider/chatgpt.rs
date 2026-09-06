@@ -811,18 +811,21 @@ fn migrate_legacy_continuation(
     if !legacy_continuation_matches_authentication(&account_binding, authentication_binding) {
         return Ok(());
     }
-    let mut migrated = serde_json::json!({
-        "schema_version": 3,
-        "authentication_binding": authentication_binding,
-        "model": model,
-        "session_id": session_id,
-        "item_id": item_id,
-        "kind": expected_kind,
-    });
+    let mut migrated = serde_json::Map::from_iter([
+        ("schema_version".into(), Value::from(3)),
+        (
+            "authentication_binding".into(),
+            Value::from(authentication_binding),
+        ),
+        ("model".into(), Value::from(model)),
+        ("session_id".into(), Value::from(session_id)),
+        ("item_id".into(), Value::from(item_id)),
+        ("kind".into(), Value::from(expected_kind)),
+    ]);
     if let Some(encrypted_content) = encrypted_content {
-        migrated["encrypted_content"] = Value::String(encrypted_content.to_owned());
+        migrated.insert("encrypted_content".into(), Value::from(encrypted_content));
     }
-    metadata.insert(CONTINUATION_METADATA.into(), migrated);
+    metadata.insert(CONTINUATION_METADATA.into(), Value::Object(migrated));
     Ok(())
 }
 

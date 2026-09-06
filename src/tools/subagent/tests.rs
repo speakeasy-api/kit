@@ -276,6 +276,7 @@ fn explicit_null_output_schema_is_rejected() {
 fn boolean_output_schema_is_supported() {
     let contract = OutputContract::new(Value::Bool(true)).unwrap();
     assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
+    assert!(contract.prompt("respond".into()).ends_with("\ntrue"));
 }
 
 #[test]
@@ -862,6 +863,46 @@ impl MockAcpScenario {
     fn release(path: &Path) {
         std::fs::write(path, b"release").unwrap();
     }
+}
+
+#[tokio::test]
+async fn output_contract_sends_serialized_schema_to_child() {
+    let scenario = MockAcpScenario::new(ScenarioOptions::default());
+    let schema = json!({
+        "type": "object",
+        "description": "A quoted \"decision\"\nwith Unicode: ✓",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"]
+    });
+    let contract = OutputContract::new(schema.clone()).unwrap();
+    let handle = scenario
+        .manager
+        .create(
+            "MOCK_STRUCTURED_OUTPUT".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            Some(&contract),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        handle.output,
+        json!({"approved": true, "reason": "mock approved"})
+    );
+    let expected = format!(
+        "MOCK_STRUCTURED_OUTPUT\n\nReturn only a JSON value matching this JSON Schema. Do not wrap it in Markdown or add commentary:\n{}",
+        serde_json::to_string(&schema).unwrap()
+    );
+    assert!(logged_requests(&scenario.requests).iter().any(|request| {
+        matches!(request, LoggedRequest::Prompt { text, .. } if text == &expected)
+    }));
+    scenario
+        .manager
+        .close(&handle.id, &TurnCancellation::default())
+        .await
+        .unwrap();
 }
 
 mod lifecycle_events {

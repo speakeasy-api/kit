@@ -22,19 +22,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::ValueEnum;
+use futures_util::future::{Either, select};
 use kit::resilient_fs as fs;
 use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
-#[derive(Parser)]
-#[command(version, about = "Coding agent runtime and terminal client")]
 struct Cli {
-    #[command(flatten)]
     telemetry: TelemetryArgs,
-    #[command(flatten)]
+
     openrouter: OpenRouterArgs,
-    #[command(subcommand)]
+
     command: Command,
 }
 
@@ -44,10 +42,8 @@ const OTEL_TRACES_PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
-#[derive(Args)]
 struct OpenRouterArgs {
     /// OpenRouter API key (prefer the environment or stored credentials to keep it out of argv).
-    #[arg(long, global = true, value_name = "KEY")]
     openrouter_api_key: Option<kit::provider::OpenRouterApiKey>,
 }
 
@@ -66,35 +62,25 @@ fn resolve_openrouter_api_key(
         })
 }
 
-#[derive(Args)]
 struct TelemetryArgs {
     /// Resolved local diagnostic setting inherited by built-in Kit children.
-    #[arg(long, hide = true, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
     internal_capture_error_spans: Option<bool>,
     /// OTLP collector endpoint for OpenTelemetry trace export.
-    #[arg(long, global = true)]
     otel_endpoint: Option<String>,
     /// OTLP trace transport: grpc, http/protobuf, or http/json.
-    #[arg(long, global = true)]
     otel_protocol: Option<kit::telemetry::Protocol>,
     /// Capture structured GenAI input and output messages in exported spans.
-    #[arg(long, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
     otel_capture_message_content: Option<bool>,
     /// Maximum captured messages per GenAI input or output attribute.
-    #[arg(long, global = true)]
     otel_message_content_max_messages: Option<usize>,
     /// Maximum captured UTF-8 bytes per GenAI input or output attribute.
-    #[arg(long, global = true)]
     otel_message_content_max_bytes: Option<usize>,
 }
 
-#[derive(Args)]
 struct CredentialArgs {
     /// Credential storage backend (defaults to config or memory).
-    #[arg(long, value_enum, global = true)]
     credential_store: Option<CredentialStoreKind>,
     /// Private directory for file-backed credentials.
-    #[arg(long, global = true)]
     credential_dir: Option<PathBuf>,
 }
 
@@ -129,21 +115,16 @@ impl CredentialArgs {
     }
 }
 
-#[derive(Args)]
 struct McpArgs {
     /// Highest-precedence MCP server configuration.
-    #[arg(long)]
     mcp_config: Option<PathBuf>,
     /// Resolved config.toml MCP path inherited by built-in Kit children.
-    #[arg(long = "internal-mcp-config", hide = true)]
     configured_mcp_config: Option<PathBuf>,
     /// Preserve inherited layered configuration without a configured source.
-    #[arg(long = "internal-no-mcp-config", hide = true)]
     no_configured_mcp_config: bool,
     /// Preserve legacy single-file MCP behavior in built-in Kit children.
-    #[arg(long = "internal-mcp-legacy", hide = true)]
     legacy_mcp_config: bool,
-    #[command(flatten)]
+
     credentials: CredentialArgs,
 }
 
@@ -179,7 +160,7 @@ impl McpArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum CredentialStoreKind {
     Memory,
@@ -187,7 +168,7 @@ enum CredentialStoreKind {
     File,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ReasoningEffortArg {
     Default,
     Low,
@@ -203,6 +184,914 @@ impl ReasoningEffortArg {
             Self::Medium => Some(kit::ReasoningEffort::Medium),
             Self::High => Some(kit::ReasoningEffort::High),
         }
+    }
+}
+
+// Keep Clap's public builder and fallible accessors here: derive-generated lint
+// allowances conflict with this binary's non-overridable production policy.
+fn optional_arg<T: Clone + Send + Sync + 'static>(
+    matches: &clap::ArgMatches,
+    name: &str,
+) -> Result<Option<T>, clap::Error> {
+    matches
+        .try_get_one::<T>(name)
+        .map(|value| value.cloned())
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::InvalidValue, error))
+}
+
+fn required_arg<T: Clone + Send + Sync + 'static>(
+    matches: &clap::ArgMatches,
+    name: &str,
+) -> Result<T, clap::Error> {
+    optional_arg(matches, name)?.ok_or_else(|| {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            format!("missing required argument {name}"),
+        )
+    })
+}
+
+fn required_subcommand(
+    matches: &clap::ArgMatches,
+) -> Result<(&str, &clap::ArgMatches), clap::Error> {
+    matches.subcommand().ok_or_else(|| {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingSubcommand,
+            "missing required subcommand",
+        )
+    })
+}
+
+impl Cli {
+    fn command() -> clap::Command {
+        let command = clap::Command::new(env!("CARGO_PKG_NAME"))
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("Coding agent runtime and terminal client");
+        let command = command.group(clap::ArgGroup::new("Cli").multiple(true));
+        let command = TelemetryArgs::augment_command(command);
+        let command = OpenRouterArgs::augment_command(command);
+        Command::augment_command(command)
+            .subcommand_required(true)
+            .arg_required_else_help(true)
+    }
+
+    fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut command = Self::command();
+        let matches = command.try_get_matches_from_mut(args)?;
+        Self::from_matches(&matches).map_err(|error| error.format(&mut command))
+    }
+
+    fn parse() -> Self {
+        Self::try_parse_from(env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            telemetry: TelemetryArgs::from_matches(matches)?,
+            openrouter: OpenRouterArgs::from_matches(matches)?,
+            command: Command::from_matches(matches)?,
+        })
+    }
+}
+
+impl OpenRouterArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(
+            clap::ArgGroup::new("OpenRouterArgs")
+                .multiple(true)
+                .args(["openrouter_api_key"]),
+        );
+        command.arg(clap::Arg::new("openrouter_api_key").long("openrouter-api-key").value_name("KEY").value_parser(clap::value_parser!(kit::provider::OpenRouterApiKey)).action(clap::ArgAction::Set).help("OpenRouter API key (prefer the environment or stored credentials to keep it out of argv)").global(true))
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            openrouter_api_key: optional_arg(matches, "openrouter_api_key")?,
+        })
+    }
+}
+
+impl TelemetryArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(clap::ArgGroup::new("TelemetryArgs").multiple(true).args([
+            "internal_capture_error_spans",
+            "otel_endpoint",
+            "otel_protocol",
+            "otel_capture_message_content",
+            "otel_message_content_max_messages",
+            "otel_message_content_max_bytes",
+        ]));
+        let command = command.arg(
+            clap::Arg::new("internal_capture_error_spans")
+                .long("internal-capture-error-spans")
+                .value_name("BOOL")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::Set)
+                .help("Resolved local diagnostic setting inherited by built-in Kit children")
+                .hide(true)
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_endpoint")
+                .long("otel-endpoint")
+                .value_name("OTEL_ENDPOINT")
+                .value_parser(clap::value_parser!(String))
+                .action(clap::ArgAction::Set)
+                .help("OTLP collector endpoint for OpenTelemetry trace export")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_protocol")
+                .long("otel-protocol")
+                .value_name("OTEL_PROTOCOL")
+                .value_parser(clap::value_parser!(kit::telemetry::Protocol))
+                .action(clap::ArgAction::Set)
+                .help("OTLP trace transport: grpc, http/protobuf, or http/json")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_capture_message_content")
+                .long("otel-capture-message-content")
+                .value_name("BOOL")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::Set)
+                .help("Capture structured GenAI input and output messages in exported spans")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_message_content_max_messages")
+                .long("otel-message-content-max-messages")
+                .value_name("OTEL_MESSAGE_CONTENT_MAX_MESSAGES")
+                .value_parser(clap::value_parser!(usize))
+                .action(clap::ArgAction::Set)
+                .help("Maximum captured messages per GenAI input or output attribute")
+                .global(true),
+        );
+        command.arg(
+            clap::Arg::new("otel_message_content_max_bytes")
+                .long("otel-message-content-max-bytes")
+                .value_name("OTEL_MESSAGE_CONTENT_MAX_BYTES")
+                .value_parser(clap::value_parser!(usize))
+                .action(clap::ArgAction::Set)
+                .help("Maximum captured UTF-8 bytes per GenAI input or output attribute")
+                .global(true),
+        )
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            internal_capture_error_spans: optional_arg(matches, "internal_capture_error_spans")?,
+            otel_endpoint: optional_arg(matches, "otel_endpoint")?,
+            otel_protocol: optional_arg(matches, "otel_protocol")?,
+            otel_capture_message_content: optional_arg(matches, "otel_capture_message_content")?,
+            otel_message_content_max_messages: optional_arg(
+                matches,
+                "otel_message_content_max_messages",
+            )?,
+            otel_message_content_max_bytes: optional_arg(
+                matches,
+                "otel_message_content_max_bytes",
+            )?,
+        })
+    }
+}
+
+impl CredentialArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(
+            clap::ArgGroup::new("CredentialArgs")
+                .multiple(true)
+                .args(["credential_store", "credential_dir"]),
+        );
+        let command = command.arg(
+            clap::Arg::new("credential_store")
+                .long("credential-store")
+                .value_name("CREDENTIAL_STORE")
+                .value_parser(clap::value_parser!(CredentialStoreKind))
+                .action(clap::ArgAction::Set)
+                .help("Credential storage backend (defaults to config or memory)")
+                .global(true),
+        );
+        command.arg(
+            clap::Arg::new("credential_dir")
+                .long("credential-dir")
+                .value_name("CREDENTIAL_DIR")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Private directory for file-backed credentials")
+                .global(true),
+        )
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            credential_store: optional_arg(matches, "credential_store")?,
+            credential_dir: optional_arg(matches, "credential_dir")?,
+        })
+    }
+}
+
+impl McpArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(clap::ArgGroup::new("McpArgs").multiple(true));
+        let command = command.arg(
+            clap::Arg::new("mcp_config")
+                .long("mcp-config")
+                .value_name("MCP_CONFIG")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Highest-precedence MCP server configuration"),
+        );
+        let command = command.arg(
+            clap::Arg::new("configured_mcp_config")
+                .long("internal-mcp-config")
+                .value_name("CONFIGURED_MCP_CONFIG")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Resolved config.toml MCP path inherited by built-in Kit children")
+                .hide(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("no_configured_mcp_config")
+                .long("internal-no-mcp-config")
+                .value_name("NO_CONFIGURED_MCP_CONFIG")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::SetTrue)
+                .help("Preserve inherited layered configuration without a configured source")
+                .hide(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("legacy_mcp_config")
+                .long("internal-mcp-legacy")
+                .value_name("LEGACY_MCP_CONFIG")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::SetTrue)
+                .help("Preserve legacy single-file MCP behavior in built-in Kit children")
+                .hide(true),
+        );
+        CredentialArgs::augment_command(command)
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            mcp_config: optional_arg(matches, "mcp_config")?,
+            configured_mcp_config: optional_arg(matches, "configured_mcp_config")?,
+            no_configured_mcp_config: required_arg(matches, "no_configured_mcp_config")?,
+            legacy_mcp_config: required_arg(matches, "legacy_mcp_config")?,
+            credentials: CredentialArgs::from_matches(matches)?,
+        })
+    }
+}
+
+impl AuthAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand({
+            let command = clap::Command::new("login")
+                .about("Authenticate a model provider in the configured credential store");
+            let command = command.group(
+                clap::ArgGroup::new("Login")
+                    .multiple(true)
+                    .args(["provider"]),
+            );
+            command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            )
+        });
+        let command = command.subcommand({
+            let command =
+                clap::Command::new("status").about("Show model-provider authentication status");
+            let command = command.group(
+                clap::ArgGroup::new("Status")
+                    .multiple(true)
+                    .args(["provider"]),
+            );
+            command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            )
+        });
+        command.subcommand({
+            let command = clap::Command::new("logout")
+                .about("Remove model-provider credentials, revoking them when supported");
+            let command = command.group(
+                clap::ArgGroup::new("Logout")
+                    .multiple(true)
+                    .args(["provider", "local_only"]),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            );
+            command.arg(
+                clap::Arg::new("local_only")
+                    .long("local-only")
+                    .value_name("LOCAL_ONLY")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Remove local credentials without attempting remote revocation"),
+            )
+        })
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "login" => Ok(Self::Login {
+                provider: required_arg(matches, "provider")?,
+            }),
+            "status" => Ok(Self::Status {
+                provider: required_arg(matches, "provider")?,
+            }),
+            "logout" => Ok(Self::Logout {
+                provider: required_arg(matches, "provider")?,
+                local_only: required_arg(matches, "local_only")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl SessionsAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        command.subcommand({
+            let command =
+                clap::Command::new("rename").about("Set or clear a session's custom display name");
+            let command = command.group(clap::ArgGroup::new("Rename").multiple(true).args([
+                "session_id",
+                "name",
+                "clear",
+            ]));
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .required(true)
+                    .help("Durable session ID"),
+            );
+            let command = command.arg(
+                clap::Arg::new("name")
+                    .value_name("NAME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("New display name")
+                    .required_unless_present("clear")
+                    .conflicts_with("clear"),
+            );
+            command.arg(
+                clap::Arg::new("clear")
+                    .long("clear")
+                    .value_name("CLEAR")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Clear the custom name and restore the generated title"),
+            )
+        })
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "rename" => Ok(Self::Rename {
+                session_id: required_arg(matches, "session_id")?,
+                name: optional_arg(matches, "name")?,
+                clear: required_arg(matches, "clear")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl Command {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand({
+            clap::Command::new("init")
+                .about("Write the recommended configuration to ~/.kit/config.toml")
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("auth")
+                .about("Manage provider authentication without starting a runtime");
+            let command = command.group(clap::ArgGroup::new("Auth").multiple(true));
+            let command = AuthAction::augment_command(command)
+                .subcommand_required(true)
+                .arg_required_else_help(true);
+            CredentialArgs::augment_command(command)
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("sessions")
+                .about("List or rename durable sessions for a workspace");
+            let command = command.group(
+                clap::ArgGroup::new("Sessions")
+                    .multiple(true)
+                    .args(["root"]),
+            );
+            let command = SessionsAction::augment_command(command);
+            command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)")
+                    .global(true),
+            )
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("serve")
+                .about("Serve ACP on stdio with A2A, remote ACP, or both over HTTP");
+            let command = command.group(clap::ArgGroup::new("Serve").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set)
+                    .help("Reasoning effort (defaults to config or provider default)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("a2a")
+                    .long("a2a")
+                    .value_name("A2A")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help(
+                        "HTTP listen address. An available loopback port is selected when omitted",
+                    )
+                    .visible_alias("http"),
+            );
+            let command = command.arg(
+                clap::Arg::new("remote_acp")
+                    .long("remote-acp")
+                    .value_name("REMOTE_ACP")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Expose ACP over HTTP/SSE and WebSocket at `/acp`"),
+            );
+            let command = command.arg(
+                clap::Arg::new("no_a2a")
+                    .long("no-a2a")
+                    .value_name("NO_A2A")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Do not expose A2A on the HTTP listener")
+                    .requires("remote_acp"),
+            );
+            let command = command.arg(
+                clap::Arg::new("no_stdio")
+                    .long("no-stdio")
+                    .value_name("NO_STDIO")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Do not serve ACP on stdio. Requires remote ACP over HTTP")
+                    .requires("remote_acp"),
+            );
+            let command = command.arg(
+                clap::Arg::new("stdio_protocol_version")
+                    .long("stdio-protocol-version")
+                    .value_name("STDIO_PROTOCOL_VERSION")
+                    .value_parser(clap::value_parser!(AcpProtocolVersion))
+                    .action(clap::ArgAction::Set)
+                    .help("ACP wire version for stdio (defaults to v1 for compatibility)")
+                    .default_value("1")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("server_credential_file")
+                    .long("server-credential-file")
+                    .value_name("PATH")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Require this file's bearer token on every HTTP request"),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("terminal_auth_login")
+                    .long("terminal-auth-login")
+                    .value_name("TERMINAL_AUTH_LOGIN")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .help("Provider login requested by ACP terminal authentication")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .long("session-id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Persistent session id selected by the hosting client"),
+            );
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Load session_id instead of creating it")
+                    .requires("session_id"),
+            );
+            command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override a stale session lock")
+                    .requires("resume"),
+            )
+        });
+        let command = command.subcommand({
+            let command =
+                clap::Command::new("acp").about("Serve only the Agent Client Protocol on stdio");
+            let command = command.group(clap::ArgGroup::new("Acp").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("protocol_version")
+                    .long("protocol-version")
+                    .value_name("PROTOCOL_VERSION")
+                    .value_parser(clap::value_parser!(AcpProtocolVersion))
+                    .action(clap::ArgAction::Set)
+                    .help("ACP wire protocol version")
+                    .default_value("1"),
+            );
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .long("session-id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("terminal_auth_login")
+                    .long("terminal-auth-login")
+                    .value_name("TERMINAL_AUTH_LOGIN")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .help("Provider login requested by ACP terminal authentication")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("session_id"),
+            );
+            let command = command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("resume"),
+            );
+            let command = command.arg(
+                clap::Arg::new("subagent_depth")
+                    .long("subagent-depth")
+                    .value_name("SUBAGENT_DEPTH")
+                    .value_parser(clap::value_parser!(usize))
+                    .action(clap::ArgAction::Set)
+                    .default_value("0")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("subagent_parent_id")
+                    .long("subagent-parent-id")
+                    .value_name("SUBAGENT_PARENT_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .hide(true)
+                    .requires("subagent_parent_name"),
+            );
+            command.arg(
+                clap::Arg::new("subagent_parent_name")
+                    .long("subagent-parent-name")
+                    .value_name("SUBAGENT_PARENT_NAME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .hide(true)
+                    .requires("subagent_parent_id"),
+            )
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("prompt")
+                .about("Run one persisted prompt, print its answer and session id, then exit");
+            let command = command.group(clap::ArgGroup::new("Prompt").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Resume this persisted session id"),
+            );
+            let command = command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override the resumed session's stale lock")
+                    .requires("resume"),
+            );
+            command.arg(
+                clap::Arg::new("prompt")
+                    .value_name("PROMPT")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .required(true)
+                    .help("Prompt text; quote it when it contains spaces"),
+            )
+        });
+        command.subcommand({
+            let command = clap::Command::new("tui").about("Start the ACP-backed terminal client");
+            let command = command.group(clap::ArgGroup::new("Tui").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("a2a")
+                    .long("a2a")
+                    .value_name("A2A")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help(
+                        "A2A listen address. An available loopback port is selected when omitted",
+                    ),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Resume this persisted session id"),
+            );
+            command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override the resumed session's stale lock")
+                    .requires("resume"),
+            )
+        })
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "init" => Ok(Self::Init),
+            "auth" => Ok(Self::Auth {
+                action: AuthAction::from_matches(matches)?,
+                credentials: CredentialArgs::from_matches(matches)?,
+            }),
+            "sessions" => Ok(Self::Sessions {
+                action: if matches.subcommand().is_some() {
+                    Some(SessionsAction::from_matches(matches)?)
+                } else {
+                    None
+                },
+                root: optional_arg(matches, "root")?,
+            }),
+            "serve" => Ok(Self::Serve {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                a2a: optional_arg(matches, "a2a")?,
+                remote_acp: required_arg(matches, "remote_acp")?,
+                no_a2a: required_arg(matches, "no_a2a")?,
+                no_stdio: required_arg(matches, "no_stdio")?,
+                stdio_protocol_version: required_arg(matches, "stdio_protocol_version")?,
+                server_credential_file: optional_arg(matches, "server_credential_file")?,
+                mcp: McpArgs::from_matches(matches)?,
+                terminal_auth_login: optional_arg(matches, "terminal_auth_login")?,
+                session_id: optional_arg(matches, "session_id")?,
+                resume: required_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+            }),
+            "acp" => Ok(Self::Acp {
+                protocol_version: required_arg(matches, "protocol_version")?,
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                mcp: McpArgs::from_matches(matches)?,
+                session_id: optional_arg(matches, "session_id")?,
+                terminal_auth_login: optional_arg(matches, "terminal_auth_login")?,
+                resume: required_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+                subagent_depth: required_arg(matches, "subagent_depth")?,
+                subagent_parent_id: optional_arg(matches, "subagent_parent_id")?,
+                subagent_parent_name: optional_arg(matches, "subagent_parent_name")?,
+            }),
+            "prompt" => Ok(Self::Prompt {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                mcp: McpArgs::from_matches(matches)?,
+                resume: optional_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+                prompt: required_arg(matches, "prompt")?,
+            }),
+            "tui" => Ok(Self::Tui {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                a2a: optional_arg(matches, "a2a")?,
+                mcp: McpArgs::from_matches(matches)?,
+                resume: optional_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl ValueEnum for CredentialStoreKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Memory, Self::Keychain, Self::File]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Memory => "memory",
+            Self::Keychain => "keychain",
+            Self::File => "file",
+        }))
+    }
+}
+
+impl ValueEnum for ReasoningEffortArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Default, Self::Low, Self::Medium, Self::High]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Default => "default",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }))
+    }
+}
+
+impl ValueEnum for AcpProtocolVersion {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::V1, Self::V2]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }))
+    }
+}
+
+impl ValueEnum for AuthProvider {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Openai, Self::Openrouter, Self::Speakeasy]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Openai => "openai",
+            Self::Openrouter => "openrouter",
+            Self::Speakeasy => "speakeasy",
+        }))
     }
 }
 
@@ -478,15 +1367,14 @@ fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum AcpProtocolVersion {
-    #[value(name = "1")]
     V1,
-    #[value(name = "2")]
+
     V2,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum AuthProvider {
     Openai,
     Openrouter,
@@ -503,7 +1391,6 @@ impl AuthProvider {
     }
 }
 
-#[derive(Subcommand)]
 enum AuthAction {
     /// Authenticate a model provider in the configured credential store.
     Login { provider: AuthProvider },
@@ -513,144 +1400,114 @@ enum AuthAction {
     Logout {
         provider: AuthProvider,
         /// Remove local credentials without attempting remote revocation.
-        #[arg(long)]
         local_only: bool,
     },
 }
 
-#[derive(Subcommand)]
 enum SessionsAction {
     /// Set or clear a session's custom display name.
     Rename {
         /// Durable session ID.
         session_id: String,
         /// New display name.
-        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
         name: Option<String>,
         /// Clear the custom name and restore the generated title.
-        #[arg(long)]
         clear: bool,
     },
 }
 
-#[derive(Subcommand)]
 enum Command {
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
     /// Manage provider authentication without starting a runtime.
     Auth {
-        #[command(subcommand)]
         action: AuthAction,
-        #[command(flatten)]
+
         credentials: CredentialArgs,
     },
     /// List or rename durable sessions for a workspace.
     Sessions {
-        #[command(subcommand)]
         action: Option<SessionsAction>,
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long, global = true)]
         root: Option<PathBuf>,
     },
     /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
     Serve {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
         /// Reasoning effort (defaults to config or provider default).
-        #[arg(long, value_enum)]
         reasoning_effort: Option<ReasoningEffortArg>,
         /// HTTP listen address. An available loopback port is selected when omitted.
-        #[arg(long, visible_alias = "http")]
         a2a: Option<String>,
         /// Expose ACP over HTTP/SSE and WebSocket at `/acp`.
-        #[arg(long)]
         remote_acp: bool,
         /// Do not expose A2A on the HTTP listener.
-        #[arg(long, requires = "remote_acp")]
         no_a2a: bool,
         /// Do not serve ACP on stdio. Requires remote ACP over HTTP.
-        #[arg(long, requires = "remote_acp")]
         no_stdio: bool,
         /// ACP wire version for stdio (defaults to v1 for compatibility).
-        #[arg(long, value_enum, default_value = "1", hide = true)]
         stdio_protocol_version: AcpProtocolVersion,
         /// Require this file's bearer token on every HTTP request.
-        #[arg(long, value_name = "PATH")]
         server_credential_file: Option<PathBuf>,
-        #[command(flatten)]
+
         mcp: McpArgs,
         /// Provider login requested by ACP terminal authentication.
-        #[arg(long, value_enum, hide = true)]
         terminal_auth_login: Option<AuthProvider>,
         /// Persistent session id selected by the hosting client.
-        #[arg(long)]
         session_id: Option<String>,
         /// Load session_id instead of creating it.
-        #[arg(long, requires = "session_id")]
         resume: bool,
         /// Override a stale session lock.
-        #[arg(long, requires = "resume")]
         force: bool,
     },
     /// Serve only the Agent Client Protocol on stdio.
     Acp {
         /// ACP wire protocol version.
-        #[arg(long, value_enum, default_value = "1")]
         protocol_version: AcpProtocolVersion,
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
-        #[arg(long)]
+
         model: Option<String>,
-        #[arg(long, value_enum)]
+
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
-        #[command(flatten)]
+
         mcp: McpArgs,
-        #[arg(long)]
+
         session_id: Option<String>,
         /// Provider login requested by ACP terminal authentication.
-        #[arg(long, value_enum, hide = true)]
         terminal_auth_login: Option<AuthProvider>,
-        #[arg(long, requires = "session_id")]
+
         resume: bool,
-        #[arg(long, requires = "resume")]
+
         force: bool,
-        #[arg(long, default_value_t = 0, hide = true)]
+
         subagent_depth: usize,
-        #[arg(long, hide = true, requires = "subagent_parent_name")]
+
         subagent_parent_id: Option<String>,
-        #[arg(long, hide = true, requires = "subagent_parent_id")]
+
         subagent_parent_name: Option<String>,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
-        #[command(flatten)]
+
         mcp: McpArgs,
         /// Resume this persisted session id.
-        #[arg(long)]
         resume: Option<String>,
         /// Override the resumed session's stale lock.
-        #[arg(long, requires = "resume")]
         force: bool,
         /// Prompt text; quote it when it contains spaces.
         prompt: String,
@@ -658,26 +1515,20 @@ enum Command {
     /// Start the ACP-backed terminal client.
     Tui {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
         /// A2A listen address. An available loopback port is selected when omitted.
-        #[arg(long)]
         a2a: Option<String>,
-        #[command(flatten)]
+
         mcp: McpArgs,
         /// Resume this persisted session id.
-        #[arg(long)]
         resume: Option<String>,
         /// Override the resumed session's stale lock.
-        #[arg(long, requires = "resume")]
         force: bool,
     },
 }
@@ -830,9 +1681,16 @@ async fn termination_signal() -> io::Result<()> {
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+        // This race runs once: either signal may end supervision when both
+        // are ready, and there is no repeated polling order to cause starvation.
+        match select(
+            std::pin::pin!(tokio::signal::ctrl_c()),
+            std::pin::pin!(terminate.recv()),
+        )
+        .await
+        {
+            Either::Left((result, _)) => result,
+            Either::Right((_, _)) => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -889,14 +1747,27 @@ async fn supervise_serve_with_trigger(
                 }
             }
         };
-        tokio::pin!(stdio);
-        tokio::pin!(termination);
         let shutdown = fs::shutdown_token();
-        tokio::select! {
-            _ = shutdown.cancelled() => Exit::Signal(Ok(())),
-            result = &mut stdio => Exit::Stdio(result),
-            result = http.join() => Exit::Http(result),
-            result = &mut termination => Exit::Signal(result),
+        // This is a one-shot exit decision, not a work-dispatch loop. Any ready
+        // exit may win; fixed polling order cannot starve another iteration.
+        // All losing futures (including the borrow of http) are dropped at the
+        // end of this scope, before session retirement and HTTP cleanup.
+        match select(
+            std::pin::pin!(select(
+                std::pin::pin!(shutdown.cancelled()),
+                std::pin::pin!(stdio),
+            )),
+            std::pin::pin!(select(
+                std::pin::pin!(http.join()),
+                std::pin::pin!(termination),
+            )),
+        )
+        .await
+        {
+            Either::Left((Either::Left(((), _)), _)) => Exit::Signal(Ok(())),
+            Either::Left((Either::Right((result, _)), _)) => Exit::Stdio(result),
+            Either::Right((Either::Left((result, _)), _)) => Exit::Http(result),
+            Either::Right((Either::Right((result, _)), _)) => Exit::Signal(result),
         }
     };
 
@@ -925,89 +1796,98 @@ async fn supervise_serve_with_trigger(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    kit::resilient_fs::start_recovery_worker();
-    let result = run().await;
-    // Finish synchronously: a detached task can be terminated with the process,
-    // and timing out spawn_blocking would still make runtime teardown wait.
-    let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
-    // Always attempt recovery, but preserve the original command error. The
-    // recovery helper separately warns if accepted data remains undurable.
-    result?;
-    recovery?;
-    Ok(())
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            kit::resilient_fs::start_recovery_worker();
+            let result = run().await;
+            // Finish synchronously: a detached task can be terminated with the process,
+            // and timing out spawn_blocking would still make runtime teardown wait.
+            let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
+            // Always attempt recovery, but preserve the original command error. The
+            // recovery helper separately warns if accepted data remains undurable.
+            result?;
+            recovery?;
+            Ok(())
+        })
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    if matches!(&cli.command, Command::Init) {
-        tokio::task::spawn_blocking(init_default_config).await??;
-        if fs::global().status().pending_operations > 0 {
-            eprintln!(
-                "Config initialized in memory only; persistence is pending and will not survive process termination."
+    run_cli(Cli::parse()).await
+}
+
+async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Only auth and runtime commands poll this future. Init must not load the
+    // config, and sessions must not resolve credentials or initialize telemetry.
+    let initialize = async {
+        let config = tokio::task::spawn_blocking(Config::load_default).await??;
+        let openrouter_api_key =
+            resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
+                env::var(name).ok()
+            });
+        let telemetry_settings = config.telemetry_settings(
+            &cli.telemetry,
+            env::var(OTEL_ENDPOINT_ENV).ok(),
+            env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
+            env::var(OTEL_TRACES_PROTOCOL_ENV).ok(),
+            env::var(OTEL_PROTOCOL_ENV).ok(),
+        )?;
+        let _telemetry = kit::telemetry::init(&telemetry_settings)?;
+        Ok::<_, Box<dyn std::error::Error>>((
+            config,
+            telemetry_settings,
+            _telemetry,
+            openrouter_api_key,
+        ))
+    };
+    let terminal_auth_provider = cli
+        .command
+        .terminal_auth_login()
+        .map(|(provider, _)| provider);
+    match cli.command {
+        Command::Init => {
+            tokio::task::spawn_blocking(init_default_config).await??;
+            if fs::global().status().pending_operations > 0 {
+                eprintln!(
+                    "Config initialized in memory only; persistence is pending and will not survive process termination."
+                );
+            }
+            println!(
+                "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
+                env!("CARGO_PKG_VERSION")
             );
         }
-        println!(
-            "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(());
-    }
-    let config = tokio::task::spawn_blocking(Config::load_default).await??;
-    if let Command::Sessions { action, root } = &cli.command {
-        let root = config.root(root.clone());
-        match action {
-            None => print!("{}", format_sessions(&kit::session::catalog(&root)?)),
-            Some(SessionsAction::Rename {
-                session_id,
-                name,
-                clear,
-            }) => {
-                let display_name = if *clear { None } else { name.as_deref() };
-                kit::session::set_display_name(&root, session_id, display_name)?;
-                if *clear {
-                    println!("Cleared name for session {session_id}");
-                } else if let Some(name) = name {
-                    println!("Renamed session {session_id} to \"{}\"", name.trim());
+        Command::Sessions { action, root } => {
+            let config = tokio::task::spawn_blocking(Config::load_default).await??;
+            let root = config.root(root);
+            match action {
+                None => print!("{}", format_sessions(&kit::session::catalog(&root)?)),
+                Some(SessionsAction::Rename {
+                    session_id,
+                    name,
+                    clear,
+                }) => {
+                    let display_name = if clear { None } else { name.as_deref() };
+                    kit::session::set_display_name(&root, &session_id, display_name)?;
+                    if clear {
+                        println!("Cleared name for session {session_id}");
+                    } else if let Some(name) = name {
+                        println!("Renamed session {session_id} to \"{}\"", name.trim());
+                    }
                 }
             }
         }
-        return Ok(());
-    }
-    let openrouter_api_key =
-        resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
-            env::var(name).ok()
-        });
-    let telemetry_settings = config.telemetry_settings(
-        &cli.telemetry,
-        env::var(OTEL_ENDPOINT_ENV).ok(),
-        env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
-        env::var(OTEL_TRACES_PROTOCOL_ENV).ok(),
-        env::var(OTEL_PROTOCOL_ENV).ok(),
-    )?;
-    let _telemetry = kit::telemetry::init(&telemetry_settings)?;
-    if let Command::Auth {
-        action,
-        credentials,
-    } = &cli.command
-    {
-        let storage = credentials.storage(&config)?;
-        validate_auth_storage(action, &storage)?;
-        execute_auth(action, storage, openrouter_api_key.clone()).await?;
-        return Ok(());
-    }
-    if let Some((provider, credentials)) = cli.command.terminal_auth_login() {
-        let action = AuthAction::Login { provider };
-        let storage = credentials.storage(&config)?;
-        validate_auth_storage(&action, &storage)?;
-        execute_auth(&action, storage, openrouter_api_key.clone()).await?;
-        return Ok(());
-    }
-    match cli.command {
-        Command::Init => unreachable!("init returns before loading runtime config"),
-        Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
-        Command::Sessions { .. } => unreachable!("sessions returns before starting a runtime"),
+        Command::Auth {
+            action,
+            credentials,
+        } => {
+            let (config, _settings, _telemetry, openrouter_api_key) = initialize.await?;
+            let storage = credentials.storage(&config)?;
+            validate_auth_storage(&action, &storage)?;
+            execute_auth(&action, storage, openrouter_api_key).await?;
+        }
         Command::Serve {
             root,
             model,
@@ -1025,6 +1905,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
+            if let Some(provider) = terminal_auth_provider {
+                let action = AuthAction::Login { provider };
+                let storage = mcp.credentials.storage(&config)?;
+                validate_auth_storage(&action, &storage)?;
+                execute_auth(&action, storage, openrouter_api_key).await?;
+                return Ok(());
+            }
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1115,6 +2003,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             subagent_parent_id,
             subagent_parent_name,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
+            if let Some(provider) = terminal_auth_provider {
+                let action = AuthAction::Login { provider };
+                let storage = mcp.credentials.storage(&config)?;
+                validate_auth_storage(&action, &storage)?;
+                execute_auth(&action, storage, openrouter_api_key).await?;
+                return Ok(());
+            }
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1187,6 +2083,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             force,
             prompt,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1247,6 +2144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             // The TUI child reloads this config, but validate profile names and
             // the selected reference before starting that subprocess.
             let _ = config.harnesses()?;
@@ -1297,7 +2195,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
-    use clap::Parser as _;
     use kit::tools::CredentialStorage;
 
     use super::{
@@ -1306,6 +2203,127 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn cli_builder_preserves_help_version_and_hidden_flags() {
+        for path in [
+            vec![],
+            vec!["init"],
+            vec!["auth"],
+            vec!["auth", "login"],
+            vec!["auth", "status"],
+            vec!["auth", "logout"],
+            vec!["sessions"],
+            vec!["sessions", "rename"],
+            vec!["serve"],
+            vec!["acp"],
+            vec!["prompt"],
+            vec!["tui"],
+        ] {
+            for flag in ["--help", "-h"] {
+                let args = std::iter::once("kit")
+                    .chain(path.iter().copied())
+                    .chain([flag]);
+                let error = Cli::try_parse_from(args).err().unwrap();
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                let help = error.to_string();
+                assert!(!help.contains("--internal-"));
+                assert!(!help.contains("--terminal-auth-login"));
+                assert!(!help.contains("--subagent-"));
+                assert!(!help.contains("--stdio-protocol-version"));
+            }
+        }
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["kit", flag]).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("kit {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["kit", "--invalid-flag"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::UnknownArgument,
+        );
+    }
+
+    #[test]
+    fn cli_builder_preserves_defaults_and_alias_values() {
+        let cli = Cli::try_parse_from(["kit", "serve", "--http", "127.0.0.1:0"]).unwrap();
+        let Command::Serve {
+            a2a,
+            stdio_protocol_version,
+            remote_acp,
+            no_a2a,
+            no_stdio,
+            resume,
+            force,
+            mcp,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(a2a.as_deref(), Some("127.0.0.1:0"));
+        assert!(matches!(
+            stdio_protocol_version,
+            super::AcpProtocolVersion::V1
+        ));
+        assert!(!remote_acp && !no_a2a && !no_stdio && !resume && !force);
+        assert!(!mcp.no_configured_mcp_config && !mcp.legacy_mcp_config);
+        assert!(mcp.credentials.credential_store.is_none());
+        let cli = Cli::try_parse_from(["kit", "acp"]).unwrap();
+        let Command::Acp {
+            protocol_version,
+            subagent_depth,
+            ..
+        } = cli.command
+        else {
+            panic!("expected acp command");
+        };
+        assert!(matches!(protocol_version, super::AcpProtocolVersion::V1));
+        assert_eq!(subagent_depth, 0);
+    }
+
+    #[test]
+    fn cli_extraction_rejects_missing_required_values() {
+        let command = Cli::command();
+        let mut matches = command
+            .try_get_matches_from(["kit", "prompt", "hello"])
+            .unwrap();
+        let (_, mut prompt) = matches.remove_subcommand().unwrap();
+        assert_eq!(
+            prompt
+                .try_remove_one::<String>("prompt")
+                .unwrap()
+                .as_deref(),
+            Some("hello")
+        );
+        let error = super::required_arg::<String>(&prompt, "prompt").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            Command::from_matches(&matches).err().unwrap().kind(),
+            clap::error::ErrorKind::MissingSubcommand,
+        );
+        assert!(error.to_string().contains("prompt"));
+
+        let matches = clap::Command::new("kit")
+            .arg(clap::Arg::new("prompt").value_parser(clap::value_parser!(usize)))
+            .try_get_matches_from(["kit", "1"])
+            .unwrap();
+        assert_eq!(
+            super::required_arg::<String>(&matches, "prompt")
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -2124,6 +3142,102 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "init"]).is_ok());
     }
 
+    #[tokio::test]
+    async fn command_dispatch_preserves_initialization_boundaries() {
+        const CHILD: &str = "KIT_TEST_COMMAND_DISPATCH_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["bypass", "login"] {
+                let home = tempfile::tempdir().unwrap();
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::command_dispatch_preserves_initialization_boundaries",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("HOME", home.path())
+                    .env_remove(super::OTEL_ENDPOINT_ENV)
+                    .env_remove(super::OTEL_TRACES_PROTOCOL_ENV)
+                    .env_remove(super::OTEL_CAPTURE_MESSAGE_CONTENT_ENV)
+                    .env_remove(super::OTEL_PROTOCOL_ENV)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                if case == "bypass" {
+                    command.env(super::OTEL_PROTOCOL_ENV, "invalid-protocol");
+                }
+                let output = command.output().await.unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let config_path = home.join(".kit/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        if case == "bypass" {
+            fs::write(&config_path, "invalid TOML [").unwrap();
+            super::run_cli(Cli::try_parse_from(["kit", "init"]).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), "invalid TOML [");
+            let error = super::run_cli(Cli::try_parse_from(["kit", "sessions"]).unwrap())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid config"), "{error}");
+        }
+        // Runtime setup would reject this harness. Sessions and provider login
+        // must finish before runtime configuration is validated.
+        fs::write(&config_path, "[subagent]\nharness = \"missing-harness\"\n").unwrap();
+        if case == "bypass" {
+            super::run_cli(
+                Cli::try_parse_from(["kit", "sessions", "--root", home.to_str().unwrap()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        for args in [
+            vec![
+                "kit",
+                "auth",
+                "login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+            vec![
+                "kit",
+                "acp",
+                "--terminal-auth-login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+            vec![
+                "kit",
+                "serve",
+                "--terminal-auth-login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+        ] {
+            let error = super::run_cli(Cli::try_parse_from(args).unwrap())
+                .await
+                .unwrap_err();
+            let expected = if case == "bypass" {
+                "invalid OTEL_EXPORTER_OTLP_PROTOCOL"
+            } else {
+                "provider login cannot use memory credential storage"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
     #[test]
     fn auth_commands_parse_without_runtime_arguments() {
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openai"]).is_ok());
@@ -2310,6 +3424,40 @@ future_option = true
         .await
         .expect("supervisor shutdown timed out")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_shutdown_error_still_releases_http_listener() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let address = http.address();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_serve_with_trigger(
+                runtime,
+                sessions,
+                true,
+                super::AcpProtocolVersion::V1,
+                http,
+                std::future::ready(Err(io::Error::other("termination signal failed"))),
+            ),
+        )
+        .await
+        .expect("supervisor shutdown timed out")
+        .unwrap_err();
+        assert_eq!(error.to_string(), "termination signal failed");
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
     }
 
     #[test]

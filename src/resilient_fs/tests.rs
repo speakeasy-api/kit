@@ -1670,3 +1670,39 @@ fn panic_during_pending_publication_blocks_further_recovery() {
     assert_service_isolated(&t);
     assert_eq!(native::read(&path).unwrap(), b"queued");
 }
+
+#[test]
+#[cfg(unix)]
+fn rejected_truncation_preserves_shared_image_cursor_and_disk() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    t.fs.write(&path, b"original").unwrap();
+    let mut held = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_in(&t.fs, &path)
+        .unwrap();
+    held.seek(SeekFrom::Start(3)).unwrap();
+    let mut clone = held.try_clone().unwrap();
+
+    // The temporary file has been changed when sync fails, but neither API
+    // may commit truncation to the shared object or its logical namespace.
+    t.faults.arm(Point::Sync, libc::EIO);
+    assert_eq!(
+        t.fs.create(&path).unwrap_err().raw_os_error(),
+        Some(libc::EIO)
+    );
+    assert_eq!(held.set_len(2).unwrap_err().raw_os_error(), Some(libc::EIO));
+    assert_eq!(held.metadata().unwrap().len(), 8);
+    assert_eq!(clone.stream_position().unwrap(), 3);
+    assert_eq!(t.fs.read(&path).unwrap(), b"original");
+    assert_eq!(native::read(&path).unwrap(), b"original");
+    assert_eq!(t.fs.status().pending_operations, 0);
+
+    t.settle();
+    clone.write_all(b"!").unwrap();
+    assert_eq!(held.stream_position().unwrap(), 4);
+    t.settle();
+    assert_eq!(native::read(&path).unwrap(), b"ori!inal");
+    assert_eq!(native::read_dir(&t.root).unwrap().count(), 1);
+}

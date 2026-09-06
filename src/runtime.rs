@@ -27,7 +27,8 @@ use agentkit_tools_core::{
     ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use futures_util::future::{Either, select};
+use serde_json::{Map, Value};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
@@ -56,7 +57,103 @@ use crate::{
 mod test_support {
     use super::*;
 
+    #[tokio::test]
+    async fn storage_bridge_relays_external_cancellation_and_reasserts_for_new_generations() {
+        let external = CancellationController::new();
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        let bridge = StorageCancellationBridge::new(controller.clone(), Some(external.handle()));
+        // Make the external branch ready before the spawned bridge first polls.
+        external.interrupt();
+        tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
+            .await
+            .unwrap();
+        let next_generation = controller.handle().checkpoint();
+        tokio::time::timeout(Duration::from_secs(2), next_generation.cancelled())
+            .await
+            .unwrap();
+        drop(bridge);
+    }
+
+    #[test]
+    fn fork_deferral_retains_transcript_until_the_transferred_observer_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let mut claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            &id,
+            false,
+            vec![Item::text(agentkit_core::ItemKind::System, "system")],
+        )
+        .unwrap();
+        claim.guard_uncommitted_transcript(&opened.observer);
+        let creation = claim.defer_fork_commit().unwrap();
+        drop(opened);
+        assert!(crate::session::load(root.path(), &id).is_ok());
+        drop(creation);
+        assert!(crate::session::load(root.path(), &id).is_err());
+    }
+
+    #[test]
+    fn rejected_fork_deferral_cleans_transcripts_before_releasing_identity_for_retry() {
+        for kind in ["configured", "generated", "load"] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = if kind == "generated" {
+                Runtime::new(root.path(), "gpt-5.4").unwrap()
+            } else {
+                Runtime::with_session(
+                    root.path(),
+                    "gpt-5.4",
+                    SessionRequest {
+                        id: "selected".into(),
+                        resume: false,
+                        force: false,
+                    },
+                )
+                .unwrap()
+            };
+            let mut claim = if kind == "load" {
+                runtime.claim_session_load("selected").unwrap()
+            } else {
+                runtime.claim_session().unwrap()
+            };
+            let id = claim.id().to_owned();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(agentkit_core::ItemKind::System, "system")],
+            )
+            .unwrap();
+            claim.guard_uncommitted_transcript(&opened.observer);
+            drop(opened);
+            assert!(crate::session::load(root.path(), &id).is_ok());
+            assert!(claim.defer_fork_commit().is_err());
+            assert!(crate::session::load(root.path(), &id).is_err());
+            let mut retry = runtime.claim_session().unwrap();
+            assert_eq!(retry.id(), id);
+            assert!(!retry.request.resume);
+            let recreated = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(agentkit_core::ItemKind::System, "recreated")],
+            )
+            .unwrap();
+            retry.guard_uncommitted_transcript(&recreated.observer);
+            retry.commit().unwrap();
+            drop(recreated);
+            assert!(crate::session::load(root.path(), &id).is_ok());
+        }
+    }
+
     impl Runtime {
+        pub(crate) fn mcp_for_test(&self) -> &crate::tools::mcp::McpRuntime {
+            &self.mcp
+        }
+
         pub(crate) fn set_ambient_openrouter_api_key_for_test(&mut self, present: bool) {
             self.ambient_openrouter_api_key = present;
         }
@@ -271,12 +368,19 @@ impl SessionClaim {
         matches!(self.kind, SessionClaimKind::Fork)
     }
 
-    pub(crate) fn defer_fork_commit(mut self) -> crate::session::SessionObserver {
-        debug_assert!(self.is_fork());
+    pub(crate) fn defer_fork_commit(
+        mut self,
+    ) -> Result<crate::session::SessionObserver, AcpRuntimeError> {
+        if !self.is_fork() {
+            return Err(AcpRuntimeError::Loop(
+                "only a fork claim can defer transcript creation".into(),
+            ));
+        }
+        let observer = self.uncommitted_observer.take().ok_or_else(|| {
+            AcpRuntimeError::Loop("fork claim has no uncommitted transcript observer".into())
+        })?;
         self.committed = true;
-        self.uncommitted_observer
-            .take()
-            .expect("an opened fork claim must retain its transcript observer")
+        Ok(observer)
     }
 
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
@@ -304,15 +408,15 @@ impl SessionClaim {
             observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
             self.mark_opened();
         }
-        match self.kind {
-            SessionClaimKind::New {
-                configured,
-                opened_new,
-            } => selection.finish_new(&self.request, configured, true, opened_new, false),
-            SessionClaimKind::Load { configured } => {
-                selection.finish_load(&self.request, configured, true)
-            }
-            SessionClaimKind::Fork => unreachable!("fork claims commit before locking selection"),
+        // Fork claims returned above; the remaining claims either create or load.
+        if let SessionClaimKind::New {
+            configured,
+            opened_new,
+        } = self.kind
+        {
+            selection.finish_new(&self.request, configured, true, opened_new, false);
+        } else {
+            selection.finish_load(&self.request, self.is_configured(), true);
         }
         self.committed = true;
         drop(selection);
@@ -392,7 +496,7 @@ pub struct Runtime {
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ambient_openrouter_api_key: bool,
-    telemetry: crate::telemetry::Settings,
+    telemetry: agentkit_loop::TelemetryConfig,
     max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
@@ -718,10 +822,10 @@ impl Runtime {
         runtime: Arc<Self>,
         telemetry: crate::telemetry::Settings,
     ) -> Result<Arc<Self>, String> {
-        telemetry.agentkit_config()?;
+        let config = telemetry.agentkit_config()?;
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure telemetry after runtime was shared".to_string())?;
-        runtime.telemetry = telemetry.clone();
+        runtime.telemetry = config;
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
@@ -934,8 +1038,13 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    pub(crate) fn subscribe_mcp(&self, session_id: String) -> crate::tools::mcp::McpSubscription {
-        self.mcp.subscribe(session_id)
+    pub(crate) fn subscribe_mcp(
+        &self,
+        session_id: String,
+    ) -> Result<crate::tools::mcp::McpSubscription, AcpRuntimeError> {
+        self.mcp
+            .subscribe(session_id)
+            .map_err(AcpRuntimeError::Loop)
     }
 
     pub const fn max_subagent_depth(&self) -> usize {
@@ -949,8 +1058,6 @@ impl Runtime {
 
     fn agentkit_telemetry(&self) -> agentkit_loop::TelemetryConfig {
         self.telemetry
-            .agentkit_config()
-            .expect("runtime telemetry settings are validated before storage")
     }
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
@@ -2267,14 +2374,29 @@ impl BackgroundableCompose {
         let relay_jobs = self.background_jobs.clone();
         let relay_call_id = call_id.clone();
         let relay = tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => { relay_jobs.cancel_registration(&relay_call_id.0, Some(&registration)); },
-                _ = async {
-                    if let Some(cancellation) = foreground_cancellation { cancellation.cancelled().await; }
-                    else { std::future::pending::<()>().await; }
-                } => relay_jobs.propagate_foreground_cancellation(&relay_call_id, &registration),
+            // This one-shot race needs no fairness. If both signals are ready,
+            // deterministically prefer shutdown over foreground cancellation.
+            let shutting_down = {
+                let shutdown = std::pin::pin!(shutdown.cancelled());
+                let foreground = std::pin::pin!(async {
+                    if let Some(cancellation) = foreground_cancellation {
+                        cancellation.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                });
+                match select(shutdown, foreground).await {
+                    Either::Left(((), _pending)) => true,
+                    Either::Right(((), _pending)) => false,
+                }
+            };
+            if shutting_down {
+                relay_jobs.cancel_registration(&relay_call_id.0, Some(&registration));
+            } else {
+                relay_jobs.propagate_foreground_cancellation(&relay_call_id, &registration);
             }
-        }).abort_handle();
+        })
+        .abort_handle();
         let mut jobs = self.background_jobs.lock_jobs();
         // This guard is the sole removal owner and has not yet left this function.
         let old_relay = jobs
@@ -2306,24 +2428,26 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
     {
         properties.insert(
             "intent".into(),
-            json!({
-                "type": "string",
-                "description": "A brief user-facing status sentence, preferably 3–10 words. Start with an -ing verb; omit first-person language, rationale, and implementation details."
-            }),
+            Value::Object(Map::from_iter([
+                ("type".into(), Value::String("string".into())),
+                ("description".into(), Value::String("A brief user-facing status sentence, preferably 3–10 words. Start with an -ing verb; omit first-person language, rationale, and implementation details.".into())),
+            ])),
         );
         properties.insert(
             "background".into(),
-            json!({
-                "description": "Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.",
-                "oneOf": [
-                    { "type": "boolean" },
-                    {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_BACKGROUND_AFTER_SECONDS
-                    }
-                ]
-            }),
+            Value::Object(Map::from_iter([
+                ("description".into(), Value::String("Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.".into())),
+                ("oneOf".into(), Value::Array(vec![
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::String("boolean".into())),
+                    ])),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::String("integer".into())),
+                        ("minimum".into(), Value::Number(1.into())),
+                        ("maximum".into(), Value::Number(MAX_BACKGROUND_AFTER_SECONDS.into())),
+                    ])),
+                ])),
+            ])),
         );
     }
     spec
@@ -2439,11 +2563,13 @@ async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<V
                     body.trim_end()
                 ),
             );
-            item.metadata
-                .insert("agentkit.context.source".into(), json!("agents_md"));
+            item.metadata.insert(
+                "agentkit.context.source".into(),
+                Value::String("agents_md".into()),
+            );
             item.metadata.insert(
                 "agentkit.context.path".into(),
-                json!(path.display().to_string()),
+                Value::String(path.display().to_string()),
             );
             transcript.push(item);
         }
@@ -2523,12 +2649,21 @@ impl StorageCancellationBridge {
         let shutdown = crate::resilient_fs::shutdown_token().child_token();
         let external = external.map(|handle| handle.checkpoint());
         Self(tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = async {
-                    if let Some(external) = external { external.cancelled().await; }
-                    else { std::future::pending::<()>().await; }
-                } => {},
+            {
+                // Both handlers are identical and this race runs only once:
+                // deterministic shutdown-first ties need no fairness rotation.
+                let shutdown = std::pin::pin!(shutdown.cancelled());
+                let external = std::pin::pin!(async {
+                    if let Some(external) = external {
+                        external.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                });
+                match select(shutdown, external).await {
+                    Either::Left(((), _pending)) => {}
+                    Either::Right(((), _pending)) => {}
+                }
             }
             // A generation snapshot can be created during async startup after
             // the first interrupt. Keep shutdown asserted until the owner closes.

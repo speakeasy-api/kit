@@ -5,8 +5,9 @@ use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_util::{FutureExt as _, StreamExt as _, stream};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value};
 use tokio::{io::AsyncReadExt, process::Command};
 
 use crate::process_tree::{isolate_tokio_process_tree, terminate_tokio_process_tree};
@@ -21,32 +22,77 @@ pub struct ShellTool {
 
 impl ShellTool {
     pub fn new(root: PathBuf) -> Self {
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "command".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "timeout_seconds".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("integer")),
+                            ("minimum".into(), Value::from(1)),
+                            ("maximum".into(), Value::from(3600)),
+                            ("default".into(), Value::from(120)),
+                        ])),
+                    ),
+                ])),
+            ),
+            (
+                "required".into(),
+                Value::Array(vec![Value::from("command")]),
+            ),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
+        let output_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "exit_code".into(),
+                        Value::Object(Map::from_iter([(
+                            "type".into(),
+                            Value::Array(vec![Value::from("integer"), Value::from("null")]),
+                        )])),
+                    ),
+                    (
+                        "success".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("boolean"))])),
+                    ),
+                    (
+                        "stdout".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "stderr".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                ])),
+            ),
+            (
+                "required".into(),
+                Value::Array(vec![
+                    Value::from("exit_code"),
+                    Value::from("success"),
+                    Value::from("stdout"),
+                    Value::from("stderr"),
+                ]),
+            ),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
         Self {
             root,
             spec: ToolSpec::new(
                 ToolName::new("shell"),
                 "Run a shell command from Kit's working directory. Commands can access any path allowed to the Kit process.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 120}
-                    },
-                    "required": ["command"],
-                    "additionalProperties": false
-                }),
+                input_schema,
             )
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "exit_code": {"type": ["integer", "null"]},
-                    "success": {"type": "boolean"},
-                    "stdout": {"type": "string"},
-                    "stderr": {"type": "string"}
-                },
-                "required": ["exit_code", "success", "stdout", "stderr"],
-                "additionalProperties": false
-            }))
+            .with_output_schema(output_schema)
             .with_annotations(ToolAnnotations::new()),
         }
     }
@@ -108,7 +154,6 @@ impl Tool for ShellTool {
         let mut stdout = None;
         let mut stderr = None;
         let timeout = tokio::time::sleep(Duration::from_secs(input.timeout_seconds));
-        tokio::pin!(timeout);
         // A cancelled turn must not wait out the command: the loop awaits this
         // invocation, so an uncooperative tool keeps the whole turn alive until
         // the timeout, however long the caller asked for.
@@ -118,91 +163,67 @@ impl Tool for ShellTool {
                 None => std::future::pending().await,
             }
         };
-        tokio::pin!(interrupted);
 
-        while status.is_none() || stdout.is_none() || stderr.is_none() {
-            let event = tokio::select! {
-                result = child.wait(), if status.is_none() => ShellEvent::Wait(result),
-                result = &mut stdout_task, if !stdout_finished => ShellEvent::Stdout(result),
-                result = &mut stderr_task, if !stderr_finished => ShellEvent::Stderr(result),
-                () = &mut timeout => ShellEvent::Timeout,
-                () = &mut interrupted => ShellEvent::Cancelled,
-            };
-            match event {
-                ShellEvent::Wait(Ok(exit_status)) => status = Some(exit_status),
-                ShellEvent::Wait(Err(error)) => {
-                    terminate_shell(
-                        &mut child,
-                        pid,
-                        &mut stdout_task,
-                        stdout_finished,
-                        &mut stderr_task,
-                        stderr_finished,
-                    )
-                    .await;
-                    return Err(ToolError::ExecutionFailed(error.to_string()));
+        let outcome = {
+            // Keep one merge alive throughout collection. Each source yields
+            // once and then exhausts, replacing select guards without polling
+            // completed wait/join futures again or rebuilding a priority race.
+            let mut events = stream::SelectAll::from_iter([
+                stream::once(child.wait().map(ShellEvent::Wait)).boxed(),
+                stream::once((&mut stdout_task).map(ShellEvent::Stdout)).boxed(),
+                stream::once((&mut stderr_task).map(ShellEvent::Stderr)).boxed(),
+                stream::once(timeout.map(|()| ShellEvent::Timeout)).boxed(),
+                stream::once(interrupted.map(|()| ShellEvent::Cancelled)).boxed(),
+            ]);
+            loop {
+                if status.is_some() && stdout.is_some() && stderr.is_some() {
+                    break Ok(());
                 }
-                ShellEvent::Stdout(result) => {
-                    stdout_finished = true;
-                    match output_task_result(result) {
-                        Ok(output) => stdout = Some(output),
-                        Err(error) => {
-                            terminate_shell(
-                                &mut child,
-                                pid,
-                                &mut stdout_task,
-                                stdout_finished,
-                                &mut stderr_task,
-                                stderr_finished,
-                            )
-                            .await;
-                            return Err(error);
+                let Some(event) = events.next().await else {
+                    break Err(ToolError::Internal(
+                        "shell events exhausted before collection".into(),
+                    ));
+                };
+                match event {
+                    ShellEvent::Wait(Ok(exit_status)) => status = Some(exit_status),
+                    ShellEvent::Wait(Err(error)) => {
+                        break Err(ToolError::ExecutionFailed(error.to_string()));
+                    }
+                    ShellEvent::Stdout(result) => {
+                        stdout_finished = true;
+                        match output_task_result(result) {
+                            Ok(output) => stdout = Some(output),
+                            Err(error) => break Err(error),
                         }
                     }
-                }
-                ShellEvent::Stderr(result) => {
-                    stderr_finished = true;
-                    match output_task_result(result) {
-                        Ok(output) => stderr = Some(output),
-                        Err(error) => {
-                            terminate_shell(
-                                &mut child,
-                                pid,
-                                &mut stdout_task,
-                                stdout_finished,
-                                &mut stderr_task,
-                                stderr_finished,
-                            )
-                            .await;
-                            return Err(error);
+                    ShellEvent::Stderr(result) => {
+                        stderr_finished = true;
+                        match output_task_result(result) {
+                            Ok(output) => stderr = Some(output),
+                            Err(error) => break Err(error),
                         }
                     }
-                }
-                ShellEvent::Timeout => {
-                    terminate_shell(
-                        &mut child,
-                        pid,
-                        &mut stdout_task,
-                        stdout_finished,
-                        &mut stderr_task,
-                        stderr_finished,
-                    )
-                    .await;
-                    return Err(ToolError::ExecutionFailed("shell command timed out".into()));
-                }
-                ShellEvent::Cancelled => {
-                    terminate_shell(
-                        &mut child,
-                        pid,
-                        &mut stdout_task,
-                        stdout_finished,
-                        &mut stderr_task,
-                        stderr_finished,
-                    )
-                    .await;
-                    return Err(ToolError::Cancelled);
+                    ShellEvent::Timeout => {
+                        break Err(ToolError::ExecutionFailed("shell command timed out".into()));
+                    }
+                    ShellEvent::Cancelled => break Err(ToolError::Cancelled),
                 }
             }
+        };
+        // The merge and its child/handle borrows are gone before cleanup.
+        // Dropping join handles only detaches: terminate the process tree, then
+        // abort and await every reader whose result was not already consumed.
+        if let Err(error) = outcome {
+            terminate_shell(
+                &mut child,
+                pid,
+                &mut stdout_task,
+                stdout_finished,
+                &mut stderr_task,
+                stderr_finished,
+            )
+            .await;
+            return Err(error);
         }
         let status =
             status.ok_or_else(|| ToolError::Internal("shell status was not collected".into()))?;
@@ -210,12 +231,15 @@ impl Tool for ShellTool {
             stdout.ok_or_else(|| ToolError::Internal("shell stdout was not collected".into()))?;
         let stderr =
             stderr.ok_or_else(|| ToolError::Internal("shell stderr was not collected".into()))?;
-        let output = json!({
-            "exit_code": status.code(),
-            "success": status.success(),
-            "stdout": stdout,
-            "stderr": stderr
-        });
+        let output = Value::Object(Map::from_iter([
+            (
+                "exit_code".into(),
+                status.code().map_or(Value::Null, Value::from),
+            ),
+            ("success".into(), Value::from(status.success())),
+            ("stdout".into(), Value::from(stdout)),
+            ("stderr".into(), Value::from(stderr)),
+        ]));
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(output),
@@ -310,21 +334,31 @@ const fn default_timeout() -> u64 {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
-    use agentkit_core::{MetadataMap, SessionId, TurnId};
+    use agentkit_core::{
+        CancellationController, MetadataMap, SessionId, ToolOutput, TurnCancellation, TurnId,
+    };
     use agentkit_tools_core::{
-        AllowAllPermissions, OwnedToolContext, Tool as _, ToolError, ToolRequest,
+        AllowAllPermissions, OwnedToolContext, Tool as _, ToolError, ToolRequest, ToolResult,
     };
     use serde_json::json;
     use tokio::io::AsyncWriteExt as _;
 
-    use super::{MAX_INTERNAL_OUTPUT_BYTES, ShellTool, read_output, shell_command};
-    use crate::process_tree::{isolate_tokio_process_tree, terminate_tokio_process_tree};
+    use super::{MAX_INTERNAL_OUTPUT_BYTES, ShellTool, read_output};
 
     async fn invoke_shell(
         root: &std::path::Path,
         command: &str,
         timeout_seconds: u64,
-    ) -> Result<(), ToolError> {
+    ) -> Result<ToolResult, ToolError> {
+        invoke_shell_with_cancellation(root, command, timeout_seconds, None).await
+    }
+
+    async fn invoke_shell_with_cancellation(
+        root: &std::path::Path,
+        command: &str,
+        timeout_seconds: u64,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<ToolResult, ToolError> {
         let tool = ShellTool::new(root.to_path_buf());
         let context = OwnedToolContext {
             session_id: SessionId::new("session"),
@@ -332,7 +366,7 @@ mod tests {
             metadata: MetadataMap::new(),
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
-            cancellation: None,
+            cancellation,
             execution_scope: None,
             approved_request: None,
         };
@@ -346,9 +380,32 @@ mod tests {
             "session",
             "turn",
         );
-        tool.invoke(request, &mut context.borrowed())
-            .await
-            .map(|_| ())
+        tool.invoke(request, &mut context.borrowed()).await
+    }
+
+    #[tokio::test]
+    async fn structured_output_preserves_exit_codes_and_signal_null() {
+        let directory = tempfile::tempdir().unwrap();
+        for (command, expected) in [
+            (
+                "printf 'héllo'; printf 'error' >&2; exit 7",
+                json!({"exit_code": 7, "success": false, "stdout": "héllo", "stderr": "error"}),
+            ),
+            (
+                "exit 0",
+                json!({"exit_code": 0, "success": true, "stdout": "", "stderr": ""}),
+            ),
+            (
+                "kill -TERM $$",
+                json!({"exit_code": null, "success": false, "stdout": "", "stderr": ""}),
+            ),
+        ] {
+            let result = invoke_shell(directory.path(), command, 5).await.unwrap();
+            let ToolOutput::Structured(output) = result.result.output else {
+                panic!("structured output expected");
+            };
+            assert_eq!(output, expected);
+        }
     }
 
     fn assert_output_limit(error: ToolError) {
@@ -451,28 +508,53 @@ mod tests {
     async fn cancellation_kills_shell_descendants() {
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("child.pid");
-        let mut command = shell_command(&format!(
-            "sleep 30 & echo $! > {}; wait",
-            pid_file.display()
-        ));
-        isolate_tokio_process_tree(&mut command);
-        let mut child = command.spawn().unwrap();
-        let pid = child.id().unwrap();
-        let descendant = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file)
-                    && let Ok(pid) = contents.trim().parse::<i32>()
-                {
-                    break pid;
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+        let controller = CancellationController::new();
+        let invocation = invoke_shell_with_cancellation(
+            directory.path(),
+            &command,
+            30,
+            Some(controller.handle().checkpoint()),
+        );
+        let interrupt = async {
+            let descendant = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&pid_file)
+                        && let Ok(pid) = contents.trim().parse::<i32>()
+                    {
+                        break pid;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            })
+            .await
+            .expect("shell did not report its descendant PID");
+            controller.interrupt();
+            descendant
+        };
+        let (result, descendant) = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join(invocation, interrupt),
+        )
         .await
-        .expect("shell did not report its descendant PID");
+        .expect("cancellation did not stop the shell invocation");
 
-        terminate_tokio_process_tree(&mut child, pid).await;
-
+        assert!(matches!(result, Err(ToolError::Cancelled)));
         assert_process_exited(descendant).await;
+    }
+
+    #[tokio::test]
+    async fn closed_output_pipes_do_not_disable_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke_shell(directory.path(), "exec 1>&- 2>&-; sleep 30", 1),
+        )
+        .await
+        .expect("finished output readers disabled the timeout")
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolError::ExecutionFailed(message) if message == "shell command timed out")
+        );
     }
 }

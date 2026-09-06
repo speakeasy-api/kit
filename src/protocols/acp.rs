@@ -38,8 +38,11 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
+use serde_json::{Map, Value};
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
@@ -87,11 +90,11 @@ impl<'a> AuthenticationRequiredData<'a> {
     }
 
     pub(crate) fn into_value(self) -> serde_json::Value {
-        serde_json::json!({
-            "kind": AUTH_REQUIRED_KIND,
-            "methodId": self.method_id,
-            "detail": self.detail,
-        })
+        Value::Object(Map::from_iter([
+            ("kind".into(), Value::from(AUTH_REQUIRED_KIND)),
+            ("methodId".into(), Value::from(self.method_id)),
+            ("detail".into(), Value::from(self.detail)),
+        ]))
     }
 }
 
@@ -257,7 +260,10 @@ fn tool_replay_update(part: &Part) -> Option<SessionUpdate> {
 
 pub(super) fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> {
     match output {
-        ToolOutput::Text(text) => Some(json!({ "text": text })),
+        ToolOutput::Text(text) => Some(Value::Object(Map::from_iter([(
+            "text".into(),
+            Value::from(text.clone()),
+        )]))),
         ToolOutput::Structured(value) => Some(value.clone()),
         ToolOutput::Parts(parts) => serde_json::to_value(parts).ok(),
         ToolOutput::Files(files) => serde_json::to_value(files).ok(),
@@ -926,7 +932,10 @@ async fn logout_authentication(
             "authentication logout could not finish session teardown".into(),
         ));
     }
-    match logout.expect("successful teardown runs the authentication reset action") {
+    let logout = logout.ok_or_else(|| {
+        AcpRuntimeError::Loop("authentication reset did not run credential deletion".into())
+    })?;
+    match logout {
         Ok(()) => Ok(()),
         Err(error) => Err(AcpRuntimeError::Loop(format!(
             "{error}; active ACP sessions were reset because credential state may have changed"
@@ -934,12 +943,12 @@ async fn logout_authentication(
     }
 }
 
-struct AttachedSession {
+struct AttachedSession<C> {
     session_id: agentkit_acp::SessionId,
     config_options: Vec<SessionConfigOption>,
     canonical_transcript: Vec<Item>,
     activation: oneshot::Sender<()>,
-    pending_fork_creation: Option<crate::session::SessionObserver>,
+    creation: C,
 }
 
 struct PreparedLoad {
@@ -1150,8 +1159,12 @@ impl Server {
         } else {
             "authentication method was not advertised by this agent"
         };
-        Err(agent_client_protocol::Error::invalid_params()
-            .data(serde_json::json!({ "detail": detail, "methodId": method_id })))
+        Err(
+            agent_client_protocol::Error::invalid_params().data(Value::Object(Map::from_iter([
+                ("detail".into(), Value::from(detail)),
+                ("methodId".into(), Value::from(method_id)),
+            ]))),
+        )
     }
 
     async fn logout(self: &Arc<Self>) -> Result<LogoutResponse, AcpRuntimeError> {
@@ -1248,6 +1261,7 @@ impl Server {
                 connection,
                 claim,
                 None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let AttachedSession {
@@ -1319,6 +1333,7 @@ impl Server {
                 connection,
                 claim,
                 None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let replay = transcript_replay(&attached.session_id, &attached.canonical_transcript);
@@ -1360,26 +1375,31 @@ impl Server {
                 connection,
                 claim,
                 Some(forked),
+                crate::runtime::SessionClaim::defer_fork_commit,
             )
             .await?;
         Ok(PreparedFork {
             response: ForkSessionResponse::new(attached.session_id)
                 .config_options(Some(attached.config_options)),
             activation: attached.activation,
-            creation: attached
-                .pending_fork_creation
-                .expect("fork attachment must defer transcript creation"),
+            creation: attached.creation,
         })
     }
 
-    async fn attach_session(
+    async fn attach_session<C>(
         self: &Arc<Self>,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         connection: ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
-    ) -> Result<AttachedSession, AcpRuntimeError> {
+        commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
+    ) -> Result<AttachedSession<C>, AcpRuntimeError> {
+        // Validate path serialization before admission or any binding/actor effects.
+        let cwd_metadata =
+            serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        let directories_metadata = serde_json::to_value(&additional_directories)
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
         // Reject exhaustion before admission or any binding, driver, or actor effects.
         let token = self.registry.next_token()?;
         let mut admission = self
@@ -1390,6 +1410,7 @@ impl Server {
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
+        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string())?;
         if crate::resilient_fs::shutdown_token().is_cancelled() {
             return Err(AcpRuntimeError::ClientClosed);
         }
@@ -1409,12 +1430,8 @@ impl Server {
         });
 
         let mut metadata = MetadataMap::new();
-        metadata.insert("acp.cwd".into(), json!(cwd));
-        metadata.insert(
-            "acp.additional_directories".into(),
-            json!(additional_directories),
-        );
-        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
+        metadata.insert("acp.cwd".into(), cwd_metadata);
+        metadata.insert("acp.additional_directories".into(), directories_metadata);
         let binding =
             AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client.clone())
                 .cancellation(cancellation)
@@ -1524,16 +1541,9 @@ impl Server {
                 structured_completion,
                 tasks,
             },
-            || {
-                if claim.is_fork() {
-                    Ok(Some(claim.defer_fork_commit()))
-                } else {
-                    claim.commit()?;
-                    Ok(None)
-                }
-            },
+            || commit(claim),
         );
-        let pending_fork_creation = match publication {
+        let creation = match publication {
             Ok(creation) => creation,
             Err(error) => {
                 drop(activation);
@@ -1556,7 +1566,7 @@ impl Server {
             config_options,
             canonical_transcript,
             activation,
-            pending_fork_creation,
+            creation,
         })
     }
 
@@ -1756,25 +1766,47 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let mut binding = Some(binding);
     let mut model_switch = model_switch::Guard::default();
     loop {
-        tokio::select! {
-            // A queued cancel or close wins over a simultaneously-ready task
-            // completion, preventing autonomous progress past that boundary.
-            biased;
-            command = commands.recv() => match command {
+        // Poll in command > MCP > task order. In particular, queued cancellation
+        // must prevent an autonomous continuation from starting.
+        let event = {
+            let command = std::pin::pin!(commands.recv());
+            let mcp = std::pin::pin!(async {
+                match mcp_events.recv().await {
+                    Some(event) => event,
+                    None => std::future::pending().await,
+                }
+            });
+            let task = std::pin::pin!(tasks.next_event());
+            let work = std::pin::pin!(select(mcp, task));
+            match select(command, work).await {
+                Either::Left((command, _pending)) => Either::Left(command),
+                Either::Right((work, _pending)) => Either::Right(match work {
+                    Either::Left((event, _pending)) => Either::Left(event),
+                    Either::Right((event, _pending)) => Either::Right(event),
+                }),
+            }
+        }; // Drop the owning futures before handlers reborrow receivers/driver.
+        match event {
+            Either::Left(command) => match command {
                 Some(Command::Prompt { request, reply }) => {
-                    let result = activity.execute(activity::ExecutionOrigin::Prompt, drive_runtime_prompt(
-                        &session_id,
-                        &runtime,
-                        &integration,
-                        &mut skill_catalog,
-                        &mut driver,
-                        request,
-                        &tasks,
-                        &background_jobs,
-                        structured_completion,
-                    ), |reason| Some(reason.clone()))
-                    .instrument(crate::telemetry::error_spans::operation("acp"))
-                    .await;
+                    let result = activity
+                        .execute(
+                            activity::ExecutionOrigin::Prompt,
+                            drive_runtime_prompt(
+                                &session_id,
+                                &runtime,
+                                &integration,
+                                &mut skill_catalog,
+                                &mut driver,
+                                request,
+                                &tasks,
+                                &background_jobs,
+                                structured_completion,
+                            ),
+                            |reason| Some(reason.clone()),
+                        )
+                        .instrument(crate::telemetry::error_spans::operation("acp"))
+                        .await;
                     let response = result.and_then(|reason| {
                         agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
                     });
@@ -1783,35 +1815,76 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
                 Some(Command::Cancel) => {}
-                Some(Command::SetConfig { request, reply, cancellation_generation }) => {
+                Some(Command::SetConfig {
+                    request,
+                    reply,
+                    cancellation_generation,
+                }) => {
                     let result = async {
-                        let cancellation = integration.cancellation_handle(&session_id).map_err(sdk_error)?;
-                        if cancellation.is_cancelled_since(cancellation_generation) { return Err(model_switch::error("model change cancelled")); }
+                        let cancellation = integration
+                            .cancellation_handle(&session_id)
+                            .map_err(sdk_error)?;
+                        if cancellation.is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
                         if request.config_id.to_string() == MODEL_CONFIG_ID {
-                            let target = request.value.as_value_id().ok_or_else(|| model_switch::error("selection requires an id value"))?;
+                            let target = request.value.as_value_id().ok_or_else(|| {
+                                model_switch::error("selection requires an id value")
+                            })?;
                             let decision = model_switch.check(
-                                (&adapter.selection().map_err(|error| model_switch::error(&error))?, cancellation_generation),
-                                ModelSelection::from_id(&target.to_string()).map_err(|error| model_switch::error(&error))?,
-                                &catalog, driver.snapshot().transcript,
-                                request.meta.as_ref().and_then(|meta| meta.get(model_switch::META)),
+                                (
+                                    &adapter
+                                        .selection()
+                                        .map_err(|error| model_switch::error(&error))?,
+                                    cancellation_generation,
+                                ),
+                                ModelSelection::from_id(&target.to_string())
+                                    .map_err(|error| model_switch::error(&error))?,
+                                &catalog,
+                                driver.snapshot().transcript,
+                                request
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|meta| meta.get(model_switch::META)),
                             )?;
                             if decision == model_switch::Decision::Compact {
                                 let marker = model_switch::compact_marker();
                                 let marker_id = marker.id.clone();
-                                driver.submit_input(vec![marker]).map_err(|error| sdk_error(record_acp_loop_failure(&session_id, &error)))?;
-                                let reason = activity.execute(activity::ExecutionOrigin::Prompt,
-                                    drive_finalized(&session_id, &integration, &mut driver, false, None),
-                                    |reason| Some(reason.clone()),
-                                ).await.map_err(sdk_error)?;
-                                if !model_switch::compaction_completed(&reason, &marker_id, &driver.snapshot().transcript,
-                                    cancellation.is_cancelled_since(cancellation_generation)) {
-                                    return Err(model_switch::error("compaction did not complete; model unchanged"));
+                                driver.submit_input(vec![marker]).map_err(|error| {
+                                    sdk_error(record_acp_loop_failure(&session_id, &error))
+                                })?;
+                                let reason = activity
+                                    .execute(
+                                        activity::ExecutionOrigin::Prompt,
+                                        drive_finalized(
+                                            &session_id,
+                                            &integration,
+                                            &mut driver,
+                                            false,
+                                            None,
+                                        ),
+                                        |reason| Some(reason.clone()),
+                                    )
+                                    .await
+                                    .map_err(sdk_error)?;
+                                if !model_switch::compaction_completed(
+                                    &reason,
+                                    &marker_id,
+                                    &driver.snapshot().transcript,
+                                    cancellation.is_cancelled_since(cancellation_generation),
+                                ) {
+                                    return Err(model_switch::error(
+                                        "compaction did not complete; model unchanged",
+                                    ));
                                 }
                             }
                         }
-                        if cancellation.is_cancelled_since(cancellation_generation) { return Err(model_switch::error("model change cancelled")); }
+                        if cancellation.is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
                         set_config(&adapter, &catalog, request).map_err(sdk_error)
-                    }.await;
+                    }
+                    .await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Fork {
@@ -1843,41 +1916,35 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 None => {
                     clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
                     break;
-                },
+                }
             },
-            event = mcp_events.recv() => {
-                if let Some(event) = event {
-                    let result = driver
-                        .submit_input(vec![Item::notification(event.message)])
-                        .map_err(|error| AcpRuntimeError::Loop(error.to_string()));
-                    let result = match result {
-                        Ok(()) => drive_unsolicited(
-                            &session_id,
-                            &integration,
-                            &mut driver,
-                            &activity,
-                        ).await,
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = result {
-                        eprintln!("autonomous MCP continuation failed for {session_id}: {error}");
+            Either::Right(Either::Left(event)) => {
+                let result = driver
+                    .submit_input(vec![Item::notification(event.message)])
+                    .map_err(|error| AcpRuntimeError::Loop(error.to_string()));
+                let result = match result {
+                    Ok(()) => {
+                        drive_unsolicited(&session_id, &integration, &mut driver, &activity).await
                     }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("autonomous MCP continuation failed for {session_id}: {error}");
                 }
             }
             // Task events remain queued while a prompt is being driven, so a
             // completion cannot be lost in the prompt-to-idle transition.
-            event = tasks.next_event() => match event {
+            Either::Right(Either::Right(event)) => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background {
-                        let result = drive_unsolicited(
-                            &session_id,
-                            &integration,
-                            &mut driver,
-                            &activity,
-                        ).await;
+                        let result =
+                            drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+                                .await;
                         if let Err(error) = result {
-                            eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
+                            eprintln!(
+                                "autonomous ACP continuation failed for {session_id}: {error}"
+                            );
                         }
                     }
                 }
@@ -1886,7 +1953,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 }
                 Some(_) => {}
                 None => break,
-            }
+            },
         }
     }
 }
@@ -2015,26 +2082,39 @@ pub(super) async fn settle_background_jobs(
         if !stable.active && !running && !stable.unacknowledged_terminals {
             return Ok(observed_activity);
         }
-        tokio::select! {
-            biased;
-            _ = background_jobs.activity_after(stable.generation) => {}
-            event = tasks.next_event(), if running || stable.unacknowledged_terminals => {
-                match event {
-                    Some(
-                        TaskEvent::Completed(snapshot, _)
-                        | TaskEvent::Cancelled(snapshot)
-                        | TaskEvent::Failed(snapshot, _),
-                    ) => {
-                        background_jobs.acknowledge_terminal(&snapshot.call_id);
-                    }
-                    Some(_) => {}
-                    None => {
-                        return Err(AcpRuntimeError::Loop(
-                            "background task event stream closed before quiescence".into(),
-                        ));
-                    }
+        let event = {
+            let activity = std::pin::pin!(background_jobs.activity_after(stable.generation));
+            let task = std::pin::pin!(async {
+                if running || stable.unacknowledged_terminals {
+                    tasks.next_event().await
+                } else {
+                    std::future::pending().await
                 }
+            });
+            // A generation change wins over a task event; refresh both guards
+            // on the next iteration rather than waiting on a stale snapshot.
+            match select(activity, task).await {
+                Either::Left((_activity, _pending)) => Either::Left(()),
+                Either::Right((event, _pending)) => Either::Right(event),
             }
+        };
+        match event {
+            Either::Left(()) => {}
+            Either::Right(event) => match event {
+                Some(
+                    TaskEvent::Completed(snapshot, _)
+                    | TaskEvent::Cancelled(snapshot)
+                    | TaskEvent::Failed(snapshot, _),
+                ) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
+                }
+                Some(_) => {}
+                None => {
+                    return Err(AcpRuntimeError::Loop(
+                        "background task event stream closed before quiescence".into(),
+                    ));
+                }
+            },
         }
     }
 }
@@ -2320,9 +2400,19 @@ async fn connect_stdio(component: impl ConnectTo<Client>) -> Result<(), AcpRunti
         Ok::<_, std::io::Error>(send)
     });
     let transport = agent_client_protocol::Lines::new(Box::pin(outgoing), Box::pin(incoming));
-    tokio::select! {
-        result = component.connect_to(transport) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
-        _ = eof.cancelled() => Ok(()),
+    // On a tie, report the connection outcome before EOF. Both outcomes were
+    // permitted by the former unbiased race; connection errors stay visible.
+    let outcome = {
+        let connection = std::pin::pin!(component.connect_to(transport));
+        let eof = std::pin::pin!(eof.cancelled());
+        match select(connection, eof).await {
+            Either::Left((result, _pending)) => Some(result),
+            Either::Right(((), _pending)) => None,
+        }
+    };
+    match outcome {
+        Some(result) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
+        None => Ok(()),
     }
 }
 
@@ -2336,24 +2426,42 @@ pub async fn serve_with_registry(
 ) -> Result<(), AcpRuntimeError> {
     let component = component(runtime, registry.clone())?;
     let shutdown = crate::resilient_fs::shutdown_token();
-    let result = tokio::select! {
-        result = connect_stdio(component) => result,
-        _ = shutdown.cancelled() => Ok(()),
+    let result = {
+        let connection = std::pin::pin!(connect_stdio(component));
+        let shutdown = std::pin::pin!(shutdown.cancelled());
+        // Deterministically prefer the connection outcome on a tie, one of the
+        // former unbiased race's allowed outcomes. Drop it before registry cleanup.
+        match select(connection, shutdown).await {
+            Either::Left((result, _pending)) => result,
+            Either::Right(((), _pending)) => Ok(()),
+        }
     };
     registry.shutdown().await;
     result
 }
 
+// The HTTP SDK requires an infallible factory. Carry construction failure to
+// its fallible connection boundary instead of panicking or sharing a server's
+// integration binding map between connections.
+struct HttpConnection(Result<agent_client_protocol::AgentProtocolRouter, AcpRuntimeError>);
+
+impl ConnectTo<Client> for HttpConnection {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<agent_client_protocol::Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.0.map_err(sdk_error)?.connect_to(client).await
+    }
+}
+
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        let v1 = component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP v1 integration must build");
-        let v2 = v2::component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP v2 integration must build");
-        agent_client_protocol::Agent
-            .protocol_router()
-            .with_v1(v1)
-            .with_v2(v2)
+        HttpConnection(component(Arc::clone(&runtime), registry.clone()).map(|v1| {
+            agent_client_protocol::Agent
+                .protocol_router()
+                .with_v1(v1)
+                .with_v2(v2::component(Arc::clone(&runtime), registry.clone()))
+        }))
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         health_endpoint: false,
@@ -2760,6 +2868,75 @@ pub(super) mod tests {
         legacy_activity(id, move |state| {
             tx.send(state).map_err(|_| AcpRuntimeError::ClientClosed)
         })
+    }
+
+    #[test]
+    fn rejected_fork_deferral_releases_configured_new_and_load_claims() {
+        for load in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::with_session(
+                root.path(),
+                "gpt-5.4",
+                crate::runtime::SessionRequest {
+                    id: "selected".into(),
+                    resume: false,
+                    force: false,
+                },
+            )
+            .unwrap();
+            let claim = if load {
+                runtime.claim_session_load("selected").unwrap()
+            } else {
+                runtime.claim_session().unwrap()
+            };
+            assert!(claim.is_configured());
+            assert!(claim.defer_fork_commit().is_err());
+            let retry = runtime.claim_session().unwrap();
+            assert_eq!(retry.id(), "selected");
+            assert!(retry.is_configured());
+            assert!(crate::session::load(root.path(), "selected").is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_runtime_telemetry_is_rejected_before_shared_runtime_reconfiguration() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let invalid = crate::telemetry::Settings {
+            message_content_max_messages: 0,
+            ..Default::default()
+        };
+        let error = Runtime::with_telemetry(runtime.clone(), invalid)
+            .err()
+            .unwrap();
+        assert!(error.contains("otel_message_content_max_messages"));
+        // Rejection leaves the original runtime privately owned and configurable.
+        let runtime = Runtime::with_telemetry(runtime, Default::default()).unwrap();
+        assert_eq!(runtime.base_depth(), 0);
+    }
+
+    #[test]
+    fn unopened_fork_cannot_transfer_cleanup_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        assert!(claim.defer_fork_commit().is_err());
+        assert!(crate::session::load(root.path(), &id).is_err());
+        let next = runtime.claim_session_fork().unwrap();
+        assert_ne!(next.id(), id);
+        assert!(next.is_fork());
+    }
+
+    #[tokio::test]
+    async fn http_connection_propagates_integration_construction_failure() {
+        let failure = AcpIntegration::builder().build().err().unwrap();
+        let expected = sdk_error(AcpRuntimeError::MissingField("name"));
+        let actual = HttpConnection(Err(failure))
+            .connect_to(agent_client_protocol::Client.builder())
+            .await
+            .unwrap_err();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -3718,6 +3895,82 @@ pub(super) mod tests {
         assert!(!registry.reset_authentication().await);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_invalid_path_metadata_rejects_before_attachment_and_releases_claim() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let selected_id = crate::session::new_id();
+        let runtime = Runtime::with_session_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::runtime::SessionRequest {
+                id: selected_id.clone(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = Arc::new(Server::new(
+            runtime.clone(),
+            AcpIntegration::builder()
+                .name("invalid-path-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry.clone(),
+        ));
+        let (client_transport, agent_transport) = Channel::duplex();
+        let serving = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .builder()
+                .connect_to(client_transport)
+                .await
+        });
+        let workspace = root.path().to_path_buf();
+        agent_client_protocol::Agent
+            .builder()
+            .connect_with(agent_transport, async move |connection| {
+                let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+                for invalid_cwd in [true, false] {
+                    let mut request = NewSessionRequest::new(if invalid_cwd {
+                        invalid.clone()
+                    } else {
+                        workspace.clone()
+                    });
+                    if !invalid_cwd {
+                        request.additional_directories = vec![invalid.clone()];
+                    }
+                    // Exercise the attachment boundary directly: a wire encoder
+                    // would reject this non-UTF-8 path before it reached the server.
+                    let error = server
+                        .new_session(request, connection.clone())
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(error, AcpRuntimeError::Sdk(_)));
+                    assert!(error.to_string().contains("UTF-8"));
+                    assert!(server.sessions.lock().unwrap().is_empty());
+                    {
+                        let state = registry.inner.lock_state();
+                        assert_eq!(state.pending_attachments, 0);
+                        assert!(state.sessions.is_empty());
+                    }
+                    let claim = runtime.claim_session().unwrap();
+                    assert_eq!(claim.id(), selected_id);
+                    drop(claim);
+                    assert!(crate::session::load(&workspace, &selected_id).is_err());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        serving.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn legacy_token_exhaustion_rejects_attachment_before_publication() {
         let root = tempfile::tempdir().unwrap();
@@ -3795,6 +4048,87 @@ pub(super) mod tests {
         server.abort();
         let _ = server.await;
         result.expect("exhaustion client timed out").unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_rejection_releases_attachment_and_claim() {
+        for poison in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let session_id = crate::session::new_id();
+            let runtime = Runtime::with_session_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::runtime::SessionRequest {
+                    id: session_id.clone(),
+                    resume: false,
+                    force: false,
+                },
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap();
+            let registry = SessionRegistry::new();
+            let expected = if poison {
+                let routes = runtime.mcp_for_test().event_route_registry();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = routes.lock().unwrap();
+                        panic!("interrupted event route admission");
+                    }))
+                    .is_err()
+                );
+                "MCP event routes are poisoned"
+            } else {
+                runtime
+                    .mcp_for_test()
+                    .event_route_counter()
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                "MCP event route generation space exhausted"
+            };
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let router = component(runtime.clone(), registry.clone()).unwrap();
+            let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+            let workspace = root.path().to_path_buf();
+            let client = agent_client_protocol::Client.builder().connect_with(
+                client_transport,
+                async move |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    for _ in 0..2 {
+                        let error = connection
+                            .send_request(NewSessionRequest::new(workspace.clone()))
+                            .block_task()
+                            .await
+                            .expect_err("unavailable MCP routes must reject attachment");
+                        assert!(error.data.unwrap().to_string().contains(expected));
+                        assert!(!registry.inner.state.is_poisoned());
+                        {
+                            let state = registry.inner.lock_state();
+                            assert!(state.accepting);
+                            assert_eq!(state.pending_attachments, 0);
+                            assert!(state.sessions.is_empty());
+                            assert!(state.v2_sessions.is_empty());
+                        }
+                        // Failed attachment releases its claim without creating a transcript.
+                        let claim = runtime.claim_session().unwrap();
+                        assert_eq!(claim.id(), session_id);
+                        assert!(claim.is_configured());
+                        drop(claim);
+                        assert_eq!(
+                            crate::session::load(&workspace, &session_id).unwrap_err(),
+                            format!("session {session_id:?} does not exist")
+                        );
+                    }
+                    Ok(())
+                },
+            );
+            let result = timeout(Duration::from_secs(2), client).await;
+            server.abort();
+            let _ = server.await;
+            result.expect("MCP rejection client timed out").unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4792,6 +5126,26 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn settlement_wakes_on_activity_when_task_event_guard_is_disabled() {
+        let jobs = BackgroundJobs::default();
+        jobs.register_foreground_for_test("foreground-call");
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let mut settlement = std::pin::pin!(settle_background_jobs(&tasks, &jobs));
+        // There is active foreground work, but no background task or terminal
+        // debt. Only a fresh activity generation can wake this settlement.
+        assert!(futures_util::poll!(&mut settlement).is_pending());
+        jobs.finish_for_test("foreground-call");
+        assert!(
+            timeout(Duration::from_secs(1), settlement)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!jobs.activity().active);
+    }
+
+    #[tokio::test]
     async fn failed_background_terminal_settles_after_fast_completion() {
         let jobs = BackgroundJobs::default();
         jobs.register_foreground_for_test("failed-call");
@@ -5375,7 +5729,7 @@ pub(super) mod tests {
         let (commands_tx, commands_rx) = mpsc::channel(8);
 
         let test_mcp = crate::tools::mcp::empty();
-        let mcp_events = test_mcp.subscribe(acp_session_id.to_string());
+        let mcp_events = test_mcp.subscribe(acp_session_id.to_string()).unwrap();
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();

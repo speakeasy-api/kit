@@ -4,7 +4,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value};
 
 #[derive(Clone)]
 pub struct DocsTool {
@@ -13,50 +13,129 @@ pub struct DocsTool {
 
 impl DocsTool {
     pub fn new() -> Self {
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([(
+                    "query".into(),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("string")),
+                        ("minLength".into(), Value::from(1)),
+                        ("maxLength".into(), Value::from(512)),
+                        (
+                            "description".into(),
+                            Value::from(
+                                "A free-text Kit question, error message, or feature name.",
+                            ),
+                        ),
+                    ])),
+                )])),
+            ),
+            ("required".into(), Value::Array(vec![Value::from("query")])),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
+        let output_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "query".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "version".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "matches".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("array")),
+                            ("maxItems".into(), Value::from(5)),
+                            (
+                                "items".into(),
+                                Value::Object(Map::from_iter([
+                                    ("type".into(), Value::from("object")),
+                                    (
+                                        "properties".into(),
+                                        Value::Object(Map::from_iter([
+                                            (
+                                                "path".into(),
+                                                Value::Object(Map::from_iter([
+                                                    ("type".into(), Value::from("string")),
+                                                    ("maxLength".into(), Value::from(256)),
+                                                ])),
+                                            ),
+                                            (
+                                                "title".into(),
+                                                Value::Object(Map::from_iter([
+                                                    ("type".into(), Value::from("string")),
+                                                    ("maxLength".into(), Value::from(256)),
+                                                ])),
+                                            ),
+                                            (
+                                                "section".into(),
+                                                Value::Object(Map::from_iter([
+                                                    ("type".into(), Value::from("string")),
+                                                    ("maxLength".into(), Value::from(256)),
+                                                ])),
+                                            ),
+                                            (
+                                                "score".into(),
+                                                Value::Object(Map::from_iter([(
+                                                    "type".into(),
+                                                    Value::from("integer"),
+                                                )])),
+                                            ),
+                                            (
+                                                "content".into(),
+                                                Value::Object(Map::from_iter([
+                                                    ("type".into(), Value::from("string")),
+                                                    ("maxLength".into(), Value::from(1800)),
+                                                ])),
+                                            ),
+                                        ])),
+                                    ),
+                                    (
+                                        "required".into(),
+                                        Value::Array(vec![
+                                            Value::from("path"),
+                                            Value::from("title"),
+                                            Value::from("section"),
+                                            Value::from("score"),
+                                            Value::from("content"),
+                                        ]),
+                                    ),
+                                    ("additionalProperties".into(), Value::from(false)),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "truncated".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("boolean"))])),
+                    ),
+                ])),
+            ),
+            (
+                "required".into(),
+                Value::Array(vec![
+                    Value::from("query"),
+                    Value::from("version"),
+                    Value::from("matches"),
+                    Value::from("truncated"),
+                ]),
+            ),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
         Self {
             spec: ToolSpec::new(
                 ToolName::new("docs"),
                 "Search the version-matched Kit documentation bundled in this binary for questions or troubleshooting about Kit itself.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 512,
-                            "description": "A free-text Kit question, error message, or feature name."
-                        }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }),
+                input_schema,
             )
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "version": {"type": "string"},
-                    "matches": {
-                        "type": "array",
-                        "maxItems": 5,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string", "maxLength": 256},
-                                "title": {"type": "string", "maxLength": 256},
-                                "section": {"type": "string", "maxLength": 256},
-                                "score": {"type": "integer"},
-                                "content": {"type": "string", "maxLength": 1800}
-                            },
-                            "required": ["path", "title", "section", "score", "content"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "truncated": {"type": "boolean"}
-                },
-                "required": ["query", "version", "matches", "truncated"],
-                "additionalProperties": false
-            }))
+            .with_output_schema(output_schema)
             .with_annotations(ToolAnnotations::new()),
         }
     }

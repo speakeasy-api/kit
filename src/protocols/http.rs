@@ -1,12 +1,13 @@
 use std::{convert::Infallible, io, path::Path, sync::Arc, time::Duration};
 
+use futures_util::future::{Either, select};
 use tokio::{task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use axum::{
     Router,
     body::Body,
-    http::{HeaderMap, Request, Response, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header},
 };
 use subtle::ConstantTimeEq as _;
 use tower::ServiceExt as _;
@@ -199,13 +200,34 @@ async fn serve_bound(
     let accepts_stopped = SignalOnDrop(accepts_stopped);
     let mut connections = JoinSet::new();
     loop {
-        tokio::select! {
-            biased;
-            _ = stop_accepting.cancelled() => break,
-            completed = connections.join_next(), if !connections.is_empty() => {
-                report_connection(completed.expect("non-empty connection set"));
+        // Left-first polling preserves stop > guarded join > accept. Leave
+        // both owning scopes before handling the event to release JoinSet borrows.
+        let event = {
+            let stop = std::pin::pin!(stop_accepting.cancelled());
+            let activity = std::pin::pin!(async {
+                let completed = std::pin::pin!(async {
+                    if !connections.is_empty()
+                        && let Some(completed) = connections.join_next().await
+                    {
+                        return completed;
+                    }
+                    std::future::pending().await
+                });
+                let accepted = std::pin::pin!(listener.accept());
+                match select(completed, accepted).await {
+                    Either::Left((completed, _pending)) => Either::Left(completed),
+                    Either::Right((accepted, _pending)) => Either::Right(accepted),
+                }
+            });
+            match select(stop, activity).await {
+                Either::Left(((), _pending)) => None,
+                Either::Right((event, _pending)) => Some(event),
             }
-            accepted = listener.accept() => match accepted {
+        };
+        match event {
+            None => break,
+            Some(Either::Left(completed)) => report_connection(completed),
+            Some(Either::Right(accepted)) => match accepted {
                 Ok((stream, _)) => {
                     let _ = stream.set_nodelay(true);
                     let a2a = a2a.clone();
@@ -225,25 +247,44 @@ async fn serve_bound(
                 }
                 Err(error) => {
                     eprintln!("HTTP accept failed: {error}");
-                    tokio::select! {
-                        biased;
-                        _ = stop_accepting.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    let stopped = {
+                        let stop = std::pin::pin!(stop_accepting.cancelled());
+                        let backoff =
+                            std::pin::pin!(tokio::time::sleep(Duration::from_millis(100)));
+                        match select(stop, backoff).await {
+                            Either::Left(((), _pending)) => true,
+                            Either::Right(((), _pending)) => false,
+                        }
+                    };
+                    if stopped {
+                        break;
                     }
                 }
-            }
+            },
         }
     }
     drop(listener);
     drop(accepts_stopped);
 
     loop {
-        tokio::select! {
-            biased;
-            _ = shutdown_connections.cancelled() => break,
-            completed = connections.join_next(), if !connections.is_empty() => {
-                report_connection(completed.expect("non-empty connection set"));
+        let completed = {
+            let shutdown = std::pin::pin!(shutdown_connections.cancelled());
+            let completed = std::pin::pin!(async {
+                if !connections.is_empty()
+                    && let Some(completed) = connections.join_next().await
+                {
+                    return completed;
+                }
+                std::future::pending().await
+            });
+            match select(shutdown, completed).await {
+                Either::Left(((), _pending)) => None,
+                Either::Right((completed, _pending)) => Some(completed),
             }
+        };
+        match completed {
+            None => break,
+            Some(completed) => report_connection(completed),
         }
     }
 
@@ -283,20 +324,18 @@ async fn dispatch(
         .as_ref()
         .is_some_and(|credential| !credential.authorizes(request.headers()))
     {
-        return Ok(Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(header::WWW_AUTHENTICATE, "Bearer")
-            .body(Body::from("unauthorized"))
-            .expect("fixed unauthorized response"));
+        let mut response = Response::new(Body::from("unauthorized"));
+        *response.status_mut() = StatusCode::UNAUTHORIZED;
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return Ok(response);
     }
 
     if matches!(request.uri().path(), "/acp" | "/acp/v2")
         && let Some(router) = acp
     {
-        let response = router
-            .oneshot(request.map(Body::new))
-            .await
-            .expect("Axum router is infallible");
+        let response = router.oneshot(request.map(Body::new)).await?;
         return Ok(response);
     }
 
@@ -304,10 +343,9 @@ async fn dispatch(
         return Ok(dispatcher.dispatch(request).await.map(Body::new));
     }
 
-    Ok(Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::from("not found"))
-        .expect("fixed not-found response"))
+    let mut response = Response::new(Body::from("not found"));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -495,6 +533,50 @@ mod tests {
         drop(websocket);
         server.shutdown();
         server.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_stop_preempts_queued_accept_and_empty_drain_waits_for_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let accepts_stopped = tokio_util::sync::CancellationToken::new();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let server = tokio::spawn(super::serve_bound(
+            listener,
+            None,
+            None,
+            None,
+            stop,
+            accepts_stopped.clone(),
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), accepts_stopped.cancelled())
+            .await
+            .unwrap();
+        assert!(!server.is_finished(), "empty drain must wait for shutdown");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap();
+        match read {
+            Ok(_) => {}
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+        }
+        assert!(response.is_empty(), "stop must prevent an HTTP response");
     }
 
     #[tokio::test]

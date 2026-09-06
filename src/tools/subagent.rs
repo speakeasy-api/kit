@@ -9,8 +9,11 @@ use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::{Map, Value};
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::Instrument as _;
 
@@ -178,7 +181,7 @@ struct SubagentListing {
 }
 
 struct OutputContract {
-    schema: Value,
+    schema: String,
     validator: jsonschema::Validator,
 }
 
@@ -186,13 +189,16 @@ impl OutputContract {
     fn new(schema: Value) -> Result<Self, ToolError> {
         let validator = jsonschema::validator_for(&schema)
             .map_err(|error| ToolError::InvalidInput(format!("invalid output_schema: {error}")))?;
+        let schema = serde_json::to_string(&schema).map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to serialize output_schema: {error}"))
+        })?;
         Ok(Self { schema, validator })
     }
 
     fn prompt(&self, prompt: String) -> String {
         format!(
             "{prompt}\n\nReturn only a JSON value matching this JSON Schema. Do not wrap it in Markdown or add commentary:\n{}",
-            serde_json::to_string(&self.schema).expect("JSON Schema serializes")
+            self.schema
         )
     }
 
@@ -470,10 +476,16 @@ impl Subagents {
         contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
         let state = self.lookup(&prior)?;
-        let mut locked = tokio::select! {
-            locked = state.lock() => locked,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        };
+        // Lock-first ties were already allowed by the unbiased select.
+        // The losing lock future is dropped before returning cancellation.
+        let mut locked =
+            match select(Box::pin(state.lock()), Box::pin(cancellation.cancelled())).await {
+                Either::Left((locked, _)) => locked,
+                Either::Right(((), pending_lock)) => {
+                    drop(pending_lock);
+                    return Err(ChildError::Cancelled);
+                }
+            };
         self.check_ready(&locked)?;
         if locked.forking.is_some() {
             return Err(ChildError::Failed(
@@ -558,9 +570,19 @@ impl Subagents {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let source_state = self.lookup(&prior)?;
-        let mut source = tokio::select! {
-            source = source_state.lock() => source,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
+        // Lock-first ties were already allowed by the unbiased select.
+        // The losing lock future is dropped before returning cancellation.
+        let mut source = match select(
+            Box::pin(source_state.lock()),
+            Box::pin(cancellation.cancelled()),
+        )
+        .await
+        {
+            Either::Left((source, _)) => source,
+            Either::Right(((), pending_lock)) => {
+                drop(pending_lock);
+                return Err(ChildError::Cancelled);
+            }
         };
         self.check_ready(&source)?;
         if source.forking.is_some() {
@@ -838,10 +860,16 @@ impl Subagents {
             .collect::<Vec<_>>();
         let mut values = Vec::with_capacity(states.len());
         for (id, state) in states {
-            let state = tokio::select! {
-                state = state.lock() => state,
-                () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-            };
+            // Lock-first ties were already allowed by the unbiased select.
+            // The losing lock future is dropped before returning cancellation.
+            let state =
+                match select(Box::pin(state.lock()), Box::pin(cancellation.cancelled())).await {
+                    Either::Left((state, _)) => state,
+                    Either::Right(((), pending_lock)) => {
+                        drop(pending_lock);
+                        return Err(ChildError::Cancelled);
+                    }
+                };
             let child_closed = state.child.as_ref().is_some_and(ChildSession::is_closed);
             if state.status != SubagentStatus::Removed && !child_closed {
                 values.push((
@@ -872,10 +900,16 @@ impl Subagents {
             .get(id)
             .map(|entry| Arc::clone(&entry.state))
             .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))?;
-        let mut locked = tokio::select! {
-            locked = state.lock() => locked,
-            () = cancellation.cancelled() => return Err(ChildError::Cancelled),
-        };
+        // Lock-first ties were already allowed by the unbiased select.
+        // The losing lock future is dropped before returning cancellation.
+        let mut locked =
+            match select(Box::pin(state.lock()), Box::pin(cancellation.cancelled())).await {
+                Either::Left((locked, _)) => locked,
+                Either::Right(((), pending_lock)) => {
+                    drop(pending_lock);
+                    return Err(ChildError::Cancelled);
+                }
+            };
         self.check_active(&locked)?;
         locked.status = SubagentStatus::Removed;
         locked.forking = None;
@@ -1224,7 +1258,6 @@ impl Subagents {
         }
     }
     fn check_ready(&self, state: &State) -> Result<(), ChildError> {
-        self.check_active(state)?;
         match state.status {
             SubagentStatus::Idle => Ok(()),
             SubagentStatus::Starting => Err(ChildError::Failed(
@@ -1233,7 +1266,9 @@ impl Subagents {
             SubagentStatus::Working => Err(ChildError::Failed(
                 "subagent session is already working".into(),
             )),
-            SubagentStatus::Removed => unreachable!("check_active rejects removed sessions"),
+            SubagentStatus::Removed => {
+                Err(ChildError::Failed("subagent session is retired".into()))
+            }
         }
     }
     fn check_generation(&self, prior: &SubagentValue, actual: u64) -> Result<(), ChildError> {
@@ -1320,22 +1355,204 @@ impl CloseInput {
 }
 
 fn value_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"output":{},"generation":{"type":"integer","minimum":1},"updates":{"type":"object","properties":{"items":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean"}},"required":["items","truncated"],"additionalProperties":false}},"required":["id","output","generation"],"additionalProperties":false})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from_iter([
+                (
+                    "id".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "name".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+                ("output".into(), Value::Object(Map::new())),
+                (
+                    "generation".into(),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1)),
+                    ])),
+                ),
+                (
+                    "updates".into(),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "properties".into(),
+                            Value::Object(Map::from_iter([
+                                (
+                                    "items".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("array")),
+                                        (
+                                            "items".into(),
+                                            Value::Object(Map::from_iter([(
+                                                "type".into(),
+                                                Value::from("object"),
+                                            )])),
+                                        ),
+                                    ])),
+                                ),
+                                (
+                                    "truncated".into(),
+                                    Value::Object(Map::from_iter([(
+                                        "type".into(),
+                                        Value::from("boolean"),
+                                    )])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "required".into(),
+                            Value::Array(vec![Value::from("items"), Value::from("truncated")]),
+                        ),
+                        ("additionalProperties".into(), Value::from(false)),
+                    ])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("id"),
+                Value::from("output"),
+                Value::from("generation"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
 }
 fn listing_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string","enum":["starting","working","idle"]},"generation":{"type":"integer","minimum":1},"task":{"type":"string"}},"required":["id","name","status","generation","task"],"additionalProperties":false})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from_iter([
+                (
+                    "id".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "name".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "status".into(),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("string")),
+                        (
+                            "enum".into(),
+                            Value::Array(vec![
+                                Value::from("starting"),
+                                Value::from("working"),
+                                Value::from("idle"),
+                            ]),
+                        ),
+                    ])),
+                ),
+                (
+                    "generation".into(),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("integer")),
+                        ("minimum".into(), Value::from(1)),
+                    ])),
+                ),
+                (
+                    "task".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![
+                Value::from("id"),
+                Value::from("name"),
+                Value::from("status"),
+                Value::from("generation"),
+                Value::from("task"),
+            ]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
 }
 fn continuation_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from_iter([
+                ("subagent".into(), value_schema()),
+                (
+                    "prompt".into(),
+                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                ),
+                (
+                    "output_schema".into(),
+                    Value::Object(Map::from_iter([(
+                        "oneOf".into(),
+                        Value::Array(vec![
+                            Value::Object(Map::from_iter([("type".into(), Value::from("object"))])),
+                            Value::Object(Map::from_iter([(
+                                "type".into(),
+                                Value::from("boolean"),
+                            )])),
+                        ]),
+                    )])),
+                ),
+            ])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("subagent"), Value::from("prompt")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
 }
 fn display_name_schema() -> serde_json::Value {
-    json!({"type":"string","description":"Provide a concise role-oriented display name that is unique among live sibling subagents. Valid names are 1-32 bytes of printable ASCII. Kit allocates a unique fallback when the name is omitted or invalid."})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("string")),
+        (
+            "description".into(),
+            Value::from(
+                "Provide a concise role-oriented display name that is unique among live sibling subagents. Valid names are 1-32 bytes of printable ASCII. Kit allocates a unique fallback when the name is omitted or invalid.",
+            ),
+        ),
+    ]))
 }
 fn id_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from_iter([(
+                "id".into(),
+                Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+            )])),
+        ),
+        ("required".into(), Value::Array(vec![Value::from("id")])),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
 }
 fn call_id_schema() -> serde_json::Value {
-    json!({"type":"object","properties":{"call_id":{"type":"string"}},"required":["call_id"],"additionalProperties":false})
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("object")),
+        (
+            "properties".into(),
+            Value::Object(Map::from_iter([(
+                "call_id".into(),
+                Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+            )])),
+        ),
+        (
+            "required".into(),
+            Value::Array(vec![Value::from("call_id")]),
+        ),
+        ("additionalProperties".into(), Value::from(false)),
+    ]))
 }
 
 impl SubagentTool {
@@ -1355,7 +1572,86 @@ impl SubagentTool {
         let description = format!(
             "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. {usage}Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference."
         );
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("subagent"), description, json!({"type":"object","properties":{"prompt":{"type":"string"},"name":display_name_schema(),"harness":{"type":"string","enum":harnesses,"description":"Override the user's configured harness preference with this value. Default to omitting it."},"model":{"type":"string","minLength":1,"description":"Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it."},"cwd":{"type":"string","minLength":1,"description":"Working directory for the new subagent. Relative paths resolve from Kit's working directory."},"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "prompt".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    ("name".into(), display_name_schema()),
+                    (
+                        "harness".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                            (
+                                "enum".into(),
+                                Value::Array(harnesses.into_iter().map(Value::from).collect()),
+                            ),
+                            (
+                                "description".into(),
+                                Value::from(
+                                    "Override the user's configured harness preference with this value. Default to omitting it.",
+                                ),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "model".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                            ("minLength".into(), Value::from(1)),
+                            (
+                                "description".into(),
+                                Value::from(
+                                    "Exact ACP model selection ID or configured alias explicitly requested by the user or active workflow. Applies only to this new session; default to omitting it.",
+                                ),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "cwd".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                            ("minLength".into(), Value::from(1)),
+                            (
+                                "description".into(),
+                                Value::from(
+                                    "Working directory for the new subagent. Relative paths resolve from Kit's working directory.",
+                                ),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "output_schema".into(),
+                        Value::Object(Map::from_iter([(
+                            "oneOf".into(),
+                            Value::Array(vec![
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("object"),
+                                )])),
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("boolean"),
+                                )])),
+                            ]),
+                        )])),
+                    ),
+                ])),
+            ),
+            ("required".into(), Value::Array(vec![Value::from("prompt")])),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
+        Self {
+            manager,
+            depth,
+            spec: ToolSpec::new(ToolName::new("subagent"), description, input_schema)
+                .with_output_schema(value_schema())
+                .with_annotations(ToolAnnotations::new()),
+        }
     }
 }
 impl PromptTool {
@@ -1382,7 +1678,54 @@ impl ForkTool {
         let description = format!(
             "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, preferably assign the fork a concise role-oriented display name, prompt it, and return the new session value.{usage}"
         );
-        Self { manager, depth, spec: ToolSpec::new(ToolName::new("fork"), description, json!({"type":"object","properties":{"subagent":value_schema(),"prompt":{"type":"string"},"name":display_name_schema(),"output_schema":{"oneOf":[{"type":"object"},{"type":"boolean"}]}},"required":["subagent","prompt"],"additionalProperties":false})).with_output_schema(value_schema()).with_annotations(ToolAnnotations::new()) }
+        Self {
+            manager,
+            depth,
+            spec: ToolSpec::new(
+                ToolName::new("fork"),
+                description,
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from_iter([
+                            ("subagent".into(), value_schema()),
+                            (
+                                "prompt".into(),
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("string"),
+                                )])),
+                            ),
+                            ("name".into(), display_name_schema()),
+                            (
+                                "output_schema".into(),
+                                Value::Object(Map::from_iter([(
+                                    "oneOf".into(),
+                                    Value::Array(vec![
+                                        Value::Object(Map::from_iter([(
+                                            "type".into(),
+                                            Value::from("object"),
+                                        )])),
+                                        Value::Object(Map::from_iter([(
+                                            "type".into(),
+                                            Value::from("boolean"),
+                                        )])),
+                                    ]),
+                                )])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![Value::from("subagent"), Value::from("prompt")]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
+            )
+            .with_output_schema(value_schema())
+            .with_annotations(ToolAnnotations::new()),
+        }
     }
 }
 impl SubagentsTool {
@@ -1392,9 +1735,9 @@ impl SubagentsTool {
             spec: ToolSpec::new(
                 ToolName::new("subagents"),
                 "List active subagent sessions owned by this parent, including sessions whose first prompt is still starting.",
-                json!({"type":"object","properties":{},"additionalProperties":false}),
+                Value::Object(Map::from_iter([("type".into(), Value::from("object")), ("properties".into(), Value::Object(Map::new())), ("additionalProperties".into(), Value::from(false))])),
             )
-            .with_output_schema(json!({"type":"array","items":listing_schema()}))
+            .with_output_schema(Value::Object(Map::from_iter([("type".into(), Value::from("array")), ("items".into(), listing_schema())])))
             .with_annotations(ToolAnnotations::new()),
         }
     }
@@ -1410,7 +1753,7 @@ impl CloseTool {
             spec: ToolSpec::new(
                 ToolName::new("close"),
                 "Close an active subagent by its complete handle or `{ id }`, or cancel a background tool call with `{ call_id }`. Closed subagent handles become unusable and their capacity is released.",
-                json!({"oneOf":[value_schema(), id_schema(), call_id_schema()]}),
+                Value::Object(Map::from_iter([("oneOf".into(), Value::Array(vec![value_schema(), id_schema(), call_id_schema()]))])),
             )
             .with_output_schema(id_schema())
             .with_annotations(ToolAnnotations::new()),
@@ -1476,9 +1819,12 @@ fn result(
             ToolError::ExecutionFailed(error)
         }
     })?;
+    let value = serde_json::to_value(value).map_err(|error| {
+        ToolError::ExecutionFailed(format!("failed to serialize subagent value: {error}"))
+    })?;
     Ok(ToolResult::new(ToolResultPart::success(
         request.call_id,
-        ToolOutput::structured(serde_json::to_value(value).expect("subagent value serializes")),
+        ToolOutput::structured(value),
     )))
 }
 
@@ -1493,7 +1839,7 @@ impl Tool for SubagentsTool {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        if request.input != json!({}) {
+        if request.input != Value::Object(Map::new()) {
             return Err(ToolError::InvalidInput(
                 "subagents input must be an empty object".into(),
             ));
@@ -1503,11 +1849,12 @@ impl Tool for SubagentsTool {
             .list(&cancellation(context))
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        let values = serde_json::to_value(values).map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to serialize subagent listing: {error}"))
+        })?;
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
-            ToolOutput::structured(
-                serde_json::to_value(values).expect("subagent values serialize"),
-            ),
+            ToolOutput::structured(values),
         )))
     }
 }
@@ -1534,7 +1881,10 @@ impl Tool for CloseTool {
         }
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
-            ToolOutput::structured(json!({ "id": id })),
+            ToolOutput::structured(Value::Object(Map::from_iter([(
+                "id".into(),
+                Value::from(id),
+            )]))),
         )))
     }
 }

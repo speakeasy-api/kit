@@ -1123,10 +1123,11 @@ async fn model_catalog_with_openai(
                     .await
                     .unwrap_or_else(|_| fallback_catalog())
             };
-            tokio::join!(openrouter_catalog, speakeasy_catalog)
+            futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
         }
     };
-    let (discovered_openai, (openrouter, speakeasy)) = tokio::join!(openai_catalog, other_catalogs);
+    let (discovered_openai, (openrouter, speakeasy)) =
+        futures_util::future::join(openai_catalog, other_catalogs).await;
     let openai_windows = discovered_openai.context_windows;
     let openrouter_windows = openrouter.context_windows;
     let speakeasy_windows = speakeasy.context_windows;

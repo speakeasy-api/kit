@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use agentkit_core::ToolOutput;
 use agentkit_tools_core::ToolError;
-use serde_json::json;
+use serde_json::{Map, Value};
 
 const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
 
@@ -49,12 +49,15 @@ pub(crate) async fn guard(
     let mut preview_budget = MAX_MODEL_OUTPUT_BYTES;
     loop {
         let preview = preview(&body, &marker, preview_budget);
-        let replacement = json!({
-            "preview": preview,
-            "artifact": artifact,
-            "original_bytes": original_bytes,
-            "artifact_error": artifact_error,
-        });
+        let replacement = Value::Object(Map::from_iter([
+            ("preview".into(), Value::from(preview)),
+            ("artifact".into(), Value::from(artifact.as_deref())),
+            ("original_bytes".into(), Value::from(original_bytes)),
+            (
+                "artifact_error".into(),
+                Value::from(artifact_error.as_deref()),
+            ),
+        ]));
         let replacement_bytes = serde_json::to_vec(&replacement)
             .map_err(|error| ToolError::Internal(error.to_string()))?
             .len();
@@ -123,9 +126,59 @@ mod tests {
     use super::{MAX_MODEL_OUTPUT_BYTES, guard};
 
     #[tokio::test]
+    async fn inline_structured_output_preserves_numeric_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let value = json!({
+            "unsigned": u64::MAX,
+            "signed": i64::MIN,
+            "fraction": -1.25,
+        });
+        let output = guard(directory.path(), ToolOutput::structured(value.clone()))
+            .await
+            .unwrap();
+        let ToolOutput::Structured(output) = output else {
+            panic!("guard returned non-structured output");
+        };
+        assert_eq!(output, value);
+        assert_eq!(output["unsigned"].as_u64(), Some(u64::MAX));
+        assert_eq!(output["signed"].as_i64(), Some(i64::MIN));
+        assert_eq!(output["fraction"].as_f64(), Some(-1.25));
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_storage_keeps_output_and_reports_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, "occupied").unwrap();
+        let body = "é".repeat(MAX_MODEL_OUTPUT_BYTES);
+        let output = guard(&blocked, ToolOutput::Text(body.clone()))
+            .await
+            .unwrap();
+        let ToolOutput::Structured(output) = output else {
+            panic!("guard returned non-structured output");
+        };
+        assert!(output["artifact"].is_null());
+        assert!(!output["artifact_error"].as_str().unwrap().is_empty());
+        assert_eq!(output["original_bytes"], body.len());
+        assert!(
+            output["preview"]
+                .as_str()
+                .unwrap()
+                .contains("artifact storage failed")
+        );
+        assert!(serde_json::to_vec(&output).unwrap().len() <= MAX_MODEL_OUTPUT_BYTES);
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "occupied");
+    }
+
+    #[tokio::test]
     async fn oversized_compose_output_spills_at_the_boundary() {
         let directory = tempfile::tempdir().unwrap();
-        let value = json!({ "document": "\\".repeat(MAX_MODEL_OUTPUT_BYTES * 2) });
+        let value = json!({
+            "document": "\\".repeat(MAX_MODEL_OUTPUT_BYTES * 2),
+            "unsigned": u64::MAX,
+            "signed": i64::MIN,
+            "fraction": 1.25,
+        });
         let expected = serde_json::to_string(&value).unwrap();
 
         let output = guard(directory.path(), ToolOutput::structured(value))
@@ -137,6 +190,8 @@ mod tests {
         let artifact = output["artifact"].as_str().unwrap();
 
         assert_eq!(output["original_bytes"], expected.len());
+        assert!(output["original_bytes"].is_u64());
+        assert!(output["artifact_error"].is_null());
         assert!(
             output["preview"]
                 .as_str()

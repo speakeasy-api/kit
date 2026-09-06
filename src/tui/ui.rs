@@ -21,8 +21,8 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 use super::{
     app::{
         AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
-        CachedTranscriptRow, Child, CodeHit, ComposeView, FilePickerStatus, Phase, SessionRename,
-        ToolCall, UserMessage,
+        CachedTranscriptRow, Child, CodeHit, ComposeView, EffortDialog, FilePickerDialog,
+        FilePickerStatus, ModelDialog, Phase, SessionRename, ToolCall, UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -115,14 +115,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     };
     if let Some(pending) = &app.model_switch {
         draw_model_switch_dialog(frame, pending);
-    } else if app.file_picker.is_some() {
-        draw_file_picker(frame, app, prompt_area, prompt_viewport, picker_below);
+    } else if let Some(dialog) = &app.file_picker {
+        draw_file_picker(
+            frame,
+            app,
+            dialog,
+            prompt_area,
+            prompt_viewport,
+            picker_below,
+        );
     } else if app.session_dialog.is_some() {
         draw_session_dialog(frame, app);
-    } else if app.model_dialog.is_some() {
-        draw_model_dialog(frame, app);
-    } else if app.effort_dialog.is_some() {
-        draw_effort_dialog(frame, app);
+    } else if let Some(dialog) = &app.model_dialog {
+        draw_model_dialog(frame, app, dialog);
+    } else if let Some(dialog) = &app.effort_dialog {
+        draw_effort_dialog(frame, app, dialog);
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
@@ -241,14 +248,33 @@ fn draw_completion_popup(frame: &mut Frame<'_>, anchor: Rect, popup: CompletionP
 fn draw_file_picker(
     frame: &mut Frame<'_>,
     app: &App,
+    dialog: &FilePickerDialog,
     prompt: Rect,
     viewport: PromptViewport,
     prefer_below: bool,
 ) {
-    let dialog = app.file_picker.as_ref().expect("checked above");
-    let (row, column) = app
+    let Some((row, column)) = app
         .editor
-        .display_position(dialog.query_range.start, viewport.field.width as usize);
+        .display_position(dialog.query_range.start, viewport.field.width as usize)
+    else {
+        draw_completion_popup(
+            frame,
+            prompt,
+            CompletionPopup {
+                title: " files ",
+                rows: vec![Line::from(Span::styled(
+                    "invalid file picker position",
+                    theme::bold(theme::error_color()),
+                ))],
+                selected: None,
+                footer: Some(Line::from("esc close")),
+                max_rows: 1,
+                max_width: 88,
+                prefer_below,
+            },
+        );
+        return;
+    };
     let trigger_x = viewport.field.x + u16::try_from(column).unwrap_or(0);
     let max_width = prompt.width.min(88).min(frame.area().width);
     let min_width = max_width.min(24);
@@ -585,7 +611,7 @@ fn draw_model_switch_dialog(frame: &mut Frame<'_>, pending: &super::app::ModelSw
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
+fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App, dialog: &EffortDialog) {
     let outer = frame.area();
     let width = outer.width.min(48);
     let height = outer.height.min(app.effort_choices.len() as u16 + 3);
@@ -595,7 +621,6 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
         width,
         height,
     );
-    let dialog = app.effort_dialog.as_ref().expect("checked above");
     let footer = format!(
         "tab defaults [{}] · enter select · esc close",
         if dialog.save_defaults { "x" } else { " " }
@@ -631,7 +656,7 @@ fn draw_effort_dialog(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-fn draw_model_dialog(frame: &mut Frame<'_>, app: &App) {
+fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     let outer = frame.area();
     let width = if outer.width > 20 {
         outer.width.saturating_sub(4).min(72)
@@ -649,7 +674,6 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App) {
         width,
         height,
     );
-    let dialog = app.model_dialog.as_ref().expect("checked above");
     let choices = app.selected_model_choices();
     let footer = format!(
         "tab defaults [{}]  ·  enter select  ·  esc close",
@@ -1105,14 +1129,8 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         let old_count = app.transcript_cache[block_index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
-        let (rows, cached_images) = if let Block::User(message) = &app.blocks[block_index] {
-            user_block_rows(message, width, images.enabled())
-        } else {
-            (
-                wrap_linked_tagged(&transcript_block_lines(app, block_index, width), width),
-                Vec::new(),
-            )
-        };
+        let (rows, cached_images) =
+            transcript_block_rows(app, block_index, width, images.enabled());
         if missing || rows.len() != old_count {
             first_changed_count = first_changed_count.min(block_index);
             layout_changed |= !missing;
@@ -1178,14 +1196,15 @@ fn user_block_rows(
     (rows, placements)
 }
 
-fn transcript_block_lines(
+fn transcript_block_rows(
     app: &App,
     block_index: usize,
     width: usize,
-) -> Vec<TaggedTranscriptLine> {
+    reserve_images: bool,
+) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
-        Block::User(_) => unreachable!("user blocks are laid out with image anchors"),
+        Block::User(message) => return user_block_rows(message, width, reserve_images),
         Block::Agent(text) => (markdown::render_copyable_at_width(text, Some(width)), None),
         Block::Thought {
             text,
@@ -1230,7 +1249,7 @@ fn transcript_block_lines(
             None,
         ),
     };
-    block_lines
+    let lines = block_lines
         .into_iter()
         .enumerate()
         .map(|(line_index, (line, code))| {
@@ -1240,7 +1259,8 @@ fn transcript_block_lines(
             });
             (line, (call.clone(), code, Some(line_index)))
         })
-        .collect()
+        .collect::<Vec<TaggedTranscriptLine>>();
+    (wrap_linked_tagged(&lines, width), Vec::new())
 }
 
 fn uncopyable(lines: Vec<LinkedLine>) -> Vec<(LinkedLine, Option<Range<usize>>)> {
@@ -2777,6 +2797,25 @@ mod tests {
         assert!(selected.contains("› src/path-9.rs"), "{selected}");
         let tiny = render(&mut app, 12, 3);
         assert!(tiny.contains("files"), "{tiny}");
+    }
+
+    #[test]
+    fn file_picker_reports_invalid_query_offsets() {
+        for offset in [1, usize::MAX] {
+            let mut app = sample();
+            app.editor.insert_str("界");
+            app.file_picker = Some(FilePickerDialog {
+                query_range: offset..offset,
+                revision: 1,
+                activation: 1,
+                selected: 0,
+                matches: Vec::new(),
+                status: FilePickerStatus::Loading,
+            });
+            let frame = render(&mut app, 60, 12);
+            assert!(frame.contains("invalid file picker position"), "{frame}");
+            assert!(!frame.contains("indexing workspace files"), "{frame}");
+        }
     }
 
     #[test]
