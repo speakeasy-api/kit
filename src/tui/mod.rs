@@ -75,6 +75,24 @@ struct ModelSwitchCompletion {
     response: Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
 }
 
+/// Keep model-switch requests off the terminal loop on the normal Tokio runtime.
+fn spawn_model_switch(
+    connection: agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    request: SetSessionConfigOptionRequest,
+    generation: u64,
+    operation: u64,
+    completed: mpsc::UnboundedSender<ModelSwitchCompletion>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let response = connection.send_request(request).block_task().await;
+        let _ = completed.send(ModelSwitchCompletion {
+            generation,
+            operation,
+            response,
+        });
+    })
+}
+
 fn prepare_model_switch_request(
     app: &mut App,
     action: Action,
@@ -1549,12 +1567,13 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             continue;
                                         }
                                     };
-                                    let connection = connection.clone();
-                                    let completed = switch_tx.clone();
-                                    tokio::task::spawn_local(async move {
-                                        let response = connection.send_request(request).block_task().await;
-                                        let _ = completed.send(ModelSwitchCompletion { generation, operation, response });
-                                    });
+                                    spawn_model_switch(
+                                        connection.clone(),
+                                        request,
+                                        generation,
+                                        operation,
+                                        switch_tx.clone(),
+                                    );
                                 }
                                 Action::SelectEffort { effort, save_defaults } => {
                                     let response = connection
@@ -3441,6 +3460,115 @@ mod tests {
             [Update::ToolPatched { intent: Some(Some(intent)), script: Some(script), .. }]
                 if intent == "Check the project." && script == "return 1"
         ));
+    }
+
+    async fn model_switch_over_transport() {
+        let agent = agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async move |_request: wire::InitializeRequest, responder, _cx| {
+                    responder.respond(wire::InitializeResponse::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("model-switch-peer", "0"),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: wire::SetSessionConfigOptionRequest, responder, _cx| {
+                    assert_eq!(request.config_id.to_string(), super::MODEL_CONFIG_ID);
+                    assert_eq!(
+                        request.value.as_id().unwrap().to_string(),
+                        "openai-subscription:gpt-5.6-terra"
+                    );
+                    if request.session_id.to_string() == "rejected" {
+                        responder.respond_with_error(agent_client_protocol::util::internal_error(
+                            "model switch rejected",
+                        ))
+                    } else {
+                        responder.respond(wire::SetSessionConfigOptionResponse::new(vec![
+                            SessionConfigOption::select(
+                                super::MODEL_CONFIG_ID,
+                                "Model",
+                                "openai-subscription:gpt-5.6-terra",
+                                vec![SessionConfigSelectOption::new(
+                                    "openai-subscription:gpt-5.6-terra",
+                                    "gpt-5.6-terra",
+                                )],
+                            ),
+                        ]))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        agent_client_protocol::Client
+            .v2()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                for (operation, session) in [(11, "accepted"), (12, "rejected")] {
+                    let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+                    // Exercise the production spawner without a LocalSet, just like the TUI.
+                    let task = super::spawn_model_switch(
+                        connection.clone(),
+                        wire::SetSessionConfigOptionRequest::new(
+                            session,
+                            super::MODEL_CONFIG_ID,
+                            "openai-subscription:gpt-5.6-terra",
+                        ),
+                        7,
+                        operation,
+                        completed,
+                    );
+                    let completion =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    task.await.unwrap();
+                    assert_eq!(completion.generation, 7);
+                    assert_eq!(completion.operation, operation);
+                    if session == "accepted" {
+                        let response = completion.response.unwrap();
+                        assert_eq!(
+                            super::current_config_value(
+                                &response.config_options,
+                                super::MODEL_CONFIG_ID
+                            ),
+                            Some("openai-subscription:gpt-5.6-terra".into()),
+                        );
+                    } else {
+                        let error = completion.response.unwrap_err();
+                        assert_eq!(
+                            error.code,
+                            agent_client_protocol::Error::internal_error().code
+                        );
+                        assert_eq!(error.data, Some(json!("model switch rejected")));
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn model_switch_completes_without_local_set() {
+        model_switch_over_transport().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_switch_completes_on_multithread_runtime() {
+        model_switch_over_transport().await;
     }
 
     #[test]
