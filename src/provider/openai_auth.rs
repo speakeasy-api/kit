@@ -3,10 +3,12 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 
 use crate::credentials::{CredentialEntry, CredentialFilesystemScope, CredentialStorage};
 use crate::resilient_fs as fs;

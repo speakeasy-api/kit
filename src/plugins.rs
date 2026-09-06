@@ -886,6 +886,13 @@ fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
 }
 
 #[cfg(not(unix))]
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::permissions_set_readonly_false,
+        reason = "On Windows this clears the readonly file attribute; the Unix helper only adds owner-write permission, avoiding the world-writable hazard."
+    )
+)]
 fn writable_permissions(metadata: &fs::Metadata) -> fs::Permissions {
     let mut permissions = metadata.permissions();
     permissions.set_readonly(false);
@@ -2096,7 +2103,10 @@ fn enforce_git_staging_metadata(git_dir: &Path, remote: &OsStr) -> Result<(), St
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
     let mut builder = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
     builder.create(path)

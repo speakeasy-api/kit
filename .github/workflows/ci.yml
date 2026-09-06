@@ -30,11 +30,10 @@ jobs:
           components: rustfmt, clippy
       - run: scripts/tests/test_next_release_version.sh
       - run: cargo fmt --check
-      - run: cargo clippy --locked --lib --bins --all-features -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
 
-  macos-desktop:
+  macos-rust:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: useblacksmith/checkout@v1
@@ -45,9 +44,25 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-desktop
-      - run: cargo clippy --locked --lib --bins --all-features -- -D warnings
+          shared-key: macos-rust
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build shared Kit helper
+        shell: bash
+        run: |
+          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          tar -czf "$RUNNER_TEMP/kit.tar.gz" -C target/aarch64-apple-darwin/release kit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-kit-helper
+          path: ${{ runner.temp }}/kit.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-desktop:
+    needs: macos-rust
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: useblacksmith/checkout@v1
       - name: Install pinned XcodeGen
         shell: bash
         run: |
@@ -60,13 +75,17 @@ jobs:
           scripts/generate-acp-swift.py --check
           PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
           git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
-      # Reuse one release helper for the Debug smoke test and the Release archive.
-      - name: Build real Kit helper
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-kit-helper
+          path: ${{ runner.temp }}/macos-kit-helper
+      - name: Install shared Kit helper
         shell: bash
         run: |
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          mkdir -p target/aarch64-apple-darwin/release target/debug
+          tar -xzf "$RUNNER_TEMP/macos-kit-helper/kit.tar.gz" -C target/aarch64-apple-darwin/release
+          test -x target/aarch64-apple-darwin/release/kit
           # The lifecycle XCTest discovers a local development helper at this path.
-          mkdir -p target/debug
           ln -sf ../aarch64-apple-darwin/release/kit target/debug/kit
       - name: Run Swift tests and real Kit lifecycle smoke
         shell: bash
