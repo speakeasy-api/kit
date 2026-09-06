@@ -141,7 +141,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         );
         frame.render_widget(Clear, warning);
         frame.render_widget(
-            Paragraph::new("Input overflow: input discarded\nWait, then Esc to resume\nCheck draft before sending")
+            Paragraph::new(if app.input_recovery_ready {
+                "Input overflow: input discarded\nPress Esc to resume\nCheck draft before sending"
+            } else {
+                "Input overflow: input discarded\nWaiting for quiet input...\nCheck draft before sending"
+            })
                 .style(Style::default().fg(Color::Yellow)),
             warning,
         );
@@ -3151,9 +3155,24 @@ mod tests {
             output.contains("Input overflow: input discarded"),
             "{output}"
         );
-        assert!(output.contains("Wait, then Esc to resume"), "{output}");
+        assert!(output.contains("Waiting for quiet input"), "{output}");
         assert!(app.navigation.dialog.is_some());
         assert_eq!(app.editor.text(), "parked draft");
+        for ready in [true, false, true] {
+            crate::tui::handle_input(
+                &mut app,
+                crate::tui::input::InputEvent::RecoveryReady(ready),
+            );
+            let output = render(&mut app, 60, 14);
+            assert_eq!(output.contains("Press Esc to resume"), ready, "{output}");
+            assert_eq!(
+                output.contains("Waiting for quiet input"),
+                !ready,
+                "{output}"
+            );
+            assert!(app.navigation.dialog.is_some());
+            assert_eq!(app.editor.text(), "parked draft");
+        }
         crate::tui::handle_input(
             &mut app,
             crate::tui::input::InputEvent::Resumed(std::time::Instant::now()),

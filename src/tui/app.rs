@@ -711,6 +711,7 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     /// Terminal queue overload requires acknowledgement before input resumes.
     pub input_overflow: bool,
+    pub input_recovery_ready: bool,
     /// When the last key arrived, for telling a paste from typing.
     pub last_key: Option<Instant>,
     next_file_search_revision: u64,
@@ -948,6 +949,7 @@ impl App {
             press: None,
             toast: None,
             input_overflow: false,
+            input_recovery_ready: false,
             last_key: None,
             next_file_search_revision: 0,
         }

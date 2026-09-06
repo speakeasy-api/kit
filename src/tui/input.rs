@@ -28,6 +28,7 @@ pub struct ReceivedEvent {
 pub enum InputEvent {
     Event(ReceivedEvent),
     Overflow,
+    RecoveryReady(bool),
     Resumed(Instant),
 }
 
@@ -49,6 +50,8 @@ struct InputQueue {
     events: VecDeque<ReceivedEvent>,
     queued_bytes: usize,
     overflow: bool,
+    // Coalesce readiness changes: activity must revoke even an unconsumed ready.
+    readiness: Option<bool>,
     resumed: Option<Instant>,
     recovery: Recovery,
     error: Option<io::Error>,
@@ -87,7 +90,8 @@ impl InputQueue {
                 } else {
                     Recovery::DropUntilQuiet(received.received_at)
                 };
-                return false;
+                self.readiness = Some(false);
+                return true;
             }
             Recovery::AfterEsc { last_input, .. } => {
                 *last_input = received.received_at;
@@ -101,6 +105,7 @@ impl InputQueue {
             self.events.clear();
             self.queued_bytes = 0;
             self.overflow = true;
+            self.readiness = None;
             self.resumed = None;
             self.recovery = Recovery::DropUntilQuiet(received.received_at);
             return true;
@@ -121,11 +126,14 @@ impl InputQueue {
                 if now.saturating_duration_since(last_input) >= RECOVERY_QUIET =>
             {
                 self.recovery = Recovery::AwaitEsc;
+                self.readiness = Some(true);
+                return true;
             }
             Recovery::AfterEsc {
                 last_input,
                 acknowledged_at,
             } if now.saturating_duration_since(last_input) >= RECOVERY_QUIET => {
+                self.readiness = None;
                 self.resumed = Some(acknowledged_at);
                 self.recovery = Recovery::Normal;
                 return true;
@@ -139,6 +147,9 @@ impl InputQueue {
         if self.overflow {
             self.overflow = false;
             return Some(Ok(InputEvent::Overflow));
+        }
+        if let Some(ready) = self.readiness.take() {
+            return Some(Ok(InputEvent::RecoveryReady(ready)));
         }
         if let Some(acknowledged_at) = self.resumed.take() {
             return Some(Ok(InputEvent::Resumed(acknowledged_at)));
@@ -268,7 +279,7 @@ mod tests {
     };
     use std::{
         fs::File,
-        io::{BufRead, BufReader, Read, Write},
+        io::{BufRead, BufReader, Read, Seek, Write},
         os::{
             fd::{AsRawFd, FromRawFd},
             unix::{net::UnixStream, process::CommandExt},
@@ -386,6 +397,11 @@ mod tests {
             queue.observe_quiet(later + RECOVERY_QUIET);
             // Even after quiet, Enter is not acknowledgement and remains inert.
             queue.push(key(KeyCode::Enter, later + RECOVERY_QUIET));
+            // Unconsumed readiness is revoked, not left as a stale ready event.
+            assert!(matches!(
+                queue.pop().unwrap().unwrap(),
+                InputEvent::RecoveryReady(false)
+            ));
             assert!(queue.pop().is_none());
             queue.observe_quiet(later + RECOVERY_QUIET * 2);
             queue.push(key(KeyCode::Esc, later + RECOVERY_QUIET * 2));
@@ -393,6 +409,10 @@ mod tests {
             queue.push(key(KeyCode::Tab, later + RECOVERY_QUIET * 3));
             queue.push(key(KeyCode::Enter, later + RECOVERY_QUIET * 3));
             queue.observe_quiet(later + RECOVERY_QUIET * 3);
+            assert!(matches!(
+                queue.pop().unwrap().unwrap(),
+                InputEvent::RecoveryReady(false)
+            ));
             assert!(queue.pop().is_none());
             queue.observe_quiet(later + RECOVERY_QUIET * 4);
             assert!(matches!(
@@ -432,6 +452,11 @@ mod tests {
         ));
         queue.observe_quiet(now + RECOVERY_QUIET);
         queue.push(key(KeyCode::Enter, now + RECOVERY_QUIET));
+        assert!(matches!(
+            crate::tui::handle_input(&mut app, queue.pop().unwrap().unwrap()),
+            Action::Redraw
+        ));
+        assert!(!app.input_recovery_ready);
         assert!(queue.pop().is_none());
         assert_eq!(app.editor.text(), partial);
         assert!(app.input_overflow);
@@ -480,6 +505,67 @@ mod tests {
         assert!(queue.pop().is_none());
         queue.finish(None);
         assert!(queue.closed);
+    }
+
+    #[test]
+    fn recovery_readiness_is_coalesced_and_reported_only_on_transitions() {
+        let mut queue = InputQueue::default();
+        let mut now = Instant::now();
+        queue.push(ReceivedEvent {
+            event: Event::Paste("x".repeat(MAX_QUEUED_BYTES + 1)),
+            received_at: now,
+        });
+        assert!(matches!(
+            queue.pop().unwrap().unwrap(),
+            InputEvent::Overflow
+        ));
+        queue.observe_quiet(now + RECOVERY_QUIET);
+        assert!(matches!(
+            queue.pop().unwrap().unwrap(),
+            InputEvent::RecoveryReady(true)
+        ));
+        queue.observe_quiet(now + RECOVERY_QUIET * 2);
+        assert!(queue.pop().is_none()); // No idle notification loop.
+        now += RECOVERY_QUIET * 2;
+        for _ in 0..100 {
+            now += RECOVERY_QUIET;
+            queue.push(key(KeyCode::Enter, now));
+            queue.observe_quiet(now + RECOVERY_QUIET);
+        }
+        // Only the latest state survives slow UI consumption, not 200 messages.
+        assert!(matches!(
+            queue.pop().unwrap().unwrap(),
+            InputEvent::RecoveryReady(true)
+        ));
+        assert!(queue.pop().is_none());
+        queue.push(key(KeyCode::Tab, now + RECOVERY_QUIET));
+        assert!(matches!(
+            queue.pop().unwrap().unwrap(),
+            InputEvent::RecoveryReady(false)
+        ));
+        assert!(queue.pop().is_none());
+        queue.finish(None);
+        queue.observe_quiet(now + RECOVERY_QUIET * 3);
+        assert!(queue.pop().is_none());
+    }
+
+    async fn await_recovery(input: &mut InputEvents, app: &mut App, phase: &str, resume: bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = input.next().await.expect("reader remains open").unwrap();
+                let complete = match &event {
+                    InputEvent::RecoveryReady(ready) => *ready && !resume,
+                    InputEvent::Resumed(_) if resume => true,
+                    other => panic!("{phase}: unexpected recovery event {other:?}"),
+                };
+                crate::tui::handle_input(app, event);
+                if complete {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase}: reader did not report recovery (resume={resume})"));
     }
 
     fn run_child() {
@@ -582,18 +668,16 @@ mod tests {
                     assert!(app.navigation.dialog.is_some());
                     assert_eq!(app.editor.text(), draft);
                     assert_eq!(app.attachments, attachments);
-                    assert!(input.try_next().is_none());
+                    await_recovery(&mut input, &mut app, &format!("flood-{kind}"), false).await;
+                    assert!(app.input_recovery_ready);
                     mark(&format!("blocked-{kind}"));
-                    thread::sleep(Duration::from_millis(300));
-                    assert!(input.try_next().is_none());
+                    // The parent sends controls and a premature Esc. Wait for
+                    // the reader's next quiet transition, not a scheduling delay.
+                    await_recovery(&mut input, &mut app, &format!("blocked-{kind}"), false).await;
+                    assert!(app.input_overflow);
+                    assert!(app.input_recovery_ready);
                     mark(&format!("ack-{kind}"));
-                    let resumed = tokio::time::timeout(Duration::from_secs(3), input.next())
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap();
-                    assert!(matches!(resumed, InputEvent::Resumed(_)));
-                    crate::tui::handle_input(&mut app, resumed);
+                    await_recovery(&mut input, &mut app, &format!("ack-{kind}"), true).await;
                     assert!(!app.input_overflow);
                     assert!(app.navigation.dialog.is_some()); // Esc did not close it.
                     assert_eq!(app.editor.text(), draft);
@@ -632,6 +716,18 @@ mod tests {
 
     #[test]
     fn pty_captures_receipt_times_while_busy_and_restarts() {
+        run_pty_test(false);
+    }
+
+    // Exercise the Linux polling backend's /dev/tty fallback. The unchanged
+    // macOS MIO backend cannot initialize with redirected stdin on all systems.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_uses_controlling_terminal_with_redirected_stdin() {
+        run_pty_test(true);
+    }
+
+    fn run_pty_test(redirect_stdin: bool) {
         if std::env::var_os(CHILD_ENV).is_some() {
             run_child();
             return;
@@ -657,6 +753,13 @@ mod tests {
         let mut master = unsafe { File::from_raw_fd(master_fd) };
         let slave = unsafe { File::from_raw_fd(slave_fd) };
         let (mut control, child_control) = UnixStream::pair().unwrap();
+        let mut redirected = redirect_stdin.then(|| {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(b"not terminal input\r\t\r").unwrap();
+            file.rewind().unwrap();
+            file
+        });
+        let redirected_fd = redirected.as_ref().map(AsRawFd::as_raw_fd);
         let mut command = Command::new(std::env::current_exe().unwrap());
         let test_name = thread::current().name().unwrap().to_owned();
         command
@@ -667,13 +770,19 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         // SAFETY: only async-signal-safe terminal setup runs between fork and
-        // exec. Stdin supplies the controlling PTY, not the developer's terminal.
+        // exec. Stdin initially supplies the controlling PTY, not the developer's
+        // terminal. Redirecting it afterwards exercises the /dev/tty fallback.
         // The extra descriptor is only a test-transport completion signal.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1
                     || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
                     || libc::fcntl(child_control.as_raw_fd(), libc::F_SETFD, 0) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(fd) = redirected_fd
+                    && libc::dup2(fd, libc::STDIN_FILENO) == -1
                 {
                     return Err(io::Error::last_os_error());
                 }
@@ -722,7 +831,7 @@ mod tests {
             master.write_all(b"\r\t\r").unwrap();
             control.write_all(b"!").unwrap();
             wait_for(&format!("blocked-{kind}"));
-            master.write_all(b"\r\t\r").unwrap();
+            master.write_all(b"\r\t\r\x1b").unwrap();
             wait_for(&format!("ack-{kind}"));
             master.write_all(b"\x1b").unwrap();
             wait_for(&format!("recover-{kind}"));
@@ -745,5 +854,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         output_reader.join().unwrap();
+        if let Some(file) = redirected.as_mut() {
+            assert_eq!(
+                file.stream_position().unwrap(),
+                0,
+                "redirected input consumed"
+            );
+        }
     }
 }

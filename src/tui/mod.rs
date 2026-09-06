@@ -2044,10 +2044,16 @@ fn handle_input(app: &mut App, input: InputEvent) -> Action {
         InputEvent::Event(received) => handle(app, received),
         InputEvent::Overflow => {
             app.input_overflow = true;
+            app.input_recovery_ready = false;
+            Action::Redraw
+        }
+        InputEvent::RecoveryReady(ready) => {
+            app.input_recovery_ready = ready;
             Action::Redraw
         }
         InputEvent::Resumed(received_at) => {
             app.input_overflow = false;
+            app.input_recovery_ready = false;
             app.last_key = Some(received_at);
             app.toast = Some((
                 "Input resumed; check draft before sending".into(),
@@ -2850,7 +2856,7 @@ mod tests {
             output.contains("Input overflow: input discarded"),
             "{output}"
         );
-        assert!(output.contains("Wait, then Esc to resume"), "{output}");
+        assert!(output.contains("Waiting for quiet input"), "{output}");
         assert_eq!(app.editor.text(), "a".repeat(MAX_BURST));
     }
 
