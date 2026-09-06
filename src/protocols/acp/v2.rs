@@ -319,10 +319,89 @@ impl ReplacementGeneration {
     }
 }
 
+// A boundary owns this ledger while the SDK submits and acknowledges one
+// injection at a time. Ordinary prompt echoes use `update`, not this ledger.
+// Successful message batches retain their ordered input items even if a later
+// notification fails. Display message IDs are not canonical Item identities.
+#[derive(Clone, Default)]
+struct SteeringAcknowledgements(Arc<Mutex<Option<Vec<Item>>>>);
+
+struct SteeringBoundary<'a>(&'a SteeringAcknowledgements);
+
+impl SteeringAcknowledgements {
+    fn begin(&self) -> Result<SteeringBoundary<'_>, AcpRuntimeError> {
+        let mut state = self.0.lock().map_err(|_| AcpRuntimeError::ClientClosed)?;
+        if state.is_some() {
+            return Err(AcpRuntimeError::Loop(
+                "injection boundary already active".into(),
+            ));
+        }
+        *state = Some(Vec::new());
+        Ok(SteeringBoundary(self))
+    }
+
+    fn prepare(
+        &self,
+        notification: &wire::UpdateSessionNotification,
+    ) -> Result<Option<Vec<Item>>, AcpRuntimeError> {
+        let active = self
+            .0
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .is_some();
+        if !active {
+            return Ok(None);
+        }
+        let wire::SessionUpdate::UserMessage(message) = &notification.update else {
+            return Ok(None);
+        };
+        let agent_client_protocol::schema::MaybeUndefined::Value(content) = &message.content else {
+            return Err(AcpRuntimeError::Loop(
+                "injected user message has no content".into(),
+            ));
+        };
+        agentkit_acp::v2::content_blocks_to_items(content).map(Some)
+    }
+
+    fn acknowledged(&self, items: Option<Vec<Item>>) -> Result<(), AcpRuntimeError> {
+        if let Some(items) = items {
+            self.0
+                .lock()
+                .map_err(|_| AcpRuntimeError::ClientClosed)?
+                .as_mut()
+                .ok_or_else(|| {
+                    AcpRuntimeError::Loop("injection boundary ended before acknowledgement".into())
+                })?
+                .extend(items);
+        }
+        Ok(())
+    }
+}
+
+impl SteeringBoundary<'_> {
+    fn finish(self) -> Result<Vec<Item>, AcpRuntimeError> {
+        let completed = {
+            let mut state = self.0.0.lock().map_err(|_| AcpRuntimeError::ClientClosed)?;
+            state.take()
+        };
+        completed.ok_or_else(|| AcpRuntimeError::Loop("injection boundary is not active".into()))
+    }
+}
+
+impl Drop for SteeringBoundary<'_> {
+    fn drop(&mut self) {
+        // No recovery of poisoned acknowledgement state. Abandon its owner;
+        // otherwise release the items outside the guard, including on unwind.
+        let abandoned = self.0.0.lock().ok().and_then(|mut state| state.take());
+        drop(abandoned);
+    }
+}
+
 #[derive(Clone)]
 struct ResponseReplacementSink<S> {
     inner: S,
     current: Arc<Mutex<CurrentReplacementMessages>>,
+    acknowledgements: SteeringAcknowledgements,
 }
 
 impl<S> ResponseReplacementSink<S> {
@@ -330,6 +409,7 @@ impl<S> ResponseReplacementSink<S> {
         Self {
             inner,
             current: Arc::new(Mutex::new(CurrentReplacementMessages::default())),
+            acknowledgements: SteeringAcknowledgements::default(),
         }
     }
 
@@ -468,8 +548,11 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
         &self,
         mut notification: wire::UpdateSessionNotification,
     ) -> Result<(), AcpRuntimeError> {
+        let items = self.acknowledgements.prepare(&notification)?;
         self.rewrite_and_track(&mut notification);
-        self.inner.update_acknowledged(notification).await
+        // Never hold the ledger guard across external delivery or its await.
+        self.inner.update_acknowledged(notification).await?;
+        self.acknowledgements.acknowledged(items)
     }
 
     async fn flush(&self) -> Result<(), AcpRuntimeError> {
@@ -2015,22 +2098,24 @@ async fn drive_prompt<S>(
     handle: &AcpSessionHandle,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    acknowledgements: &SteeringAcknowledgements,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
 {
-    let mut delivered_pending = false;
+    let mut acknowledged_pending = Vec::new();
     let result = drive_prompt_inner(
         session_id,
         driver,
         handle,
         cancellation_generation,
         structured,
-        &mut delivered_pending,
+        acknowledgements,
+        &mut acknowledged_pending,
     )
     .await;
     if matches!(result, Ok(FinishReason::Cancelled)) {
-        if delivered_pending && !driver.snapshot().pending_input.is_empty() {
+        if !acknowledged_pending.is_empty() && !driver.snapshot().pending_input.is_empty() {
             // A successful injection boundary can stop after acknowledging one
             // steer while awaiting another response's activation. Those items
             // are accepted input, not the unstarted original prompt. Commit
@@ -2051,18 +2136,43 @@ where
     result
 }
 
-// Only an acknowledged boundary can classify pending input as delivered
-// steering. The actor cannot select MCP/config/original input while it waits.
+// A partial boundary can contain acknowledged A and submitted but unacknowledged
+// B. Only the exact ordered prefix witnessed by successful notifications is
+// durable. A failed notification retires the attachment, never retries B.
 async fn injection_boundary<S: ModelSession + Send + 'static>(
     driver: &mut LoopDriver<S>,
     handle: &AcpSessionHandle,
     terminal: bool,
-    delivered_pending: &mut bool,
+    acknowledgements: &SteeringAcknowledgements,
+    acknowledged_pending: &mut Vec<Item>,
 ) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
-    let steering_only = driver.snapshot().pending_input.is_empty() || *delivered_pending;
+    if driver.snapshot().pending_input != *acknowledged_pending {
+        driver.make_unavailable();
+        return Err(AcpRuntimeError::Loop(
+            "unclassified input at injection boundary".into(),
+        ));
+    }
+    let boundary = acknowledgements
+        .begin()
+        .inspect_err(|_| driver.make_unavailable())?;
     let result = handle.handle_injection_boundary(driver, terminal).await;
-    *delivered_pending =
-        steering_only && result.is_ok() && !driver.snapshot().pending_input.is_empty();
+    acknowledged_pending.extend(
+        boundary
+            .finish()
+            .inspect_err(|_| driver.make_unavailable())?,
+    );
+    if result.is_ok() && driver.snapshot().pending_input != *acknowledged_pending {
+        driver.make_unavailable();
+        return Err(AcpRuntimeError::Loop(
+            "injection acknowledgement did not match queued items".into(),
+        ));
+    }
+    if result.is_err() {
+        let accepted = std::mem::take(acknowledged_pending);
+        let settled = driver.settle_acknowledged_input(&accepted).await;
+        driver.make_unavailable();
+        settled.map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+    }
     result
 }
 
@@ -2072,7 +2182,8 @@ async fn drive_prompt_inner<S>(
     handle: &AcpSessionHandle,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-    delivered_pending: &mut bool,
+    acknowledgements: &SteeringAcknowledgements,
+    acknowledged_pending: &mut Vec<Item>,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
@@ -2101,7 +2212,7 @@ where
             }
         };
         if driver.snapshot().pending_input.is_empty() {
-            *delivered_pending = false;
+            acknowledged_pending.clear();
         }
         if handle
             .cancellation_handle()
@@ -2129,7 +2240,15 @@ where
                 {
                     continue;
                 }
-                match injection_boundary(driver, handle, true, delivered_pending).await {
+                match injection_boundary(
+                    driver,
+                    handle,
+                    true,
+                    acknowledgements,
+                    acknowledged_pending,
+                )
+                .await
+                {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -2157,7 +2276,15 @@ where
                 {
                     continue;
                 }
-                match injection_boundary(driver, handle, true, delivered_pending).await {
+                match injection_boundary(
+                    driver,
+                    handle,
+                    true,
+                    acknowledgements,
+                    acknowledged_pending,
+                )
+                .await
+                {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -2180,7 +2307,15 @@ where
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-                match injection_boundary(driver, handle, false, delivered_pending).await {
+                match injection_boundary(
+                    driver,
+                    handle,
+                    false,
+                    acknowledgements,
+                    acknowledged_pending,
+                )
+                .await
+                {
                     Ok(AcpInjectionBoundary::Stopped) => {
                         return Ok(FinishReason::Cancelled);
                     }
@@ -2285,6 +2420,7 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
                     handle,
                     cancellation_generation,
                     structured,
+                    &sink.acknowledgements,
                 )
                 .await;
                 let outcome = super::activity::ExecutionOutcome::new(
@@ -5483,7 +5619,7 @@ mod tests {
     fn bind_test_session(
         integration: &AcpIntegration,
         session_id: &wire::SessionId,
-        sink: RecordingSink,
+        sink: impl AcpSessionUpdateSink + 'static,
     ) -> AcpSessionHandle {
         let handle = integration
             .bind_session(AcpSessionBinding::new(
@@ -5584,7 +5720,8 @@ mod tests {
     async fn cancellation_before_tool_boundary_retires_turn() {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("boundary-cancel");
-        let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
+        let sink = ResponseReplacementSink::new(RecordingSink::default());
+        let handle = bind_test_session(&integration, &session_id, sink.clone());
         let generation = handle.cancellation_handle().generation();
         let (mut driver, _) = test_driver_with_interrupt(
             TestOutcome::ToolThenContent,
@@ -5596,9 +5733,16 @@ mod tests {
             .submit_input(vec![Item::text(ItemKind::User, "first")])
             .unwrap();
         assert_eq!(
-            drive_prompt(&session_id, &mut driver, &handle, generation, None)
-                .await
-                .unwrap(),
+            drive_prompt(
+                &session_id,
+                &mut driver,
+                &handle,
+                generation,
+                None,
+                &sink.acknowledgements
+            )
+            .await
+            .unwrap(),
             FinishReason::Cancelled
         );
         assert!(
@@ -5615,9 +5759,16 @@ mod tests {
             .unwrap();
         let generation = handle.cancellation_handle().generation();
         assert_eq!(
-            drive_prompt(&session_id, &mut driver, &handle, generation, None)
-                .await
-                .unwrap(),
+            drive_prompt(
+                &session_id,
+                &mut driver,
+                &handle,
+                generation,
+                None,
+                &sink.acknowledgements
+            )
+            .await
+            .unwrap(),
             FinishReason::Completed
         );
         assert!(
@@ -5636,14 +5787,14 @@ mod tests {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("injection-cancel");
         let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let handle = bind_test_session(&integration, &session_id, sink.clone());
         let (receipt, _client, server) = staged_injection(integration.clone(), &session_id).await;
         let message_id = receipt.message_id().clone();
-        let sink = ResponseReplacementSink::new(recording.clone());
         let activity = native_activity(session_id.clone(), sink.clone());
         let observer = ResponseReplacementObserver::new(
             integration,
-            sink,
+            sink.clone(),
             session_id.clone(),
             activity.clone(),
         );
@@ -5669,7 +5820,14 @@ mod tests {
         {
             let turn = activity.execute(
                 ExecutionOrigin::Prompt,
-                drive_prompt(&session_id, &mut driver, &handle, generation, None),
+                drive_prompt(
+                    &session_id,
+                    &mut driver,
+                    &handle,
+                    generation,
+                    None,
+                    &sink.acknowledgements,
+                ),
                 |reason| Some(reason.clone()),
             );
             tokio::pin!(turn);
@@ -5709,7 +5867,14 @@ mod tests {
             activity
                 .execute(
                     ExecutionOrigin::Prompt,
-                    drive_prompt(&session_id, &mut driver, &handle, generation, None),
+                    drive_prompt(
+                        &session_id,
+                        &mut driver,
+                        &handle,
+                        generation,
+                        None,
+                        &sink.acknowledgements
+                    ),
                     |reason| Some(reason.clone())
                 )
                 .await
@@ -5743,7 +5908,8 @@ mod tests {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("terminal-inject");
         let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let handle = bind_test_session(&integration, &session_id, sink.clone());
         let (receipt, _client, server) = staged_injection(integration, &session_id).await;
         let message_id = receipt.message_id().clone();
         let (mut driver, _) = test_driver(TestOutcome::Content, "terminal-inject").await;
@@ -5752,7 +5918,14 @@ mod tests {
             .unwrap();
         let generation = handle.cancellation_handle().generation();
         {
-            let turn = drive_prompt(&session_id, &mut driver, &handle, generation, None);
+            let turn = drive_prompt(
+                &session_id,
+                &mut driver,
+                &handle,
+                generation,
+                None,
+                &sink.acknowledgements,
+            );
             tokio::pin!(turn);
             assert!(futures_util::poll!(&mut turn).is_pending());
             receipt.activate_after_response().await.unwrap();
@@ -5799,14 +5972,23 @@ mod tests {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("finish-error");
         let recording = RecordingSink::default();
-        let handle = bind_test_session(&integration, &session_id, recording.clone());
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let handle = bind_test_session(&integration, &session_id, sink.clone());
         let (receipt, _client, server) = staged_injection(integration, &session_id).await;
         let (mut driver, _) = test_driver(TestOutcome::FinishError, "finish-error").await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fail")])
             .unwrap();
         let generation = handle.cancellation_handle().generation();
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        let result = drive_prompt(
+            &session_id,
+            &mut driver,
+            &handle,
+            generation,
+            None,
+            &sink.acknowledgements,
+        )
+        .await;
         assert!(
             matches!(result, Err(AcpRuntimeError::Loop(message)) if message == "model turn failed")
         );
@@ -5824,13 +6006,13 @@ mod tests {
     #[tokio::test]
     async fn cancellation_race_wins_over_provider_error() {
         let integration = AcpIntegration::default();
-        let sink = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(RecordingSink::default());
         let session_id = wire::SessionId::new("cancel-race");
         let handle = integration
             .bind_session(AcpSessionBinding::new(
                 session_id.clone(),
                 SessionId::new("cancel-race-loop"),
-                sink,
+                sink.clone(),
             ))
             .unwrap();
         handle.prepare_injection_turn();
@@ -5843,7 +6025,15 @@ mod tests {
             .submit_input(vec![Item::text(ItemKind::User, "cancel")])
             .unwrap();
 
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        let result = drive_prompt(
+            &session_id,
+            &mut driver,
+            &handle,
+            generation,
+            None,
+            &sink.acknowledgements,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), FinishReason::Cancelled);
     }
@@ -5852,13 +6042,22 @@ mod tests {
     async fn provider_error_without_cancellation_remains_an_error() {
         let integration = AcpIntegration::default();
         let session_id = wire::SessionId::new("provider-error");
-        let handle = bind_test_session(&integration, &session_id, RecordingSink::default());
+        let sink = ResponseReplacementSink::new(RecordingSink::default());
+        let handle = bind_test_session(&integration, &session_id, sink.clone());
         let (mut driver, _) = test_driver(TestOutcome::ProviderError, "provider-error").await;
         driver
             .submit_input(vec![Item::text(ItemKind::User, "fail")])
             .unwrap();
         let generation = handle.cancellation_handle().generation();
-        let result = drive_prompt(&session_id, &mut driver, &handle, generation, None).await;
+        let result = drive_prompt(
+            &session_id,
+            &mut driver,
+            &handle,
+            generation,
+            None,
+            &sink.acknowledgements,
+        )
+        .await;
         assert!(matches!(result, Err(AcpRuntimeError::Loop(_))));
     }
 

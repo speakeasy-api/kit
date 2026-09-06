@@ -1574,7 +1574,7 @@ impl Runtime {
             .mutator(input_settlement.clone())
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
-            .transcript_observer(observer)
+            .transcript_observer(input_settlement.observer(observer))
             .transcript(transcript)
             .input(input)
             .cancellation(context.cancellation)

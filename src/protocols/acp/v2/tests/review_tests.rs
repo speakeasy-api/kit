@@ -1,3 +1,5 @@
+mod partial_delivery;
+
 use super::*;
 
 /// The provider boundary records actual requests, not driver implementation work.
@@ -312,7 +314,7 @@ async fn cancelled_delivery_keeps_actor(entry: Entry) {
             session_id.clone(),
             activity.clone(),
         ))
-        .transcript_observer(opened.observer)
+        .transcript_observer(settlement.observer(opened.observer))
         .transcript(opened.transcript)
         .input(if initial_branch {
             vec![Item::text(ItemKind::User, "initial branch prompt")]
