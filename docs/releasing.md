@@ -69,13 +69,18 @@ An issuer-gated endpoint that accepts only OAuth user sessions is not sufficient
 
 The MCP must expose posting with the actual posted message in its response and
 permalink retrieval. Invite the bot to the target channel and grant `chat:write`.
+The bot must be a channel member with this scope; MCP authentication and channel
+lookup can succeed even when posting would fail with `not_in_channel`.
 The announcement does not use channel lookup, message search, or channel-history
 tools. The final permalink must refer to the configured channel ID. Use only a trusted MCP endpoint: it
 receives the Gram API key.
 
 The workflow writes a private temporary MCP JSON file with an explicit
 `headers.Authorization` and `headers.Gram-Environment`, passes it via `--mcp-config`, and removes it on
-exit. It does not upload the config or Kit session as an artifact.
+exit. The captured CLI response uses the same temporary directory. On failure,
+the job logs the CLI exit code and up to 8 KiB of its final response (without the
+session ID) to explain which step failed. It does not upload the config or Kit
+session as an artifact.
 
 An announcement failure marks the workflow failed but does not roll back the
 already published release. Before rerunning the announcement job, check Slack:
