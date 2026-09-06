@@ -2040,12 +2040,22 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                                 handle.start_injection_turn();
                                 advance_checkout_revision(&mut checkout_revision);
                                 compaction_started = true;
+                                if autonomous_external {
+                                    // Commit the explicit seed before adding the queued
+                                    // external cause: run_active_turn must not refresh it
+                                    // back to this config's owner after local activation.
+                                    ConsumptionScope::bind_local_seed();
+                                    ConsumptionScope::consumed(None);
+                                }
                                 let compacted = compact_for_switch(
                                     &session_id, &integration, &handle, &mut driver, &sink,
                                     cancellation_generation, &activity,
                                 ).await;
                                 handle.stop_injection_turn();
                                 busy.store(false, Ordering::Release);
+                                if driver.snapshot().pending_input.is_empty() {
+                                    autonomous_external = false;
+                                }
                                 compacted?;
                             }
                         }
@@ -5000,6 +5010,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct OwnershipAdapter<A> {
         inner: A,
         model_scopes: Arc<Mutex<Vec<DiagnosticScope>>>,
@@ -9113,6 +9124,289 @@ mod tests {
                 interrupt: self.interrupt.clone(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn model_switch_consumes_selected_mcp_provenance_before_queued_fresh_prompt() {
+        timeout(Duration::from_secs(15), async {
+            for external in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let runtime = Runtime::new_with_provider_and_credentials(
+                    root.path(),
+                    "gpt-5.4",
+                    ProviderKind::OpenAiSubscription,
+                    crate::credentials::CredentialStorage::Memory,
+                )
+                .unwrap();
+                let session_id = wire::SessionId::new(format!("switch-provenance-{external}"));
+                events::activate_diagnostics(&session_id.to_string());
+                let config_origin = events::scope_diagnostics(&session_id.to_string(), async {
+                    DiagnosticScope::with_operation(events::DiagnosticOperation::new(
+                        "config-owner".into(),
+                    ))
+                })
+                .await;
+                let fresh_origin = events::scope_diagnostics(&session_id.to_string(), async {
+                    DiagnosticScope::with_operation(events::DiagnosticOperation::new(
+                        "fresh-owner".into(),
+                    ))
+                })
+                .await;
+                let loop_id = SessionId::new(session_id.to_string());
+                let integration = Arc::new(AcpIntegration::default());
+                let sink = ResponseReplacementSink::new(RecordingSink::default());
+                let activity = native_activity(session_id.clone(), sink.clone());
+                let handle = integration
+                    .bind_session(AcpSessionBinding::new(
+                        session_id.clone(),
+                        loop_id.clone(),
+                        sink.clone(),
+                    ))
+                    .unwrap();
+                let selection = SelectableAdapter::new_with_credentials(
+                    ProviderKind::OpenAiSubscription,
+                    "gpt-5.4",
+                    crate::credentials::CredentialStorage::Memory,
+                )
+                .unwrap();
+                let summary_scopes = Arc::new(Mutex::new(Vec::new()));
+                let model_scopes = Arc::new(Mutex::new(Vec::new()));
+                let compactor = crate::compaction::automatic(
+                    OwnershipAdapter {
+                        inner: SwitchSummaryAdapter {
+                            selection: selection.clone(),
+                            seen: Arc::new(Mutex::new(Vec::new())),
+                            outcome: TestOutcome::Content,
+                            interrupt: None,
+                        },
+                        model_scopes: summary_scopes.clone(),
+                    },
+                    Default::default(),
+                    None,
+                    loop_id.clone(),
+                )
+                .unwrap();
+                let manager = AsyncTaskManager::new();
+                let tasks = manager.handle();
+                let driver = Agent::builder()
+                    .model(OwnershipAdapter {
+                        inner: TestAdapter {
+                            outcome: TestOutcome::Content,
+                            turns: Arc::new(AtomicU64::new(0)),
+                            interrupt: None,
+                        },
+                        model_scopes: model_scopes.clone(),
+                    })
+                    .task_manager(manager)
+                    .mutator(compactor)
+                    .cancellation(handle.cancellation_handle())
+                    .transcript(vec![
+                        Item::text(ItemKind::User, "older content ".repeat(20_000)),
+                        Item::text(ItemKind::Assistant, "recent response")
+                            .with_usage(Usage::new(agentkit_core::TokenUsage::new(100, 0))),
+                    ])
+                    .build()
+                    .unwrap()
+                    .start(SessionConfig::new(loop_id).without_cache())
+                    .await
+                    .unwrap();
+                let mcp = crate::tools::mcp::empty();
+                let work = Arc::new(Mutex::new(InjectionWork::default()));
+                let busy = Arc::new(AtomicBool::new(false));
+                let admission = BranchAdmission::claim(busy.clone(), work.clone()).unwrap();
+                let (commands, receiver) = mpsc::channel(8);
+                let mut actor = Box::pin(session_actor(SessionActor {
+                    initial_generation: None,
+                    admission_released: work.lock().unwrap().admission_released.clone(),
+                    session_id: session_id.clone(),
+                    runtime,
+                    integration: integration.clone(),
+                    handle: handle.clone(),
+                    busy: busy.clone(),
+                    binding: BindingGuard {
+                        integration,
+                        session_id: session_id.clone(),
+                    },
+                    sink,
+                    activity,
+                    driver,
+                    tasks,
+                    background_jobs: BackgroundJobs::default(),
+                    structured_completion: false,
+                    skill_catalog: skill_catalog::SkillCatalogMonitor::new(&[]).unwrap(),
+                    adapter: selection.clone(),
+                    catalog: vec![crate::provider::ModelGroup {
+                        provider: ProviderKind::OpenAiSubscription,
+                        models: vec!["gpt-5.4-mini".into()],
+                        context_windows: [("gpt-5.4-mini".into(), 150)].into_iter().collect(),
+                    }],
+                    commands: receiver,
+                    mcp_events: mcp.subscribe(session_id.to_string()),
+                }));
+                if external {
+                    mcp.publish(
+                        &session_id.to_string(),
+                        crate::tools::mcp::McpEvent {
+                            message: "selected external input".into(),
+                        },
+                    );
+                }
+                // Poll the real actor until the event is selected. The genuine
+                // branch owner prevents autonomous execution without a pause hook.
+                assert!(futures_util::poll!(&mut actor).is_pending());
+                let generation = handle.cancellation_handle().generation();
+                // Neither a rejected config nor a successful noncompacting one
+                // may consume the selected external input or start model work.
+                for (id, value, accepted) in [
+                    ("unknown-config", "unused", false),
+                    ("reasoning_effort", "medium", true),
+                ] {
+                    let (reply, response) = oneshot::channel();
+                    commands
+                        .try_send(config_origin.sync_scope(|| {
+                            Command::SetConfig {
+                                request: wire::SetSessionConfigOptionRequest::new(
+                                    session_id.clone(),
+                                    id,
+                                    value,
+                                ),
+                                reply,
+                                cancellation_generation: generation,
+                            }
+                            .scoped()
+                        }))
+                        .unwrap();
+                    let result = tokio::select! {
+                        result = response => result.unwrap(),
+                        () = &mut actor => panic!("config retired the actor"),
+                    };
+                    assert_eq!(result.is_ok(), accepted);
+                    assert!(summary_scopes.lock().unwrap().is_empty());
+                    assert!(model_scopes.lock().unwrap().is_empty());
+                    assert!(busy.load(Ordering::Acquire));
+                }
+                let request = wire::SetSessionConfigOptionRequest::new(
+                    session_id.clone(),
+                    super::super::MODEL_CONFIG_ID,
+                    "openai-subscription:gpt-5.4-mini",
+                );
+                let (reply, response) = oneshot::channel();
+                commands
+                    .try_send(config_origin.sync_scope(|| {
+                        Command::SetConfig {
+                            request: request.clone(),
+                            reply,
+                            cancellation_generation: generation,
+                        }
+                        .scoped()
+                    }))
+                    .unwrap();
+                let warning = tokio::select! {
+                    result = response => result.unwrap().unwrap_err(),
+                    () = &mut actor => panic!("warning retired the actor"),
+                };
+                let warning: model_switch::Warning =
+                    serde_json::from_value(warning.data.unwrap()[model_switch::META].clone())
+                        .unwrap();
+                let mut request = request;
+                request.meta = Some(serde_json::Map::from_iter([(
+                    model_switch::META.into(),
+                    serde_json::to_value(model_switch::Confirmation {
+                        token: warning.token,
+                        action: model_switch::Decision::Compact,
+                    })
+                    .unwrap(),
+                )]));
+                let (reply, compacted) = oneshot::channel();
+                commands
+                    .try_send(config_origin.sync_scope(|| {
+                        Command::SetConfig {
+                            request,
+                            reply,
+                            cancellation_generation: generation,
+                        }
+                        .scoped()
+                    }))
+                    .unwrap();
+                let (reply, prompted) = oneshot::channel();
+                commands
+                    .try_send(fresh_origin.sync_scope(|| {
+                        Command::Prompt(PromptCommand {
+                            request: wire::PromptRequest::new(
+                                session_id.clone(),
+                                vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                    "fresh after compaction",
+                                ))],
+                            ),
+                            cancellation_generation: generation,
+                            reply,
+                        })
+                        .scoped()
+                    }))
+                    .unwrap();
+                // Queue both actor commands before releasing admission: no
+                // intervening autonomous no-work drive can clear stale provenance.
+                drop(admission);
+                tokio::select! {
+                    result = compacted => { result.unwrap().unwrap(); },
+                    () = &mut actor => panic!("compaction retired the actor"),
+                }
+                let activate = tokio::select! {
+                    result = prompted => result.unwrap().unwrap(),
+                    () = &mut actor => panic!("fresh prompt retired the actor"),
+                };
+                let expected = if external {
+                    DiagnosticScope::default()
+                } else {
+                    config_origin.clone()
+                };
+                assert!(!summary_scopes.lock().unwrap().is_empty());
+                assert!(
+                    summary_scopes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|scope| *scope == expected)
+                );
+                assert!(
+                    model_scopes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|scope| *scope == expected)
+                );
+                assert_eq!(selection.selection().unwrap().model, "gpt-5.4-mini");
+                let before_fresh = model_scopes.lock().unwrap().len();
+                activate.send(()).unwrap();
+                let (reply, snapshot) = oneshot::channel();
+                commands.try_send(Command::Snapshot { reply }).unwrap();
+                let snapshot = tokio::select! {
+                    result = snapshot => result.unwrap().unwrap(),
+                    () = &mut actor => panic!("fresh prompt retired the actor"),
+                };
+                let scopes = model_scopes.lock().unwrap().clone();
+                assert!(!scopes[before_fresh..].is_empty());
+                assert!(
+                    scopes[before_fresh..]
+                        .iter()
+                        .all(|scope| *scope == fresh_origin)
+                );
+                assert!(snapshot.canonical_transcript.iter().any(|item| {
+                    item.kind == ItemKind::User
+                        && serde_json::to_string(item)
+                            .unwrap()
+                            .contains("fresh after compaction")
+                }));
+                assert!(!busy.load(Ordering::Acquire));
+                assert_eq!(handle.cancellation_handle().generation(), generation);
+                let (reply, closed) = oneshot::channel();
+                commands.try_send(Command::Close { reply }).unwrap();
+                actor.await;
+                closed.await.unwrap();
+            }
+        })
+        .await
+        .expect("compaction provenance regression timed out");
     }
 
     #[tokio::test]
