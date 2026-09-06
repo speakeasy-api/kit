@@ -763,12 +763,12 @@ impl LoopMutator for AutomaticCompactor {
     }
 }
 
-fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
+pub(crate) fn latest_context_tokens(transcript: &[Item]) -> Option<u64> {
     let usage = transcript
         .iter()
         .rev()
         .find_map(|item| item.usage.as_ref())?;
-    let used = usage
+    usage
         .metadata
         .get("context_used")
         .and_then(serde_json::Value::as_u64)
@@ -777,7 +777,15 @@ fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
                 .tokens
                 .as_ref()
                 .and_then(|tokens| tokens.input_tokens.checked_add(tokens.output_tokens))
-        })?;
+        })
+}
+
+fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
+    let used = latest_context_tokens(transcript)?;
+    let usage = transcript
+        .iter()
+        .rev()
+        .find_map(|item| item.usage.as_ref())?;
     let window = usage
         .metadata
         .get("context_window")
