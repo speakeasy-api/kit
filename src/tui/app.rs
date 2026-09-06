@@ -34,6 +34,7 @@ use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
     plan::{PlanNode, parse as parse_plan},
+    transcript::{Navigation, Navigator, Role},
     wrap::LinkHit,
 };
 
@@ -645,6 +646,7 @@ pub struct App {
     retained_image_source_bytes: usize,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
+    pub(super) navigation: Navigation,
     pub editor: Editor,
     pub attachments: Vec<Attachment>,
     next_attachment: usize,
@@ -707,6 +709,9 @@ pub struct App {
     /// dismissed an older selection, while still allowing it to start a drag.
     press: Option<(usize, usize, bool)>,
     pub toast: Option<(String, Instant)>,
+    /// Terminal queue overload requires acknowledgement before input resumes.
+    pub input_overflow: bool,
+    pub input_recovery_ready: bool,
     /// When the last key arrived, for telling a paste from typing.
     pub last_key: Option<Instant>,
     next_file_search_revision: u64,
@@ -893,6 +898,7 @@ impl App {
             retained_image_source_bytes: 0,
             next_transcript_revision: 0,
             transcript_focus_index: None,
+            navigation: Navigation::default(),
             editor: Editor::default(),
             attachments: Vec::new(),
             next_attachment: 0,
@@ -942,6 +948,8 @@ impl App {
             selection: None,
             press: None,
             toast: None,
+            input_overflow: false,
+            input_recovery_ready: false,
             last_key: None,
             next_file_search_revision: 0,
         }
@@ -1019,6 +1027,7 @@ impl App {
             _ => None,
         };
         self.blocks.push(block);
+        self.navigation.push();
         self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
         self.transcript_revisions
             .push(self.next_transcript_revision);
@@ -1065,6 +1074,7 @@ impl App {
 
     /// Aligns cache bookkeeping for tests and other direct transcript setup.
     pub(super) fn sync_transcript_cache(&mut self) {
+        self.navigation.sync(self.blocks.len());
         self.transcript_cache.truncate(self.blocks.len());
         self.transcript_revisions.truncate(self.blocks.len());
         self.transcript_dirty
@@ -1980,6 +1990,7 @@ impl App {
         self.command_completion_query = None;
         self.command_completion_dismissed = None;
         self.blocks.clear();
+        self.navigation.reset();
         self.transcript_cache.clear();
         self.transcript_revisions.clear();
         self.transcript_dirty.clear();
@@ -2176,6 +2187,7 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, lines: isize) {
+        self.navigation.anchored = false;
         self.press = None;
         let top = self.total_lines.saturating_sub(self.viewport);
         let current = self.scroll.min(top);
@@ -2184,12 +2196,14 @@ impl App {
     }
 
     fn scroll_to_top(&mut self) {
+        self.navigation.anchored = false;
         self.press = None;
         self.follow = false;
         self.scroll = 0;
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.navigation.anchored = false;
         self.press = None;
         self.follow = true;
         self.scroll = usize::MAX;
@@ -2272,6 +2286,11 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         if self.model_switch.is_some() {
+            return;
+        }
+        if let Some(dialog) = &mut self.navigation.dialog {
+            dialog.insert(text);
+            self.sync_navigation();
             return;
         }
         // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
@@ -2884,8 +2903,156 @@ impl App {
         Some(id)
     }
 
-    /// Applies a key press, returning work for the event loop.
-    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+    /// Open a read-only view without borrowing the parked composer's state.
+    pub(super) fn open_navigation(&mut self) {
+        self.navigation.sync(self.blocks.len());
+        self.navigation.dialog = Some(Navigator {
+            selected: self.navigation.revealed,
+            ..Navigator::default()
+        });
+        self.sync_navigation();
+    }
+
+    pub(super) fn sync_navigation(&mut self) -> Vec<usize> {
+        let matches = self
+            .navigation
+            .matches(&self.blocks, &self.transcript_revisions);
+        self.navigation.reconcile(&matches);
+        matches
+    }
+
+    fn handle_navigation_key(&mut self, key: KeyEvent, pasted: bool) -> Action {
+        if pasted && matches!(key.code, KeyCode::Enter | KeyCode::Tab) {
+            // Keep unbracketed paste inside the query, never reveal or cycle
+            // roles. Its control whitespace is discarded just like Event::Paste.
+            self.paste(if key.code == KeyCode::Enter {
+                "\n"
+            } else {
+                "\t"
+            });
+            return Action::None;
+        }
+        let matches = self.sync_navigation();
+        let selected = self
+            .navigation
+            .dialog
+            .as_ref()
+            .and_then(|dialog| dialog.selected);
+        let current = selected.and_then(|id| self.navigation.index(id));
+        match key.code {
+            KeyCode::Esc | KeyCode::F(3) => self.navigation.dialog = None,
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                if let Some(index) = current {
+                    if let Some(old) = self
+                        .navigation
+                        .revealed
+                        .and_then(|id| self.navigation.index(id))
+                    {
+                        self.mark_block_dirty(old);
+                    }
+                    self.navigation.revealed = selected;
+                    self.navigation.reveal_pending = true;
+                    self.navigation.anchored = true;
+                    self.mark_block_dirty(index);
+                    self.navigation.dialog = None;
+                }
+            }
+            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigation.dialog.as_mut().unwrap().role = Role::User;
+                let users = self
+                    .navigation
+                    .matches(&self.blocks, &self.transcript_revisions);
+                let target = if key.code == KeyCode::Up {
+                    users
+                        .iter()
+                        .rev()
+                        .find(|index| current.is_none_or(|current| **index < current))
+                } else {
+                    users
+                        .iter()
+                        .find(|index| current.is_none_or(|current| **index > current))
+                }
+                .copied();
+                // At an edge retain the current matching prompt, otherwise use
+                // the nearest matching prompt. The query is never discarded.
+                let target = target
+                    .or_else(|| current.filter(|index| users.contains(index)))
+                    .or_else(|| {
+                        if key.code == KeyCode::Up {
+                            users.first()
+                        } else {
+                            users.last()
+                        }
+                        .copied()
+                    });
+                self.navigation.dialog.as_mut().unwrap().selected =
+                    target.and_then(|index| self.navigation.id(index));
+            }
+            KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() => {
+                let position = matches
+                    .iter()
+                    .position(|index| Some(*index) == current)
+                    .unwrap_or(0);
+                let position = if key.code == KeyCode::Up {
+                    position.saturating_sub(1)
+                } else {
+                    (position + 1).min(matches.len().saturating_sub(1))
+                };
+                self.navigation.dialog.as_mut().unwrap().selected = matches
+                    .get(position)
+                    .and_then(|index| self.navigation.id(*index));
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let dialog = self.navigation.dialog.as_mut().unwrap();
+                dialog.role = dialog.role.cycle(
+                    key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+            }
+            KeyCode::Backspace if key.modifiers.is_empty() => {
+                self.navigation.dialog.as_mut().unwrap().backspace()
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                self.navigation
+                    .dialog
+                    .as_mut()
+                    .unwrap()
+                    .insert(&character.to_string());
+            }
+            _ => {}
+        }
+        self.sync_navigation();
+        Action::None
+    }
+
+    /// Resolve only after the wrapping cache has current-width prefix offsets.
+    pub(super) fn apply_navigation_reveal(&mut self, viewport_changed: bool) {
+        // Resuming follow supersedes an old anchor, but not an explicit reveal.
+        if self.follow && !self.navigation.reveal_pending {
+            self.navigation.anchored = false;
+            return;
+        }
+        if !(self.navigation.reveal_pending || viewport_changed && self.navigation.anchored) {
+            return;
+        }
+        if let Some(index) = self
+            .navigation
+            .revealed
+            .and_then(|id| self.navigation.index(id))
+            && let Some(prefix) = self.transcript_prefixes.get(index)
+        {
+            self.follow = false;
+            self.scroll = prefix + usize::from(*prefix > 0);
+        }
+        self.navigation.reveal_pending = false;
+    }
+
+    /// Applies a key press using its terminal receipt time, not dispatch time.
+    /// Synchronous rendering/search must not change inter-key paste gaps.
+    pub fn handle_key_at(&mut self, key: KeyEvent, received_at: Instant) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
@@ -2924,11 +3091,20 @@ impl App {
             }
             return Action::Redraw;
         }
+        if self.navigation.dialog.is_some() {
+            let pasted = self
+                .last_key
+                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+            self.last_key = Some(received_at);
+            return self.handle_navigation_key(key, pasted);
+        }
         if self.session_dialog.is_some() {
             // Terminals without bracketed paste deliver a paste as a key burst, so
             // the arrival gap is the only thing separating it from typing.
-            let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
-            self.last_key = Some(Instant::now());
+            let pasted = self
+                .last_key
+                .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+            self.last_key = Some(received_at);
             return self.handle_session_key(key, pasted);
         }
         if self.model_dialog.is_some() {
@@ -2936,6 +3112,10 @@ impl App {
         }
         if self.effort_dialog.is_some() {
             return self.handle_effort_key(key);
+        }
+        if key.code == KeyCode::F(3) && key.modifiers.is_empty() {
+            self.open_navigation();
+            return Action::None;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.file_picker = None;
@@ -3035,8 +3215,10 @@ impl App {
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
-        let pasted = self.last_key.is_some_and(|last| last.elapsed() < PASTE_GAP);
-        self.last_key = Some(Instant::now());
+        let pasted = self
+            .last_key
+            .is_some_and(|last| received_at.saturating_duration_since(last) < PASTE_GAP);
+        self.last_key = Some(received_at);
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -3137,6 +3319,15 @@ impl App {
                 self.toast = None;
             }
             KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
+                // Local and read-only, even while streaming or editing a steer.
+                // Do not submit/clear the parked composer or its attachments.
+                if matches!(
+                    parse(self.editor.text(), !self.auth_methods.is_empty()),
+                    Parsed::Transcript
+                ) {
+                    self.open_navigation();
+                    return Action::None;
+                }
                 if self.editor.is_empty() {
                     return Action::None;
                 }
@@ -3207,6 +3398,10 @@ impl App {
                             self.session_catalog_pending = true;
                             Action::ListSessions
                         }
+                    }
+                    Parsed::Transcript => {
+                        self.open_navigation();
+                        Action::None
                     }
                     Parsed::Close => Action::Close,
                     Parsed::Agents => {
@@ -3384,7 +3579,7 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
-        if self.model_switch.is_some() {
+        if self.model_switch.is_some() || self.navigation.dialog.is_some() {
             return Action::None;
         }
         match mouse.kind {
@@ -3737,6 +3932,12 @@ mod tests {
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
+    impl App {
+        pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Action {
+            self.handle_key_at(key, Instant::now())
+        }
+    }
+
     fn press(code: KeyCode) -> KeyEvent {
         modified_press(code, KeyModifiers::NONE)
     }
@@ -3894,6 +4095,270 @@ mod tests {
             Action::Redraw
         ));
         assert!(app.model_switch.is_none());
+    }
+
+    #[test]
+    fn transcript_navigation_receipt_times_survive_slow_processing() {
+        for deliberate in [false, true] {
+            for key in [KeyCode::Tab, KeyCode::Enter] {
+                let mut app = app();
+                app.push_block(Block::Agent("matching text".into()));
+                app.paste("parked draft");
+                app.open_navigation();
+                let first = Instant::now();
+                app.handle_key_at(press(KeyCode::Char('m')), first);
+                // These are input receipt times, not dispatch times. Both events
+                // can be queued while the UI is busy rendering or searching.
+                let gap = if deliberate {
+                    super::PASTE_GAP * 3
+                } else {
+                    Duration::ZERO
+                };
+                let received_at = first + gap;
+                std::thread::sleep(super::PASTE_GAP * 4);
+                assert!(matches!(
+                    app.handle_key_at(press(key), received_at),
+                    Action::None
+                ));
+                assert_eq!(app.editor.text(), "parked draft");
+                if deliberate && key == KeyCode::Enter {
+                    assert!(app.navigation.dialog.is_none());
+                    assert!(app.navigation.revealed.is_some());
+                } else {
+                    let dialog = app.navigation.dialog.as_ref().unwrap();
+                    assert_eq!(dialog.role == super::Role::All, !deliberate);
+                    assert!(app.navigation.revealed.is_none());
+                }
+                if !deliberate {
+                    // A second buffered newline must not submit the parked draft.
+                    assert!(matches!(
+                        app.handle_key_at(press(KeyCode::Enter), received_at),
+                        Action::None
+                    ));
+                    assert!(app.navigation.dialog.is_some());
+                    assert_eq!(app.editor.text(), "parked draft");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_navigation_preserves_streaming_draft_and_attachments() {
+        let mut app = app();
+        app.push_block(Block::Agent("visible history".into()));
+        app.paste("draft e\u{301} 👩‍💻");
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            12,
+        );
+        app.editor.move_left();
+        let draft = app.editor.text().to_owned();
+        let cursor = app.editor.cursor();
+        app.phase = Phase::Working;
+        app.follow = false;
+        app.scroll = 7;
+        assert!(matches!(app.handle_key(press(KeyCode::F(3))), Action::None));
+        for key in [
+            modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            modified_press(KeyCode::Char('b'), KeyModifiers::SUPER),
+            modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        ] {
+            assert!(matches!(app.handle_key(key), Action::None));
+        }
+        app.paste("history");
+        assert_eq!(app.sync_navigation(), vec![0]);
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.editor.cursor(), cursor);
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.scroll, 7);
+        assert!(!app.follow);
+        assert!(app.working());
+        assert!(app.navigation.revealed.is_none());
+    }
+
+    #[test]
+    fn transcript_command_is_read_only_while_streaming() {
+        let mut app = app();
+        app.phase = Phase::Working;
+        app.paste("/transcript");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.navigation.dialog.is_some());
+        assert_eq!(app.editor.text(), "/transcript");
+        assert!(app.working());
+        assert!(app.pending_steers.is_empty());
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        assert_eq!(app.editor.text(), "/transcript");
+    }
+
+    #[test]
+    fn transcript_navigation_filters_unicode_and_jumps_between_user_prompts() {
+        let mut app = app();
+        app.push_block(Block::User("ÉCOLE first".to_string().into()));
+        app.push_block(Block::Agent("école answer".into()));
+        app.push_block(Block::Thought {
+            text: "école thought".into(),
+            started: Instant::now(),
+            millis: Some(1),
+        });
+        app.push_block(Block::User("école last".to_string().into()));
+        app.push_block(Block::Notice("école not a message".into()));
+        app.open_navigation();
+        app.paste("École");
+        assert_eq!(app.sync_navigation(), vec![0, 1, 2, 3]);
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(modified_press(KeyCode::Down, KeyModifiers::CONTROL));
+        let dialog = app.navigation.dialog.as_ref().unwrap();
+        assert_eq!(dialog.role, super::Role::User);
+        assert_eq!(dialog.query, "École");
+        assert_eq!(dialog.selected, app.navigation.id(3));
+        app.handle_key(modified_press(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.navigation.dialog.as_ref().unwrap().selected,
+            app.navigation.id(0)
+        );
+        app.last_key = None; // Intentional key, outside a paste burst.
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.sync_navigation(), vec![1]);
+        app.last_key = None; // Intentional key, outside a paste burst.
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.sync_navigation(), vec![2]);
+        assert!(!app.show_thoughts);
+        app.last_key = None; // Intentional key, outside a paste burst.
+        app.handle_key(press(KeyCode::Tab));
+        assert!(app.sync_navigation().is_empty());
+        assert!(app.navigation.dialog.as_ref().unwrap().selected.is_none());
+        app.last_key = None; // Intentional key, outside a paste burst.
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.navigation.dialog.is_some());
+        app.handle_key(press(KeyCode::BackTab));
+        assert_eq!(app.sync_navigation(), vec![2]);
+    }
+
+    #[test]
+    fn transcript_navigation_keeps_identity_across_live_and_replay_upserts() {
+        let mut app = app();
+        app.start_session("session".into());
+        app.apply(Update::AgentMessage {
+            id: "acp-message".into(),
+            text: "original".into(),
+            append: false,
+        });
+        app.open_navigation();
+        let selected = app.navigation.dialog.as_ref().unwrap().selected;
+        // Replay replacement uses the same ACP ID; it is not a fork address.
+        app.apply(Update::AgentMessage {
+            id: "acp-message".into(),
+            text: "replacement".into(),
+            append: false,
+        });
+        app.apply(Update::AgentMessage {
+            id: "acp-message".into(),
+            text: " live tail".into(),
+            append: true,
+        });
+        app.apply(Update::AgentMessage {
+            id: "different-message".into(),
+            text: "later".into(),
+            append: false,
+        });
+        app.sync_navigation();
+        assert_eq!(app.navigation.dialog.as_ref().unwrap().selected, selected);
+        assert_eq!(app.blocks.len(), 2);
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.navigation.revealed, selected);
+        app.start_session("session".into()); // same ID, fresh activation
+        assert!(app.navigation.dialog.is_none());
+        assert!(app.navigation.revealed.is_none());
+        app.apply(Update::AgentMessage {
+            id: "acp-message".into(),
+            text: "replacement".into(),
+            append: false,
+        });
+        app.open_navigation();
+        assert_ne!(app.navigation.dialog.as_ref().unwrap().selected, selected);
+    }
+
+    #[test]
+    fn transcript_navigation_search_updates_and_excludes_pending_and_image_bytes() {
+        let mut app = app();
+        app.apply(Update::UserMessage {
+            id: "user".into(),
+            text: "[Image #1]".into(),
+            images: vec![UserImage::new("c2VjcmV0".into(), "image/png".into(), 0).unwrap()],
+            append: false,
+        });
+        app.apply(Update::SteerAccepted {
+            id: "pending".into(),
+            text: "undelivered secret".into(),
+            editable: true,
+        });
+        app.apply(Update::ToolStarted {
+            id: "tool".into(),
+            title: "shell".into(),
+            kind: ToolKind::Other,
+            script: Some("return readable_script".into()),
+            backgrounded: false,
+        });
+        let tool_focus = app.transcript_focus_index;
+        app.open_navigation();
+        app.paste("c2VjcmV0");
+        assert!(app.sync_navigation().is_empty());
+        app.navigation.dialog.as_mut().unwrap().query = "undelivered".into();
+        assert!(app.sync_navigation().is_empty());
+        app.navigation.dialog.as_mut().unwrap().query = "READABLE_SCRIPT".into();
+        assert_eq!(app.sync_navigation(), vec![1]);
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.transcript_focus_index, tool_focus);
+        app.open_navigation();
+        app.paste("future text");
+        assert!(app.sync_navigation().is_empty());
+        app.apply(Update::AgentMessage {
+            id: "future".into(),
+            text: "future text".into(),
+            append: true,
+        });
+        assert_eq!(app.sync_navigation(), vec![2]);
+        app.apply(Update::AgentMessage {
+            id: "future".into(),
+            text: "no longer matches".into(),
+            append: false,
+        });
+        assert!(app.sync_navigation().is_empty());
+        assert!(app.navigation.dialog.as_ref().unwrap().selected.is_none());
+    }
+
+    #[test]
+    fn transcript_navigation_restored_history_and_empty_session_are_safe() {
+        let mut app = app();
+        app.open_navigation();
+        for key in [KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::BackTab] {
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+        }
+        assert!(app.navigation.dialog.as_ref().unwrap().selected.is_none());
+        app.start_session("restored".into());
+        app.apply(Update::UserMessage {
+            id: "replayed-user".into(),
+            text: "replayed user".into(),
+            images: Vec::new(),
+            append: false,
+        });
+        app.apply(Update::AgentMessage {
+            id: "replayed-agent".into(),
+            text: "replayed assistant".into(),
+            append: false,
+        });
+        app.open_navigation();
+        assert_eq!(app.sync_navigation(), vec![0, 1]);
+        app.handle_key(press(KeyCode::Down));
+        app.last_key = None; // Intentional key, outside a paste burst.
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.navigation.revealed, app.navigation.id(1));
     }
 
     #[test]
