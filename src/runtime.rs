@@ -2828,6 +2828,128 @@ mod branch_startup_tests {
     }
 
     #[tokio::test]
+    async fn interrupted_first_migration_resumes_through_runtime_and_acp() {
+        for empty in [false, true] {
+            for acp in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let id = "migration-resume";
+                let expected = vec![
+                    Item::text(ItemKind::System, "system"),
+                    Item::text(ItemKind::User, "legacy prompt"),
+                ];
+                let (legacy, scoped) = crate::session::test_support::interrupted_migration(
+                    root.path(),
+                    id,
+                    expected.clone(),
+                    empty,
+                );
+                let before = [
+                    std::fs::read(&legacy).unwrap(),
+                    std::fs::read(&scoped).unwrap(),
+                ];
+                assert_eq!(branch::validate_resume(root.path(), id).unwrap(), None);
+                assert_eq!(std::fs::read(&legacy).unwrap(), before[0]);
+                assert_eq!(std::fs::read(&scoped).unwrap(), before[1]);
+                assert!(!legacy.with_extension("lock").exists());
+                assert!(!scoped.with_extension("lock").exists());
+
+                let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+                    root.path(),
+                    "openai/gpt-5.4",
+                    ProviderKind::OpenRouter,
+                    SessionRequest {
+                        id: id.into(),
+                        resume: true,
+                        force: false,
+                    },
+                    crate::credentials::CredentialStorage::Memory,
+                    None,
+                    Some(crate::provider::OpenRouterApiKey::new("")),
+                )
+                .unwrap();
+                let error = if acp {
+                    let mut claim = runtime.claim_session_load(id).unwrap();
+                    runtime
+                        .start_acp_driver(context(root.path()), &mut claim)
+                        .await
+                        .err()
+                        .expect("adapter must reject empty key")
+                        .to_string()
+                } else {
+                    runtime
+                        .run_persistent("must not be appended".into())
+                        .await
+                        .unwrap_err()
+                };
+                assert!(
+                    error.contains("--openrouter-api-key cannot be empty"),
+                    "{error}"
+                );
+                assert_eq!(crate::session::load(root.path(), id).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_first_migration_preflight_rejects_invalid_authority_without_mutation() {
+        for case in [
+            "malformed-destination",
+            "terminated-torn-destination",
+            "malformed-legacy",
+            "foreign-workspace",
+            "foreign-session",
+            "divergent-history",
+            "incomplete-checkout",
+            "missing-legacy",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let id = "invalid-migration";
+            let transcript = if case == "incomplete-checkout" {
+                prepared()[..1].to_vec()
+            } else {
+                vec![Item::text(ItemKind::System, "system")]
+            };
+            let (legacy, scoped) = crate::session::test_support::interrupted_migration(
+                root.path(),
+                id,
+                transcript,
+                false,
+            );
+            match case {
+                "malformed-destination" => std::fs::write(&scoped, b"{}").unwrap(),
+                "terminated-torn-destination" => std::fs::write(&scoped, b"{\n").unwrap(),
+                "malformed-legacy" => std::fs::write(&legacy, b"{}\n").unwrap(),
+                "foreign-workspace" | "foreign-session" => {
+                    let mut record: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+                    if case == "foreign-workspace" {
+                        record["workspace_root"] = json!(root.path().join("elsewhere"));
+                    } else {
+                        record["session_id"] = json!("unauthorized");
+                    }
+                    std::fs::write(&legacy, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+                "divergent-history" => {
+                    let mut record: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+                    record["replacement"] = json!([Item::text(ItemKind::System, "unrelated")]);
+                    std::fs::write(&scoped, serde_json::to_vec(&record).unwrap()).unwrap();
+                }
+                "missing-legacy" => std::fs::remove_file(&legacy).unwrap(),
+                "incomplete-checkout" => {}
+                _ => unreachable!(),
+            }
+            let legacy_before = std::fs::read(&legacy).ok();
+            let scoped_before = std::fs::read(&scoped).unwrap();
+            assert!(branch::validate_resume(root.path(), id).is_err(), "{case}");
+            assert_eq!(std::fs::read(&legacy).ok(), legacy_before, "{case}");
+            assert_eq!(std::fs::read(&scoped).unwrap(), scoped_before, "{case}");
+            assert!(!legacy.with_extension("lock").exists(), "{case}");
+            assert!(!scoped.with_extension("lock").exists(), "{case}");
+        }
+    }
+
+    #[tokio::test]
     async fn noninteractive_branch_reload_validates_completion_and_restores_selection() {
         let root = tempfile::tempdir().unwrap();
         for complete in [false, true] {

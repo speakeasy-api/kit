@@ -1351,7 +1351,10 @@ fn belongs_to_workspace_in(
 ) -> Result<bool, String> {
     validate_id(session_id)?;
     let root = canonical_workspace(root);
-    Ok(select_authority(global_directory, &root, session_id)?.is_some())
+    // ACP resume checks workspace membership before acquiring the writer.
+    // Apply the same read-only recovery view as resume preflight; the locked
+    // opener alone may repair a torn migration destination or tail.
+    Ok(select_authority_with(global_directory, &root, session_id, true, true)?.is_some())
 }
 
 pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
@@ -1466,6 +1469,16 @@ fn select_authority_with(
             .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
         {
             continue;
+        }
+        // The locked opener discards an empty or torn first replacement at
+        // the scoped destination. Ignore exactly that destination here too;
+        // legacy candidates still undergo normal workspace/lineage validation.
+        if tolerate_incomplete_tail && path == &scoped {
+            let bytes = fs::read(path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            if incomplete_migration_destination(&bytes) {
+                continue;
+            }
         }
         let (workspace, transcript) =
             read_authority_candidate(path, session_id, tolerate_incomplete_tail)?;
@@ -1585,6 +1598,12 @@ fn torn_migration_tail_start(bytes: &[u8]) -> Option<usize> {
         .then_some(start)
 }
 
+/// No complete record exists yet; only a scoped migration destination may be
+/// discarded. Complete malformed records must still reach the strict parser.
+fn incomplete_migration_destination(bytes: &[u8]) -> bool {
+    bytes.is_empty() || torn_migration_tail_start(bytes) == Some(0)
+}
+
 fn migration_source_workspace(path: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -1635,7 +1654,7 @@ fn recover_torn_migration_writes(
         }
         let bytes = fs::read(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        if bytes.is_empty() && path == scoped {
+        if path == scoped && incomplete_migration_destination(&bytes) {
             filesystem
                 .remove_file(&path)
                 .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
@@ -1672,25 +1691,18 @@ fn recover_torn_migration_writes(
             }
             continue;
         };
-        if complete == 0 && path == scoped {
-            filesystem
-                .remove_file(&path)
-                .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
-            sync_parent_directory(&filesystem, &path)?;
-        } else {
-            let file = OpenOptions::new()
-                .write(true)
-                .open_in(&filesystem, &path)
-                .map_err(|error| format!("could not open {}: {error}", path.display()))?;
-            file.set_len(complete as u64)
-                .and_then(|_| file.sync_all())
-                .map_err(|error| {
-                    format!(
-                        "could not recover torn migration {}: {error}",
-                        path.display()
-                    )
-                })?;
-        }
+        let file = OpenOptions::new()
+            .write(true)
+            .open_in(&filesystem, &path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+        file.set_len(complete as u64)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                format!(
+                    "could not recover torn migration {}: {error}",
+                    path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -2003,6 +2015,38 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
         Err("session id must be 1-128 ASCII letters, digits, '-' or '_'".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Leave an intact legacy source and a crashed first scoped replacement.
+    pub(crate) fn interrupted_migration(
+        root: &Path,
+        session_id: &str,
+        transcript: Vec<Item>,
+        empty: bool,
+    ) -> (PathBuf, PathBuf) {
+        let legacy = legacy_transcript(root, session_id);
+        let scoped = transcript_path_for_test(root, session_id);
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            session_id: session_id.into(),
+            generation: 1,
+            workspace_root: Some(canonical_workspace(root)),
+            item: None,
+            replacement: Some(transcript),
+            redirect: None,
+        };
+        let mut bytes = serde_json::to_vec(&record).unwrap();
+        bytes.push(b'\n');
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(scoped.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, &bytes).unwrap();
+        std::fs::write(&scoped, &bytes[..if empty { 0 } else { bytes.len() / 2 }]).unwrap();
+        (legacy, scoped)
     }
 }
 
@@ -2965,7 +3009,25 @@ mod tests {
             redirect: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
-        fs::write(&scoped, &encoded[..encoded.len() / 2]).unwrap();
+        let legacy_bytes = fs::read(&global).unwrap();
+        for destination in [&b""[..], &encoded[..encoded.len() / 2]] {
+            fs::write(&scoped, destination).unwrap();
+            let authority = select_authority_with(
+                &session_directory(root.path()),
+                &canonical_workspace(&project_root(root.path())),
+                "abc",
+                true,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(authority.items, expected);
+            assert_eq!(authority.path, global);
+            assert_eq!(fs::read(&scoped).unwrap(), destination);
+            assert_eq!(fs::read(&global).unwrap(), legacy_bytes);
+            assert!(!scoped.with_extension("lock").exists());
+            assert!(!global.with_extension("lock").exists());
+        }
 
         assert!(load(root.path(), "abc").is_err());
         let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();

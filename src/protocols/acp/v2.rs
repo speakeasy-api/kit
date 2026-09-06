@@ -3006,6 +3006,8 @@ pub(crate) fn component(
 
 #[cfg(test)]
 mod tests {
+    mod migration_resume;
+
     use std::{
         collections::VecDeque,
         sync::{atomic::AtomicUsize, mpsc as std_mpsc},
