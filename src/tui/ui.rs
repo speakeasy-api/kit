@@ -2337,6 +2337,14 @@ fn compact(value: u64) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use agent_client_protocol::schema::v2::{
         IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,

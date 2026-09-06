@@ -1,3 +1,13 @@
+// Integration crate and its helpers are test-only. Placeholders stay denied.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
 //! Exercise public session and tool APIs against a real-disk backend whose
 //! capacity is unavailable until a normal shell tool repairs the condition.
 use std::{

@@ -3557,6 +3557,14 @@ fn select_package_root(extraction: &Path, subdir: Option<&Path>) -> Result<PathB
 pub(crate) use test_support::make_tree_writable_for_test;
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use super::*;
 
@@ -3566,6 +3574,14 @@ mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::net::TcpListener;
     use std::thread;

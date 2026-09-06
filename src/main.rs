@@ -1,3 +1,19 @@
+// Production policy is deliberately non-overridable. Test-only scopes below
+// retain assertions and unwrap ergonomics; placeholder lints remain denied.
+#![cfg_attr(
+    not(test),
+    forbid(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
+
 use std::{
     collections::BTreeMap,
     env,
@@ -1270,6 +1286,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 

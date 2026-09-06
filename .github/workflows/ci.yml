@@ -29,8 +29,11 @@ jobs:
           toolchain: 1.94.0
           components: rustfmt, clippy
       - run: scripts/tests/test_next_release_version.sh
+      - run: python3 scripts/tests/test_panic_policy.py
+      - run: python3 scripts/tests/test_build_docs.py
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --lib --bins --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
 
   macos-desktop:
@@ -41,9 +44,12 @@ jobs:
         with:
           toolchain: 1.94.0
           targets: aarch64-apple-darwin
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-desktop
+      - run: cargo clippy --locked --lib --bins --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Install pinned XcodeGen
         shell: bash
         run: |
@@ -100,3 +106,14 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = com.speakeasy.kit.desktop
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+
+  windows-rust-policy:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy
+      # Compile native Windows branches; tests run on the Linux job above.
+      - run: cargo clippy --locked --lib --bins --all-features -- -D warnings

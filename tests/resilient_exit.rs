@@ -1,3 +1,13 @@
+// Integration crate and its helpers are test-only. Placeholders stay denied.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
 //! Final process-exit recovery must not depend on the background worker waking.
 #[path = "support/capacity.rs"]
 mod capacity;

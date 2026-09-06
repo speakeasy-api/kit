@@ -1303,8 +1303,8 @@ fn bind_callback() -> Result<TcpListener, AuthError> {
 }
 
 fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) -> String {
-    let mut url = url::Url::parse("https://auth.openai.com/oauth/authorize").expect("fixed URL");
-    url.query_pairs_mut()
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", redirect_uri)
@@ -1319,7 +1319,7 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) 
         .append_pair("state", state)
         .append_pair("nonce", nonce)
         .append_pair("originator", "kit");
-    url.into()
+    format!("https://auth.openai.com/oauth/authorize?{}", query.finish())
 }
 
 fn http_client(deadline: Instant) -> Result<reqwest::blocking::Client, AuthError> {
@@ -1407,7 +1407,12 @@ fn process_lock_scoped(
     credential_scope: Option<&std::path::Path>,
 ) -> Result<ProcessLock, AuthError> {
     let path = auth_lock_path()?;
-    let parent = path.parent().expect("auth lock path has a parent");
+    let parent = path.parent().ok_or_else(|| {
+        AuthError::unavailable(
+            "auth_lock_failed",
+            "authentication lock path has no parent directory",
+        )
+    })?;
     fs::create_private_dir_all(parent).map_err(|_| {
         AuthError::unavailable(
             "auth_lock_failed",
@@ -1653,6 +1658,14 @@ fn human(stdout: impl Into<String>) -> Output {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 pub(crate) mod test_support {
     use super::TokenRecord;
 
@@ -1675,6 +1688,14 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
 

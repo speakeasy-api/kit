@@ -485,9 +485,9 @@ async fn wait_for_terminal_auth(
     mut command: tokio::process::Command,
     stop: &mut Stop,
 ) -> Option<std::io::Result<std::process::ExitStatus>> {
-    let child = command.kill_on_drop(true).spawn();
-    let Ok(mut child) = child else {
-        return Some(child.map(|_| unreachable!()));
+    let mut child = match command.kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
     };
     tokio::select! {
         status = child.wait() => Some(status),
@@ -530,11 +530,12 @@ async fn bounded_startup_request<T>(
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
     timeout: Duration,
 ) -> Result<T, RequestFailure> {
-    match bounded_agent_request(request, exit, std::future::pending(), timeout).await {
-        Ok(output) => Ok(output),
-        Err(RequestInterrupt::AgentExited(status)) => Err(RequestFailure::AgentExited(status)),
-        Err(RequestInterrupt::TimedOut) => Err(RequestFailure::TimedOut),
-        Err(RequestInterrupt::Stopped) => unreachable!("the stop future is pending"),
+    tokio::select! {
+        output = request => Ok(output),
+        status = &mut *exit => Err(RequestFailure::AgentExited(
+            status.ok().and_then(Result::ok),
+        )),
+        () = tokio::time::sleep(timeout) => Err(RequestFailure::TimedOut),
     }
 }
 
@@ -2537,33 +2538,33 @@ fn message_patch(
         MaybeUndefined::Null => Vec::new(),
         MaybeUndefined::Value(blocks) => blocks,
     };
-    if matches!(kind, MessageKind::User) {
-        let (text, images) = user_message_of(blocks);
-        return vec![Update::UserMessage {
+    let patch: fn(String, String) -> Update = match kind {
+        MessageKind::User => {
+            let (text, images) = user_message_of(blocks);
+            return vec![Update::UserMessage {
+                id,
+                text,
+                images,
+                append: false,
+            }];
+        }
+        MessageKind::Agent => |id, text| Update::AgentMessage {
             id,
             text,
-            images,
             append: false,
-        }];
-    }
+        },
+        MessageKind::Thought => |id, text| Update::AgentThought {
+            id,
+            text,
+            append: false,
+        },
+    };
     let text = blocks
         .into_iter()
         .filter_map(message_of)
         .collect::<Vec<_>>()
         .join("");
-    vec![match kind {
-        MessageKind::User => unreachable!("handled above"),
-        MessageKind::Agent => Update::AgentMessage {
-            id,
-            text,
-            append: false,
-        },
-        MessageKind::Thought => Update::AgentThought {
-            id,
-            text,
-            append: false,
-        },
-    }]
+    vec![patch(id, text)]
 }
 
 fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
@@ -2716,6 +2717,14 @@ fn readable(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         path::PathBuf,
@@ -4544,10 +4553,59 @@ a = [still text]
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod signal_tests {
     use std::{future, time::Duration};
 
     use super::{RequestInterrupt, Stop, bounded_agent_request, bounded_graceful_close};
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_requests_preserve_success_timeout_and_agent_exit() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            super::bounded_startup_request(future::ready(7), &mut exit_rx, Duration::from_secs(30))
+                .await,
+            Ok(7)
+        ));
+        assert!(matches!(
+            super::bounded_startup_request(
+                future::pending::<()>(),
+                &mut exit_rx,
+                Duration::from_secs(30)
+            )
+            .await,
+            Err(super::RequestFailure::TimedOut)
+        ));
+        drop(exit_tx);
+        assert!(matches!(
+            super::bounded_startup_request(
+                future::pending::<()>(),
+                &mut exit_rx,
+                Duration::from_secs(30)
+            )
+            .await,
+            Err(super::RequestFailure::AgentExited(None))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_auth_reports_spawn_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let command = tokio::process::Command::new(root.path().join("missing-auth-command"));
+        let mut stop = Stop::new().unwrap();
+        let error = super::wait_for_terminal_auth(command, &mut stop)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_stuck_session_request_is_bounded() {

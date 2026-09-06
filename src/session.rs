@@ -398,7 +398,7 @@ fn open_with_initial_timestamps_in(
             "session {session_id:?} already exists; use --resume"
         ));
     }
-    let (mut transcript, mut generation) = if resume {
+    let (mut transcript, generation) = if resume {
         read_records(&path, session_id)?
     } else {
         (Vec::new(), 0)
@@ -451,8 +451,6 @@ fn open_with_initial_timestamps_in(
             }
             transcript.push(item);
         }
-        generation = writer.generation;
-        debug_assert_eq!(generation, transcript.len() as u64);
     }
     // Nothing guards a transcript between sessions: it is a plain file a user
     // can edit, truncate, or lose a write from, and a tool call left unanswered
@@ -1476,10 +1474,13 @@ fn select_authority_with(
             continue;
         }
         let is_unbound_global = is_global && workspace.is_none();
-        if !is_global && workspace.as_deref().is_some_and(|stored| stored != root) {
+        if !is_global
+            && let Some(stored) = workspace.as_deref()
+            && stored != root
+        {
             return Err(format!(
                 "session {session_id:?} belongs to workspace {}, not {}",
-                workspace.unwrap().display(),
+                stored.display(),
                 root.display()
             ));
         }
@@ -1727,7 +1728,13 @@ fn lock_migration_sources(
             return Ok(locks);
         }
         for path in pending {
-            fs::create_dir_all(path.parent().expect("session lock has a parent"))
+            let directory = path.parent().ok_or_else(|| {
+                format!(
+                    "legacy session lock {} has no parent directory",
+                    path.display()
+                )
+            })?;
+            fs::create_dir_all(directory)
                 .map_err(|error| format!("could not create legacy session directory: {error}"))?;
             let lock = SessionLock::acquire(path.clone(), true)
                 .map_err(|error| format!("legacy {error}"))?;
@@ -1966,6 +1973,14 @@ pub(crate) fn validate_id(value: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::io::{BufRead, BufReader};
 

@@ -177,11 +177,8 @@ fn trim_linked_and_push(
     separator: String,
 ) -> String {
     let mut trailing = Vec::new();
-    while spans
-        .last()
-        .is_some_and(|span| span.span.content.trim().is_empty())
-    {
-        trailing.push(spans.pop().expect("the final span exists").span.content);
+    while let Some(span) = spans.pop_if(|span| span.span.content.trim().is_empty()) {
+        trailing.push(span.span.content);
     }
     trailing.reverse();
     lines.push((std::mem::take(spans), separator));
@@ -283,6 +280,14 @@ fn hanging_indent(line: &Line<'static>, leading_gutter: Option<bool>) -> usize {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use ratatui::text::{Line, Span};
 

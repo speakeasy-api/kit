@@ -2474,6 +2474,14 @@ pub fn open_beneath<P: AsRef<Path>, Q: AsRef<Path>>(root: P, relative: Q) -> io:
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests;
 
 #[derive(Default, Debug)]

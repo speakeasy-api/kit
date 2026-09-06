@@ -557,11 +557,10 @@ impl CompactionStrategy for SummarizeForContinuation {
         })?;
         let manual = (request.reason == CompactionReason::Manual)
             .then(|| {
-                request
-                    .transcript
-                    .last()
-                    .and_then(manual_message)
-                    .map(|(part_index, suffix)| (part_index, suffix.to_string()))
+                request.transcript.last().and_then(|marker| {
+                    manual_message(marker)
+                        .map(|(part_index, suffix)| (marker, part_index, suffix.to_string()))
+                })
             })
             .flatten();
         let marker_index = manual.as_ref().map(|_| request.transcript.len() - 1);
@@ -599,9 +598,14 @@ impl CompactionStrategy for SummarizeForContinuation {
                 replacement.push(previous);
             }
             replacement.extend(conversation);
-            if let Some((part_index, next)) = manual.as_ref().filter(|(_, next)| !next.is_empty()) {
-                let marker = request.transcript.last().cloned().expect("manual marker");
-                replacement.push(user_message_from_marker(marker, *part_index, next));
+            if let Some((marker, part_index, next)) =
+                manual.as_ref().filter(|(_, _, next)| !next.is_empty())
+            {
+                replacement.push(user_message_from_marker(
+                    (*marker).clone(),
+                    *part_index,
+                    next,
+                )?);
             }
             return Ok(CompactionResult::new(
                 replacement,
@@ -637,20 +641,25 @@ impl CompactionStrategy for SummarizeForContinuation {
         let mut replacement = bootstrap;
         replacement.extend(summary.items);
         replacement.extend_from_slice(recent);
-        if let Some((part_index, next)) = manual.filter(|(_, next)| !next.is_empty()) {
-            let marker = request.transcript.last().cloned().expect("manual marker");
-            replacement.push(user_message_from_marker(marker, part_index, &next));
+        if let Some((marker, part_index, next)) = manual.filter(|(_, _, next)| !next.is_empty()) {
+            replacement.push(user_message_from_marker(marker.clone(), part_index, &next)?);
         }
         Ok(CompactionResult::new(replacement, head.len()))
     }
 }
 
-fn user_message_from_marker(mut marker: Item, part_index: usize, message: &str) -> Item {
+fn user_message_from_marker(
+    mut marker: Item,
+    part_index: usize,
+    message: &str,
+) -> Result<Item, CompactionError> {
     let Some(Part::Text(text)) = marker.parts.get_mut(part_index) else {
-        unreachable!("manual command part must remain text");
+        return Err(CompactionError::Failed(
+            "manual command part is not text".into(),
+        ));
     };
     text.text = message.to_string();
-    marker
+    Ok(marker)
 }
 
 pub struct AutomaticCompactor {
@@ -799,11 +808,28 @@ fn compaction_reason(transcript: &[Item]) -> Option<CompactionReason> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use agentkit_core::{TokenUsage, ToolCallPart, ToolResultPart, Usage};
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn invalid_manual_marker_is_rejected() {
+        let marker = Item::text(ItemKind::User, "/compact next");
+        assert!(user_message_from_marker(marker.clone(), 1, "next").is_err());
+        let mut empty = marker;
+        empty.parts.clear();
+        assert!(user_message_from_marker(empty, 0, "next").is_err());
+    }
 
     fn measured(used: u64, window: Option<u64>) -> Item {
         let mut metadata = MetadataMap::new();

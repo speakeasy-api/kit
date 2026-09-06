@@ -177,7 +177,7 @@ async fn manager(
     super::credentials::configure(
         credential_storage,
         &mut manager,
-        &credential_identity(resource_url, config),
+        &credential_identity(resource_url, config)?,
     );
     Ok(manager)
 }
@@ -190,7 +190,7 @@ async fn migrate_credentials(
     super::credentials::migrate_legacy(
         credential_storage,
         &legacy_credential_identity(resource_url, config),
-        &credential_identity(resource_url, config),
+        &credential_identity(resource_url, config)?,
     )
     .await
     .map_err(|error| format!("could not migrate OAuth credentials: {error}"))
@@ -204,13 +204,14 @@ fn legacy_credential_identity(resource_url: &str, config: &Config) -> String {
     )
 }
 
-fn credential_identity(resource_url: &str, config: &Config) -> String {
-    format!(
+fn credential_identity(resource_url: &str, config: &Config) -> Result<String, String> {
+    Ok(format!(
         "{resource_url}\0{}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
         config.client_metadata_url.as_deref().unwrap_or_default(),
-        serde_json::to_string(&config.scopes).expect("OAuth scopes encode as JSON")
-    )
+        serde_json::to_string(&config.scopes)
+            .map_err(|error| format!("could not encode OAuth scopes: {error}"))?
+    ))
 }
 
 pub async fn finish(
@@ -342,6 +343,14 @@ async fn respond(stream: &mut TcpStream, success: bool) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use rmcp::transport::auth::{
         AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
@@ -373,6 +382,22 @@ mod tests {
         assert_eq!(
             credential_identity("https://mcp.example/mcp", &Config::default()),
             credential_identity("https://mcp.example/mcp", &explicit)
+        );
+    }
+
+    #[test]
+    fn credential_identity_preserves_json_scope_encoding() {
+        let config: Config = serde_json::from_value(json!({
+            "type": "oauth", "scopes": ["read", "quoted\"scope", "line\nbreak"]
+        }))
+        .unwrap();
+        let expected = format!(
+            "https://mcp.example/mcp\0\0\0{}",
+            serde_json::to_string(&config.scopes).unwrap()
+        );
+        assert_eq!(
+            credential_identity("https://mcp.example/mcp", &config).unwrap(),
+            expected
         );
     }
 

@@ -134,6 +134,14 @@ fn publish_status(pending: bool, exhausted: bool, previous: &mut Option<(bool, b
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     #[test]
     fn allocation_failure_exit_is_nonzero_without_protocol_stdout() {

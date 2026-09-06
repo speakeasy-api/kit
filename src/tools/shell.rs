@@ -299,6 +299,14 @@ const fn default_timeout() -> u64 {
 }
 
 #[cfg(all(test, unix))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 

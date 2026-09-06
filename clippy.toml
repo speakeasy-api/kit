@@ -1,0 +1,33 @@
+# Intentional panic policy: compile-time unwrap/expect are also rejected. Use
+# compile_error! for deliberate compile-time validation, not runtime exemptions.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-consts = false
+allow-expect-in-consts = false
+
+# Also catch UFCS calls and function-item references that unwrap_used misses.
+disallowed-methods = [
+    "std::panic::panic_any",
+    "core::option::Option::unwrap",
+    "core::option::Option::expect",
+    "core::result::Result::unwrap",
+    "core::result::Result::expect",
+    "core::result::Result::unwrap_err",
+    "core::result::Result::expect_err",
+]
+
+# Catch assertions and local wrapper macros as well as explicit panic sites.
+disallowed-macros = [
+    "core::panic",
+    "std::panic",
+    "core::unreachable",
+    "core::todo",
+    "core::unimplemented",
+    "core::assert",
+    "core::assert_eq",
+    "core::assert_ne",
+    "core::debug_assert",
+    "core::debug_assert_eq",
+    "core::debug_assert_ne",
+]

@@ -23,6 +23,14 @@ const MAX_SNAPSHOT_BYTES: usize = 12 * 1024;
 const TARGET: &str = "kit::telemetry::error_spans";
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod task_manager_tests;
 
 /// The future instrumented with this span must include execution AND error logging.
@@ -267,6 +275,14 @@ impl Visit for Fields {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use tracing::Instrument as _;

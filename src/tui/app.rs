@@ -3659,6 +3659,14 @@ fn open_url(_url: &str) {}
 
 /// Fixtures and deterministic-clock adapters; not an alternate live event protocol.
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod test_support {
     use agent_client_protocol::schema::v2::RunningStateUpdate;
 
@@ -3717,6 +3725,14 @@ mod test_support {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         path::PathBuf,

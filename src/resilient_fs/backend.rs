@@ -833,6 +833,14 @@ fn acquire_lease(request: &LeaseRequest) -> io::Result<Box<dyn BackendLease>> {
 }
 
 #[cfg(all(test, unix))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
