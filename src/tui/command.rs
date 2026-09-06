@@ -15,6 +15,7 @@ enum Kind {
     Effort,
     Agents,
     Transcript,
+    Branch,
     Login,
 }
 
@@ -90,6 +91,11 @@ const LOCAL_COMMANDS: &[Spec] = &[
         kind: Kind::Transcript,
     },
     Spec {
+        token: "/branch",
+        description: "Edit a previous text prompt in a new session",
+        kind: Kind::Branch,
+    },
+    Spec {
         token: "/login",
         description: "Authenticate with the agent",
         kind: Kind::Login,
@@ -106,6 +112,7 @@ pub enum Parsed<'a> {
     Effort { value: Option<&'a str> },
     Agents,
     Transcript,
+    Branch,
     Login { method_id: Option<&'a str> },
     Prompt(&'a str),
 }
@@ -142,7 +149,8 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
         Kind::Effort => Parsed::Effort { value: prompt },
         Kind::Agents if prompt.is_none() => Parsed::Agents,
         Kind::Transcript if prompt.is_none() => Parsed::Transcript,
-        Kind::Agents | Kind::Transcript => Parsed::Prompt(input),
+        Kind::Branch if prompt.is_none() => Parsed::Branch,
+        Kind::Agents | Kind::Transcript | Kind::Branch => Parsed::Prompt(input),
         Kind::Login => Parsed::Login {
             method_id: prompt.map(str::trim),
         },
@@ -303,6 +311,15 @@ mod tests {
     }
 
     #[test]
+    fn branch_is_an_exact_local_command_with_completion() {
+        assert_eq!(parse("/branch"), Parsed::Branch);
+        assert_eq!(parse("/branch  "), Parsed::Branch);
+        assert_eq!(parse("/branch extra"), Parsed::Prompt("/branch extra"));
+        assert_eq!(known_token("/branch", &[]), Some(0..7));
+        assert_eq!(completions("/br", 3, &[])[0].name, "/branch");
+    }
+
+    #[test]
     fn transcript_is_an_exact_highlighted_local_command_without_arguments() {
         for login_available in [false, true] {
             for input in ["/transcript", "/transcript ", "/transcript\t\n"] {
@@ -405,6 +422,7 @@ mod tests {
                 "/effort",
                 "/agents",
                 "/transcript",
+                "/branch",
                 "/compact",
             ]
         );

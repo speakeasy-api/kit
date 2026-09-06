@@ -49,6 +49,7 @@ use tracing::Instrument as _;
 
 mod activity;
 pub(crate) mod model_switch;
+pub(crate) mod prompt_branches;
 mod skill_catalog;
 pub mod v2;
 
@@ -1474,7 +1475,7 @@ impl Server {
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
             binding,
-            driver: driver.driver,
+            driver: driver.driver.into_inner(),
             tasks: driver.tasks,
             background_jobs: background_jobs.clone(),
             structured_completion,
