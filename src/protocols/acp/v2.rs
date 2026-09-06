@@ -3915,6 +3915,8 @@ mod tests {
             .await
             .unwrap();
         let driver = input_settlement.wrap(driver);
+        // Mirror successful server admission before exercising route restoration.
+        events::activate_diagnostics(&session_id.to_string());
         let mcp = crate::tools::mcp::empty();
         let mcp_events = mcp.subscribe(child_id.clone());
         let busy = Arc::new(AtomicBool::new(!autonomous));
@@ -4430,7 +4432,17 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(routes, ["failed-child", "source", "failed-child", "source"]);
+            assert_eq!(
+                routes,
+                [
+                    "source",
+                    "failed-child",
+                    "failed-child",
+                    "source",
+                    "failed-child",
+                    "source"
+                ]
+            );
             assert_eq!(running, 2);
             return;
         }
@@ -4457,6 +4469,8 @@ mod tests {
                 self.0.flush().await
             }
         }
+        events::activate_diagnostics("source");
+        events::activate_diagnostics("failed-child");
         for origin in [ExecutionOrigin::Prompt, ExecutionOrigin::Autonomous] {
             let integration = AcpIntegration::default();
             let recording = RecordingSink::default();
@@ -9104,7 +9118,7 @@ mod tests {
     #[tokio::test]
     async fn model_switch_cancel_before_first_step_retires_queued_prompt_and_mcp_wake() {
         use std::io::{Read as _, Write as _};
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
         const CHILD: &str = "KIT_TEST_MODEL_SWITCH_CANCEL_CHILD";
         const ROUTE: &str = "compact-cancel-io-";
@@ -9123,10 +9137,22 @@ mod tests {
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let mut stderr = child.stderr.take().unwrap();
+            let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap());
             let mut stdout = child.stdout.take().unwrap();
             let mut stdin = child.stdin.take().unwrap();
             timeout(Duration::from_secs(15), async {
+                // Drain successful admission's complete activation marker first.
+                // Only the later restoration is after submit_input and therefore
+                // an authority for this test's pre-next cancellation barrier.
+                let mut admission = Vec::new();
+                loop {
+                    admission.clear();
+                    assert_ne!(stderr.read_until(b'\n', &mut admission).await.unwrap(), 0);
+                    let line = std::str::from_utf8(&admission).unwrap().trim_end();
+                    if matches!(events::parse(line), Some(events::RuntimeEvent::SessionStarted { session_id }) if session_id.starts_with(ROUTE)) {
+                        break;
+                    }
+                }
                 let needle = format!("\"session_id\":\"{ROUTE}");
                 let mut prefix = Vec::new();
                 let mut chunk = [0; 128];
@@ -9197,6 +9223,7 @@ mod tests {
         // The transport ID need not be the disk ID. Exceed the diagnostic pipe
         // capacity so its first bytes are observable while emit still blocks.
         let session_id = wire::SessionId::new(format!("{ROUTE}{}", "x".repeat(2 * 1024 * 1024)));
+        events::activate_diagnostics(&session_id.to_string());
         let loop_id = SessionId::new(durable_id.clone());
         let integration = Arc::new(AcpIntegration::default());
         let recording = RecordingSink::default();

@@ -2509,8 +2509,9 @@ impl App {
         if self.model_switch.is_some() {
             return;
         }
-        // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
-        self.last_key = None;
+        if self.session_dialog.is_some() {
+            self.last_key = None;
+        }
         if let Some(rename) = self
             .session_dialog
             .as_mut()
@@ -2546,6 +2547,10 @@ impl App {
             self.sync_navigation();
             return;
         }
+        // Navigation also routes pasted key controls through this method;
+        // keep their receipt timestamp for the next key in that same burst.
+        // Explicit composer pastes are outside the key-burst heuristic.
+        self.last_key = None;
         self.file_picker = None;
         self.queue_handoff = false;
         self.editor.insert_str(text);

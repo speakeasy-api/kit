@@ -879,7 +879,7 @@ mod tests {
             let mut transcript = prepared();
             transcript[0].metadata.insert(METADATA_KEY.into(), value);
             let opened = open_branch(root.path(), transcript);
-            opened.observer.commit_creation();
+            opened.observer.commit_creation().unwrap();
             drop(opened);
             let before = disk_snapshot(root.path());
             assert!(matches!(
@@ -918,7 +918,7 @@ mod tests {
                 .unwrap()
                 .append(&transcript[1])
                 .unwrap();
-            opened.observer.commit_creation();
+            opened.observer.commit_creation().unwrap();
             drop(opened);
             let before = disk_snapshot(root.path());
             assert!(matches!(
@@ -942,7 +942,7 @@ mod tests {
             }
             let opened = open_branch(root.path(), transcript.clone());
             opened.observer.replace(&transcript).unwrap();
-            opened.observer.commit_creation();
+            opened.observer.commit_creation().unwrap();
             drop(opened);
             let before = disk_snapshot(root.path());
             assert!(matches!(
@@ -957,7 +957,7 @@ mod tests {
     fn catalog_lineage_preserves_legacy_roots_without_rewriting() {
         let root = tempfile::tempdir().unwrap();
         let opened = open_branch(root.path(), vec![Item::text(ItemKind::System, "legacy")]);
-        opened.observer.commit_creation();
+        opened.observer.commit_creation().unwrap();
         drop(opened);
         let before = disk_snapshot(root.path());
         assert_eq!(catalog_row(root.path()).lineage, CatalogLineage::Root);
