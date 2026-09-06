@@ -260,7 +260,9 @@ pub(crate) fn remove_stale_lock_in(
         &workspace_storage_directory(directory, &workspace_root),
         session_id,
     );
-    let path = if fs::best_effort_global()
+    // Locks are native ownership, not optional history. A dropped or poisoned
+    // transcript namespace must not prevent OS-backed stale-owner cleanup.
+    let path = if fs::global()
         .try_exists(&scoped)
         .map_err(|error| format!("could not inspect {}: {error}", scoped.display()))?
     {
@@ -272,7 +274,7 @@ pub(crate) fn remove_stale_lock_in(
     } else {
         return Ok(());
     };
-    if !fs::best_effort_global()
+    if !fs::global()
         .try_exists(&path)
         .map_err(|error| format!("could not inspect session lock: {error}"))?
     {
@@ -905,27 +907,36 @@ enum StoredTranscript {
 }
 
 fn read_records(path: &Path, session_id: &str) -> Result<(Vec<Item>, u64), String> {
-    read_records_following(path, session_id, 0)
+    read_records_following(fs::best_effort_global(), path, session_id, 0)
 }
 
 fn read_records_following(
+    filesystem: &Fs,
     path: &Path,
     session_id: &str,
     redirects: usize,
 ) -> Result<(Vec<Item>, u64), String> {
-    match read_records_direct(path, session_id)? {
+    match read_records_direct_in(filesystem, path, session_id)? {
         StoredTranscript::History(history) => Ok((history.items, history.generation)),
         StoredTranscript::Redirect(target) => {
             if redirects >= 4 || target.file_name() != path.file_name() || !target.is_absolute() {
                 return Err(format!("invalid session redirect in {}", path.display()));
             }
-            read_records_following(&target, session_id, redirects + 1)
+            read_records_following(filesystem, &target, session_id, redirects + 1)
         }
     }
 }
 
 fn read_records_direct(path: &Path, session_id: &str) -> Result<StoredTranscript, String> {
-    let file = File::open_in(fs::best_effort_global(), path)
+    read_records_direct_in(fs::best_effort_global(), path, session_id)
+}
+
+fn read_records_direct_in(
+    filesystem: &Fs,
+    path: &Path,
+    session_id: &str,
+) -> Result<StoredTranscript, String> {
+    let file = File::open_in(filesystem, path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let lines = BufReader::new(file)
         .lines()
@@ -2112,22 +2123,28 @@ fn legacy_transcript_for_workspace(
     root: &Path,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
+    // This discovery is only used for native lock cleanup. Read persisted
+    // workspace bindings and redirect targets through the same strict service.
+    let filesystem = fs::global();
     let global = transcript_path(directory, session_id);
-    if fs::best_effort_global()
+    if filesystem
         .try_exists(&global)
         .map_err(|error| format!("could not inspect {}: {error}", global.display()))?
-        && transcript_workspace(&global, session_id)?
+    {
+        let bytes = transcript_snapshot(filesystem, &global, false)?;
+        if transcript_workspace_bytes(&global, session_id, &bytes)?
             .as_deref()
             .is_none_or(|stored| stored == root)
-    {
-        return Ok(Some(global));
+        {
+            return Ok(Some(global));
+        }
     }
     let local = legacy_transcript(root, session_id);
-    if fs::best_effort_global()
+    if filesystem
         .try_exists(&local)
         .map_err(|error| format!("could not inspect {}: {error}", local.display()))?
     {
-        read_records(&local, session_id)?;
+        read_records_following(filesystem, &local, session_id, 0)?;
         Ok(Some(local))
     } else {
         Ok(None)
@@ -2745,6 +2762,141 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn stale_scoped_lock_cleanup_survives_optional_storage_loss() {
+        if isolated_process("stale_scoped_lock_cleanup_survives_optional_storage_loss") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "persisted history")],
+        )
+        .unwrap();
+        let expected = opened.transcript.clone();
+        drop(opened);
+        let path = session_lock_path(root.path(), "abc");
+        std::fs::write(&path, "abandoned").unwrap();
+        fs::best_effort_global().abandon_best_effort().unwrap();
+
+        // Bypass the service registry: rejection must respect an actual native
+        // owner, not merely an in-process SessionObserver reference. Native
+        // entry points require the normalized paths normally supplied by Fs.
+        let native_path = fs::canonicalize(&path).unwrap();
+        let owner = fs::Backend::acquire_lease(
+            &fs::DiskBackend,
+            &fs::LeaseRequest {
+                path: native_path.clone(),
+                scope: native_path.parent().unwrap().to_path_buf(),
+                mode: LeaseMode::ExistingOrNew,
+                remove_on_drop: false,
+            },
+        )
+        .unwrap();
+        let locked = std::fs::read(&path).unwrap();
+        assert!(remove_stale_lock(root.path(), "abc").is_err());
+        owner.check().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), locked);
+        drop(owner);
+
+        remove_stale_lock(root.path(), "abc").unwrap();
+        assert!(!path.exists());
+        let resumed = open(root.path(), "abc", true, false, vec![]).unwrap();
+        assert_eq!(resumed.transcript, expected);
+        assert_eq!(
+            fs::best_effort_global().best_effort_status(),
+            Some(fs::BestEffortStatus::Dropped)
+        );
+    }
+
+    #[test]
+    fn stale_legacy_lock_cleanup_survives_optional_storage_loss() {
+        if isolated_process("stale_legacy_lock_cleanup_survives_optional_storage_loss") {
+            return;
+        }
+        fs::best_effort_global().abandon_best_effort().unwrap();
+        for layout in ["global", "local", "redirect", "foreign-global"] {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(project_root(root.path())).unwrap();
+            let workspace = canonical_workspace(&project_root(root.path()));
+            let global = super::transcript_path(&session_directory(root.path()), "abc");
+            let path = if layout == "global" {
+                global.clone()
+            } else {
+                legacy_directory(root.path()).join("abc.jsonl")
+            };
+            write_history(
+                &path,
+                SCHEMA_VERSION,
+                "abc",
+                &["history"],
+                Some(workspace.clone()),
+            );
+            if layout == "redirect" {
+                let target = transcript_path(root.path(), "abc");
+                write_history(
+                    &target,
+                    SCHEMA_VERSION,
+                    "abc",
+                    &["history"],
+                    Some(workspace.clone()),
+                );
+                let redirect = Record {
+                    schema_version: REDIRECT_SCHEMA_VERSION,
+                    session_id: "abc".into(),
+                    generation: 2,
+                    workspace_root: Some(workspace.clone()),
+                    item: None,
+                    replacement: None,
+                    redirect: Some(target),
+                };
+                let mut contents = fs::read_to_string(&path).unwrap();
+                contents.push_str(&serde_json::to_string(&redirect).unwrap());
+                contents.push('\n');
+                fs::write(&path, contents).unwrap();
+            }
+            if layout == "foreign-global" {
+                write_history(
+                    &global,
+                    SCHEMA_VERSION,
+                    "abc",
+                    &["other workspace"],
+                    Some(root.path().join("other")),
+                );
+                std::fs::write(global.with_extension("lock"), "unrelated lock").unwrap();
+            }
+            let lock = path.with_extension("lock");
+            std::fs::write(&lock, "abandoned").unwrap();
+            let native_path = fs::canonicalize(&lock).unwrap();
+            let owner = fs::Backend::acquire_lease(
+                &fs::DiskBackend,
+                &fs::LeaseRequest {
+                    path: native_path.clone(),
+                    scope: native_path.parent().unwrap().to_path_buf(),
+                    mode: LeaseMode::ExistingOrNew,
+                    remove_on_drop: false,
+                },
+            )
+            .unwrap();
+            let locked = std::fs::read(&lock).unwrap();
+            assert!(remove_stale_lock(root.path(), "abc").is_err(), "{layout}");
+            owner.check().unwrap();
+            assert_eq!(std::fs::read(&lock).unwrap(), locked, "{layout}");
+            drop(owner);
+            remove_stale_lock(root.path(), "abc").unwrap();
+            assert!(!lock.exists(), "{layout}");
+            if layout == "foreign-global" {
+                assert_eq!(
+                    std::fs::read(global.with_extension("lock")).unwrap(),
+                    b"unrelated lock"
+                );
+            }
+        }
     }
 
     #[test]
