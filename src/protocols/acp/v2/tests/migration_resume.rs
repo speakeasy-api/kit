@@ -72,7 +72,8 @@ async fn resume_recovers_empty_or_torn_first_migration_destination() {
                     })
                     .block_task()
                     .await?;
-                assert_eq!(listed.boundaries.len(), 1);
+                // M3 also offers the recovered safe assistant continuation.
+                assert_eq!(listed.boundaries.len(), 2);
                 cx.send_request(wire::CloseSessionRequest::new(resumed_id))
                     .block_task()
                     .await?;

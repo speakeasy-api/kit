@@ -5343,6 +5343,30 @@ mod signal_tests {
     /// leaves the shell in raw mode with mouse reporting on.
     #[tokio::test]
     async fn a_termination_signal_ends_the_session() {
+        // Stop subscribers share process-global signals. Send TERM only in a
+        // child running this exact test, never to parallel authentication tests
+        // (or any other Stop recipient) in the parent test runner.
+        const CHILD: &str = "KIT_TUI_TERMINATION_SIGNAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tui::signal_tests::a_termination_signal_ends_the_session",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated signal test runs");
+            assert!(
+                output.status.success(),
+                "signal test failed: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         let mut stop = Stop::new().expect("signal handlers install");
         let mut ticker = tokio::time::interval(Duration::from_millis(20));
         std::process::Command::new("kill")
