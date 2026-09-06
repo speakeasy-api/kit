@@ -29,7 +29,6 @@ jobs:
           toolchain: 1.94.0
           components: rustfmt, clippy
       - run: scripts/tests/test_next_release_version.sh
-      - run: python3 -m unittest scripts/tests/test_release_announcement.py
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --locked

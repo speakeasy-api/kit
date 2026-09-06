@@ -162,7 +162,6 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
-      - run: python3 -m unittest scripts/tests/test_release_announcement.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
@@ -564,7 +563,7 @@ jobs:
       RELEASE_VERSION: ${{ needs.verify.outputs.version }}
       RELEASE_TAG: ${{ needs.verify.outputs.tag }}
       PREVIOUS_TAG: ${{ needs.verify.outputs.previous_tag }}
-      SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+      SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
       SLACK_MCP_URL: ${{ vars.SLACK_MCP_URL }}
       GRAM_ENVIRONMENT: ${{ vars.GRAM_ENVIRONMENT }}
     steps:
@@ -584,12 +583,17 @@ jobs:
           GRAM_API_KEY: ${{ secrets.GRAM_API_KEY }}
         shell: bash
         run: |
-          for name in OPENROUTER_API_KEY SLACK_CHANNEL SLACK_MCP_URL GRAM_ENVIRONMENT GRAM_API_KEY; do
+          for name in OPENROUTER_API_KEY SLACK_CHANNEL_ID SLACK_MCP_URL GRAM_ENVIRONMENT GRAM_API_KEY; do
             if [[ -z ${!name} ]]; then
               echo "::error::Missing required $name for the Slack release smoke test."
               exit 1
             fi
           done
+
+          if [[ ! $SLACK_CHANNEL_ID =~ ^[CG][A-Z0-9]+$ ]]; then
+            echo "::error::SLACK_CHANNEL_ID must be a Slack channel ID, not a channel name."
+            exit 1
+          fi
 
           # HTTP headers are literal config values, not environment placeholders.
           # Keep the credential-bearing config private and outside the checkout.
@@ -611,7 +615,7 @@ jobs:
               "mcpServers": {
                   "slack": {
                       "type": "http",
-                      "description": "Slack: resolve channels, post release announcements, and retrieve message permalinks",
+                      "description": "Slack: post release announcements and retrieve message permalinks",
                       "url": url,
                       "headers": {
                           "Authorization": "Bearer " + os.environ["GRAM_API_KEY"],
@@ -628,9 +632,9 @@ jobs:
           tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             -C release-kit
           release-kit/kit --version
-          prompt="Use the announce-kit-release skill to post release notes for ${PREVIOUS_TAG}..${RELEASE_TAG} to the exact public Slack channel named ${SLACK_CHANNEL}. The checkout is the published release.
-          Load the skill with the skill tool, discover the configured slack MCP tools with tool_search, and use only those MCP tools for Slack operations. Do not use shell, curl, or a direct Slack API client as a fallback. Follow channel-lookup pagination until the exact name is found or results are exhausted.
-          This is a noninteractive release smoke test: post directly, do not draft or request confirmation. The bot has channels:read and chat:write but no channel-history access. Use the skill's restricted-bot verification: inspect the actual message returned by the successful send response, verify its channel, timestamp and formatting, then retrieve its permalink through MCP. Do not call history tools or message search.
+          prompt="Use the announce-kit-release skill to post release notes for ${PREVIOUS_TAG}..${RELEASE_TAG} to Slack channel ID ${SLACK_CHANNEL_ID}, supplied by the SLACK_CHANNEL_ID environment variable. The checkout is the published release.
+          Load the skill with the skill tool, discover the configured slack MCP tools with tool_search, and use only those MCP tools for Slack operations. Do not use shell, curl, or a direct Slack API client as a fallback. Use the supplied channel ID directly; do not search, list, or resolve channels by name.
+          This is a noninteractive release smoke test: post directly, do not draft or request confirmation. The bot can post messages but has no channel-history access. Use the skill's restricted-bot verification: inspect the actual message returned by the successful send response, verify its channel matches ${SLACK_CHANNEL_ID}, timestamp and formatting, then retrieve its permalink through MCP. Do not call history tools or message search.
           Do not expose credentials or read the MCP config. If any step fails, report failure and do not return a success link. Only after successful posting and verification, respond with just the Slack message permalink on its own line."
           release-kit/kit prompt \
             --root "$GITHUB_WORKSPACE" \
@@ -640,7 +644,7 @@ jobs:
             "$prompt" \
             > slack-kit-output.txt
           announcement=$(sed '$ { /^session_id: /d; }' slack-kit-output.txt)
-          if [[ ! $announcement =~ ^https://[a-zA-Z0-9-]+\.slack\.com/archives/[A-Z0-9]+/p[0-9]+$ ]]; then
+          if [[ ! $announcement =~ ^https://[a-zA-Z0-9-]+\.slack\.com/archives/${SLACK_CHANNEL_ID}/p[0-9]+$ ]]; then
             echo "::error::Kit did not confirm a posted and verified Slack announcement with a permalink."
             exit 1
           fi

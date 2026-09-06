@@ -38,8 +38,10 @@ step. Kit uses the `release-notes` skill with the `openai/gpt-5.6-terra` OpenRou
 After the GitHub release and container images are published, `announce-release`
 runs the newly released Linux CLI with the `announce-kit-release` skill. It uses
 the same `RELEASE_NOTES_MODEL` setting and `OPENROUTER_API_KEY` secret as the
-release-note generator. Kit resolves the exact channel name, posts through Slack
-MCP tools, checks the posted message returned by Slack, and retrieves its permalink.
+release-note generator. Kit posts directly to the configured Slack channel ID
+through MCP tools, checks the posted message returned by Slack, and retrieves its
+permalink. It does not search for the channel, so renaming it does not break the
+announcement destination.
 This exercises skill activation, MCP discovery and tool calling, and static HTTP
 header authentication. The bot does not need channel-history access: the skill's
 restricted-bot path verifies the actual message, channel, timestamp, and formatting
@@ -52,7 +54,7 @@ Configure these repository Actions values before releasing:
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Variable | `SLACK_CHANNEL` | Exact channel name, not a channel ID. |
+| Variable | `SLACK_CHANNEL_ID` | Stable Slack channel ID, not its name. Resolve it once during setup; releases use the ID directly. |
 | Variable | `SLACK_MCP_URL` | Trusted HTTPS Gram MCP endpoint exposing the built-in Slack tools and accepting consumer API keys. |
 | Variable | `GRAM_ENVIRONMENT` | Slug of the environment in the MCP's project containing the Slack bot token. |
 | Secret | `GRAM_API_KEY` | Gram API key with `consumer` scope authorized for the MCP's project. |
@@ -65,10 +67,10 @@ Kit sends the Gram key as `Authorization: Bearer <key>` and selects the environm
 with `Gram-Environment`; Gram uses the Slack token for the upstream API calls.
 An issuer-gated endpoint that accepts only OAuth user sessions is not sufficient.
 
-The MCP must expose public-channel lookup, posting with the actual posted message
-in its response, and permalink retrieval. Invite the bot to the target public
-channel and grant `channels:read` and `chat:write`. The announcement does not use
-message search or channel-history tools. Use only a trusted MCP endpoint: it
+The MCP must expose posting with the actual posted message in its response and
+permalink retrieval. Invite the bot to the target channel and grant `chat:write`.
+The announcement does not use channel lookup, message search, or channel-history
+tools. The final permalink must refer to the configured channel ID. Use only a trusted MCP endpoint: it
 receives the Gram API key.
 
 The workflow writes a private temporary MCP JSON file with an explicit
