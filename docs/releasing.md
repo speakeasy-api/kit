@@ -33,6 +33,54 @@ writes the GitHub release notes before the workflow attaches the archives and
 checksums. Configure the repository Actions secret `OPENROUTER_API_KEY` for this
 step. Kit uses the `release-notes` skill with the `openai/gpt-5.6-terra` OpenRouter model.
 
+## Slack announcement smoke test
+
+After the GitHub release and container images are published, `announce-release`
+runs the newly released Linux CLI with the `announce-kit-release` skill. It uses
+the same `RELEASE_NOTES_MODEL` setting and `OPENROUTER_API_KEY` secret as the
+release-note generator. Kit posts directly to the configured Slack channel ID
+through MCP tools, checks the posted message returned by Slack, and retrieves its
+permalink. It does not search for the channel, so renaming it does not break the
+announcement destination.
+This exercises skill activation, MCP discovery and tool calling, and static HTTP
+header authentication. The bot does not need channel-history access: the skill's
+restricted-bot path verifies the actual message, channel, timestamp, and formatting
+in the send response instead of fetching channel history. Verification is performed
+by the agent, not an independent Slack API assertion. The job fails if configuration
+is missing, Kit fails, or its final response is not a single Slack message permalink.
+The permalink is written to the job summary.
+
+Configure these repository Actions values before releasing:
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Variable | `SLACK_CHANNEL_ID` | Stable Slack channel ID, not its name. Resolve it once during setup; releases use the ID directly. |
+| Variable | `SLACK_MCP_URL` | Trusted HTTPS Gram MCP endpoint exposing the built-in Slack tools and accepting consumer API keys. |
+| Variable | `GRAM_ENVIRONMENT` | Slug of the environment in the MCP's project containing the Slack bot token. |
+| Secret | `GRAM_API_KEY` | Gram API key with `consumer` scope authorized for the MCP's project. |
+
+Store the raw Slack bot token as the secret `SLACK_BOT_TOKEN` in the selected Gram
+environment, not in the workflow's MCP authentication header. If the MCP has
+variable-provisioning controls, allow this variable from the request-selected
+configuration (User), rather than filtering it to an attached System environment.
+Kit sends the Gram key as `Authorization: Bearer <key>` and selects the environment
+with `Gram-Environment`; Gram uses the Slack token for the upstream API calls.
+An issuer-gated endpoint that accepts only OAuth user sessions is not sufficient.
+
+The MCP must expose posting with the actual posted message in its response and
+permalink retrieval. Invite the bot to the target channel and grant `chat:write`.
+The announcement does not use channel lookup, message search, or channel-history
+tools. The final permalink must refer to the configured channel ID. Use only a trusted MCP endpoint: it
+receives the Gram API key.
+
+The workflow writes a private temporary MCP JSON file with an explicit
+`headers.Authorization` and `headers.Gram-Environment`, passes it via `--mcp-config`, and removes it on
+exit. It does not upload the config or Kit session as an artifact.
+
+An announcement failure marks the workflow failed but does not roll back the
+already published release. Before rerunning the announcement job, check Slack:
+if posting succeeded but verification failed, a rerun can produce a duplicate.
+
 ## macOS signing and notarization
 
 The release workflow signs the standalone Mach-O executable with the code-signing
