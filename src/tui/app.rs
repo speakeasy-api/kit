@@ -2881,6 +2881,7 @@ impl App {
 
         if dialog.searching {
             match key.code {
+                KeyCode::F(4) => self.dismiss_sessions(),
                 KeyCode::Esc | KeyCode::Enter => dialog.searching = false,
                 KeyCode::Backspace => {
                     if let Some((index, _)) = dialog.query.grapheme_indices(true).next_back() {
@@ -7878,6 +7879,128 @@ mod tests {
             assert_eq!(app.editor.text(), draft);
             assert_eq!(app.attachments, attachments);
         }
+    }
+
+    #[test]
+    fn explorer_f4_closes_typed_pasted_and_loading_search_preserving_drafts() {
+        for (pasted, query_before_load) in [(false, false), (true, false), (false, true)] {
+            for pending_edit in [false, true] {
+                let mut app = app();
+                app.start_session("source".into());
+                app.paste("parked draft");
+                app.attach(
+                    PathBuf::from("/tmp/image.png"),
+                    "image/png",
+                    AttachmentKind::Image,
+                    12,
+                );
+                app.editor.move_left();
+                let parked_text = app.editor.text().to_owned();
+                let parked_cursor = app.editor.cursor();
+                let parked_attachments = app.attachments.clone();
+                let received_at = Instant::now();
+                if pending_edit {
+                    app.can_steer = true;
+                    app.can_replace_steer = true;
+                    app.apply(Update::SteerAccepted {
+                        editable: true,
+                        id: "a".into(),
+                        text: "pending a".into(),
+                    });
+                    app.handle_key_at(press(KeyCode::F(2)), received_at);
+                    app.handle_key_at(press(KeyCode::Enter), received_at + super::PASTE_GAP * 2);
+                    assert!(app.editing_steer());
+                    app.paste(" revised");
+                    app.editor.move_left();
+                }
+                let draft = app.editor.text().to_owned();
+                let cursor = app.editor.cursor();
+                let attachments = app.attachments.clone();
+                let Action::ListSessions { epoch } =
+                    app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 4)
+                else {
+                    panic!("catalog requested")
+                };
+                if !query_before_load {
+                    app.apply(Update::SessionCatalog {
+                        epoch,
+                        result: Ok(explorer_entries()),
+                    });
+                }
+                if pasted {
+                    app.paste("source");
+                } else {
+                    for (index, character) in "source".chars().enumerate() {
+                        app.handle_key_at(
+                            press(KeyCode::Char(character)),
+                            received_at + super::PASTE_GAP * (6 + index as u32 * 2),
+                        );
+                    }
+                }
+                if query_before_load {
+                    app.apply(Update::SessionCatalog {
+                        epoch,
+                        result: Ok(explorer_entries()),
+                    });
+                }
+                let dialog = app.session_dialog.as_ref().unwrap();
+                assert!(dialog.searching);
+                assert_eq!(dialog.query, "source");
+                assert_eq!(app.session_matches.len(), 1);
+                assert!(!app.session_catalog_pending);
+                assert!(matches!(
+                    app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 18),
+                    Action::None
+                ));
+                assert!(app.session_dialog.is_none());
+                app.apply(Update::SessionCatalog {
+                    epoch,
+                    result: Ok(explorer_entries()),
+                });
+                assert!(app.session_dialog.is_none());
+                assert!(!app.session_catalog_pending);
+                assert_eq!(app.session_id.as_deref(), Some("source"));
+                assert_eq!(app.editor.text(), draft);
+                assert_eq!(app.editor.cursor(), cursor);
+                assert_eq!(app.attachments, attachments);
+                assert_eq!(app.editing_steer(), pending_edit);
+                if pending_edit {
+                    app.handle_key_at(press(KeyCode::Esc), received_at + super::PASTE_GAP * 20);
+                    assert!(!app.editing_steer());
+                }
+                assert_eq!(app.editor.text(), parked_text);
+                assert_eq!(app.editor.cursor(), parked_cursor);
+                assert_eq!(app.attachments, parked_attachments);
+            }
+        }
+    }
+
+    #[test]
+    fn loading_explorer_f4_dismisses_search_and_rejects_late_catalog() {
+        let mut app = app();
+        let received_at = Instant::now();
+        let Action::ListSessions { epoch } = app.handle_key_at(press(KeyCode::F(4)), received_at)
+        else {
+            panic!("catalog requested")
+        };
+        app.handle_key_at(
+            press(KeyCode::Char('s')),
+            received_at + super::PASTE_GAP * 2,
+        );
+        assert!(app.session_catalog_pending);
+        assert!(app.session_dialog.as_ref().unwrap().searching);
+        assert!(matches!(
+            app.handle_key_at(press(KeyCode::F(4)), received_at + super::PASTE_GAP * 4),
+            Action::None
+        ));
+        assert!(app.session_dialog.is_none());
+        assert!(!app.session_catalog_pending);
+        app.apply(Update::SessionCatalog {
+            epoch,
+            result: Ok(explorer_entries()),
+        });
+        assert!(app.session_dialog.is_none());
+        assert!(!app.session_catalog_pending);
     }
 
     #[test]
