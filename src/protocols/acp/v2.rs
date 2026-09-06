@@ -20,8 +20,7 @@ use agentkit_core::{
     ToolOutput, Usage,
 };
 use agentkit_loop::{
-    AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
-    ObservedEvent,
+    AgentEvent, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession, ObservedEvent,
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use async_trait::async_trait;
@@ -31,7 +30,7 @@ use tracing::Instrument as _;
 
 use crate::{
     provider::{ProviderKind, SelectableAdapter, authentication_method_id},
-    runtime::{AcpDriverContext, BackgroundJobs, Runtime},
+    runtime::{AcpDriverContext, BackgroundJobs, InputSettlingDriver as LoopDriver, Runtime},
 };
 
 use super::activity::{ExecutionOrigin, SessionActivity};
@@ -245,16 +244,21 @@ impl Drop for BranchAdmission {
 #[async_trait]
 impl AcpSessionUpdateSink for ConnectionSink {
     fn update(&self, notification: wire::UpdateSessionNotification) -> Result<(), AcpRuntimeError> {
-        if let wire::SessionUpdate::UserMessage(message) = &notification.update {
+        let delivered = match &notification.update {
+            wire::SessionUpdate::UserMessage(message) => Some(message.message_id.clone()),
+            _ => None,
+        };
+        self.0
+            .send_notification(notification)
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        if let Some(id) = delivered {
             self.1
                 .lock()
                 .expect("injection work poisoned")
                 .pending
-                .remove(&message.message_id);
+                .remove(&id);
         }
-        self.0
-            .send_notification(notification)
-            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+        Ok(())
     }
 
     async fn update_acknowledged(
@@ -1636,7 +1640,7 @@ async fn run_initial_branch_turn<S: ModelSession + Send + 'static>(
     .await;
     handle.stop_injection_turn();
     busy.store(false, Ordering::Release);
-    if !driver.snapshot().pending_input.is_empty() {
+    if !driver.is_available() || !driver.snapshot().pending_input.is_empty() {
         result?;
         // retire_interrupted_turn preserves queued input. There is no loop API
         // to clear unstarted input, so retire this attachment instead. Dropping
@@ -1792,8 +1796,8 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     if let Err(error) = result {
                         eprintln!("ACP v2 prompt failed for {session_id}: {error}");
                     }
-                    if handle.cancellation_handle().is_cancelled_since(generation)
-                        && !driver.snapshot().pending_input.is_empty()
+                    if !driver.is_available() || (handle.cancellation_handle().is_cancelled_since(generation)
+                        && !driver.snapshot().pending_input.is_empty())
                     {
                         // The same pre-step cancellation race applies to a
                         // queued ordinary prompt, not just branch activation.
@@ -1838,9 +1842,9 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                     }.await;
                     if result.is_ok() { advance_checkout_revision(&mut checkout_revision); }
                     let _ = reply.send(result);
-                    if compaction_started
+                    if !driver.is_available() || (compaction_started
                         && handle.cancellation_handle().is_cancelled_since(cancellation_generation)
-                        && !driver.snapshot().pending_input.is_empty()
+                        && !driver.snapshot().pending_input.is_empty())
                     {
                         // Cancellation before the first step leaves the synthetic
                         // /compact input queued. As with an interrupted prompt,
@@ -1876,9 +1880,9 @@ async fn session_actor<S: ModelSession + Send + 'static, K: AcpSessionUpdateSink
                 if let Err(error) = result {
                     eprintln!("ACP v2 autonomous turn failed for {session_id}: {error}");
                 }
-                if !autonomous_pending
+                if !driver.is_available() || (!autonomous_pending
                     && handle.cancellation_handle().is_cancelled_since(generation)
-                    && !driver.snapshot().pending_input.is_empty()
+                    && !driver.snapshot().pending_input.is_empty())
                 {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
                     super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
@@ -2015,22 +2019,50 @@ async fn drive_prompt<S>(
 where
     S: ModelSession + Send + 'static,
 {
+    let mut delivered_pending = false;
     let result = drive_prompt_inner(
         session_id,
         driver,
         handle,
         cancellation_generation,
         structured,
+        &mut delivered_pending,
     )
     .await;
     if matches!(result, Ok(FinishReason::Cancelled)) {
-        // A cooperative interrupt is still a live logical turn. Retire it
-        // without another `next`, which could execute cancelled model work.
-        driver
-            .retire_interrupted_turn()
-            .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        if delivered_pending && !driver.snapshot().pending_input.is_empty() {
+            // A successful injection boundary can stop after acknowledging one
+            // steer while awaiting another response's activation. Those items
+            // are accepted input, not the unstarted original prompt. Commit
+            // them through the real transcript observer with execution fenced.
+            driver
+                .settle_delivered_input()
+                .await
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        } else {
+            // Unstarted original/synthetic input must not be drained here. The
+            // actor retires that attachment so no later wake executes it.
+            driver
+                .retire_interrupted_turn()
+                .await
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        }
     }
+    result
+}
+
+// Only an acknowledged boundary can classify pending input as delivered
+// steering. The actor cannot select MCP/config/original input while it waits.
+async fn injection_boundary<S: ModelSession + Send + 'static>(
+    driver: &mut LoopDriver<S>,
+    handle: &AcpSessionHandle,
+    terminal: bool,
+    delivered_pending: &mut bool,
+) -> Result<AcpInjectionBoundary, AcpRuntimeError> {
+    let steering_only = driver.snapshot().pending_input.is_empty() || *delivered_pending;
+    let result = handle.handle_injection_boundary(driver, terminal).await;
+    *delivered_pending =
+        steering_only && result.is_ok() && !driver.snapshot().pending_input.is_empty();
     result
 }
 
@@ -2040,6 +2072,7 @@ async fn drive_prompt_inner<S>(
     handle: &AcpSessionHandle,
     cancellation_generation: u64,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    delivered_pending: &mut bool,
 ) -> Result<FinishReason, AcpRuntimeError>
 where
     S: ModelSession + Send + 'static,
@@ -2067,6 +2100,9 @@ where
                 return loop_error_stop_reason(session_id, &error);
             }
         };
+        if driver.snapshot().pending_input.is_empty() {
+            *delivered_pending = false;
+        }
         if handle
             .cancellation_handle()
             .is_cancelled_since(cancellation_generation)
@@ -2093,7 +2129,7 @@ where
                 {
                     continue;
                 }
-                match handle.handle_injection_boundary(driver, true).await {
+                match injection_boundary(driver, handle, true, delivered_pending).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -2121,7 +2157,7 @@ where
                 {
                     continue;
                 }
-                match handle.handle_injection_boundary(driver, true).await {
+                match injection_boundary(driver, handle, true, delivered_pending).await {
                     Ok(AcpInjectionBoundary::Delivered | AcpInjectionBoundary::Continue) => {
                         continue;
                     }
@@ -2144,7 +2180,7 @@ where
                 }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-                match handle.handle_injection_boundary(driver, false).await {
+                match injection_boundary(driver, handle, false, delivered_pending).await {
                     Ok(AcpInjectionBoundary::Stopped) => {
                         return Ok(FinishReason::Cancelled);
                     }
@@ -3007,6 +3043,7 @@ pub(crate) fn component(
 #[cfg(test)]
 mod tests {
     mod migration_resume;
+    mod review_tests;
 
     use std::{
         collections::VecDeque,
@@ -3084,7 +3121,9 @@ mod tests {
             ))
             .unwrap();
         let turns = Arc::new(AtomicU64::new(0));
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -3096,6 +3135,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new(source_id.clone())).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         // Re-listing and reading an identical snapshot leave the token valid.
         checkouts
             .list(
@@ -3164,7 +3204,9 @@ mod tests {
         let prompt = Item::text(ItemKind::User, "already committed edited prompt");
         // Match runtime's fresh-branch bootstrap: disk/canonical replay already
         // has the prompt, while the loop receives it once through pending input.
+        let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -3183,6 +3225,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new("initial-branch")).without_cache())
             .await
             .unwrap();
+        let driver = input_settlement.wrap(driver);
         assert_eq!(driver.snapshot().pending_input.len(), 1);
         let busy = Arc::new(AtomicBool::new(true));
         let actor_busy = busy.clone();
@@ -3322,7 +3365,9 @@ mod tests {
             let turns = Arc::new(AtomicU64::new(0));
             let manager = AsyncTaskManager::new();
             let tasks = manager.handle();
+            let input_settlement = crate::runtime::InputSettlement::default();
             let driver = Agent::builder()
+                .mutator(input_settlement.clone())
                 .model(TestAdapter {
                     outcome,
                     turns: turns.clone(),
@@ -3342,6 +3387,7 @@ mod tests {
                 .start(SessionConfig::new(SessionId::new(child_id.clone())).without_cache())
                 .await
                 .unwrap();
+            let driver = input_settlement.wrap(driver);
             let busy = Arc::new(AtomicBool::new(true));
             let (commands, receiver) = mpsc::channel(8);
             let mcp_events = runtime.subscribe_mcp(child_id.clone());
@@ -3540,7 +3586,9 @@ mod tests {
         let turns = Arc::new(AtomicU64::new(0));
         let manager = AsyncTaskManager::new();
         let tasks = manager.handle();
+        let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -3554,6 +3602,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new(child_id.clone())).without_cache())
             .await
             .unwrap();
+        let driver = input_settlement.wrap(driver);
         let mcp = crate::tools::mcp::empty();
         let mcp_events = mcp.subscribe(child_id.clone());
         let busy = Arc::new(AtomicBool::new(!autonomous));
@@ -3707,7 +3756,9 @@ mod tests {
             crate::session::branch::load_history(root.path(), &child_id).unwrap(),
             committed
         );
-        let mut reloaded = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let reloaded = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -3719,6 +3770,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new(child_id)).without_cache())
             .await
             .unwrap();
+        let mut reloaded = input_settlement.wrap(reloaded);
         assert!(matches!(
             reloaded.next().await.unwrap(),
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
@@ -3856,7 +3908,9 @@ mod tests {
                 .unwrap();
             let activity = native_activity(session_id.clone(), sink.clone());
             let turns = Arc::new(AtomicU64::new(0));
-            let mut driver = Agent::builder()
+            let input_settlement = crate::runtime::InputSettlement::default();
+            let driver = Agent::builder()
+                .mutator(input_settlement.clone())
                 .model(TestAdapter {
                     outcome: TestOutcome::Content,
                     turns: turns.clone(),
@@ -3874,6 +3928,7 @@ mod tests {
                 .start(SessionConfig::new(SessionId::new("source")).without_cache())
                 .await
                 .unwrap();
+            let mut driver = input_settlement.wrap(driver);
             handle.prepare_injection_turn();
             let generation = handle.cancellation_handle().generation();
             handle.start_injection_turn();
@@ -4099,7 +4154,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
+        let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -4112,6 +4169,7 @@ mod tests {
             .start(SessionConfig::new(loop_id).without_cache())
             .await
             .unwrap();
+        let driver = input_settlement.wrap(driver);
         let mcp = crate::tools::mcp::empty();
         let mcp_events = mcp.subscribe(session_id.to_string());
         let work = Arc::new(Mutex::new(InjectionWork::default()));
@@ -4985,7 +5043,9 @@ mod tests {
         interrupt: Option<AcpSessionHandle>,
     ) -> (LoopDriver<TestSession>, Arc<AtomicU64>) {
         let turns = Arc::new(AtomicU64::new(0));
+        let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome,
                 turns: Arc::clone(&turns),
@@ -4996,6 +5056,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new(session_id)).without_cache())
             .await
             .unwrap();
+        let driver = input_settlement.wrap(driver);
         (driver, turns)
     }
 
@@ -5016,7 +5077,9 @@ mod tests {
             .unwrap();
         let observer =
             ResponseReplacementObserver::new(integration, sink, session_id, activity.clone());
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(StreamingCancellationAdapter {
                 interrupt: handle.clone(),
             })
@@ -5027,6 +5090,7 @@ mod tests {
             .start(SessionConfig::new(loop_session_id).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::text(ItemKind::User, "cancel")])
             .unwrap();
@@ -5188,7 +5252,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::ProviderError,
                 turns: turns.clone(),
@@ -5205,6 +5271,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         let (reply, response) = oneshot::channel();
         let command = PromptCommand {
             request: wire::PromptRequest::new(
@@ -5313,7 +5380,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
                 user_items_seen: Arc::new(AtomicUsize::new(0)),
@@ -5327,6 +5396,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new("v2-structured-loop")).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::text(ItemKind::User, "start background")])
             .unwrap();
@@ -5577,7 +5647,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome,
                 turns: Arc::new(AtomicU64::new(0)),
@@ -5589,6 +5661,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new("injection-cancel")).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::text(ItemKind::User, "first")])
             .unwrap();
@@ -5810,7 +5883,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -5827,6 +5902,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         let busy = AtomicBool::new(false);
 
         drive_autonomous(
@@ -5869,7 +5945,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: Arc::clone(&turns),
@@ -5881,6 +5959,7 @@ mod tests {
             .start(SessionConfig::new(loop_session_id).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -5947,7 +6026,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::ProviderError,
                 turns: turns.clone(),
@@ -5964,6 +6045,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -6021,7 +6103,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::ProviderError,
                 turns: turns.clone(),
@@ -6038,6 +6122,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -6085,7 +6170,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: Arc::new(AtomicU64::new(0)),
@@ -6097,6 +6184,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new("failed-flush-loop")).without_cache())
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::notification("work")])
             .unwrap();
@@ -6147,7 +6235,9 @@ mod tests {
             session_id.clone(),
             activity.clone(),
         );
-        let mut driver = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::FinishError,
                 turns: turns.clone(),
@@ -6164,6 +6254,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let mut driver = input_settlement.wrap(driver);
         driver
             .submit_input(vec![Item::notification("background event")])
             .unwrap();
@@ -7594,7 +7685,9 @@ mod tests {
         .unwrap();
         let manager = AsyncTaskManager::new();
         let tasks = manager.handle();
+        let input_settlement = crate::runtime::InputSettlement::default();
         let driver = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -7616,6 +7709,7 @@ mod tests {
             .start(SessionConfig::new(loop_id).without_cache())
             .await
             .unwrap();
+        let driver = input_settlement.wrap(driver);
         let busy = Arc::new(AtomicBool::new(false));
         let (commands, receiver) = mpsc::channel(8);
         let mcp = crate::tools::mcp::empty();
@@ -7771,7 +7865,9 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         let transcript = crate::session::load(root.path(), &durable_id).unwrap();
         assert_eq!(transcript, original);
-        let mut reloaded = Agent::builder()
+        let input_settlement = crate::runtime::InputSettlement::default();
+        let reloaded = Agent::builder()
+            .mutator(input_settlement.clone())
             .model(TestAdapter {
                 outcome: TestOutcome::Content,
                 turns: turns.clone(),
@@ -7783,6 +7879,7 @@ mod tests {
             .start(SessionConfig::new(SessionId::new(durable_id)).without_cache())
             .await
             .unwrap();
+        let mut reloaded = input_settlement.wrap(reloaded);
         assert!(matches!(
             reloaded.next().await.unwrap(),
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
@@ -7825,7 +7922,9 @@ mod tests {
                 loop_id.clone(),
             )
             .unwrap();
-            let mut driver = Agent::builder()
+            let input_settlement = crate::runtime::InputSettlement::default();
+            let driver = Agent::builder()
+                .mutator(input_settlement.clone())
                 .model(TestAdapter {
                     outcome: TestOutcome::Content,
                     turns: Arc::new(AtomicU64::new(0)),
@@ -7842,6 +7941,7 @@ mod tests {
                 .start(SessionConfig::new(loop_id).without_cache())
                 .await
                 .unwrap();
+            let mut driver = input_settlement.wrap(driver);
             handle.prepare_injection_turn();
             handle.start_injection_turn();
             let generation = handle.cancellation_handle().generation();

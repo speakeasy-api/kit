@@ -44,6 +44,9 @@ use crate::{
     },
 };
 
+mod input_settlement;
+pub(crate) use input_settlement::{InputSettlement, InputSettlingDriver};
+
 #[cfg(test)]
 mod test_support {
     use super::*;
@@ -375,7 +378,7 @@ impl Drop for SessionClaim {
 }
 
 pub(crate) struct AcpDriver {
-    pub driver: LoopDriver<SelectableSession>,
+    pub driver: InputSettlingDriver<SelectableSession>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
@@ -1556,6 +1559,7 @@ impl Runtime {
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
         }
+        let input_settlement = InputSettlement::default();
         let driver = Agent::builder()
             .model(adapter.clone())
             .telemetry(self.agentkit_telemetry())
@@ -1566,6 +1570,8 @@ impl Runtime {
                 skills,
             ))
             .task_manager(task_manager)
+            // Settlement must fence every mutator, including compaction.
+            .mutator(input_settlement.clone())
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
             .transcript_observer(observer)
@@ -1578,7 +1584,7 @@ impl Runtime {
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {
-            driver,
+            driver: input_settlement.wrap(driver),
             skills: skill_catalog,
             tasks,
             background_jobs,
