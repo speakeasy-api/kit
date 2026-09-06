@@ -647,8 +647,12 @@ jobs:
           announcement=$(sed '$ { /^session_id: /d; }' "$mcp_dir/output.txt")
           if (( kit_status != 0 )) || [[ ! $announcement =~ ^https://[a-zA-Z0-9-]+\.slack\.com/archives/${SLACK_CHANNEL_ID}/p[0-9]+$ ]]; then
             echo "::error::Kit did not confirm a posted and verified Slack announcement with a permalink (CLI exit code: $kit_status)."
-            # Bound diagnostics and prefix lines so model output is not a workflow command.
+            # Disable both modern and legacy workflow commands in model-controlled output.
+            command_token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+            printf '::stop-commands::%s\n' "$command_token"
             head -c 8192 <<< "$announcement" | sed 's/^/Kit: /'
+            # Truncation can remove the last newline; resume on a separate line.
+            printf '\n::%s::\n' "$command_token"
             exit 1
           fi
           printf 'Slack release announcement: %s\n' "$announcement" >> "$GITHUB_STEP_SUMMARY"
