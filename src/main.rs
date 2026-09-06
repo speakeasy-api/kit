@@ -1805,6 +1805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = run().await;
             // Finish synchronously: a detached task can be terminated with the process,
             // and timing out spawn_blocking would still make runtime teardown wait.
+            kit::resilient_fs::finish_best_effort_recovery(kit::resilient_fs::best_effort_global());
             let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
             // Always attempt recovery, but preserve the original command error. The
             // recovery helper separately warns if accepted data remains undurable.

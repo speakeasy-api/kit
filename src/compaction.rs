@@ -724,9 +724,8 @@ impl LoopMutator for AutomaticCompactor {
                     finish(true, false);
                     return Ok(());
                 }
-                if let Some(persistence) = &self.persistence
-                    && let Err(error) = persistence.replace(&compacted)
-                {
+                if compacted.is_empty() {
+                    let error = "cannot persist an empty transcript replacement".to_string();
                     metadata.insert("error".into(), error.clone().into());
                     ctx.emitter.emit(AgentEvent::MutationFinished {
                         session_id: ctx.session_id.clone(),
@@ -737,6 +736,13 @@ impl LoopMutator for AutomaticCompactor {
                     });
                     finish(false, false);
                     return Err(LoopError::Mutator(error));
+                }
+                if let Some(persistence) = &self.persistence
+                    && let Err(error) = persistence.replace(&compacted)
+                {
+                    // Storage, poison, and lost ownership stop persistence,
+                    // never the already-computed in-memory compaction.
+                    metadata.insert("persistence_error".into(), error.into());
                 }
                 metadata.insert(
                     "replaced_items".into(),
@@ -821,6 +827,167 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    struct NoModelTurn;
+
+    #[async_trait]
+    impl ModelAdapter for NoModelTurn {
+        type Session = Self;
+        async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+            Ok(Self)
+        }
+    }
+
+    #[async_trait]
+    impl agentkit_loop::ModelSession for NoModelTurn {
+        type Turn = Self;
+        async fn begin_turn(
+            &mut self,
+            _: agentkit_loop::TurnRequest,
+            _: Option<agentkit_core::TurnCancellation>,
+        ) -> Result<Self, LoopError> {
+            Err(LoopError::Provider(
+                "manual compaction must not start a model turn".into(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl agentkit_loop::ModelTurn for NoModelTurn {
+        async fn next_event(
+            &mut self,
+            _: Option<agentkit_core::TurnCancellation>,
+        ) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> {
+            Err(LoopError::Provider("unexpected model turn".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_continues_after_persistence_loses_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sessions");
+        let initial = vec![
+            Item::text(ItemKind::System, "system"),
+            Item::text(ItemKind::User, "old request"),
+            Item::text(ItemKind::Assistant, "old answer"),
+            Item::text(ItemKind::User, MANUAL_COMMAND),
+        ];
+        let opened = crate::session::open_in(
+            root.path(),
+            &directory,
+            "abc",
+            false,
+            false,
+            initial.clone(),
+        )
+        .unwrap();
+        crate::resilient_fs::remove_dir_all(&directory).unwrap();
+        let replacement =
+            crate::session::open_in(root.path(), &directory, "abc", false, false, initial).unwrap();
+        let before = crate::session::load_in(root.path(), &directory, "abc").unwrap();
+        assert!(opened.observer.replace(&before).is_err());
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |transcript: &[Item], _| {
+                    transcript
+                        .last()
+                        .and_then(manual_message)
+                        .map(|_| CompactionReason::Manual)
+                },
+                CompactionPipeline::new().with_strategy(test_strategy()),
+            )
+            .with_backend(FixedBackend),
+            persistence: Some(opened.observer),
+        };
+        let mut transcript = opened.transcript;
+        let marker = transcript.pop().unwrap();
+        let agent = Agent::builder()
+            .model(NoModelTurn)
+            .transcript(transcript)
+            .input(vec![marker])
+            .mutator(compactor)
+            .build()
+            .unwrap();
+        let mut driver = agent.start(SessionConfig::new("abc")).await.unwrap();
+        let _ = driver.next().await.unwrap();
+        let compacted = driver.snapshot().transcript;
+        assert!(
+            compacted
+                .iter()
+                .any(|item| item.kind == ItemKind::Developer)
+        );
+        assert!(compacted.last().and_then(manual_message).is_none());
+        assert_eq!(
+            crate::session::load_in(root.path(), &directory, "abc").unwrap(),
+            before
+        );
+        drop(replacement);
+    }
+
+    struct EmptyStrategy;
+
+    #[async_trait]
+    impl CompactionStrategy for EmptyStrategy {
+        async fn apply(
+            &self,
+            request: CompactionRequest,
+            _: &mut CompactionContext<'_>,
+        ) -> Result<CompactionResult, CompactionError> {
+            Ok(CompactionResult::new(Vec::new(), request.transcript.len()))
+        }
+    }
+
+    struct CapturedEvents(std::sync::mpsc::Sender<AgentEvent>);
+
+    impl agentkit_loop::LoopObserver for CapturedEvents {
+        fn handle_event(&self, event: agentkit_loop::ObservedEvent) {
+            let _ = self.0.send(event.event);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_compaction_finishes_failed_lifecycle_without_mutating_transcript() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let system = Item::text(ItemKind::System, "system");
+        let marker = Item::text(ItemKind::User, MANUAL_COMMAND).with_created_at(Timestamp(123));
+        let compactor = AutomaticCompactor {
+            inner: StrategyCompactor::new(
+                |_: &[Item], _| Some(CompactionReason::Manual),
+                CompactionPipeline::new().with_strategy(EmptyStrategy),
+            ),
+            persistence: None,
+        };
+        let agent = Agent::builder()
+            .model(NoModelTurn)
+            .transcript(vec![system.clone()])
+            .input(vec![marker.clone()])
+            .mutator(compactor)
+            .observer(CapturedEvents(send))
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("empty-compaction"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(driver.next().await, Err(LoopError::Mutator(error)) if error.contains("empty transcript"))
+        );
+        let transcript = driver.snapshot().transcript;
+        assert_eq!(transcript, vec![system, marker]);
+        let events = receive.try_iter().collect::<Vec<_>>();
+        let started = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+            AgentEvent::MutationStarted { mutator, .. } if mutator == "automatic-compaction")
+            })
+            .unwrap();
+        let finished = events.iter().position(|event| matches!(event,
+            AgentEvent::MutationFinished { mutator, dirty: false, metadata, .. }
+            if mutator == "automatic-compaction" && metadata.get("error").and_then(serde_json::Value::as_str)
+                .is_some_and(|error| error.contains("empty transcript")))).unwrap();
+        assert!(started < finished);
+    }
 
     #[test]
     fn invalid_manual_marker_is_rejected() {

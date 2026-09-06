@@ -1,9 +1,8 @@
 # Intentional panic policy
 
-> **Published as a blocked draft — migration is incomplete, not merge-ready.**
-> The proposed enforcement still rejects the session persistence callback.
-> This is a blocker, not a grandfathered exception. Do not merge or weaken
-> the rules to conceal it.
+> **Draft — native platform validation remains required before merge.**
+> Do not weaken production rules to conceal a diagnostic. Transcript
+> persistence is explicitly best effort, not an exception to panic enforcement.
 
 This policy rejects explicit panic mechanisms in the Rust library, binary, and
 build script. It is a finite Clippy policy, **not proof of panic-freedom**:
@@ -54,9 +53,10 @@ This draft preserves the merged test-boundary and shared-state fixes on its
 base. It includes fallible build-document generation, provider header/credential
 encoding, compaction marker validation, workspace scanning, resilient-filesystem
 publication, credential authority, ACP/runtime attachment, MCP lifecycle, and
-TUI control-flow migrations. Errors are propagated rather than converted into
-defaults or successful continuation. Actor admission and publication retain
-ownership of rollback until a complete transition commits.
+TUI control-flow migrations. Strict-operation errors are propagated rather
+than converted into defaults or successful continuation. Transcript storage is
+explicitly best effort, as described below. Actor admission and publication
+retain ownership of rollback until a complete transition commits.
 
 Production JSON construction uses explicit `Value`/`Map` conversions for concrete
 JSON-compatible values and propagates fallible serialization errors. Clap's
@@ -72,7 +72,9 @@ now-deterministic, previously permitted simultaneous-ready outcomes. Losing
 futures and their owning scopes end before handlers reuse receivers, reset
 terminal input, or terminate and reap child processes.
 
-The upstream persistence contract described below remains a prerequisite.
+Transcript persistence follows the best-effort contract described below; it
+is not a transaction gate for the running agent.
+
 The correctly test-gated `src/tools/subagent/tests.rs` module uses the same
 narrow assertion/unwrap allowances as the other test modules, including their
 macro expansions. These allowances do not apply to production code, and direct
@@ -112,11 +114,29 @@ a successful host check does not establish behavior in other conditional code.
   image, cursor, and namespace commits. Replay validates parent paths before
   effects; existing lease fencing and poison isolation remain authoritative.
   Credential mutations acquire real refresh authority before changing storage.
+- The process best-effort filesystem is published once and never reset. It
+  shares the strict backend, not the strict queue or budget. A best-effort
+  guarded handle can retain a real lease from that same backend owner; every
+  replay still checks native authority and scope. Strict handles reject foreign
+  leases. RAII authority claims cover in-flight submissions and queued work
+  across services; source registries cannot mistake foreign outstanding work
+  for a clean lease. Claim counts are bounded by their owning Arc references.
+  The recovery worker and final pass use filesystem synchronization;
+  warning-transition state is local to each worker/pass, with no await or
+  callback under a new shared guard.
 - Session claims cover acquisition, transcript guarding, commit, fork deferral,
   and drop. Rejected deferral retains rollback ownership. Typed attachments carry
   required creation ownership rather than discovering its absence after
   publication. Both ACP versions acquire fallible MCP subscriptions before
   binding or starting drivers, so rejected admission releases the claim.
+- Transcript writers serialize generation, optional file ownership, real leases,
+  and creation publication under their existing mutex, with no await. Persistence
+  loss retires the file instead of vetoing the loop's in-memory append. Source
+  leases remain owned for the writer lifetime when legacy redirects can be lost.
+  Poisoned writers are not inspected; observer persistence is skipped and
+  result-bearing creation validation remains fallible. Native I/O and descriptor
+  replacement/destruction remain callback/unwind boundaries under this mutex;
+  isolation is not a claim that arbitrary backend callbacks cannot panic.
 - MCP event-route admission and subscription drop are the route-map writers.
   Checked generation allocation prevents wraparound and stale-owner reuse.
   Complete routes are published under the lock; replaced senders are dropped
@@ -152,37 +172,44 @@ This inventory and its failure-path coverage are bounded, not a proof over all
 schedules or dependency-internal rollback. Existing subagent create/fork callbacks
 under registry guards remain a separate reentrancy/unwind audit boundary.
 
-## Unresolved persistence prerequisite
+## Best-effort transcript persistence
 
 The pinned `agentkit-loop` revision
-`8e4ee26434a3f847e3613da5bb073ae63a262243` exposes
-`TranscriptObserver::on_transcript_event` returning `()`. `append_item` calls it
-immediately before an unconditional in-memory transcript push. Logging,
-requesting shutdown, cancellation, or an early return still permits that commit.
-Checking only an outer driver boundary misses append paths such as final
-assistant output, tool dispatch, cancellation cleanup, and approval retirement.
+`8e4ee26434a3f847e3613da5bb073ae63a262243` documents host-owned storage in
+[`book/src/session-persistence.md`](https://github.com/danielkov/agentkit/blob/8e4ee26434a3f847e3613da5bb073ae63a262243/book/src/session-persistence.md).
+The supported protocol restores with `AgentBuilder::transcript`, mirrors new
+items with `TranscriptObserver`, and checkpoints with `LoopDriver::snapshot`.
+There deliberately is no `SessionStore` trait. The observer returns `()` and
+cannot veto the following in-memory append. Documentation and the SQLite
+example continue on write failure; buffered writes and periodic snapshots are
+also documented. These APIs do not promise persistence-before-memory or
+unconditional crash durability. No upstream API change is required for Kit's
+best-effort contract.
 
-`src/session.rs` therefore retains the current poisoned-writer `expect` and
-persistence-failure `panic!` unchanged. The existing storage-exhaustion/shutdown
-early return has the same unpersisted-continuation hazard and must not be reused
-as a replacement. The panic also bypasses asynchronous actor cleanup: retaining
-it is a blocker, not an endorsed solution. No default, silent continuation,
-process abort, or production `catch_unwind` replaces it.
+The running driver's transcript is authoritative. Storage is a best-effort copy;
+unavailable storage must not fail a turn, prevent compaction, or cancel the
+agent. The resilient filesystem owns the persistence-failure, bounded-buffer,
+and retry boundary. Session code must not implement a second retry queue.
+Acceptance into memory is not a durability acknowledgment, and transcript loss
+is permitted when buffering or safe recovery is no longer possible.
 
-The required upstream and host contract is:
+The process-owned best-effort filesystem has an independent 64 MiB / 4,096
+operation budget and one shared namespace for transcript readers and writers.
+The recovery worker retains it beyond observer lifetimes. Budget exhaustion
+permanently retires this whole optional-storage domain until process exit; it
+does not reset the domain and resume writing a tail with a missing prefix.
+Pending data is released on abandonment, while live handles remain fenced.
+Final recovery attempts do not change the command result if optional history
+remains unpersisted. Genuine process allocator failure remains outside this
+finite panic policy and retains the existing emergency handling.
 
-1. A fallible synchronous persistence acknowledgment with a distinguishable error.
-2. No in-memory commit for a rejected item; batches stop at the committed prefix.
-3. Propagation through inputs, assistant output, tools, detach placeholders,
-   approvals, cancellation, and interrupted-turn repair.
-4. Terminal isolation: no further inference, tool dispatch, success response, or
-   reuse of the failed driver; do not misreport the failure as cancellation.
-5. Cleanup that cancels/retires owned work without requiring writes to the failed
-   sink, while preserving the primary error.
-6. Explicit semantics for uncertain writes, external effects already executed,
-   multiple-observer ordering, and retry.
-7. Host-side terminal reporting and session retirement, not an error followed by
-   continued actor-loop operation.
-
-This prerequisite requires separate authorization and upstream work. Until it
-and the remaining migration/expansion work are resolved, this PR stays draft.
+Best-effort storage must remain separate from strict storage obligations:
+credentials, ownership leases, and explicit durability barriers retain truthful
+failures. Dropping persistence must retire a coherent stream rather than replay
+later dependent writes behind a missing or uncertain prefix. Poisoned state is
+isolated, never recovered by assuming interrupted transitions completed.
+Explicit resume validation, active-owner exclusion, and creation rollback remain
+separate from write durability; unavailable history is not silently replaced by
+an empty successful resume. Creating directories, obtaining real native leases,
+and validating/migrating existing history can still fail before optional writing
+begins. A memory-only lease is never substituted for native ownership.

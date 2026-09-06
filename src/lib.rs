@@ -36,7 +36,8 @@ pub mod runtime;
 pub mod resilient_fs {
     pub use crate::filesystem::*;
     pub use crate::storage_runtime::{
-        finish_recovery, request_shutdown, shutdown_token, start_recovery_worker,
+        finish_best_effort_recovery, finish_recovery, request_shutdown, shutdown_token,
+        start_recovery_worker,
     };
 }
 pub mod session;

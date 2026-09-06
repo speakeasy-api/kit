@@ -56,6 +56,60 @@ pub fn finish_recovery(filesystem: &crate::resilient_fs::Fs) -> std::io::Result<
     Ok(())
 }
 
+/// Retry the optional storage domain without turning loss into process failure.
+/// The service, not this worker, owns buffering, ordering, and replay. No worker
+/// state is shared: only Fs's existing synchronization coordinates concurrent
+/// submission, recovery, and the final pass. Abandonment releases queued images
+/// and leases outside the filesystem guard; poison is never recovered.
+fn recover_best_effort(
+    filesystem: &crate::resilient_fs::Fs,
+) -> Option<crate::resilient_fs::BestEffortStatus> {
+    use crate::resilient_fs::BestEffortStatus;
+    match filesystem.best_effort_status()? {
+        BestEffortStatus::Ready | BestEffortStatus::Buffered => {
+            let _ = filesystem.recover();
+        }
+        BestEffortStatus::Dropped | BestEffortStatus::Poisoned => {}
+    }
+    if filesystem.best_effort_status() == Some(BestEffortStatus::Dropped) {
+        let _ = filesystem.abandon_best_effort();
+    }
+    filesystem.best_effort_status()
+}
+
+fn report_best_effort(
+    status: Option<crate::resilient_fs::BestEffortStatus>,
+    previous: &mut Option<crate::resilient_fs::BestEffortStatus>,
+) {
+    use crate::resilient_fs::BestEffortStatus;
+    if status == *previous {
+        return;
+    }
+    let message: Option<&[u8]> = match status {
+        Some(BestEffortStatus::Buffered) => Some(
+            b"kit: transcript storage is buffered in memory; history may be lost if Kit exits before storage recovers.\n",
+        ),
+        Some(BestEffortStatus::Dropped | BestEffortStatus::Poisoned) => Some(
+            b"kit: transcript persistence is disabled for this process; the agent will continue, but new history will not be saved.\n",
+        ),
+        Some(BestEffortStatus::Ready) if *previous == Some(BestEffortStatus::Buffered) => Some(
+            b"kit: transcript storage recovered; pending writes have been replayed.\n",
+        ),
+        _ => None,
+    };
+    if let Some(message) = message {
+        let _ = std::io::stderr().write_all(message);
+    }
+    *previous = status;
+}
+
+/// Make a final bounded attempt for optional transcripts. Unpersisted history
+/// is permitted to be lost and must not replace the command's exit result.
+pub fn finish_best_effort_recovery(filesystem: &crate::resilient_fs::Fs) {
+    let status = recover_best_effort(filesystem);
+    report_best_effort(status, &mut None);
+}
+
 /// Start one recovery worker for the process, independent of session handles.
 /// A turn completing or a session closing does not stop this worker or discard
 /// the filesystem's pending changes.
@@ -68,12 +122,17 @@ pub fn start_recovery_worker() {
             .name("kit-storage-recovery".into())
             .spawn(|| {
                 let fs = crate::resilient_fs::global();
+                let best_effort = crate::resilient_fs::best_effort_global();
+                let mut best_effort_status = None;
                 let mut delay = 1;
                 let mut warned = false;
                 let mut emitted_status = None;
                 loop {
+                    let best_status = recover_best_effort(best_effort);
+                    report_best_effort(best_status, &mut best_effort_status);
+                    let best_pending = best_status == Some(crate::resilient_fs::BestEffortStatus::Buffered);
                     let status = fs.status();
-                    publish_status(status.pending_operations > 0, status.exhausted, &mut emitted_status);
+                    publish_status(status.pending_operations > 0 || best_pending, status.exhausted, &mut emitted_status);
                     if status.exhausted {
                         let _ = std::io::stderr().write_all(
                             b"kit: internal storage memory budget exhausted; cancelling work and shutting down. Unpersisted data cannot survive process exit.\n",
@@ -89,7 +148,7 @@ pub fn start_recovery_worker() {
                         }
                         let _ = fs.recover();
                         let recovered = fs.status();
-                        publish_status(recovered.pending_operations > 0, recovered.exhausted, &mut emitted_status);
+                        publish_status(recovered.pending_operations > 0 || best_pending, recovered.exhausted, &mut emitted_status);
                         if recovered.pending_operations == 0 {
                             let _ = std::io::stderr().write_all(
                                 b"kit: internal storage recovered; pending changes are persisted.\n",
@@ -112,6 +171,7 @@ pub fn start_recovery_worker() {
                         // One final best-effort pass; never discard pending data
                         // merely because a caller or observer was dropped.
                         let _ = fs.recover();
+                        finish_best_effort_recovery(best_effort);
                         return;
                     }
                     std::thread::sleep(Duration::from_secs(delay));
@@ -143,6 +203,53 @@ fn publish_status(pending: bool, exhausted: bool, previous: &mut Option<(bool, b
     clippy::disallowed_macros
 )]
 mod tests {
+    #[test]
+    fn optional_storage_loss_does_not_exhaust_strict_storage_or_fail_final_pass() {
+        use crate::resilient_fs::{BestEffortStatus, DiskBackend, Fs};
+        let directory = tempfile::tempdir().unwrap();
+        let strict = Fs::new(std::sync::Arc::new(DiskBackend));
+        let optional = strict.best_effort(0, 0);
+        // A successful immediate disk write needs no buffer budget. Exercise
+        // explicit loss through the production abandonment boundary instead.
+        optional
+            .write(directory.path().join("transcript"), b"prefix")
+            .unwrap();
+        optional.abandon_best_effort().unwrap();
+        assert!(
+            optional
+                .write(directory.path().join("transcript"), b"lost tail")
+                .is_err()
+        );
+        assert_eq!(
+            optional.best_effort_status(),
+            Some(BestEffortStatus::Dropped)
+        );
+        super::finish_best_effort_recovery(&optional);
+        assert_eq!(optional.status().pending_operations, 0);
+        assert_eq!(optional.status().retained_bytes, 0);
+        assert!(!strict.status().exhausted);
+        strict
+            .write(directory.path().join("strict"), b"important")
+            .unwrap();
+        strict
+            .require_disk(directory.path().join("strict"))
+            .unwrap();
+        assert_eq!(
+            strict.read(directory.path().join("strict")).unwrap(),
+            b"important"
+        );
+    }
+
+    #[test]
+    fn optional_recovery_does_not_operate_on_a_strict_service() {
+        let strict =
+            crate::resilient_fs::Fs::new(std::sync::Arc::new(crate::resilient_fs::DiskBackend));
+        assert_eq!(super::recover_best_effort(&strict), None);
+        let mut previous = None;
+        super::report_best_effort(None, &mut previous);
+        assert_eq!(previous, None);
+    }
+
     #[test]
     fn allocation_failure_exit_is_nonzero_without_protocol_stdout() {
         const CHILD: &str = "KIT_ALLOCATION_EXIT_TEST_CHILD";
