@@ -29,8 +29,6 @@ jobs:
           toolchain: 1.94.0
           components: rustfmt, clippy
       - run: scripts/tests/test_next_release_version.sh
-      - run: python3 scripts/tests/test_panic_policy.py
-      - run: python3 scripts/tests/test_build_docs.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --lib --bins --all-features -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings

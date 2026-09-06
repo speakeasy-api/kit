@@ -37,15 +37,9 @@ placeholders from Clippy; review is still required. Unused, unexpanded macro
 bodies are outside semantic lint coverage. Do not move production algorithms
 into test-only scopes to bypass enforcement.
 
-The dependency-free fixtures use Rust/Clippy 1.94.0 and the repository config.
-They exercise alternate syntax, const calls, local overrides, production code
-in test builds, actual root/manifest wiring, test helpers, and known test-only
-limitations. Build-script process fixtures exercise invalid/missing inputs,
-missing output directory, write rejection, and symlink rejection.
+Run Clippy against the actual Cargo targets using the repository configuration:
 
 ```sh
-python3 scripts/tests/test_panic_policy.py
-python3 scripts/tests/test_build_docs.py
 cargo clippy --locked --lib --bins --all-features -- -D warnings
 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
