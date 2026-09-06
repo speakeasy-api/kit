@@ -1980,5 +1980,13 @@ impl Tool for ForkTool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 #[path = "subagent/tests.rs"]
 mod tests;

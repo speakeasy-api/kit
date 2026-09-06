@@ -1,9 +1,9 @@
 # Intentional panic policy
 
 > **Published as a blocked draft — migration is incomplete, not merge-ready.**
-> The proposed enforcement still rejects the session persistence callback and
-> a test-only policy inconsistency. These are blockers, not grandfathered
-> exceptions. Do not merge or weaken the rules to conceal them.
+> The proposed enforcement still rejects the session persistence callback.
+> This is a blocker, not a grandfathered exception. Do not merge or weaken
+> the rules to conceal it.
 
 This policy rejects explicit panic mechanisms in the Rust library, binary, and
 build script. It is a finite Clippy policy, **not proof of panic-freedom**:
@@ -72,11 +72,11 @@ now-deterministic, previously permitted simultaneous-ready outcomes. Losing
 futures and their owning scopes end before handlers reuse receivers, reset
 terminal input, or terminate and reap child processes.
 
-Two policy prerequisites remain: the upstream persistence contract described
-below, and agreement on the correctly test-gated `src/tools/subagent/tests.rs`
-module. That module lacks the narrow assertion/unwrap allowances already used
-by the other test modules, including allowances for their macro expansions.
-Its assertions have not been weakened or exempted during this migration.
+The upstream persistence contract described below remains a prerequisite.
+The correctly test-gated `src/tools/subagent/tests.rs` module uses the same
+narrow assertion/unwrap allowances as the other test modules, including their
+macro expansions. These allowances do not apply to production code, and direct
+test placeholders remain denied.
 
 No dependency revision, version, feature, or production lint configuration is
 changed by these callsite migrations. Native platform coverage remains required;
