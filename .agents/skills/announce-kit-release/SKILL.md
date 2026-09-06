@@ -23,11 +23,11 @@ description: Use when asked to summarize the current Kit release against the pre
    ```
    ````
 
-5. Search Slack for the requested channel by name and resolve its current channel ID. Never hard-code a Slack channel ID.
+5. Search Slack for the requested channel by name and resolve its current channel ID. Follow pagination until the exact name is found or results are exhausted; a filtered page with no matches does not mean the channel is absent. Never hard-code a Slack channel ID.
 6. Before sending or drafting, inspect the exact Slack payload. Every opening ` ```shell` fence must end immediately with a newline, every closing ` ``` ` fence must be on its own line, and prose or links must appear only after a closing fence. Reject payloads such as ` ```shell command` or `command``` `.
 7. If the user explicitly asked to post, send the announcement directly. Otherwise, create a draft for review. Do not post to an approximate channel name; fail and ask for clarification if the exact channel cannot be found.
-8. Read the sent message back from Slack and verify that the install commands did not absorb later prose or links. If it is malformed, replace or delete it when Slack tools allow that; otherwise post one corrected copy and report that the malformed message requires manual deletion.
-9. Return the Slack message or draft link.
+8. Read the sent message back from Slack and verify that the install commands did not absorb later prose or links. For a restricted bot explicitly known to lack history access, instead inspect the actual message returned in Slack's successful send response: verify the channel matches the resolved target, a message timestamp is present, and the returned text has correct formatting. This verifies the send response, not a later history read. A bare success acknowledgement or the original outgoing payload is not sufficient; fail if the response lacks the posted message. If the message is malformed, replace or delete it when Slack tools allow that; otherwise post one corrected copy and report that the malformed message requires manual deletion.
+9. For a sent announcement, retrieve its permalink through Slack tools using the verified channel and message timestamp. Return the Slack message or draft link.
 
 ## Announcement shape
 

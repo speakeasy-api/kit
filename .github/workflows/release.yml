@@ -8,6 +8,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_NOTES_MODEL: openai/gpt-5.6-terra
 
 concurrency:
   group: release
@@ -161,6 +162,7 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
+      - run: python3 -m unittest scripts/tests/test_release_announcement.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked
@@ -436,7 +438,7 @@ jobs:
           release-kit/kit prompt \
             --root "$GITHUB_WORKSPACE" \
             --provider openrouter \
-            --model openai/gpt-5.6-terra \
+            --model "$RELEASE_NOTES_MODEL" \
             "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
             > kit-output.txt
           sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
@@ -550,6 +552,99 @@ jobs:
             fi
           fi
           gh release edit "${edit_args[@]}"
+
+  announce-release:
+    name: Announce release in Slack (Kit MCP smoke test)
+    needs: [verify, publish, containers]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      PREVIOUS_TAG: ${{ needs.verify.outputs.previous_tag }}
+      SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
+      SLACK_MCP_URL: ${{ vars.SLACK_MCP_URL }}
+      GRAM_ENVIRONMENT: ${{ vars.GRAM_ENVIRONMENT }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-linux-x64
+          path: dist
+      - name: Post and verify announcement with the released Kit CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GRAM_API_KEY: ${{ secrets.GRAM_API_KEY }}
+        shell: bash
+        run: |
+          for name in OPENROUTER_API_KEY SLACK_CHANNEL SLACK_MCP_URL GRAM_ENVIRONMENT GRAM_API_KEY; do
+            if [[ -z ${!name} ]]; then
+              echo "::error::Missing required $name for the Slack release smoke test."
+              exit 1
+            fi
+          done
+
+          # HTTP headers are literal config values, not environment placeholders.
+          # Keep the credential-bearing config private and outside the checkout.
+          umask 077
+          mcp_dir=$(mktemp -d "$RUNNER_TEMP/kit-slack.XXXXXX")
+          trap 'rm -rf "$mcp_dir"' EXIT
+          export SLACK_MCP_CONFIG="$mcp_dir/mcp.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          url = os.environ["SLACK_MCP_URL"]
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("SLACK_MCP_URL must be an HTTPS MCP endpoint without URL credentials")
+          config = {
+              "mcpServers": {
+                  "slack": {
+                      "type": "http",
+                      "description": "Slack: resolve channels, post release announcements, and retrieve message permalinks",
+                      "url": url,
+                      "headers": {
+                          "Authorization": "Bearer " + os.environ["GRAM_API_KEY"],
+                          "Gram-Environment": os.environ["GRAM_ENVIRONMENT"],
+                      },
+                  }
+              }
+          }
+          Path(os.environ["SLACK_MCP_CONFIG"]).write_text(json.dumps(config))
+          PY
+          unset GRAM_API_KEY
+
+          mkdir -p release-kit
+          tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C release-kit
+          release-kit/kit --version
+          prompt="Use the announce-kit-release skill to post release notes for ${PREVIOUS_TAG}..${RELEASE_TAG} to the exact public Slack channel named ${SLACK_CHANNEL}. The checkout is the published release.
+          Load the skill with the skill tool, discover the configured slack MCP tools with tool_search, and use only those MCP tools for Slack operations. Do not use shell, curl, or a direct Slack API client as a fallback. Follow channel-lookup pagination until the exact name is found or results are exhausted.
+          This is a noninteractive release smoke test: post directly, do not draft or request confirmation. The bot has channels:read and chat:write but no channel-history access. Use the skill's restricted-bot verification: inspect the actual message returned by the successful send response, verify its channel, timestamp and formatting, then retrieve its permalink through MCP. Do not call history tools or message search.
+          Do not expose credentials or read the MCP config. If any step fails, report failure and do not return a success link. Only after successful posting and verification, respond with just the Slack message permalink on its own line."
+          release-kit/kit prompt \
+            --root "$GITHUB_WORKSPACE" \
+            --provider openrouter \
+            --model "$RELEASE_NOTES_MODEL" \
+            --mcp-config "$SLACK_MCP_CONFIG" \
+            "$prompt" \
+            > slack-kit-output.txt
+          announcement=$(sed '$ { /^session_id: /d; }' slack-kit-output.txt)
+          if [[ ! $announcement =~ ^https://[a-zA-Z0-9-]+\.slack\.com/archives/[A-Z0-9]+/p[0-9]+$ ]]; then
+            echo "::error::Kit did not confirm a posted and verified Slack announcement with a permalink."
+            exit 1
+          fi
+          printf 'Slack release announcement: %s\n' "$announcement" >> "$GITHUB_STEP_SUMMARY"
 
   container-build:
     name: Build container images (${{ matrix.arch }}, ${{ matrix.family }})
