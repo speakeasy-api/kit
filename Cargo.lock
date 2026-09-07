@@ -2674,7 +2674,6 @@ dependencies = [
  "ratatui-image",
  "reqwest",
  "rmcp",
- "runlet",
  "serde",
  "serde_json",
  "sha2 0.11.0",

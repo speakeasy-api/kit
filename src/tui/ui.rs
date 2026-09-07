@@ -26,9 +26,7 @@ use super::{
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
-    markdown,
-    plan::PlanKind,
-    theme,
+    markdown, theme,
     wrap::{LinkedLine, LinkedSpan, wrap_linked_tagged},
 };
 
@@ -1322,7 +1320,7 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     let compose = call.is_compose();
     if call.running() {
         if compose && !call.script.is_empty() {
-            lines.extend(live_script_lines(app, call));
+            lines.extend(script_lines(call));
         } else if let Some(child) = call.children.iter().rev().find(|child| child.running()) {
             lines.push(Line::from(vec![
                 Span::styled("   ↳ ", theme::faint()),
@@ -1350,203 +1348,18 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     lines
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProgramState {
-    Idle,
-    Resolved,
-    Failed,
-    Running,
-}
-
-fn live_script_lines(app: &App, call: &ToolCall) -> Vec<Line<'static>> {
+/// Source text is not execution telemetry. Runtime events identify calls,
+/// not source expressions, so script lines carry no inferred state.
+fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
     call.script
         .lines()
-        .enumerate()
-        .map(|(line_index, source)| {
-            let nodes: Vec<usize> = call
-                .plan
-                .iter()
-                .enumerate()
-                .filter_map(|(index, node)| (node.source_line == line_index).then_some(index))
-                .collect();
-            let state = nodes
-                .iter()
-                .map(|&index| program_state(call, index))
-                .max()
-                .unwrap_or(ProgramState::Idle);
-            let (glyph, style) = match state {
-                ProgramState::Running => (
-                    theme::pulse(theme::Pulse::Child, app.tick),
-                    Style::default().fg(theme::running_color()),
-                ),
-                ProgramState::Failed => ("✗", Style::default().fg(theme::error_color())),
-                ProgramState::Resolved => ("✓", Style::default().fg(theme::success_color())),
-                ProgramState::Idle => ("·", theme::faint()),
-            };
-            let annotations: Vec<String> = nodes
-                .iter()
-                .map(|&index| program_annotation(call, index))
-                .filter(|text| !text.is_empty())
-                .collect();
-            let mut spans = vec![
+        .map(|source| {
+            Line::from(vec![
                 Span::styled("   │ ", theme::faint()),
-                Span::styled(format!("{glyph} "), style),
-                Span::styled(source.to_string(), style),
-            ];
-            if !annotations.is_empty() {
-                spans.push(Span::styled("  # ", theme::faint()));
-                spans.push(Span::styled(annotations.join(" · "), style));
-            }
-            Line::from(spans)
+                Span::styled(source.to_string(), theme::dim()),
+            ])
         })
         .collect()
-}
-
-fn program_state(call: &ToolCall, index: usize) -> ProgramState {
-    let node = &call.plan[index];
-    if node.kind == PlanKind::Binding {
-        return ProgramState::Resolved;
-    }
-    if node.kind == PlanKind::Return {
-        return ProgramState::Idle;
-    }
-    let end = subtree_end(call, index);
-    let children: Vec<&Child> = call
-        .children
-        .iter()
-        .filter(|child| {
-            child
-                .node
-                .is_some_and(|owner| owner >= index && owner < end)
-        })
-        .collect();
-    if children.iter().any(|child| child.running()) {
-        ProgramState::Running
-    } else if children.is_empty() {
-        ProgramState::Idle
-    } else if children.iter().any(|child| child.ok) {
-        ProgramState::Resolved
-    } else {
-        ProgramState::Failed
-    }
-}
-
-fn subtree_end(call: &ToolCall, index: usize) -> usize {
-    let depth = call.plan[index].depth;
-    call.plan
-        .iter()
-        .enumerate()
-        .skip(index + 1)
-        .find_map(|(next, node)| (node.depth <= depth).then_some(next))
-        .unwrap_or(call.plan.len())
-}
-
-fn program_annotation(call: &ToolCall, index: usize) -> String {
-    let node = &call.plan[index];
-    let state = program_state(call, index);
-    let variable = node.binding.as_ref().map(|name| {
-        let status = match state {
-            ProgramState::Resolved => "resolved",
-            ProgramState::Failed => "failed",
-            ProgramState::Idle | ProgramState::Running => "waiting",
-        };
-        format!("{name} {status}")
-    });
-    let detail = match node.kind {
-        PlanKind::Call => {
-            let attached: Vec<&Child> = call
-                .children
-                .iter()
-                .filter(|child| child.node == Some(index))
-                .collect();
-            let status = match state {
-                ProgramState::Idle => "idle",
-                ProgramState::Running => "running",
-                ProgramState::Resolved => "success",
-                ProgramState::Failed => "failure",
-            };
-            let target = node.tool.as_deref().unwrap_or(node.label.as_str());
-            let target = if target.is_empty() {
-                node.kind.glyph()
-            } else {
-                target
-            };
-            if attached.len() <= 1 {
-                Some(format!("{target} {status}"))
-            } else {
-                let running = attached.iter().filter(|child| child.running()).count();
-                let success = attached
-                    .iter()
-                    .filter(|child| !child.running() && child.ok)
-                    .count();
-                let failure = attached
-                    .iter()
-                    .filter(|child| !child.running() && !child.ok)
-                    .count();
-                let states = [
-                    (running, "running"),
-                    (success, "success"),
-                    (failure, "failure"),
-                ]
-                .into_iter()
-                .filter(|(count, _)| *count > 0)
-                .map(|(count, state)| format!("{count} {state}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-                Some(format!("{target}: {states}"))
-            }
-        }
-        PlanKind::Loop | PlanKind::Fold => Some(match direct_execution_count(call, index) {
-            Some(0) => "iteration waiting".into(),
-            Some(count) if state == ProgramState::Running => {
-                format!("iteration {count} running")
-            }
-            Some(count) => format!("{count} {}", plural("iteration", count)),
-            None if state == ProgramState::Idle => "iteration waiting".into(),
-            None => "iterations active".into(),
-        }),
-        PlanKind::Boundary => Some(match direct_execution_count(call, index) {
-            Some(0) => "attempt waiting".into(),
-            Some(attempt) => format!("attempt {attempt}"),
-            None if state == ProgramState::Idle => "attempt waiting".into(),
-            None => "boundary active".into(),
-        }),
-        PlanKind::After => Some(if state == ProgramState::Idle {
-            "dependency waiting".into()
-        } else {
-            "dependency ready".into()
-        }),
-        PlanKind::Branch => Some(if state == ProgramState::Idle {
-            "branch waiting".into()
-        } else {
-            "branch active".into()
-        }),
-        PlanKind::Return => Some("waiting to return".into()),
-        PlanKind::Binding => None,
-    };
-    [variable, detail]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// Counts a construct only when one direct child call makes dispatch count a
-/// sound proxy. Nested loops/boundaries and branching bodies stay qualitative.
-fn direct_execution_count(call: &ToolCall, index: usize) -> Option<usize> {
-    let end = subtree_end(call, index);
-    let child_depth = call.plan[index].depth + 1;
-    let calls: Vec<usize> = (index + 1..end)
-        .filter(|&child| {
-            call.plan[child].depth == child_depth && call.plan[child].kind == PlanKind::Call
-        })
-        .collect();
-    (calls.len() == 1).then(|| {
-        call.children
-            .iter()
-            .filter(|child| child.node == calls.first().copied())
-            .count()
-    })
 }
 
 fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
@@ -3369,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_script_runs_inline_with_live_annotations_at_full_width() {
+    fn compose_script_stays_neutral_with_running_and_successful_calls() {
         let mut app = sample();
 
         let frame = render(&mut app, 120, 40);
@@ -3378,17 +3191,16 @@ mod tests {
             frame.contains("files = shell({ command: \"ls src\" })"),
             "{frame}"
         );
-        assert!(frame.contains("files resolved · shell success"), "{frame}");
-        assert!(
-            frame.contains("checked waiting · iteration 1 running"),
-            "{frame}"
-        );
-        assert!(frame.contains("shell running"), "{frame}");
+        assert!(frame.contains("1 in flight"), "{frame}");
+        assert!(!frame.contains(" # "), "{frame}");
+        assert!(!frame.contains("resolved"), "{frame}");
+        assert!(!frame.contains("iteration 1 running"), "{frame}");
+        assert!(!frame.contains("shell running"), "{frame}");
         assert!(app.transcript_width > 100, "{}", app.transcript_width);
     }
 
     #[test]
-    fn compose_script_annotates_idle_and_failed_calls_and_boundary_attempts() {
+    fn compose_script_does_not_infer_failure_retry_or_waiting_state() {
         let script = "value = boundary retry 2 {\n\
             return shell({ command: \"false\" })\n\
         } catch err {\n\
@@ -3426,9 +3238,54 @@ mod tests {
         let frame = render(&mut app, 100, 30);
 
         assert!(frame.contains("value = boundary retry 2 {"), "{frame}");
-        assert!(frame.contains("value failed · attempt 1"), "{frame}");
-        assert!(frame.contains("shell failure"), "{frame}");
-        assert!(frame.contains("later waiting · docs idle"), "{frame}");
+        assert!(!frame.contains(" # "), "{frame}");
+        assert!(!frame.contains("value failed"), "{frame}");
+        assert!(!frame.contains("attempt 1"), "{frame}");
+        assert!(!frame.contains("shell failure"), "{frame}");
+        assert!(!frame.contains("later waiting"), "{frame}");
+    }
+
+    #[test]
+    fn compose_script_does_not_attribute_descendants_to_a_dependent_review() {
+        let mut app = App::new(
+            PathBuf::from("/Users/dev/projects/kit"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let script = "a = subagent({name: \"implementation\", prompt: input.task})\n\
+            r = subagent({name: \"review\", prompt: json.encode(a.output)})\n\
+            return r";
+        app.apply(Update::ToolStarted {
+            id: "root".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some(script.into()),
+            backgrounded: true,
+        });
+        for call in [
+            "root:compose:implementation",
+            "child:compose:storage",
+            "child:compose:backfill",
+            "child:compose:transport",
+            "child:compose:tests",
+        ] {
+            app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
+                call: call.into(),
+                tool: "subagent".into(),
+                summary: "working".into(),
+                at: 0,
+            }));
+        }
+        let frame = render(&mut app, 160, 30);
+        assert!(frame.contains("1 in flight"), "{frame}");
+        let source_rows: Vec<_> = frame
+            .lines()
+            .filter_map(|line| line.split_once("│ ").map(|(_, source)| source.trim_end()))
+            .collect();
+        assert_eq!(source_rows, script.lines().collect::<Vec<_>>());
+        assert!(!frame.contains("subagent: 2 running"), "{frame}");
+        assert!(!frame.contains("subagent: 3 running"), "{frame}");
     }
 
     #[test]
@@ -3636,7 +3493,7 @@ mod tests {
     }
 
     #[test]
-    fn non_compose_running_child_summary_remains_inline() {
+    fn non_compose_child_summary_requires_a_matching_parent() {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
             "openai-subscription".into(),
@@ -3659,6 +3516,15 @@ mod tests {
 
         let frame = render(&mut app, 80, 20);
 
+        assert!(!frame.contains("↳ cargo check"), "{frame}");
+
+        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
+            call: "call-1:compose:child".into(),
+            tool: "shell".into(),
+            summary: "cargo check".into(),
+            at: 0,
+        }));
+        let frame = render(&mut app, 80, 20);
         assert!(frame.contains("↳ cargo check"), "{frame}");
     }
 

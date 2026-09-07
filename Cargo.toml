@@ -53,7 +53,6 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
-runlet = "=0.5.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 shlex = "=2.0.1"
