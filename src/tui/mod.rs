@@ -4,14 +4,13 @@
 //! process's stdio, so the UI runs against exactly the protocol surface any
 //! other editor would use. The child's stderr carries two things: ordinary
 //! diagnostics, shown in the log pane, and the runtime side channel
-//! ([`crate::events`]) that feeds the live graph of a running Runlet program.
+//! ([`crate::events`]) that reports tool-call and subagent activity.
 
 mod app;
 mod command;
 mod editor;
 mod image;
 mod markdown;
-mod plan;
 mod theme;
 mod ui;
 mod wrap;

@@ -33,7 +33,6 @@ const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
-    plan::{PlanNode, parse as parse_plan},
     wrap::LinkHit,
 };
 
@@ -328,8 +327,6 @@ pub struct Child {
     pub started: Instant,
     pub millis: Option<u64>,
     pub ok: bool,
-    /// Plan node this dispatch was attributed to.
-    pub node: Option<usize>,
 }
 
 impl Child {
@@ -361,7 +358,6 @@ pub struct ToolCall {
     pub finished: Option<Instant>,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
-    pub plan: Vec<PlanNode>,
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
@@ -413,30 +409,11 @@ impl ToolCall {
         self.finish_running_children();
     }
 
-    /// Records a nested dispatch against the plan node most likely to own it.
+    /// Records a dispatch whose parent call ID matches this tool call.
     ///
-    /// Runlet's own node ids stay inside the runtime, so attribution goes by
-    /// tool name and load: among the plan nodes calling this tool, the one
-    /// carrying the fewest dispatches so far wins. That is exact for the
-    /// common program shapes and otherwise degrades to a stable grouping when
-    /// one tool is called from several places. Child lifecycle itself stays
-    /// exact because start and finish are correlated by the runtime call id.
+    /// Events do not carry source locations. Keep lifecycle state correlated
+    /// by call ID without guessing which script expression owns a dispatch.
     pub fn attach(&mut self, call: String, tool: String, summary: String) {
-        let node = self
-            .plan
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.tool.as_deref() == Some(tool.as_str()))
-            .map(|(index, _)| {
-                let load = self
-                    .children
-                    .iter()
-                    .filter(|child| child.node == Some(index))
-                    .count();
-                (load, index)
-            })
-            .min()
-            .map(|(_, index)| index);
         self.children.push(Child {
             call,
             tool,
@@ -445,7 +422,6 @@ impl ToolCall {
             started: Instant::now(),
             millis: None,
             ok: true,
-            node,
         });
     }
 
@@ -1730,7 +1706,6 @@ impl App {
                     status: ToolCallStatus::Pending,
                     started: Instant::now(),
                     finished: None,
-                    plan: script.as_deref().map(parse_plan).unwrap_or_default(),
                     script: script.unwrap_or_default(),
                     children: Vec::new(),
                     output: Vec::new(),
@@ -1782,7 +1757,6 @@ impl App {
                     call.intent = intent;
                 }
                 if let Some(script) = script {
-                    call.plan = parse_plan(&script);
                     call.script = script;
                 }
                 if let Some(output) = output {
@@ -2001,14 +1975,9 @@ impl App {
     }
 
     fn runtime_call_mut(&mut self, parent: Option<&str>) -> Option<&mut ToolCall> {
-        // Prefer the explicit owner even when it has already completed. Runs
-        // started by subagents may name an unseen call; fold those into the
-        // visible running call instead.
-        if let Some(parent) = parent.filter(|parent| self.call_index(parent).is_some()) {
-            self.call_mut(parent)
-        } else {
-            self.find_call_mut(ToolCall::running)
-        }
+        // Descendant events can name an unseen compose call. Without its
+        // owner, the event cannot update another call's counts.
+        self.call_mut(parent?)
     }
 
     fn call_index(&self, id: &str) -> Option<usize> {
@@ -4261,17 +4230,18 @@ mod tests {
             panic!("expected a tool block");
         };
         assert_eq!(call.children.len(), 1);
-        assert_eq!(call.children[0].node, Some(0));
+        assert_eq!(call.children[0].call, "call-1:compose:abc");
         assert_eq!(call.running_children(), 1);
     }
 
     #[test]
-    fn unknown_child_owner_uses_running_call_and_finishes_the_same_child() {
+    fn unknown_child_owner_cannot_change_a_visible_child_lifecycle() {
         let mut app = app();
         // No visible owner is a valid event-stream boundary, not a tool variant.
         app.apply(Update::Runtime(child("unseen:compose:before", "shell")));
         assert!(app.blocks.is_empty());
         compose(&mut app, "return shell({ command: \"ls\" })");
+        app.apply(Update::Runtime(child("call-1:compose:known", "shell")));
         app.note("intervening non-tool block");
         app.apply(Update::Runtime(child("unseen:compose:abc", "shell")));
         app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
@@ -4285,9 +4255,9 @@ mod tests {
             panic!("expected the visible compose call");
         };
         assert_eq!(call.children.len(), 1);
-        assert_eq!(call.running_children(), 0);
-        assert!(call.children[0].ok);
-        assert_eq!(call.children[0].millis, Some(12));
+        assert_eq!(call.running_children(), 1);
+        assert_eq!(call.children[0].call, "call-1:compose:known");
+        assert!(call.children[0].running());
     }
 
     #[test]
@@ -4318,7 +4288,7 @@ mod tests {
     }
 
     #[test]
-    fn spreads_repeated_dispatches_across_matching_plan_nodes() {
+    fn repeated_dispatches_keep_distinct_call_id_lifecycles() {
         let mut app = app();
         compose(
             &mut app,
@@ -4329,8 +4299,41 @@ mod tests {
         let Some(Block::Tool(call)) = app.blocks.last() else {
             panic!("expected a tool block");
         };
-        let nodes: Vec<_> = call.children.iter().map(|child| child.node).collect();
-        assert_eq!(nodes, [Some(0), Some(1)]);
+        assert_eq!(call.running_children(), 2);
+        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
+            call: "call-1:compose:b".into(),
+            tool: "shell".into(),
+            ok: true,
+            summary: "two".into(),
+            millis: 10,
+        }));
+        let Some(Block::Tool(call)) = app.blocks.last() else {
+            panic!("expected a tool block");
+        };
+        assert_eq!(call.running_children(), 1);
+        assert!(call.children[0].running());
+        assert!(!call.children[1].running());
+    }
+
+    #[test]
+    fn unknown_parent_events_do_not_attach_to_the_visible_call() {
+        let mut app = app();
+        compose(&mut app, "a = subagent({prompt: input.prompt})\nreturn a");
+        for id in ["descendant:compose:one", "unscoped"] {
+            app.apply(Update::Runtime(child(id, "subagent")));
+            app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
+                call: id.into(),
+                tool: "subagent".into(),
+                ok: true,
+                summary: "done".into(),
+                millis: 10,
+            }));
+        }
+        let Some(Block::Tool(call)) = app.blocks.last() else {
+            panic!("expected a tool block");
+        };
+        assert!(call.children.is_empty());
+        assert_eq!(call.running_children(), 0);
     }
 
     #[test]
