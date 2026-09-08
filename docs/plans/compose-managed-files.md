@@ -47,7 +47,7 @@ Extract references before text spilling. Apply the 8 KiB spill policy only to th
 
 ### Provider contract
 
-The canonical transcript retains typed tool-result images. Use native multimodal tool output where supported; otherwise verify wire contracts before adding adapter-only user-image projection after the relevant tool-result batch. Never persist fake user turns or silently stringify pixels. Explicitly gate unsupported provider/model combinations. Existing pinned private Responses support and public Responses/Completions stringification must be revalidated against current main.
+The canonical transcript retains typed tool-result images. **Phase 1 MUST include the non-native fallback**, not defer it to a later phase. Use native multimodal tool output on verified routes; otherwise project text/metadata tool results with a pointer to an immediately following user-role image message through the existing user attachment encoder. Place that message after the full parallel tool-result batch, never between unanswered results. This is provider-request-only: never persist fake user turns, rerun compose, duplicate delivery, or stringify pixels. Preserve original result text, labels, diagnostics, call/result pairing, normalization budgets, background completion, and replay/continuations. Lack of native image tool-output support is not a fatal gate when ordinary image input transport is available; model vision capability remains a provider/model constraint, not an arbitrary Kit allowlist. Verify actual private Responses and Completions/OpenRouter request encoders.
 
 The acceptance criterion is an actual image block in the next outgoing provider request, not a base64 string or marker. Replay must use snapshotted content after the original file changes or disappears.
 
@@ -95,7 +95,7 @@ Markdown image nodes such as `![Edited image](kit-file://file_opaque_id)` resolv
 
 | Phase | Branch / PR base | Owner | Scope and completion milestone |
 | --- | --- | --- | --- |
-| 1 | `feat/compose-files-phase-1` -> `main` | Dedicated phase-1 subagent | Versioned managed storage/reference contract; hidden read_file; compose finalizer; media-aware spill; provider delivery or explicit capability gate; basic tool-result TUI rendering. `return read_file({ path: "screenshot.png" })` delivers real pixels to model and TUI. |
+| 1 | `feat/compose-files-phase-1` -> `main` | Dedicated phase-1 subagent | Versioned managed storage/reference contract; hidden read_file; compose finalizer; media-aware spill; native provider delivery plus mandatory user-image transport fallback; basic tool-result TUI rendering. `return read_file({ path: "screenshot.png" })` delivers real pixels to model and TUI. |
 | 2 | `feat/compose-files-phase-2` -> phase-1 branch | New dedicated phase-2 subagent | Rotate/crop/resize/export, immutable references, bounded transforms, docs/tests. A pipeline works in one compose invocation; only returned files reach parent model. |
 | 3 | `feat/compose-files-phase-3` -> phase-2 branch | New dedicated phase-3 subagent | Typed subagent attachments/output, file-aware schema/binding, capability checks, parent/child grants and output promotion. Sticker-editing pipeline is supported end to end. |
 | 4 | `feat/compose-files-phase-4` -> phase-3 branch | New dedicated phase-4 subagent | Unified user/tool/assistant/Markdown rendering, resolver policy, live/replay consistency, caching and terminal fallback. All image origins render safely. |
@@ -117,7 +117,7 @@ The parent launches each successor only after verifying the previous gate. Keep 
 
 ## Acceptance test matrix
 
-- Real provider request contains native image input after compose return. No descriptor/base64 text substituted for pixels.
+- Real provider request contains image input after compose return, natively or in the mandatory request-only user-image fallback after the full tool-result batch. No descriptor/base64 text substituted for pixels.
 - Nested returns, multiple references, deduplication, deterministic labels, and intermediate non-delivery.
 - Text spill does not hide or corrupt image delivery; bounded traversal and independent byte/pixel budgets.
 - Malformed/forged/stale/cross-session references, unsupported versions, missing files, corrupt formats, directories, permissions, oversized/decompression-bomb input.

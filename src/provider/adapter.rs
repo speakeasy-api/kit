@@ -823,17 +823,16 @@ pub struct SpeakeasyKitSession {
     context_window: Option<u64>,
 }
 
-/// Validate the complete replay before a provider can stringify selected images.
-/// Ordinary user images are not tool outputs and are deliberately unaffected.
-pub(super) fn validate_tool_output_images(
-    request: &TurnRequest,
-    provider: &str,
-    model: &str,
-    supported: bool,
-) -> Result<(), LoopError> {
-    if supported {
-        return Ok(());
-    }
+/// Project only the outbound request; the caller's canonical transcript stays typed.
+/// Completions (including OpenRouter) stringify tool Parts, but encode ordinary
+/// user Media as image_url content. Native transports retain typed tool images,
+/// but detached notification images always need ordinary user attachments.
+pub(super) fn project_tool_output_images(
+    mut request: TurnRequest,
+    native: bool,
+) -> Result<TurnRequest, LoopError> {
+    // Validate before moving or recursively visiting parts. The iterator stack
+    // bounds both depth and work without allocating a sibling-sized frontier.
     const MAX_NODES: usize = 100_000;
     const MAX_DEPTH: usize = 64;
     let mut visited = 0;
@@ -845,8 +844,8 @@ pub(super) fn validate_tool_output_images(
         }
         // Store only one iterator per nesting level, never a transcript-wide
         // frontier or one entry per sibling. Bound both traversal and stack size.
-        pending.push((item.parts.iter(), false));
-        while let Some((parts, in_tool_output)) = pending.last_mut() {
+        pending.push(item.parts.iter());
+        while let Some(parts) = pending.last_mut() {
             let Some(part) = parts.next() else {
                 pending.pop();
                 continue;
@@ -855,25 +854,210 @@ pub(super) fn validate_tool_output_images(
             if visited > MAX_NODES {
                 return Err(tool_image_traversal_error());
             }
-            match part {
-                Part::Media(media) if *in_tool_output && media.modality == Modality::Image => {
-                    return Err(LoopError::InvalidState(format!(
-                        "selected-images-not-delivered: {provider}:{model} does not have verified image tool-output support. The program may already have completed; do not retry the program. Select a supported provider/model to deliver the retained images."
-                    )));
+            if let Part::ToolResult(result) = part
+                && let ToolOutput::Parts(parts) = &result.output
+            {
+                if pending.len() >= MAX_DEPTH {
+                    return Err(tool_image_traversal_error());
                 }
-                Part::ToolResult(result) => {
-                    if let ToolOutput::Parts(parts) = &result.output {
-                        if pending.len() >= MAX_DEPTH {
-                            return Err(tool_image_traversal_error());
-                        }
-                        pending.push((parts.iter(), true));
-                    }
-                }
-                _ => {}
+                pending.push(parts.iter());
             }
         }
     }
+
+    let mut transcript = Vec::with_capacity(request.transcript.len());
+    let mut outstanding = std::collections::HashSet::new();
+    let mut images = Vec::new();
+    for mut item in request.transcript {
+        // The loop has already answered detached calls with placeholders. Its
+        // completion notification contains serialized ToolResultPart values,
+        // not another tool answer. Even native transports must lift these images.
+        if item.kind == agentkit_core::ItemKind::Notification
+            && matches!(item.parts.first(), Some(Part::Text(text)) if text.text.starts_with("Background tool results: "))
+        {
+            for part in &mut item.parts {
+                if let Part::Structured(value) = part
+                    && is_detached_result(&value.value)
+                {
+                    project_detached_images(&mut value.value, &mut images, &mut visited, 1)?;
+                }
+            }
+        }
+        // Register the whole item before processing any answers. Calls may also
+        // span multiple assistant items, and results multiple tool items.
+        for part in &item.parts {
+            if let Part::ToolCall(call) = part {
+                outstanding.insert(call.id.clone());
+            }
+        }
+        for part in &mut item.parts {
+            if let Part::ToolResult(result) = part {
+                project_result_images(result, &mut images, native)?;
+                outstanding.remove(&result.call_id);
+            }
+        }
+        transcript.push(item);
+        if outstanding.is_empty() && !images.is_empty() {
+            let mut attachment = agentkit_core::Item::new(
+                agentkit_core::ItemKind::User,
+                std::mem::take(&mut images),
+            );
+            attachment
+                .metadata
+                .insert("kit.projected_tool_images".into(), Value::Bool(true));
+            transcript.push(attachment);
+        }
+    }
+    if !images.is_empty() {
+        return Err(LoopError::InvalidState(
+            "selected-images-not-delivered: cannot attach tool images before all outstanding tool calls are answered. The program may already have completed; do not retry or rerun the program.".into(),
+        ));
+    }
+    request.transcript = transcript;
+    Ok(request)
+}
+
+// maybe_convert_detached adds no dedicated metadata marker. Match its exact
+// result envelope only inside its Background tool results notification, never
+// reinterpret arbitrary Structured tool/user output as typed media.
+fn is_detached_result(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 4
+            && value["call_id"].is_string()
+            && value["is_error"].is_boolean()
+            && value["metadata"].is_object()
+            && value["output"].is_object()
+    })
+}
+
+// Walk only the serialized Parts/ToolResult domain, not arbitrary JSON values
+// or byte arrays. This keeps large images out of the node budget and never
+// deserializes an unbounded recursive ToolResult tree.
+fn project_detached_images(
+    result: &mut Value,
+    images: &mut Vec<Part>,
+    visited: &mut usize,
+    depth: usize,
+) -> Result<(), LoopError> {
+    if depth >= 64 {
+        return Err(tool_image_traversal_error());
+    }
+    let call_id = result["call_id"].as_str().unwrap_or_default().to_owned();
+    let Some(parts) = result["output"]
+        .get_mut("Parts")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let mut previous_text = None;
+    for part in parts {
+        *visited += 1;
+        if *visited > 100_000 {
+            return Err(tool_image_traversal_error());
+        }
+        if part
+            .get("Media")
+            .is_some_and(|media| media["modality"] == "Image")
+        {
+            let label = format!(
+                "Image from background tool call {call_id}: see the user image message immediately after this complete result batch."
+            );
+            let placeholder =
+                serde_json::to_value(Part::text(&label)).map_err(tool_image_projection_error)?;
+            let image = std::mem::replace(part, placeholder);
+            let image: Part = serde_json::from_value(image).map_err(|error| LoopError::InvalidState(format!(
+                "selected-images-not-delivered: invalid detached image: {error}. Do not retry or rerun the program."
+            )))?;
+            images.push(Part::text(label));
+            if let Some(text) = previous_text.take() {
+                images.push(Part::Text(text));
+            }
+            images.push(image);
+        } else if let Some(nested) = part.get_mut("ToolResult") {
+            project_detached_images(nested, images, visited, depth + 1)?;
+            previous_text = None;
+        } else {
+            previous_text = part
+                .get("Text")
+                .and_then(|text| serde_json::from_value(text.clone()).ok());
+        }
+    }
     Ok(())
+}
+
+// Recursion is safe after the complete request passes the depth/node preflight.
+fn project_result_images(
+    result: &mut agentkit_core::ToolResultPart,
+    images: &mut Vec<Part>,
+    native: bool,
+) -> Result<(), LoopError> {
+    let ToolOutput::Parts(parts) = &mut result.output else {
+        return Ok(());
+    };
+    let mut previous_text: Option<&agentkit_core::TextPart> = None;
+    for part in parts.iter_mut() {
+        match part {
+            Part::Media(media) if !native && media.modality == Modality::Image => {
+                let label = format!(
+                    "Image from tool call {}: see the user image message immediately after this complete tool-result batch.",
+                    result.call_id.0
+                );
+                images.push(Part::text(&label));
+                if let Some(text) = previous_text.take() {
+                    images.push(Part::Text(text.clone()));
+                }
+                images.push(std::mem::replace(part, Part::text(label)));
+            }
+            Part::ToolResult(nested) => {
+                project_result_images(nested, images, native)?;
+                previous_text = None;
+            }
+            Part::Text(text) => previous_text = Some(text),
+            _ => previous_text = None,
+        }
+    }
+    if !parts.iter().any(|part| matches!(part, Part::ToolResult(_))) {
+        return Ok(());
+    }
+    let mut flat = Vec::new();
+    for part in std::mem::take(parts) {
+        if let Part::ToolResult(nested) = part {
+            // Nested calls are content, not new protocol calls. Preserve their
+            // provenance and diagnostics while exposing supported content parts.
+            let provenance = Value::Object(serde_json::Map::from_iter([
+                ("call_id".into(), Value::String(nested.call_id.0)),
+                ("is_error".into(), Value::Bool(nested.is_error)),
+                (
+                    "metadata".into(),
+                    serde_json::to_value(nested.metadata).map_err(tool_image_projection_error)?,
+                ),
+            ]));
+            flat.push(Part::structured(Value::Object(serde_json::Map::from_iter(
+                [("nested_tool_result".into(), provenance)],
+            ))));
+            match nested.output {
+                ToolOutput::Parts(parts) => flat.extend(parts),
+                ToolOutput::Text(text) => flat.push(Part::text(text)),
+                ToolOutput::Structured(value) => flat.push(Part::structured(value)),
+                ToolOutput::Files(files) => flat.push(Part::structured(Value::Object(
+                    serde_json::Map::from_iter([(
+                        "files".into(),
+                        serde_json::to_value(files).map_err(tool_image_projection_error)?,
+                    )]),
+                ))),
+            }
+        } else {
+            flat.push(part);
+        }
+    }
+    *parts = flat;
+    Ok(())
+}
+
+fn tool_image_projection_error(error: serde_json::Error) -> LoopError {
+    LoopError::InvalidState(format!(
+        "selected-images-not-delivered: image request projection failed: {error}. The program may already have completed; do not retry or rerun the program."
+    ))
 }
 
 fn tool_image_traversal_error() -> LoopError {
@@ -891,14 +1075,11 @@ impl ModelSession for KitSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        if !matches!(self, Self::OpenAiSubscription(_)) {
-            validate_tool_output_images(
-                &request,
-                self.provider_name().unwrap_or("unknown"),
-                self.model_name().unwrap_or("unknown"),
-                false,
-            )?;
-        }
+        let request = if matches!(self, Self::OpenAiSubscription(_)) {
+            request
+        } else {
+            project_tool_output_images(request, false)?
+        };
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -1844,70 +2025,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn selected_images_rejected_on_completions_replay() {
-        let provider = SpeakeasyProvider {
-            openrouter: OpenRouterProvider::from(OpenRouterConfig::new("test-key", "test/model")),
-            api_key: "test-key".into(),
-            project: "test-project".into(),
-            chat_id: None,
-        };
-        let inner = agentkit_adapter_completions::CompletionsAdapter::new(provider)
-            .unwrap()
-            .start_session(SessionConfig::new("provider-identity-test"))
-            .await
-            .unwrap();
-        let speakeasy = KitSession::Speakeasy(super::SpeakeasyKitSession {
-            inner,
-            context_window: None,
-        });
-        for mut session in [openrouter_session("test/model").await, speakeasy] {
-            for nested in [false, true] {
-                let provider = session.provider_name().unwrap().to_owned();
-                let request = selected_image_request(nested);
-                let original = serde_json::to_value(&request.transcript).unwrap();
-                let error = match session.begin_turn(request.clone(), None).await {
-                    Err(error) => error,
-                    Ok(_) => panic!("image output reached unsupported provider"),
-                };
-                assert!(matches!(error, LoopError::InvalidState(_)));
-                let message = error.to_string();
-                assert!(message.contains("selected-images-not-delivered"));
-                assert!(message.contains(&provider));
-                assert!(message.contains("do not retry the program"));
-                assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_images_rejected_after_active_provider_switch() {
-        let initial = ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
-        let mut session = selectable_session(initial, openrouter_session("test/initial").await);
-        session.openrouter_api_key = Some("test-key".parse().unwrap());
-        let selected = ModelSelection::new(ProviderKind::OpenRouter, "test/replacement");
-        // Publish a complete selection, exactly as the selection API does. No
-        // guard crosses begin_turn, which must replace the active session first.
-        *session.selection.lock().unwrap() = SessionSelection {
-            model: selected.clone(),
-            reasoning_effort: None,
-            revision: 1,
-        };
-        let error = match session
-            .begin_turn(selected_image_request(false), None)
-            .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("switched provider accepted replayed images"),
-        };
-        assert!(matches!(error, LoopError::InvalidState(_)));
-        assert!(error.to_string().contains("openrouter:test/replacement"));
-        assert_eq!(session.active.model, selected);
-        assert_eq!(session.provider_name(), Some("openrouter"));
-    }
-
     #[test]
-    fn selected_image_guard_bounds_nested_and_wide_outputs() {
+    fn selected_image_projection_bounds_nested_and_wide_outputs() {
         let mut request = selected_image_request(false);
         let mut part = Part::text("deep");
         for _ in 0..65 {
@@ -1917,20 +2036,18 @@ mod tests {
             ));
         }
         request.transcript[0].parts = vec![part];
-        let error = super::validate_tool_output_images(&request, "openrouter", "test/model", false)
-            .unwrap_err();
+        let error = super::project_tool_output_images(request.clone(), false).unwrap_err();
         assert!(error.to_string().contains("traversal budget"));
         request.transcript[0].parts = vec![Part::ToolResult(ToolResultPart::success(
             "wide",
             ToolOutput::Parts(vec![Part::text("text"); 100_001]),
         ))];
-        let error = super::validate_tool_output_images(&request, "speakeasy", "test/model", false)
-            .unwrap_err();
+        let error = super::project_tool_output_images(request.clone(), false).unwrap_err();
         assert!(error.to_string().contains("do not retry or rerun"));
     }
 
     #[test]
-    fn selected_image_guard_preserves_user_images_and_text_tool_outputs() {
+    fn selected_image_projection_preserves_user_images_and_text_tool_outputs() {
         let mut request = selected_image_request(false);
         request.transcript[0] = Item::new(
             ItemKind::User,
@@ -1954,8 +2071,12 @@ mod tests {
             ));
         }
         let original = serde_json::to_value(&request.transcript).unwrap();
-        for provider in ["openrouter", "speakeasy", "openai-subscription"] {
-            super::validate_tool_output_images(&request, provider, "unknown", false).unwrap();
+        for native in [false, true] {
+            let projected = super::project_tool_output_images(request.clone(), native).unwrap();
+            assert_eq!(
+                serde_json::to_value(&projected.transcript).unwrap(),
+                original
+            );
         }
         assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
     }
@@ -2150,3 +2271,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "adapter_image_tests.rs"]
+mod image_tests;
+
+#[cfg(test)]
+#[path = "adapter_background_image_tests.rs"]
+mod background_image_tests;

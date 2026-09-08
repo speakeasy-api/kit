@@ -316,10 +316,8 @@ impl ModelSession for OpenAiSubscriptionSession {
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
         let model = self.inner.model_name().unwrap_or("unknown");
-        super::adapter::validate_tool_output_images(
-            &request,
-            "openai-subscription",
-            model,
+        request = super::adapter::project_tool_output_images(
+            request,
             supports_tool_output_images(model),
         )?;
         migrate_legacy_continuations(&mut request, &self.authentication_binding)?;
@@ -347,9 +345,8 @@ impl ModelSession for OpenAiSubscriptionSession {
     }
 }
 
-// Phase 1 deliberately verifies one existing fallback route, not arbitrary catalog
-// entries (the catalog currently has no parsed modality capabilities). GPT-5.4
-// documents image input: https://developers.openai.com/api/docs/models/gpt-5.4
+// Keep the verified native tool-output route. Other models use the ordinary
+// user-image request path; this is a transport choice, not a vision allowlist.
 // The pinned private Responses encoder supplies native image tool-output blocks.
 fn supports_tool_output_images(model: &str) -> bool {
     model == "gpt-5.4"
@@ -365,7 +362,12 @@ fn normalize_openai_images(
             item.kind,
             ItemKind::User | ItemKind::Context | ItemKind::Tool
         ) {
-            normalize_openai_parts(&mut item.parts, cancellation, 0)?;
+            let result = normalize_openai_parts(&mut item.parts, cancellation, 0);
+            if item.metadata.get("kit.projected_tool_images") == Some(&Value::Bool(true)) {
+                result.map_err(tool_image_normalization_error)?;
+            } else {
+                result?;
+            }
         }
     }
     Ok(request)
@@ -1048,10 +1050,8 @@ mod tests {
         let request = image_tool_request();
         let original = serde_json::to_value(&request.transcript).unwrap();
         assert!(supports_tool_output_images("gpt-5.4"));
-        super::super::adapter::validate_tool_output_images(
-            &request,
-            "openai-subscription",
-            "gpt-5.4",
+        let request = super::super::adapter::project_tool_output_images(
+            request,
             supports_tool_output_images("gpt-5.4"),
         )
         .unwrap();
@@ -1097,13 +1097,7 @@ mod tests {
             ),
         ];
         // An unverified model is not blocked for ordinary user images or text.
-        super::super::adapter::validate_tool_output_images(
-            &request,
-            "openai-subscription",
-            "gpt-future",
-            false,
-        )
-        .unwrap();
+        let request = super::super::adapter::project_tool_output_images(request, false).unwrap();
         let config = OpenAIResponsesConfig::chatgpt_private(
             "gpt-future",
             Authentication::bearer("test-key"),
@@ -1117,31 +1111,46 @@ mod tests {
         assert_eq!(wire["input"][1]["output"], "done");
     }
 
-    #[tokio::test]
-    async fn unknown_subscription_model_rejects_replayed_tool_images() {
+    #[test]
+    fn unlisted_subscription_model_projects_images_on_each_request_only() {
+        let request = image_tool_request();
+        let original = serde_json::to_value(&request.transcript).unwrap();
         let config = OpenAIResponsesConfig::chatgpt_private(
-            "gpt-future",
+            "gpt-6-astra",
             Authentication::bearer("test-key"),
         );
-        let inner = OpenAIResponsesAdapter::new(config)
-            .unwrap()
-            .start_session(SessionConfig::new("image-session"))
-            .await
+        assert!(!supports_tool_output_images("gpt-6-astra"));
+        let mut previous_wire = None;
+        // A resumed or continued turn starts from the same canonical typed data.
+        for _ in 0..2 {
+            let projected = super::super::adapter::project_tool_output_images(
+                request.clone(),
+                supports_tool_output_images("gpt-6-astra"),
+            )
             .unwrap();
-        let mut session = OpenAiSubscriptionSession {
-            inner,
-            context_window: None,
-            authentication_binding: "unused".into(),
-        };
-        let error = match session.begin_turn(image_tool_request(), None).await {
-            Err(error) => error,
-            Ok(_) => panic!("unknown model accepted image tool output"),
-        };
-        assert!(matches!(error, LoopError::InvalidState(_)));
-        assert!(error.to_string().contains("selected-images-not-delivered"));
-        assert!(error.to_string().contains("gpt-future"));
-        assert!(!supports_tool_output_images("gpt-5.4-custom"));
-        assert!(!supports_tool_output_images("gpt-5.3-codex-spark"));
+            let projected = normalize_openai_images(projected, None).unwrap();
+            let wire = config.encode_request(&projected).unwrap();
+            assert_eq!(wire["input"].as_array().unwrap().len(), 2);
+            assert_eq!(wire["input"][0]["type"], "function_call_output");
+            assert_eq!(wire["input"][0]["call_id"], "image-call");
+            let output = wire["input"][0]["output"].to_string();
+            assert!(output.contains("Selected screenshot"));
+            assert!(!output.contains("AQID"));
+            assert_eq!(wire["input"][1]["role"], "user");
+            let images: Vec<_> = wire["input"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|part| part["type"] == "input_image")
+                .collect();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0]["image_url"], "data:image/png;base64,AQID");
+            if let Some(previous) = previous_wire {
+                assert_eq!(wire, previous);
+            }
+            previous_wire = Some(wire);
+            assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
+        }
     }
 
     #[test]
@@ -1188,6 +1197,65 @@ mod tests {
             .decode()
             .unwrap();
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
+    }
+
+    #[test]
+    fn projected_image_failure_retains_no_rerun_guidance() {
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![0; MAX_FIELD_BYTES]),
+        )]);
+        let projected = super::super::adapter::project_tool_output_images(request, false).unwrap();
+        let error = normalize_openai_images(projected, None).unwrap_err();
+        assert!(error.to_string().contains("selected-images-not-delivered"));
+        assert!(error.to_string().contains("do not retry or rerun"));
+    }
+
+    #[test]
+    fn projected_tool_images_use_user_image_normalization_limits() {
+        let png = noisy_png(600, 600);
+        assert!(png.len() > MAX_NORMALIZED_IMAGE_BYTES);
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![
+            Part::text("Retained diagnostic and label"),
+            Part::media(Modality::Image, "image/png", DataRef::InlineBytes(png)),
+        ]);
+        let projected = super::super::adapter::project_tool_output_images(request, false).unwrap();
+        let normalized = normalize_openai_images(projected, None).unwrap();
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-6-astra",
+            Authentication::bearer("test-key"),
+        )
+        .with_limits(OpenAIResponsesLimits {
+            max_request_bytes: MAX_REQUEST_BYTES,
+            max_attempt_bytes: MAX_ATTEMPT_BYTES,
+            max_wire_bytes: MAX_WIRE_BYTES,
+            max_items: MAX_ITEMS,
+            max_text_bytes: MAX_FIELD_BYTES,
+        });
+        let wire = config.encode_request(&normalized).unwrap();
+        let image = wire["input"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| part["type"] == "input_image")
+            .unwrap();
+        let url = image["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(url.len() <= MAX_FIELD_BYTES);
+        assert!(
+            wire["input"][0]["output"]
+                .to_string()
+                .contains("Retained diagnostic and label")
+        );
     }
 
     #[test]
@@ -1722,3 +1790,7 @@ mod tests {
         assert_eq!(catalog.context_windows.len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "chatgpt_image_tests.rs"]
+mod image_tests;
