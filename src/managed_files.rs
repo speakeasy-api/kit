@@ -13,6 +13,9 @@ use serde_json::Value;
 
 use crate::resilient_fs as fs;
 
+mod operations;
+pub(crate) use operations::{Anchor, AspectRatio, Fit, Transform};
+
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 4096;
 const MAX_DIMENSION: u32 = 8192;
@@ -115,6 +118,19 @@ impl FileStore {
                 "file name must be nonempty UTF-8, at most 255 bytes, without control characters",
             )?
             .to_owned();
+        self.publish(session, bytes, name, mime_type, image, cancellation)
+    }
+
+    fn publish(
+        &self,
+        session: &str,
+        bytes: Vec<u8>,
+        name: String,
+        mime_type: String,
+        image: ImageDimensions,
+        cancellation: Option<&TurnCancellation>,
+    ) -> Result<FileReference> {
+        check_cancelled(cancellation)?;
         let mut random = [0_u8; 32];
         getrandom::fill(&mut random).map_err(display)?;
         let id = format!("file_{}", blake3::Hash::from_bytes(random).to_hex());
@@ -396,6 +412,17 @@ impl Selection {
 
 fn inspect_image(bytes: &[u8]) -> Result<(String, ImageDimensions)> {
     let format = image::guess_format(bytes).map_err(display)?;
+    let decoder = bounded_decoder(bytes, format)?;
+    let (width, height) = decoder.dimensions();
+    // Validate pixels without changing the original bytes or dimensions.
+    DynamicImage::from_decoder(decoder).map_err(display)?;
+    Ok((
+        format.to_mime_type().into(),
+        ImageDimensions { width, height },
+    ))
+}
+
+fn bounded_decoder(bytes: &[u8], format: ImageFormat) -> Result<Box<dyn ImageDecoder + '_>> {
     if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
         return Err("read_file supports only nonanimated PNG and JPEG images".into());
     }
@@ -404,6 +431,7 @@ fn inspect_image(bytes: &[u8]) -> Result<(String, ImageDimensions)> {
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(MAX_DECODE_BYTES);
     let decoder: Box<dyn ImageDecoder> = if format == ImageFormat::Png {
+        operations::check_png_metadata(bytes)?;
         let decoder = image::codecs::png::PngDecoder::with_limits(Cursor::new(bytes), limits)
             .map_err(display)?;
         if decoder.is_apng().map_err(display)? {
@@ -423,13 +451,7 @@ fn inspect_image(bytes: &[u8]) -> Result<(String, ImageDimensions)> {
     {
         return Err("image exceeds decoded pixel or allocation budget".into());
     }
-    // Fully decode to reject corrupt payloads before publication, then discard
-    // pixels. Preserve source bytes, EXIF orientation and metadata unchanged.
-    DynamicImage::from_decoder(decoder).map_err(display)?;
-    Ok((
-        format.to_mime_type().into(),
-        ImageDimensions { width, height },
-    ))
+    Ok(decoder)
 }
 
 fn valid_name(name: &str) -> bool {

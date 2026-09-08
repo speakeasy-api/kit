@@ -81,6 +81,12 @@ return stickered.output.result
 
 Explicit attachment arguments, not concatenating a reference into prompt text, determine image input. A model capable of images behind a text-only harness is still unsupported.
 
+### Phase 2 implemented contract
+
+The chosen explicit export name is `export_file({ file, path })`; its path/status receipt has no File marker. Hidden `image_rotate({ image, degrees })`, `image_crop({ image, aspect_ratio, anchor })`, and `image_resize({ image, width, height, fit })` use the unchanged version-1 session-authorized File descriptor and immutable disk publication. Geometry, all nine anchors, contain/cover/stretch rounding, format/orientation/metadata policy, per-stage allocation limits, and disk-only no-clobber export semantics are specified in [the user guide](../user/compose-and-local-tools.md#transform-images-in-one-compose-program).
+
+The pipeline remains one compose invocation with final-return-only delivery, using the existing foreground/background/replay finalizer and native/user-role provider transport. Export uses OS process permissions rather than inventing a filesystem sandbox; its explicit create-new/partial-output cancellation contract does not overwrite or roll back user paths. No dependency or persistent envelope schema change is intended. Phase 3 subagent contracts and phase 4 presentation remain separate milestones.
+
 ### Multimodal subagents
 
 Extend the currently text-oriented ACP child prompt/output path to retain typed attachments and assistant media. Import native generated media into managed storage. Bind actual emitted media to a file-aware output contract; models must not invent file IDs. Specify single-image binding and reject ambiguous multiple output. Validate shape AND reference existence/access, with explicit contract failure rather than silent string fallback for the new file-aware contract. Parent outputs must survive child close; grants and promotion must preserve session isolation.
