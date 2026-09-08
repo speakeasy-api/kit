@@ -115,14 +115,6 @@ def prompt(request):
                 "content": {"type": "text", "text": "internal"},
             },
             {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {
-                    "type": "image",
-                    "data": "aGVsbG8=",
-                    "mimeType": "image/png",
-                },
-            },
-            {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call-1",
                 "title": "Inspect files",

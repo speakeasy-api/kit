@@ -463,10 +463,11 @@ pub enum KitAdapter {
 #[derive(Clone)]
 pub struct OpenRouterKitAdapter {
     inner: OpenRouterAdapter,
+    config: Box<OpenRouterConfig>,
     client: reqwest::Client,
     models_url: Option<String>,
     model: String,
-    context_window: Arc<tokio::sync::OnceCell<u64>>,
+    context_window: Arc<tokio::sync::OnceCell<OpenRouterModelInfo>>,
 }
 
 const SPEAKEASY_COMPLETIONS_URL: &str = "https://app.getgram.ai/chat/completions";
@@ -607,7 +608,7 @@ impl KitAdapter {
                 )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
-                let inner = OpenRouterAdapter::new(config)
+                let inner = OpenRouterAdapter::new(config.clone())
                     .map_err(|error| error.to_string())?
                     .with_resilience(agentkit_http::ResilienceConfig::default());
                 let client = reqwest::Client::builder()
@@ -619,6 +620,7 @@ impl KitAdapter {
                     .map_err(|_| "could not build OpenRouter model catalog client".to_owned())?;
                 Ok(Self::OpenRouter(OpenRouterKitAdapter {
                     inner,
+                    config: Box::new(config),
                     client,
                     models_url,
                     model,
@@ -766,21 +768,53 @@ impl ModelAdapter for KitAdapter {
                 .await
                 .map(KitSession::OpenAiSubscription),
             Self::OpenRouter(adapter) => {
-                let session = adapter.inner.start_session(config).await?;
-                let context_window = match &adapter.models_url {
+                // The OnceCell publishes one complete immutable discovery result. Failed or
+                // cancelled discovery leaves it empty; no credentials or session state change.
+                let discovered = match &adapter.models_url {
                     Some(url) => adapter
                         .context_window
                         .get_or_try_init(|| {
-                            fetch_context_window(&adapter.client, url, &adapter.model)
+                            fetch_openrouter_model(&adapter.client, url, &adapter.model)
                         })
                         .await
-                        .ok()
-                        .copied(),
+                        .inspect_err(|_| tracing::warn!("OpenRouter model discovery unavailable; retaining legacy routing without native capability assertions"))
+                        .ok(),
                     None => None,
+                };
+                let context_window = discovered.and_then(|info| info.context_window);
+                let native = discover_native_image(
+                    &agentkit_http::Http::new(adapter.client.clone()),
+                    &adapter.config,
+                    discovered,
+                )
+                .await?;
+                let session = if let Some(capability) = &native {
+                    let native_config =
+                        native_generation_config((*adapter.config).clone(), capability)?;
+                    let client = reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(Duration::from_secs(10))
+                        .timeout(NATIVE_GENERATION_TIMEOUT)
+                        .build()
+                        .map_err(|_| {
+                            LoopError::Provider("could not build native image client".into())
+                        })?;
+                    CompletionsAdapter::with_client(
+                        OpenRouterProvider::from(native_config),
+                        agentkit_http::Http::new(BoundedImageClient {
+                            inner: agentkit_http::Http::new(client),
+                        }),
+                    )
+                    .with_resilience(native_generation_resilience())
+                    .start_session(config)
+                    .await?
+                } else {
+                    adapter.inner.start_session(config).await?
                 };
                 Ok(KitSession::OpenRouter(OpenRouterKitSession {
                     inner: session,
                     context_window,
+                    native,
                 }))
             }
             Self::Speakeasy(adapter) => {
@@ -816,6 +850,7 @@ pub enum KitSession {
 pub struct OpenRouterKitSession {
     inner: OpenRouterSession,
     context_window: Option<u64>,
+    native: Option<NativeImageCapability>,
 }
 
 pub struct SpeakeasyKitSession {
@@ -823,9 +858,14 @@ pub struct SpeakeasyKitSession {
     context_window: Option<u64>,
 }
 
+// Bound retained assistant-image payloads before the Completions encoder expands
+// them to base64. This is not a limit on the whole request, user attachments,
+// or model context; per-delivery validation remains separate.
+const MAX_OUTGOING_ASSISTANT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Project only the outbound request; the caller's canonical transcript stays typed.
-/// Completions (including OpenRouter) stringify tool Parts, but encode ordinary
-/// user Media as image_url content. Native transports retain typed tool images,
+/// Completions (including OpenRouter) stringify tool Parts and reject assistant
+/// Media, but encode ordinary user Media as image_url content. Native transports retain typed tool images,
 /// but detached notification images always need ordinary user attachments.
 pub(super) fn project_tool_output_images(
     mut request: TurnRequest,
@@ -836,6 +876,7 @@ pub(super) fn project_tool_output_images(
     const MAX_NODES: usize = 100_000;
     const MAX_DEPTH: usize = 64;
     let mut visited = 0;
+    let mut retained_assistant_image_bytes = 0_usize;
     let mut pending = Vec::new();
     for item in &request.transcript {
         visited += 1;
@@ -853,6 +894,20 @@ pub(super) fn project_tool_output_images(
             visited += 1;
             if visited > MAX_NODES {
                 return Err(tool_image_traversal_error());
+            }
+            if !native
+                && item.kind == agentkit_core::ItemKind::Assistant
+                && let Part::Media(media) = part
+                && media.modality == Modality::Image
+                && let DataRef::InlineBytes(bytes) = &media.data
+            {
+                retained_assistant_image_bytes =
+                    retained_assistant_image_bytes.saturating_add(bytes.len());
+                if retained_assistant_image_bytes > MAX_OUTGOING_ASSISTANT_IMAGE_BYTES {
+                    return Err(LoopError::InvalidState(
+                        "selected-images-not-delivered: outgoing request/history budget of 64 MiB for retained assistant-image payloads exceeded; compact history or start a fresh session with selected attachments".into(),
+                    ));
+                }
             }
             if let Part::ToolResult(result) = part
                 && let ToolOutput::Parts(parts) = &result.output
@@ -890,13 +945,59 @@ pub(super) fn project_tool_output_images(
                 outstanding.insert(call.id.clone());
             }
         }
+        // The canonical completed assistant item remains typed. Lift only the
+        // outbound copy's images, without synthetic text. Register all calls
+        // first so images wait for the complete parallel tool-result batch.
+        let mut lifted_assistant_images = false;
+        if !native && item.kind == agentkit_core::ItemKind::Assistant {
+            // These are delivery quotas, not cumulative transcript quotas.
+            let mut assistant_image_bytes = 0;
+            let mut assistant_image_count = 0;
+            let mut assistant_image_pixels = 0;
+            let mut supported = Vec::new();
+            for part in std::mem::take(&mut item.parts) {
+                if let Part::Media(media) = &part
+                    && media.modality == Modality::Image
+                {
+                    let DataRef::InlineBytes(bytes) = &media.data else {
+                        return Err(LoopError::InvalidState("selected-images-not-delivered: historical assistant images require inline PNG/JPEG bytes".into()));
+                    };
+                    if bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+                        return Err(LoopError::InvalidState("selected-images-not-delivered: historical assistant image exceeds 8 MiB".into()));
+                    }
+                    let (mime, pixels) = crate::managed_files::validate_provider_image(bytes)
+                        .map_err(|error| LoopError::InvalidState(format!("selected-images-not-delivered: invalid historical assistant image: {error}")))?;
+                    if mime != media.mime_type {
+                        return Err(LoopError::InvalidState("selected-images-not-delivered: historical image MIME disagrees with bytes".into()));
+                    }
+                    assistant_image_count += 1;
+                    assistant_image_bytes += bytes.len();
+                    assistant_image_pixels += pixels;
+                    if assistant_image_count > 8
+                        || assistant_image_bytes > MAX_NATIVE_DELIVERY_BYTES
+                        || assistant_image_pixels > 32 * 1024 * 1024
+                    {
+                        return Err(LoopError::InvalidState("selected-images-not-delivered: historical assistant images exceed 8 images, 16 MiB or 32 megapixels".into()));
+                    }
+                    images.push(part);
+                    lifted_assistant_images = true;
+                } else {
+                    supported.push(part);
+                }
+            }
+            item.parts = supported;
+        }
         for part in &mut item.parts {
             if let Part::ToolResult(result) = part {
                 project_result_images(result, &mut images, native)?;
                 outstanding.remove(&result.call_id);
             }
         }
-        transcript.push(item);
+        // An image-only assistant item has no supported content left. Do not
+        // emit an invalid empty assistant message before its user image block.
+        if !lifted_assistant_images || !item.parts.is_empty() {
+            transcript.push(item);
+        }
         if outstanding.is_empty() && !images.is_empty() {
             let mut attachment = agentkit_core::Item::new(
                 agentkit_core::ItemKind::User,
@@ -910,7 +1011,7 @@ pub(super) fn project_tool_output_images(
     }
     if !images.is_empty() {
         return Err(LoopError::InvalidState(
-            "selected-images-not-delivered: cannot attach tool images before all outstanding tool calls are answered. The program may already have completed; do not retry or rerun the program.".into(),
+            "selected-images-not-delivered: cannot attach images before all outstanding tool calls are answered. The program may already have completed; do not retry or rerun the program.".into(),
         ));
     }
     request.transcript = transcript;
@@ -1080,6 +1181,17 @@ impl ModelSession for KitSession {
         } else {
             project_tool_output_images(request, false)?
         };
+        if let Self::OpenRouter(session) = self
+            && let Some(capability) = &session.native
+            && !capability.image_input
+            && request
+                .transcript
+                .iter()
+                .flat_map(|item| &item.parts)
+                .any(|part| matches!(part, Part::Media(media) if media.modality == Modality::Image))
+        {
+            return Err(LoopError::Provider("selected-images-not-delivered: selected OpenRouter generation model does not support image input".into()));
+        }
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -1095,6 +1207,7 @@ impl ModelSession for KitSession {
                     context_window: session.context_window,
                     media_part: None,
                     next_media: 0,
+                    native: session.native.is_some(),
                 })
                 .map(KitTurn::OpenRouter),
             Self::Speakeasy(session) => session
@@ -1106,6 +1219,7 @@ impl ModelSession for KitSession {
                     context_window: session.context_window,
                     media_part: None,
                     next_media: 0,
+                    native: false,
                 })
                 .map(KitTurn::Speakeasy),
         }
@@ -1139,6 +1253,7 @@ pub struct OpenRouterKitTurn {
     context_window: Option<u64>,
     media_part: Option<PartId>,
     next_media: usize,
+    native: bool,
 }
 
 #[async_trait]
@@ -1151,7 +1266,9 @@ impl ModelTurn for KitTurn {
             Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
-                if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
+                if turn.native {
+                    normalize_native_event(&mut event)?;
+                } else if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
                     rewrite_openrouter_media(delta, &mut turn.media_part, &mut turn.next_media);
                 }
                 if let Some(context_window) = turn.context_window {
@@ -1162,6 +1279,452 @@ impl ModelTurn for KitTurn {
         }
     }
 }
+
+// Native image generation is opt-in through exact catalogue model selection, not
+// model-name heuristics. Official capabilities never apply to custom endpoints.
+#[derive(Clone)]
+struct NativeImageCapability {
+    image_input: bool,
+    modalities: Vec<String>,
+}
+
+struct OpenRouterModelInfo {
+    context_window: Option<u64>,
+    input: Vec<String>,
+    output: Vec<String>,
+    tools: bool,
+}
+
+fn parse_openrouter_model(value: &Value, model: &str) -> Option<OpenRouterModelInfo> {
+    let models = value.get("data")?.as_array()?;
+    if models.len() > MAX_MODELS {
+        return None;
+    }
+    let entry = models
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(model))?;
+    Some(OpenRouterModelInfo {
+        context_window: parse_context_window(value, model),
+        input: capability_strings(&entry["architecture"]["input_modalities"]).unwrap_or_default(),
+        output: capability_strings(&entry["architecture"]["output_modalities"]).unwrap_or_default(),
+        tools: capability_strings(&entry["supported_parameters"])
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == "tools"),
+    })
+}
+
+const MAX_NATIVE_ENDPOINTS: usize = 256;
+const MAX_CAPABILITY_VALUES: usize = 128;
+
+fn capability_strings(value: &Value) -> Result<Vec<String>, String> {
+    let values = value.as_array().ok_or("capability list must be an array")?;
+    if values.len() > MAX_CAPABILITY_VALUES {
+        return Err("capability list exceeds 128 entries".into());
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .map(str::to_owned)
+                .ok_or_else(|| "invalid capability list entry".into())
+        })
+        .collect()
+}
+
+fn native_endpoints_url(model: &str) -> Result<url::Url, LoopError> {
+    let error =
+        || LoopError::Provider("native-image-discovery: invalid selected model path".into());
+    if !valid_model_id(model)
+        || !model.contains('/')
+        || model
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        return Err(error());
+    }
+    let mut url = url::Url::parse(OPENROUTER_MODELS_URL).map_err(|_| error())?;
+    {
+        let mut path = url.path_segments_mut().map_err(|_| error())?;
+        for segment in model.split('/') {
+            path.push(segment);
+        }
+        path.push("endpoints");
+    }
+    Ok(url)
+}
+
+async fn discover_native_image(
+    client: &agentkit_http::Http,
+    config: &OpenRouterConfig,
+    catalog: Option<&OpenRouterModelInfo>,
+) -> Result<Option<NativeImageCapability>, LoopError> {
+    if !equivalent_openrouter_base_urls(&config.base_url, &OpenRouterConfig::new("", "").base_url) {
+        return Ok(None);
+    }
+    let Some(catalog) = catalog.filter(|info| info.output.iter().any(|value| value == "image"))
+    else {
+        return Ok(None);
+    };
+    let url = native_endpoints_url(&config.model)?;
+    let response = client.get(url.as_str()).send().await.map_err(|_| {
+        LoopError::Provider(
+            "native-image-discovery: endpoint transport failed; generation eligibility is unknown"
+                .into(),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(LoopError::Provider(format!(
+            "native-image-discovery: endpoint catalog returned {}; generation eligibility is unknown",
+            response.status()
+        )));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            LoopError::Provider("native-image-discovery: endpoint body failed".into())
+        })?;
+        if chunk.len() > MAX_MODELS_BYTES.saturating_sub(body.len()) {
+            return Err(LoopError::Provider(
+                "native-image-discovery: endpoint catalog exceeds 2 MiB".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice(&body).map_err(|_| {
+        LoopError::Provider("native-image-discovery: endpoint catalog is not valid JSON".into())
+    })?;
+    endpoint_image_capability(config, catalog, &value)
+}
+
+fn endpoint_image_capability(
+    config: &OpenRouterConfig,
+    catalog: &OpenRouterModelInfo,
+    value: &Value,
+) -> Result<Option<NativeImageCapability>, LoopError> {
+    let invalid = |reason: &str| {
+        LoopError::Provider(format!(
+            "native-image-discovery: {reason}; generation eligibility is unknown"
+        ))
+    };
+    let data = &value["data"];
+    if data["id"].as_str() != Some(config.model.as_str()) {
+        return Err(invalid("endpoint model identity mismatch"));
+    }
+    let input = capability_strings(&data["architecture"]["input_modalities"])
+        .map_err(|error| invalid(&error))?;
+    let output = capability_strings(&data["architecture"]["output_modalities"])
+        .map_err(|error| invalid(&error))?;
+    let same_values = |a: &[String], b: &[String]| {
+        a.len() == b.len()
+            && a.iter().all(|value| b.contains(value))
+            && b.iter().all(|value| a.contains(value))
+    };
+    if !same_values(&input, &catalog.input) || !same_values(&output, &catalog.output) {
+        return Err(invalid(
+            "endpoint architecture disagrees with model catalog",
+        ));
+    }
+    let endpoints = data["endpoints"]
+        .as_array()
+        .ok_or_else(|| invalid("missing endpoint list"))?;
+    if endpoints.len() > MAX_NATIVE_ENDPOINTS {
+        return Err(invalid("endpoint count exceeds 256"));
+    }
+    // Routing selectors can advertise broad aggregate modalities without having
+    // concrete generation providers. An empty list preserves legacy routing.
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    let mut tools = false;
+    for endpoint in endpoints {
+        let parameters = capability_strings(&endpoint["supported_parameters"])
+            .map_err(|error| invalid(&error))?;
+        tools |= parameters.iter().any(|parameter| parameter == "tools");
+    }
+    if !tools {
+        return Err(LoopError::Provider("native-image-ineligible: no concrete OpenRouter endpoint supports tools; compose cannot be removed".into()));
+    }
+    let concrete = OpenRouterModelInfo {
+        context_window: catalog.context_window,
+        input,
+        output,
+        tools: catalog.tools && tools,
+    };
+    native_image_capability(config, Some(&concrete))
+}
+
+fn native_image_capability(
+    config: &OpenRouterConfig,
+    info: Option<&OpenRouterModelInfo>,
+) -> Result<Option<NativeImageCapability>, LoopError> {
+    if !equivalent_openrouter_base_urls(&config.base_url, &OpenRouterConfig::new("", "").base_url) {
+        return Ok(None);
+    }
+    let Some(info) = info.filter(|info| info.output.iter().any(|value| value == "image")) else {
+        return Ok(None);
+    };
+    if !info.tools {
+        return Err(LoopError::Provider("OpenRouter image model is not eligible for a Kit agent: catalogue does not advertise tools support; compose cannot be removed".into()));
+    }
+    if info
+        .output
+        .iter()
+        .any(|value| value != "image" && value != "text")
+    {
+        return Err(LoopError::Provider(
+            "OpenRouter image model advertises unsupported output modalities".into(),
+        ));
+    }
+    Ok(Some(NativeImageCapability {
+        image_input: info.input.iter().any(|value| value == "image"),
+        modalities: info.output.clone(),
+    }))
+}
+
+fn native_generation_config(
+    mut config: OpenRouterConfig,
+    capability: &NativeImageCapability,
+) -> Result<OpenRouterConfig, LoopError> {
+    let routing = config
+        .extra_body
+        .entry("provider".into())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let routing = routing.as_object_mut().ok_or_else(|| {
+        LoopError::Provider(
+            "native-image-configuration: provider routing options must be an object".into(),
+        )
+    })?;
+    routing.insert("require_parameters".into(), Value::Bool(true));
+    // The proven generation contract is a complete JSON response. Buffer only
+    // after the transport enforces its raw-byte ceiling, before the decoder.
+    Ok(config.with_streaming(false).with_extra_body_value(
+        "modalities",
+        Value::Array(
+            capability
+                .modalities
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
+    ))
+}
+
+const NATIVE_GENERATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn native_generation_resilience() -> agentkit_http::ResilienceConfig {
+    // A timed-out/nonstreaming generation may already have been billed. Keep
+    // authentication and cancellation under a finite logical deadline, but do
+    // not automatically replay ambiguous generation failures or HTTP statuses.
+    agentkit_http::ResilienceConfig {
+        max_retries: 0,
+        retry_budget: Duration::from_secs(310),
+        attempt_timeout: Some(NATIVE_GENERATION_TIMEOUT),
+        stream_idle_timeout: Some(NATIVE_GENERATION_TIMEOUT),
+        ..agentkit_http::ResilienceConfig::default()
+    }
+}
+
+const MAX_NATIVE_RESPONSE_BYTES: usize = 24 * 1024 * 1024;
+const MAX_NATIVE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATIVE_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedImageClient {
+    inner: agentkit_http::Http,
+}
+
+#[async_trait]
+impl agentkit_http::HttpClient for BoundedImageClient {
+    async fn execute(
+        &self,
+        request: agentkit_http::HttpRequest,
+    ) -> Result<agentkit_http::HttpResponse, agentkit_http::HttpError> {
+        use agentkit_http::{HttpError, HttpResponse};
+        let response = self.inner.execute(request).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let url = response.url().to_owned();
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if chunk.len() > MAX_NATIVE_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Err(HttpError::Other(
+                    "native-image-response-too-large: raw response exceeds 24 MiB".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if status.is_success() {
+            let value: Value = serde_json::from_slice(&body).map_err(|_| {
+                HttpError::Other("native-image-malformed: expected a complete JSON response".into())
+            })?;
+            // The pinned decoder skips malformed image entries. Reject these
+            // before decoding so a valid sibling cannot mask invalid media.
+            let choices = value["choices"].as_array().ok_or_else(|| {
+                HttpError::Other("native-image-malformed: missing choices".into())
+            })?;
+            if choices.len() != 1 {
+                return Err(HttpError::Other(
+                    "native-image-malformed: expected exactly one completion choice".into(),
+                ));
+            }
+            let mut image_count = 0_usize;
+            let mut encoded_bytes = 0_usize;
+            for choice in choices {
+                for key in ["message", "delta"] {
+                    let message = &choice[key];
+                    let images = match message.get("images") {
+                        Some(images) => images
+                            .as_array()
+                            .ok_or_else(|| {
+                                HttpError::Other(
+                                    "native-image-malformed: images must be an array".into(),
+                                )
+                            })?
+                            .as_slice(),
+                        None => &[],
+                    };
+                    // Both native message.images and standard content image_url
+                    // parts pass the same strict checks, including skipped entries.
+                    let content_images = message["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| part["type"] == "image_url");
+                    for image in images.iter().chain(content_images) {
+                        let uri = image["image_url"]["url"].as_str().ok_or_else(|| {
+                            HttpError::Other("native-image-malformed: missing image URL".into())
+                        })?;
+                        let (_, payload) = native_image_payload(uri)
+                            .map_err(|error| HttpError::Other(error.to_string()))?;
+                        image_count += 1;
+                        encoded_bytes += payload.len();
+                        if image_count > 8
+                            || encoded_bytes > MAX_NATIVE_DELIVERY_BYTES.div_ceil(3) * 4 + 8 * 4
+                        {
+                            return Err(HttpError::Other(
+                                "native-image-too-large: aggregate images exceed delivery budget"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(HttpResponse::new(
+            status,
+            headers,
+            url,
+            Box::pin(futures_util::stream::once(async move {
+                Ok(bytes::Bytes::from(body))
+            })),
+        ))
+    }
+}
+
+fn native_image_payload(uri: &str) -> Result<(&str, &str), LoopError> {
+    let malformed = || {
+        LoopError::Provider("native-image-malformed: expected inline base64 PNG or JPEG; remote and file URIs are not fetched".into())
+    };
+    let (header, payload) = uri.split_once(',').ok_or_else(malformed)?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .ok_or_else(malformed)?;
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/*") || payload.is_empty() {
+        return Err(malformed());
+    }
+    if payload.len() > MAX_NATIVE_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err(LoopError::Provider(
+            "native-image-too-large: encoded image exceeds 8 MiB decoded budget".into(),
+        ));
+    }
+    Ok((mime, payload))
+}
+
+fn normalize_native_part(part: &mut Part) -> Result<(usize, u64), LoopError> {
+    use base64::Engine as _;
+    let Part::Media(media) = part else {
+        return Ok((0, 0));
+    };
+    if media.modality != Modality::Image {
+        return Err(LoopError::Provider(
+            "native-image-malformed: unsupported media modality".into(),
+        ));
+    }
+    let DataRef::Uri(uri) = &media.data else {
+        return Err(LoopError::Provider(
+            "native-image-malformed: expected inline image URI".into(),
+        ));
+    };
+    let (declared, payload) = native_image_payload(uri)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| LoopError::Provider("native-image-malformed: invalid base64".into()))?;
+    if bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(LoopError::Provider(
+            "native-image-too-large: decoded image exceeds 8 MiB".into(),
+        ));
+    }
+    let (mime, pixels) =
+        crate::managed_files::validate_provider_image(&bytes).map_err(|error| {
+            // The shared validator returns strings; preserve the bounded decoder's
+            // size failures separately from invalid encoding/format failures.
+            let code = match error.as_str() {
+                "image exceeds decoded pixel or allocation budget"
+                | "Memory limit exceeded"
+                | "Image size exceeds limit" => "native-image-too-large",
+                _ => "native-image-malformed",
+            };
+            LoopError::Provider(format!("{code}: {error}"))
+        })?;
+    if declared != "image/*" && declared != mime {
+        return Err(LoopError::Provider(
+            "native-image-malformed: declared MIME disagrees with image bytes".into(),
+        ));
+    }
+    let size = bytes.len();
+    media.mime_type = mime;
+    media.data = DataRef::InlineBytes(bytes);
+    Ok((size, pixels))
+}
+
+fn normalize_native_event(event: &mut Option<ModelTurnEvent>) -> Result<(), LoopError> {
+    match event {
+        Some(ModelTurnEvent::Delta(Delta::CommitPart { part })) => {
+            normalize_native_part(part)?;
+        }
+        Some(ModelTurnEvent::Finished(result)) => {
+            let mut count = 0;
+            let mut bytes = 0;
+            let mut pixels = 0;
+            for part in result
+                .output_items
+                .iter_mut()
+                .flat_map(|item| &mut item.parts)
+            {
+                let (size, image_pixels) = normalize_native_part(part)?;
+                count += usize::from(size > 0);
+                bytes += size;
+                pixels += image_pixels;
+                if count > 8 || bytes > MAX_NATIVE_DELIVERY_BYTES || pixels > 32 * 1024 * 1024 {
+                    return Err(LoopError::Provider("native-image-too-large: delivery exceeds 8 images, 16 MiB or 32 megapixels".into()));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "adapter_native_tests.rs"]
+mod native_tests;
 
 fn rewrite_openrouter_media(
     delta: &mut Delta,
@@ -1244,11 +1807,11 @@ fn models_url(completions_url: &str) -> Option<String> {
         .map(|prefix| format!("{prefix}/models"))
 }
 
-async fn fetch_context_window(
+async fn fetch_openrouter_model(
     client: &reqwest::Client,
     url: &str,
     model: &str,
-) -> Result<u64, String> {
+) -> Result<OpenRouterModelInfo, String> {
     let response = client
         .get(url)
         .send()
@@ -1271,8 +1834,8 @@ async fn fetch_context_window(
     }
     let value: Value = serde_json::from_slice(&body)
         .map_err(|_| "OpenRouter model catalog is not valid JSON".to_owned())?;
-    parse_context_window(&value, model)
-        .ok_or_else(|| format!("OpenRouter model catalog omitted context length for {model:?}"))
+    parse_openrouter_model(&value, model)
+        .ok_or_else(|| "OpenRouter model catalog omitted selected model".to_owned())
 }
 
 fn parse_context_window(value: &Value, model: &str) -> Option<u64> {
@@ -1972,6 +2535,7 @@ mod tests {
         KitSession::OpenRouter(OpenRouterKitSession {
             inner,
             context_window: None,
+            native: None,
         })
     }
 

@@ -176,10 +176,21 @@ fn transcript_replay(
 ) -> Vec<SessionNotification> {
     let mut replay = Vec::new();
     for item in transcript {
+        // History stores items, not TurnFinished boundaries. Bound each durable
+        // assistant item independently: the live per-turn budget must not become
+        // a lifetime session quota, nor guess turn boundaries from user messages
+        // (automated turns need not have one). Individual image limits are shared
+        // with live output; live capture still enforces the aggregate turn budget.
+        let mut image_budget = NativeImageBudget::default();
         for part in &item.parts {
             let update = match item.kind {
                 ItemKind::User => user_replay_content(part).map(SessionUpdate::UserMessageChunk),
-                ItemKind::Assistant => assistant_replay_update(part),
+                ItemKind::Assistant => match part {
+                    Part::Media(media) if media.modality == Modality::Image => {
+                        Some(image_budget.update(media))
+                    }
+                    _ => assistant_replay_update(part),
+                },
                 ItemKind::Tool => tool_replay_update(part),
                 ItemKind::Developer if crate::compaction::is_compaction_summary(item) => {
                     assistant_replay_update(part)
@@ -231,11 +242,46 @@ fn assistant_replay_update(part: &Part) -> Option<SessionUpdate> {
             .status(ToolCallStatus::Pending)
             .raw_input(call.input.clone()),
         )),
+        Part::Media(media) if media.modality == Modality::Image => {
+            Some(NativeImageBudget::default().update(media))
+        }
         Part::Media(_)
         | Part::File(_)
         | Part::Structured(_)
         | Part::ToolResult(_)
         | Part::Custom(_) => None,
+    }
+}
+
+/// A local budget, never shared across observers or guarded across notifications.
+#[derive(Default)]
+struct NativeImageBudget {
+    count: usize,
+    bytes: usize,
+}
+
+impl NativeImageBudget {
+    fn update(&mut self, media: &MediaPart) -> SessionUpdate {
+        use crate::acp_child::{
+            MAX_NATIVE_IMAGE_BYTES, MAX_NATIVE_IMAGE_TOTAL_BYTES, MAX_NATIVE_IMAGES,
+            NATIVE_IMAGE_ERROR,
+        };
+        // URI and handle media are not byte output. In particular, never fetch a URL.
+        let DataRef::InlineBytes(bytes) = &media.data else {
+            return SessionUpdate::Notice(Notice::new(NoticeSeverity::Error, NATIVE_IMAGE_ERROR));
+        };
+        if !matches!(media.mime_type.as_str(), "image/png" | "image/jpeg")
+            || bytes.is_empty()
+            || bytes.len() > MAX_NATIVE_IMAGE_BYTES
+            || self.count >= MAX_NATIVE_IMAGES
+            || self.bytes + bytes.len() > MAX_NATIVE_IMAGE_TOTAL_BYTES
+        {
+            return SessionUpdate::Notice(Notice::new(NoticeSeverity::Error, NATIVE_IMAGE_ERROR));
+        }
+        let image = ImageContent::new(BASE64.encode(bytes), media.mime_type.clone());
+        self.count += 1;
+        self.bytes += bytes.len();
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Image(image)))
     }
 }
 
@@ -1049,6 +1095,29 @@ impl LoopObserver for ResponseInterruptionNoticeObserver {
                 tracing::debug!(%error, "failed to queue ACP v1 interruption notice");
             }
             return;
+        }
+        // The pinned ACP adapter ignores media deltas. Forward only completed
+        // assistant items at this single boundary, before prompt settlement.
+        if let AgentEvent::TurnFinished(result) = &event.event
+            && result.finish_reason == FinishReason::Completed
+        {
+            let mut budget = NativeImageBudget::default();
+            for item in &result.items {
+                if item.kind != ItemKind::Assistant {
+                    continue;
+                }
+                for part in &item.parts {
+                    if let Part::Media(media) = part
+                        && media.modality == Modality::Image
+                        && let Err(error) = self.client.notify_session(SessionNotification::new(
+                            self.session_id.clone(),
+                            budget.update(media),
+                        ))
+                    {
+                        tracing::error!(%error, "failed to queue ACP assistant image output");
+                    }
+                }
+            }
         }
         self.inner.handle_event(event);
     }
@@ -1895,6 +1964,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         let mut transcript = driver.snapshot().transcript;
                         crate::transcript::sanitize_forked_transcript(&mut transcript);
                         Ok(AcpForkState {
+                            source_session_id: session_id.to_string(),
                             transcript,
                             selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
                             reasoning_effort: adapter
@@ -4581,6 +4651,159 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn native_images_forward_once_at_completed_assistant_boundary_and_replay() {
+        let integration = AcpIntegration::builder()
+            .name("native-image-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("native-image");
+        let loop_session_id = AgentkitSessionId::new("native-image-loop");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_session_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseInterruptionNoticeObserver::new(
+            integration,
+            client,
+            session_id.clone(),
+            test_activity(session_id.clone(), mpsc::unbounded_channel().0),
+        );
+        let media = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::inline_bytes([1, 2, 3]),
+        );
+        let items = vec![
+            Item::new(ItemKind::User, vec![media.clone()]),
+            Item::new(ItemKind::Tool, vec![media.clone()]),
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::text("answer"), media.clone()],
+            ),
+        ];
+        let emit = |event| {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_session_id.clone()),
+                event,
+            })
+        };
+        emit(AgentEvent::ContentDelta(Delta::CommitPart {
+            part: media.clone(),
+        }));
+        assert!(
+            messages.try_recv().is_err(),
+            "pinned adapter must not duplicate committed media"
+        );
+        let result = agentkit_loop::TurnResult {
+            turn_id: agentkit_core::TurnId::new("image-turn"),
+            finish_reason: FinishReason::Cancelled,
+            items: items.clone(),
+            usage: None,
+            metadata: MetadataMap::default(),
+        };
+        emit(AgentEvent::TurnFinished(result.clone()));
+        assert!(
+            messages.try_recv().is_err(),
+            "cancelled output must not be forwarded"
+        );
+        emit(AgentEvent::TurnFinished(agentkit_loop::TurnResult {
+            finish_reason: FinishReason::Completed,
+            ..result
+        }));
+        let Some(AcpClientMessage::SessionNotification(notification)) = messages.recv().await
+        else {
+            panic!("expected native output")
+        };
+        assert!(
+            matches!(&notification.update, SessionUpdate::AgentMessageChunk(chunk)
+            if matches!(&chunk.content, ContentBlock::Image(image) if image.data == "AQID" && image.mime_type == "image/png"))
+        );
+        assert!(
+            messages.try_recv().is_err(),
+            "only assistant media is forwarded, exactly once"
+        );
+        let replay = transcript_replay(&session_id, &items);
+        let assistant_images = replay.iter().filter(|n| matches!(&n.update,
+            SessionUpdate::AgentMessageChunk(chunk) if matches!(chunk.content, ContentBlock::Image(_)))).collect::<Vec<_>>();
+        assert_eq!(assistant_images.len(), 1);
+        assert_eq!(assistant_images[0].update, notification.update);
+    }
+
+    #[test]
+    fn native_image_replay_budget_is_not_a_session_lifetime_quota() {
+        use crate::acp_child::MAX_NATIVE_IMAGES;
+        let session = agentkit_acp::SessionId::new("many-image-turns");
+        // No user items are required between durable assistant outputs, e.g.
+        // automated continuation turns. Both histories must replay all images.
+        for with_user_input in [false, true] {
+            let mut transcript = Vec::new();
+            for _ in 0..=MAX_NATIVE_IMAGES {
+                if with_user_input {
+                    transcript.push(Item::text(ItemKind::User, "next image"));
+                }
+                transcript.push(Item::new(
+                    ItemKind::Assistant,
+                    vec![Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::inline_bytes([1, 2, 3]),
+                    )],
+                ));
+            }
+            let replay = transcript_replay(&session, &transcript);
+            assert_eq!(replay.iter().filter(|notification| matches!(
+                &notification.update, SessionUpdate::AgentMessageChunk(chunk)
+                    if matches!(&chunk.content, ContentBlock::Image(image) if image.data == "AQID")
+            )).count(), MAX_NATIVE_IMAGES + 1);
+            assert!(
+                !replay
+                    .iter()
+                    .any(|notification| matches!(notification.update, SessionUpdate::Notice(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn native_image_replay_reports_unsupported_sources_and_output_budgets() {
+        use crate::acp_child::{MAX_NATIVE_IMAGE_BYTES, MAX_NATIVE_IMAGES, NATIVE_IMAGE_ERROR};
+        let session = agentkit_acp::SessionId::new("image-errors");
+        for data in [
+            DataRef::uri("https://example.invalid/image.png"),
+            DataRef::inline_bytes([]),
+            DataRef::inline_bytes(vec![0; MAX_NATIVE_IMAGE_BYTES + 1]),
+        ] {
+            let replay = transcript_replay(
+                &session,
+                &[Item::new(
+                    ItemKind::Assistant,
+                    vec![Part::media(Modality::Image, "image/png", data)],
+                )],
+            );
+            assert!(matches!(&replay[0].update, SessionUpdate::Notice(notice)
+                if notice.severity == NoticeSeverity::Error && notice.title == NATIVE_IMAGE_ERROR));
+        }
+        let replay = transcript_replay(
+            &session,
+            &[Item::new(
+                ItemKind::Assistant,
+                vec![
+                    Part::media(Modality::Image, "image/png", DataRef::inline_bytes([1]));
+                    MAX_NATIVE_IMAGES + 1
+                ],
+            )],
+        );
+        assert!(matches!(
+            replay[MAX_NATIVE_IMAGES].update,
+            SessionUpdate::Notice(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn response_interruption_marker_becomes_v1_warning_before_replacement() {
         let integration = AcpIntegration::builder()
             .name("response-interruption-test")
@@ -6268,6 +6491,19 @@ pub(super) mod tests {
                 vec![Item::text(ItemKind::System, "system")],
             )
             .unwrap();
+            let store = crate::managed_files::FileStore::new(root.path());
+            let source_id = crate::session::new_id();
+            let image_path = root.path().join("inherited.png");
+            image::DynamicImage::new_luma8(2, 2)
+                .save(&image_path)
+                .unwrap();
+            let reference = store.import(&source_id, &image_path, None).unwrap();
+            opened
+                .observer
+                .attach_inherited_authority(
+                    store.prepare_inheritance(&source_id, &id).unwrap().unwrap(),
+                )
+                .unwrap();
             // A creation already owned by a prepared publication is rejected by
             // normal APIs, just as poison/write fencing is rejected in session tests.
             let held = if delivery == "rejected" {
@@ -6321,11 +6557,179 @@ pub(super) mod tests {
             }
             drop(held);
             drop(opened);
+            assert!(store.resolve(&source_id, &reference).is_ok());
+            let reopened_store = crate::managed_files::FileStore::new(root.path());
+            assert_eq!(
+                reopened_store.resolve(&id, &reference).is_ok(),
+                delivery == "success"
+            );
+            if delivery != "success" {
+                let retry = crate::session::open_uncommitted(
+                    root.path(),
+                    &id,
+                    false,
+                    vec![Item::text(ItemKind::System, "retry")],
+                )
+                .unwrap();
+                assert!(reopened_store.resolve(&id, &reference).is_err());
+                drop(retry);
+            }
+            let base = crate::artifacts::base(root.path()).with_file_name("files");
+            for session in [&source_id, &id] {
+                let _ = std::fs::remove_dir_all(
+                    base.join(blake3::hash(session.as_bytes()).to_hex().as_str()),
+                );
+            }
             assert_eq!(
                 crate::session::load(root.path(), &id).is_ok(),
                 delivery == "success"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_kit_fork_inherits_file_authority_without_reattachment() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let source = connection
+                    .send_request(NewSessionRequest::new(root.path().to_path_buf()))
+                    .block_task()
+                    .await?;
+                let store = crate::managed_files::FileStore::new(root.path());
+                let image_path = root.path().join("input.png");
+                image::DynamicImage::new_rgb8(2, 2)
+                    .save(&image_path)
+                    .unwrap();
+                let inherited = store
+                    .import(&source.session_id.to_string(), &image_path, None)
+                    .unwrap();
+                let expected = store
+                    .resolve(&source.session_id.to_string(), &inherited)
+                    .unwrap();
+                std::fs::remove_file(&image_path).unwrap();
+                // The request carries only the source session ID, never attachments.
+                let fork = connection
+                    .send_request(ForkSessionRequest::new(
+                        source.session_id.clone(),
+                        root.path().to_path_buf(),
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    store
+                        .resolve(&fork.session_id.to_string(), &inherited)
+                        .unwrap(),
+                    expected
+                );
+                // Imports after the authority snapshot are private to each branch.
+                image::DynamicImage::new_rgb8(3, 2)
+                    .save(&image_path)
+                    .unwrap();
+                let later_source = store
+                    .import(&source.session_id.to_string(), &image_path, None)
+                    .unwrap();
+                let later_branch = store
+                    .import(&fork.session_id.to_string(), &image_path, None)
+                    .unwrap();
+                assert!(
+                    store
+                        .resolve(&fork.session_id.to_string(), &later_source)
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .resolve(&source.session_id.to_string(), &later_branch)
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .resolve(&source.session_id.to_string(), &later_source)
+                        .is_ok()
+                );
+                assert!(
+                    store
+                        .resolve(&fork.session_id.to_string(), &later_branch)
+                        .is_ok()
+                );
+
+                // Corrupt a real storage envelope at the external filesystem boundary.
+                // Failed preparation must not publish a destination transcript/session.
+                let reference = serde_json::to_value(&inherited).unwrap();
+                let object = crate::artifacts::base(root.path())
+                    .with_file_name("files")
+                    .join(
+                        blake3::hash(source.session_id.to_string().as_bytes())
+                            .to_hex()
+                            .as_str(),
+                    )
+                    .join(reference["id"].as_str().unwrap());
+                let original = std::fs::read(&object).unwrap();
+                std::fs::write(&object, b"corrupt").unwrap();
+                let before = connection
+                    .send_request(ListSessionsRequest::new().cwd(root.path().to_path_buf()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(ForkSessionRequest::new(
+                        source.session_id.clone(),
+                        root.path().to_path_buf(),
+                    ))
+                    .block_task()
+                    .await
+                    .expect_err("corrupt authority must reject fork preparation");
+                let after = connection
+                    .send_request(ListSessionsRequest::new().cwd(root.path().to_path_buf()))
+                    .block_task()
+                    .await?;
+                assert_eq!(before.sessions.len(), after.sessions.len());
+                assert_eq!(
+                    store
+                        .resolve(&fork.session_id.to_string(), &inherited)
+                        .unwrap(),
+                    expected
+                );
+                std::fs::write(&object, original).unwrap();
+                let retry = connection
+                    .send_request(ForkSessionRequest::new(
+                        source.session_id.clone(),
+                        root.path().to_path_buf(),
+                    ))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    store
+                        .resolve(&retry.session_id.to_string(), &inherited)
+                        .unwrap(),
+                    expected
+                );
+                for id in [retry.session_id, fork.session_id, source.session_id] {
+                    connection
+                        .send_request(CloseSessionRequest::new(id))
+                        .block_task()
+                        .await?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

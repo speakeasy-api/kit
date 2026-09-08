@@ -14,12 +14,14 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, PermissionOption,
-    PermissionOptionKind, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, ImageContent,
+    PermissionOption, PermissionOptionKind, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::future::{Either, select};
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,6 +40,10 @@ const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
 const MAX_CAPTURED_UPDATES: usize = 64;
 const MAX_CAPTURED_UPDATE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_NATIVE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_NATIVE_IMAGES: usize = 8;
+pub(crate) const MAX_NATIVE_IMAGE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const NATIVE_IMAGE_ERROR: &str = "ACP assistant image transport failed";
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
 pub const BUILTIN_HARNESS: &str = "acp.kit";
@@ -417,6 +423,7 @@ struct Prompt {
     serial: tokio::sync::OwnedMutexGuard<()>,
     session_id: SessionId,
     text: String,
+    attachments: Vec<ImageContent>,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
@@ -500,11 +507,43 @@ pub(crate) struct ChildOutput {
     pub text: String,
     pub updates: Vec<Value>,
     pub updates_truncated: bool,
+    pub(crate) images: Vec<ImageContent>,
+    pub(crate) media_error: Option<String>,
+    image_bytes: usize,
     update_bytes: usize,
 }
 
 impl ChildOutput {
     fn record(&mut self, update: SessionUpdate) {
+        if let SessionUpdate::Notice(notice) = &update
+            && notice.title == NATIVE_IMAGE_ERROR
+        {
+            self.media_error = Some(NATIVE_IMAGE_ERROR.into());
+            return;
+        }
+        if let SessionUpdate::AgentMessageChunk(chunk) = &update
+            && let ContentBlock::Image(image) = &chunk.content
+        {
+            // Sticky rejection: later chunks cannot turn a partial image set into success.
+            if self.media_error.is_none() {
+                match native_image_size(image).and_then(|size| {
+                    if self.images.len() >= MAX_NATIVE_IMAGES
+                        || self.image_bytes + size > MAX_NATIVE_IMAGE_TOTAL_BYTES
+                    {
+                        Err("ACP assistant images exceed the output budget".into())
+                    } else {
+                        Ok(size)
+                    }
+                }) {
+                    Ok(size) => {
+                        self.images.push(image.clone());
+                        self.image_bytes += size;
+                    }
+                    Err(error) => self.media_error = Some(error),
+                }
+            }
+            return;
+        }
         if let SessionUpdate::AgentMessageChunk(chunk) = &update
             && let ContentBlock::Text(text) = &chunk.content
         {
@@ -542,6 +581,23 @@ impl ChildOutput {
         self.update_bytes += encoded.len();
         self.updates.push(value);
     }
+}
+
+/// Validate encoded transport before allocating decoded bytes. File import validates pixels.
+fn native_image_size(image: &ImageContent) -> Result<usize, String> {
+    if !matches!(image.mime_type.as_str(), "image/png" | "image/jpeg") {
+        return Err("ACP image MIME type must be PNG or JPEG".into());
+    }
+    if image.data.len() > MAX_NATIVE_IMAGE_BYTES.div_ceil(3) * 4 {
+        return Err("ACP image exceeds the byte limit".into());
+    }
+    let bytes = BASE64
+        .decode(&image.data)
+        .map_err(|_| "ACP image contains invalid base64".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err("ACP image has empty or oversized bytes".into());
+    }
+    Ok(bytes.len())
 }
 
 fn deduplicate_tool_output(update: &mut Value) {
@@ -680,6 +736,10 @@ impl ChildSession {
         }
     }
 
+    pub(crate) fn session_id(&self) -> &str {
+        self.session_id.0.as_ref()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed() || *self.closed.borrow()
     }
@@ -786,6 +846,35 @@ impl ChildSession {
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
+        self.prompt_with_attachments(text, Vec::new(), cancellation)
+            .await
+    }
+
+    pub async fn prompt_with_attachments(
+        &self,
+        text: String,
+        attachments: Vec<ImageContent>,
+        cancellation: TurnCancellation,
+    ) -> Result<ChildOutput, ChildError> {
+        if !attachments.is_empty() && !self.capabilities.prompt_capabilities.image {
+            return Err(ChildError::Failed(
+                "ACP harness does not support image prompts".into(),
+            ));
+        }
+        if attachments.len() > MAX_NATIVE_IMAGES {
+            return Err(ChildError::Failed(
+                "ACP image attachments exceed the count limit".into(),
+            ));
+        }
+        let mut bytes = 0;
+        for image in &attachments {
+            bytes += native_image_size(image).map_err(ChildError::Failed)?;
+            if bytes > MAX_NATIVE_IMAGE_TOTAL_BYTES {
+                return Err(ChildError::Failed(
+                    "ACP image attachments exceed the byte budget".into(),
+                ));
+            }
+        }
         // A one-shot admission race: an available gate may win concurrent
         // cancellation. The request retains cancellation after admission.
         let serial = match select(
@@ -802,6 +891,7 @@ impl ChildSession {
             serial,
             session_id: self.session_id.clone(),
             text,
+            attachments,
             cancellation: cancellation.clone(),
             reply,
         });
@@ -1156,8 +1246,10 @@ async fn run(
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
+                            let mut content = vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))];
+                            content.extend(prompt.attachments.into_iter().map(ContentBlock::Image));
                             let request = connection.send_request(agentkit_acp::PromptRequest::new(
-                                session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
+                                session_id.clone(), content,
                             )).block_task();
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
@@ -1636,6 +1728,7 @@ mod tests {
                 serial,
                 session_id: child.session_id.clone(),
                 text: "queued".into(),
+                attachments: Vec::new(),
                 cancellation: controller.handle().checkpoint(),
                 reply,
             }))
@@ -1915,11 +2008,144 @@ mod tests {
         })));
 
         assert_eq!(output.text, "hello");
-        assert_eq!(output.updates.len(), 3);
-        assert_eq!(output.updates[0]["content"]["type"], "image");
-        assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
-        assert_eq!(output.updates[2]["sessionUpdate"], "plan");
+        assert_eq!(output.images.len(), 1);
+        assert!(output.media_error.is_none());
+        assert_eq!(output.updates.len(), 2);
+        assert_eq!(output.updates[0]["sessionUpdate"], "tool_call");
+        assert_eq!(output.updates[1]["sessionUpdate"], "plan");
         assert!(!output.updates_truncated);
+    }
+
+    #[test]
+    fn native_image_capture_has_sticky_explicit_limits() {
+        let image = |data: String| {
+            SessionUpdate::AgentMessageChunk(agentkit_acp::ContentChunk::new(ContentBlock::Image(
+                ImageContent::new(data, "image/png"),
+            )))
+        };
+        for bad in [
+            String::new(),
+            "not base64!".into(),
+            "A".repeat(MAX_NATIVE_IMAGE_BYTES.div_ceil(3) * 4 + 1),
+        ] {
+            let mut output = ChildOutput::default();
+            output.record(image(bad));
+            output.record(image("AQID".into()));
+            assert!(output.media_error.is_some());
+            assert!(output.images.is_empty());
+            assert!(output.updates.is_empty());
+            assert!(!output.updates_truncated);
+        }
+        let mut output = ChildOutput::default();
+        for _ in 0..=MAX_NATIVE_IMAGES {
+            output.record(image("AQID".into()));
+        }
+        assert_eq!(output.images.len(), MAX_NATIVE_IMAGES);
+        assert!(output.media_error.is_some());
+        assert!(output.updates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_image_prompt_requires_advertised_capability_before_admission() {
+        let (session, mut requests) = admission_test_session();
+        let error = session
+            .prompt_with_attachments(
+                "image".into(),
+                vec![ImageContent::new("AQID", "image/png")],
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not support image"));
+        assert!(requests.try_recv().is_err());
+        assert!(session.serial.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn native_image_stdio_roundtrip_and_error_preserve_next_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        // A genuine external ACP peer: inspect typed input and echo native output
+        // before settling the JSON-RPC prompt response.
+        let script = r#"import json, sys
+for line in sys.stdin:
+ r=json.loads(line); method=r.get('method'); p=r.get('params', {})
+ if method=='initialize': out={'protocolVersion':1,'agentCapabilities':{'promptCapabilities':{'image':True}}}
+ elif method=='session/new': out={'sessionId':'image-session'}
+ elif method=='session/prompt':
+  blocks=p['prompt']; text=blocks[0]['text']
+  if text=='image':
+   assert blocks[1]=={'type':'image','data':'AQID','mimeType':'image/png'}, blocks
+   for kind in ['agent_thought_chunk','agent_message_chunk']:
+    print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':p['sessionId'],'update':{'sessionUpdate':kind,'content':blocks[1]}}}), flush=True)
+  if text=='bad':
+   print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':p['sessionId'],'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'image','data':'!','mimeType':'image/png'}}}}), flush=True)
+  print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':p['sessionId'],'update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':text}}}}), flush=True)
+  out={'stopReason':'end_turn'}
+ else: continue
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':out}), flush=True)
+"#;
+        let harnesses = AcpHarnesses::new(BTreeMap::from([(
+            "mock".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into()],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        )]))
+        .unwrap();
+        let config = ChildConfig {
+            root: root.path().to_path_buf(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses,
+            default_harness: "acp.mock".into(),
+            parent_id: None,
+            parent_name: None,
+        };
+        let session = ChildSession::start(
+            config,
+            "acp.mock".into(),
+            None,
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .unwrap();
+        let output = session
+            .prompt_with_attachments(
+                "image".into(),
+                vec![ImageContent::new("AQID", "image/png")],
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.text, "image");
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].data, "AQID");
+        assert!(output.updates.is_empty());
+        assert!(output.media_error.is_none());
+        let bad = session
+            .prompt("bad".into(), TurnCancellation::default())
+            .await
+            .unwrap();
+        assert!(bad.media_error.is_some());
+        assert!(bad.updates.is_empty());
+        let next = session
+            .prompt("next".into(), TurnCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(next.text, "next");
+        assert!(next.images.is_empty());
+        assert!(next.media_error.is_none());
     }
 
     #[test]
@@ -1981,28 +2207,20 @@ mod tests {
 
     #[test]
     fn rich_updates_are_bounded_by_count_and_bytes() {
-        let image = || {
+        let tool = |title: String| {
             update(json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "image", "data": "eA==", "mimeType": "image/png"}
+                "sessionUpdate": "tool_call", "toolCallId": "call", "title": title
             }))
         };
         let mut counted = ChildOutput::default();
         for _ in 0..=MAX_CAPTURED_UPDATES {
-            counted.record(image());
+            counted.record(tool("Inspect".into()));
         }
         assert_eq!(counted.updates.len(), MAX_CAPTURED_UPDATES);
         assert!(counted.updates_truncated);
 
         let mut oversized = ChildOutput::default();
-        oversized.record(update(json!({
-            "sessionUpdate": "agent_message_chunk",
-            "content": {
-                "type": "image",
-                "data": "x".repeat(MAX_CAPTURED_UPDATE_BYTES),
-                "mimeType": "image/png"
-            }
-        })));
+        oversized.record(tool("x".repeat(MAX_CAPTURED_UPDATE_BYTES)));
         assert!(oversized.updates.is_empty());
         assert!(oversized.updates_truncated);
     }

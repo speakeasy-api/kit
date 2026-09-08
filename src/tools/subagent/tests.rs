@@ -1896,3 +1896,6 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
     );
 }
+
+#[path = "native_images.rs"]
+mod native_images;

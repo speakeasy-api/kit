@@ -4,11 +4,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::managed_files::{FileReference, FileStore};
+use agentkit_acp::ImageContent;
 use agentkit_core::{ToolOutput, ToolResultPart, TurnCancellation};
 use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -180,22 +183,495 @@ struct SubagentListing {
     task: String,
 }
 
+const FILE_SCHEMA_REF: &str = "kit://schemas/file/v1";
+const IMAGE_INDEX_ANNOTATION: &str = "x-kit-image-index";
+const MEDIA_GUIDANCE: &str = " Attach images explicitly with attachments. A file-aware output_schema uses $ref kit://schemas/file/v1 at one root or required fixed object path; emit exactly one distinct native assistant image and omit the Kit-bound field. An optional x-kit-image-index integer 0..7 beside the File $ref selects that distinct image in emission order after all images validate; otherwise exactly one distinct image is required. Native images without this schema return output {value, files}. Only Files in the final compose return deliver pixels.";
+
+struct MediaContext {
+    store: FileStore,
+    session: String,
+    attachments: Vec<FileReference>,
+}
+
+fn attachments_schema() -> Value {
+    Value::Object(Map::from_iter([
+        ("type".into(), Value::from("array")),
+        ("maxItems".into(), Value::from(8)),
+        ("items".into(), super::read_file::file_schema()),
+    ]))
+}
+
+// File bindings deliberately support only a fixed required object-property path.
+// Scan first so refs hidden in unsupported applicators cannot silently fall back.
+fn file_binding(schema: &mut Value) -> Result<Option<Vec<String>>, String> {
+    // Walk schema positions only, iteratively. Ordinary schemas retain the
+    // validator's existing limits: a deep/wide non-File schema must not acquire
+    // the narrower File contract's limits. Once a File ref is found, enforce
+    // bounds including all positions visited before that ref.
+    let mut pending = vec![(&*schema, 0usize)];
+    let mut count = 0;
+    let mut nodes = 0;
+    let mut exceeded = false;
+    let mut unsupported = false;
+    while let Some((value, depth)) = pending.pop() {
+        nodes += 1;
+        exceeded |= nodes > 10_000 || depth > 64;
+        if let Value::Object(object) = value {
+            if object.contains_key(IMAGE_INDEX_ANNOTATION)
+                && object.get("$ref").and_then(Value::as_str) != Some(FILE_SCHEMA_REF)
+            {
+                return Err("x-kit-image-index is only allowed beside the exact File $ref".into());
+            }
+            if let Some(reference) = object.get("$ref") {
+                if reference.as_str() == Some(FILE_SCHEMA_REF) {
+                    count += 1;
+                } else {
+                    unsupported = true;
+                }
+            }
+            for (key, value) in object {
+                unsupported |= matches!(
+                    key.as_str(),
+                    "anyOf"
+                        | "oneOf"
+                        | "allOf"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "not"
+                        | "items"
+                        | "prefixItems"
+                        | "contains"
+                        | "$dynamicRef"
+                        | "$recursiveRef"
+                );
+                match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" | "dependencies" => {
+                        if let Value::Object(properties) = value {
+                            pending.extend(properties.values().map(|v| (v, depth + 1)));
+                        }
+                    }
+                    "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                        if let Value::Array(schemas) = value {
+                            pending.extend(schemas.iter().map(|v| (v, depth + 1)));
+                        }
+                    }
+                    "items" => match value {
+                        Value::Array(schemas) => {
+                            pending.extend(schemas.iter().map(|v| (v, depth + 1)));
+                        }
+                        _ => pending.push((value, depth + 1)),
+                    },
+                    "additionalProperties"
+                    | "additionalItems"
+                    | "unevaluatedProperties"
+                    | "unevaluatedItems"
+                    | "propertyNames"
+                    | "contains"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "contentSchema" => {
+                        pending.push((value, depth + 1));
+                    }
+                    // Annotations and literal data (const, enum, examples,
+                    // defaults) are not schemas, even when they contain $ref.
+                    _ => {}
+                }
+            }
+        }
+        if count > 0 && exceeded {
+            return Err("file-aware output_schema exceeds traversal limits".into());
+        }
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != 1 || unsupported {
+        return Err("file-aware output_schema requires exactly one fixed File binding; arrays, unions and other references are unsupported".into());
+    }
+    fn locate(schema: &mut Value, path: &mut Vec<String>) -> Result<bool, String> {
+        if schema.get("$ref").and_then(Value::as_str) == Some(FILE_SCHEMA_REF) {
+            if schema.as_object().is_none_or(|object| {
+                object
+                    .keys()
+                    .any(|key| key != "$ref" && key != IMAGE_INDEX_ANNOTATION)
+            }) {
+                return Err("File $ref only permits the optional x-kit-image-index sibling".into());
+            }
+            if let Some(index) = schema.get(IMAGE_INDEX_ANNOTATION)
+                && index.as_u64().is_none_or(|index| index > 7)
+            {
+                return Err("x-kit-image-index must be an integer from 0 through 7".into());
+            }
+            // Expand locally without passing Kit's selection annotation to the validator.
+            *schema = super::read_file::file_schema();
+            return Ok(true);
+        }
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let object_type = schema.get("type").and_then(Value::as_str) == Some("object");
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            for (key, child) in properties {
+                path.push(key.clone());
+                if locate(child, path)? {
+                    if !object_type || !required.contains(&Value::String(key.clone())) {
+                        return Err(
+                            "every File path property must be required in a fixed object schema"
+                                .into(),
+                        );
+                    }
+                    return Ok(true);
+                }
+                path.pop();
+            }
+        }
+        Ok(false)
+    }
+    let mut path = Vec::new();
+    if !locate(schema, &mut path)? {
+        return Err("File binding must be at the root or a required object-property path".into());
+    }
+    Ok(Some(path))
+}
+
+impl OutputContract {
+    fn for_request(
+        schema: Option<Value>,
+        attachments: Vec<FileReference>,
+        root: &std::path::Path,
+        session: &str,
+    ) -> Result<Self, ToolError> {
+        if attachments.len() > 8 {
+            return Err(ToolError::InvalidInput(
+                "at most eight attachments are supported".into(),
+            ));
+        }
+        let explicit_schema = schema.is_some();
+        let mut contract = Self::new(schema.unwrap_or(Value::Bool(true)))?;
+        contract.explicit_schema = explicit_schema;
+        contract.media = Some(MediaContext {
+            store: FileStore::new(root),
+            session: session.to_owned(),
+            attachments,
+        });
+        Ok(contract)
+    }
+
+    fn bind(&self, text: &str, file: Value) -> Result<Value, ChildError> {
+        let path = self
+            .binding
+            .as_ref()
+            .ok_or_else(|| ChildError::Failed("missing File binding".into()))?;
+        let mut value = if text.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(text.trim()).map_err(|_| {
+                ChildError::Failed("file-aware output contains invalid surrounding JSON".into())
+            })?
+        };
+        if path.is_empty() {
+            if !text.trim().is_empty() {
+                return Err(ChildError::Failed(
+                    "model must not supply the root File binding".into(),
+                ));
+            }
+            value = file;
+        } else {
+            let mut target = &mut value;
+            for (index, key) in path.iter().enumerate() {
+                let object = target.as_object_mut().ok_or_else(|| {
+                    ChildError::Failed("File binding requires surrounding JSON objects".into())
+                })?;
+                if index + 1 == path.len() {
+                    if object.contains_key(key) {
+                        return Err(ChildError::Failed(
+                            "model must not supply the File binding field".into(),
+                        ));
+                    }
+                    object.insert(key.clone(), file);
+                    break;
+                }
+                target = object
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Map::new()));
+            }
+        }
+        self.validator.validate(&value).map_err(|_| {
+            ChildError::Failed("bound File output does not match output_schema".into())
+        })?;
+        Ok(value)
+    }
+}
+
+// Charge every occurrence before deduplication. These are the managed delivery
+// budgets; the ACP transport independently enforces its capture budgets.
+const MAX_OUTPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OUTPUT_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+
+fn distinct_native_images<'a>(
+    images: &'a [ImageContent],
+    cancellation: &TurnCancellation,
+) -> Result<Vec<(&'a str, Vec<u8>)>, ChildError> {
+    use crate::acp_child::{MAX_NATIVE_IMAGE_BYTES, MAX_NATIVE_IMAGES};
+    if images.len() > MAX_NATIVE_IMAGES {
+        return Err(ChildError::Failed(
+            "native assistant images exceed the occurrence budget".into(),
+        ));
+    }
+    let mut encoded_bytes = 0;
+    for image in images {
+        if image.data.len() > MAX_NATIVE_IMAGE_BYTES.div_ceil(3) * 4 {
+            return Err(ChildError::Failed(
+                "native assistant image exceeds the encoded byte budget".into(),
+            ));
+        }
+        encoded_bytes += image.data.len();
+    }
+    // Each independently encoded occurrence can have up to two padding bytes.
+    if encoded_bytes > (MAX_OUTPUT_IMAGE_BYTES + 2 * images.len()).div_ceil(3) * 4 {
+        return Err(ChildError::Failed(
+            "native assistant images exceed the aggregate encoded byte budget".into(),
+        ));
+    }
+    let mut decoded_bytes = 0;
+    let mut pixels = 0;
+    let mut distinct: Vec<(&str, Vec<u8>)> = Vec::new();
+    for image in images {
+        if cancellation.is_cancelled() {
+            return Err(ChildError::Cancelled);
+        }
+        let bytes = BASE64.decode(&image.data).map_err(|_| {
+            ChildError::Failed("native assistant image contains invalid base64".into())
+        })?;
+        decoded_bytes += bytes.len();
+        if decoded_bytes > MAX_OUTPUT_IMAGE_BYTES {
+            return Err(ChildError::Failed(
+                "native assistant images exceed the aggregate decoded byte budget".into(),
+            ));
+        }
+        // Validate every occurrence, including a repeated payload with a forged
+        // MIME declaration, before it can qualify as an exact duplicate.
+        let (mime, occurrence_pixels) =
+            crate::managed_files::validate_provider_image(&bytes).map_err(ChildError::Failed)?;
+        if mime != image.mime_type {
+            return Err(ChildError::Failed(
+                "native assistant image MIME type does not match its bytes".into(),
+            ));
+        }
+        pixels += occurrence_pixels;
+        if pixels > MAX_OUTPUT_IMAGE_PIXELS {
+            return Err(ChildError::Failed(
+                "native assistant images exceed the aggregate pixel budget".into(),
+            ));
+        }
+        if !distinct.iter().any(|(previous_mime, previous_bytes)| {
+            *previous_mime == image.mime_type && previous_bytes == &bytes
+        }) {
+            distinct.push((&image.mime_type, bytes));
+        }
+    }
+    if cancellation.is_cancelled() {
+        return Err(ChildError::Cancelled);
+    }
+    Ok(distinct)
+}
+
+async fn run_turn(
+    child: &ChildSession,
+    root: &std::path::Path,
+    child_id: &str,
+    kit: bool,
+    prompt: String,
+    contract: Option<&OutputContract>,
+    cancellation: TurnCancellation,
+) -> Result<(Value, Option<SubagentUpdates>), ChildError> {
+    let media = contract.and_then(|c| c.media.as_ref());
+    let child_store = FileStore::new(root);
+    // Kit's ACP session ID is its durable storage identity, including native
+    // forks. External harness IDs are not Kit identities (and may collide), so
+    // those use the unique parent-owned handle namespace instead.
+    let child_id = if kit { child.session_id() } else { child_id };
+    let mut attachments = Vec::new();
+    if let Some(media) = media {
+        let selection = serde_json::to_value(&media.attachments)
+            .map_err(|e| ChildError::Failed(e.to_string()))?;
+        // Preflight all descriptor and aggregate image budgets before encoding.
+        let parts = media
+            .store
+            .selected_parts(&media.session, &selection, Some(&cancellation))
+            .map_err(ChildError::Failed)?;
+        let mut granted = Vec::new();
+        for reference in &media.attachments {
+            // selected_parts already checked every occurrence's metadata.
+            // Deduplicate complete references, not unvalidated IDs.
+            if granted.contains(&reference) {
+                continue;
+            }
+            media
+                .store
+                .grant_to(
+                    &media.session,
+                    reference,
+                    &child_store,
+                    child_id,
+                    Some(&cancellation),
+                )
+                .map_err(ChildError::Failed)?;
+            granted.push(reference);
+        }
+        for part in parts {
+            if let agentkit_core::Part::Media(part) = part
+                && let agentkit_core::DataRef::InlineBytes(bytes) = part.data
+            {
+                attachments.push(ImageContent::new(BASE64.encode(bytes), part.mime_type));
+            }
+        }
+    }
+    let prompt = structured_prompt(prompt, contract);
+    let output = if attachments.is_empty() {
+        child.prompt(prompt, cancellation.clone()).await?
+    } else {
+        child
+            .prompt_with_attachments(prompt, attachments, cancellation.clone())
+            .await?
+    };
+    if let Some(error) = &output.media_error {
+        return Err(ChildError::Failed(format!(
+            "native assistant image capture failed: {error}"
+        )));
+    }
+    let mut images = distinct_native_images(&output.images, &cancellation)?;
+    let strict = contract.is_some_and(|c| c.binding.is_some());
+    if let Some(index) = contract.and_then(|contract| contract.image_index) {
+        if index >= images.len() {
+            return Err(ChildError::Failed(format!(
+                "x-kit-image-index {index} is out of range for {} distinct native assistant images",
+                images.len()
+            )));
+        }
+        // Selection is caller-fixed, and happens only after all occurrences have
+        // passed validation and budgets. No unselected image is imported/granted.
+        images = vec![images.swap_remove(index)];
+    } else if strict && images.len() != 1 {
+        return Err(ChildError::Failed(format!(
+            "file-aware output requires exactly one distinct native assistant image (received {})",
+            images.len()
+        )));
+    }
+    if output.images.is_empty() {
+        return Ok(turn_output(output, contract));
+    }
+    let media = media.ok_or_else(|| {
+        ChildError::Failed("native image output requires an invoking session".into())
+    })?;
+    let mut files = Vec::new();
+    for (index, (mime_type, bytes)) in images.into_iter().enumerate() {
+        let extension = if mime_type == "image/png" {
+            "png"
+        } else {
+            "jpg"
+        };
+        let file = child_store
+            .import_bytes(
+                child_id,
+                &format!("assistant-{}.{}", index + 1, extension),
+                mime_type,
+                &bytes,
+                Some(&cancellation),
+            )
+            .map_err(ChildError::Failed)?;
+        child_store
+            .grant_to(
+                child_id,
+                &file,
+                &media.store,
+                &media.session,
+                Some(&cancellation),
+            )
+            .map_err(ChildError::Failed)?;
+        files.push(serde_json::to_value(file).map_err(|e| ChildError::Failed(e.to_string()))?);
+    }
+    let (value, updates) = if let Some(contract) = contract.filter(|c| c.binding.is_some()) {
+        let value = contract.bind(&output.text, files.remove(0))?;
+        let (_, updates) = turn_output(output, None);
+        (value, updates)
+    } else {
+        let (value, updates) = turn_output(output, contract);
+        (
+            Value::Object(Map::from_iter([
+                ("value".into(), value),
+                ("files".into(), Value::Array(files)),
+            ])),
+            updates,
+        )
+    };
+    // Publication and complete access validation precede the success transition.
+    media
+        .store
+        .selected_parts(&media.session, &value, Some(&cancellation))
+        .map_err(ChildError::Failed)?;
+    Ok((value, updates))
+}
+
 struct OutputContract {
     schema: String,
     validator: jsonschema::Validator,
+    binding: Option<Vec<String>>,
+    image_index: Option<usize>,
+    media: Option<MediaContext>,
+    explicit_schema: bool,
 }
 
 impl OutputContract {
     fn new(schema: Value) -> Result<Self, ToolError> {
-        let validator = jsonschema::validator_for(&schema)
+        let mut resolved = schema.clone();
+        let binding = file_binding(&mut resolved).map_err(ToolError::InvalidInput)?;
+        let image_index = binding.as_ref().and_then(|path| {
+            path.iter()
+                .fold(&schema, |node, key| &node["properties"][key])
+                .get(IMAGE_INDEX_ANNOTATION)
+                .and_then(Value::as_u64)
+                .map(|index| index as usize)
+        });
+        let validator = jsonschema::validator_for(&resolved)
             .map_err(|error| ToolError::InvalidInput(format!("invalid output_schema: {error}")))?;
         let schema = serde_json::to_string(&schema).map_err(|error| {
             ToolError::ExecutionFailed(format!("failed to serialize output_schema: {error}"))
         })?;
-        Ok(Self { schema, validator })
+        Ok(Self {
+            schema,
+            validator,
+            binding,
+            image_index,
+            media: None,
+            explicit_schema: true,
+        })
     }
 
     fn prompt(&self, prompt: String) -> String {
+        if !self.explicit_schema {
+            return prompt;
+        }
+        if let Some(path) = &self.binding {
+            if let Some(index) = self.image_index {
+                return format!(
+                    "{prompt}\n\nEmit native assistant images. The caller fixed distinct-image index {index} in first-emission order; Kit validates every occurrence and binds only that selected image at {}. Do not supply or override the index or binding field, a placeholder, or a File ID. Return only surrounding JSON fields; omit text if none are needed. Output schema: {}",
+                    serde_json::to_string(path).unwrap_or_default(),
+                    self.schema
+                );
+            }
+            return format!(
+                "{prompt}\n\nEmit exactly one distinct native assistant image. Kit imports and binds it at {}. Do not write that field, a placeholder, or a File ID. Return only surrounding JSON fields; omit text if none are needed. Output schema: {}",
+                serde_json::to_string(path).unwrap_or_default(),
+                self.schema
+            );
+        }
         format!(
             "{prompt}\n\nReturn only a JSON value matching this JSON Schema. Do not wrap it in Markdown or add commentary:\n{}",
             self.schema
@@ -203,6 +679,9 @@ impl OutputContract {
     }
 
     fn parse(&self, output: &str) -> Option<Value> {
+        if !self.explicit_schema || self.binding.is_some() {
+            return None;
+        }
         let value: Value = serde_json::from_str(output.trim()).ok()?;
         self.validator.validate(&value).ok()?;
         Some(value)
@@ -395,7 +874,7 @@ impl Subagents {
         let child_config = self
             .config
             .clone()
-            .with_root(root)
+            .with_root(root.clone())
             .with_parent_context(id.clone(), state.lock().await.name.clone());
         {
             let locked = state.lock().await;
@@ -436,10 +915,7 @@ impl Subagents {
             self.emit_event(locked.runtime_event(id.clone()));
         }
         self.monitor_child_exit(id.clone(), &state, &child);
-        let output = match child
-            .prompt(structured_prompt(prompt, contract), cancellation)
-            .await
-        {
+        let output = match run_turn(&child, &root, &id, kit, prompt, contract, cancellation).await {
             Ok(output) => output,
             Err(error) => {
                 self.fail_removed_and_remove(&id, &state).await;
@@ -447,7 +923,7 @@ impl Subagents {
                 return Err(error);
             }
         };
-        let (output, updates) = turn_output(output, contract);
+        let (output, updates) = output;
         let mut locked = state.lock().await;
         self.check_active(&locked)?;
         locked.status = SubagentStatus::Idle;
@@ -508,15 +984,24 @@ impl Subagents {
             .clone()
             .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?;
         let name = locked.name.clone();
+        let root = locked.root.clone();
+        let kit = locked.kit;
         let event = locked.runtime_event(prior.id.clone());
         drop(locked);
         self.emit_event(event);
-        match child
-            .prompt(structured_prompt(prompt, contract), cancellation)
-            .await
+        match run_turn(
+            &child,
+            &root,
+            &prior.id,
+            kit,
+            prompt,
+            contract,
+            cancellation,
+        )
+        .await
         {
             Ok(output) => {
-                let (output, updates) = turn_output(output, contract);
+                let (output, updates) = output;
                 let mut locked = state.lock().await;
                 self.check_active(&locked)?;
                 locked.status = SubagentStatus::Idle;
@@ -742,7 +1227,7 @@ impl Subagents {
         let child_config = self
             .config
             .clone()
-            .with_root(root)
+            .with_root(root.clone())
             .with_parent_context(id.clone(), branch_name.clone());
         let child_result = if native_fork {
             let parent = kit.then(|| (id.clone(), branch_name));
@@ -804,9 +1289,16 @@ impl Subagents {
                 .cleanup_installed_child(&id, &state, &child, ChildError::Cancelled)
                 .await);
         }
-        let output = match child
-            .prompt(structured_prompt(prompt, contract.as_deref()), cancellation)
-            .await
+        let output = match run_turn(
+            &child,
+            &root,
+            &id,
+            kit,
+            prompt,
+            contract.as_deref(),
+            cancellation,
+        )
+        .await
         {
             Ok(output) => output,
             Err(error) => {
@@ -815,7 +1307,7 @@ impl Subagents {
                     .await);
             }
         };
-        let (output, updates) = turn_output(output, contract.as_deref());
+        let (output, updates) = output;
         let mut locked = state.lock().await;
         if reply.is_closed() {
             drop(locked);
@@ -1490,6 +1982,7 @@ fn continuation_schema() -> serde_json::Value {
                     "prompt".into(),
                     Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
                 ),
+                ("attachments".into(), attachments_schema()),
                 (
                     "output_schema".into(),
                     Value::Object(Map::from_iter([(
@@ -1570,7 +2063,7 @@ impl SubagentTool {
             )
         };
         let description = format!(
-            "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. {usage}Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference."
+            "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. {usage}Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference.{MEDIA_GUIDANCE}"
         );
         let input_schema = Value::Object(Map::from_iter([
             ("type".into(), Value::from("object")),
@@ -1624,6 +2117,7 @@ impl SubagentTool {
                             ),
                         ])),
                     ),
+                    ("attachments".into(), attachments_schema()),
                     (
                         "output_schema".into(),
                         Value::Object(Map::from_iter([(
@@ -1660,7 +2154,7 @@ impl PromptTool {
             manager,
             spec: ToolSpec::new(
                 ToolName::new("prompt"),
-                "Re-prompt the same completed ACP subagent session using a prior subagent value.",
+                format!("Re-prompt the same completed ACP subagent session using a prior subagent value.{MEDIA_GUIDANCE}"),
                 continuation_schema(),
             )
             .with_output_schema(value_schema())
@@ -1676,7 +2170,7 @@ impl ForkTool {
             ""
         };
         let description = format!(
-            "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, preferably assign the fork a concise role-oriented display name, prompt it, and return the new session value.{usage}"
+            "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, preferably assign the fork a concise role-oriented display name, prompt it, and return the new session value.{usage}{MEDIA_GUIDANCE}"
         );
         Self {
             manager,
@@ -1698,6 +2192,7 @@ impl ForkTool {
                                 )])),
                             ),
                             ("name".into(), display_name_schema()),
+                            ("attachments".into(), attachments_schema()),
                             (
                                 "output_schema".into(),
                                 Value::Object(Map::from_iter([(
@@ -1764,6 +2259,8 @@ impl CloseTool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
+    #[serde(default)]
+    attachments: Vec<FileReference>,
     prompt: String,
     name: Option<String>,
     harness: Option<String>,
@@ -1775,6 +2272,8 @@ struct Input {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Continuation {
+    #[serde(default)]
+    attachments: Vec<FileReference>,
     subagent: SubagentValue,
     prompt: String,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
@@ -1783,6 +2282,8 @@ struct Continuation {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForkInput {
+    #[serde(default)]
+    attachments: Vec<FileReference>,
     subagent: SubagentValue,
     prompt: String,
     name: Option<String>,
@@ -1902,7 +2403,12 @@ impl Tool for SubagentTool {
     ) -> Result<ToolResult, ToolError> {
         let input: Input = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let contract = input.output_schema.map(OutputContract::new).transpose()?;
+        let contract = Some(OutputContract::for_request(
+            input.output_schema,
+            input.attachments,
+            &self.manager.config.root,
+            &request.session_id.0,
+        )?);
         result(
             request,
             self.manager
@@ -1935,7 +2441,12 @@ impl Tool for PromptTool {
     ) -> Result<ToolResult, ToolError> {
         let input: Continuation = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let contract = input.output_schema.map(OutputContract::new).transpose()?;
+        let contract = Some(OutputContract::for_request(
+            input.output_schema,
+            input.attachments,
+            &self.manager.config.root,
+            &request.session_id.0,
+        )?);
         result(
             request,
             self.manager
@@ -1962,7 +2473,12 @@ impl Tool for ForkTool {
     ) -> Result<ToolResult, ToolError> {
         let input: ForkInput = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let contract = input.output_schema.map(OutputContract::new).transpose()?;
+        let contract = Some(OutputContract::for_request(
+            input.output_schema,
+            input.attachments,
+            &self.manager.config.root,
+            &request.session_id.0,
+        )?);
         result(
             request,
             self.manager

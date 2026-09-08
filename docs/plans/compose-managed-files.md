@@ -71,7 +71,7 @@ stickered = subagent({
   attachments: [cropped],
   output_schema: {
     type: "object",
-    properties: { result: { "$ref": "kit://schemas/file/v1" } },
+    properties: { result: { "$ref": "kit://schemas/file/v1", "x-kit-image-index": 0 } },
     required: ["result"],
     additionalProperties: false
   }
@@ -90,6 +90,14 @@ The pipeline remains one compose invocation with final-return-only delivery, usi
 ### Multimodal subagents
 
 Extend the currently text-oriented ACP child prompt/output path to retain typed attachments and assistant media. Import native generated media into managed storage. Bind actual emitted media to a file-aware output contract; models must not invent file IDs. Specify single-image binding and reject ambiguous multiple output. Validate shape AND reference existence/access, with explicit contract failure rather than silent string fallback for the new file-aware contract. Parent outputs must survive child close; grants and promotion must preserve session isolation.
+
+### Phase 3 implemented contract
+
+The subagent tool layer accepts optional typed `attachments` on `subagent`, `prompt`, and `fork`, resolving authority from `ToolRequest.session_id`. Native ACP image inputs and generated outputs use managed storage rather than model-created identities. Attachment grants cross working-directory stores explicitly; generated-image parent publication and final access validation complete before the existing success transition. Errors use the existing create cleanup, continuation retry-handle, and fork cleanup paths without adding shared-state instrumentation.
+
+File-aware `output_schema` uses the locally resolved `kit://schemas/file/v1` reference. The supported binding is exactly one root File or one required fixed nested object-property path. By default, Kit requires exactly one distinct native assistant image; an optional caller-fixed `x-kit-image-index` integer 0–7 beside the exact File `$ref` instead selects a distinct image in first-emission order. Kit rejects attempted model binding, validates surrounding JSON and the completed schema, and only constructs omitted surrounding objects when the complete result is valid. Arrays, unions, conditionals, indirect references and multiple bindings are unsupported. Every native image occurrence is independently validated and charged against occurrence, encoded/decoded byte, and aggregate pixel budgets before deduplication. Only equal MIME types and byte-identical image payloads from the current output collapse; visually identical images with different bytes remain distinct and require an explicit index to select one. Every occurrence, including unselected images, must validate and satisfy budgets before selection. Out-of-range indices fail without fallback, and only the selected image is imported/published. Kit does not strip signed metadata or deduplicate perceptually. No model identity, input image, or previous turn participates in that comparison. Ordinary text-only schema fallback is preserved. Native images without a file-aware schema have the explicit `output: { value, files }` surface, not base64 diagnostic updates. The [user guide](../user/compose-and-local-tools.md#attach-files-to-subagents-and-return-native-images) specifies the contract and final-return-only behavior.
+
+The complete read/rotate/crop → built-in ACP subagent → managed output → child close → `return output.result` pipeline has been verified against the canonical OpenRouter `google/gemini-3-pro-image` route. The caller explicitly selected distinct native output index 0; this does not claim that the backend emits only one image. The selected bytes were visually verified to contain the requested Hello Kitty sticker. Eligibility comes from exact-model and concrete-endpoint capability discovery, not a model allowlist. Other harness/provider routes require their own native-output support. Shared TUI presentation remains Phase 4 work.
 
 ### Shared TUI presentation
 
