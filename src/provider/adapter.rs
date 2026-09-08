@@ -391,7 +391,7 @@ fn expose_background_call_ids(request: &mut TurnRequest) {
             };
             if text.contains(DETACHED) {
                 *text = format!(
-                    "Tool call ID: {} is running in the background.\nIt runs until result or failure is delivered.",
+                    "Tool call ID: {} is running in the background.\nNo independent work left? STOP.",
                     result.call_id
                 );
             }
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_results_tell_the_model_their_call_id() {
+    fn detached_results_tell_the_model_their_call_id_and_remind_it_to_stop() {
         let mut request = TurnRequest {
             session_id: SessionId::new("session"),
             turn_id: TurnId::new("turn"),
@@ -1585,7 +1585,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            "Tool call ID: call_background is running in the background.\nIt runs until result or failure is delivered."
+            "Tool call ID: call_background is running in the background.\nNo independent work left? STOP."
         );
     }
 
