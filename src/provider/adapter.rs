@@ -823,6 +823,65 @@ pub struct SpeakeasyKitSession {
     context_window: Option<u64>,
 }
 
+/// Validate the complete replay before a provider can stringify selected images.
+/// Ordinary user images are not tool outputs and are deliberately unaffected.
+pub(super) fn validate_tool_output_images(
+    request: &TurnRequest,
+    provider: &str,
+    model: &str,
+    supported: bool,
+) -> Result<(), LoopError> {
+    if supported {
+        return Ok(());
+    }
+    const MAX_NODES: usize = 100_000;
+    const MAX_DEPTH: usize = 64;
+    let mut visited = 0;
+    let mut pending = Vec::new();
+    for item in &request.transcript {
+        visited += 1;
+        if visited > MAX_NODES {
+            return Err(tool_image_traversal_error());
+        }
+        // Store only one iterator per nesting level, never a transcript-wide
+        // frontier or one entry per sibling. Bound both traversal and stack size.
+        pending.push((item.parts.iter(), false));
+        while let Some((parts, in_tool_output)) = pending.last_mut() {
+            let Some(part) = parts.next() else {
+                pending.pop();
+                continue;
+            };
+            visited += 1;
+            if visited > MAX_NODES {
+                return Err(tool_image_traversal_error());
+            }
+            match part {
+                Part::Media(media) if *in_tool_output && media.modality == Modality::Image => {
+                    return Err(LoopError::InvalidState(format!(
+                        "selected-images-not-delivered: {provider}:{model} does not have verified image tool-output support. The program may already have completed; do not retry the program. Select a supported provider/model to deliver the retained images."
+                    )));
+                }
+                Part::ToolResult(result) => {
+                    if let ToolOutput::Parts(parts) = &result.output {
+                        if pending.len() >= MAX_DEPTH {
+                            return Err(tool_image_traversal_error());
+                        }
+                        pending.push((parts.iter(), true));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tool_image_traversal_error() -> LoopError {
+    LoopError::InvalidState(
+        "selected-images-not-delivered: tool-output image validation exceeds its traversal budget. The program may already have completed; do not retry or rerun the program.".into(),
+    )
+}
+
 #[async_trait]
 impl ModelSession for KitSession {
     type Turn = KitTurn;
@@ -832,6 +891,14 @@ impl ModelSession for KitSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
+        if !matches!(self, Self::OpenAiSubscription(_)) {
+            validate_tool_output_images(
+                &request,
+                self.provider_name().unwrap_or("unknown"),
+                self.model_name().unwrap_or("unknown"),
+                false,
+            )?;
+        }
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -1742,6 +1809,155 @@ mod tests {
             active,
             inner,
         }
+    }
+
+    fn selected_image_request(nested: bool) -> TurnRequest {
+        let image = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![1, 2, 3]),
+        );
+        let output = if nested {
+            vec![Part::ToolResult(ToolResultPart::success(
+                "nested",
+                ToolOutput::Parts(vec![image]),
+            ))]
+        } else {
+            vec![Part::text("Selected image"), image]
+        };
+        TurnRequest {
+            session_id: SessionId::new("provider-identity-test"),
+            turn_id: TurnId::new("replay"),
+            transcript: vec![
+                Item::new(
+                    ItemKind::Tool,
+                    vec![Part::ToolResult(ToolResultPart::success(
+                        "completed-call",
+                        ToolOutput::Parts(output),
+                    ))],
+                ),
+                Item::text(ItemKind::User, "Continue after switching providers"),
+            ],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_images_rejected_on_completions_replay() {
+        let provider = SpeakeasyProvider {
+            openrouter: OpenRouterProvider::from(OpenRouterConfig::new("test-key", "test/model")),
+            api_key: "test-key".into(),
+            project: "test-project".into(),
+            chat_id: None,
+        };
+        let inner = agentkit_adapter_completions::CompletionsAdapter::new(provider)
+            .unwrap()
+            .start_session(SessionConfig::new("provider-identity-test"))
+            .await
+            .unwrap();
+        let speakeasy = KitSession::Speakeasy(super::SpeakeasyKitSession {
+            inner,
+            context_window: None,
+        });
+        for mut session in [openrouter_session("test/model").await, speakeasy] {
+            for nested in [false, true] {
+                let provider = session.provider_name().unwrap().to_owned();
+                let request = selected_image_request(nested);
+                let original = serde_json::to_value(&request.transcript).unwrap();
+                let error = match session.begin_turn(request.clone(), None).await {
+                    Err(error) => error,
+                    Ok(_) => panic!("image output reached unsupported provider"),
+                };
+                assert!(matches!(error, LoopError::InvalidState(_)));
+                let message = error.to_string();
+                assert!(message.contains("selected-images-not-delivered"));
+                assert!(message.contains(&provider));
+                assert!(message.contains("do not retry the program"));
+                assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_images_rejected_after_active_provider_switch() {
+        let initial = ModelSelection::new(ProviderKind::OpenAiSubscription, "gpt-5.4");
+        let mut session = selectable_session(initial, openrouter_session("test/initial").await);
+        session.openrouter_api_key = Some("test-key".parse().unwrap());
+        let selected = ModelSelection::new(ProviderKind::OpenRouter, "test/replacement");
+        // Publish a complete selection, exactly as the selection API does. No
+        // guard crosses begin_turn, which must replace the active session first.
+        *session.selection.lock().unwrap() = SessionSelection {
+            model: selected.clone(),
+            reasoning_effort: None,
+            revision: 1,
+        };
+        let error = match session
+            .begin_turn(selected_image_request(false), None)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("switched provider accepted replayed images"),
+        };
+        assert!(matches!(error, LoopError::InvalidState(_)));
+        assert!(error.to_string().contains("openrouter:test/replacement"));
+        assert_eq!(session.active.model, selected);
+        assert_eq!(session.provider_name(), Some("openrouter"));
+    }
+
+    #[test]
+    fn selected_image_guard_bounds_nested_and_wide_outputs() {
+        let mut request = selected_image_request(false);
+        let mut part = Part::text("deep");
+        for _ in 0..65 {
+            part = Part::ToolResult(ToolResultPart::success(
+                "nested",
+                ToolOutput::Parts(vec![part]),
+            ));
+        }
+        request.transcript[0].parts = vec![part];
+        let error = super::validate_tool_output_images(&request, "openrouter", "test/model", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("traversal budget"));
+        request.transcript[0].parts = vec![Part::ToolResult(ToolResultPart::success(
+            "wide",
+            ToolOutput::Parts(vec![Part::text("text"); 100_001]),
+        ))];
+        let error = super::validate_tool_output_images(&request, "speakeasy", "test/model", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("do not retry or rerun"));
+    }
+
+    #[test]
+    fn selected_image_guard_preserves_user_images_and_text_tool_outputs() {
+        let mut request = selected_image_request(false);
+        request.transcript[0] = Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(vec![1, 2, 3]),
+            )],
+        );
+        for output in [
+            ToolOutput::Text("done".into()),
+            ToolOutput::Structured(json!({"ok": true})),
+            ToolOutput::Parts(vec![Part::text("done")]),
+        ] {
+            request.transcript.push(Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "text-call",
+                    output,
+                ))],
+            ));
+        }
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        for provider in ["openrouter", "speakeasy", "openai-subscription"] {
+            super::validate_tool_output_images(&request, provider, "unknown", false).unwrap();
+        }
+        assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
     }
 
     #[tokio::test]

@@ -999,10 +999,12 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     frame.render_widget(Paragraph::new(visible), inner);
     draw_selection(frame, app, inner, offset, &row_widths);
     for (block_index, source_index, y) in visible_images {
-        let Some(Block::User(message)) = app.blocks.get(block_index) else {
-            continue;
+        let sources = match app.blocks.get(block_index) {
+            Some(Block::User(message)) => &message.images,
+            Some(Block::Tool(call)) => &call.images,
+            _ => continue,
         };
-        let Some(source) = message.images.get(source_index) else {
+        let Some(source) = sources.get(source_index) else {
             continue;
         };
         if let Some(image) = images.prepare(source, inner.width.max(1)) {
@@ -1260,7 +1262,39 @@ fn transcript_block_rows(
             (line, (call.clone(), code, Some(line_index)))
         })
         .collect::<Vec<TaggedTranscriptLine>>();
-    (wrap_linked_tagged(&lines, width), Vec::new())
+    let mut rows = wrap_linked_tagged(&lines, width);
+    let mut placements = Vec::new();
+    if let Block::Tool(call) = block
+        && call.expanded
+        && (!call.is_compose() || call.compose_view == ComposeView::Output)
+    {
+        for (source, image) in call.images.iter().enumerate() {
+            rows.extend(wrap_linked_tagged(
+                &[(
+                    LinkedLine::plain(Line::from(Span::styled(
+                        format!("   [Image: {}]", image.mime_type),
+                        theme::dim(),
+                    ))),
+                    (Some(call.id.clone()), None, None),
+                )],
+                width,
+            ));
+            if !reserve_images {
+                continue;
+            }
+            let row = rows.len();
+            rows.extend((0..RESERVED_ROWS).map(|_| {
+                (
+                    Line::default(),
+                    (Some(call.id.clone()), None, None),
+                    Vec::new(),
+                    String::new(),
+                )
+            }));
+            placements.push(CachedTranscriptImage { source, row });
+        }
+    }
+    (rows, placements)
 }
 
 fn uncopyable(lines: Vec<LinkedLine>) -> Vec<(LinkedLine, Option<Range<usize>>)> {
@@ -3312,6 +3346,7 @@ mod tests {
             status: None,
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: Some(Some("  Check every source file.  ".into())),
             backgrounded: false,
@@ -3338,6 +3373,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -3372,6 +3408,7 @@ mod tests {
             status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
             script: Some("return 1".into()),
             output: Some(vec!["1".into()]),
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: false,
@@ -3383,6 +3420,7 @@ mod tests {
             status: None,
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: false,
@@ -3399,6 +3437,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -3441,6 +3480,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -3479,6 +3519,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -3591,6 +3632,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -3751,6 +3793,7 @@ mod tests {
         app.apply(Update::ToolPatched {
             title: None,
             kind: None,
+            images: None,
             append_output: false,
             intent: None,
             id: "call-1".into(),
@@ -4279,6 +4322,64 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("after"))
         );
+    }
+
+    #[test]
+    fn tool_images_render_with_shared_runtime_and_text_fallback() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let source = UserImage::new(
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+            "image/png".into(),
+            0,
+        )
+        .unwrap();
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.apply(Update::ToolPatched {
+            id: "tool".into(),
+            title: Some("compose".into()),
+            kind: None,
+            status: None,
+            script: None,
+            output: Some(vec!["[Image]".into()]),
+            images: Some(vec![source]),
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+        let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+        refresh_transcript_cache_with_images(&mut app, &mut images, 40);
+        assert_eq!(app.transcript_cache[0].as_ref().unwrap().images.len(), 1);
+        assert_eq!(images.cached_entries(), 0);
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 1);
+        let mut disabled = ImageRuntime::disabled();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut disabled))
+            .unwrap();
+        let cached = app.transcript_cache[0].as_ref().unwrap();
+        assert!(cached.images.is_empty());
+        assert!(
+            cached
+                .rows
+                .iter()
+                .any(|row| line_text(&row.0).contains("[Image: image/png]"))
+        );
+        if let Block::Tool(call) = &mut app.blocks[0] {
+            call.expanded = false;
+        }
+        let (_, placements) = super::transcript_block_rows(&app, 0, 40, true);
+        assert!(placements.is_empty());
     }
 
     #[test]

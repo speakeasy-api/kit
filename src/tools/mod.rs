@@ -4,6 +4,7 @@ mod docs;
 mod edit;
 pub(crate) mod mcp;
 mod observed;
+mod read_file;
 mod shell;
 mod subagent;
 
@@ -15,5 +16,6 @@ pub use edit::EditTool;
 pub use mcp::{AuthTool, McpTool, ToolSearch};
 pub use observed::Observed;
 pub(crate) use observed::shared as observe_shared;
+pub use read_file::ReadFileTool;
 pub use shell::ShellTool;
 pub use subagent::{CloseTool, ForkTool, PromptTool, SubagentTool, Subagents, SubagentsTool};

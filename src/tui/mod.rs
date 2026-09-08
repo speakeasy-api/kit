@@ -2579,6 +2579,13 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             MessageKind::Thought,
         ),
         SessionUpdate::ToolCallUpdate(update) => {
+            let images = match &update.content {
+                MaybeUndefined::Value(content) => Some(tool_images_of(content)),
+                MaybeUndefined::Null => Some(Vec::new()),
+                // Raw output is a parallel representation, not an authoritative
+                // content replacement. Only explicit content patches clear pixels.
+                MaybeUndefined::Undefined => None,
+            };
             let output = match &update.content {
                 MaybeUndefined::Value(content) => Some(output_of(Some(content))),
                 MaybeUndefined::Null => Some(Vec::new()),
@@ -2628,12 +2635,14 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 },
                 script,
                 output,
+                images,
                 append_output: false,
                 intent,
                 backgrounded,
             }]
         }
         SessionUpdate::ToolCallContentChunk(chunk) => {
+            let images = tool_images_of(std::slice::from_ref(&chunk.content));
             let output = output_of(Some(std::slice::from_ref(&chunk.content)));
             let backgrounded = output
                 .iter()
@@ -2645,6 +2654,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 status: None,
                 script: None,
                 output: Some(output),
+                images: Some(images),
                 append_output: true,
                 intent: None,
                 backgrounded,
@@ -2820,17 +2830,102 @@ fn intent_of(input: &Value) -> Option<String> {
 
 /// A tool call's output as readable lines, kept whole for the folded card.
 fn raw_output_lines(output: &Value) -> Vec<String> {
+    let output = raw_output_without_media(output, 0);
     if let Some(text) = output
         .as_str()
         .or_else(|| output.get("text").and_then(Value::as_str))
     {
         return readable(text);
     }
-    serde_json::to_string_pretty(output)
+    serde_json::to_string_pretty(&output)
         .unwrap_or_else(|_| output.to_string())
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+// ACP raw output can serialize ToolOutput::Parts (Media/DataRef), ACP content,
+// or a JSON-encoded version of either. Do not print their pixels in text-only
+// cards. This fallback deliberately does not decode, fetch, or replace images.
+fn raw_output_without_media(output: &Value, depth: usize) -> Value {
+    if depth >= 64 {
+        return Value::String("[Truncated output]".into());
+    }
+    match output {
+        Value::Object(object) => {
+            let is_image = (object.contains_key("data")
+                && ["mime_type", "mimeType"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|mime| mime.starts_with("image/"))
+                }))
+                || ["type", "modality"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("image"))
+                });
+            if is_image {
+                return Value::String("[Image]".into());
+            }
+            if object.contains_key("InlineBytes") || object.contains_key("InlineText") {
+                return Value::String("[Media]".into());
+            }
+            Value::Object(
+                object
+                    .iter()
+                    .take(MAX_OUTPUT_LINES)
+                    .map(|(key, value)| (key.clone(), raw_output_without_media(value, depth + 1)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(MAX_OUTPUT_LINES)
+                .map(|value| raw_output_without_media(value, depth + 1))
+                .collect(),
+        ),
+        Value::String(text) => {
+            if text.contains("data:image/") {
+                Value::String("[Image]".into())
+            } else if let Ok(value) = serde_json::from_str::<Value>(text) {
+                raw_output_without_media(&value, depth + 1)
+            } else {
+                output.clone()
+            }
+        }
+        _ => output.clone(),
+    }
+}
+
+// Keep pixels separate from text previews. Live chunks and replay snapshots
+// use this path; never fetch a model-supplied URI.
+fn tool_images_of(content: &[ToolCallContent]) -> Vec<UserImage> {
+    let mut images: Vec<UserImage> = Vec::new();
+    let mut retained = 0usize;
+    for entry in content {
+        if images.len() >= app::MAX_TOOL_IMAGES {
+            break;
+        }
+        let ToolCallContent::Content(content) = entry else {
+            continue;
+        };
+        let ContentBlock::Image(image) = &content.content else {
+            continue;
+        };
+        if retained.saturating_add(image.data.len()) > app::MAX_RETAINED_IMAGE_SOURCE_BYTES {
+            continue;
+        }
+        if let Some(image) = UserImage::new(image.data.clone(), image.mime_type.to_string(), 0)
+            && !images.iter().any(|existing| existing.key == image.key)
+        {
+            retained += image.data.len();
+            images.push(image);
+        }
+    }
+    images
 }
 
 fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
@@ -3921,6 +4016,8 @@ mod tests {
         assert_eq!(user.images.len(), 1);
         assert_eq!(user.images[0].data, "c2VjcmV0");
         assert_eq!(summary, "summary");
+        assert_eq!(tool.images.len(), 1);
+        assert_eq!(tool.images[0].data, "c2VjcmV0");
         assert_eq!(tool.status, wire::ToolCallStatus::Completed);
         assert_eq!(
             tool.output,
@@ -3965,6 +4062,149 @@ mod tests {
             assert!(
                 matches!(translate_for_session(update, "session").as_slice(),
                 [Update::AgentMessage { text, .. }] if text == "[Image]")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_images_survive_live_chunks_and_replay_replacement() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let image = |data: &str| {
+            wire::ToolCallContent::Content(Box::new(wire::Content::new(ContentBlock::Image(
+                wire::ImageContent::new(data, "image/png"),
+            ))))
+        };
+        let snapshots = [
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("AQID"),
+            )),
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("AQID"),
+            )),
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("BAUG"),
+            )),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(vec![image("AQID"), image("BAUG")]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").status(wire::ToolCallStatus::Completed),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(vec![image("BAUG")]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(Vec::<wire::ToolCallContent>::new()),
+            ),
+        ];
+        for (notification, expected) in snapshots.into_iter().zip([1, 1, 2, 2, 2, 1, 0]) {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", notification),
+                "session",
+            ) {
+                app.apply(update);
+            }
+            let Block::Tool(tool) = &app.blocks[0] else {
+                panic!("expected tool")
+            };
+            assert_eq!(tool.images.len(), expected);
+            assert!(
+                tool.output
+                    .iter()
+                    .all(|line| !line.contains("AQID") && !line.contains("BAUG"))
+            );
+        }
+    }
+
+    #[test]
+    fn raw_tool_output_patches_preserve_images_and_never_print_pixels() {
+        use super::app::Block;
+        use agentkit_core::{DataRef, Modality, Part, ToolOutput};
+        use serde_json::Value;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let content = wire::ToolCallContent::Content(Box::new(wire::Content::new(
+            ContentBlock::Image(wire::ImageContent::new("c2VjcmV0", "image/png")),
+        )));
+        let initial = wire::ToolCallUpdate::new("tool").content(vec![content]);
+        for update in translate_for_session(
+            UpdateSessionNotification::new("session", SessionUpdate::ToolCallUpdate(initial)),
+            "session",
+        ) {
+            app.apply(update);
+        }
+        let inline = serde_json::to_value(ToolOutput::parts(vec![
+            Part::text("image result"),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::inline_text("c2VjcmV0"),
+            ),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::inline_bytes(vec![231, 232, 233]),
+            ),
+        ]))
+        .unwrap();
+        let raw_outputs = [
+            inline.clone(),
+            Value::String(serde_json::to_string(&inline).unwrap()),
+            json!({"output": inline}),
+            json!({"content": [{"type": "image", "data": "c2VjcmV0", "mimeType": "image/png"}]}),
+            json!({"uri": "data:image/png;base64,c2VjcmV0"}),
+            json!({"text": "data:image/png;base64,c2VjcmV0"}),
+            json!({"text": "ordinary result"}),
+            Value::Null,
+        ];
+        for raw in raw_outputs {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::ToolCallUpdate(
+                    wire::ToolCallUpdate::new("tool").raw_output(raw.clone()),
+                ),
+            );
+            for update in translate_for_session(notification, "session") {
+                app.apply(update);
+            }
+            let Block::Tool(tool) = &app.blocks[0] else {
+                panic!("expected tool")
+            };
+            assert_eq!(tool.images.len(), 1);
+            assert_eq!(tool.images[0].data, "c2VjcmV0");
+            let text = tool.output.join("\n");
+            assert!(!text.contains("c2VjcmV0"), "{text}");
+            assert!(!text.contains("231"), "{text}");
+            assert!(!text.contains("InlineBytes"), "{text}");
+            assert!(!text.contains("data:image/"), "{text}");
+
+            // Raw-only replay uses the same safe fallback even without a prior
+            // typed content notification. It must not pretend to reconstruct pixels.
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::ToolCallUpdate(
+                    wire::ToolCallUpdate::new("raw-only").raw_output(raw),
+                ),
+            );
+            assert!(
+                matches!(translate_for_session(notification, "session").as_slice(),
+                    [Update::ToolPatched { images: None, output: Some(output), .. }]
+                        if output.iter().all(|line| !line.contains("c2VjcmV0") && !line.contains("231"))
+                )
             );
         }
     }

@@ -1,3 +1,6 @@
+mod managed_background;
+mod managed_files;
+
 use std::{sync::Arc, time::Duration};
 
 use agentkit_core::{

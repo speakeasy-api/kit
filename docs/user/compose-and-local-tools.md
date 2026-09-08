@@ -97,6 +97,39 @@ The result contains `content`, `next_offset`, `total_bytes`, and `eof`. Continue
 
 An artifact-storage error does not turn an already-completed tool into a failed tool call. Kit returns a bounded preview with `artifact_error` when output cannot be retained. Do not repeat a side-effecting tool merely to obtain its output again.
 
+## Return images with `read_file`
+
+`read_file` is a hidden compose callable, not another model-exposed tool. It imports a local image into Kit-managed storage and returns a small JSON **File reference**, not a path or a base64 string:
+
+```text
+image = read_file({ path: "screenshot.png" })
+return { screenshot: image }
+```
+
+Only File references reachable from the final return deliver pixels to the parent model. A reference used only in an intermediate binding does not attach its image. Arrays and nested objects work; repeated references deliver one image, labeled with its first position as an escaped JSON Pointer. Every occurrence must have valid metadata, including duplicates. The whole selection is validated before any image is delivered.
+
+The initial reader supports **nonanimated PNG and JPEG**. It sniffs content rather than trusting the extension, rejects corrupt images and nonregular files, and reads at most 8 MiB. An image can have at most 8,192 pixels on either axis, 16 megapixels, and a 64 MiB decoder allocation. GIF, WebP, animated PNG, SVG, PDF, URLs, and text files are unsupported. Use `shell` for ordinary text reads. Relative paths resolve from Kit's working directory; absolute paths follow the Kit process's filesystem access, not a new project sandbox.
+
+Imports preserve the original bytes, metadata, and orientation. Width and height describe the encoded raster. There is no automatic transformation or export, and importing never overwrites the source.
+
+### Delivery limits and provider support
+
+A final compose return can select at most 8 distinct images, 16 MiB of encoded image bytes, and 32 megapixels in total. Selection traversal is bounded to 100,000 JSON nodes, depth 64, and 64 reference occurrences, with position labels bounded to 2 KiB each and 4 KiB in total. These limits are separate from the **8 KiB text-output budget**. Large returned JSON spills to a text artifact without hiding the selected image parts or their labels; media bytes do not enter the text artifact.
+
+Phase 1 enables native image tool output on **`openai-subscription:gpt-5.4`**. Other models and the OpenRouter/Speakeasy adapters fail explicitly for selected image tool results. This is a conservative Kit transport capability gate, not a claim that those models cannot understand images. Switching providers or resuming a transcript cannot silently turn retained pixels into text. Select the supported route to send an already-retained image; do not rerun a side-effecting compose program merely because output delivery failed.
+
+The canonical tool result retains typed images. Supported terminal graphics render them in expanded tool cards using the existing bounded image cache; disabled graphics or decoding failures leave a text fallback. Displaying a tool image does not create a synthetic user message.
+
+### File identity, durability, and lifetime
+
+File descriptors reserve `"$kit": "file"` and use schema version 1. They contain an opaque ID, a bounded display name, MIME type, encoded byte count, and image dimensions. Unknown fields, unknown versions, altered metadata, missing objects, and inaccessible IDs fail rather than appearing as successful text-only image delivery. Do not edit descriptors or invent IDs.
+
+Kit stores immutable snapshots under `~/.kit/files/<session-namespace>/` (or `<root>/.kit/files` when HOME is unavailable). A descriptor is returned only after the binary object and directory entries cross the disk durability barrier. Storage failure returns no usable descriptor. Each versioned binary envelope has a bounded metadata header and a digest-verified payload; truncated or corrupted objects are rejected.
+
+References survive process restart and source modification or deletion. Authorization comes from the calling session, not from possession of a marker or an arbitrary filesystem path. Copying a descriptor to a fork or another session does **not** grant access. Cross-session grants are not part of this reader.
+
+There is no automatic managed-file garbage collection in this phase. Calls, cancellation, session close, and process exit do not delete these objects. Cancelled or failed imports can leave unreachable objects. Explicit removal of a session's managed-file directory invalidates its references; do not remove retained objects that you need after resume. Finalization can repeat against the same immutable references without importing again. A delivery error states that the compose program already completed and side effects may have occurred; it is not a rollback or an invitation to retry blindly.
+
 ## Make exact file changes with `edit`
 
 `edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from Kit's working directory. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.

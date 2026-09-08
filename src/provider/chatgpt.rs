@@ -46,7 +46,8 @@ const MAX_ITEMS: usize = 10_000;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u64 = 10_000_000;
+// Match managed-file import limits; retain the independent decoded-byte bound.
+const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_TOOL_RESULT_DEPTH: usize = 8;
 const JPEG_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
@@ -314,13 +315,22 @@ impl ModelSession for OpenAiSubscriptionSession {
         mut request: TurnRequest,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
+        let model = self.inner.model_name().unwrap_or("unknown");
+        super::adapter::validate_tool_output_images(
+            &request,
+            "openai-subscription",
+            model,
+            supports_tool_output_images(model),
+        )?;
         migrate_legacy_continuations(&mut request, &self.authentication_binding)?;
         let normalization_cancellation = cancellation.clone();
         let request = tokio::task::spawn_blocking(move || {
             normalize_openai_images(request, normalization_cancellation.as_ref())
         })
         .await
-        .map_err(|_| protocol("Responses image normalization task failed"))??;
+        .map_err(|_| {
+            tool_image_normalization_error(protocol("Responses image normalization task failed"))
+        })??;
         self.inner
             .begin_turn(request, cancellation)
             .await
@@ -335,6 +345,14 @@ impl ModelSession for OpenAiSubscriptionSession {
     fn provider_name(&self) -> Option<&str> {
         Some("openai-subscription")
     }
+}
+
+// Phase 1 deliberately verifies one existing fallback route, not arbitrary catalog
+// entries (the catalog currently has no parsed modality capabilities). GPT-5.4
+// documents image input: https://developers.openai.com/api/docs/models/gpt-5.4
+// The pinned private Responses encoder supplies native image tool-output blocks.
+fn supports_tool_output_images(model: &str) -> bool {
+    model == "gpt-5.4"
 }
 
 fn normalize_openai_images(
@@ -377,13 +395,24 @@ fn normalize_openai_parts(
             }
             Part::ToolResult(result) => {
                 if let ToolOutput::Parts(parts) = &mut result.output {
-                    normalize_openai_parts(parts, cancellation, depth + 1)?;
+                    normalize_openai_parts(parts, cancellation, depth + 1)
+                        .map_err(tool_image_normalization_error)?;
                 }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn tool_image_normalization_error(error: LoopError) -> LoopError {
+    match error {
+        // Preserve cancellation and avoid wrapping an already contextualized error.
+        LoopError::Cancelled | LoopError::InvalidState(_) => error,
+        _ => LoopError::InvalidState(format!(
+            "selected-images-not-delivered: {error}. The program may already have completed; do not retry or rerun the program. The retained images could not be prepared for delivery."
+        )),
+    }
 }
 
 fn check_image_cancellation(
@@ -989,6 +1018,132 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn image_tool_request() -> TurnRequest {
+        use agentkit_core::{Item, SessionId, ToolResultPart, TurnId};
+        TurnRequest {
+            session_id: SessionId::new("image-session"),
+            turn_id: TurnId::new("image-turn"),
+            transcript: vec![Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "image-call",
+                    ToolOutput::Parts(vec![
+                        Part::text("Selected screenshot"),
+                        Part::media(
+                            Modality::Image,
+                            "image/png",
+                            DataRef::InlineBytes(vec![1, 2, 3]),
+                        ),
+                    ]),
+                ))],
+            )],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn selected_images_use_native_private_responses_wire_content() {
+        let request = image_tool_request();
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        assert!(supports_tool_output_images("gpt-5.4"));
+        super::super::adapter::validate_tool_output_images(
+            &request,
+            "openai-subscription",
+            "gpt-5.4",
+            supports_tool_output_images("gpt-5.4"),
+        )
+        .unwrap();
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"));
+        let wire = config.encode_request(&request).unwrap();
+        assert_eq!(
+            wire["input"][0],
+            json!({
+                "type": "function_call_output",
+                "call_id": "image-call",
+                "output": [
+                    {"type": "input_text", "text": "Selected screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AQID", "detail": "high"}
+                ]
+            })
+        );
+        assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
+    }
+
+    #[test]
+    fn selected_image_guard_leaves_user_images_and_text_wire_unchanged() {
+        use agentkit_core::{Item, ToolResultPart};
+        let mut request = image_tool_request();
+        request.transcript = vec![
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("Look at this"),
+                    Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::InlineBytes(vec![1, 2, 3]),
+                    ),
+                ],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "text-call",
+                    ToolOutput::Text("done".into()),
+                ))],
+            ),
+        ];
+        // An unverified model is not blocked for ordinary user images or text.
+        super::super::adapter::validate_tool_output_images(
+            &request,
+            "openai-subscription",
+            "gpt-future",
+            false,
+        )
+        .unwrap();
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-future",
+            Authentication::bearer("test-key"),
+        );
+        let wire = config.encode_request(&request).unwrap();
+        assert_eq!(
+            wire["input"][0]["content"][0],
+            json!({"type": "input_text", "text": "Look at this"})
+        );
+        assert_eq!(wire["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(wire["input"][1]["output"], "done");
+    }
+
+    #[tokio::test]
+    async fn unknown_subscription_model_rejects_replayed_tool_images() {
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-future",
+            Authentication::bearer("test-key"),
+        );
+        let inner = OpenAIResponsesAdapter::new(config)
+            .unwrap()
+            .start_session(SessionConfig::new("image-session"))
+            .await
+            .unwrap();
+        let mut session = OpenAiSubscriptionSession {
+            inner,
+            context_window: None,
+            authentication_binding: "unused".into(),
+        };
+        let error = match session.begin_turn(image_tool_request(), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("unknown model accepted image tool output"),
+        };
+        assert!(matches!(error, LoopError::InvalidState(_)));
+        assert!(error.to_string().contains("selected-images-not-delivered"));
+        assert!(error.to_string().contains("gpt-future"));
+        assert!(!supports_tool_output_images("gpt-5.4-custom"));
+        assert!(!supports_tool_output_images("gpt-5.3-codex-spark"));
+    }
+
     #[test]
     fn subscription_config_accepts_models_without_a_client_release() {
         assert!(SubscriptionConfig::new("gpt-future".into()).is_ok());
@@ -1033,6 +1188,103 @@ mod tests {
             .decode()
             .unwrap();
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
+    }
+
+    #[test]
+    fn selected_twelve_megapixel_jpeg_normalizes_to_native_wire_budget() {
+        // Keep a high-detail region in an otherwise flat 12MP image: the valid
+        // source exceeds the wire field limit but fits the managed-file limits.
+        let image = RgbImage::from_fn(4000, 3000, |x, y| {
+            if x >= 800 || y >= 800 {
+                return Rgb([255, 255, 255]);
+            }
+            let mut value = x
+                .wrapping_mul(747_796_405)
+                .wrapping_add(y.wrapping_mul(2_891_336_453));
+            value = (value ^ (value >> 16)).wrapping_mul(2_246_822_519);
+            value ^= value >> 13;
+            Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .unwrap();
+        assert!(jpeg.len() > MAX_NORMALIZED_IMAGE_BYTES);
+        assert!(jpeg.len() <= 8 * 1024 * 1024);
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![
+            Part::text("Selected 12MP JPEG"),
+            Part::media(Modality::Image, "image/jpeg", DataRef::InlineBytes(jpeg)),
+        ]);
+        // Exercise the full normalizer used by begin_turn, not just byte decoding.
+        let normalized = normalize_openai_images(request, None).unwrap();
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"))
+                .with_limits(OpenAIResponsesLimits {
+                    max_request_bytes: MAX_REQUEST_BYTES,
+                    max_attempt_bytes: MAX_ATTEMPT_BYTES,
+                    max_wire_bytes: MAX_WIRE_BYTES,
+                    max_items: MAX_ITEMS,
+                    max_text_bytes: MAX_FIELD_BYTES,
+                });
+        let wire = config.encode_request(&normalized).unwrap();
+        let output = &wire["input"][0]["output"];
+        assert_eq!(wire["input"][0]["call_id"], "image-call");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        let url = output[1]["image_url"].as_str().unwrap();
+        assert!(url.len() <= MAX_FIELD_BYTES);
+        let bytes = BASE64
+            .decode(url.strip_prefix(JPEG_DATA_URL_PREFIX).unwrap())
+            .unwrap();
+        assert!(
+            ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .unwrap()
+                .decode()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_image_normalization_failure_does_not_invite_program_retry() {
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"));
+        let inner = OpenAIResponsesAdapter::new(config)
+            .unwrap()
+            .start_session(SessionConfig::new("image-session"))
+            .await
+            .unwrap();
+        let mut session = OpenAiSubscriptionSession {
+            inner,
+            context_window: None,
+            authentication_binding: "unused".into(),
+        };
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![Part::media(
+            Modality::Image,
+            "image/jpeg",
+            DataRef::InlineBytes(vec![0; MAX_FIELD_BYTES]),
+        )]);
+        let error = match session.begin_turn(request, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid image reached provider"),
+        };
+        assert!(matches!(error, LoopError::InvalidState(_)));
+        let message = error.to_string();
+        assert!(message.contains("selected-images-not-delivered"));
+        assert!(message.contains("program may already have completed"));
+        assert!(message.contains("do not retry or rerun the program"));
+        assert!(matches!(
+            tool_image_normalization_error(LoopError::Cancelled),
+            LoopError::Cancelled
+        ));
     }
 
     #[test]
