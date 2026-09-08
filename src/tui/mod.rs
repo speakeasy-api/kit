@@ -2888,16 +2888,64 @@ fn raw_output_without_media(output: &Value, depth: usize) -> Value {
                 .collect(),
         ),
         Value::String(text) => {
-            if text.contains("data:image/") {
-                Value::String("[Image]".into())
-            } else if let Ok(value) = serde_json::from_str::<Value>(text) {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
                 raw_output_without_media(&value, depth + 1)
             } else {
-                output.clone()
+                Value::String(redact_image_data_urls(text))
             }
         }
         _ => output.clone(),
     }
+}
+
+// Recognize bounded data-URL headers and consume only their payload spans.
+// A literal scheme mention is not an image, and diagnostics outside a URL
+// must survive redaction. No payload decoding or network access is needed.
+fn redact_image_data_urls(text: &str) -> String {
+    const PREFIX: &str = "data:image/";
+    let mut result = String::new();
+    let mut copied = 0;
+    for (start, _) in text.match_indices(PREFIX) {
+        if start < copied {
+            continue;
+        }
+        let tail = &text[start + PREFIX.len()..];
+        let Some(header_len) = tail
+            .bytes()
+            .take(513)
+            .position(|byte| !byte.is_ascii_alphanumeric() && !b"+.-;=_%".contains(&byte))
+        else {
+            continue;
+        };
+        let header = &tail[..header_len];
+        if header.is_empty() || header.starts_with(';') || tail.as_bytes()[header_len] != b',' {
+            continue;
+        }
+        let payload = &tail[header_len + 1..];
+        let base64 = header
+            .rsplit(';')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case("base64"));
+        let payload_len = payload
+            .bytes()
+            .take_while(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || if base64 {
+                        b"+/=%".contains(byte)
+                    } else {
+                        b"%:@!$&*+-./;=?_~,".contains(byte)
+                    }
+            })
+            .count();
+        if payload_len == 0 {
+            continue;
+        }
+        result.push_str(&text[copied..start]);
+        result.push_str("[Image]");
+        copied = start + PREFIX.len() + header_len + 1 + payload_len;
+    }
+    result.push_str(&text[copied..]);
+    result
 }
 
 // Keep pixels separate from text previews. Live chunks and replay snapshots
@@ -4206,6 +4254,67 @@ mod tests {
                         if output.iter().all(|line| !line.contains("c2VjcmV0") && !line.contains("231"))
                 )
             );
+        }
+    }
+
+    #[test]
+    fn raw_tool_output_redacts_only_image_spans_and_preserves_diagnostics() {
+        let cases = [
+            (
+                "Screenshot: data:image/png;base64,AQID\nUpload failed: permission denied",
+                "Screenshot: [Image]\nUpload failed: permission denied",
+            ),
+            (
+                "The literal data:image/ is a URI prefix, not an image.",
+                "The literal data:image/ is a URI prefix, not an image.",
+            ),
+            (
+                "Incomplete data:image/png;base64,\nUpload failed",
+                "Incomplete data:image/png;base64,\nUpload failed",
+            ),
+            (
+                "First (data:image/png;base64,AQID), second \"data:image/jpeg;base64,BAUG\". Failed.",
+                "First ([Image]), second \"[Image]\". Failed.",
+            ),
+            (
+                "Encoded: data:image/svg+xml,%3Csvg%3E\nUpload failed",
+                "Encoded: [Image]\nUpload failed",
+            ),
+            (
+                "Image: data:image/svg+xml,%3Csvg%3E,%3C/svg%3E\nUpload failed",
+                "Image: [Image]\nUpload failed",
+            ),
+            ("data:image/png;base64,AQID", "[Image]"),
+        ];
+        for (text, expected) in cases {
+            // Both native raw objects and JSON-encoded raw output occur in live
+            // and replayed updates. Neither may discard non-image diagnostics.
+            for raw in [
+                json!({"text": text}),
+                json!(json!({"text": text}).to_string()),
+            ] {
+                let notification = UpdateSessionNotification::new(
+                    "session",
+                    SessionUpdate::ToolCallUpdate(
+                        wire::ToolCallUpdate::new("raw-only").raw_output(raw),
+                    ),
+                );
+                let updates = translate_for_session(notification, "session");
+                let [
+                    Update::ToolPatched {
+                        images: None,
+                        output: Some(lines),
+                        ..
+                    },
+                ] = updates.as_slice()
+                else {
+                    panic!("expected raw-only tool patch");
+                };
+                assert_eq!(lines.join("\n"), expected, "source: {text}");
+                assert!(!lines.iter().any(|line| line.contains("AQID")
+                    || line.contains("BAUG")
+                    || line.contains("%3Csvg")));
+            }
         }
     }
 
