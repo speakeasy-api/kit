@@ -8,11 +8,13 @@ on:
     types: [opened, edited, synchronize, reopened]
 
 jobs:
-  test:
+  pr-title:
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'edited' || github.event.changes.title != null)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Validate Conventional Commit title
-        if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         shell: bash
@@ -23,6 +25,11 @@ jobs:
             echo "Examples: feat: add a feature, fix(api): correct behavior, feat!: break compatibility" >&2
             exit 1
           fi
+
+  test:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
       - uses: useblacksmith/checkout@v1
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -34,6 +41,7 @@ jobs:
       - run: cargo test --locked
 
   macos-rust:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: useblacksmith/checkout@v1
@@ -57,6 +65,7 @@ jobs:
           retention-days: 1
 
   macos-desktop:
+    if: github.event_name != 'pull_request' || github.event.action != 'edited'
     needs: macos-rust
     runs-on: blacksmith-6vcpu-macos-15
     steps:
