@@ -840,6 +840,8 @@ fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
         Some(
             crate::events::RuntimeEvent::ChildStarted { .. }
                 | crate::events::RuntimeEvent::ChildFinished { .. }
+                | crate::events::RuntimeEvent::RunletProgress { .. }
+                | crate::events::RuntimeEvent::RunletTransport { .. }
         )
     ) {
         return None;

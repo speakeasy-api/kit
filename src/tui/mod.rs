@@ -11,6 +11,7 @@ mod command;
 mod editor;
 mod image;
 mod markdown;
+mod progress;
 mod theme;
 mod ui;
 mod wrap;

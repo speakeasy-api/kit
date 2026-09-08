@@ -31,6 +31,7 @@ pub mod plugins;
 pub(crate) mod process_tree;
 pub mod protocols;
 pub mod provider;
+mod runlet_progress;
 pub mod runtime;
 /// Shared internal filesystem and process-lifetime recovery controls.
 pub mod resilient_fs {

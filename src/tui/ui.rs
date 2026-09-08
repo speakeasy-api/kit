@@ -1348,18 +1348,36 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     lines
 }
 
-/// Source text is not execution telemetry. Runtime events identify calls,
-/// not source expressions, so script lines carry no inferred state.
+/// Source lines stay neutral. Exact runtime call spans add qualified counts at
+/// their source start line; annotations never assert whole-line/binding state.
 fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
-    call.script
+    let annotations = call.progress.labels(&call.script);
+    let mut lines: Vec<_> = call
+        .script
         .lines()
-        .map(|source| {
-            Line::from(vec![
+        .take(MAX_OUTPUT_ROWS)
+        .enumerate()
+        .map(|(index, source)| {
+            let mut spans = vec![
                 Span::styled("   │ ", theme::faint()),
                 Span::styled(source.to_string(), theme::dim()),
-            ])
+            ];
+            if let Some(labels) = annotations.get(&(index + 1)) {
+                for label in labels {
+                    spans.push(Span::styled(format!("  {label}"), theme::dim()));
+                }
+            }
+            Line::from(spans)
         })
-        .collect()
+        .collect();
+    let count = call.script.lines().count();
+    if count > MAX_OUTPUT_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
+            theme::faint(),
+        )));
+    }
+    lines
 }
 
 fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
@@ -1418,19 +1436,7 @@ fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
     match call.compose_view {
         ComposeView::Output => lines.extend(expanded_output_lines(call)),
         ComposeView::Script => {
-            let count = call.script.lines().count();
-            lines.extend(call.script.lines().take(MAX_OUTPUT_ROWS).map(|source| {
-                Line::from(vec![
-                    Span::styled("   │ ", theme::faint()),
-                    Span::styled(source.to_string(), theme::dim()),
-                ])
-            }));
-            if count > MAX_OUTPUT_ROWS {
-                lines.push(Line::from(Span::styled(
-                    format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
-                    theme::faint(),
-                )));
-            }
+            lines.extend(script_lines(call));
         }
     }
     lines
@@ -2753,6 +2759,8 @@ mod tests {
         assert_eq!(right - left + 1, 24);
         assert_eq!(right, 79);
     }
+
+    include!("progress_tests.rs");
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
         checked = for file in files.lines {\n\

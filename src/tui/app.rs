@@ -358,6 +358,7 @@ pub struct ToolCall {
     pub finished: Option<Instant>,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
+    pub(super) progress: Box<super::progress::ScriptProgress>,
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
@@ -401,6 +402,7 @@ impl ToolCall {
     }
 
     fn finalize_terminal_state(&mut self) {
+        self.progress.parent_finished();
         if self.is_compose() && !self.expansion_explicit {
             self.expanded = false;
             self.compose_view = ComposeView::Output;
@@ -587,6 +589,8 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    progress_last_frame: Option<Instant>,
+    progress_unavailable: bool,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
@@ -836,6 +840,8 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
+            progress_last_frame: None,
+            progress_unavailable: false,
             root,
             provider,
             model,
@@ -1146,6 +1152,7 @@ impl App {
 
     /// Advances animations and removes expired transient state.
     pub fn tick(&mut self) {
+        self.progress_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
     }
 
@@ -1706,7 +1713,8 @@ impl App {
                     status: ToolCallStatus::Pending,
                     started: Instant::now(),
                     finished: None,
-                    script: script.unwrap_or_default(),
+                    script: crate::runlet_progress::bounded_source(script.unwrap_or_default()),
+                    progress: Box::default(),
                     children: Vec::new(),
                     output: Vec::new(),
                     intent: None,
@@ -1757,6 +1765,10 @@ impl App {
                     call.intent = intent;
                 }
                 if let Some(script) = script {
+                    let script = crate::runlet_progress::bounded_source(script);
+                    if call.script != script {
+                        call.progress.invalidate();
+                    }
                     call.script = script;
                 }
                 if let Some(output) = output {
@@ -1813,6 +1825,7 @@ impl App {
                 _ => {}
             },
             Update::ProcessExited(error) => {
+                self.disable_progress();
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
@@ -1823,13 +1836,55 @@ impl App {
         }
     }
 
+    fn disable_progress(&mut self) {
+        if self.progress_unavailable {
+            return;
+        }
+        self.progress_unavailable = true;
+        for index in 0..self.blocks.len() {
+            if let Block::Tool(call) = &mut self.blocks[index] {
+                call.progress.invalidate();
+            }
+            self.mark_block_dirty(index);
+        }
+    }
+
+    /// Monotonic transport deadline, also checked before accepting new traffic.
+    pub(super) fn progress_tick_at(&mut self, now: Instant) {
+        if !self.progress_unavailable
+            && self.progress_last_frame.is_some_and(|last| {
+                now.saturating_duration_since(last) >= crate::runlet_progress::transport::LEASE
+            })
+        {
+            self.disable_progress();
+        }
+    }
+    fn progress_activity(&mut self) {
+        let now = Instant::now();
+        self.progress_tick_at(now);
+        if !self.progress_unavailable {
+            self.progress_last_frame = Some(now);
+        }
+    }
+
     fn apply_runtime(&mut self, event: RuntimeEvent) {
         self.apply_runtime_at(event, crate::events::now_millis());
     }
 
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        if matches!(event, RuntimeEvent::RunletProgress { .. }) {
+            self.progress_activity();
+        }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
+            RuntimeEvent::RunletTransport { available } => {
+                if available {
+                    self.progress_activity();
+                } else {
+                    self.disable_progress();
+                }
+                return;
+            }
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
@@ -1942,6 +1997,49 @@ impl App {
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
                 return;
+            }
+            RuntimeEvent::RunletProgress { progress } => {
+                if self.progress_unavailable {
+                    return;
+                }
+                let Some(owner) = self.blocks.iter().rev().find_map(|b| match b {
+                    Block::Tool(c) if c.id == progress.owner && c.is_compose() => Some(c),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let needs_slot = owner.running() && !owner.progress.retained();
+                // Retain at most MAX_RUNS maps across the transcript. Eviction
+                // preserves incarnation tombstones so stale replay cannot revive it.
+                let retained = self
+                    .blocks
+                    .iter()
+                    .filter(|b| matches!(b, Block::Tool(c) if c.progress.retained()))
+                    .count();
+                if needs_slot
+                    && retained >= crate::runlet_progress::MAX_RUNS
+                    && let Some(id) = self.blocks.iter().find_map(|b| match b {
+                        Block::Tool(c) if c.id != progress.owner && c.progress.retained() => {
+                            Some(c.id.clone())
+                        }
+                        _ => None,
+                    })
+                    && let Some(call) = self.call_mut(&id)
+                {
+                    call.progress.invalidate();
+                }
+                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
+                    return;
+                };
+                if !call.is_compose() {
+                    return;
+                }
+                if call.running() {
+                    call.progress.apply(&progress, &call.script);
+                } else {
+                    call.progress.apply_terminal(&progress, &call.script);
+                }
+                call.id.clone()
             }
             RuntimeEvent::ChildStarted {
                 call: child_call,

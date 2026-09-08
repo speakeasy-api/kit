@@ -36,6 +36,12 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    /// Process-wide progress transport lease/reset, not a source execution.
+    RunletTransport { available: bool },
+    /// Authoritative, value-free observations owned by an exact compose call.
+    RunletProgress {
+        progress: crate::runlet_progress::Progress,
+    },
     /// Process-wide durability state, independent of the active ACP session.
     StorageStatus { pending: bool, exhausted: bool },
     /// A persisted ACP session was opened by the child runtime.
@@ -116,8 +122,10 @@ impl RuntimeEvent {
     #[must_use]
     pub fn parent_call(&self) -> Option<&str> {
         let call = match self {
+            Self::RunletProgress { progress } => return Some(&progress.owner),
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::StorageStatus { .. }
+            Self::RunletTransport { .. }
+            | Self::StorageStatus { .. }
             | Self::SessionStarted { .. }
             | Self::CompactionStarted { .. }
             | Self::CompactionFinished { .. }
@@ -144,7 +152,12 @@ pub fn emit(event: &RuntimeEvent) {
     write_event(&mut stderr, event);
 }
 
-fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
+pub(crate) fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
+    if let RuntimeEvent::RunletProgress { progress } = event
+        && !progress.bounded()
+    {
+        return;
+    }
     if let Ok(line) = serde_json::to_string(event) {
         let _ = writeln!(writer, "{EVENT_MARKER}{line}");
     }
@@ -153,7 +166,19 @@ fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
 /// Parses one stderr line, returning an event when the line carries one.
 #[must_use]
 pub fn parse(line: &str) -> Option<RuntimeEvent> {
-    serde_json::from_str(line.strip_prefix(EVENT_MARKER)?).ok()
+    let body = line.strip_prefix(EVENT_MARKER)?;
+    if body.len() > 64 * 1024 {
+        return None;
+    }
+    // Existing diagnostic events retain their historical parser shape. The new
+    // bounded payload is checked before it can reach retained UI state.
+    let event: RuntimeEvent = serde_json::from_str(body).ok()?;
+    if let RuntimeEvent::RunletProgress { progress } = &event
+        && (body.len() > 4096 || !progress.bounded())
+    {
+        return None;
+    }
+    Some(event)
 }
 
 /// Milliseconds since the Unix epoch, saturating at zero on a broken clock.
