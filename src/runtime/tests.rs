@@ -2334,9 +2334,10 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     assert!(prompt.contains("when it can run across a turn boundary"));
     assert!(prompt.contains("it also suits one-shot triggers"));
     assert!(prompt.contains("including launching more detached work"));
-    assert!(prompt.contains("When the remaining work depends on background results, yield"));
-    assert!(prompt.contains("yielding continues the task with those results"));
-    assert!(prompt.contains("the user's answer need not be completed first"));
+    assert!(prompt.contains("STOP: end your turn now with the response `STOP`"));
+    assert!(prompt.contains("`STOP` is a valid intermediate response"));
+    assert!(prompt.contains("The harness automatically resumes you with the background result"));
+    assert!(prompt.contains("Do not call tools to wait, sleep, poll for completion, or keep the turn alive"));
     assert!(prompt.contains("the next step needs its result in the current turn"));
     assert!(
         prompt.contains("Prefer one compose program whenever the remaining tool graph is known")
