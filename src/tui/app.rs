@@ -26,9 +26,10 @@ use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
+pub(super) const MAX_TOOL_IMAGES: usize = 32;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
@@ -99,6 +100,7 @@ pub enum Update {
         status: Option<ToolCallStatus>,
         script: Option<String>,
         output: Option<Vec<String>>,
+        images: Option<Vec<UserImage>>,
         append_output: bool,
         intent: Option<Option<String>>,
         backgrounded: bool,
@@ -362,6 +364,8 @@ pub struct ToolCall {
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
+    /// Typed tool-result images sharing the user-image retention and decode budgets.
+    pub images: Vec<UserImage>,
     /// User-facing summary supplied by a compose caller.
     pub intent: Option<String>,
     pub expanded: bool,
@@ -521,7 +525,7 @@ pub enum Block {
         started: Instant,
         millis: Option<u64>,
     },
-    Tool(ToolCall),
+    Tool(Box<ToolCall>),
     TurnDuration(u64),
     Notice(String),
     Error(String),
@@ -1193,14 +1197,14 @@ impl App {
         if self.transcript_revisions.len() != self.blocks.len() || self.focused_call_id.is_some() {
             if let Some(id) = &self.focused_call_id
                 && let Some(call) = self.blocks.iter().rev().find_map(|block| match block {
-                    Block::Tool(call) if &call.id == id => Some(call),
+                    Block::Tool(call) if &call.id == id => Some(call.as_ref()),
                     _ => None,
                 })
             {
                 return Some(call);
             }
             return self.blocks.iter().rev().find_map(|block| match block {
-                Block::Tool(call) => Some(call),
+                Block::Tool(call) => Some(call.as_ref()),
                 _ => None,
             });
         }
@@ -1214,7 +1218,7 @@ impl App {
                     && call.running()
                     && !call.backgrounded =>
             {
-                Some(call)
+                Some(call.as_ref())
             }
             _ => None,
         })
@@ -1707,7 +1711,7 @@ impl App {
                 self.close_thought();
                 self.prepare_focused_call(id.clone());
                 let expanded = title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
-                self.push_block(Block::Tool(ToolCall {
+                self.push_block(Block::Tool(Box::new(ToolCall {
                     id,
                     title,
                     kind,
@@ -1718,12 +1722,13 @@ impl App {
                     progress: Box::default(),
                     children: Vec::new(),
                     output: Vec::new(),
+                    images: Vec::new(),
                     intent: None,
                     expanded,
                     compose_view: ComposeView::Output,
                     expansion_explicit: false,
                     backgrounded,
-                }));
+                })));
             }
             Update::ToolPatched {
                 id,
@@ -1732,6 +1737,7 @@ impl App {
                 status,
                 script,
                 output,
+                images,
                 append_output,
                 intent,
                 backgrounded,
@@ -1744,6 +1750,36 @@ impl App {
                         script: script.clone(),
                         backgrounded,
                     });
+                }
+                if let Some(images) = images
+                    && let Some(index) = self.call_index(&id)
+                    && let Block::Tool(call) = &mut self.blocks[index]
+                {
+                    if !append_output {
+                        let replaced = call
+                            .images
+                            .iter()
+                            .map(|image| image.data.len())
+                            .sum::<usize>();
+                        self.retained_image_source_bytes =
+                            self.retained_image_source_bytes.saturating_sub(replaced);
+                        call.images.clear();
+                    }
+                    for image in images {
+                        if call.images.len() >= MAX_TOOL_IMAGES {
+                            break;
+                        }
+                        if call.images.iter().any(|existing| existing.key == image.key) {
+                            continue;
+                        }
+                        let retained = self
+                            .retained_image_source_bytes
+                            .saturating_add(image.data.len());
+                        if retained <= MAX_RETAINED_IMAGE_SOURCE_BYTES {
+                            self.retained_image_source_bytes = retained;
+                            call.images.push(image);
+                        }
+                    }
                 }
                 let Some(call) = self.call_mut(&id) else {
                     return;
@@ -4204,6 +4240,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_share_user_budget_and_release_replaced_sources() {
+        let mut app = app();
+        let bytes = 9 * 1024 * 1024;
+        let image = |byte: char| {
+            UserImage::new(byte.to_string().repeat(bytes), "image/png".into(), 0).unwrap()
+        };
+        app.apply(Update::UserMessage {
+            id: "user".into(),
+            text: "[Image]".into(),
+            images: vec![image('A')],
+            append: false,
+        });
+        let patch = |images, append_output| Update::ToolPatched {
+            id: "tool".into(),
+            title: None,
+            kind: None,
+            status: None,
+            script: None,
+            output: Some(vec!["[Image]".into()]),
+            images: Some(images),
+            append_output,
+            intent: None,
+            backgrounded: false,
+        };
+        app.apply(patch(vec![image('B'), image('C'), image('D')], false));
+        assert_eq!(app.retained_image_source_bytes, 3 * bytes);
+        let Block::Tool(call) = &app.blocks[1] else {
+            panic!("expected tool")
+        };
+        assert_eq!(call.images.len(), 2);
+        app.apply(patch(vec![image('B')], true));
+        assert_eq!(app.retained_image_source_bytes, 3 * bytes);
+        app.apply(patch(vec![image('D')], false));
+        assert_eq!(app.retained_image_source_bytes, 2 * bytes);
+        app.apply(patch(Vec::new(), false));
+        assert_eq!(app.retained_image_source_bytes, bytes);
+    }
+
+    #[test]
     fn retained_user_image_sources_have_an_aggregate_bound() {
         let source_bytes = 9 * 1024 * 1024;
         let mut app = app();
@@ -4398,6 +4473,7 @@ mod tests {
             status: Some(ToolCallStatus::Failed),
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: false,
@@ -4561,6 +4637,7 @@ mod tests {
             status: Some(ToolCallStatus::Completed),
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: false,
@@ -6043,6 +6120,7 @@ mod tests {
             status: Some(ToolCallStatus::Completed),
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: false,
@@ -6481,6 +6559,7 @@ mod tests {
             status: Some(ToolCallStatus::Completed),
             script: None,
             output: None,
+            images: None,
             append_output: false,
             intent: None,
             backgrounded: true,

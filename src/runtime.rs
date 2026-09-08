@@ -40,8 +40,8 @@ use crate::{
     },
     tools::{
         A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
-        Observed, PromptTool, ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch,
-        observe_shared,
+        Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents, SubagentsTool,
+        ToolSearch, observe_shared,
     },
 };
 
@@ -1137,6 +1137,7 @@ impl Runtime {
             .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
                 &self.root,
             ))))
+            .with(Observed::new(ReadFileTool::new(self.root.clone())))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())));
@@ -2264,11 +2265,19 @@ impl Tool for BackgroundableCompose {
         let call_id = request.call_id.clone();
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
+        let session = request.session_id.0.clone();
         let request = Self::sanitized(request)?;
         let _job = self.begin_background(background, &call_id, ctx)?;
         match self.inner.invoke(request, ctx).await {
             Ok(mut result) => {
-                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                match crate::compose_output::finalize(
+                    &self.root,
+                    &session,
+                    &artifact_directory,
+                    result.result.output,
+                    ctx.cancellation.clone(),
+                )
+                .await
                 {
                     Ok(output) => {
                         result.result.output = output;
@@ -2290,6 +2299,7 @@ impl Tool for BackgroundableCompose {
         let call_id = request.call_id.clone();
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
+        let session = request.session_id.0.clone();
         let request = match Self::sanitized(request) {
             Ok(request) => request,
             Err(error) => return ToolExecutionOutcome::Failed(error),
@@ -2300,7 +2310,14 @@ impl Tool for BackgroundableCompose {
         };
         match self.inner.invoke_outcome(request, ctx).await {
             ToolExecutionOutcome::Completed(mut result) => {
-                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                match crate::compose_output::finalize(
+                    &self.root,
+                    &session,
+                    &artifact_directory,
+                    result.result.output,
+                    ctx.cancellation.clone(),
+                )
+                .await
                 {
                     Ok(output) => {
                         result.result.output = output;

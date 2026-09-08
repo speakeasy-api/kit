@@ -1,14 +1,106 @@
 use std::{path::Path, sync::Arc};
 
-use agentkit_core::ToolOutput;
+use agentkit_core::{Part, ToolOutput, TurnCancellation};
 use agentkit_tools_core::ToolError;
 use serde_json::{Map, Value};
 
 const MAX_MODEL_OUTPUT_BYTES: usize = 8 * 1024;
 
+/// Resolve only the final Runlet JSON value. Both foreground and detached
+/// completions use this boundary; resolving a reference never reimports its path.
+pub(crate) async fn finalize(
+    root: &Path,
+    session: &str,
+    artifact_directory: &Path,
+    output: ToolOutput,
+    cancellation: Option<TurnCancellation>,
+) -> Result<ToolOutput, ToolError> {
+    let output = if let ToolOutput::Structured(value) = output {
+        let store = crate::managed_files::FileStore::new(root);
+        let session = session.to_owned();
+        let (value, selected) = tokio::task::spawn_blocking(move || {
+            let selected = store.selected_parts(&session, &value, cancellation.as_ref());
+            (value, selected)
+        })
+        .await
+        .map_err(|error| delivery_failed(error.to_string()))?;
+        let selected = selected.map_err(delivery_failed)?;
+        if selected.is_empty() {
+            ToolOutput::Structured(value)
+        } else {
+            // Keep each position label adjacent to its image, even when the
+            // ordinary JSON spills. Reserve label bytes from the text budget.
+            let label_bytes = selected
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(text.text.len()),
+                    _ => None,
+                })
+                .sum::<usize>();
+            if label_bytes > MAX_MODEL_OUTPUT_BYTES / 2 {
+                return Err(delivery_failed(
+                    "selected image labels exceed the 4 KiB label budget".into(),
+                ));
+            }
+            let text = guard_text(
+                artifact_directory,
+                ToolOutput::Structured(value),
+                MAX_MODEL_OUTPUT_BYTES - label_bytes,
+            )
+            .await?;
+            let mut parts = match text {
+                ToolOutput::Structured(value) => vec![Part::structured(value)],
+                ToolOutput::Text(text) => vec![Part::text(text)],
+                ToolOutput::Parts(parts) => parts,
+                ToolOutput::Files(files) => files.into_iter().map(Part::File).collect(),
+            };
+            parts.extend(selected);
+            return Ok(ToolOutput::Parts(parts));
+        }
+    } else {
+        output
+    };
+    guard(artifact_directory, output).await
+}
+
+fn delivery_failed(detail: String) -> ToolError {
+    ToolError::ExecutionFailed(format!(
+        "compose program completed; selected File delivery failed: {detail}. Side effects may have occurred; do not rerun blindly."
+    ))
+}
+
 pub(crate) async fn guard(
     artifact_directory: &Path,
     output: ToolOutput,
+) -> Result<ToolOutput, ToolError> {
+    // Never serialize typed media into a spill artifact or count it as text.
+    let (output, media) = match output {
+        ToolOutput::Parts(parts) => {
+            let (media, text): (Vec<_>, Vec<_>) = parts
+                .into_iter()
+                .partition(|part| matches!(part, Part::Media(_)));
+            (ToolOutput::Parts(text), media)
+        }
+        output => (output, Vec::new()),
+    };
+    let text = guard_text(artifact_directory, output, MAX_MODEL_OUTPUT_BYTES).await?;
+    if media.is_empty() {
+        return Ok(text);
+    }
+    let mut parts = match text {
+        ToolOutput::Text(text) => vec![Part::text(text)],
+        ToolOutput::Structured(value) => vec![Part::structured(value)],
+        ToolOutput::Parts(parts) => parts,
+        ToolOutput::Files(files) => files.into_iter().map(Part::File).collect(),
+    };
+    parts.extend(media);
+    Ok(ToolOutput::Parts(parts))
+}
+
+async fn guard_text(
+    artifact_directory: &Path,
+    output: ToolOutput,
+    budget: usize,
 ) -> Result<ToolOutput, ToolError> {
     let body =
         match &output {
@@ -19,7 +111,7 @@ pub(crate) async fn guard(
                 .map_err(|error| ToolError::Internal(error.to_string()))?,
         };
     let original_bytes = body.len();
-    if original_bytes <= MAX_MODEL_OUTPUT_BYTES {
+    if original_bytes <= budget {
         return Ok(output);
     }
 
@@ -46,7 +138,7 @@ pub(crate) async fn guard(
             "\n...[tool completed; output truncated: {original_bytes} bytes; artifact storage failed]...\n"
         )
     };
-    let mut preview_budget = MAX_MODEL_OUTPUT_BYTES;
+    let mut preview_budget = budget;
     loop {
         let preview = preview(&body, &marker, preview_budget);
         let replacement = Value::Object(Map::from_iter([
@@ -61,11 +153,11 @@ pub(crate) async fn guard(
         let replacement_bytes = serde_json::to_vec(&replacement)
             .map_err(|error| ToolError::Internal(error.to_string()))?
             .len();
-        if replacement_bytes <= MAX_MODEL_OUTPUT_BYTES {
+        if replacement_bytes <= budget {
             return Ok(ToolOutput::structured(replacement));
         }
         let next_budget = preview_budget
-            .saturating_mul(MAX_MODEL_OUTPUT_BYTES)
+            .saturating_mul(budget)
             .checked_div(replacement_bytes)
             .unwrap_or(0)
             .min(preview_budget.saturating_sub(1))
