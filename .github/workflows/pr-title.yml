@@ -1,0 +1,21 @@
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  pr-title:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Validate Conventional Commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          pattern='^[a-z][a-z0-9-]*(\([^()]+\))?(!)?: .+'
+          if [[ ! $PR_TITLE =~ $pattern ]]; then
+            echo "Pull request titles must use Conventional Commit syntax." >&2
+            echo "Examples: feat: add a feature, fix(api): correct behavior, feat!: break compatibility" >&2
+            exit 1
+          fi
