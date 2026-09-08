@@ -525,7 +525,7 @@ pub enum Block {
         started: Instant,
         millis: Option<u64>,
     },
-    Tool(ToolCall),
+    Tool(Box<ToolCall>),
     TurnDuration(u64),
     Notice(String),
     Error(String),
@@ -1197,14 +1197,14 @@ impl App {
         if self.transcript_revisions.len() != self.blocks.len() || self.focused_call_id.is_some() {
             if let Some(id) = &self.focused_call_id
                 && let Some(call) = self.blocks.iter().rev().find_map(|block| match block {
-                    Block::Tool(call) if &call.id == id => Some(call),
+                    Block::Tool(call) if &call.id == id => Some(call.as_ref()),
                     _ => None,
                 })
             {
                 return Some(call);
             }
             return self.blocks.iter().rev().find_map(|block| match block {
-                Block::Tool(call) => Some(call),
+                Block::Tool(call) => Some(call.as_ref()),
                 _ => None,
             });
         }
@@ -1218,7 +1218,7 @@ impl App {
                     && call.running()
                     && !call.backgrounded =>
             {
-                Some(call)
+                Some(call.as_ref())
             }
             _ => None,
         })
@@ -1711,7 +1711,7 @@ impl App {
                 self.close_thought();
                 self.prepare_focused_call(id.clone());
                 let expanded = title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
-                self.push_block(Block::Tool(ToolCall {
+                self.push_block(Block::Tool(Box::new(ToolCall {
                     id,
                     title,
                     kind,
@@ -1728,7 +1728,7 @@ impl App {
                     compose_view: ComposeView::Output,
                     expansion_explicit: false,
                     backgrounded,
-                }));
+                })));
             }
             Update::ToolPatched {
                 id,
