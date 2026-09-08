@@ -2534,7 +2534,11 @@ impl ComposeBackend for HiddenRunletBackend {
 
     async fn execute(&self, mut run: BackendRun) -> Result<Value, ComposeOutcome> {
         run.visible_specs = self.specs();
-        RunletBackend.execute(run).await
+        if crate::events::enabled() {
+            crate::runlet_progress::execute(run).await
+        } else {
+            RunletBackend.execute(run).await
+        }
     }
 }
 

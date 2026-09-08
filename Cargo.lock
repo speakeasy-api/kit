@@ -342,9 +342,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.10"
+version = "0.10.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddfa6bc961e33850391795f78557d86d581d85267fbb797c2846be7df27dbf80"
+checksum = "2bd493e7dd9ed206d203ec37c4ff5c65bb97e5a77b5f0f385a366d5e75064c0c"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -2674,6 +2674,7 @@ dependencies = [
  "ratatui-image",
  "reqwest",
  "rmcp",
+ "runlet",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3855,9 +3856,9 @@ dependencies = [
 
 [[package]]
 name = "runlet"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "927f293f868ee447cfc55b1e5220f1717a907c566f45d836c8810e5155b3b6c8"
+checksum = "057e0864428c5a79a68683942d3750d05e9ffae541aa0185fde9ae1c87eca100"
 dependencies = [
  "hex",
  "regex",

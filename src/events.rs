@@ -14,7 +14,6 @@
 //! ACP hosts never see the extra chatter.
 
 use std::{
-    io::Write,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +35,12 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    /// Process-wide progress transport lease/reset, not a source execution.
+    RunletTransport { available: bool },
+    /// Authoritative, value-free observations owned by an exact compose call.
+    RunletProgress {
+        progress: crate::runlet_progress::Progress,
+    },
     /// Process-wide durability state, independent of the active ACP session.
     StorageStatus { pending: bool, exhausted: bool },
     /// A persisted ACP session was opened by the child runtime.
@@ -116,8 +121,10 @@ impl RuntimeEvent {
     #[must_use]
     pub fn parent_call(&self) -> Option<&str> {
         let call = match self {
+            Self::RunletProgress { progress } => return Some(&progress.owner),
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::StorageStatus { .. }
+            Self::RunletTransport { .. }
+            | Self::StorageStatus { .. }
             | Self::SessionStarted { .. }
             | Self::CompactionStarted { .. }
             | Self::CompactionFinished { .. }
@@ -135,25 +142,33 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os(EVENTS_ENV).is_some())
 }
 
-/// Writes one event to stderr when emission is enabled.
+/// Enqueues one event without waiting for stderr. Loss disables the transport;
+/// its explicit reset (or the client lease on a stalled sink) hides source state.
 pub fn emit(event: &RuntimeEvent) {
     if !enabled() {
         return;
     }
-    let mut stderr = std::io::stderr().lock();
-    write_event(&mut stderr, event);
-}
-
-fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
-    if let Ok(line) = serde_json::to_string(event) {
-        let _ = writeln!(writer, "{EVENT_MARKER}{line}");
+    if let Some(transport) = crate::runlet_progress::transport::global() {
+        transport.publish_event(event);
     }
 }
 
 /// Parses one stderr line, returning an event when the line carries one.
 #[must_use]
 pub fn parse(line: &str) -> Option<RuntimeEvent> {
-    serde_json::from_str(line.strip_prefix(EVENT_MARKER)?).ok()
+    let body = line.strip_prefix(EVENT_MARKER)?;
+    if body.len() > 64 * 1024 {
+        return None;
+    }
+    // Existing diagnostic events retain their historical parser shape. The new
+    // bounded payload is checked before it can reach retained UI state.
+    let event: RuntimeEvent = serde_json::from_str(body).ok()?;
+    if let RuntimeEvent::RunletProgress { progress } = &event
+        && (body.len() > 4096 || !progress.bounded())
+    {
+        return None;
+    }
+    Some(event)
 }
 
 /// Milliseconds since the Unix epoch, saturating at zero on a broken clock.
@@ -236,7 +251,7 @@ mod tests {
 
     use super::{
         EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
-        summarize_output, write_event,
+        summarize_output, test_support::write_event,
     };
 
     #[test]
@@ -394,3 +409,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

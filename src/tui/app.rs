@@ -358,6 +358,7 @@ pub struct ToolCall {
     pub finished: Option<Instant>,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
+    pub(super) progress: Box<super::progress::ScriptProgress>,
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
@@ -401,6 +402,7 @@ impl ToolCall {
     }
 
     fn finalize_terminal_state(&mut self) {
+        self.progress.parent_finished();
         if self.is_compose() && !self.expansion_explicit {
             self.expanded = false;
             self.compose_view = ComposeView::Output;
@@ -587,6 +589,8 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    progress_last_frame: Option<Instant>,
+    progress_unavailable: bool,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
@@ -836,6 +840,8 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
+            progress_last_frame: None,
+            progress_unavailable: false,
             root,
             provider,
             model,
@@ -1127,9 +1133,10 @@ impl App {
         }
     }
 
-    /// Whether the periodic animation clock can change anything on screen.
+    /// Whether periodic polling must advance animations or expire a runtime lease.
     pub fn needs_redraw_tick(&self) -> bool {
-        self.working()
+        (!self.progress_unavailable && self.progress_last_frame.is_some())
+            || self.working()
             || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
             || self.agents.values().any(|row| match row.status {
@@ -1146,6 +1153,7 @@ impl App {
 
     /// Advances animations and removes expired transient state.
     pub fn tick(&mut self) {
+        self.progress_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
     }
 
@@ -1706,7 +1714,8 @@ impl App {
                     status: ToolCallStatus::Pending,
                     started: Instant::now(),
                     finished: None,
-                    script: script.unwrap_or_default(),
+                    script: crate::runlet_progress::bounded_source(script.unwrap_or_default()),
+                    progress: Box::default(),
                     children: Vec::new(),
                     output: Vec::new(),
                     intent: None,
@@ -1757,6 +1766,10 @@ impl App {
                     call.intent = intent;
                 }
                 if let Some(script) = script {
+                    let script = crate::runlet_progress::bounded_source(script);
+                    if call.script != script {
+                        call.progress.invalidate();
+                    }
                     call.script = script;
                 }
                 if let Some(output) = output {
@@ -1813,6 +1826,9 @@ impl App {
                 _ => {}
             },
             Update::ProcessExited(error) => {
+                // Confirmed process exit can retire known roster rows. A mere
+                // diagnostic gap cannot claim those terminal outcomes.
+                self.invalidate_runtime_status();
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
@@ -1823,13 +1839,79 @@ impl App {
         }
     }
 
+    fn disable_runtime(&mut self) {
+        self.agents.clear();
+        self.invalidate_runtime_status();
+    }
+
+    fn invalidate_runtime_status(&mut self) {
+        if self.progress_unavailable {
+            return;
+        }
+        self.progress_unavailable = true;
+        // All these fields depend on the same lossy side channel. Absence is
+        // unknown, not idle/success/healthy; the UI exposes unavailability.
+        self.agent_versions.clear();
+        self.cleaned_agent_ids.clear();
+        self.cleaned_agent_ancestors.clear();
+        self.agents_scroll = 0;
+        self.runtime_session_id = None;
+        self.compacting = false;
+        self.storage_pending = false;
+        self.storage_exhausted = false;
+        for index in 0..self.blocks.len() {
+            if let Block::Tool(call) = &mut self.blocks[index] {
+                call.progress.invalidate();
+                call.children.clear();
+            }
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
+        }
+    }
+
+    pub(super) fn runtime_unavailable(&self) -> bool {
+        self.progress_unavailable
+    }
+
+    /// Monotonic transport deadline, also checked before accepting new traffic.
+    pub(super) fn progress_tick_at(&mut self, now: Instant) {
+        if !self.progress_unavailable
+            && self.progress_last_frame.is_some_and(|last| {
+                now.saturating_duration_since(last) >= crate::runlet_progress::transport::LEASE
+            })
+        {
+            self.disable_runtime();
+        }
+    }
+    fn progress_activity(&mut self) {
+        let now = Instant::now();
+        self.progress_tick_at(now);
+        if !self.progress_unavailable {
+            self.progress_last_frame = Some(now);
+        }
+    }
+
     fn apply_runtime(&mut self, event: RuntimeEvent) {
         self.apply_runtime_at(event, crate::events::now_millis());
     }
 
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        // Check expiry before any frame can refresh the lease or revive a
+        // lifecycle map. Loss applies to all runtime events, not only progress.
+        self.progress_activity();
+        if self.runtime_unavailable() {
+            return;
+        }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
+            RuntimeEvent::RunletTransport { available } => {
+                if available {
+                    self.progress_activity();
+                } else {
+                    self.disable_runtime();
+                }
+                return;
+            }
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
@@ -1942,6 +2024,49 @@ impl App {
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
                 return;
+            }
+            RuntimeEvent::RunletProgress { progress } => {
+                if self.progress_unavailable {
+                    return;
+                }
+                let Some(owner) = self.blocks.iter().rev().find_map(|b| match b {
+                    Block::Tool(c) if c.id == progress.owner && c.is_compose() => Some(c),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let needs_slot = owner.running() && !owner.progress.retained();
+                // Retain at most MAX_RUNS maps across the transcript. Eviction
+                // preserves incarnation tombstones so stale replay cannot revive it.
+                let retained = self
+                    .blocks
+                    .iter()
+                    .filter(|b| matches!(b, Block::Tool(c) if c.progress.retained()))
+                    .count();
+                if needs_slot
+                    && retained >= crate::runlet_progress::MAX_RUNS
+                    && let Some(id) = self.blocks.iter().find_map(|b| match b {
+                        Block::Tool(c) if c.id != progress.owner && c.progress.retained() => {
+                            Some(c.id.clone())
+                        }
+                        _ => None,
+                    })
+                    && let Some(call) = self.call_mut(&id)
+                {
+                    call.progress.invalidate();
+                }
+                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
+                    return;
+                };
+                if !call.is_compose() {
+                    return;
+                }
+                if call.running() {
+                    call.progress.apply(&progress, &call.script);
+                } else {
+                    call.progress.apply_terminal(&progress, &call.script);
+                }
+                call.id.clone()
             }
             RuntimeEvent::ChildStarted {
                 call: child_call,
@@ -6286,6 +6411,51 @@ mod tests {
     }
 
     #[test]
+    fn idle_runtime_lease_keeps_timer_scheduled_until_state_is_invalidated() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+
+        let mut app = app();
+        assert!(!app.needs_redraw_tick());
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        app.apply(Update::Runtime(agent_event(
+            "idle",
+            "Completed worker",
+            SubagentStatus::Idle,
+            Some(GenerationOutcome::Success),
+            1,
+            None,
+            (10, 20, Some(30)),
+        )));
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        assert!(!app.working());
+        assert!(app.transcript_dynamic.is_empty());
+        assert!(app.toast.is_none());
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+        assert!(app.needs_redraw_tick());
+        app.tick();
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+
+        // Advance the lease age without sleeping, then use the same scheduling
+        // predicate and tick entry point as both event loops. No new traffic.
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        assert!(app.needs_redraw_tick());
+        if app.needs_redraw_tick() {
+            app.tick();
+        }
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
     fn redraw_ticks_only_while_time_dependent_ui_is_visible() {
         let mut app = app();
         assert!(!app.needs_redraw_tick());
@@ -6574,7 +6744,8 @@ mod tests {
         assert!(app.needs_redraw_tick());
         app.tick_at(5_000);
         assert!(!app.agents.contains_key("failed"));
-        assert!(!app.needs_redraw_tick());
+        // Runtime traffic established a lease even after the animation ends.
+        assert!(app.needs_redraw_tick());
     }
 
     #[test]
