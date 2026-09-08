@@ -10,7 +10,9 @@ mod app;
 mod command;
 mod editor;
 mod image;
+mod image_source;
 mod markdown;
+mod markdown_images;
 mod progress;
 mod theme;
 mod ui;
@@ -71,8 +73,8 @@ use crate::{
 };
 
 use app::{
-    Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
-    UserImage,
+    Action, App, Attachment, AttachmentKind, EffortChoice, MediaImage, ModelChoice,
+    SubmittedPrompt, Update,
 };
 
 struct ModelSwitchCompletion {
@@ -1158,7 +1160,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
                     let event = {
-                        let redraw = app.needs_redraw_tick();
+                        let redraw = app.needs_redraw_tick() || images.pending() || !app.transcript_dirty.is_empty();
                         let mut stopped = pin!(stop.requested());
                         // Rotate the first eligible source after every winner.
                         // If none is ready, poll every eligible source with the
@@ -1347,7 +1349,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     let event = {
-                        let redraw = app.needs_redraw_tick();
+                        let redraw = app.needs_redraw_tick() || images.pending() || !app.transcript_dirty.is_empty();
                         let mut stopped = pin!(stop.requested());
                         let mut shutdown = pin!(storage_shutdown.cancelled());
                         // A local round-robin race keeps hot input/update queues
@@ -2547,14 +2549,15 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 append: true,
             }]
         }
-        SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
-            .map(|text| Update::AgentMessage {
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            let (text, images) = user_message_of(vec![chunk.content]);
+            vec![Update::AgentMessage {
                 id: chunk.message_id.to_string(),
                 text,
+                images,
                 append: true,
-            })
-            .into_iter()
-            .collect(),
+            }]
+        }
         SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Update::AgentThought {
                 id: chunk.message_id.to_string(),
@@ -2718,11 +2721,15 @@ fn message_patch(
                 append: false,
             }];
         }
-        MessageKind::Agent => |id, text| Update::AgentMessage {
-            id,
-            text,
-            append: false,
-        },
+        MessageKind::Agent => {
+            let (text, images) = user_message_of(blocks);
+            return vec![Update::AgentMessage {
+                id,
+                text,
+                images,
+                append: false,
+            }];
+        }
         MessageKind::Thought => |id, text| Update::AgentThought {
             id,
             text,
@@ -2737,7 +2744,7 @@ fn message_patch(
     vec![patch(id, text)]
 }
 
-fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
+fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<MediaImage>) {
     let mut text = String::new();
     let mut images = Vec::new();
     let mut image_ordinal = 0;
@@ -2747,7 +2754,8 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
         match block {
             ContentBlock::Image(image) => {
                 image_ordinal += 1;
-                let uri = image.uri.filter(|uri| safe_media_uri(uri));
+                let source_uri = image.uri;
+                let uri = source_uri.clone().filter(|uri| safe_media_uri(uri));
                 let existing_line = uri
                     .as_deref()
                     .and_then(|uri| markdown::line_with_link(&text, uri));
@@ -2765,8 +2773,11 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                         separate_after_image = true;
                         line
                     });
-                if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), line) {
-                    images.push(image);
+                if images.len() < app::MAX_MESSAGE_IMAGES
+                    && let Some(image) =
+                        MediaImage::new(image.data, image.mime_type.to_string(), line)
+                {
+                    images.push(image.with_uri(source_uri));
                 }
             }
             block => {
@@ -2808,7 +2819,12 @@ fn message_of(content: ContentBlock) -> Option<String> {
 
 fn safe_media_uri(uri: &str) -> bool {
     uri.len() <= 2_048
-        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
+        && !uri.chars().any(char::is_control)
+        && url::Url::parse(uri).is_ok_and(|uri| {
+            uri.username().is_empty()
+                && uri.password().is_none()
+                && matches!(uri.scheme(), "file" | "http" | "https" | "kit-file")
+        })
 }
 
 /// The Runlet program inside a `compose` call's input, when there is one.
@@ -2950,8 +2966,8 @@ fn redact_image_data_urls(text: &str) -> String {
 
 // Keep pixels separate from text previews. Live chunks and replay snapshots
 // use this path; never fetch a model-supplied URI.
-fn tool_images_of(content: &[ToolCallContent]) -> Vec<UserImage> {
-    let mut images: Vec<UserImage> = Vec::new();
+fn tool_images_of(content: &[ToolCallContent]) -> Vec<MediaImage> {
+    let mut images: Vec<MediaImage> = Vec::new();
     let mut retained = 0usize;
     for entry in content {
         if images.len() >= app::MAX_TOOL_IMAGES {
@@ -2966,7 +2982,8 @@ fn tool_images_of(content: &[ToolCallContent]) -> Vec<UserImage> {
         if retained.saturating_add(image.data.len()) > app::MAX_RETAINED_IMAGE_SOURCE_BYTES {
             continue;
         }
-        if let Some(image) = UserImage::new(image.data.clone(), image.mime_type.to_string(), 0)
+        if let Some(image) = MediaImage::new(image.data.clone(), image.mime_type.to_string(), 0)
+            .map(|source| source.with_uri(image.uri.clone()))
             && !images.iter().any(|existing| existing.key == image.key)
         {
             retained += image.data.len();
@@ -3856,7 +3873,7 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(message, "session").as_slice(),
-            [Update::AgentMessage { id, text, append: false }]
+            [Update::AgentMessage { id, text, append: false, .. }]
                 if id == "message" && text.is_empty()
         ));
 
@@ -3866,7 +3883,7 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(thought, "session").as_slice(),
-            [Update::AgentThought { id, text, append: false }]
+            [Update::AgentThought { id, text, append: false, .. }]
                 if id == "thought" && text.is_empty()
         ));
     }
@@ -4062,10 +4079,10 @@ mod tests {
         let links = "inspect these[file:///tmp/image.png](file:///tmp/image.png)[https://example.com/result.png](https://example.com/result.png)";
         assert_eq!(user.text, format!("{links}\n[Image #1]"));
         assert_eq!(user.images.len(), 1);
-        assert_eq!(user.images[0].data, "c2VjcmV0");
-        assert_eq!(summary, "summary");
+        assert_eq!(user.images[0].data.as_ref(), "c2VjcmV0");
+        assert_eq!(summary.text, "summary");
         assert_eq!(tool.images.len(), 1);
-        assert_eq!(tool.images[0].data, "c2VjcmV0");
+        assert_eq!(tool.images[0].data.as_ref(), "c2VjcmV0");
         assert_eq!(tool.status, wire::ToolCallStatus::Completed);
         assert_eq!(
             tool.output,
@@ -4109,8 +4126,158 @@ mod tests {
             );
             assert!(
                 matches!(translate_for_session(update, "session").as_slice(),
-                [Update::AgentMessage { text, .. }] if text == "[Image]")
+                [Update::AgentMessage { text, .. }] if text == "[Image #1]")
             );
+        }
+    }
+
+    #[test]
+    fn assistant_images_survive_live_and_replay_with_source_uri() {
+        let image = ContentBlock::Image(
+            wire::ImageContent::new("c2VjcmV0", "image/png")
+                .uri(Some("file:///tmp/native.png".into())),
+        );
+        let updates = [
+            SessionUpdate::AgentMessageChunk(wire::ContentChunk::new(image.clone(), "native")),
+            SessionUpdate::AgentMessage(AgentMessage::new("native").content(vec![image])),
+        ];
+        for (index, update) in updates.into_iter().enumerate() {
+            let translated =
+                translate_for_session(UpdateSessionNotification::new("session", update), "session");
+            let [
+                Update::AgentMessage {
+                    text,
+                    images,
+                    append,
+                    ..
+                },
+            ] = translated.as_slice()
+            else {
+                panic!("expected typed assistant message");
+            };
+            assert_eq!(*append, index == 0);
+            assert_eq!(images.len(), 1);
+            assert_eq!(
+                images[0].source_uri.as_deref(),
+                Some("file:///tmp/native.png")
+            );
+            assert!(!text.contains("c2VjcmV0"));
+            assert!(!format!("{translated:?}").contains("c2VjcmV0"));
+        }
+    }
+
+    #[test]
+    fn typed_message_snapshots_bound_occurrences_and_keep_overflow_text() {
+        for user in [true, false] {
+            for payload in ["", "AQID"] {
+                let content = (0..super::app::MAX_MESSAGE_IMAGES + 100)
+                    .map(|_| ContentBlock::Image(wire::ImageContent::new(payload, "image/png")))
+                    .collect::<Vec<_>>();
+                let update = if user {
+                    SessionUpdate::UserMessage(UserMessage::new("snapshot").content(content))
+                } else {
+                    SessionUpdate::AgentMessage(AgentMessage::new("snapshot").content(content))
+                };
+                let updates = translate_for_session(
+                    UpdateSessionNotification::new("session", update),
+                    "session",
+                );
+                let [
+                    Update::UserMessage { text, images, .. }
+                    | Update::AgentMessage { text, images, .. },
+                ] = updates.as_slice()
+                else {
+                    panic!("typed snapshot");
+                };
+                assert_eq!(
+                    images.len(),
+                    if payload.is_empty() {
+                        0
+                    } else {
+                        super::app::MAX_MESSAGE_IMAGES
+                    }
+                );
+                assert!(text.contains(&format!(
+                    "[Image #{}]",
+                    super::app::MAX_MESSAGE_IMAGES + 100
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_typed_live_chunks_preserve_fallback_without_images() {
+        for user in [true, false] {
+            let content = ContentBlock::Image(wire::ImageContent::new("", "image/png"));
+            let chunk = wire::ContentChunk::new(content, "empty");
+            let update = if user {
+                SessionUpdate::UserMessageChunk(chunk)
+            } else {
+                SessionUpdate::AgentMessageChunk(chunk)
+            };
+            let updates =
+                translate_for_session(UpdateSessionNotification::new("session", update), "session");
+            let [
+                Update::UserMessage { text, images, .. }
+                | Update::AgentMessage { text, images, .. },
+            ] = updates.as_slice()
+            else {
+                panic!("typed chunk");
+            };
+            assert_eq!(text, "[Image #1]");
+            assert!(images.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_snapshots_bound_tiny_occurrences_and_empty_replacement_releases_them() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        for empty in [false, true, false] {
+            let content = (0..super::app::MAX_TOOL_IMAGES + 100)
+                .map(|index| {
+                    let payload = if empty {
+                        String::new()
+                    } else {
+                        format!("{index:04}")
+                    };
+                    wire::ToolCallContent::Content(Box::new(wire::Content::new(
+                        ContentBlock::Image(wire::ImageContent::new(payload, "image/png")),
+                    )))
+                })
+                .collect::<Vec<_>>();
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::ToolCallUpdate(wire::ToolCallUpdate::new("tool").content(content)),
+            );
+            let updates = translate_for_session(notification, "session");
+            let [
+                Update::ToolPatched {
+                    images: Some(images),
+                    ..
+                },
+            ] = updates.as_slice()
+            else {
+                panic!("typed tool patch");
+            };
+            let expected = if empty {
+                0
+            } else {
+                super::app::MAX_TOOL_IMAGES
+            };
+            assert_eq!(images.len(), expected);
+            for update in updates {
+                app.apply(update);
+            }
+            let super::app::Block::Tool(call) = &app.blocks[0] else {
+                panic!("tool");
+            };
+            assert_eq!(call.images.len(), expected);
+            assert!(call.output.iter().any(|line| line.contains("[Image]")));
         }
     }
 
@@ -4233,7 +4400,7 @@ mod tests {
                 panic!("expected tool")
             };
             assert_eq!(tool.images.len(), 1);
-            assert_eq!(tool.images[0].data, "c2VjcmV0");
+            assert_eq!(tool.images[0].data.as_ref(), "c2VjcmV0");
             let text = tool.output.join("\n");
             assert!(!text.contains("c2VjcmV0"), "{text}");
             assert!(!text.contains("231"), "{text}");
@@ -4871,7 +5038,7 @@ mod tests {
 
         assert_eq!(text, format!("describe [Image #1]({uri})"));
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].data, "AQID");
+        assert_eq!(images[0].data.as_ref(), "AQID");
         assert_eq!(images[0].mime_type, "image/png");
     }
 

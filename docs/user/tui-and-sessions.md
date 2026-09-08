@@ -23,6 +23,24 @@ The catalog requires an existing directory and is workspace-filtered and newest-
 
 A session ID must be 1–128 ASCII letters, digits, `-`, or `_`. `kit prompt` uses the same durable sessions: it prints `session_id: <id>` after its answer, and that ID can be continued by either `kit prompt --resume <session-id>` or `kit tui --resume <session-id>`.
 
+## Images in the transcript
+
+User attachments, native assistant-generated images, typed tool results, and Markdown image nodes use the same terminal image renderer. Image loading and decoding are asynchronous. Loading or unavailable images retain text placeholders; unsupported terminal graphics retain readable text and source links. Image viewports keep a fixed height and refit to the terminal width after resize. When the visible image set exceeds cache capacity, Kit keeps a stable admitted subset and shows a capacity-deferred placeholder for the rest; scrolling to a smaller set permits recovery without repeated background downloads or decoding. Display is presentation-only: it never attaches pixels to a prompt, grants File access, or changes provider requests.
+
+Markdown images use CommonMark image syntax, including reference-style images. Ordinary links, escaped image syntax, and images inside code do not load. An incomplete streamed image node remains text until it parses as an image. Explicit repeated image nodes remain separate occurrences. A typed attachment and a Markdown image are deduplicated only after the resolved bytes identify the same image; an inaccessible Markdown source does not hide the typed attachment.
+
+- `![Edited image](kit-file://file_<64-hex-digits>)` resolves through the current session's managed-file authority. An ID alone cannot grant access to another session's image.
+- Relative paths resolve from the session project root. Absolute paths and local `file:` URLs use OS process permissions, including symlink targets; only bounded regular files are read. This is not a workspace filesystem sandbox.
+- Remote images are **disabled by default**. To authorize anonymous HTTPS image loads from an exact origin, start Kit with an explicit environment policy, for example:
+
+  ```sh
+  KIT_TUI_IMAGE_ORIGINS=https://images.example.com kit tui --root /path/to/project
+  ```
+
+  Multiple origins are comma-separated. Authorization is for the entire origin, not an individual path. URLs with credentials, nondefault ports, nonpublic destination addresses, or redirects are rejected. Each DNS address must pass validation and the connection is pinned to the validated addresses while retaining TLS hostname verification. The dedicated client does not inherit proxies, cookies, or authorization headers. Reads, connection time, response size, decode work, and concurrent jobs are bounded. An ordinary HTTPS link is still only a link.
+
+External Markdown images are temporary presentation snapshots, not managed imports. Cache reset or session replay re-resolves local files and remote URLs; changes outside Kit can therefore change those images. Managed and typed images retain their original snapshot semantics. Session changes invalidate cached authorization and prevent stale work from publishing into the new session. Already running blocking work can finish before its bounded worker slot is released. Missing, denied, and corrupt sources are negatively cached rather than retried on every redraw. Restart the TUI to change the remote-origin policy.
+
 ## Recovering from full storage
 
 Kit routes its internal persistence through a shared filesystem service. If a write fails because storage is full or a quota is exceeded, the service retains the pending change in a bounded memory overlay. Internal reads and session listings use the same view, so finishing a turn or closing a session handle does not discard accepted changes. An existing session can be reopened in the same running process while persistence is pending.

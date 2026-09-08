@@ -43,6 +43,47 @@ impl Fixture {
     }
 }
 #[test]
+fn id_lookup_uses_session_authority_and_validates_stored_envelope() {
+    let f = Fixture::new();
+    let reference = f.import("image.png");
+    let expected = f.store.resolve("session", &reference).unwrap();
+    assert_eq!(
+        f.store.resolve_id("session", &reference.id).unwrap(),
+        (expected, "image/png".into())
+    );
+    assert!(f.store.resolve_id("other-session", &reference.id).is_err());
+    for invalid in [
+        format!("{}/", reference.id),
+        format!("{}?q=1", reference.id),
+        format!("{}#x", reference.id),
+        "../image".into(),
+        format!("file_{}", "A".repeat(64)),
+        format!("file_{}", "0".repeat(64)),
+    ] {
+        assert!(f.store.resolve_id("session", &invalid).is_err());
+    }
+    let path = f.object(&reference);
+    let mut bytes = disk::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    disk::write(&path, bytes).unwrap();
+    assert!(f.store.resolve_id("session", &reference.id).is_err());
+}
+
+#[test]
+fn id_lookup_rejects_stored_descriptor_for_another_id() {
+    let f = Fixture::new();
+    let reference = f.import("image.png");
+    let alternate = format!("file_{}", "f".repeat(64));
+    disk::copy(
+        f.object(&reference),
+        f.store.session_directory("session").join(&alternate),
+    )
+    .unwrap();
+    assert!(f.store.resolve_id("session", &alternate).is_err());
+}
+
+#[test]
 fn png_and_jpeg_snapshots_survive_source_deletion_and_reopen() {
     for (format, name, mime) in [
         (ImageFormat::Png, "image.png", "image/png"),

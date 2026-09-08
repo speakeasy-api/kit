@@ -7,6 +7,69 @@
 
 use std::ops::Range;
 
+/// A completed CommonMark image occurrence. Ordinary links and code never load media.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ImageNode {
+    pub range: Range<usize>,
+    pub line: usize,
+    pub destination: String,
+    pub alt: String,
+}
+
+pub(super) fn image_nodes(source: &str) -> Vec<ImageNode> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    // Bound parser work and occurrence retention independently of image bytes.
+    if source.len() > 1024 * 1024 {
+        return Vec::new();
+    }
+    let mut nodes = Vec::new();
+    let mut current: Option<ImageNode> = None;
+    let mut depth = 0usize;
+    for (event, range) in Parser::new(source).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                if depth == 0 {
+                    current = Some(ImageNode {
+                        line: source[..range.start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count(),
+                        range,
+                        destination: dest_url.into_string(),
+                        alt: String::new(),
+                    });
+                }
+                depth += 1;
+            }
+            Event::End(TagEnd::Image) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(mut node) = current.take()
+                {
+                    node.range.end = range.end;
+                    nodes.push(node);
+                    if nodes.len() == 64 {
+                        break;
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) if depth > 0 => {
+                if let Some(node) = &mut current {
+                    node.alt.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if depth > 0 => {
+                if let Some(node) = &mut current {
+                    node.alt.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    nodes
+}
+
 use super::{
     theme,
     wrap::{LinkedLine, LinkedSpan},
@@ -17,10 +80,25 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
 pub(super) fn render_copyable_at_width(
     source: &str,
     max_width: Option<usize>,
 ) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+    render_copyable_with_source_at_width(source, max_width)
+        .into_iter()
+        .map(|(line, code, _)| (line, code))
+        .collect()
+}
+
+/// Render the complete document, retaining code-copy ranges and byte coverage.
+/// Coverage includes raw line endings; synthetic frames have empty ranges.
+/// A source row expanded into several table lines is covered by its last line,
+/// so media insertion cannot interrupt that row before its contents are shown.
+pub(super) fn render_copyable_with_source_at_width(
+    source: &str,
+    max_width: Option<usize>,
+) -> Vec<(LinkedLine, Option<Range<usize>>, Range<usize>)> {
     let mut next_offset = 0;
     let raw_lines: Vec<(usize, &str)> = source
         .split('\n')
@@ -37,6 +115,7 @@ pub(super) fn render_copyable_at_width(
         if index < table_end {
             continue;
         }
+        let coverage = offset..(offset + raw.len() + 1).min(source.len());
         let trimmed = raw.trim_start();
         let candidate = fence_line(raw);
         if let Some((language, marker, length, content)) = fence.as_ref() {
@@ -51,10 +130,11 @@ pub(super) fn render_copyable_at_width(
                         }
                     )),
                     Some(content.clone()),
+                    coverage,
                 ));
                 fence = None;
             } else {
-                lines.push((code_line(raw), Some(content.clone())));
+                lines.push((code_line(raw), Some(content.clone()), coverage));
             }
             continue;
         }
@@ -85,19 +165,28 @@ pub(super) fn render_copyable_at_width(
                     }
                 )),
                 Some(content.clone()),
+                coverage,
             ));
             fence = Some((language, marker, length, content));
             continue;
         }
-        if let Some((end, table)) = table_at(&raw_lines, index, max_width) {
-            lines.extend(table.into_iter().map(|line| (line, None)));
+        if let Some((end, table)) = table_at(&raw_lines, index, max_width, source.len()) {
+            lines.extend(
+                table
+                    .into_iter()
+                    .map(|(line, coverage)| (line, None, coverage)),
+            );
             table_end = end;
             continue;
         }
-        lines.push((block_line(raw, trimmed), None));
+        lines.push((block_line(raw, trimmed), None, coverage));
     }
     if let Some((_, _, _, content)) = fence {
-        lines.push((code_frame("└─ code"), Some(content)));
+        lines.push((
+            code_frame("└─ code"),
+            Some(content),
+            source.len()..source.len(),
+        ));
     }
     lines
 }
@@ -114,11 +203,14 @@ struct TableCell {
     width: usize,
 }
 
+type CoveredLine = (LinkedLine, Range<usize>);
+
 fn table_at(
     lines: &[(usize, &str)],
     start: usize,
     max_width: Option<usize>,
-) -> Option<(usize, Vec<LinkedLine>)> {
+    source_len: usize,
+) -> Option<(usize, Vec<CoveredLine>)> {
     let header_line = lines.get(start)?.1;
     if !table_row_allowed(header_line) {
         return None;
@@ -172,20 +264,51 @@ fn table_at(
         .map(|column| rows.iter().map(|row| row[column].width).max().unwrap_or(0))
         .collect::<Vec<_>>();
 
+    let coverage = |index: usize| {
+        let (offset, raw) = lines[index];
+        offset..(offset + raw.len() + 1).min(source_len)
+    };
     let table_width = 1 + widths.iter().map(|width| width + 3).sum::<usize>();
     if max_width.is_some_and(|max_width| table_width > max_width) {
-        return Some((end, stacked_table(&rows)));
+        let rendered = stacked_table(&rows)
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let row = index / columns;
+                let last_column = index % columns == columns - 1;
+                let raw_row = if rows.len() == 1 {
+                    start + 1
+                } else {
+                    start + 2 + row
+                };
+                let range_start = if row == 0 {
+                    lines[start].0
+                } else {
+                    lines[raw_row].0
+                };
+                let range_end = if last_column {
+                    coverage(raw_row).end
+                } else {
+                    range_start
+                };
+                (line, range_start..range_end)
+            })
+            .collect();
+        return Some((end, rendered));
     }
 
-    let mut rendered = vec![table_rule(&widths, '┌', '┬', '┐')];
-    rendered.push(table_row(&rows[0], &widths, &alignments));
-    rendered.push(table_rule(&widths, '├', '┼', '┤'));
-    rendered.extend(
-        rows[1..]
-            .iter()
-            .map(|row| table_row(row, &widths, &alignments)),
-    );
-    rendered.push(table_rule(&widths, '└', '┴', '┘'));
+    let table_start = lines[start].0;
+    let mut rendered = vec![(table_rule(&widths, '┌', '┬', '┐'), table_start..table_start)];
+    rendered.push((table_row(&rows[0], &widths, &alignments), coverage(start)));
+    rendered.push((table_rule(&widths, '├', '┼', '┤'), coverage(start + 1)));
+    rendered.extend(rows[1..].iter().enumerate().map(|(row, cells)| {
+        (
+            table_row(cells, &widths, &alignments),
+            coverage(start + 2 + row),
+        )
+    }));
+    let table_end = coverage(end - 1).end;
+    rendered.push((table_rule(&widths, '└', '┴', '┘'), table_end..table_end));
     Some((end, rendered))
 }
 
@@ -695,6 +818,125 @@ mod tests {
     }
 
     #[test]
+    fn source_coverage_uses_raw_unicode_and_crlf_byte_offsets() {
+        let source = "# café\r\n雪\r\n";
+        let rendered = render_copyable_with_source_at_width(source, None);
+        let covered: Vec<_> = rendered
+            .iter()
+            .map(|(_, _, range)| &source[range.clone()])
+            .collect();
+        assert_eq!(covered, ["# café\r\n", "雪\r\n", ""]);
+        assert_eq!(rendered.last().unwrap().2, source.len()..source.len());
+        assert!(rendered.iter().all(|(_, code, _)| code.is_none()));
+    }
+
+    #[test]
+    fn fenced_source_coverage_is_separate_from_complete_code_copy_range() {
+        let source = "前\r\n```rust\r\n雪\r\n```\r\n後";
+        let rendered = render_copyable_with_source_at_width(source, None);
+        let covered: Vec<_> = rendered
+            .iter()
+            .map(|(_, _, range)| &source[range.clone()])
+            .collect();
+        assert_eq!(
+            covered,
+            ["前\r\n", "```rust\r\n", "雪\r\n", "```\r\n", "後"]
+        );
+        for (_, code, _) in &rendered[1..4] {
+            assert_eq!(&source[code.clone().unwrap()], "雪");
+        }
+        let unclosed = "~~~\r\n雪";
+        let rendered = render_copyable_with_source_at_width(unclosed, None);
+        assert_eq!(rendered[0].2, 0..5);
+        assert_eq!(rendered[1].2, 5..unclosed.len());
+        assert_eq!(rendered[2].2, unclosed.len()..unclosed.len());
+        for (_, code, _) in rendered {
+            assert_eq!(&unclosed[code.unwrap()], "雪");
+        }
+    }
+
+    #[test]
+    fn table_source_coverage_places_images_after_their_rendered_rows() {
+        let source = "| 頭 | B |\r\n| --- | --- |\r\n| ![雪](image.png) | x |\r\n| last | y |";
+        let rendered = render_copyable_with_source_at_width(source, None);
+        let covered: Vec<_> = rendered
+            .iter()
+            .map(|(_, _, range)| &source[range.clone()])
+            .collect();
+        assert_eq!(
+            covered,
+            [
+                "",
+                "| 頭 | B |\r\n",
+                "| --- | --- |\r\n",
+                "| ![雪](image.png) | x |\r\n",
+                "| last | y |",
+                ""
+            ]
+        );
+        let node = image_nodes(source).remove(0);
+        assert_eq!(
+            rendered
+                .iter()
+                .position(|(_, _, range)| range.end >= node.range.end),
+            Some(3)
+        );
+        let stacked = render_copyable_with_source_at_width(source, Some(1));
+        assert_eq!(stacked.len(), 4);
+        assert_eq!(stacked[0].2, 0..0);
+        assert_eq!(stacked[1].2.end, rendered[3].2.end);
+        assert_eq!(
+            stacked
+                .iter()
+                .position(|(_, _, range)| range.end >= node.range.end),
+            Some(1)
+        );
+        assert_eq!(stacked[2].2.start, stacked[2].2.end);
+        assert_eq!(stacked[3].2.end, source.len());
+
+        let header_only = "| ![頭](header.png) | B |\n| --- | --- |";
+        let node = image_nodes(header_only).remove(0);
+        for width in [None, Some(1)] {
+            let rows = render_copyable_with_source_at_width(header_only, width);
+            assert_eq!(
+                rows.iter()
+                    .position(|(_, _, range)| range.end >= node.range.end),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_wrapper_preserves_styles_links_gutters_and_code_ranges() {
+        for source in [
+            "# café\n- **bold** [link](https://example.com)\n> quote",
+            "before\r\n```rust\r\nlet 雪 = 1;\r\n```\r\nafter",
+            "~~~\n雪",
+            "| **A** | B |\n| --- | --- |\n| [link](https://example.com) | 雪 |",
+            "| A | B |\n| --- | --- |",
+            "",
+        ] {
+            for width in [None, Some(1), Some(80)] {
+                let original = render_copyable_at_width(source, width);
+                let covered = render_copyable_with_source_at_width(source, width);
+                assert_eq!(original.len(), covered.len());
+                for ((line, code), (with_source, source_code, range)) in
+                    original.iter().zip(&covered)
+                {
+                    assert_eq!(format!("{line:?}"), format!("{with_source:?}"));
+                    assert_eq!(code, source_code);
+                    assert!(source.get(range.clone()).is_some());
+                }
+                assert!(
+                    covered
+                        .windows(2)
+                        .all(|rows| rows[0].2.end <= rows[1].2.end)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn renders_aligned_pipe_tables() {
         let rendered =
             render("| Name | Status |\n| :--- | ---: |\n| alpha | Ready |\n| beta | In progress |");
@@ -987,6 +1229,31 @@ mod tests {
             linked_urls("[docs](https://example.com/a_(b))"),
             ["https://example.com/a_(b)", "https://example.com/a_(b)"]
         );
+    }
+
+    #[test]
+    fn image_nodes_are_completed_commonmark_not_links_or_code() {
+        let source = "![a *bold* image](kit-file://example)\n![again][pic]\n\n[pic]: /tmp/image.png\n\n`![code](bad.png)`\n```md\n![fence](bad.png)\n```\n\\![escaped](bad.png)\n[ordinary](bad.png)\n![partial](";
+        let nodes = super::image_nodes(source);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].alt, "a bold image");
+        assert_eq!(nodes[0].destination, "kit-file://example");
+        assert_eq!(
+            &source[nodes[0].range.clone()],
+            "![a *bold* image](kit-file://example)"
+        );
+        assert_eq!(nodes[1].destination, "/tmp/image.png");
+        assert_eq!(nodes[1].line, 1);
+    }
+
+    #[test]
+    fn image_nodes_preserve_repeated_occurrences_and_stream_completion() {
+        assert!(super::image_nodes("![alt](https://example.com/a").is_empty());
+        let nodes =
+            super::image_nodes("![alt](https://example.com/a) ![alt](https://example.com/a)");
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(nodes[0].range, nodes[1].range);
+        assert_eq!(nodes[0].destination, nodes[1].destination);
     }
 
     #[test]

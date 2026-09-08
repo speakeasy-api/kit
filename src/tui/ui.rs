@@ -22,7 +22,8 @@ use super::{
     app::{
         AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
         CachedTranscriptRow, Child, CodeHit, ComposeView, EffortDialog, FilePickerDialog,
-        FilePickerStatus, ModelDialog, Phase, SessionRename, ToolCall, UserMessage,
+        FilePickerStatus, ModelDialog, Phase, SessionRename, ToolCall, TranscriptImageSource,
+        UserMessage,
     },
     command,
     image::{ImageRuntime, RESERVED_ROWS},
@@ -47,6 +48,16 @@ type TranscriptTag = (Option<String>, Option<CodeHit>, Option<usize>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
+    images
+        .markdown
+        .context(&app.root, app.session_id.as_deref());
+    if app.blocks.is_empty() {
+        images.markdown.set_visible(std::iter::empty());
+        images.markdown.poll();
+        images.set_visible_keys(std::iter::empty());
+        images.poll();
+        app.invalidate_image_layout(&images.markdown.take_changed_sources());
+    }
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let start_width = frame
@@ -933,7 +944,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         Vec::new(),
         String::new(),
     );
-    let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
+    let mut visible_images: Vec<(usize, TranscriptImageSource, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         visible.push(row.0.clone());
         app.row_calls.push(row.1.0.clone());
@@ -972,7 +983,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                         let y = image_start as isize - offset as isize;
                         visible_images.push((
                             block_index,
-                            placement.source,
+                            placement.source.clone(),
                             y.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
                         ));
                     }
@@ -998,19 +1009,79 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
     frame.render_widget(Paragraph::new(visible), inner);
     draw_selection(frame, app, inner, offset, &row_widths);
-    for (block_index, source_index, y) in visible_images {
-        let sources = match app.blocks.get(block_index) {
-            Some(Block::User(message)) => &message.images,
-            Some(Block::Tool(call)) => &call.images,
-            _ => continue,
+    // Register the whole viewport before any completion can evict another
+    // visible image. Known identities include source snapshots deferred by the
+    // source byte budget, not just images already in the decoder cache.
+    images.markdown.set_visible(
+        visible_images
+            .iter()
+            .filter_map(|(_, source, _)| match source {
+                TranscriptImageSource::Markdown(destination) => Some(destination.as_str()),
+                TranscriptImageSource::Typed(_) => None,
+            }),
+    );
+    images.markdown.poll();
+    let visible_keys = visible_images
+        .iter()
+        .filter_map(|(block_index, source, _)| match source {
+            TranscriptImageSource::Typed(index) => {
+                let sources = match app.blocks.get(*block_index) {
+                    Some(Block::User(message) | Block::Agent(message)) => &message.images,
+                    Some(Block::Tool(call)) => &call.images,
+                    _ => return None,
+                };
+                sources.get(*index).map(|source| source.key)
+            }
+            TranscriptImageSource::Markdown(destination) => images
+                .markdown
+                .is_visible(destination)
+                .then(|| images.markdown.key(destination))
+                .flatten(),
+        })
+        .collect::<Vec<_>>();
+    images.set_visible_keys(visible_keys);
+    images.poll();
+    app.invalidate_image_layout(&images.markdown.take_changed_sources());
+    for (block_index, source, y) in visible_images {
+        let (prepared, status) = match source {
+            TranscriptImageSource::Typed(index) => {
+                let sources = match app.blocks.get(block_index) {
+                    Some(Block::User(message) | Block::Agent(message)) => &message.images,
+                    Some(Block::Tool(call)) => &call.images,
+                    _ => continue,
+                };
+                let Some(source) = sources.get(index) else {
+                    continue;
+                };
+                let prepared = images.prepare(source, inner.width.max(1));
+                (prepared, images.status(&source.key).to_owned())
+            }
+            TranscriptImageSource::Markdown(destination) => {
+                if !images.enabled() {
+                    continue;
+                }
+                // Requests start only for viewports intersecting the screen. Layout
+                // and replay never initiate IO for offscreen transcript history.
+                if !images.markdown.is_visible(&destination) {
+                    draw_image_status(frame, inner, y, "image deferred (visible image budget)");
+                    continue;
+                }
+                images.markdown.request(&destination);
+                if let Some(source) = images.markdown.image(&destination).cloned() {
+                    let prepared = images.prepare(&source, inner.width.max(1));
+                    (prepared, images.status(&source.key).to_owned())
+                } else {
+                    (None, images.markdown.status(&destination).to_owned())
+                }
+            }
         };
-        let Some(source) = sources.get(source_index) else {
-            continue;
-        };
-        if let Some(image) = images.prepare(source, inner.width.max(1)) {
+        if let Some(image) = prepared {
             images.render(frame, image, inner, y);
+        } else {
+            draw_image_status(frame, inner, y, &status);
         }
     }
+
     if total > height {
         let mut state = ScrollbarState::new(bottom).position(offset);
         frame.render_stateful_widget(
@@ -1027,6 +1098,26 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
 
 /// Restyles the cells a drag selected. The highlight hugs each row's text
 /// instead of running to the margin, so it shows exactly what a copy takes.
+fn draw_image_status(frame: &mut Frame<'_>, area: Rect, y: i16, status: &str) {
+    let start = i32::from(y).max(0).min(i32::from(area.height)) as u16;
+    let end = (i32::from(y) + i32::from(RESERVED_ROWS))
+        .max(0)
+        .min(i32::from(area.height)) as u16;
+    if start < end {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("[Image: {status}]"),
+                theme::dim(),
+            ))),
+            Rect {
+                y: area.y + start,
+                height: end - start,
+                ..area
+            },
+        );
+    }
+}
+
 fn draw_selection(
     frame: &mut Frame<'_>,
     app: &App,
@@ -1093,6 +1184,48 @@ fn welcome_logo() -> Paragraph<'static> {
     Paragraph::new(lines).alignment(Alignment::Center)
 }
 
+/// Keep the same logical row when cache-dependent dedup inserts or removes
+/// reserved image rows. Image anchors include their occurrence so repeated
+/// Markdown destinations do not jump to the first occurrence.
+fn remap_image_layout_row(
+    old: &[CachedTranscriptImage],
+    new: &[CachedTranscriptImage],
+    row: usize,
+) -> usize {
+    let reserved = usize::from(RESERVED_ROWS);
+    let mut text_row = row;
+    for (index, image) in old.iter().enumerate() {
+        if image.row > row {
+            break;
+        }
+        if row < image.row + reserved {
+            let occurrence = old[..index]
+                .iter()
+                .filter(|previous| previous.source == image.source)
+                .count();
+            if let Some(current) = new
+                .iter()
+                .filter(|current| current.source == image.source)
+                .nth(occurrence)
+            {
+                return current.row + row - image.row;
+            }
+            // A removed image falls back to the following logical text row.
+            text_row -= row - image.row;
+            break;
+        }
+        text_row -= reserved;
+    }
+    let mut mapped = text_row;
+    for image in new {
+        if image.row > mapped {
+            break;
+        }
+        mapped += reserved;
+    }
+    mapped
+}
+
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
 fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime, width: usize) {
@@ -1103,6 +1236,42 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         app.sync_transcript_cache();
     }
     let width_changed = app.transcript_cache_width != width;
+    // A fixed numeric scroll offset is not a viewport anchor: source readiness
+    // can remove a typed duplicate above it, change the visible working set,
+    // and trigger eviction/reacquisition forever. Preserve the top block and
+    // its logical row only for an unchanged User/Agent message, the only blocks
+    // with cache-dependent Markdown/typed-image dedup. Tools and thoughts keep
+    // their existing scroll behavior. Earlier blocks may change: their rebuilt
+    // prefixes locate the same message.
+    // A replacement of the anchored block makes old image indices and logical
+    // row numbers unsafe, even at the same width/block count.
+    let mut anchor = if !app.follow && !structure_changed && !width_changed {
+        let block = app
+            .transcript_prefixes
+            .partition_point(|prefix| *prefix <= app.scroll)
+            .saturating_sub(1);
+        app.transcript_cache
+            .get(block)
+            .and_then(Option::as_ref)
+            .filter(|cached| {
+                matches!(
+                    app.blocks.get(block),
+                    Some(Block::User(_) | Block::Agent(_))
+                ) && cached.revision == app.transcript_revisions[block]
+            })
+            .map(|_| {
+                let start = app.transcript_prefixes[block];
+                let separator = usize::from(start > 0);
+                let on_separator = separator > 0 && app.scroll == start;
+                (
+                    block,
+                    app.scroll.saturating_sub(start + separator),
+                    on_separator,
+                )
+            })
+    } else {
+        None
+    };
     let mut layout_changed = structure_changed || width_changed;
     if width_changed {
         app.transcript_cache_width = width;
@@ -1119,23 +1288,24 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
             _ => false,
         };
         let revision = app.transcript_revisions[block_index];
-        if !width_changed
-            && !dynamic
-            && app.transcript_cache[block_index]
-                .as_ref()
-                .is_some_and(|cached| cached.revision == revision)
-        {
-            continue;
-        }
+        // Dirty includes source-cache-only invalidations, whose content
+        // revision intentionally matches the cache. Every dirty block rebuilds.
         let missing = app.transcript_cache[block_index].is_none();
         let old_count = app.transcript_cache[block_index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
         let (rows, cached_images) =
-            transcript_block_rows(app, block_index, width, images.enabled());
+            transcript_block_rows(app, block_index, width, images.enabled(), images);
         if missing || rows.len() != old_count {
             first_changed_count = first_changed_count.min(block_index);
             layout_changed |= !missing;
+        }
+        if let Some((block, row, false)) = &mut anchor
+            && *block == block_index
+            && let Some(old) = &app.transcript_cache[block_index]
+        {
+            *row = remap_image_layout_row(&old.images, &cached_images, *row)
+                .min(rows.len().saturating_sub(1));
         }
         app.transcript_cache[block_index] = Some(CachedTranscriptBlock {
             revision,
@@ -1155,43 +1325,142 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         app.transcript_prefixes[index + 1] =
             app.transcript_prefixes[index] + rows + usize::from(app.transcript_prefixes[index] > 0);
     }
+    if let Some((block, row, on_separator)) = anchor {
+        let start = app.transcript_prefixes[block];
+        app.scroll = start
+            + if on_separator {
+                0
+            } else {
+                usize::from(start > 0) + row
+            };
+    }
     if layout_changed {
         app.clear_transcript_interaction();
     }
 }
 
-fn user_block_rows(
+fn reserve_image_rows(
+    rows: &mut Vec<CachedTranscriptRow>,
+    placements: &mut Vec<CachedTranscriptImage>,
+    source: TranscriptImageSource,
+    call: Option<String>,
+) {
+    let row = rows.len();
+    rows.extend((0..RESERVED_ROWS).map(|_| {
+        (
+            Line::default(),
+            (call.clone(), None, None),
+            Vec::new(),
+            String::new(),
+        )
+    }));
+    placements.push(CachedTranscriptImage { source, row });
+}
+
+/// Render the whole document first, then insert image occurrences using source
+/// ranges. Fences, tables, and code-copy byte offsets never see sliced Markdown.
+fn message_block_rows(
     message: &UserMessage,
+    block_index: usize,
     width: usize,
     reserve_images: bool,
+    user: bool,
+    images: &ImageRuntime,
 ) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+    let nodes = markdown::image_nodes(&message.text);
+    let rendered = if user {
+        let mut offset = 0;
+        message
+            .text
+            .split('\n')
+            .enumerate()
+            .map(|(index, text)| {
+                let start = offset;
+                offset += text.len() + 1;
+                (
+                    user_line(text, index == 0),
+                    None,
+                    start..offset.min(message.text.len()),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        markdown::render_copyable_with_source_at_width(&message.text, Some(width))
+    };
+    let mut occurrences = vec![Vec::new(); rendered.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(row) = rendered
+            .iter()
+            .position(|(_, _, range)| range.end >= node.range.end)
+        {
+            occurrences[row].push((
+                TranscriptImageSource::Markdown(node.destination.clone()),
+                Some(index),
+            ));
+        }
+    }
+    let line_ends: Vec<_> = message
+        .text
+        .split('\n')
+        .scan(0, |offset, line| {
+            let end = *offset + line.len();
+            *offset = end + 1;
+            Some(end)
+        })
+        .collect();
+    for (index, image) in message.images.iter().enumerate() {
+        let duplicate = reserve_images
+            && nodes.iter().any(|node| {
+                images
+                    .markdown
+                    .image(&node.destination)
+                    .is_some_and(|loaded| loaded.key == image.key)
+            });
+        if duplicate {
+            continue;
+        }
+        let end = line_ends
+            .get(image.line)
+            .copied()
+            .unwrap_or(message.text.len());
+        if let Some(row) = rendered.iter().position(|(_, _, range)| range.end >= end) {
+            occurrences[row].push((TranscriptImageSource::Typed(index), None));
+        }
+    }
     let mut rows = Vec::new();
     let mut placements = Vec::new();
-    for (line_index, text) in message.text.split('\n').enumerate() {
+    for (line_index, ((line, code, _), occurrences)) in
+        rendered.into_iter().zip(occurrences).enumerate()
+    {
+        let code = code.map(|range| CodeHit {
+            block: block_index,
+            range,
+        });
         rows.extend(wrap_linked_tagged(
-            &[(
-                user_line(text, line_index == 0),
-                (None, None, Some(line_index)),
-            )],
+            &[(line, (None, code, Some(line_index)))],
             width,
         ));
-        if reserve_images {
-            for (source, _) in message
-                .images
-                .iter()
-                .enumerate()
-                .filter(|(_, image)| image.line == line_index)
-            {
-                let row = rows.len();
-                rows.extend((0..RESERVED_ROWS).map(|_| {
-                    (
-                        Line::default(),
-                        (None, None, None),
-                        Vec::new(),
-                        String::new(),
-                    )
-                }));
-                placements.push(CachedTranscriptImage { source, row });
+        for (source, node) in occurrences {
+            if let Some(node) = node {
+                let node = &nodes[node];
+                let safe = super::safe_media_uri(&node.destination);
+                let relative = !node.destination.contains(':')
+                    && node.destination.len() <= 2048
+                    && !node.destination.chars().any(char::is_control);
+                let destination = if safe || relative {
+                    node.destination.as_str()
+                } else {
+                    "unsupported source"
+                };
+                let label = format!("[Image: {} — {destination}]", node.alt);
+                let line = LinkedLine::new(vec![LinkedSpan {
+                    span: Span::styled(label, theme::dim()),
+                    url: safe.then(|| node.destination.clone()),
+                }]);
+                rows.extend(wrap_linked_tagged(&[(line, (None, None, None))], width));
+            }
+            if reserve_images {
+                reserve_image_rows(&mut rows, &mut placements, source, None);
             }
         }
     }
@@ -1203,11 +1472,16 @@ fn transcript_block_rows(
     block_index: usize,
     width: usize,
     reserve_images: bool,
+    images: &ImageRuntime,
 ) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
-        Block::User(message) => return user_block_rows(message, width, reserve_images),
-        Block::Agent(text) => (markdown::render_copyable_at_width(text, Some(width)), None),
+        Block::User(message) => {
+            return message_block_rows(message, block_index, width, reserve_images, true, images);
+        }
+        Block::Agent(message) => {
+            return message_block_rows(message, block_index, width, reserve_images, false, images);
+        }
         Block::Thought {
             text,
             started,
@@ -1282,16 +1556,12 @@ fn transcript_block_rows(
             if !reserve_images {
                 continue;
             }
-            let row = rows.len();
-            rows.extend((0..RESERVED_ROWS).map(|_| {
-                (
-                    Line::default(),
-                    (Some(call.id.clone()), None, None),
-                    Vec::new(),
-                    String::new(),
-                )
-            }));
-            placements.push(CachedTranscriptImage { source, row });
+            reserve_image_rows(
+                &mut rows,
+                &mut placements,
+                TranscriptImageSource::Typed(source),
+                Some(call.id.clone()),
+            );
         }
     }
     (rows, placements)
@@ -2236,7 +2506,7 @@ mod tests {
     use super::{
         ImageRuntime, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
         model_dialog_rows, model_dialog_viewport, prompt_lines,
-        refresh_transcript_cache_with_images, truncate_to_width, user_block_rows, user_line,
+        refresh_transcript_cache_with_images, truncate_to_width, user_line,
     };
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
@@ -3491,6 +3761,7 @@ mod tests {
         });
 
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "after-compose".into(),
             text: "Moving on.".into(),
             append: true,
@@ -3933,7 +4204,7 @@ mod tests {
         );
         let code = "one\n\n  abcdefghijklmnopqrstuvwxyz0123456789\ntwo";
         app.blocks
-            .push(Block::Agent(format!("```text\n{code}\n```")));
+            .push(Block::Agent(format!("```text\n{code}\n```").into()));
         let frame = render(&mut app, 24, 24);
         let first = frame
             .lines()
@@ -4067,8 +4338,10 @@ mod tests {
         );
         let first = "https://first.example/a/very/long/path";
         let second = "https://second.example/a/very/long/path";
-        app.blocks.push(Block::Agent(format!("[same]({first})")));
-        app.blocks.push(Block::Agent(format!("[same]({second})")));
+        app.blocks
+            .push(Block::Agent(format!("[same]({first})").into()));
+        app.blocks
+            .push(Block::Agent(format!("[same]({second})").into()));
 
         let _ = render(&mut app, 28, 24);
         let all_urls: Vec<_> = app
@@ -4256,7 +4529,8 @@ mod tests {
             "0:0".into(),
         );
         for index in 0..99 {
-            app.blocks.push(Block::Agent(format!("history {index}")));
+            app.blocks
+                .push(Block::Agent(format!("history {index}").into()));
         }
         app.apply(Update::test_text("history 99".into()));
         refresh_transcript_cache(&mut app, 12);
@@ -4312,7 +4586,8 @@ mod tests {
             images: vec![image],
         };
 
-        let (rows, placements) = user_block_rows(&message, 40, true);
+        let (rows, placements) =
+            super::message_block_rows(&message, 0, 40, true, true, &ImageRuntime::disabled());
 
         assert_eq!(placements.len(), 1);
         let after = &rows[placements[0].row + usize::from(super::RESERVED_ROWS)].0;
@@ -4322,6 +4597,622 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains("after"))
         );
+    }
+
+    #[test]
+    fn assistant_images_preserve_placement_copy_and_search_text() {
+        let message = UserMessage {
+            text: "before\n[Image #1]\nafter\n```text\ncopy me\n```".into(),
+            images: vec![UserImage::new("c2VjcmV0".into(), "image/png".into(), 1).unwrap()],
+        };
+        let (rows, placements) =
+            super::message_block_rows(&message, 7, 40, true, false, &ImageRuntime::disabled());
+        assert_eq!(placements.len(), 1);
+        let after = &rows[placements[0].row + usize::from(super::RESERVED_ROWS)].0;
+        assert!(
+            after
+                .spans
+                .iter()
+                .any(|span| span.content.contains("after"))
+        );
+        let code = rows.iter().find_map(|row| row.1.1.as_ref()).unwrap();
+        assert_eq!(&message.text[code.range.clone()], "copy me");
+        assert_eq!(code.block, 7);
+        assert!(rows.iter().all(|row| !row.3.contains("c2VjcmV0")));
+        let (fallback, placements) =
+            super::message_block_rows(&message, 7, 40, false, false, &ImageRuntime::disabled());
+        assert!(placements.is_empty());
+        assert!(fallback.iter().any(|row| {
+            row.0
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Image #1")
+        }));
+    }
+
+    #[test]
+    fn markdown_occurrences_keep_repeats_and_do_not_treat_links_or_code_as_images() {
+        let text = "![first](file:///tmp/a.png) ![second](file:///tmp/a.png)\n[ordinary](file:///tmp/b.png)\n```text\n![code](file:///tmp/c.png)\n```";
+        for user in [true, false] {
+            let message = UserMessage::from(text);
+            let images = ImageRuntime::disabled();
+            let (rows, placements) =
+                super::message_block_rows(&message, 0, 100, true, user, &images);
+            assert_eq!(placements.len(), 2);
+            assert!(
+                placements
+                    .iter()
+                    .all(|placement| matches!(&placement.source,
+                super::TranscriptImageSource::Markdown(uri) if uri == "file:///tmp/a.png"))
+            );
+            if !user {
+                let code = rows.iter().find_map(|row| row.1.1.as_ref()).unwrap();
+                assert_eq!(&text[code.range.clone()], "![code](file:///tmp/c.png)");
+            }
+            let (fallback, placements) =
+                super::message_block_rows(&message, 0, 100, false, user, &images);
+            assert!(placements.is_empty());
+            let text = fallback
+                .iter()
+                .map(|row| line_text(&row.0))
+                .collect::<String>();
+            assert!(text.contains("first") && text.contains("file:///tmp/a.png"));
+            assert!(!images.markdown.pending());
+        }
+    }
+
+    #[test]
+    fn source_completion_invalidates_only_dependent_markdown_layout() {
+        let mut app = sample();
+        app.start_session("owner".into());
+        for (id, source) in [("first", "first.png"), ("second", "second.png")] {
+            app.apply(Update::AgentMessage {
+                id: id.into(),
+                text: format!("![image]({source})"),
+                images: Vec::new(),
+                append: false,
+            });
+        }
+        let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+        refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+        let revisions = app.transcript_revisions.clone();
+        app.invalidate_image_layout(&std::collections::HashSet::from(["first.png".into()]));
+        assert_eq!(app.transcript_revisions, revisions);
+        assert_eq!(app.transcript_dirty, std::collections::BTreeSet::from([0]));
+        assert_eq!(
+            app.transcript_cache[1].as_ref().unwrap().revision,
+            revisions[1]
+        );
+        let after = app.transcript_revisions.clone();
+        app.invalidate_image_layout(&std::collections::HashSet::new());
+        assert_eq!(app.transcript_revisions, after);
+    }
+
+    #[tokio::test]
+    async fn markdown_user_and_assistant_load_local_and_managed_live_replay_and_replace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, bytes.get_ref()).unwrap();
+        let local = url::Url::from_file_path(&path).unwrap().to_string();
+        let store = crate::managed_files::FileStore::new(directory.path());
+        let reference = store.import("owner", &path, None).unwrap();
+        let descriptor = serde_json::to_value(reference).unwrap();
+        let managed = format!("kit-file://{}", descriptor["id"].as_str().unwrap());
+        for user in [true, false] {
+            for uri in [&local, &managed] {
+                let mut app = App::new(
+                    directory.path().into(),
+                    "provider".into(),
+                    "model".into(),
+                    "a2a".into(),
+                );
+                app.start_session("owner".into());
+                let patch = |text: String, append| {
+                    if user {
+                        Update::UserMessage {
+                            id: "message".into(),
+                            text,
+                            images: Vec::new(),
+                            append,
+                        }
+                    } else {
+                        Update::AgentMessage {
+                            id: "message".into(),
+                            text,
+                            images: Vec::new(),
+                            append,
+                        }
+                    }
+                };
+                app.apply(patch(format!("![visible alt]({uri})"), true));
+                let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+                let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert!(images.markdown.pending());
+                let visible = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(visible.contains("visible alt") && visible.contains("image loading"));
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        terminal
+                            .draw(|frame| draw(frame, &mut app, &mut images))
+                            .unwrap();
+                        if images.markdown.image(uri).is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(app.transcript_cache[0].as_ref().unwrap().images.len(), 1);
+                app.apply(patch("replacement without images".into(), false));
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert!(app.transcript_cache[0].as_ref().unwrap().images.is_empty());
+                app.start_session("owner".into());
+                app.apply(patch(format!("![replayed alt]({uri})"), false));
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert_eq!(app.transcript_cache[0].as_ref().unwrap().images.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn message_replacements_do_not_reuse_image_layout_anchors() {
+        fn typed_image(value: u8, line: usize) -> UserImage {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                3,
+                image::Rgb([value; 3]),
+            ))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+            UserImage::new(
+                base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()),
+                "image/png".into(),
+                line,
+            )
+            .unwrap()
+        }
+        let tail = "tail\n".repeat(80);
+        let initial = format!("typed\n{tail}![A](a.png)\n{tail}");
+        let replacement = format!(
+            "{}typed\n{tail}![A](a.png)\n{tail}",
+            "inserted\n".repeat(20)
+        );
+        // Exercise both orders of a source completion overlapping replacement.
+        for invalidate_first in [false, true] {
+            for change_pixels in [false, true] {
+                let mut app = sample();
+                app.start_session("owner".into());
+                let update = |text: String, image| Update::UserMessage {
+                    id: "message".into(),
+                    text,
+                    images: vec![image],
+                    append: false,
+                };
+                app.apply(update(initial.clone(), typed_image(0, 0)));
+                let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+                let mut terminal = Terminal::new(TestBackend::new(80, 38)).unwrap();
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                let scroll = if change_pixels { 5 } else { 14 };
+                app.scroll_by(scroll as isize - app.scroll as isize);
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert_eq!(app.scroll, scroll);
+                assert_eq!(app.transcript_cache[0].as_ref().unwrap().images[0].row, 1);
+                let changed = std::collections::HashSet::from(["a.png".to_owned()]);
+                if invalidate_first {
+                    app.invalidate_image_layout(&changed);
+                }
+                app.apply(update(
+                    replacement.clone(),
+                    typed_image(u8::from(change_pixels), 20),
+                ));
+                if !invalidate_first {
+                    app.invalidate_image_layout(&changed);
+                }
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert_eq!(app.blocks.len(), 1);
+                assert_eq!(app.transcript_cache[0].as_ref().unwrap().images[0].row, 21);
+                // Row 14 must not become row 2; a new image at typed index 0
+                // must not inherit the old image's partially clipped anchor.
+                assert_eq!(app.scroll, scroll);
+            }
+        }
+
+        let mut app = sample();
+        app.start_session("owner".into());
+        let update = |text| Update::UserMessage {
+            id: "message".into(),
+            text,
+            images: Vec::new(),
+            append: false,
+        };
+        app.apply(update(format!("![A](a.png)\n![A](a.png)\n{tail}")));
+        let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+        let mut terminal = Terminal::new(TestBackend::new(80, 38)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        let scroll = app.transcript_cache[0].as_ref().unwrap().images[1].row + 1;
+        app.scroll_by(scroll as isize - app.scroll as isize);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        app.apply(update(format!("![A](a.png)\n{tail}")));
+        app.invalidate_image_layout(&std::collections::HashSet::from(["a.png".into()]));
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(app.transcript_cache[0].as_ref().unwrap().images.len(), 1);
+        assert_eq!(app.scroll, scroll);
+    }
+
+    #[test]
+    fn image_layout_anchor_preserves_text_and_repeated_image_occurrences() {
+        use crate::tui::app::{CachedTranscriptImage, TranscriptImageSource};
+        let typed = CachedTranscriptImage {
+            source: TranscriptImageSource::Typed(0),
+            row: 1,
+        };
+        let markdown = |row| CachedTranscriptImage {
+            source: TranscriptImageSource::Markdown("a.png".into()),
+            row,
+        };
+        let old = [typed, markdown(14), markdown(28)];
+        let new = [markdown(2), markdown(16)];
+        // Text before, between, and after reservations retains its logical row.
+        assert_eq!(super::remap_image_layout_row(&old, &new, 0), 0);
+        assert_eq!(super::remap_image_layout_row(&old, &new, 27), 15);
+        assert_eq!(super::remap_image_layout_row(&old, &new, 40), 28);
+        // The second repeated occurrence stays the second, with the same clip.
+        assert_eq!(super::remap_image_layout_row(&old, &new, 30), 18);
+        assert_eq!(super::remap_image_layout_row(&new, &old, 18), 30);
+        // If the anchored image itself vanishes, use the next logical text row.
+        assert_eq!(super::remap_image_layout_row(&old, &new, 5), 1);
+    }
+
+    #[tokio::test]
+    async fn markdown_dedup_keeps_scrolled_viewport_stable_under_source_pressure() {
+        use crate::tui::app::TranscriptImageSource;
+        use image::{
+            ImageEncoder as _,
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+        };
+
+        fn image_row(app: &App, destination: &str) -> usize {
+            app.transcript_cache
+                .iter()
+                .enumerate()
+                .find_map(|(index, block)| {
+                    block
+                        .as_ref()?
+                        .images
+                        .iter()
+                        .find(|image| {
+                            image.source == TranscriptImageSource::Markdown(destination.into())
+                        })
+                        .map(|image| {
+                            let start = app.transcript_prefixes[index];
+                            start + usize::from(start > 0) + image.row
+                        })
+                })
+                .unwrap()
+        }
+
+        async fn settle_draws(
+            terminal: &mut Terminal<TestBackend>,
+            app: &mut App,
+            images: &mut ImageRuntime,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    app.tick();
+                    terminal.draw(|frame| draw(frame, app, images)).unwrap();
+                    if !images.pending()
+                        && app
+                            .transcript_dirty
+                            .iter()
+                            .all(|index| app.transcript_dynamic.contains(index))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sources = ["a.png", "c.png", "d.png", "b.png"];
+        let mut typed = None;
+        let mut encoded_bytes = 0;
+        for (index, source) in sources.iter().enumerate() {
+            // Valid ~7 MiB PNGs: three encoded snapshots fit, four do not.
+            let pixels = vec![index as u8; 1792 * 1366 * 3];
+            let mut bytes = Vec::new();
+            PngEncoder::new_with_quality(
+                &mut bytes,
+                CompressionType::Level(0),
+                FilterType::NoFilter,
+            )
+            .write_image(&pixels, 1792, 1366, image::ExtendedColorType::Rgb8)
+            .unwrap();
+            std::fs::write(directory.path().join(source), &bytes).unwrap();
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            encoded_bytes += data.len();
+            if index == 0 {
+                typed = UserImage::new(data, "image/png".into(), 0);
+            }
+        }
+        assert!(encoded_bytes > 32 * 1024 * 1024);
+        assert!(encoded_bytes / 4 * 3 < 32 * 1024 * 1024);
+        for running_prefix in [false, true] {
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.start_session("owner".into());
+            if running_prefix {
+                app.apply(Update::ToolStarted {
+                    id: "running-prefix".into(),
+                    title: "Working".into(),
+                    kind: ToolKind::Other,
+                    script: None,
+                    backgrounded: false,
+                });
+            }
+            app.apply(Update::UserMessage {
+                id: "message".into(),
+                text: format!(
+                    "typed duplicate\n{}![A](a.png)\n![C](c.png)\n![D](d.png)\n![B](b.png)\n{}",
+                    "before\n".repeat(20),
+                    "after\n".repeat(80)
+                ),
+                images: vec![typed.clone().unwrap()],
+                append: false,
+            });
+            let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+            let mut terminal = Terminal::new(TestBackend::new(80, 38)).unwrap();
+            // Start below the image viewports, then load B by genuinely scrolling.
+            settle_draws(&mut terminal, &mut app, &mut images).await;
+            let b = image_row(&app, "b.png");
+            app.scroll_by(b as isize - app.scroll as isize + 1);
+            settle_draws(&mut terminal, &mut app, &mut images).await;
+            assert!(images.markdown.image("b.png").is_some());
+            assert!(images.markdown.image("a.png").is_none());
+
+            let a = image_row(&app, "a.png");
+            app.scroll_by(a as isize - app.scroll as isize + 1);
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .unwrap();
+            // Typed A is above the viewport. Markdown A and D straddle its edges;
+            // B would enter if dedup removed twelve rows without moving the anchor.
+            assert!(app.scroll > usize::from(super::RESERVED_ROWS));
+            assert_eq!(app.scroll, image_row(&app, "a.png") + 1);
+            assert!(image_row(&app, "d.png") < app.scroll + app.viewport);
+            assert!(
+                image_row(&app, "d.png") + usize::from(super::RESERVED_ROWS)
+                    > app.scroll + app.viewport
+            );
+            assert!(image_row(&app, "b.png") >= app.scroll + app.viewport);
+            assert!(
+                image_row(&app, "b.png") - usize::from(super::RESERVED_ROWS)
+                    < app.scroll + app.viewport
+            );
+            settle_draws(&mut terminal, &mut app, &mut images).await;
+            assert_eq!(app.scroll, a + 1 - usize::from(super::RESERVED_ROWS));
+            assert_eq!(app.scroll, image_row(&app, "a.png") + 1);
+            assert!(
+                sources[..3]
+                    .iter()
+                    .all(|source| images.markdown.image(source).is_some())
+            );
+            assert!(images.markdown.image("b.png").is_none());
+            let stable_scroll = app.scroll;
+            for _ in 0..16 {
+                app.tick();
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+                assert_eq!(app.scroll, stable_scroll);
+                assert!(!images.pending());
+                assert_eq!(app.transcript_dynamic.contains(&0), running_prefix);
+                assert!(
+                    sources[..3]
+                        .iter()
+                        .all(|source| images.markdown.image(source).is_some())
+                );
+                assert!(!images.markdown.is_visible("b.png"));
+            }
+
+            // Scroll to the evicted B and back. Evicting A restores its typed
+            // duplicate above the viewport; the inverse layout change also anchors.
+            let b = image_row(&app, "b.png");
+            app.scroll_by(b as isize - app.scroll as isize + 1);
+            settle_draws(&mut terminal, &mut app, &mut images).await;
+            assert!(images.markdown.image("b.png").is_some());
+            assert!(images.markdown.image("a.png").is_none());
+            assert_eq!(app.scroll, image_row(&app, "b.png") + 1);
+            let a = image_row(&app, "a.png");
+            app.scroll_by(a as isize - app.scroll as isize + 1);
+            settle_draws(&mut terminal, &mut app, &mut images).await;
+            assert_eq!(app.scroll, image_row(&app, "a.png") + 1);
+            assert!(
+                sources[..3]
+                    .iter()
+                    .all(|source| images.markdown.image(source).is_some())
+            );
+            assert!(!images.pending());
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_dedup_requires_loaded_matching_identity_and_preserves_repeats() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("same.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(4, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&path, bytes.get_ref()).unwrap();
+        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+        let typed = UserImage::new(
+            base64::engine::general_purpose::STANDARD.encode(bytes.get_ref()),
+            "image/png".into(),
+            0,
+        )
+        .unwrap()
+        .with_uri(Some(uri.clone()));
+        let message = UserMessage {
+            text: format!("![one]({uri}) ![two]({uri})"),
+            images: vec![typed],
+        };
+        let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+        images.markdown.context(directory.path(), Some("owner"));
+        assert_eq!(
+            super::message_block_rows(&message, 0, 100, true, false, &images)
+                .1
+                .len(),
+            3
+        );
+        images.markdown.request(&uri);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while images.markdown.image(&uri).is_none() {
+                images.markdown.poll();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for user in [true, false] {
+            let placements = super::message_block_rows(&message, 0, 100, true, user, &images).1;
+            assert_eq!(placements.len(), 2);
+            assert!(placements.iter().all(|placement| matches!(
+                placement.source,
+                super::TranscriptImageSource::Markdown(_)
+            )));
+        }
+        std::fs::write(directory.path().join("other.png"), bytes.get_ref()).unwrap();
+        // Independently authorized aliases and distinct files with exact bytes
+        // suppress the redundant typed viewport, not explicit Markdown nodes.
+        for destination in ["same.png", "other.png"] {
+            images.markdown.request(destination);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while images.markdown.pending() {
+                    images.markdown.poll();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut alias = message.clone();
+            alias.text = format!("![one]({destination}) ![two]({destination})");
+            assert_eq!(
+                super::message_block_rows(&alias, 0, 100, true, false, &images)
+                    .1
+                    .len(),
+                2
+            );
+        }
+        let mut mismatch = message.clone();
+        mismatch.images[0] = UserImage::new("AQID".into(), "image/png".into(), 0)
+            .unwrap()
+            .with_uri(Some(uri));
+        assert_eq!(
+            super::message_block_rows(&mismatch, 0, 100, true, false, &images)
+                .1
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_missing_sources_keep_typed_pixels_and_offscreen_sources_do_not_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = url::Url::from_file_path(directory.path().join("missing.png"))
+            .unwrap()
+            .to_string();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.start_session("owner".into());
+        app.apply(Update::AgentMessage {
+            id: "old".into(),
+            text: format!("![missing alt]({uri})"),
+            images: vec![
+                UserImage::new("AQID".into(), "image/png".into(), 0)
+                    .unwrap()
+                    .with_uri(Some(uri.clone())),
+            ],
+            append: false,
+        });
+        app.apply(Update::AgentMessage {
+            id: "tail".into(),
+            text: "tail\n".repeat(100),
+            images: Vec::new(),
+            append: false,
+        });
+        let mut images = ImageRuntime::with_picker(Picker::halfblocks());
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert!(!images.markdown.pending());
+        app.scroll_by(-1000);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert!(images.markdown.pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while images.markdown.pending() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                terminal
+                    .draw(|frame| draw(frame, &mut app, &mut images))
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(images.markdown.image(&uri).is_none());
+        assert_ne!(images.markdown.status(&uri), "image loading");
+        assert_eq!(app.transcript_cache[0].as_ref().unwrap().images.len(), 2);
+        let mut disabled = ImageRuntime::disabled();
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut disabled))
+            .unwrap();
+        assert!(!disabled.markdown.pending());
     }
 
     #[test]
@@ -4378,7 +5269,7 @@ mod tests {
         if let Block::Tool(call) = &mut app.blocks[0] {
             call.expanded = false;
         }
-        let (_, placements) = super::transcript_block_rows(&app, 0, 40, true);
+        let (_, placements) = super::transcript_block_rows(&app, 0, 40, true, &images);
         assert!(placements.is_empty());
     }
 
