@@ -1133,9 +1133,10 @@ impl App {
         }
     }
 
-    /// Whether the periodic animation clock can change anything on screen.
+    /// Whether periodic polling must advance animations or expire a runtime lease.
     pub fn needs_redraw_tick(&self) -> bool {
-        self.working()
+        (!self.progress_unavailable && self.progress_last_frame.is_some())
+            || self.working()
             || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
             || self.agents.values().any(|row| match row.status {
@@ -6410,6 +6411,51 @@ mod tests {
     }
 
     #[test]
+    fn idle_runtime_lease_keeps_timer_scheduled_until_state_is_invalidated() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+
+        let mut app = app();
+        assert!(!app.needs_redraw_tick());
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        app.apply(Update::Runtime(agent_event(
+            "idle",
+            "Completed worker",
+            SubagentStatus::Idle,
+            Some(GenerationOutcome::Success),
+            1,
+            None,
+            (10, 20, Some(30)),
+        )));
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        assert!(!app.working());
+        assert!(app.transcript_dynamic.is_empty());
+        assert!(app.toast.is_none());
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+        assert!(app.needs_redraw_tick());
+        app.tick();
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+
+        // Advance the lease age without sleeping, then use the same scheduling
+        // predicate and tick entry point as both event loops. No new traffic.
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        assert!(app.needs_redraw_tick());
+        if app.needs_redraw_tick() {
+            app.tick();
+        }
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
     fn redraw_ticks_only_while_time_dependent_ui_is_visible() {
         let mut app = app();
         assert!(!app.needs_redraw_tick());
@@ -6698,7 +6744,8 @@ mod tests {
         assert!(app.needs_redraw_tick());
         app.tick_at(5_000);
         assert!(!app.agents.contains_key("failed"));
-        assert!(!app.needs_redraw_tick());
+        // Runtime traffic established a lease even after the animation ends.
+        assert!(app.needs_redraw_tick());
     }
 
     #[test]
