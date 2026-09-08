@@ -391,7 +391,7 @@ fn expose_background_call_ids(request: &mut TurnRequest) {
             };
             if text.contains(DETACHED) {
                 *text = format!(
-                    "Tool call ID: {} is running in the background.\nNo independent work left? STOP (see system instructions).",
+                    "Tool call ID: {} is running in the background.\nNo independent work left? STOP.",
                     result.call_id
                 );
             }
@@ -1585,7 +1585,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            "Tool call ID: call_background is running in the background.\nNo independent work left? STOP (see system instructions)."
+            "Tool call ID: call_background is running in the background.\nNo independent work left? STOP."
         );
     }
 
