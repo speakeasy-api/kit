@@ -450,11 +450,34 @@ impl FileStore {
 
     pub(crate) fn resolve(&self, session: &str, selected: &FileReference) -> Result<Vec<u8>> {
         selected.validate()?;
+        self.resolve_stored(session, &selected.id, Some(selected))
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Resolve an existing session-owned object without importing or granting it.
+    pub(crate) fn resolve_id(&self, session: &str, id: &str) -> Result<(Vec<u8>, String)> {
+        if !id.strip_prefix("file_").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err("invalid managed file ID".into());
+        }
+        self.resolve_stored(session, id, None)
+    }
+
+    fn resolve_stored(
+        &self,
+        session: &str,
+        id: &str,
+        selected: Option<&FileReference>,
+    ) -> Result<(Vec<u8>, String)> {
         let directory = self.session_directory(session);
         // A reference must never resolve an import still retained only in the
         // resilient filesystem's volatile write-back layer.
-        fs::require_disk(directory.join(&selected.id)).map_err(display)?;
-        let mut file = fs::open_beneath(&directory, Path::new(&selected.id)).map_err(|error| {
+        fs::require_disk(directory.join(id)).map_err(display)?;
+        let mut file = fs::open_beneath(&directory, Path::new(id)).map_err(|error| {
             format!("managed file is missing or inaccessible in this session: {error}")
         })?;
         let length = file.metadata().map_err(display)?.len();
@@ -475,9 +498,10 @@ impl FileStore {
         file.read_exact(&mut header).map_err(display)?;
         let header: Header = serde_json::from_slice(&header).map_err(display)?;
         header.file.validate()?;
-        if &header.file != selected {
+        if header.file.id != id || selected.is_some_and(|selected| &header.file != selected) {
             return Err("selected file metadata does not match its stored object".into());
         }
+        let selected = &header.file;
         if length != 12 + header_length as u64 + selected.size_bytes {
             return Err("managed file envelope length does not match its payload".into());
         }
@@ -492,7 +516,7 @@ impl FileStore {
         }
         // Digest and metadata bind the already validated immutable import. No
         // repeated pixel decode is necessary for each selection or replay.
-        Ok(bytes)
+        Ok((bytes, header.file.mime_type))
     }
 
     pub(crate) fn selected_parts(

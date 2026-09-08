@@ -105,6 +105,12 @@ Generalize user-image rendering into reusable media presentation for user attach
 
 Markdown image nodes such as `![Edited image](kit-file://file_opaque_id)` resolve through the managed file resolver. Local paths follow filesystem permission policy. Remote images require explicit network policy, asynchronous bounded fetch/decode, redirect/address validation, and no implicit credentials. Do not fetch arbitrary model-supplied URLs without the applicable authorization. Parse real image nodes, not regexes scanning code fences. Retain alt text, source links, placeholders, and terminal fallback. Ordinary links remain links unless explicitly previewed. TUI display never automatically attaches pixels to model context.
 
+### Phase 4 presentation contract
+
+The TUI retains one presentation-only message/image representation for native user, assistant, and tool media. CommonMark image nodes use source-aware layout without splitting Markdown documents. Managed references resolve under current-session authority; external sources are temporary snapshots and are re-resolved after cache reset or replay. Duplicate typed/Markdown viewports require independently authorized, exact resolved content identity within the same message; repeated Markdown nodes remain visible. No display path imports files, grants access, or adds model-context attachments.
+
+Remote loading is default-denied and requires the startup `KIT_TUI_IMAGE_ORIGINS` exact-origin HTTPS policy. Redirects are rejected, every resolved address must be public, and DNS results are pinned while TLS hostname checks remain active. The dedicated client has no ambient proxy or credential configuration. Acquisition and the common decode/protocol renderer have separate bounded worker admission; blocking DNS/file/decode operations retain their permits even after cancellation. The [TUI guide](../user/tui-and-sessions.md#images-in-the-transcript) specifies fallback, cache, replay, and local-file semantics.
+
 ## Milestones and PR stack
 
 | Phase | Branch / PR base | Owner | Scope and completion milestone |

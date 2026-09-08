@@ -27,6 +27,9 @@ use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
 pub(super) const MAX_TOOL_IMAGES: usize = 32;
+/// Typed occurrence metadata is bounded independently of encoded source bytes.
+pub(super) const MAX_RETAINED_IMAGES: usize = 256;
+pub(super) const MAX_MESSAGE_IMAGES: usize = 64;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 pub(super) const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -69,13 +72,14 @@ pub enum Update {
     UserMessage {
         id: String,
         text: String,
-        images: Vec<UserImage>,
+        images: Vec<MediaImage>,
         append: bool,
     },
     /// Agent prose, either appended as a chunk or replaced by an upsert.
     AgentMessage {
         id: String,
         text: String,
+        images: Vec<MediaImage>,
         append: bool,
     },
     /// Agent reasoning, either appended as a chunk or replaced by an upsert.
@@ -100,7 +104,7 @@ pub enum Update {
         status: Option<ToolCallStatus>,
         script: Option<String>,
         output: Option<Vec<String>>,
-        images: Option<Vec<UserImage>>,
+        images: Option<Vec<MediaImage>>,
         append_output: bool,
         intent: Option<Option<String>>,
         backgrounded: bool,
@@ -364,8 +368,8 @@ pub struct ToolCall {
     pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
-    /// Typed tool-result images sharing the user-image retention and decode budgets.
-    pub images: Vec<UserImage>,
+    /// Typed tool-result images sharing transcript retention and decode budgets.
+    pub images: Vec<MediaImage>,
     /// User-facing summary supplied by a compose caller.
     pub intent: Option<String>,
     pub expanded: bool,
@@ -457,21 +461,27 @@ impl ToolCall {
     }
 }
 
-/// One entry in the transcript.
-#[derive(Clone, Debug)]
-pub struct UserImage {
+/// A typed image source shared by user, assistant, and tool messages.
+#[derive(Clone)]
+pub struct MediaImage {
     pub(super) key: [u8; 32],
-    pub(super) data: String,
+    pub(super) data: std::sync::Arc<str>,
     pub(super) mime_type: String,
     /// Source line after which the fixed image viewport is reserved.
     pub(super) line: usize,
+    /// Original ACP URI; consumers must validate it before deduplication or use.
+    pub(super) source_uri: Option<String>,
 }
 
-impl UserImage {
+impl MediaImage {
     pub(super) fn new(data: String, mime_type: String, line: usize) -> Option<Self> {
         // Check the encoded and maximum decoded lengths before hashing or retaining
         // attacker-controlled ACP payloads. The exact decode stays lazy.
-        if data.len() > MAX_IMAGE_BASE64_BYTES {
+        if data.is_empty()
+            || data.len() > MAX_IMAGE_BASE64_BYTES
+            || mime_type.len() > 128
+            || mime_type.chars().any(char::is_control)
+        {
             return None;
         }
         let padding = data
@@ -495,20 +505,46 @@ impl UserImage {
         hasher.update(data.as_bytes());
         Some(Self {
             key: *hasher.finalize().as_bytes(),
-            data,
+            data: data.into(),
             mime_type,
             line,
+            source_uri: None,
         })
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct UserMessage {
-    pub(super) text: String,
-    pub(super) images: Vec<UserImage>,
+impl MediaImage {
+    pub(super) fn with_uri(mut self, uri: Option<String>) -> Self {
+        self.source_uri = uri.filter(|uri| uri.len() <= 4096 && !uri.chars().any(char::is_control));
+        self
+    }
 }
 
-impl From<String> for UserMessage {
+impl std::fmt::Debug for MediaImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaImage")
+            .field("source_bytes", &self.data.len())
+            .field("line", &self.line)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+pub type UserImage = MediaImage;
+
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub(super) text: String,
+    pub(super) images: Vec<MediaImage>,
+}
+
+impl From<&str> for Message {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl From<String> for Message {
     fn from(text: String) -> Self {
         Self {
             text,
@@ -517,9 +553,11 @@ impl From<String> for UserMessage {
     }
 }
 
+pub type UserMessage = Message;
+
 pub enum Block {
-    User(UserMessage),
-    Agent(String),
+    User(Message),
+    Agent(Message),
     Thought {
         text: String,
         started: Instant,
@@ -531,8 +569,14 @@ pub enum Block {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TranscriptImageSource {
+    Typed(usize),
+    Markdown(String),
+}
+
 pub(super) struct CachedTranscriptImage {
-    pub source: usize,
+    pub source: TranscriptImageSource,
     pub row: usize,
 }
 
@@ -627,6 +671,7 @@ pub struct App {
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
     retained_image_source_bytes: usize,
+    retained_images: usize,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
     pub editor: Editor,
@@ -877,6 +922,7 @@ impl App {
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
             retained_image_source_bytes: 0,
+            retained_images: 0,
             next_transcript_revision: 0,
             transcript_focus_index: None,
             editor: Editor::default(),
@@ -1046,6 +1092,29 @@ impl App {
             self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
             *revision = self.next_transcript_revision;
             self.transcript_dirty.insert(index);
+        }
+    }
+
+    pub(super) fn invalidate_image_layout(&mut self, sources: &std::collections::HashSet<String>) {
+        if sources.is_empty() {
+            return;
+        }
+        let affected: Vec<_> = self
+            .transcript_cache
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                block.as_ref().is_some_and(|block| {
+                    block
+                        .images
+                        .iter()
+                        .any(|image| matches!(&image.source, TranscriptImageSource::Markdown(source) if sources.contains(source)))
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in affected {
+            self.mark_block_dirty(index);
         }
     }
 
@@ -1401,7 +1470,7 @@ impl App {
         &mut self,
         id: String,
         text: String,
-        images: Vec<UserImage>,
+        images: Vec<MediaImage>,
         append: bool,
         role: MessageRole,
     ) {
@@ -1409,11 +1478,17 @@ impl App {
             self.collapse_last_tool_output();
         }
         let mut images = images;
-        let existing_index = self.message_blocks.get(&id).copied();
+        let existing_index = self.message_blocks.get(&id).copied().filter(|&index| {
+            matches!(
+                (&self.blocks[index], role),
+                (Block::User(_), MessageRole::User)
+                    | (Block::Agent(_), MessageRole::Agent)
+                    | (Block::Thought { .. }, MessageRole::Thought)
+            )
+        });
         if !append
-            && matches!(role, MessageRole::User)
             && let Some(index) = existing_index
-            && let Block::User(existing) = &self.blocks[index]
+            && let Block::User(existing) | Block::Agent(existing) = &self.blocks[index]
         {
             let replaced = existing
                 .images
@@ -1422,22 +1497,31 @@ impl App {
                 .sum::<usize>();
             self.retained_image_source_bytes =
                 self.retained_image_source_bytes.saturating_sub(replaced);
+            self.retained_images = self.retained_images.saturating_sub(existing.images.len());
         }
         images.retain(|image| {
             let retained = self
                 .retained_image_source_bytes
                 .saturating_add(image.data.len());
-            if retained > MAX_RETAINED_IMAGE_SOURCE_BYTES {
+            if retained > MAX_RETAINED_IMAGE_SOURCE_BYTES
+                || self.retained_images >= MAX_RETAINED_IMAGES
+            {
                 false
             } else {
                 self.retained_image_source_bytes = retained;
+                self.retained_images += 1;
                 true
             }
         });
         if let Some(index) = existing_index {
             let mut changed = false;
             match (&mut self.blocks[index], role) {
-                (Block::User(existing), MessageRole::User) => {
+                (Block::User(existing), MessageRole::User)
+                | (Block::Agent(existing), MessageRole::Agent) => {
+                    let old_len = existing.text.len();
+                    let replaces_latest = !append
+                        && matches!(role, MessageRole::Agent)
+                        && self.latest_agent_source.ends_with(&existing.text);
                     if append {
                         let last_line = existing.text.bytes().filter(|&byte| byte == b'\n').count();
                         let follows_image =
@@ -1462,21 +1546,16 @@ impl App {
                         existing.text = text.clone();
                         existing.images = std::mem::take(&mut images);
                     }
-                    changed = true;
-                }
-                (Block::Agent(existing), MessageRole::Agent) => {
-                    if append {
-                        existing.push_str(&text);
-                        self.latest_agent_source.push_str(&text);
-                    } else {
-                        if self.latest_agent_source.ends_with(existing.as_str()) {
+                    if matches!(role, MessageRole::Agent) {
+                        if append {
+                            self.latest_agent_source.push_str(&existing.text[old_len..]);
+                        } else if replaces_latest {
                             self.latest_agent_source
-                                .truncate(self.latest_agent_source.len() - existing.len());
-                            self.latest_agent_source.push_str(&text);
+                                .truncate(self.latest_agent_source.len() - old_len);
+                            self.latest_agent_source.push_str(&existing.text);
                         } else {
-                            self.latest_agent_source = text.clone();
+                            self.latest_agent_source = existing.text.clone();
                         }
-                        *existing = text.clone();
                     }
                     changed = true;
                 }
@@ -1510,7 +1589,7 @@ impl App {
                     self.latest_agent_source.push_str(&text);
                 }
                 self.agent_stream_sealed = false;
-                self.push_block(Block::Agent(text));
+                self.push_block(Block::Agent(Message { text, images }));
             }
             MessageRole::Thought => self.push_block(Block::Thought {
                 text,
@@ -1695,8 +1774,13 @@ impl App {
                 self.remove_pending_steer(&id);
                 self.apply_message(id, text, images, append, MessageRole::User);
             }
-            Update::AgentMessage { id, text, append } => {
-                self.apply_message(id, text, Vec::new(), append, MessageRole::Agent);
+            Update::AgentMessage {
+                id,
+                text,
+                images,
+                append,
+            } => {
+                self.apply_message(id, text, images, append, MessageRole::Agent);
             }
             Update::AgentThought { id, text, append } => {
                 self.apply_message(id, text, Vec::new(), append, MessageRole::Thought);
@@ -1763,10 +1847,14 @@ impl App {
                             .sum::<usize>();
                         self.retained_image_source_bytes =
                             self.retained_image_source_bytes.saturating_sub(replaced);
+                        self.retained_images =
+                            self.retained_images.saturating_sub(call.images.len());
                         call.images.clear();
                     }
                     for image in images {
-                        if call.images.len() >= MAX_TOOL_IMAGES {
+                        if call.images.len() >= MAX_TOOL_IMAGES
+                            || self.retained_images >= MAX_RETAINED_IMAGES
+                        {
                             break;
                         }
                         if call.images.iter().any(|existing| existing.key == image.key) {
@@ -1777,6 +1865,7 @@ impl App {
                             .saturating_add(image.data.len());
                         if retained <= MAX_RETAINED_IMAGE_SOURCE_BYTES {
                             self.retained_image_source_bytes = retained;
+                            self.retained_images += 1;
                             call.images.push(image);
                         }
                     }
@@ -2212,6 +2301,7 @@ impl App {
         self.transcript_prefixes.push(0);
         self.transcript_cache_width = 0;
         self.retained_image_source_bytes = 0;
+        self.retained_images = 0;
         self.transcript_focus_index = None;
         self.clear_attachments();
         self.latest_agent_source.clear();
@@ -3619,7 +3709,7 @@ impl App {
             .and_then(Option::as_ref)
             .and_then(|hit| self.blocks.get(hit.block).map(|block| (block, hit)))
             .and_then(|(block, hit)| match block {
-                Block::Agent(source) => source.get(hit.range.clone()),
+                Block::Agent(source) => source.text.get(hit.range.clone()),
                 _ => None,
             })
             .map(str::to_string);
@@ -3799,6 +3889,7 @@ mod test_support {
     impl Update {
         pub(in crate::tui) fn test_text(text: String) -> Self {
             Self::AgentMessage {
+                images: Vec::new(),
                 id: "test-agent".into(),
                 text,
                 append: true,
@@ -3863,7 +3954,7 @@ mod tests {
 
     use super::{
         Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
-        MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+        MAX_RETAINED_IMAGE_SOURCE_BYTES, MediaImage, Phase, Update,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -4231,12 +4322,145 @@ mod tests {
     }
 
     #[test]
+    fn assistant_images_append_replace_and_clear_without_payload_previews() {
+        let mut app = app();
+        let image = MediaImage::new("c2VjcmV0".into(), "image/png".into(), 0)
+            .unwrap()
+            .with_uri(Some("data:image/png;base64,c2VjcmV0".into()));
+        assert!(!format!("{image:?}").contains("c2VjcmV0"));
+        let patch = |text: &str, images, append| Update::AgentMessage {
+            id: "assistant".into(),
+            text: text.into(),
+            images,
+            append,
+        };
+        app.apply(patch("before", Vec::new(), true));
+        app.apply(patch("[Image #1]", vec![image.clone()], true));
+        app.apply(patch("after", Vec::new(), true));
+        let Block::Agent(message) = &app.blocks[0] else {
+            panic!("assistant");
+        };
+        assert_eq!(message.text, "before\n[Image #1]\nafter");
+        assert_eq!(message.images[0].line, 1);
+        assert_eq!(app.retained_image_source_bytes, image.data.len());
+        assert_eq!(app.latest_agent_text().unwrap(), message.text);
+        app.apply(patch("replacement", vec![image.clone()], false));
+        assert_eq!(app.retained_image_source_bytes, image.data.len());
+        app.apply(patch("", Vec::new(), false));
+        assert_eq!(app.retained_image_source_bytes, 0);
+        let Block::Agent(message) = &app.blocks[0] else {
+            panic!("assistant");
+        };
+        assert!(message.text.is_empty() && message.images.is_empty());
+        app.apply(patch("[Image #1]", vec![image], false));
+        app.start_session("next".into());
+        assert_eq!(app.retained_image_source_bytes, 0);
+        assert!(app.blocks.is_empty());
+        assert!(app.latest_agent_text().is_none());
+    }
+
+    #[test]
+    fn typed_occurrence_budget_is_shared_and_recovers_on_replacement_and_reset() {
+        let mut app = app();
+        let image = MediaImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        let patch = |index: usize, images: Vec<MediaImage>, append| match index % 3 {
+            0 => Update::UserMessage {
+                id: format!("user-{index}"),
+                text: "[Image]".into(),
+                images,
+                append,
+            },
+            1 => Update::AgentMessage {
+                id: format!("agent-{index}"),
+                text: "[Image]".into(),
+                images,
+                append,
+            },
+            _ => Update::ToolPatched {
+                id: format!("tool-{index}"),
+                title: None,
+                kind: None,
+                status: None,
+                script: None,
+                output: Some(vec!["[Image]".into()]),
+                images: Some(images),
+                append_output: append,
+                intent: None,
+                backgrounded: false,
+            },
+        };
+        for index in 0..super::MAX_RETAINED_IMAGES {
+            app.apply(patch(index, vec![image.clone()], true));
+        }
+        let retained = |app: &App| {
+            app.blocks
+                .iter()
+                .map(|block| match block {
+                    Block::User(message) | Block::Agent(message) => message.images.len(),
+                    Block::Tool(call) => call.images.len(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+        };
+        assert_eq!(retained(&app), super::MAX_RETAINED_IMAGES);
+        assert_eq!(app.retained_images, retained(&app));
+        for index in 0..3 {
+            app.apply(patch(index, vec![image.clone()], true));
+        }
+        assert_eq!(retained(&app), super::MAX_RETAINED_IMAGES);
+        assert_eq!(
+            app.retained_image_source_bytes,
+            retained(&app) * image.data.len()
+        );
+        // Each role releases its own slot before admitting a replacement.
+        for index in 0..3 {
+            app.apply(patch(index, Vec::new(), false));
+            assert_eq!(retained(&app), super::MAX_RETAINED_IMAGES - 1);
+            app.apply(patch(index, vec![image.clone()], false));
+            assert_eq!(retained(&app), super::MAX_RETAINED_IMAGES);
+            assert_eq!(app.retained_images, retained(&app));
+        }
+        app.start_session("next".into());
+        assert_eq!(app.retained_images, 0);
+        assert_eq!(app.retained_image_source_bytes, 0);
+        app.apply(patch(1, vec![image], true));
+        assert_eq!(retained(&app), 1);
+    }
+
+    #[test]
+    fn tiny_assistant_append_chunks_cannot_exceed_occurrence_budget() {
+        let mut app = app();
+        let image = MediaImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        for _ in 0..super::MAX_RETAINED_IMAGES + 10 {
+            app.apply(Update::AgentMessage {
+                id: "chunks".into(),
+                text: "[Image]".into(),
+                images: vec![image.clone()],
+                append: true,
+            });
+        }
+        let Block::Agent(message) = &app.blocks[0] else {
+            panic!("assistant");
+        };
+        assert_eq!(message.images.len(), super::MAX_RETAINED_IMAGES);
+        assert!(message.text.matches("[Image]").count() > message.images.len());
+        app.apply(Update::AgentMessage {
+            id: "chunks".into(),
+            text: "replacement".into(),
+            images: vec![image],
+            append: false,
+        });
+        assert_eq!(app.retained_images, 1);
+        assert!(MediaImage::new(String::new(), "image/png".into(), 0).is_none());
+    }
+
+    #[test]
     fn oversized_user_image_payload_is_rejected_before_retention() {
         let encoded_too_large = "A".repeat(MAX_IMAGE_BASE64_BYTES + 1);
-        assert!(UserImage::new(encoded_too_large, "image/png".into(), 0).is_none());
+        assert!(MediaImage::new(encoded_too_large, "image/png".into(), 0).is_none());
 
         let decoded_too_large = "A".repeat((MAX_IMAGE_SOURCE_BYTES + 1).div_ceil(3) * 4);
-        assert!(UserImage::new(decoded_too_large, "image/png".into(), 0).is_none());
+        assert!(MediaImage::new(decoded_too_large, "image/png".into(), 0).is_none());
     }
 
     #[test]
@@ -4244,7 +4468,7 @@ mod tests {
         let mut app = app();
         let bytes = 9 * 1024 * 1024;
         let image = |byte: char| {
-            UserImage::new(byte.to_string().repeat(bytes), "image/png".into(), 0).unwrap()
+            MediaImage::new(byte.to_string().repeat(bytes), "image/png".into(), 0).unwrap()
         };
         app.apply(Update::UserMessage {
             id: "user".into(),
@@ -4279,25 +4503,35 @@ mod tests {
     }
 
     #[test]
-    fn retained_user_image_sources_have_an_aggregate_bound() {
+    fn retained_user_and_assistant_image_sources_have_an_aggregate_bound() {
         let source_bytes = 9 * 1024 * 1024;
         let mut app = app();
         for index in 0..4 {
-            let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0)
+            let image = MediaImage::new("A".repeat(source_bytes), "image/png".into(), 0)
                 .expect("source is within the per-image limit");
-            app.apply(Update::UserMessage {
-                id: format!("image-{index}"),
-                text: format!("[Image #{index}]"),
-                images: vec![image],
-                append: false,
-            });
+            let update = if index == 0 {
+                Update::UserMessage {
+                    id: format!("image-{index}"),
+                    text: format!("[Image #{index}]"),
+                    images: vec![image],
+                    append: false,
+                }
+            } else {
+                Update::AgentMessage {
+                    id: format!("image-{index}"),
+                    text: format!("[Image #{index}]"),
+                    images: vec![image],
+                    append: false,
+                }
+            };
+            app.apply(update);
         }
 
         assert_eq!(app.retained_image_source_bytes, source_bytes * 3);
         assert!(app.retained_image_source_bytes <= MAX_RETAINED_IMAGE_SOURCE_BYTES);
         assert!(matches!(
             app.blocks.last(),
-            Some(Block::User(message)) if message.images.is_empty()
+            Some(Block::Agent(message)) if message.images.is_empty()
         ));
     }
 
@@ -4619,6 +4853,7 @@ mod tests {
         });
         compose(&mut app, "return 1");
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "agent".into(),
             text: "hello".into(),
             append: false,
@@ -4648,6 +4883,7 @@ mod tests {
             IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
         )));
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "late".into(),
             text: "background result".into(),
             append: false,
@@ -6028,6 +6264,7 @@ mod tests {
         app.apply(Update::test_text("# Heading\n\tindented  ".into()));
         compose(&mut app, "value = tool({})");
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "post-tool-agent".into(),
             text: "\n\n- item".into(),
             append: true,
@@ -6049,6 +6286,7 @@ mod tests {
         )));
         app.push_user("next".into());
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "next-agent".into(),
             text: "new".into(),
             append: true,
@@ -6066,7 +6304,7 @@ mod tests {
         let Some(Block::Agent(text)) = app.blocks.last() else {
             panic!("expected an agent block");
         };
-        assert_eq!(text, "hello");
+        assert_eq!(text.text, "hello");
     }
 
     #[test]
@@ -6077,11 +6315,13 @@ mod tests {
             IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
         )));
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "autonomous".into(),
             text: "RAVENS_".into(),
             append: true,
         });
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "autonomous".into(),
             text: "HARBOR_INEVITABLE".into(),
             append: true,
@@ -6091,7 +6331,7 @@ mod tests {
             .blocks
             .iter()
             .filter_map(|block| match block {
-                Block::Agent(text) => Some(text.as_str()),
+                Block::Agent(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -6126,11 +6366,13 @@ mod tests {
             backgrounded: false,
         });
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "second".into(),
             text: "second completion".into(),
             append: true,
         });
         app.apply(Update::AgentMessage {
+            images: Vec::new(),
             id: "second".into(),
             text: " continued".into(),
             append: true,
@@ -6140,7 +6382,7 @@ mod tests {
             .blocks
             .iter()
             .filter_map(|block| match block {
-                Block::Agent(text) => Some(text.as_str()),
+                Block::Agent(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
