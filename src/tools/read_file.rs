@@ -24,24 +24,68 @@ impl ReadFileTool {
             root,
             spec: ToolSpec::new(
                 ToolName::new("read_file"),
-                "Import a regular local PNG or JPEG image as a durable immutable File reference. Only File references reachable from the final compose return deliver pixels; intermediate references remain private. Maximum 8 MiB, 8192 pixels per dimension and 16 megapixels; animation is unsupported. Source bytes, orientation and metadata are preserved. Files are session-scoped and survive restart and source deletion; other sessions have no implicit access. This is not a text-file reader.",
+                "Import a regular local PNG or JPEG image as a durable immutable File reference. Only File references reachable from the final compose return deliver pixels; intermediate references remain private. Maximum 8 MiB, 8192 pixels per dimension and 16 megapixels; animation is unsupported. Source bytes, orientation and accepted metadata are preserved; PNG iCCP/zTXt/iTXt metadata is rejected to bound expansion. Files are session-scoped and survive restart and source deletion; other sessions have no implicit access. This is not a text-file reader.",
                 object_schema([ ("path", object([("type", Value::from("string")), ("minLength", Value::from(1)), ("maxLength", Value::from(4096))])) ]),
             )
-            .with_output_schema(object_schema([
-                ("$kit", object([("type", Value::from("string")), ("enum", Value::Array(vec![Value::from("file")]))])),
-                ("version", object([("type", Value::from("integer")), ("enum", Value::Array(vec![Value::from(1)]))])),
-                ("id", object([("type", Value::from("string")), ("pattern", Value::from("^file_[0-9a-f]{64}$"))])),
-                ("name", object([("type", Value::from("string")), ("minLength", Value::from(1)), ("maxLength", Value::from(255))])),
-                ("mime_type", object([("type", Value::from("string")), ("enum", Value::Array(vec![Value::from("image/png"), Value::from("image/jpeg")]))])),
-                ("size_bytes", positive_integer(8_388_608)),
-                ("image", object_schema([("width", positive_integer(8192)), ("height", positive_integer(8192))])),
-            ]))
+            .with_output_schema(file_schema())
             .with_annotations(ToolAnnotations::read_only()),
         }
     }
 }
 
-fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+pub(super) fn file_schema() -> Value {
+    object_schema([
+        (
+            "$kit",
+            object([
+                ("type", Value::from("string")),
+                ("enum", Value::Array(vec![Value::from("file")])),
+            ]),
+        ),
+        (
+            "version",
+            object([
+                ("type", Value::from("integer")),
+                ("enum", Value::Array(vec![Value::from(1)])),
+            ]),
+        ),
+        (
+            "id",
+            object([
+                ("type", Value::from("string")),
+                ("pattern", Value::from("^file_[0-9a-f]{64}$")),
+            ]),
+        ),
+        (
+            "name",
+            object([
+                ("type", Value::from("string")),
+                ("minLength", Value::from(1)),
+                ("maxLength", Value::from(255)),
+            ]),
+        ),
+        (
+            "mime_type",
+            object([
+                ("type", Value::from("string")),
+                (
+                    "enum",
+                    Value::Array(vec![Value::from("image/png"), Value::from("image/jpeg")]),
+                ),
+            ]),
+        ),
+        ("size_bytes", positive_integer(8_388_608)),
+        (
+            "image",
+            object_schema([
+                ("width", positive_integer(8192)),
+                ("height", positive_integer(8192)),
+            ]),
+        ),
+    ])
+}
+
+pub(super) fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     Value::Object(Map::from_iter(
         fields
             .into_iter()
@@ -49,7 +93,7 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
     ))
 }
 
-fn object_schema<const N: usize>(fields: [(&str, Value); N]) -> Value {
+pub(super) fn object_schema<const N: usize>(fields: [(&str, Value); N]) -> Value {
     let required = Value::Array(fields.iter().map(|(key, _)| Value::from(*key)).collect());
     object([
         ("type", Value::from("object")),
@@ -59,7 +103,7 @@ fn object_schema<const N: usize>(fields: [(&str, Value); N]) -> Value {
     ])
 }
 
-fn positive_integer(maximum: u64) -> Value {
+pub(super) fn positive_integer(maximum: u64) -> Value {
     object([
         ("type", Value::from("integer")),
         ("minimum", Value::from(1)),

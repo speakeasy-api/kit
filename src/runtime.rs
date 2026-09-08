@@ -39,9 +39,9 @@ use crate::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
     tools::{
-        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
-        Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents, SubagentsTool,
-        ToolSearch, observe_shared,
+        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, ImageTool,
+        McpTool, Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents,
+        SubagentsTool, ToolSearch, observe_shared,
     },
 };
 
@@ -1138,6 +1138,10 @@ impl Runtime {
                 &self.root,
             ))))
             .with(Observed::new(ReadFileTool::new(self.root.clone())))
+            .with(Observed::new(ImageTool::rotate(self.root.clone())))
+            .with(Observed::new(ImageTool::crop(self.root.clone())))
+            .with(Observed::new(ImageTool::resize(self.root.clone())))
+            .with(Observed::new(ImageTool::export(self.root.clone())))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())));

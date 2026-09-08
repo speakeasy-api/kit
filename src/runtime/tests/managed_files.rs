@@ -234,6 +234,98 @@ async fn managed_files_select_only_returned_references_and_preserve_spilled_imag
 }
 
 #[tokio::test]
+async fn managed_files_transform_pipeline_delivers_only_final_image_and_replays() {
+    for (background, outcome) in [(false, false), (false, true), (true, true)] {
+        let fixture = Fixture::new();
+        let output = fixture.execute(
+            "source = read_file({path: \"image.png\"})\nrotated = image_rotate({image: source, degrees: 90})\ncropped = image_crop({image: rotated, aspect_ratio: {width: 1, height: 1}, anchor: \"center\"})\nresized = image_resize({image: cropped, width: 4, height: 4, fit: \"contain\"})\nreceipt = export_file({file: resized, path: \"result.png\"})\nreturn {image: resized, receipt}",
+            Value::Null, background, outcome,
+        ).await.unwrap();
+        let exported = std::fs::read(fixture.root.path().join("result.png")).unwrap();
+        assert_image(&output, &exported);
+        let image = image::load_from_memory(&exported).unwrap();
+        assert_eq!((image.width(), image.height()), (4, 4));
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("image.png")).unwrap(),
+            fixture.bytes
+        );
+        let ToolOutput::Parts(parts) = output else {
+            panic!()
+        };
+        let Part::Structured(result) = &parts[0] else {
+            panic!()
+        };
+        let reference = result.value["image"].clone();
+        std::fs::remove_file(fixture.root.path().join("image.png")).unwrap();
+        std::fs::remove_file(fixture.root.path().join("result.png")).unwrap();
+        let replay = fixture
+            .execute("return input", reference, background, outcome)
+            .await
+            .unwrap();
+        assert_image(&replay, &exported);
+    }
+}
+
+#[tokio::test]
+async fn managed_files_export_receipt_never_selects_pixels() {
+    let fixture = Fixture::new();
+    let output = fixture.execute(
+        "source = read_file({path: \"image.png\"})\nrotated = image_rotate({image: source, degrees: 180})\nreturn export_file({file: rotated, path: \"receipt.png\"})",
+        Value::Null, false, true,
+    ).await.unwrap();
+    assert_eq!(
+        output,
+        ToolOutput::structured(json!({
+            "path":fixture.root.path().canonicalize().unwrap().join("receipt.png"),
+            "size_bytes":std::fs::metadata(fixture.root.path().join("receipt.png")).unwrap().len(),
+            "status":"exported"
+        }))
+    );
+    assert!(fixture.root.path().join("receipt.png").is_file());
+}
+
+#[tokio::test]
+async fn managed_files_unused_operations_still_execute_without_delivering_images() {
+    let fixture = Fixture::new();
+    let output = fixture.execute(
+        "source = read_file({path: \"image.png\"})\nunused = export_file({file: source, path: \"unused.png\"})\nreturn {done: true}",
+        Value::Null, false, true,
+    ).await.unwrap();
+    assert_eq!(output, ToolOutput::structured(json!({"done":true})));
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("unused.png")).unwrap(),
+        fixture.bytes
+    );
+    let error = fixture.execute(
+        "source = read_file({path: \"image.png\"})\nunused = image_crop({image: source, aspect_ratio: {width: 8192, height: 1}, anchor: \"center\"})\nreturn {done: true}",
+        Value::Null, false, true,
+    ).await.unwrap_err();
+    assert!(error.contains("nonzero"), "{error}");
+}
+
+#[tokio::test]
+async fn managed_files_hidden_transform_schema_rejects_invalid_inputs() {
+    let fixture = Fixture::new();
+    for operation in [
+        "image_rotate({image: source, degrees: 45})",
+        "image_crop({image: source, aspect_ratio: {width: 0, height: 1}, anchor: \"center\"})",
+        "image_crop({image: source, aspect_ratio: {width: 1, height: 1}, anchor: \"outside\"})",
+        "image_resize({image: source, width: 2, height: 2, fit: \"unknown\"})",
+        "image_resize({image: source, width: 2, height: 2, fit: \"contain\", extra: true})",
+        "export_file({file: source, path: \"\"})",
+    ] {
+        let script = format!("source = read_file({{path: \"image.png\"}})\nreturn {operation}");
+        assert!(
+            fixture
+                .execute(&script, Value::Null, false, true)
+                .await
+                .is_err(),
+            "{operation}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn managed_files_delivery_failure_does_not_claim_rollback() {
     let fixture = Fixture::new();
     let error = fixture

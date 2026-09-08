@@ -108,9 +108,46 @@ return { screenshot: image }
 
 Only File references reachable from the final return deliver pixels to the parent model. A reference used only in an intermediate binding does not attach its image. Arrays and nested objects work; repeated references deliver one image, labeled with its first position as an escaped JSON Pointer. Every occurrence must have valid metadata, including duplicates. The whole selection is validated before any image is delivered.
 
-The initial reader supports **nonanimated PNG and JPEG**. It sniffs content rather than trusting the extension, rejects corrupt images and nonregular files, and reads at most 8 MiB. An image can have at most 8,192 pixels on either axis, 16 megapixels, and a 64 MiB decoder allocation. GIF, WebP, animated PNG, SVG, PDF, URLs, and text files are unsupported. Use `shell` for ordinary text reads. Relative paths resolve from Kit's working directory; absolute paths follow the Kit process's filesystem access, not a new project sandbox.
+The reader supports **nonanimated PNG and JPEG**. PNG compressed profiles (`iCCP`), compressed text (`zTXt`), and international text (`iTXt`) are rejected before decoding to prevent ancillary metadata expansion; this also rejects uncompressed international text. It sniffs content rather than trusting the extension, rejects corrupt images and nonregular files, and reads at most 8 MiB. An image can have at most 8,192 pixels on either axis, 16 megapixels, and a 64 MiB decoder allocation. GIF, WebP, animated PNG, SVG, PDF, URLs, and text files are unsupported. Use `shell` for ordinary text reads. Relative paths resolve from Kit's working directory; absolute paths follow the Kit process's filesystem access, not a new project sandbox.
 
 Imports preserve the original bytes, metadata, and orientation. Width and height describe the encoded raster. There is no automatic transformation or export, and importing never overwrites the source.
+
+### Transform images in one compose program
+
+`image_rotate`, `image_crop`, and `image_resize` consume authorized File references and create new immutable references. `export_file` explicitly writes a reference's exact bytes to a new local file. All four are hidden callables; **compose remains the only exposed tool**.
+
+```text
+source = read_file({ path: "screenshot.jpg" })
+rotated = image_rotate({ image: source, degrees: 90 })
+cropped = image_crop({
+  image: rotated,
+  aspect_ratio: { width: 1, height: 1 },
+  anchor: "center"
+})
+thumbnail = image_resize({ image: cropped, width: 256, height: 256, fit: "contain" })
+receipt = export_file({ file: thumbnail, path: "thumbnail.png" })
+return { thumbnail, receipt }
+```
+
+Only `thumbnail` delivers pixels in this example. Returning just `receipt` delivers no image. The export has a dependency on `thumbnail`; source order alone does not sequence independent compose calls. Export and transforms are effectful, including when their return values are unused.
+
+Geometry is evaluated after normalizing EXIF orientation:
+
+- **Rotate:** `degrees` is exactly `90`, `180`, or `270`, clockwise.
+- **Crop:** ratio `width` and `height` are positive integers at most 8,192. Take the largest inscribed crop with an integer-rounded aspect ratio: retain one source dimension and floor the other. Reject a dimension rounded to zero. `anchor` is required: `center`, `top_left`, `top`, `top_right`, `left`, `right`, `bottom_left`, `bottom`, or `bottom_right`. Center offsets are floored, leaving an odd extra pixel outside the crop on the right/bottom. The rounded ratio need not be mathematically exact.
+- **Resize:** `width`, `height`, and `fit` are required. `contain` preserves the ratio within the requested box, floors the shortened dimension, and adds no padding; zero-rounded dimensions fail. `cover` center-crops using the target's integer-rounded ratio, then resizes exactly to the target dimensions; rounding can cause slight ratio distortion. `stretch` directly resizes to the exact dimensions. All fits permit upscaling and use Triangle filtering.
+
+Transforms support nonanimated PNG/JPEG inputs and emit fresh **RGBA8 PNG**, including when the input was JPEG. All eight EXIF orientations, including mirrored ones, are applied before geometry. The decoder either rejects malformed orientation metadata or falls back to identity. Source EXIF, ICC profiles, text, and other ancillary metadata are not copied. Stripping a profile is **not** color-managed conversion. Imports retain their original encoded dimensions and bytes; transformed descriptors describe the new raster. Source paths and existing managed objects are never overwritten.
+
+Transforms enforce the reader's encoded, dimension, pixel, and decoder limits on input and output, plus a **128 MiB resize-scratch limit** and **256 MiB estimated live-pixel-work limit**. The Triangle implementation's intermediate buffer depends on source width × target height, so even narrow images can exceed scratch limits. These are allocation checks, not a total-process RSS guarantee; independent compose operations can run concurrently. Encoded output is capped at 8 MiB. Cancellation is cooperative at stage boundaries and during bounded writes; a running decoder/filter cannot be forcibly interrupted. Failure or cancellation can leave unreachable managed objects but returns no usable new reference.
+
+### Explicit file export
+
+`export_file({ file, path })` returns `{ path, size_bytes, status: "exported" }`, not a File reference. It writes the exact stored bytes without decoding, format conversion, or extension-based rewriting. Relative paths resolve from Kit's working directory. Absolute paths and parent symlinks use ordinary process OS authority, as with `shell` and `edit`; there is no project sandbox or ancestor confinement.
+
+The destination's parent must already exist. Atomic create-new refuses any existing destination, including files, directories, and dangling final symlinks. It never overwrites an imported source. New Unix files are created with mode `0600` (subject to umask). Export bypasses volatile storage fallback: success requires disk writing and successful file sync. It does not promise atomic visibility or crash-durable directory creation.
+
+Cancellation before creation produces no destination. Errors or cancellation after creation retain a potentially partial **or complete** destination and report that path; Kit does not unlink it because another actor could have replaced it. A successful file sync is the commit point, with no cancellation rollback afterward. Retrying the same destination fails until you explicitly deal with the existing file. Do not rerun export blindly after interruption or delivery failure.
 
 ### Delivery limits and provider support
 
