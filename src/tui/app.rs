@@ -664,6 +664,7 @@ pub struct App {
     runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
     pub(super) transcript_cache: Vec<Option<CachedTranscriptBlock>>,
+    /// Block content/presentation revisions; source-cache invalidations only mark dirty.
     pub(super) transcript_revisions: Vec<u64>,
     pub(super) transcript_dirty: BTreeSet<usize>,
     pub(super) transcript_dynamic: BTreeSet<usize>,
@@ -1113,9 +1114,10 @@ impl App {
             })
             .map(|(index, _)| index)
             .collect();
-        for index in affected {
-            self.mark_block_dirty(index);
-        }
+        // Source readiness changes layout, not message content. Preserve the
+        // revision so refresh can distinguish this from an overlapping message
+        // replacement without storing or hashing another copy of the content.
+        self.transcript_dirty.extend(affected);
     }
 
     /// Aligns cache bookkeeping for tests and other direct transcript setup.

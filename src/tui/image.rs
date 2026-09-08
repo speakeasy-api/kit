@@ -10,7 +10,12 @@ use ratatui_image::{
     picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions},
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Semaphore, oneshot};
 
 const TERMINAL_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
@@ -50,6 +55,7 @@ struct CacheEntry {
     width: u16,
     running: bool,
     error: Option<&'static str>,
+    deferred_at: Option<u64>,
     last_used: u64,
 }
 struct Job {
@@ -62,6 +68,8 @@ pub(super) struct ImageRuntime {
     pub(super) markdown: super::markdown_images::MarkdownImages,
     picker: Option<Picker>,
     cache: HashMap<[u8; 32], CacheEntry>,
+    visible: HashSet<[u8; 32]>,
+    visibility_generation: u64,
     jobs: Vec<Job>,
     generation: u64,
     clock: u64,
@@ -72,6 +80,8 @@ impl ImageRuntime {
             markdown: super::markdown_images::MarkdownImages::new(),
             picker,
             cache: HashMap::new(),
+            visible: HashSet::new(),
+            visibility_generation: 0,
             jobs: Vec::new(),
             generation: 0,
             clock: 0,
@@ -90,7 +100,19 @@ impl ImageRuntime {
     pub fn enabled(&self) -> bool {
         self.picker.is_some()
     }
+    pub fn set_visible_keys(&mut self, keys: impl IntoIterator<Item = [u8; 32]>) {
+        // The caller supplies actual visible occurrences, including pending and
+        // deferred sources. Decode-cache residency must not define visibility.
+        let visible = keys.into_iter().collect();
+        if self.visible != visible {
+            self.visible = visible;
+            self.visibility_generation = self.visibility_generation.wrapping_add(1);
+        }
+    }
+
     pub fn clear(&mut self) {
+        self.visible.clear();
+        self.visibility_generation = self.visibility_generation.wrapping_add(1);
         self.markdown.clear();
         self.cache.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -102,6 +124,10 @@ impl ImageRuntime {
         }
         match self.cache.get(key) {
             Some(entry) if entry.error.is_some() => entry.error.unwrap_or("image unavailable"),
+            Some(entry) if entry.deferred_at.is_some() => "image deferred (visible image budget)",
+            None if self.cache.len() >= MAX_CACHE_ENTRIES => {
+                "image deferred (visible image budget)"
+            }
             Some(entry) if entry.protocol.is_some() && !entry.running => "image ready",
             _ => "image loading",
         }
@@ -112,6 +138,7 @@ impl ImageRuntime {
             || !self.jobs.is_empty()
             || self.cache.values().any(|entry| {
                 entry.error.is_none()
+                    && entry.deferred_at.is_none()
                     && (entry.source.is_some()
                         || entry
                             .protocol
@@ -121,7 +148,7 @@ impl ImageRuntime {
     }
 
     pub fn poll(&mut self) -> bool {
-        let mut changed = self.markdown.poll();
+        let mut changed = false;
         let mut index = 0;
         while index < self.jobs.len() {
             let result = match self.jobs[index].receiver.try_recv() {
@@ -136,51 +163,87 @@ impl ImageRuntime {
             if job.generation != self.generation {
                 continue;
             }
+            if !self.cache.contains_key(&job.key) {
+                continue;
+            }
+            let admitted = match &result {
+                Ok((decoded, _)) => self.reserve_decoded(&job.key, decoded.as_bytes().len() as u64),
+                Err(_) => true,
+            };
             let Some(entry) = self.cache.get_mut(&job.key) else {
                 continue;
             };
             entry.running = false;
             changed = true;
             match result {
-                Ok((decoded, protocol)) => {
+                Ok((decoded, protocol)) if admitted => {
                     entry.decoded = Some(decoded);
                     if entry.width == job.width {
                         entry.protocol = Some((job.width, protocol));
                     }
                 }
+                Ok(_) => {
+                    // Drop the unadmittable result, not another visible image.
+                    // Only a meaningful visible-set change permits a new decode.
+                    entry.decoded = None;
+                    entry.protocol = None;
+                    entry.deferred_at = Some(self.visibility_generation);
+                }
                 Err(error) => entry.error = Some(error),
             }
-        }
-        // Cache backing is separate from the two 64 MiB job reservations.
-        // Completed outputs move from those reservations into the cache.
-        // Trim even when there is no queued work left to schedule.
-        while self
-            .cache
-            .values()
-            .filter_map(|entry| entry.decoded.as_ref())
-            .map(|decoded| decoded.as_bytes().len() as u64)
-            .sum::<u64>()
-            > MAX_DECODED_BACKING_BYTES
-        {
-            let victim = self
-                .cache
-                .iter()
-                .filter(|(_, entry)| !entry.running && entry.decoded.is_some())
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| *key);
-            let Some(victim) = victim else {
-                break;
-            };
-            self.cache.remove(&victim);
         }
         self.schedule();
         changed
     }
+    fn reserve_decoded(&mut self, key: &[u8; 32], bytes: u64) -> bool {
+        loop {
+            let retained = self
+                .cache
+                .iter()
+                .filter(|(cached, _)| *cached != key)
+                .filter_map(|(_, entry)| entry.decoded.as_ref())
+                .map(|decoded| decoded.as_bytes().len() as u64)
+                .sum::<u64>();
+            if retained.saturating_add(bytes) <= MAX_DECODED_BACKING_BYTES {
+                return true;
+            }
+            let victim = self
+                .cache
+                .iter()
+                .filter(|(cached, entry)| {
+                    *cached != key
+                        && !self.visible.contains(*cached)
+                        && !entry.running
+                        && entry.decoded.is_some()
+                })
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key);
+            let Some(victim) = victim else { return false };
+            self.cache.remove(&victim);
+        }
+    }
+
     pub fn prepare(&mut self, image: &MediaImage, width: u16) -> Option<PreparedImage> {
         if !self.enabled() || width == 0 {
             return None;
         }
         self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.cache.get(&image.key)
+            && let Some(generation) = entry.deferred_at
+        {
+            if generation == self.visibility_generation {
+                return None;
+            }
+            while self.queued_bytes().saturating_add(image.data.len()) > MAX_QUEUED_SOURCE_BYTES {
+                if !self.evict() {
+                    return None;
+                }
+            }
+            if let Some(entry) = self.cache.get_mut(&image.key) {
+                entry.deferred_at = None;
+                entry.source = Some((image.data.clone(), image.mime_type.clone()));
+            }
+        }
         if !self.cache.contains_key(&image.key) {
             if image.data.len() > MAX_BASE64_BYTES || image.mime_type.len() > 256 {
                 return None;
@@ -201,6 +264,7 @@ impl ImageRuntime {
                     width,
                     running: false,
                     error: None,
+                    deferred_at: None,
                     last_used: self.clock,
                 },
             );
@@ -230,7 +294,7 @@ impl ImageRuntime {
         let key = self
             .cache
             .iter()
-            .filter(|(_, entry)| !entry.running)
+            .filter(|(key, entry)| !entry.running && !self.visible.contains(*key))
             .min_by_key(|(_, entry)| entry.last_used)
             .map(|(key, _)| *key);
         key.is_some_and(|key| self.cache.remove(&key).is_some())
@@ -252,7 +316,10 @@ impl ImageRuntime {
                 .cache
                 .iter()
                 .filter(|(_, entry)| {
-                    !entry.running && entry.error.is_none() && entry.protocol.is_none()
+                    !entry.running
+                        && entry.error.is_none()
+                        && entry.deferred_at.is_none()
+                        && entry.protocol.is_none()
                 })
                 .max_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
@@ -423,6 +490,119 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn settle_work(runtime: &mut ImageRuntime) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while runtime.pending() {
+                runtime.poll();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn visible_decoded_pressure_settles_and_recovers_after_scroll() {
+        let sources: Vec<_> = (0..3)
+            .map(|seed| {
+                let mut bytes = Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                    4096,
+                    4096,
+                    image::Rgb([seed, 80, 120]),
+                ))
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+                MediaImage::new(STANDARD.encode(bytes.into_inner()), "image/png".into(), 0).unwrap()
+            })
+            .collect();
+        let keys: Vec<_> = sources.iter().map(|source| source.key).collect();
+        let mut runtime = ImageRuntime::with_picker(Picker::halfblocks());
+        runtime.set_visible_keys(keys.clone());
+        for source in &sources {
+            runtime.prepare(source, 40);
+        }
+        settle_work(&mut runtime).await;
+        let deferred = sources
+            .iter()
+            .find(|source| runtime.status(&source.key).contains("deferred"))
+            .unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|source| runtime.status(&source.key) == "image ready")
+        );
+        for _ in 0..3 {
+            runtime.set_visible_keys(keys.clone());
+            for source in &sources {
+                runtime.prepare(source, 40);
+            }
+            assert!(!runtime.pending());
+        }
+        // Resize rebuilds only admitted protocols; it is not more decode capacity.
+        let retained = runtime
+            .cache
+            .iter()
+            .filter_map(|(key, entry)| entry.decoded.clone().map(|decoded| (*key, decoded)))
+            .collect::<Vec<_>>();
+        for source in &sources {
+            runtime.prepare(source, 60);
+        }
+        settle_work(&mut runtime).await;
+        assert!(runtime.status(&deferred.key).contains("deferred"));
+        for (key, decoded) in retained {
+            assert!(Arc::ptr_eq(
+                &decoded,
+                runtime.cache[&key].decoded.as_ref().unwrap()
+            ));
+        }
+        runtime.set_visible_keys([deferred.key]);
+        runtime.prepare(deferred, 60);
+        settle_work(&mut runtime).await;
+        assert_eq!(runtime.status(&deferred.key), "image ready");
+        assert!(
+            runtime
+                .cache
+                .values()
+                .filter_map(|entry| entry.decoded.as_ref())
+                .map(|image| image.as_bytes().len() as u64)
+                .sum::<u64>()
+                <= MAX_DECODED_BACKING_BYTES
+        );
+        runtime.clear();
+        runtime.set_visible_keys([sources[0].key]);
+        runtime.prepare(&sources[0], 40);
+        settle_work(&mut runtime).await;
+        assert_eq!(runtime.status(&sources[0].key), "image ready");
+    }
+
+    #[tokio::test]
+    async fn visible_entry_pressure_does_not_cycle_decoding() {
+        let sources: Vec<_> = (0..MAX_CACHE_ENTRIES + 2)
+            .map(|seed| source(seed as u8))
+            .collect();
+        let keys: Vec<_> = sources.iter().map(|source| source.key).collect();
+        let mut runtime = ImageRuntime::with_picker(Picker::halfblocks());
+        runtime.set_visible_keys(keys.clone());
+        for source in &sources {
+            runtime.prepare(source, 40);
+        }
+        settle_work(&mut runtime).await;
+        for _ in 0..3 {
+            runtime.set_visible_keys(keys.clone());
+            for source in &sources {
+                runtime.prepare(source, 40);
+            }
+            assert!(!runtime.pending());
+        }
+        let last = sources.last().unwrap();
+        assert!(runtime.status(&last.key).contains("deferred"));
+        runtime.set_visible_keys([last.key]);
+        runtime.prepare(last, 40);
+        settle_work(&mut runtime).await;
+        assert_eq!(runtime.status(&last.key), "image ready");
     }
 
     #[test]

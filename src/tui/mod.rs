@@ -1160,7 +1160,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
                     let event = {
-                        let redraw = app.needs_redraw_tick() || images.pending();
+                        let redraw = app.needs_redraw_tick() || images.pending() || !app.transcript_dirty.is_empty();
                         let mut stopped = pin!(stop.requested());
                         // Rotate the first eligible source after every winner.
                         // If none is ready, poll every eligible source with the
@@ -1349,7 +1349,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     let event = {
-                        let redraw = app.needs_redraw_tick() || images.pending();
+                        let redraw = app.needs_redraw_tick() || images.pending() || !app.transcript_dirty.is_empty();
                         let mut stopped = pin!(stop.requested());
                         let mut shutdown = pin!(storage_shutdown.cancelled());
                         // A local round-robin race keeps hot input/update queues

@@ -18,6 +18,7 @@ const MAX_JOBS: usize = 2;
 
 enum State {
     Waiting,
+    Deferred,
     Loading(tokio::task::Id),
     Ready(MediaImage),
     Failed(String),
@@ -26,6 +27,7 @@ enum State {
 struct Entry {
     state: State,
     used: u64,
+    key: Option<[u8; 32]>,
 }
 
 struct Completion {
@@ -40,6 +42,7 @@ pub(super) struct MarkdownImages {
     generation: u64,
     policy: ImagePolicy,
     entries: HashMap<String, Entry>,
+    visible: HashSet<String>,
     changed_sources: HashSet<String>,
     jobs: JoinSet<Completion>,
     clock: u64,
@@ -54,6 +57,7 @@ impl MarkdownImages {
             generation: 0,
             policy: ImagePolicy::from_environment(),
             entries: HashMap::new(),
+            visible: HashSet::new(),
             changed_sources: HashSet::new(),
             jobs: JoinSet::new(),
             clock: 0,
@@ -74,10 +78,44 @@ impl MarkdownImages {
         self.generation = self.generation.wrapping_add(1);
         self.changed_sources.extend(self.entries.keys().cloned());
         self.entries.clear();
+        self.visible.clear();
         self.retained = 0;
         // Stop old async stages, including requests following DNS. Actual blocking
         // closures retain global admission until completion even after this abort.
         self.jobs.abort_all();
+    }
+
+    /// Register the complete viewport before polling or requesting sources. The
+    /// first unique destinations form a stable, bounded admission set.
+    pub fn set_visible<'a>(&mut self, sources: impl IntoIterator<Item = &'a str>) {
+        let mut visible = HashSet::new();
+        for source in sources {
+            if source.len() > 4096 {
+                continue;
+            }
+            visible.insert(source.to_owned());
+            if visible.len() == MAX_ENTRIES {
+                break;
+            }
+        }
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        for entry in self.entries.values_mut() {
+            if matches!(entry.state, State::Deferred) {
+                entry.state = State::Waiting;
+            }
+        }
+    }
+
+    pub fn is_visible(&self, source: &str) -> bool {
+        self.visible.contains(source)
+    }
+
+    /// Authorized content identity survives byte-pressure deferral.
+    pub fn key(&self, source: &str) -> Option<[u8; 32]> {
+        self.entries.get(source)?.key
     }
 
     pub fn take_changed_sources(&mut self) -> HashSet<String> {
@@ -111,10 +149,12 @@ impl MarkdownImages {
             }
             let state = match done.image {
                 Ok(image) => {
+                    if let Some(entry) = self.entries.get_mut(&done.source) {
+                        entry.key = Some(image.key);
+                    }
                     let bytes = image.data.len();
-                    // Reclaim snapshots, never active acquisitions. An image that
-                    // cannot fit stays retryable instead of caching capacity as
-                    // an intrinsic source failure.
+                    // Reclaim offscreen snapshots, never the visible working set.
+                    // Capacity deferrals retry only when that set changes.
                     if bytes <= MAX_SOURCE_BYTES {
                         while self.retained.saturating_add(bytes) > MAX_SOURCE_BYTES {
                             if !self.evict_oldest(true) {
@@ -127,7 +167,7 @@ impl MarkdownImages {
                         self.changed_sources.insert(done.source.clone());
                         State::Ready(image)
                     } else {
-                        State::Waiting
+                        State::Deferred
                     }
                 }
                 Err(error) => State::Failed(error),
@@ -146,9 +186,10 @@ impl MarkdownImages {
         let oldest = self
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                matches!(entry.state, State::Ready(_))
-                    || (!ready_only && !matches!(entry.state, State::Loading(_)))
+            .filter(|(source, entry)| {
+                !self.visible.contains(*source)
+                    && (matches!(entry.state, State::Ready(_))
+                        || (!ready_only && !matches!(entry.state, State::Loading(_))))
             })
             .min_by_key(|(_, entry)| entry.used)
             .map(|(source, _)| source.clone());
@@ -165,7 +206,7 @@ impl MarkdownImages {
     }
 
     pub fn request(&mut self, source: &str) {
-        if source.len() > 4096 {
+        if source.len() > 4096 || (!self.visible.is_empty() && !self.is_visible(source)) {
             return;
         }
         self.clock = self.clock.wrapping_add(1);
@@ -178,6 +219,7 @@ impl MarkdownImages {
                 Entry {
                     state: State::Waiting,
                     used: self.clock,
+                    key: None,
                 },
             );
         }
@@ -232,6 +274,7 @@ impl MarkdownImages {
         match self.entries.get(source).map(|entry| &entry.state) {
             Some(State::Ready(_)) => "image",
             Some(State::Failed(error)) => error,
+            Some(State::Deferred) => "image deferred (visible image budget)",
             _ => "image loading",
         }
     }
@@ -254,6 +297,20 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         std::fs::write(root.join(name), bytes.into_inner()).unwrap();
+    }
+
+    fn write_large_png(root: &Path, name: &str, value: u8) {
+        use image::{
+            ImageEncoder as _,
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+        };
+        let pixels = vec![value; 1792 * 1366 * 3];
+        let mut bytes = Vec::new();
+        PngEncoder::new_with_quality(&mut bytes, CompressionType::Level(0), FilterType::NoFilter)
+            .write_image(&pixels, 1792, 1366, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!((7 * 1024 * 1024..8 * 1024 * 1024).contains(&bytes.len()));
+        std::fs::write(root.join(name), bytes).unwrap();
     }
 
     async fn settle(images: &mut MarkdownImages) {
@@ -297,26 +354,11 @@ mod tests {
 
     #[tokio::test]
     async fn source_byte_pressure_evicts_lru_and_revisited_images_recover() {
-        use image::{
-            ImageEncoder as _,
-            codecs::png::{CompressionType, FilterType, PngEncoder},
-        };
-
         let root = tempfile::tempdir().unwrap();
         let sources = ["first.png", "second.png", "third.png", "fourth.png"];
         for (index, source) in sources.iter().enumerate() {
             // Real, individually valid ~7 MiB PNGs, with distinct pixel content.
-            let pixels = vec![index as u8; 1792 * 1366 * 3];
-            let mut bytes = Vec::new();
-            PngEncoder::new_with_quality(
-                &mut bytes,
-                CompressionType::Level(0),
-                FilterType::NoFilter,
-            )
-            .write_image(&pixels, 1792, 1366, image::ExtendedColorType::Rgb8)
-            .unwrap();
-            assert!((7 * 1024 * 1024..8 * 1024 * 1024).contains(&bytes.len()));
-            std::fs::write(root.path().join(source), bytes).unwrap();
+            write_large_png(root.path(), source, index as u8);
         }
         let mut images = MarkdownImages::new();
         images.context(root.path(), Some("session"));
@@ -372,6 +414,121 @@ mod tests {
                 .filter_map(|source| images.image(source))
                 .map(|image| image.data.len())
                 .sum::<usize>()
+        );
+        assert!(images.retained <= MAX_SOURCE_BYTES);
+    }
+
+    async fn settle_viewport(images: &mut MarkdownImages, sources: &[&str]) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                images.set_visible(sources.iter().copied());
+                images.poll();
+                for source in sources {
+                    images.request(source);
+                }
+                if !images.pending() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn visible_source_byte_pressure_settles_and_recovers_on_viewport_change() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = ["first.png", "second.png", "third.png", "fourth.png"];
+        for (index, source) in sources.iter().enumerate() {
+            write_large_png(root.path(), source, index as u8);
+        }
+        let mut images = MarkdownImages::new();
+        images.context(root.path(), Some("session"));
+        settle_viewport(&mut images, &sources).await;
+        let ready: Vec<_> = sources
+            .iter()
+            .copied()
+            .filter(|source| images.image(source).is_some())
+            .collect();
+        let deferred: Vec<_> = sources
+            .iter()
+            .copied()
+            .filter(|source| images.status(source) == "image deferred (visible image budget)")
+            .collect();
+        assert_eq!(ready.len(), 3);
+        assert_eq!(deferred.len(), 1);
+        let key = images.key(deferred[0]).unwrap();
+        images.take_changed_sources();
+        for _ in 0..8 {
+            images.set_visible(sources);
+            assert!(!images.poll());
+            for source in sources {
+                images.request(source);
+            }
+            assert!(!images.pending());
+            assert!(ready.iter().all(|source| images.image(source).is_some()));
+            assert_eq!(images.key(deferred[0]), Some(key));
+            assert!(images.take_changed_sources().is_empty());
+        }
+        // Shrinking the viewport (scroll or resize) releases offscreen snapshots.
+        settle_viewport(&mut images, &deferred).await;
+        assert!(images.image(deferred[0]).is_some());
+        assert_eq!(images.key(deferred[0]), Some(key));
+        settle_viewport(&mut images, &sources).await;
+        for source in sources {
+            images.request(source);
+        }
+        assert!(!images.pending());
+        assert!(images.retained <= MAX_SOURCE_BYTES);
+        images.context(root.path(), Some("replacement"));
+        assert!(sources.iter().all(|source| images.key(source).is_none()));
+        settle_viewport(&mut images, &sources).await;
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| images.image(source).is_some())
+                .count(),
+            3
+        );
+        assert!(!images.pending());
+    }
+
+    #[tokio::test]
+    async fn visible_entry_overflow_keeps_first_unique_sources_and_scroll_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let sources: Vec<_> = (0..MAX_ENTRIES + 2)
+            .map(|index| format!("{index}.png"))
+            .collect();
+        for source in &sources {
+            write_png(root.path(), source);
+        }
+        let viewport: Vec<_> = sources.iter().map(String::as_str).collect();
+        let mut images = MarkdownImages::new();
+        images.context(root.path(), Some("session"));
+        settle_viewport(&mut images, &viewport).await;
+        for _ in 0..8 {
+            // Repeated occurrences do not consume extra admission slots.
+            images.set_visible(viewport.iter().flat_map(|source| [*source, *source]));
+            assert!(!images.poll());
+            for (index, source) in sources.iter().enumerate() {
+                assert_eq!(images.is_visible(source), index < MAX_ENTRIES);
+                images.request(source);
+                assert_eq!(images.image(source).is_some(), index < MAX_ENTRIES);
+            }
+            assert!(!images.pending());
+        }
+        settle_viewport(&mut images, &viewport[2..]).await;
+        assert!(
+            viewport[2..]
+                .iter()
+                .all(|source| images.image(source).is_some())
+        );
+        settle_viewport(&mut images, &viewport[..MAX_ENTRIES]).await;
+        assert!(
+            viewport[..MAX_ENTRIES]
+                .iter()
+                .all(|source| images.image(source).is_some())
         );
         assert!(images.retained <= MAX_SOURCE_BYTES);
     }
