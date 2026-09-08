@@ -96,7 +96,7 @@ impl FaultBackend {
         // Fs persists objects through sibling atomic-replacement files, not by
         // writing the final file_ basename. Scope faults to this session's file
         // contents so staged writes are covered without faulting directory work.
-        if path.parent() == Some(self.object_directory.as_path()) {
+        if path.starts_with(&self.object_directory) {
             Box::new(FaultFile {
                 disk,
                 mode: self.mode,
@@ -270,4 +270,87 @@ fn fault_child() {
         serde_json::to_vec(&error).unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+fn existing_grant_succeeds_when_new_object_writes_have_no_space() {
+    let f = Fixture::new();
+    let reference = f.import("retry.png");
+    f.store
+        .grant_to("session", &reference, &f.store, "parent", None)
+        .unwrap();
+    let manifest = f.dir.path().join("grant-retry.json");
+    disk::write(
+        &manifest,
+        serde_json::to_vec(&(f.store.base.clone(), reference)).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "managed_files::tests::faults::grant_retry_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(MANIFEST_ENV, &manifest)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+}
+
+#[test]
+#[ignore = "invoked by parent with immutable ENOSPC backend"]
+fn grant_retry_child() {
+    let path = PathBuf::from(std::env::var_os(MANIFEST_ENV).unwrap());
+    let (base, reference): (PathBuf, FileReference) =
+        serde_json::from_slice(&disk::read(path).unwrap()).unwrap();
+    let store = FileStore { base };
+    assert!(
+        fs::initialize_global(Fs::new(Arc::new(FaultBackend {
+            mode: Mode::NoSpace,
+            object_directory: store.base.clone(),
+        })))
+        .is_ok()
+    );
+    let granted = store
+        .grant_to("session", &reference, &store, "parent", None)
+        .unwrap();
+    assert_eq!(granted, reference);
+    assert_eq!(
+        store.resolve("parent", &reference).unwrap(),
+        store.resolve("session", &reference).unwrap()
+    );
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = controller.handle().checkpoint();
+    controller.interrupt();
+    assert!(
+        store
+            .grant_to("session", &reference, &store, "parent", Some(&cancellation))
+            .unwrap_err()
+            .contains("cancelled")
+    );
+    // A genuinely new grant hits real filesystem write-back/durability failure.
+    assert!(
+        store
+            .grant_to("session", &reference, &store, "new", None)
+            .is_err()
+    );
+    assert!(store.resolve("new", &reference).is_err());
+    // Existing corrupt bytes must fail, even though retry is allocation-free.
+    disk::write(
+        store.session_directory("parent").join(&reference.id),
+        b"corrupt",
+    )
+    .unwrap();
+    assert!(
+        store
+            .grant_to("session", &reference, &store, "parent", None)
+            .is_err()
+    );
 }

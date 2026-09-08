@@ -100,6 +100,7 @@ mod test_support {
     fn rejected_fork_deferral_cleans_transcripts_before_releasing_identity_for_retry() {
         for kind in ["configured", "generated", "load"] {
             let root = tempfile::tempdir().unwrap();
+            let selected_id = crate::session::new_id();
             let runtime = if kind == "generated" {
                 Runtime::new(root.path(), "gpt-5.4").unwrap()
             } else {
@@ -107,7 +108,7 @@ mod test_support {
                     root.path(),
                     "gpt-5.4",
                     SessionRequest {
-                        id: "selected".into(),
+                        id: selected_id.clone(),
                         resume: false,
                         force: false,
                     },
@@ -115,7 +116,7 @@ mod test_support {
                 .unwrap()
             };
             let mut claim = if kind == "load" {
-                runtime.claim_session_load("selected").unwrap()
+                runtime.claim_session_load(&selected_id).unwrap()
             } else {
                 runtime.claim_session().unwrap()
             };
@@ -127,11 +128,26 @@ mod test_support {
                 vec![Item::text(agentkit_core::ItemKind::System, "system")],
             )
             .unwrap();
+            let store = crate::managed_files::FileStore::new(root.path());
+            let source_id = crate::session::new_id();
+            let image_path = root.path().join("inherited.png");
+            image::DynamicImage::new_luma8(2, 2)
+                .save(&image_path)
+                .unwrap();
+            let reference = store.import(&source_id, &image_path, None).unwrap();
+            opened
+                .observer
+                .attach_inherited_authority(
+                    store.prepare_inheritance(&source_id, &id).unwrap().unwrap(),
+                )
+                .unwrap();
             claim.guard_uncommitted_transcript(&opened.observer);
             drop(opened);
             assert!(crate::session::load(root.path(), &id).is_ok());
             assert!(claim.defer_fork_commit().is_err());
             assert!(crate::session::load(root.path(), &id).is_err());
+            assert!(store.resolve(&id, &reference).is_err());
+            assert!(store.resolve(&source_id, &reference).is_ok());
             let mut retry = runtime.claim_session().unwrap();
             assert_eq!(retry.id(), id);
             assert!(!retry.request.resume);
@@ -143,10 +159,78 @@ mod test_support {
             )
             .unwrap();
             retry.guard_uncommitted_transcript(&recreated.observer);
+            assert!(store.resolve(&id, &reference).is_err());
             retry.commit().unwrap();
             drop(recreated);
+            let base = crate::artifacts::base(root.path()).with_file_name("files");
+            let _ = std::fs::remove_dir_all(
+                base.join(blake3::hash(source_id.as_bytes()).to_hex().as_str()),
+            );
             assert!(crate::session::load(root.path(), &id).is_ok());
         }
+    }
+
+    #[derive(Clone)]
+    struct DiscardLoopEvents;
+    impl LoopObserver for DiscardLoopEvents {
+        fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+    }
+
+    #[tokio::test]
+    async fn native_fork_setup_failure_rolls_back_inherited_authority_with_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let store = crate::managed_files::FileStore::new(root.path());
+        let source_id = crate::session::new_id();
+        let image_path = root.path().join("setup.png");
+        image::DynamicImage::new_luma8(2, 2)
+            .save(&image_path)
+            .unwrap();
+        let reference = store.import(&source_id, &image_path, None).unwrap();
+        let mut claim = runtime.claim_session_fork().unwrap();
+        let destination = claim.id().to_owned();
+        let controller = CancellationController::new();
+        let result = runtime
+            .start_acp_driver_with_initial(
+                AcpDriverContext {
+                    cwd: root.path().to_path_buf(),
+                    additional_directories: Vec::new(),
+                    integration: Arc::new(DiscardLoopEvents),
+                    cancellation: controller.handle(),
+                    response_attempt_replacement: false,
+                },
+                &mut claim,
+                Some(AcpForkState {
+                    source_session_id: source_id.clone(),
+                    transcript: vec![Item::text(ItemKind::System, "fork")],
+                    // The real adapter constructor rejects this after inheritance.
+                    selection: ModelSelection::new(ProviderKind::OpenRouter, ""),
+                    reasoning_effort: None,
+                    parent_context: None,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AcpRuntimeError::Loop(ref error)) if error.contains("model name"))
+        );
+        assert!(store.resolve(&destination, &reference).is_ok());
+        drop(claim);
+        assert!(crate::session::load(root.path(), &destination).is_err());
+        assert!(store.resolve(&destination, &reference).is_err());
+        assert!(store.resolve(&source_id, &reference).is_ok());
+        let retry = crate::session::open_uncommitted(
+            root.path(),
+            &destination,
+            false,
+            vec![Item::text(ItemKind::System, "retry")],
+        )
+        .unwrap();
+        assert!(store.resolve(&destination, &reference).is_err());
+        drop(retry);
+        let base = crate::artifacts::base(root.path()).with_file_name("files");
+        let _ = std::fs::remove_dir_all(
+            base.join(blake3::hash(source_id.as_bytes()).to_hex().as_str()),
+        );
     }
 
     impl Runtime {
@@ -311,6 +395,8 @@ impl SessionSelection {
 }
 
 pub(crate) struct AcpForkState {
+    /// Trusted actor storage identity, never supplied by transcript metadata.
+    pub source_session_id: String,
     pub transcript: Vec<Item>,
     pub selection: ModelSelection,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -1477,13 +1563,14 @@ impl Runtime {
         }
         let request = claim.request.clone();
         let session_id = request.id.clone();
-        let (forked_transcript, selected, parent_context) = match forked {
+        let (forked_transcript, selected, parent_context, source_session_id) = match forked {
             Some(forked) => (
                 Some(forked.transcript),
                 Some((forked.selection, forked.reasoning_effort)),
                 forked.parent_context,
+                Some(forked.source_session_id),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         let is_fork = forked_transcript.is_some();
         let initial = if let Some(transcript) = forked_transcript {
@@ -1513,6 +1600,20 @@ impl Runtime {
         .map_err(AcpRuntimeError::Loop)?;
         if is_fork || !request.resume {
             claim.guard_uncommitted_transcript(&opened.observer);
+        }
+        if let Some(source_session_id) = source_session_id {
+            // The claim already guards the destination transcript. Authority must
+            // be prepared before any driver/actor or successful fork publication;
+            // failure leaves the existing uncommitted cleanup owner intact.
+            if let Some(authority) = crate::managed_files::FileStore::new(&self.root)
+                .prepare_inheritance(&source_session_id, &request.id)
+                .map_err(AcpRuntimeError::Loop)?
+            {
+                opened
+                    .observer
+                    .attach_inherited_authority(authority)
+                    .map_err(AcpRuntimeError::Loop)?;
+            }
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.

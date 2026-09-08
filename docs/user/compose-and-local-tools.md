@@ -167,6 +167,62 @@ References survive process restart and source modification or deletion. Authoriz
 
 There is no automatic managed-file garbage collection in this phase. Calls, cancellation, session close, and process exit do not delete these objects. Cancelled or failed imports can leave unreachable objects. Explicit removal of a session's managed-file directory invalidates its references; do not remove retained objects that you need after resume. Finalization can repeat against the same immutable references without importing again. A delivery error states that the compose program already completed and side effects may have occurred; it is not a rollback or an invitation to retry blindly.
 
+## Attach files to subagents and return native images
+
+The hidden `subagent`, `prompt`, and `fork` tools accept optional `attachments: FileReference[]` (at most eight). Pass managed File values explicitly; a file ID, path, URL, or descriptor pasted into prompt text does not attach an image. Kit resolves attachments in the invoking session, checks the existing aggregate image budgets, grants durable copies to the child, and sends native ACP image blocks after the text prompt. The harness must advertise ACP image **input** support. That advertisement does not promise image generation.
+
+Use the exact local schema reference `{"$ref":"kit://schemas/file/v1"}` for a strict native-image output contract:
+
+```text
+source = read_file({ path: "source.png" })
+edited = subagent({
+  model: "openrouter:google/gemini-3-pro-image",
+  prompt: "Edit the attached image and emit exactly one distinct native assistant image.",
+  attachments: [source],
+  output_schema: {
+    type: "object",
+    properties: { result: { "$ref": "kit://schemas/file/v1" } },
+    required: ["result"],
+    additionalProperties: false
+  }
+})
+return edited.output.result
+```
+
+This example uses the built-in Kit ACP harness and a concrete OpenRouter image-output model. Select an eligible model explicitly; a vision model behind a text-only harness cannot generate native output through that harness. Standard ACP advertises image **input**, not image generation. Actual valid assistant image bytes, not the capability flag or a model name, establish output success.
+
+For the canonical OpenRouter endpoint, selecting a concrete model advertised with image output opts into generation and its additional provider cost. Kit checks the exact model catalogue and its concrete endpoint document, derives output modalities from advertised capabilities, and requires tools support so compose remains available. Automatic routing entries without concrete endpoints retain ordinary behavior. Native requests require providers to support all requested parameters; Kit does not silently remove compose or relax routing to make an incompatible model work. Editing also requires advertised image input. Custom endpoints do not inherit official OpenRouter capability assertions. Discovery failures do not manufacture support, and a required File contract fails if no native image arrives.
+
+This route uses bounded nonstreaming chat completions: at most 24 MiB of raw response, eight images, 8 MiB per image, 16 MiB of decoded image bytes and 32 megapixels in aggregate. Each image also passes the managed-file PNG/JPEG, animation, dimension, pixel and allocation checks. Only inline image bytes are accepted; Kit never fetches provider-generated HTTP or file URLs. Native media does not inject synthetic image-label text into the structured output. Generation has a 300-second attempt timeout and 310-second logical budget, with no automatic retries of ambiguous billable failures. Cancellation remains available. On continuation or replay, historical assistant images stay typed in canonical history and are projected into supported image-input blocks only in the outgoing provider request, after any complete parallel tool-result batch. The existing text-oriented behavior and tool-image user-message fallback remain unchanged for other routes.
+
+A file-aware schema supports **exactly one** File location: the root, or one fixed object-property path whose properties are required at every level. Arrays, unions, conditional binding, indirect references, multiple locations, and sibling keywords on the File `$ref` other than the optional `x-kit-image-index` annotation are rejected. Kit resolves the File schema locally. By default, the child must emit exactly one **distinct** native assistant image and return only the surrounding JSON fields, omitting the binding field. Kit independently validates every occurrence, including its declared MIME type, actual PNG/JPEG bytes, and pixels. Repeated occurrences collapse to one output only when both MIME type and actual bytes match exactly within this turn. Count, encoded/decoded byte, and aggregate pixel budgets count every occurrence before deduplication. Without an explicit selection index, different image bytes remain ambiguous even if they render identically; model IDs and File references do not determine identity. There is no cross-turn or input/output deduplication. Kit rejects model-written binding fields, including `null` placeholders and invented File IDs. A root binding requires empty text. Empty surrounding text is allowed only when Kit can construct the required object path and the resulting complete value validates; Kit does not invent other required fields or apply schema defaults.
+
+Missing images, multiple distinct images without an explicit index, out-of-range selection indices, capture errors, malformed image bytes, invalid surrounding JSON, failed schema validation, and inaccessible files fail the call explicitly. Tool-result images, thought images, resource links, and textual base64 are not native assistant output. Kit imports real PNG/JPEG bytes under the existing managed-file limits and publishes a durable parent-authorized copy before returning success. Outputs survive child close and different child working directories; unrelated sessions do not acquire access. Failed continuation calls retain the accepted handle generation for retry, as with existing text-only failures.
+
+To deliberately select one output from a backend that can emit multiple distinct images, fix `x-kit-image-index` beside the exact File `$ref` **before** starting the call. The annotation must be an integer from 0 through 7. It indexes distinct validated images in first-emission order, after byte-identical duplicates collapse. The default contract above remains strict: Kit never chooses among distinct outputs unless the caller supplies this annotation.
+
+```text
+source = read_file({ path: "source.png" })
+edited = subagent({
+  model: "openrouter:google/gemini-3-pro-image",
+  prompt: "Add the requested sticker to the attached image and emit native image output.",
+  attachments: [source],
+  output_schema: {
+    type: "object",
+    properties: {
+      result: { "$ref": "kit://schemas/file/v1", "x-kit-image-index": 0 }
+    },
+    required: ["result"],
+    additionalProperties: false
+  }
+})
+return edited.output.result
+```
+
+The root form is also supported: `output_schema: { "$ref": "kit://schemas/file/v1", "x-kit-image-index": 1 }` selects the second distinct image. Kit removes the annotation when expanding the local File schema. The model cannot supply or override the index or binding field. All occurrences—including unselected images—must pass validation and occurrence/byte/pixel budgets before selection. A requested index with no corresponding image fails explicitly, with no fallback. Only the selected image is imported and published; unselected images produce no File descriptors or diagnostic image updates. Kit does not strip signed metadata, compare images perceptually, or treat identical pixels with different PNG/JPEG bytes as duplicates.
+
+Without a file-aware schema, text-only results keep their existing behavior, including ordinary `output_schema` validation with string fallback. When native images accompany such a result, `output` is explicitly `{ value, files }`: `value` is the legacy text/JSON result and `files` contains imported File descriptors. Images are not hidden in diagnostic `updates`, and raw base64 is not included there. Returning `edited.output.files[0]` delivers that image; keeping it intermediate does not. All these tools remain callable only through compose, and final-return-only image delivery is unchanged.
+
 ## Make exact file changes with `edit`
 
 `edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from Kit's working directory. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.

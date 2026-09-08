@@ -64,6 +64,48 @@ pub(crate) struct FileStore {
     base: PathBuf,
 }
 
+/// Unique cleanup owner for a fresh inherited authority directory. It follows
+/// pending transcript creation into response publication; only commit retains it.
+pub(crate) struct InheritedAuthority {
+    path: Option<PathBuf>,
+    quarantine: PathBuf,
+    identity: fs::FileIdentity,
+    session: String,
+}
+
+impl InheritedAuthority {
+    pub(crate) fn is_for_session(&self, session: &str) -> bool {
+        self.session == session
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for InheritedAuthority {
+    fn drop(&mut self) {
+        let Some(path) = &self.path else { return };
+        let identity = |path: &Path| fs::Backend::identity(&fs::DiskBackend, path, false);
+        if identity(path).ok().flatten() != Some(self.identity) {
+            return;
+        }
+        // Detach before recursive removal. Verify again after the atomic move,
+        // so a replaced directory is never deleted, even across a pathname race.
+        if rename_no_replace(path, &self.quarantine).is_err() {
+            return;
+        }
+        if identity(&self.quarantine).ok().flatten() != Some(self.identity) {
+            let _ = rename_no_replace(&self.quarantine, path);
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.quarantine);
+        if let Some(parent) = path.parent() {
+            let _ = fs::sync_directory(parent);
+        }
+    }
+}
+
 impl FileStore {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
@@ -121,6 +163,185 @@ impl FileStore {
         self.publish(session, bytes, name, mime_type, image, cancellation)
     }
 
+    /// Imports actual native image bytes, never a URI or descriptor surrogate.
+    pub(crate) fn import_bytes(
+        &self,
+        session: &str,
+        name: &str,
+        mime_type: &str,
+        bytes: &[u8],
+        cancellation: Option<&TurnCancellation>,
+    ) -> Result<FileReference> {
+        check_cancelled(cancellation)?;
+        if !valid_name(name) || bytes.is_empty() || bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err("invalid image name or byte budget (1 byte to 8 MiB)".into());
+        }
+        let (actual_mime, dimensions) = inspect_image(bytes)?;
+        if mime_type != actual_mime {
+            return Err("declared image MIME type does not match its bytes".into());
+        }
+        self.publish(
+            session,
+            bytes.to_vec(),
+            name.into(),
+            actual_mime,
+            dimensions,
+            cancellation,
+        )
+    }
+
+    /// Resolves only the caller's authorized immutable snapshot for ACP input.
+    pub(crate) fn attachment_image(
+        &self,
+        session: &str,
+        reference: &FileReference,
+        cancellation: Option<&TurnCancellation>,
+    ) -> Result<Part> {
+        check_cancelled(cancellation)?;
+        let bytes = self.resolve(session, reference)?;
+        check_cancelled(cancellation)?;
+        Ok(Part::media(
+            Modality::Image,
+            reference.mime_type.clone(),
+            DataRef::InlineBytes(bytes),
+        ))
+    }
+
+    /// Explicit durable replication, preserving identity without global lookup.
+    /// Existing destinations must match metadata and payload; never clobber.
+    pub(crate) fn grant_to(
+        &self,
+        session: &str,
+        reference: &FileReference,
+        destination_store: &Self,
+        destination_session: &str,
+        cancellation: Option<&TurnCancellation>,
+    ) -> Result<FileReference> {
+        check_cancelled(cancellation)?;
+        let bytes = self.resolve(session, reference)?;
+        check_cancelled(cancellation)?;
+        let directory = destination_store.session_directory(destination_session);
+        let destination = directory.join(&reference.id);
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                // Existence only selects this branch; source and destination
+                // must both resolve with matching metadata, digest and bytes.
+                // Repair any outstanding directory durability after a prior
+                // publication attempt, without allocating a new disk object.
+                if destination_store.resolve(destination_session, reference)? != bytes {
+                    return Err("existing managed grant has conflicting bytes".into());
+                }
+                check_cancelled(cancellation)?;
+                fs::sync_directory(&directory).map_err(display)?;
+                fs::require_disk(&directory).map_err(display)?;
+                fs::sync_directory(&destination_store.base).map_err(display)?;
+                fs::require_disk(&destination).map_err(display)?;
+                check_cancelled(cancellation)?;
+                return Ok(reference.clone());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(display(error)),
+        }
+        fs::create_private_dir_all(&directory).map_err(display)?;
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(display)?;
+        let staging_session = format!("grant-{}", blake3::Hash::from_bytes(random).to_hex());
+        let staging_directory = destination_store.session_directory(&staging_session);
+        let staged = staging_directory.join(&reference.id);
+        let result = (|| {
+            destination_store.write_snapshot(
+                &staging_session,
+                reference.clone(),
+                &bytes,
+                cancellation,
+            )?;
+            check_cancelled(cancellation)?;
+            // Atomic exclusive rename preserves nlink == 1 throughout: readers
+            // and restart never observe a multiply linked published envelope.
+            match rename_no_replace(&staged, &destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(display(error)),
+            }
+            if destination_store.resolve(destination_session, reference)? != bytes {
+                return Err("existing managed grant has conflicting bytes".into());
+            }
+            fs::sync_directory(&staging_directory).map_err(display)?;
+            fs::require_disk(&staging_directory).map_err(display)?;
+            fs::sync_directory(&directory).map_err(display)?;
+            fs::require_disk(&directory).map_err(display)?;
+            fs::sync_directory(&destination_store.base).map_err(display)?;
+            fs::require_disk(&destination).map_err(display)?;
+            Ok(reference.clone())
+        })();
+        // A crash can leave unreachable staging bytes, never partial grants.
+        let _ = fs::remove_file(&staged);
+        let _ = std::fs::remove_dir(&staging_directory);
+        result
+    }
+
+    /// Prepare a fresh inherited set. The caller must retain its cleanup owner
+    /// until session/response publication. Commit is infallible and does no I/O;
+    /// rollback must happen outside shared writer/registry locks.
+    pub(crate) fn prepare_inheritance(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<Option<InheritedAuthority>> {
+        let target = self.session_directory(destination);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => return Err("fork destination already has managed file authority".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(display(error)),
+        }
+        let directory = self.session_directory(source);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(display(error)),
+        };
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(display)?;
+        let staging_session = format!("fork-{}", blake3::Hash::from_bytes(random).to_hex());
+        let staging_directory = self.session_directory(&staging_session);
+        fs::create_private_dir_all(&staging_directory).map_err(display)?;
+        let identity = fs::Backend::identity(&fs::DiskBackend, &staging_directory, false)
+            .map_err(display)?
+            .ok_or("inherited authority requires native directory identity")?;
+        let mut authority = InheritedAuthority {
+            path: Some(staging_directory.clone()),
+            quarantine: staging_directory.with_extension("rollback"),
+            identity,
+            session: destination.into(),
+        };
+        for entry in entries {
+            let entry = entry.map_err(display)?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or("invalid managed object filename")?;
+            let mut file = fs::open_beneath(&directory, Path::new(name)).map_err(display)?;
+            let mut prefix = [0_u8; 12];
+            file.read_exact(&mut prefix).map_err(display)?;
+            let length = u32::from_le_bytes(prefix[8..12].try_into().map_err(display)?) as usize;
+            if &prefix[..8] != MAGIC || length > MAX_HEADER_BYTES {
+                return Err("invalid inherited managed file envelope".into());
+            }
+            let mut header = vec![0; length];
+            file.read_exact(&mut header).map_err(display)?;
+            let header: Header = serde_json::from_slice(&header).map_err(display)?;
+            if header.file.id != name {
+                return Err("inherited file ID does not match its storage name".into());
+            }
+            self.grant_to(source, &header.file, self, &staging_session, None)?;
+        }
+        // The preflight is not authority: even an empty destination created
+        // concurrently must survive unchanged at the atomic commit boundary.
+        rename_no_replace(&staging_directory, &target).map_err(display)?;
+        authority.path = Some(target.clone());
+        fs::sync_directory(&self.base).map_err(display)?;
+        fs::require_disk(&target).map_err(display)?;
+        Ok(Some(authority))
+    }
+
     fn publish(
         &self,
         session: &str,
@@ -143,9 +364,20 @@ impl FileStore {
             size_bytes: bytes.len() as u64,
             image,
         };
+        self.write_snapshot(session, reference, &bytes, cancellation)
+    }
+
+    fn write_snapshot(
+        &self,
+        session: &str,
+        reference: FileReference,
+        bytes: &[u8],
+        cancellation: Option<&TurnCancellation>,
+    ) -> Result<FileReference> {
+        check_cancelled(cancellation)?;
         let header = serde_json::to_vec(&Header {
             file: reference.clone(),
-            digest: blake3::hash(&bytes).to_hex().to_string(),
+            digest: blake3::hash(bytes).to_hex().to_string(),
         })
         .map_err(display)?;
         if header.len() > MAX_HEADER_BYTES {
@@ -175,7 +407,7 @@ impl FileStore {
             .write_all(&(header.len() as u32).to_le_bytes())
             .map_err(display)?;
         output.write_all(&header).map_err(display)?;
-        output.write_all(&bytes).map_err(display)?;
+        output.write_all(bytes).map_err(display)?;
         output.sync_all().map_err(display)?;
         fs::require_disk(&destination).map_err(display)?;
         // Include newly created ancestor entries, not just the object contents.
@@ -187,7 +419,7 @@ impl FileStore {
         Ok(reference)
     }
 
-    fn resolve(&self, session: &str, selected: &FileReference) -> Result<Vec<u8>> {
+    pub(crate) fn resolve(&self, session: &str, selected: &FileReference) -> Result<Vec<u8>> {
         selected.validate()?;
         let directory = self.session_directory(session);
         // A reference must never resolve an import still retained only in the
@@ -285,13 +517,9 @@ impl FileStore {
         let mut parts = Vec::new();
         for (label, reference) in selected {
             check_cancelled(cancellation)?;
-            let data = self.resolve(session, &reference)?;
+            let image = self.attachment_image(session, &reference, cancellation)?;
             parts.push(Part::text(label));
-            parts.push(Part::media(
-                Modality::Image,
-                reference.mime_type,
-                DataRef::InlineBytes(data),
-            ));
+            parts.push(image);
         }
         check_cancelled(cancellation)?;
         Ok(parts)
@@ -299,7 +527,7 @@ impl FileStore {
 }
 
 impl FileReference {
-    fn from_value(value: &Value) -> Result<Self> {
+    pub(crate) fn from_value(value: &Value) -> Result<Self> {
         // Bound descriptor strings before deserialization copies them. A marker
         // does not make an arbitrarily large object a bounded File value.
         let object = value
@@ -408,6 +636,88 @@ impl Selection {
         }
         Ok(())
     }
+}
+
+/// Native exclusive rename for both files and directories. Staging and target
+/// are always in the same managed store. Never fall back to check-then-rename
+/// or hard links: those break no-clobber or secure single-link resolution.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())?;
+    // SAFETY: both pointers reference live NUL-terminated path strings. These
+    // calls do not retain pointers. Flags request an atomic no-replace rename.
+    let result = unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL)
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex(source: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if source.contains(&0) || destination.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    let source = [source, vec![0]].concat();
+    let destination = [destination, vec![0]].concat();
+    // SAFETY: live NUL-terminated UTF-16 paths; the call retains no pointers.
+    // Unlike std::fs::rename, flags 0 excludes MOVEFILE_REPLACE_EXISTING.
+    let result = unsafe { move_file_ex(source.as_ptr(), destination.as_ptr(), 0) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic exclusive managed-file rename is unavailable on this platform",
+    ))
+}
+
+/// Validate native provider bytes without publishing them or granting authority.
+pub(crate) fn validate_provider_image(bytes: &[u8]) -> Result<(String, u64)> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err("image must contain 1 byte to 8 MiB".into());
+    }
+    let (mime, dimensions) = inspect_image(bytes)?;
+    Ok((
+        mime,
+        u64::from(dimensions.width) * u64::from(dimensions.height),
+    ))
 }
 
 fn inspect_image(bytes: &[u8]) -> Result<(String, ImageDimensions)> {

@@ -558,3 +558,269 @@ fn fresh_process_resolve_child() {
 mod faults;
 
 mod operations;
+
+#[test]
+fn native_bytes_require_actual_image_and_matching_declared_mime() {
+    let f = Fixture::new();
+    let source = f.source("native.png", ImageFormat::Png, 3, 2);
+    let bytes = disk::read(source).unwrap();
+    for (mime, data) in [
+        ("image/jpeg", bytes.as_slice()),
+        ("image/png", b"fake"),
+        ("image/png", b""),
+    ] {
+        assert!(
+            f.store
+                .import_bytes("session", "native.png", mime, data, None)
+                .is_err()
+        );
+    }
+    let reference = f
+        .store
+        .import_bytes("session", "native.png", "image/png", &bytes, None)
+        .unwrap();
+    assert_eq!(f.store.resolve("session", &reference).unwrap(), bytes);
+    assert!(matches!(
+        f.store
+            .attachment_image("session", &reference, None)
+            .unwrap(),
+        Part::Media(_)
+    ));
+    assert!(f.store.attachment_image("other", &reference, None).is_err());
+    assert!(
+        f.store
+            .import_bytes(
+                "session",
+                "native.png",
+                "image/png",
+                &vec![0; MAX_FILE_BYTES as usize + 1],
+                None
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn grants_preserve_identity_survive_source_close_and_remain_isolated() {
+    let source = Fixture::new();
+    let destination = Fixture::new();
+    let reference = source.import("native.png");
+    let bytes = source.store.resolve("session", &reference).unwrap();
+    assert!(
+        source
+            .store
+            .grant_to("stranger", &reference, &destination.store, "parent", None)
+            .is_err()
+    );
+    let mut forged = reference.clone();
+    forged.name = "forged.png".into();
+    assert!(
+        source
+            .store
+            .grant_to("session", &forged, &destination.store, "parent", None)
+            .is_err()
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            source
+                .store
+                .grant_to("session", &reference, &destination.store, "parent", None)
+                .unwrap(),
+            reference
+        );
+    }
+    drop(source);
+    let reopened = FileStore {
+        base: destination.store.base.clone(),
+    };
+    assert_eq!(reopened.resolve("parent", &reference).unwrap(), bytes);
+    assert!(reopened.resolve("sibling", &reference).is_err());
+    reopened
+        .prepare_inheritance("parent", "fork")
+        .unwrap()
+        .unwrap()
+        .commit();
+    disk::remove_file(reopened.session_directory("parent").join(&reference.id)).unwrap();
+    assert_eq!(reopened.resolve("fork", &reference).unwrap(), bytes);
+    let later = reopened
+        .import_bytes("fork", "later.png", "image/png", &bytes, None)
+        .unwrap();
+    assert!(reopened.resolve("parent", &later).is_err());
+}
+
+#[test]
+fn grant_never_clobbers_corrupt_destination_or_accepts_missing_source() {
+    let f = Fixture::new();
+    let reference = f.import("native.png");
+    let destination = f.store.session_directory("parent");
+    disk::create_dir_all(&destination).unwrap();
+    let path = destination.join(&reference.id);
+    disk::write(&path, b"existing corrupt object").unwrap();
+    assert!(
+        f.store
+            .grant_to("session", &reference, &f.store, "parent", None)
+            .is_err()
+    );
+    assert_eq!(disk::read(&path).unwrap(), b"existing corrupt object");
+    disk::remove_file(f.object(&reference)).unwrap();
+    assert!(
+        f.store
+            .grant_to("session", &reference, &f.store, "new", None)
+            .is_err()
+    );
+    assert!(!f.store.session_directory("new").exists());
+}
+
+#[test]
+fn cancelled_grants_do_not_publish_authority() {
+    let f = Fixture::new();
+    let reference = f.import("image.png");
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = controller.handle().checkpoint();
+    controller.interrupt();
+    assert!(
+        f.store
+            .grant_to(
+                "session",
+                &reference,
+                &f.store,
+                "cancelled",
+                Some(&cancellation)
+            )
+            .is_err()
+    );
+    assert!(
+        f.store
+            .attachment_image("session", &reference, Some(&cancellation))
+            .is_err()
+    );
+    assert!(!f.store.session_directory("cancelled").exists());
+}
+
+#[test]
+fn failed_fork_does_not_publish_a_partial_authorized_set() {
+    let f = Fixture::new();
+    let reference = f.import("good.png");
+    let directory = f.store.session_directory("session");
+    disk::write(directory.join(format!("file_{}", "0".repeat(64))), b"bad").unwrap();
+    assert!(
+        f.store
+            .prepare_inheritance("session", "failed-fork")
+            .is_err()
+    );
+    assert!(!f.store.session_directory("failed-fork").exists());
+    assert!(f.store.resolve("failed-fork", &reference).is_err());
+    assert!(f.store.resolve("session", &reference).is_ok());
+}
+
+#[test]
+fn exclusive_rename_preserves_existing_files_and_empty_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let destination = dir.path().join("destination");
+    disk::write(&source, b"new").unwrap();
+    disk::write(&destination, b"existing").unwrap();
+    assert_eq!(
+        rename_no_replace(&source, &destination).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(disk::read(&destination).unwrap(), b"existing");
+    assert_eq!(disk::read(&source).unwrap(), b"new");
+    disk::remove_file(&destination).unwrap();
+    rename_no_replace(&source, &destination).unwrap();
+    assert!(!source.exists());
+    assert_eq!(disk::read(&destination).unwrap(), b"new");
+    let source = dir.path().join("source-dir");
+    let destination = dir.path().join("destination-dir");
+    disk::create_dir(&source).unwrap();
+    disk::create_dir(&destination).unwrap();
+    disk::write(source.join("private"), b"private").unwrap();
+    assert!(rename_no_replace(&source, &destination).is_err());
+    assert!(source.join("private").exists());
+    assert!(disk::read_dir(&destination).unwrap().next().is_none());
+}
+
+#[test]
+fn concurrent_grants_publish_single_link_resolvable_envelopes() {
+    let f = Fixture::new();
+    let reference = f.import("concurrent.png");
+    let expected = f.store.resolve("session", &reference).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                f.store
+                    .grant_to("session", &reference, &f.store, "parent", None)
+                    .unwrap();
+                for _ in 0..8 {
+                    assert_eq!(f.store.resolve("parent", &reference).unwrap(), expected);
+                }
+            });
+        }
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = f.store.session_directory("parent").join(&reference.id);
+        assert_eq!(disk::metadata(&path).unwrap().nlink(), 1);
+    }
+    assert_eq!(
+        disk::read_dir(f.store.session_directory("parent"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let reopened = FileStore {
+        base: f.store.base.clone(),
+    };
+    assert_eq!(reopened.resolve("parent", &reference).unwrap(), expected);
+}
+
+#[test]
+fn inherited_authority_owner_rolls_back_or_commits_without_touching_source() {
+    let f = Fixture::new();
+    let reference = f.import("owner.png");
+    let prepared = f
+        .store
+        .prepare_inheritance("session", "fork")
+        .unwrap()
+        .unwrap();
+    assert!(f.store.resolve("fork", &reference).is_ok());
+    drop(prepared);
+    assert!(!f.store.session_directory("fork").exists());
+    assert!(f.store.resolve("session", &reference).is_ok());
+    let prepared = f
+        .store
+        .prepare_inheritance("session", "fork")
+        .unwrap()
+        .unwrap();
+    prepared.commit();
+    let reopened = FileStore {
+        base: f.store.base.clone(),
+    };
+    assert!(reopened.resolve("fork", &reference).is_ok());
+    assert!(reopened.prepare_inheritance("session", "fork").is_err());
+    assert!(reopened.resolve("fork", &reference).is_ok());
+}
+
+#[test]
+fn inherited_authority_cleanup_does_not_delete_a_replacement_directory() {
+    let f = Fixture::new();
+    let reference = f.import("owner.png");
+    let prepared = f
+        .store
+        .prepare_inheritance("session", "fork")
+        .unwrap()
+        .unwrap();
+    let target = f.store.session_directory("fork");
+    let moved = target.with_extension("moved");
+    disk::rename(&target, &moved).unwrap();
+    disk::create_dir(&target).unwrap();
+    disk::write(target.join("replacement"), b"not owned").unwrap();
+    drop(prepared);
+    assert_eq!(
+        disk::read(target.join("replacement")).unwrap(),
+        b"not owned"
+    );
+    assert!(moved.join(&reference.id).exists());
+    assert!(f.store.resolve("session", &reference).is_ok());
+}

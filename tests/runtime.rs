@@ -379,14 +379,6 @@ return { output: child.output, updates: child.updates }"#,
             "updates": {
                 "items": [
                     {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {
-                            "type": "image",
-                            "data": "aGVsbG8=",
-                            "mimeType": "image/png"
-                        }
-                    },
-                    {
                         "sessionUpdate": "tool_call",
                         "toolCallId": "call-1",
                         "title": "Inspect files"

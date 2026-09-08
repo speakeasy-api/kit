@@ -1,3 +1,5 @@
+mod native_subagent;
+
 use super::*;
 use agentkit_core::{DataRef, Item, Modality, ToolResultPart};
 use agentkit_http::Authentication;
@@ -41,6 +43,18 @@ impl Fixture {
         // Reconstruct the runtime on every call to exercise restart-independent
         // storage rather than an in-memory resolver registry.
         let runtime = Runtime::new(self.root.path(), "gpt-5.4").unwrap();
+        self.execute_with_runtime(runtime, script, input, background, outcome)
+            .await
+    }
+
+    async fn execute_with_runtime(
+        &self,
+        runtime: Arc<Runtime>,
+        script: &str,
+        input: Value,
+        background: bool,
+        outcome: bool,
+    ) -> Result<ToolOutput, String> {
         let compose = runtime.compose(0);
         assert_eq!(compose.specs().len(), 1);
         assert_eq!(compose.specs()[0].name.0, "compose");

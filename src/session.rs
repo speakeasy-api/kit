@@ -116,6 +116,7 @@ struct CreatedTranscript {
     filesystem: Fs,
     path: Option<PathBuf>,
     cleanup: Option<Fs>,
+    inherited_authority: Option<crate::managed_files::InheritedAuthority>,
     keep: bool,
 }
 
@@ -131,7 +132,7 @@ impl PreparedCreation {
     /// Called only after response submission. Both steps are infallible and
     /// require no shared lock or callback; readers resume after cleanup is kept.
     pub(crate) fn commit(mut self) {
-        self.created.keep = true;
+        self.created.mark_kept();
         self.published.store(true, Ordering::Release);
     }
 }
@@ -148,12 +149,20 @@ impl CreatedTranscript {
             path,
             filesystem,
             cleanup,
+            inherited_authority: None,
             keep: false,
         }
     }
 
-    fn keep(mut self) {
+    fn mark_kept(&mut self) {
+        if let Some(authority) = self.inherited_authority.take() {
+            authority.commit();
+        }
         self.keep = true;
+    }
+
+    fn keep(mut self) {
+        self.mark_kept();
     }
 }
 
@@ -234,9 +243,15 @@ pub(crate) fn clone_completed_in(
         transcript,
         InitialTranscriptOptions {
             stamp_items: false,
-            commit_creation: true,
+            commit_creation: false,
         },
     )?;
+    if let Some(authority) =
+        crate::managed_files::FileStore::new(root).prepare_inheritance(source, destination)?
+    {
+        opened.observer.attach_inherited_authority(authority)?;
+    }
+    opened.observer.prepare_creation()?.commit();
     drop(opened);
     Ok(())
 }
@@ -598,6 +613,31 @@ fn finish_open(
 }
 
 impl SessionObserver {
+    /// Transfer private authority cleanup into the pending transcript owner.
+    /// Rejection drops the input only after the writer guard has been released.
+    pub(crate) fn attach_inherited_authority(
+        &self,
+        authority: crate::managed_files::InheritedAuthority,
+    ) -> Result<(), String> {
+        let mut writer = self
+            .0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?;
+        writer.check_ownership()?;
+        if !authority.is_for_session(&writer.session_id) {
+            return Err("inherited authority belongs to another session".into());
+        }
+        let created = writer
+            .created
+            .as_mut()
+            .ok_or("session creation is not available for inherited authority")?;
+        if created.inherited_authority.is_some() {
+            return Err("session creation already owns inherited authority".into());
+        }
+        created.inherited_authority = Some(authority);
+        Ok(())
+    }
+
     pub(crate) fn prepare_creation(&self) -> Result<PreparedCreation, String> {
         let published = Arc::new(AtomicBool::new(false));
         let mut writer = self
@@ -2502,6 +2542,55 @@ mod tests {
         let cloned = load(root.path(), "branch").unwrap();
         assert_eq!(cloned[0].created_at, None);
         assert_eq!(cloned[1].created_at, Some(Timestamp(77)));
+    }
+
+    #[test]
+    fn cloning_inherits_managed_files_without_later_branch_access() {
+        let root = tempfile::tempdir().unwrap();
+        let source_id = format!(
+            "files-source-{}",
+            blake3::hash(root.path().as_os_str().as_encoded_bytes()).to_hex()
+        );
+        let destination_id = format!(
+            "files-fork-{}",
+            blake3::hash(root.path().as_os_str().as_encoded_bytes()).to_hex()
+        );
+        let store = crate::managed_files::FileStore::new(&project_root(root.path()));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_luma8(2, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let reference = store
+            .import_bytes(&source_id, "fork.png", "image/png", bytes.get_ref(), None)
+            .unwrap();
+        let source = open(
+            root.path(),
+            &source_id,
+            false,
+            false,
+            vec![Item::text(
+                ItemKind::Assistant,
+                serde_json::to_string(&reference).unwrap(),
+            )],
+        )
+        .unwrap();
+        drop(source);
+        clone_completed(root.path(), &source_id, &destination_id).unwrap();
+        let reopened = crate::managed_files::FileStore::new(&project_root(root.path()));
+        assert_eq!(
+            reopened.resolve(&destination_id, &reference).unwrap(),
+            *bytes.get_ref()
+        );
+        let later = reopened
+            .import_bytes(&source_id, "later.png", "image/png", bytes.get_ref(), None)
+            .unwrap();
+        assert!(reopened.resolve(&destination_id, &later).is_err());
+        assert!(item_text(&load(root.path(), &destination_id).unwrap()[0]).contains("fork.png"));
+        let file_base = crate::artifacts::base(&project_root(root.path())).with_file_name("files");
+        for session in [&source_id, &destination_id] {
+            fs::remove_dir_all(file_base.join(blake3::hash(session.as_bytes()).to_hex().as_str()))
+                .unwrap();
+        }
     }
 
     #[test]
