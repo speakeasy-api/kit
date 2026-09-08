@@ -27,6 +27,52 @@ fn reds(image: &RgbaImage) -> Vec<u8> {
 }
 
 #[test]
+fn resize_preserves_transparent_edge_colors() {
+    let f = Fixture::new();
+    for fit in [Fit::Contain, Fit::Cover, Fit::Stretch] {
+        for invisible in [[0, 0, 0, 0], [255, 0, 0, 0]] {
+            let source = RgbaImage::from_fn(2, 2, |x, _| {
+                Rgba(if x == 0 {
+                    [255, 255, 255, 255]
+                } else {
+                    invisible
+                })
+            });
+            let file = import_pixels(&f, &source);
+            let (_, result) = transformed(
+                &f,
+                &file,
+                Transform::Resize {
+                    width: 1,
+                    height: 1,
+                    fit,
+                },
+            );
+            // Half the coverage, unchanged visible white. Transparent RGB must
+            // neither darken the edge nor bleed its invisible red into it.
+            assert_eq!(result.get_pixel(0, 0).0, [255, 255, 255, 128], "{fit:?}");
+        }
+        for (pixel, expected) in [
+            ([128, 64, 32, 1], [128, 64, 32, 1]),
+            ([255, 0, 255, 0], [0, 0, 0, 0]),
+        ] {
+            let source = RgbaImage::from_pixel(2, 2, Rgba(pixel));
+            let file = import_pixels(&f, &source);
+            let (_, result) = transformed(
+                &f,
+                &file,
+                Transform::Resize {
+                    width: 1,
+                    height: 1,
+                    fit,
+                },
+            );
+            assert_eq!(result.get_pixel(0, 0).0, expected, "{fit:?}");
+        }
+    }
+}
+
+#[test]
 fn clockwise_rotations_publish_new_immutable_authorized_pngs() {
     let f = Fixture::new();
     let file = import_pixels(&f, &pixels(3, 2));

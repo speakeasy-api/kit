@@ -3,8 +3,10 @@
 //! compressed PNG metadata is rejected before decoder construction because its
 //! expansion is not covered by pixel limits. Other metadata is bounded by the
 //! 8 MiB input. RGBA conversion/orientation hold at most two 64 MiB pixel buffers.
-//! Resize holds source + destination + the RGBA32F vertical intermediate, plus
-//! a small weight vector. The intermediate has a separate 128 MiB ceiling.
+//! Resize converts to premultiplied RGBA32F, holding float source + destination
+//! and the RGBA32F vertical intermediate and a small weight vector. Conversion
+//! peaks at 20 bytes/pixel (RGBA8 + RGBA32F). The intermediate has a separate
+//! 128 MiB ceiling; the float source is dropped before output conversion.
 //! PNG's level compressor buffers the entire compressed stream before writing;
 //! allow twice the raw scanline size for its Vec capacity, plus 8 MiB capped
 //! output and 8 MiB codec/row overhead. These are live-work estimates, not RSS
@@ -263,15 +265,59 @@ fn geometry(
                 }
             };
             let scratch = u64::from(source.width()) * u64::from(height) * 16;
-            let live = source.as_raw().len() as u64
-                + u64::from(width) * u64::from(height) * 4
-                + scratch
-                + CODEC_HEADROOM;
-            if scratch > MAX_SCRATCH_BYTES || live > MAX_LIVE_BYTES {
+            // Every dimension is already bounded by 8192, so these u64
+            // products cannot overflow. Include both float conversion peaks
+            // and all simultaneously live resize buffers before allocating.
+            let source_pixels = u64::from(source.width()) * u64::from(source.height());
+            let target_pixels = u64::from(width) * u64::from(height);
+            let live = (source_pixels + target_pixels) * 16 + scratch + CODEC_HEADROOM;
+            if scratch > MAX_SCRATCH_BYTES
+                || live > MAX_LIVE_BYTES
+                || source_pixels * 20 + CODEC_HEADROOM > MAX_LIVE_BYTES
+                || target_pixels * 20 + CODEC_HEADROOM > MAX_LIVE_BYTES
+            {
                 return Err("resize exceeds scratch or live pixel work budget".into());
             }
             check_cancelled(cancellation)?;
-            imageops::resize(&source, width, height, imageops::FilterType::Triangle)
+            let mut source = DynamicImage::ImageRgba8(source).into_rgba32f();
+            for row in source.rows_mut() {
+                check_cancelled(cancellation)?;
+                for pixel in row {
+                    let alpha = pixel[3];
+                    for channel in &mut pixel.0[..3] {
+                        *channel *= alpha;
+                    }
+                }
+            }
+            check_cancelled(cancellation)?;
+            let mut resized =
+                imageops::resize(&source, width, height, imageops::FilterType::Triangle);
+            drop(source);
+            check_cancelled(cancellation)?;
+            for row in resized.rows_mut() {
+                check_cancelled(cancellation)?;
+                for pixel in row {
+                    let alpha = pixel[3];
+                    for channel in &mut pixel.0[..3] {
+                        *channel = if alpha > 0.0 {
+                            (*channel / alpha).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+            }
+            check_cancelled(cancellation)?;
+            let mut result = DynamicImage::ImageRgba32F(resized).into_rgba8();
+            for row in result.rows_mut() {
+                check_cancelled(cancellation)?;
+                for pixel in row {
+                    if pixel[3] == 0 {
+                        pixel.0[..3].fill(0);
+                    }
+                }
+            }
+            result
         }
     };
     check_cancelled(cancellation)?;

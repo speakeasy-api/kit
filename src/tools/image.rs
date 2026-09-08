@@ -97,7 +97,7 @@ impl ImageTool {
             root,
             Operation::Resize,
             "image_resize",
-            "Resize with Triangle filtering; upscaling is allowed. contain fits within the width/height box, flooring the shortened dimension (zero fails), without padding. cover center-crops to the integer-rounded target aspect ratio then resizes exactly, permitting rounding distortion. stretch resizes exactly without preserving aspect ratio.",
+            "Resize with premultiplied-alpha Triangle filtering in encoded color space; upscaling is allowed. contain fits within the width/height box, flooring the shortened dimension (zero fails), without padding. cover center-crops to the integer-rounded target aspect ratio then resizes exactly, permitting rounding distortion. stretch resizes exactly without preserving aspect ratio.",
             object_schema([
                 ("image", file_schema()),
                 ("width", positive_integer(8192)),
