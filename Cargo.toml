@@ -24,7 +24,7 @@ agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.8"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
-agentkit-tool-compose = { version = "=0.10.10", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.11", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
 async-trait = "=0.1.92"
@@ -90,7 +90,6 @@ tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-tool-compose = { git = "https://github.com/danielkov/agentkit.git", rev = "5ad130c94f1645edb4630d277aab25f91e06439c" }
 agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "8e4ee26434a3f847e3613da5bb073ae63a262243" }
 agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "8e4ee26434a3f847e3613da5bb073ae63a262243" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }

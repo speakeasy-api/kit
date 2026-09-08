@@ -342,8 +342,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.10"
-source = "git+https://github.com/danielkov/agentkit.git?rev=5ad130c94f1645edb4630d277aab25f91e06439c#5ad130c94f1645edb4630d277aab25f91e06439c"
+version = "0.10.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bd493e7dd9ed206d203ec37c4ff5c65bb97e5a77b5f0f385a366d5e75064c0c"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
