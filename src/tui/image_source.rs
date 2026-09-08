@@ -111,7 +111,7 @@ pub(super) async fn resolve(
         return Err("invalid image URL".into());
     }
     let bytes = if Path::new(source).is_absolute() {
-        local(PathBuf::from(source), permit.clone()).await?
+        local(native_path(source)?, permit.clone()).await?
     } else if let Ok(url) = Url::parse(source) {
         match url.scheme() {
             "https" => {
@@ -142,7 +142,7 @@ pub(super) async fn resolve(
             _ => return Err("unsupported image source".into()),
         }
     } else {
-        local(root.join(source), permit.clone()).await?
+        local(root.join(native_path(source)?), permit.clone()).await?
     };
     // Sniff only; all origins share the runtime's single bounded decoder.
     let format = image::guess_format(&bytes).map_err(|_| "invalid image format".to_owned())?;
@@ -158,7 +158,45 @@ pub(super) async fn resolve(
     Ok((bytes, format.to_mime_type().to_owned()))
 }
 
+// Markdown destinations retain URL escapes. Decode only native destinations;
+// Url::to_file_path already decodes file URLs. The caller caps input at 4096 bytes.
+fn native_path(source: &str) -> Result<PathBuf> {
+    let mut decoded = Vec::with_capacity(source.len());
+    let mut bytes = source.bytes();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            let low = bytes.next().and_then(|b| char::from(b).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => (high * 16 + low) as u8,
+                _ => return Err("invalid local image path".into()),
+            }
+        } else {
+            byte
+        });
+    }
+    // Reject malformed UTF-8 rather than opening a lossy replacement filename.
+    let decoded = String::from_utf8(decoded).map_err(|_| "invalid local image path".to_owned())?;
+    let path = PathBuf::from(decoded);
+    validate_local_path(&path)?;
+    Ok(path)
+}
+
+fn validate_local_path(path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // Check after decoding as well as before it, including mixed separators.
+    // Do not reinterpret native paths as URLs or change their OS path semantics.
+    if bytes.contains(&0) {
+        return Err("invalid local image path".into());
+    }
+    if bytes.len() >= 2 && matches!(bytes[0], b'/' | b'\\') && matches!(bytes[1], b'/' | b'\\') {
+        return Err("invalid image source".into());
+    }
+    Ok(())
+}
+
 async fn local(path: PathBuf, permit: SourcePermit) -> Result<Vec<u8>> {
+    validate_local_path(&path)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut options = std::fs::OpenOptions::new();
@@ -555,6 +593,117 @@ mod tests {
             .unwrap_err()
                 == "image origin not allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn native_markdown_destinations_decode_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("screenshots")).unwrap();
+        let policy = ImagePolicy::default();
+        let fixtures = [
+            ("run%201.png", "run 1.png"),
+            ("run%25201.png", "run%201.png"),
+            ("literal%25.png", "literal%.png"),
+            ("caf%C3%A9.png", "café.png"),
+        ];
+        // Distinct valid images prove we open the decoded file, not a literal
+        // %20 filename or a twice-decoded space filename that also exists.
+        for (index, (_, filename)) in fixtures.iter().enumerate() {
+            let mut bytes = png();
+            bytes.push(index as u8);
+            std::fs::write(dir.path().join("screenshots").join(filename), bytes).unwrap();
+        }
+        for (index, (destination, filename)) in fixtures.iter().enumerate() {
+            let mut expected = png();
+            expected.push(index as u8);
+            let relative = format!("screenshots/{destination}");
+            let absolute = format!(
+                "{}/{relative}",
+                dir.path()
+                    .to_str()
+                    .unwrap()
+                    .replace('%', "%25")
+                    .replace(' ', "%20")
+            );
+            let file_url = Url::from_file_path(dir.path().join("screenshots").join(filename))
+                .unwrap()
+                .to_string();
+            for source in [relative, absolute, file_url] {
+                assert_eq!(
+                    resolve(&source, dir.path(), "s", &policy).await.unwrap(),
+                    (expected.clone(), "image/png".into()),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_native_escapes_fail_without_lossy_or_literal_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ImagePolicy::default();
+        for filename in [
+            "bad%.png",
+            "bad%2.png",
+            "bad%GG.png",
+            "bad%FF.png",
+            "bad%C3%28.png",
+            "bad%00.png",
+        ] {
+            std::fs::write(dir.path().join(filename), png()).unwrap();
+            for source in [
+                filename.to_owned(),
+                dir.path().join(filename).to_str().unwrap().to_owned(),
+            ] {
+                assert_eq!(
+                    resolve(&source, dir.path(), "s", &policy)
+                        .await
+                        .unwrap_err(),
+                    "invalid local image path",
+                    "{source}"
+                );
+            }
+        }
+        std::fs::write(dir.path().join("bad�.png"), png()).unwrap();
+        assert_eq!(
+            resolve("bad%EF%BF.png", dir.path(), "s", &policy)
+                .await
+                .unwrap_err(),
+            "invalid local image path"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_local_destinations_cannot_introduce_unc_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = ImagePolicy::default();
+        for source in [
+            "%2f%2fserver/share/image.png",
+            "/%2Fserver/share/image.png",
+            "%5c%5cserver%5cshare%5cimage.png",
+            "%2f%5cserver/share/image.png",
+            "%5c%2fserver/share/image.png",
+            "file:///%2Fserver/share/image.png",
+            "file://localhost/%2Fserver/share/image.png",
+        ] {
+            let error = resolve(source, dir.path(), "s", &policy).await.unwrap_err();
+            assert!(
+                matches!(
+                    error.as_str(),
+                    "invalid image source" | "invalid local image path"
+                ),
+                "{source}: {error}"
+            );
+        }
+        for source in [
+            "file://%73erver/share/image.png",
+            "file://%31%32%37.0.0.1/image.png",
+        ] {
+            assert_eq!(
+                resolve(source, dir.path(), "s", &policy).await.unwrap_err(),
+                "invalid local image URL"
+            );
+        }
     }
 
     #[tokio::test]

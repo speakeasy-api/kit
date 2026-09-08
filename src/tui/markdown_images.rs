@@ -106,21 +106,62 @@ impl MarkdownImages {
             if done.generation != self.generation {
                 continue;
             }
-            let Some(entry) = self.entries.get_mut(&done.source) else {
+            if !self.entries.contains_key(&done.source) {
                 continue;
-            };
-            entry.state = match done.image {
-                Ok(image) if self.retained.saturating_add(image.data.len()) <= MAX_SOURCE_BYTES => {
-                    self.retained += image.data.len();
-                    self.changed_sources.insert(done.source);
-                    State::Ready(image)
+            }
+            let state = match done.image {
+                Ok(image) => {
+                    let bytes = image.data.len();
+                    // Reclaim snapshots, never active acquisitions. An image that
+                    // cannot fit stays retryable instead of caching capacity as
+                    // an intrinsic source failure.
+                    if bytes <= MAX_SOURCE_BYTES {
+                        while self.retained.saturating_add(bytes) > MAX_SOURCE_BYTES {
+                            if !self.evict_oldest(true) {
+                                break;
+                            }
+                        }
+                    }
+                    if self.retained.saturating_add(bytes) <= MAX_SOURCE_BYTES {
+                        self.retained += bytes;
+                        self.changed_sources.insert(done.source.clone());
+                        State::Ready(image)
+                    } else {
+                        State::Waiting
+                    }
                 }
-                Ok(_) => State::Failed("image source budget exceeded".into()),
                 Err(error) => State::Failed(error),
             };
+            if let Some(entry) = self.entries.get_mut(&done.source) {
+                entry.state = state;
+            }
             changed = true;
         }
         changed
+    }
+
+    /// Byte pressure reclaims only ready snapshots; entry pressure can also
+    /// reclaim idle placeholders and failures. Neither may remove active jobs.
+    fn evict_oldest(&mut self, ready_only: bool) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.state, State::Ready(_))
+                    || (!ready_only && !matches!(entry.state, State::Loading(_)))
+            })
+            .min_by_key(|(_, entry)| entry.used)
+            .map(|(source, _)| source.clone());
+        let Some(oldest) = oldest else { return false };
+        if let Some(Entry {
+            state: State::Ready(image),
+            ..
+        }) = self.entries.remove(&oldest)
+        {
+            self.retained = self.retained.saturating_sub(image.data.len());
+            self.changed_sources.insert(oldest);
+        }
+        true
     }
 
     pub fn request(&mut self, source: &str) {
@@ -129,22 +170,8 @@ impl MarkdownImages {
         }
         self.clock = self.clock.wrapping_add(1);
         if !self.entries.contains_key(source) {
-            if self.entries.len() == MAX_ENTRIES {
-                let oldest = self
-                    .entries
-                    .iter()
-                    .filter(|(_, entry)| !matches!(entry.state, State::Loading(_)))
-                    .min_by_key(|(_, entry)| entry.used)
-                    .map(|(source, _)| source.clone());
-                let Some(oldest) = oldest else { return };
-                if let Some(Entry {
-                    state: State::Ready(image),
-                    ..
-                }) = self.entries.remove(&oldest)
-                {
-                    self.retained = self.retained.saturating_sub(image.data.len());
-                    self.changed_sources.insert(oldest);
-                }
+            if self.entries.len() == MAX_ENTRIES && !self.evict_oldest(false) {
+                return;
             }
             self.entries.insert(
                 source.to_owned(),
@@ -266,6 +293,113 @@ mod tests {
         images.request("image.png");
         settle(&mut images).await;
         assert!(images.image("image.png").is_some());
+    }
+
+    #[tokio::test]
+    async fn source_byte_pressure_evicts_lru_and_revisited_images_recover() {
+        use image::{
+            ImageEncoder as _,
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let sources = ["first.png", "second.png", "third.png", "fourth.png"];
+        for (index, source) in sources.iter().enumerate() {
+            // Real, individually valid ~7 MiB PNGs, with distinct pixel content.
+            let pixels = vec![index as u8; 1792 * 1366 * 3];
+            let mut bytes = Vec::new();
+            PngEncoder::new_with_quality(
+                &mut bytes,
+                CompressionType::Level(0),
+                FilterType::NoFilter,
+            )
+            .write_image(&pixels, 1792, 1366, image::ExtendedColorType::Rgb8)
+            .unwrap();
+            assert!((7 * 1024 * 1024..8 * 1024 * 1024).contains(&bytes.len()));
+            std::fs::write(root.path().join(source), bytes).unwrap();
+        }
+        let mut images = MarkdownImages::new();
+        images.context(root.path(), Some("session"));
+        let mut encoded_bytes = 0;
+        for source in &sources[..3] {
+            images.request(source);
+            settle(&mut images).await;
+            encoded_bytes += images.image(source).unwrap().data.len();
+            assert_eq!(images.retained, encoded_bytes);
+            assert!(images.retained <= MAX_SOURCE_BYTES);
+            assert_eq!(
+                images.take_changed_sources(),
+                HashSet::from([source.to_string()])
+            );
+        }
+
+        // Visiting the first again makes the second the least recently used.
+        images.request(sources[0]);
+        images.request(sources[3]);
+        settle(&mut images).await;
+        assert!(images.image(sources[3]).is_some());
+        assert!(images.image(sources[0]).is_some());
+        assert!(images.image(sources[1]).is_none());
+        assert!(images.image(sources[2]).is_some());
+        assert_eq!(
+            images.take_changed_sources(),
+            HashSet::from([sources[1].to_owned(), sources[3].to_owned()])
+        );
+        assert_eq!(
+            images.retained,
+            sources
+                .iter()
+                .filter_map(|source| images.image(source))
+                .map(|image| image.data.len())
+                .sum::<usize>()
+        );
+        assert!(images.retained <= MAX_SOURCE_BYTES);
+
+        // Scroll back without clearing the cache: reacquire the evicted source
+        // and invalidate both the newly ready and newly evicted source layouts.
+        images.request(sources[1]);
+        settle(&mut images).await;
+        assert!(images.image(sources[1]).is_some());
+        assert!(images.image(sources[2]).is_none());
+        assert_eq!(
+            images.take_changed_sources(),
+            HashSet::from([sources[1].to_owned(), sources[2].to_owned()])
+        );
+        assert_eq!(
+            images.retained,
+            sources
+                .iter()
+                .filter_map(|source| images.image(source))
+                .map(|image| image.data.len())
+                .sum::<usize>()
+        );
+        assert!(images.retained <= MAX_SOURCE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn entry_pressure_preserves_active_acquisitions() {
+        let root = tempfile::tempdir().unwrap();
+        write_png(root.path(), "first.png");
+        write_png(root.path(), "second.png");
+        let mut images = MarkdownImages::new();
+        images.context(root.path(), Some("session"));
+        images.request("first.png");
+        images.request("second.png");
+        // Without polling, these entries remain Loading even if a worker has
+        // finished. Fill the remaining entry slots, then request one more.
+        for index in 0..MAX_ENTRIES - 1 {
+            images.request(&format!("waiting-{index}.png"));
+        }
+        assert_eq!(images.entries.len(), MAX_ENTRIES);
+        assert!(!images.entries.contains_key("waiting-0.png"));
+        assert!(images.take_changed_sources().is_empty());
+        settle(&mut images).await;
+        assert!(images.image("first.png").is_some());
+        assert!(images.image("second.png").is_some());
+        assert_eq!(
+            images.take_changed_sources(),
+            HashSet::from(["first.png".to_owned(), "second.png".to_owned(),])
+        );
     }
 
     #[tokio::test]
