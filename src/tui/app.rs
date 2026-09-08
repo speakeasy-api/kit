@@ -1935,19 +1935,26 @@ impl App {
         // Check expiry before any frame can refresh the lease or revive a
         // lifecycle map. Loss applies to all runtime events, not only progress.
         self.progress_activity();
+        if let RuntimeEvent::RunletTransport { available } = event {
+            if available {
+                if self.progress_unavailable {
+                    // A heartbeat restores transport, not the observations lost
+                    // during the gap. Keep cleared state and progress tombstones.
+                    self.note("Runtime status resumed; earlier agent, child, compaction and storage state remains unknown");
+                }
+                self.progress_unavailable = false;
+                self.progress_last_frame = Some(Instant::now());
+            } else {
+                self.disable_runtime();
+            }
+            return;
+        }
         if self.runtime_unavailable() {
             return;
         }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
-            RuntimeEvent::RunletTransport { available } => {
-                if available {
-                    self.progress_activity();
-                } else {
-                    self.disable_runtime();
-                }
-                return;
-            }
+            RuntimeEvent::RunletTransport { .. } => unreachable!(),
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
@@ -6531,6 +6538,37 @@ mod tests {
         assert_eq!(app.agent_counts().total, 0);
         assert!(!app.storage_pending && !app.storage_exhausted);
         assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
+    fn healthy_heartbeat_expires_old_state_before_renewing_lease() {
+        let mut app = app();
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert!(!app.runtime_unavailable());
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(app.needs_redraw_tick());
+        assert!(
+            matches!(app.blocks.last(), Some(Block::Notice(text)) if text.contains("state remains unknown"))
+        );
+
+        let blocks = app.blocks.len();
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert_eq!(app.blocks.len(), blocks);
+        app.tick();
+        assert!(!app.runtime_unavailable());
+
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.tick();
+        assert!(app.runtime_unavailable());
     }
 
     #[test]

@@ -855,7 +855,7 @@ fn authoritative_progress_conflicting_duplicates_fail_neutral() {
 }
 
 #[test]
-fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
+fn authoritative_progress_recovery_preserves_old_incarnation_tombstones() {
     for explicit in [true, false] {
         let mut app = sample();
         progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
@@ -880,6 +880,15 @@ fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
         }
         assert!(!render(&mut app, 140, 50).contains("# call @"));
         progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+        assert!(!app.runtime_unavailable());
+        progress_start(&mut app, SCRIPT, 1, false);
+        progress_step(
+            &mut app,
+            1,
+            1,
+            progress_node("a", ProgressState::Succeeded, true),
+        );
+        assert!(!render(&mut app, 140, 50).contains("# call @"));
         progress_start(&mut app, SCRIPT, 2, false);
         progress_step(
             &mut app,
@@ -887,7 +896,7 @@ fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
             1,
             progress_node("b", ProgressState::Succeeded, true),
         );
-        assert!(!render(&mut app, 140, 50).contains("# call @"));
+        assert!(render(&mut app, 140, 50).contains("# call @"));
     }
 }
 
@@ -1066,8 +1075,7 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
                 compacted: true,
                 millis: 2,
             },
-            RuntimeEvent::RunletTransport { available: true },
-            agent,
+            agent.clone(),
         ] {
             progress_wire(&mut app, event);
         }
@@ -1086,5 +1094,30 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
         assert!(!frame.contains("working child"));
         assert!(!frame.contains("compacting context"));
         assert!(!frame.contains("context compacted"));
+
+        progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted && !app.compacting);
+        let frame = render(&mut app, 140, 50);
+        assert!(!frame.contains("Runtime status unavailable"));
+        assert!(frame.contains("Runtime status resumed"));
+        assert!(frame.contains("state remains unknown"));
+        assert!(!frame.contains("Child worker"));
+        assert!(!frame.contains("working child"));
+
+        // Fresh observations are accepted without reviving cleared state.
+        progress_wire(&mut app, agent);
+        progress_wire(
+            &mut app,
+            RuntimeEvent::StorageStatus { pending: true, exhausted: false },
+        );
+        assert_eq!(app.agent_counts().working, 1);
+        assert!(app.storage_pending);
+        assert!(app.needs_redraw_tick());
+        app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending);
     }
 }
