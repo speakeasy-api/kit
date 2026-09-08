@@ -1825,7 +1825,9 @@ impl App {
                 _ => {}
             },
             Update::ProcessExited(error) => {
-                self.disable_progress();
+                // Confirmed process exit can retire known roster rows. A mere
+                // diagnostic gap cannot claim those terminal outcomes.
+                self.invalidate_runtime_status();
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
@@ -1836,17 +1838,38 @@ impl App {
         }
     }
 
-    fn disable_progress(&mut self) {
+    fn disable_runtime(&mut self) {
+        self.agents.clear();
+        self.invalidate_runtime_status();
+    }
+
+    fn invalidate_runtime_status(&mut self) {
         if self.progress_unavailable {
             return;
         }
         self.progress_unavailable = true;
+        // All these fields depend on the same lossy side channel. Absence is
+        // unknown, not idle/success/healthy; the UI exposes unavailability.
+        self.agent_versions.clear();
+        self.cleaned_agent_ids.clear();
+        self.cleaned_agent_ancestors.clear();
+        self.agents_scroll = 0;
+        self.runtime_session_id = None;
+        self.compacting = false;
+        self.storage_pending = false;
+        self.storage_exhausted = false;
         for index in 0..self.blocks.len() {
             if let Block::Tool(call) = &mut self.blocks[index] {
                 call.progress.invalidate();
+                call.children.clear();
             }
             self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
         }
+    }
+
+    pub(super) fn runtime_unavailable(&self) -> bool {
+        self.progress_unavailable
     }
 
     /// Monotonic transport deadline, also checked before accepting new traffic.
@@ -1856,7 +1879,7 @@ impl App {
                 now.saturating_duration_since(last) >= crate::runlet_progress::transport::LEASE
             })
         {
-            self.disable_progress();
+            self.disable_runtime();
         }
     }
     fn progress_activity(&mut self) {
@@ -1872,8 +1895,11 @@ impl App {
     }
 
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-        if matches!(event, RuntimeEvent::RunletProgress { .. }) {
-            self.progress_activity();
+        // Check expiry before any frame can refresh the lease or revive a
+        // lifecycle map. Loss applies to all runtime events, not only progress.
+        self.progress_activity();
+        if self.runtime_unavailable() {
+            return;
         }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
@@ -1881,7 +1907,7 @@ impl App {
                 if available {
                     self.progress_activity();
                 } else {
-                    self.disable_progress();
+                    self.disable_runtime();
                 }
                 return;
             }

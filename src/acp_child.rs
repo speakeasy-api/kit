@@ -900,8 +900,15 @@ async fn run(
             &label,
             ancestor_id.as_deref(),
             |output| match output {
-                ForwardedStderr::RuntimeLine(line) | ForwardedStderr::Diagnostic(line) => {
-                    eprintln!("{line}");
+                ForwardedStderr::RuntimeLine(line) => {
+                    if let Some(transport) = crate::runlet_progress::transport::global() {
+                        transport.publish_runtime_line(&line);
+                    }
+                }
+                ForwardedStderr::Diagnostic(line) => {
+                    if let Some(transport) = crate::runlet_progress::transport::global() {
+                        transport.publish_line(&line);
+                    }
                 }
                 ForwardedStderr::Cleanup(event) => crate::events::emit(&event),
             },
@@ -1258,20 +1265,71 @@ async fn forward_stderr(
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(event) = crate::events::parse(&line)
-            && event.forward_from_child()
-        {
-            if let crate::events::RuntimeEvent::SubagentStateChanged {
-                parent_id: Some(parent_id),
-                ..
-            } = event
-            {
-                ancestors.insert(parent_id);
+    let mut deadline = None;
+    let mut unavailable = false;
+    loop {
+        // A nested Kit transport has its own lease. The parent's healthy
+        // heartbeat cannot certify a stalled or failed descendant publisher.
+        let next = if let Some(expires) = deadline {
+            if tokio::time::Instant::now() >= expires {
+                Err(())
+            } else {
+                tokio::time::timeout_at(expires, lines.next_line())
+                    .await
+                    .map_err(|_| ())
             }
-            // Preserve recursively forwarded private runtime events byte-for-byte.
-            output(ForwardedStderr::RuntimeLine(line));
-        } else if let Some(line) = harness_diagnostic(label, &line) {
+        } else {
+            Ok(lines.next_line().await)
+        };
+        let line = match next {
+            Ok(Ok(Some(line))) => line,
+            Ok(_) => break,
+            Err(()) => {
+                unavailable = true;
+                deadline = None;
+                output(ForwardedStderr::Cleanup(
+                    crate::events::RuntimeEvent::RunletTransport { available: false },
+                ));
+                continue;
+            }
+        };
+        if let Some(event) = crate::events::parse(&line) {
+            if unavailable {
+                continue;
+            }
+            match event {
+                crate::events::RuntimeEvent::RunletTransport { available: true } => {
+                    deadline = Some(
+                        tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE,
+                    );
+                    continue;
+                }
+                crate::events::RuntimeEvent::RunletTransport { available: false } => {
+                    unavailable = true;
+                    deadline = None;
+                    output(ForwardedStderr::RuntimeLine(line));
+                    continue;
+                }
+                _ => {}
+            }
+            if deadline.is_some() {
+                deadline =
+                    Some(tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+            }
+            if event.forward_from_child() {
+                if let crate::events::RuntimeEvent::SubagentStateChanged {
+                    parent_id: Some(parent_id),
+                    ..
+                } = event
+                {
+                    ancestors.insert(parent_id);
+                }
+                // Preserve recursively forwarded private events byte-for-byte.
+                output(ForwardedStderr::RuntimeLine(line));
+                continue;
+            }
+        }
+        if let Some(line) = harness_diagnostic(label, &line) {
             output(ForwardedStderr::Diagnostic(line));
         }
     }
@@ -1408,6 +1466,27 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn close_with_stalled_stderr() {
+        if !crate::events::test_support::with_stalled_stderr(
+            "acp_child::tests::close_with_stalled_stderr",
+        ) {
+            return;
+        }
+        let (mut session, mut requests) = admission_test_session();
+        session.descendant_parent = Some("ancestor".into());
+        session.capabilities.session_capabilities.close = Some(Default::default());
+        let actor = async {
+            let Some(Request::Close(close)) = requests.recv().await else {
+                panic!("expected actual child close request");
+            };
+            assert_eq!(close.session_id.to_string(), "test");
+            close.reply.send(Ok(())).unwrap();
+        };
+        let (result, ()) = tokio::join!(session.close(), actor);
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -2672,6 +2751,71 @@ mod tests {
 
     mod forwards_subagent_events {
         use super::*;
+
+        #[tokio::test(start_paused = true)]
+        async fn nested_transport_loss_preserves_diagnostics_not_stale_lifecycle() {
+            use crate::events::{EVENT_MARKER, RuntimeEvent};
+            use tokio::io::AsyncWriteExt;
+            for explicit in [false, true] {
+                let (mut writer, reader) = tokio::io::duplex(4096);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let forward = tokio::spawn(async move {
+                    forward_stderr(reader, "acp.kit", None, |item| {
+                        tx.send(item).unwrap();
+                    })
+                    .await;
+                });
+                let heartbeat = format!(
+                    "{EVENT_MARKER}{}\n",
+                    serde_json::to_string(&RuntimeEvent::RunletTransport { available: true })
+                        .unwrap()
+                );
+                let started = RuntimeEvent::ChildStarted {
+                    call: "parent:compose:0".into(),
+                    tool: "shell".into(),
+                    summary: "working".into(),
+                    at: 1,
+                };
+                let start = format!(
+                    "{EVENT_MARKER}{}\n",
+                    serde_json::to_string(&started).unwrap()
+                );
+                writer
+                    .write_all(format!("{heartbeat}{start}").as_bytes())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    rx.recv().await.unwrap(),
+                    ForwardedStderr::RuntimeLine(_)
+                ));
+                if explicit {
+                    let reset = format!(
+                        "{EVENT_MARKER}{}\n",
+                        serde_json::to_string(&RuntimeEvent::RunletTransport { available: false })
+                            .unwrap()
+                    );
+                    writer.write_all(reset.as_bytes()).await.unwrap();
+                } else {
+                    tokio::time::advance(crate::runlet_progress::transport::LEASE).await;
+                }
+                let reset = match rx.recv().await.unwrap() {
+                    ForwardedStderr::RuntimeLine(line) => crate::events::parse(&line).unwrap(),
+                    ForwardedStderr::Cleanup(event) => event,
+                    _ => panic!("expected nested invalidation"),
+                };
+                assert_eq!(reset, RuntimeEvent::RunletTransport { available: false });
+                writer
+                    .write_all(format!("{heartbeat}{start}later child error\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(rx.recv().await.unwrap(), ForwardedStderr::Diagnostic(line) if line.contains("later child error"))
+                );
+                drop(writer);
+                forward.await.unwrap();
+                assert!(rx.try_recv().is_err());
+            }
+        }
 
         #[tokio::test]
         async fn preserves_nested_roster_event_lines_exactly() {

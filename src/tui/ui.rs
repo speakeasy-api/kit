@@ -131,9 +131,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     }
     // Durability stays visible on the start screen and over session pickers.
     // Pending data belongs to the process, not the currently selected session.
-    if app.storage_pending || app.storage_exhausted {
+    if app.runtime_unavailable() || app.storage_pending || app.storage_exhausted {
         let area = frame.area();
-        let warning = if app.storage_exhausted {
+        let warning = if app.runtime_unavailable() {
+            " Runtime status unavailable: agent, child, compaction and storage state unknown"
+        } else if app.storage_exhausted {
             " Storage exhausted: shutting down; unpersisted data is at risk"
         } else {
             " Memory-only storage: awaiting disk recovery; data at risk on exit"

@@ -14,7 +14,6 @@
 //! ACP hosts never see the extra chatter.
 
 use std::{
-    io::Write,
     sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -143,23 +142,14 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os(EVENTS_ENV).is_some())
 }
 
-/// Writes one event to stderr when emission is enabled.
+/// Enqueues one event without waiting for stderr. Loss disables the transport;
+/// its explicit reset (or the client lease on a stalled sink) hides source state.
 pub fn emit(event: &RuntimeEvent) {
     if !enabled() {
         return;
     }
-    let mut stderr = std::io::stderr().lock();
-    write_event(&mut stderr, event);
-}
-
-pub(crate) fn write_event(writer: &mut impl Write, event: &RuntimeEvent) {
-    if let RuntimeEvent::RunletProgress { progress } = event
-        && !progress.bounded()
-    {
-        return;
-    }
-    if let Ok(line) = serde_json::to_string(event) {
-        let _ = writeln!(writer, "{EVENT_MARKER}{line}");
+    if let Some(transport) = crate::runlet_progress::transport::global() {
+        transport.publish_event(event);
     }
 }
 
@@ -261,7 +251,7 @@ mod tests {
 
     use super::{
         EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
-        summarize_output, write_event,
+        summarize_output, test_support::write_event,
     };
 
     #[test]
@@ -419,3 +409,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

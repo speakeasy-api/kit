@@ -5,7 +5,7 @@ use crate::runlet_progress::{
 
 fn progress_wire(app: &mut App, event: RuntimeEvent) {
     let mut bytes = Vec::new();
-    crate::events::write_event(&mut bytes, &event);
+    crate::events::test_support::write_event(&mut bytes, &event);
     let line = String::from_utf8(bytes).unwrap();
     app.apply(Update::Runtime(
         crate::events::parse(line.trim_end()).unwrap(),
@@ -386,7 +386,7 @@ async fn real_bridge_events_with_transport(
     }
     let mut stream = crate::runlet_progress::Active::new(
         rx.try_recv().unwrap(),
-        crate::runlet_progress::transport::Transport::start(std::io::sink(), 16).unwrap(),
+        crate::runlet_progress::transport::Transport::start(std::io::sink(), 16, true).unwrap(),
     );
     let mut events = Vec::new();
     while let Some(event) = stream.poll() {
@@ -901,7 +901,8 @@ async fn authoritative_progress_production_publication_completes_and_cancels_wit
             }
         }
         writer.set_nonblocking(false).unwrap();
-        let transport = crate::runlet_progress::transport::Transport::start(writer, 2).unwrap();
+        let transport =
+            crate::runlet_progress::transport::Transport::start(writer, 2, true).unwrap();
         let source = if cancel {
             "return progress_gate({})"
         } else {
@@ -973,4 +974,107 @@ fn authoritative_progress_terminal_conflicts_invalidate_completed_display() {
         source_event("call-1", 1, 1, ProgressChange::Finished { complete: false }),
     );
     assert!(!render(&mut app, 140, 50).contains("# call @"));
+}
+
+#[test]
+fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
+    for explicit in [false, true] {
+        let mut app = sample();
+        let agent = RuntimeEvent::SubagentStateChanged {
+            id: "child-agent".into(),
+            name: "Child worker".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "task".into(),
+            parent_id: Some("parent-agent".into()),
+            parent_name: Some("Parent".into()),
+            harness: "acp.kit".into(),
+            model: None,
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 2,
+            generation_finished_at_unix_ms: None,
+        };
+        progress_wire(&mut app, agent.clone());
+        progress_wire(
+            &mut app,
+            RuntimeEvent::ChildStarted {
+                call: "call-1:compose:0".into(),
+                tool: "shell".into(),
+                summary: "working child".into(),
+                at: 1,
+            },
+        );
+        progress_wire(
+            &mut app,
+            RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: true,
+            },
+        );
+        progress_wire(
+            &mut app,
+            RuntimeEvent::CompactionStarted {
+                reason: "test".into(),
+                at: 1,
+            },
+        );
+        assert_eq!(app.agent_counts().working, 1);
+        assert!(app.storage_pending && app.storage_exhausted && app.compacting);
+        assert!(
+            app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::Tool(call) if !call.children.is_empty()))
+        );
+        if explicit {
+            progress_wire(&mut app, RuntimeEvent::RunletTransport { available: false });
+        } else {
+            app.progress_tick_at(
+                std::time::Instant::now() + crate::runlet_progress::transport::LEASE,
+            );
+        }
+        // Actual completion/cleanup can be lost, delayed or followed by buffered
+        // starts. None can make the incomplete stream trustworthy again.
+        for event in [
+            RuntimeEvent::ChildFinished {
+                call: "call-1:compose:0".into(),
+                tool: "shell".into(),
+                ok: true,
+                summary: "done".into(),
+                millis: 2,
+            },
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "parent-agent".into(),
+            },
+            RuntimeEvent::StorageStatus {
+                pending: false,
+                exhausted: false,
+            },
+            RuntimeEvent::CompactionFinished {
+                reason: "test".into(),
+                ok: true,
+                compacted: true,
+                millis: 2,
+            },
+            RuntimeEvent::RunletTransport { available: true },
+            agent,
+        ] {
+            progress_wire(&mut app, event);
+        }
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted && !app.compacting);
+        assert!(
+            app.blocks
+                .iter()
+                .all(|block| !matches!(block, Block::Tool(call) if !call.children.is_empty()))
+        );
+        let frame = render(&mut app, 140, 50);
+        assert!(frame.contains("Runtime status unavailable"));
+        assert!(frame.contains("storage state unknown"));
+        assert!(!frame.contains("Child worker"));
+        assert!(!frame.contains("working child"));
+        assert!(!frame.contains("compacting context"));
+        assert!(!frame.contains("context compacted"));
+    }
 }

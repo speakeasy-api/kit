@@ -261,7 +261,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completion_with_stalled_stderr() {
+        if !crate::events::test_support::with_stalled_stderr(
+            "tools::observed::tests::completion_with_stalled_stderr",
+        ) {
+            return;
+        }
+        preserve_native_outcomes().await;
+        let tool = Observed::new(DirectTool {
+            spec: ToolSpec::new(ToolName::new("direct"), "direct", json!({})),
+        });
+        let context = OwnedToolContext {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+            execution_scope: None,
+            approved_request: None,
+        };
+        let request = ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("direct"),
+            json!({}),
+            context.session_id.clone(),
+            context.turn_id.clone(),
+        );
+        let result = tool.invoke(request, &mut context.borrowed()).await.unwrap();
+        assert_eq!(result.result.output, ToolOutput::text("done"));
+    }
+
+    struct DirectTool {
+        spec: ToolSpec,
+    }
+
+    #[async_trait]
+    impl Tool for DirectTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                ToolOutput::text("done"),
+            )))
+        }
+    }
+
+    #[tokio::test]
     async fn both_wrappers_preserve_native_outcomes() {
+        preserve_native_outcomes().await;
+    }
+
+    async fn preserve_native_outcomes() {
         for mode in [
             Mode::Completed,
             Mode::Failed,
