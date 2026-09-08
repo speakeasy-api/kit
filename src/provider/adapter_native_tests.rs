@@ -867,3 +867,173 @@ async fn native_pending_http_is_cancellable_and_ambiguous_timeout_is_not_replaye
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn legacy_catalog_context_survives_optional_capabilities_through_start_session() {
+    for output in [
+        None,
+        Some(Value::Null),
+        Some(json!("image")),
+        Some(json!([42])),
+    ] {
+        let mut entry = json!({"id":"test/image", "context_length":200_000});
+        if let Some(output) = output {
+            entry["architecture"] = json!({"output_modalities":output});
+        }
+        let catalog = json!({"data":[entry]});
+        let parsed = parse_openrouter_model(&catalog, "test/image").unwrap();
+        assert!(
+            native_image_capability(&OpenRouterConfig::new("test", "test/image"), Some(&parsed))
+                .unwrap()
+                .is_none()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(move || async move { axum::Json(catalog) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = OpenRouterConfig::new("test", "test/image")
+            .with_base_url(format!("{base}/chat/completions"));
+        let adapter = KitAdapter::OpenRouter(OpenRouterKitAdapter {
+            inner: OpenRouterAdapter::new(config.clone()).unwrap(),
+            models_url: models_url(&config.base_url),
+            config: Box::new(config),
+            client: reqwest::Client::new(),
+            model: "test/image".into(),
+            context_window: Arc::new(tokio::sync::OnceCell::new()),
+        });
+        let started = adapter.start_session(SessionConfig::new("legacy")).await;
+        server.abort();
+        let KitSession::OpenRouter(started) = started.unwrap() else {
+            panic!()
+        };
+        assert_eq!(started.context_window, Some(200_000));
+        assert!(started.native.is_none());
+    }
+}
+
+#[tokio::test]
+async fn nine_generated_deliveries_continue_and_reconstruct_without_changing_history() {
+    let uri = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png())
+    );
+    let body = response(json!([{"image_url":{"url":uri}}]));
+    let (mut live, mut sent) = session(vec![body.clone()], true).await;
+    let mut history = request(false);
+    for _ in 0..9 {
+        let mut turn = live.begin_turn(history.clone(), None).await.unwrap();
+        sent.try_recv().unwrap();
+        history.transcript.extend(completed_items(&mut turn).await);
+        history.transcript.push(Item::new(
+            ItemKind::User,
+            vec![Part::text("Refine that sticker")],
+        ));
+    }
+    let canonical = history.clone();
+    let mut turn = live.begin_turn(history.clone(), None).await.unwrap();
+    let wire = sent.try_recv().unwrap();
+    completed_items(&mut turn).await;
+    let images: Vec<_> = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .collect();
+    assert_eq!(images.len(), 9);
+    assert!(images.iter().all(|part| part["image_url"]["url"] == uri));
+    for _ in ["resume", "fork"] {
+        let restored: TurnRequest =
+            serde_json::from_value(serde_json::to_value(&history).unwrap()).unwrap();
+        let (mut reconstructed, mut sent) = session(vec![body.clone()], true).await;
+        let mut turn = reconstructed.begin_turn(restored, None).await.unwrap();
+        assert_eq!(sent.try_recv().unwrap(), wire);
+        completed_items(&mut turn).await;
+    }
+    assert_eq!(history, canonical);
+}
+
+#[tokio::test]
+async fn historical_image_limits_fail_before_http_and_leave_canonical_history_unchanged() {
+    let valid = Part::Media(MediaPart::new(
+        Modality::Image,
+        "image/png",
+        DataRef::InlineBytes(png()),
+    ));
+    let malformed = Part::Media(MediaPart::new(
+        Modality::Image,
+        "image/png",
+        DataRef::InlineBytes(vec![0; 8]),
+    ));
+    let oversized = Part::Media(MediaPart::new(
+        Modality::Image,
+        "image/png",
+        DataRef::InlineBytes(vec![0; MAX_NATIVE_IMAGE_BYTES + 1]),
+    ));
+    for (parts, expected) in [
+        (vec![valid; 9], "historical assistant images exceed"),
+        (vec![malformed], "invalid historical assistant image"),
+        (vec![oversized], "historical assistant image exceeds 8 MiB"),
+    ] {
+        let mut history = request(false);
+        history
+            .transcript
+            .push(Item::new(ItemKind::Assistant, parts));
+        let canonical = history.clone();
+        let (mut live, mut sent) = session(vec![response(json!([]))], true).await;
+        let Err(error) = live.begin_turn(history.clone(), None).await else {
+            panic!("invalid history accepted")
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(matches!(
+            sent.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(history, canonical);
+    }
+    // Each item independently fits delivery limits; only retained history is too large.
+    // PNG permits trailing bytes, keeping the fixture's decoded allocation tiny.
+    let mut bytes = png();
+    bytes.resize(MAX_NATIVE_IMAGE_BYTES, 0);
+    crate::managed_files::validate_provider_image(&bytes).unwrap();
+    let mut history = request(false);
+    for _ in 0..9 {
+        history.transcript.push(Item::new(
+            ItemKind::Assistant,
+            vec![Part::Media(MediaPart::new(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(bytes.clone()),
+            ))],
+        ));
+    }
+    let (mut live, mut sent) = session(vec![response(json!([]))], true).await;
+    let Err(error) = live.begin_turn(history.clone(), None).await else {
+        panic!("overbudget history accepted")
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("outgoing request/history budget of 64 MiB"),
+        "{error}"
+    );
+    assert!(error.contains("compact history or start a fresh session with selected attachments"));
+    assert!(matches!(
+        sent.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(history.transcript.len(), 10);
+    for item in &history.transcript[1..] {
+        assert_eq!(
+            item.parts,
+            vec![Part::Media(MediaPart::new(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(bytes.clone())
+            ))]
+        );
+    }
+}

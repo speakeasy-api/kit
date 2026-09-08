@@ -94,8 +94,8 @@ impl BackendFile for FaultFile {
 impl FaultBackend {
     fn wrap(&self, path: &Path, disk: Box<dyn BackendFile>) -> Box<dyn BackendFile> {
         // Fs persists objects through sibling atomic-replacement files, not by
-        // writing the final file_ basename. Scope faults to this session's file
-        // contents so staged writes are covered without faulting directory work.
+        // writing the final file_ basename. Scope faults to the store so private
+        // import staging is covered without faulting directory work.
         if path.starts_with(&self.object_directory) {
             Box::new(FaultFile {
                 disk,
@@ -201,6 +201,18 @@ fn write_sync_and_pending_recovery_fail_without_publishing_a_descriptor() {
             serde_json::from_slice(&disk::read(path.with_extension("result.json")).unwrap())
                 .unwrap();
         assert_eq!(error, mode.expected_error());
+        // With the faulting process gone, future real imports and inheritance
+        // work without investigating or deleting anything from source authority.
+        let reference = f.import("recovered.png");
+        f.store
+            .prepare_inheritance("session", "recovered-fork")
+            .unwrap()
+            .unwrap()
+            .commit();
+        assert_eq!(
+            f.store.resolve("recovered-fork", &reference).unwrap(),
+            f.store.resolve("session", &reference).unwrap()
+        );
     }
 }
 
@@ -216,48 +228,53 @@ fn fault_child() {
     assert!(
         fs::initialize_global(Fs::new(Arc::new(FaultBackend {
             mode: manifest.mode,
-            object_directory: store.session_directory("session"),
+            object_directory: store.base.clone(),
         })))
         .is_ok(),
         "filesystem must be initialized only in this child"
     );
-    // Err is the publication contract: unreachable partial objects may remain,
-    // but the caller must never receive a FileReference after any barrier fails.
+    // Every injected failure remains an error, including ENOSPC memory fallback.
+    // Failed envelopes must never enter the enumerable inherited authority set.
     let error = store.import("session", &manifest.source, None).unwrap_err();
     assert_eq!(error, manifest.mode.expected_error());
     let directory = store.session_directory("session");
-    let object = disk::read_dir(&directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("file_")
-        })
-        .expect("native managed object was created before the fault");
+    assert_eq!(disk::read_dir(&directory).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
     match manifest.mode {
-        Mode::Write => assert!(disk::read(&object).unwrap().is_empty()),
-        Mode::Sync => {
-            // The native payload was written before the injected sync error.
-            // Fs then abandons the unpublished replacement, retaining only the
-            // previously durable empty object, not unsynced payload contents.
-            assert!(disk::read(&object).unwrap().is_empty());
+        Mode::Write | Mode::Sync => {
+            assert!(disk::read_dir(&store.base).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".import-")
+            }));
+            store
+                .prepare_inheritance("session", "fork-after-failure")
+                .unwrap()
+                .unwrap()
+                .commit();
         }
         Mode::NoSpace => {
-            // Show that writes were accepted as a complete memory-backed envelope
-            // while native storage cannot retain it. This is real Fs behavior,
-            // not a callback asserting which implementation method was called.
-            let accepted = fs::read(&object).unwrap();
-            assert!(accepted.starts_with(MAGIC));
-            let header_len = u32::from_le_bytes(accepted[8..12].try_into().unwrap()) as usize;
-            let header: Header = serde_json::from_slice(&accepted[12..12 + header_len]).unwrap();
-            let payload = &accepted[12 + header_len..];
-            assert_eq!(payload, disk::read(&manifest.source).unwrap());
-            assert_eq!(payload.len() as u64, header.file.size_bytes);
-            assert_eq!(blake3::hash(payload).to_hex().as_str(), header.digest);
-            assert!(disk::metadata(&object).unwrap().len() < accepted.len() as u64);
+            // Recovery can also block best-effort cleanup, but only private
+            // staging can retain the memory-backed envelope, never authority.
+            let object = disk::read_dir(&store.base)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".import-")
+                })
+                .unwrap();
+            // Cleanup hides the volatile object immediately, but its queued
+            // unlink cannot reach disk while the earlier write still has ENOSPC.
+            assert_eq!(
+                fs::read(&object).unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            assert!(disk::read(&object).unwrap().is_empty());
             assert!(fs::global().status().pending_operations > 0);
             assert_eq!(
                 fs::require_disk(&object).unwrap_err().raw_os_error(),

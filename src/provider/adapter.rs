@@ -858,6 +858,11 @@ pub struct SpeakeasyKitSession {
     context_window: Option<u64>,
 }
 
+// Bound retained assistant-image payloads before the Completions encoder expands
+// them to base64. This is not a limit on the whole request, user attachments,
+// or model context; per-delivery validation remains separate.
+const MAX_OUTGOING_ASSISTANT_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Project only the outbound request; the caller's canonical transcript stays typed.
 /// Completions (including OpenRouter) stringify tool Parts and reject assistant
 /// Media, but encode ordinary user Media as image_url content. Native transports retain typed tool images,
@@ -871,6 +876,7 @@ pub(super) fn project_tool_output_images(
     const MAX_NODES: usize = 100_000;
     const MAX_DEPTH: usize = 64;
     let mut visited = 0;
+    let mut retained_assistant_image_bytes = 0_usize;
     let mut pending = Vec::new();
     for item in &request.transcript {
         visited += 1;
@@ -889,6 +895,20 @@ pub(super) fn project_tool_output_images(
             if visited > MAX_NODES {
                 return Err(tool_image_traversal_error());
             }
+            if !native
+                && item.kind == agentkit_core::ItemKind::Assistant
+                && let Part::Media(media) = part
+                && media.modality == Modality::Image
+                && let DataRef::InlineBytes(bytes) = &media.data
+            {
+                retained_assistant_image_bytes =
+                    retained_assistant_image_bytes.saturating_add(bytes.len());
+                if retained_assistant_image_bytes > MAX_OUTGOING_ASSISTANT_IMAGE_BYTES {
+                    return Err(LoopError::InvalidState(
+                        "selected-images-not-delivered: outgoing request/history budget of 64 MiB for retained assistant-image payloads exceeded; compact history or start a fresh session with selected attachments".into(),
+                    ));
+                }
+            }
             if let Part::ToolResult(result) = part
                 && let ToolOutput::Parts(parts) = &result.output
             {
@@ -903,9 +923,6 @@ pub(super) fn project_tool_output_images(
     let mut transcript = Vec::with_capacity(request.transcript.len());
     let mut outstanding = std::collections::HashSet::new();
     let mut images = Vec::new();
-    let mut assistant_image_bytes = 0;
-    let mut assistant_image_count = 0;
-    let mut assistant_image_pixels = 0;
     for mut item in request.transcript {
         // The loop has already answered detached calls with placeholders. Its
         // completion notification contains serialized ToolResultPart values,
@@ -933,6 +950,10 @@ pub(super) fn project_tool_output_images(
         // first so images wait for the complete parallel tool-result batch.
         let mut lifted_assistant_images = false;
         if !native && item.kind == agentkit_core::ItemKind::Assistant {
+            // These are delivery quotas, not cumulative transcript quotas.
+            let mut assistant_image_bytes = 0;
+            let mut assistant_image_count = 0;
+            let mut assistant_image_pixels = 0;
             let mut supported = Vec::new();
             for part in std::mem::take(&mut item.parts) {
                 if let Part::Media(media) = &part
@@ -1285,7 +1306,7 @@ fn parse_openrouter_model(value: &Value, model: &str) -> Option<OpenRouterModelI
     Some(OpenRouterModelInfo {
         context_window: parse_context_window(value, model),
         input: capability_strings(&entry["architecture"]["input_modalities"]).unwrap_or_default(),
-        output: capability_strings(&entry["architecture"]["output_modalities"]).ok()?,
+        output: capability_strings(&entry["architecture"]["output_modalities"]).unwrap_or_default(),
         tools: capability_strings(&entry["supported_parameters"])
             .unwrap_or_default()
             .iter()

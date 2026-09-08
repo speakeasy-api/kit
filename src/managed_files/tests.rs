@@ -698,19 +698,76 @@ fn cancelled_grants_do_not_publish_authority() {
 }
 
 #[test]
-fn failed_fork_does_not_publish_a_partial_authorized_set() {
+fn legacy_v1_envelopes_resolve_and_fork_without_rewriting_source() {
+    let f = Fixture::new();
+    let source = f.source("legacy.png", ImageFormat::Png, 3, 2);
+    let payload = disk::read(source).unwrap();
+    // Construct the historical envelope directly, independently of the writer.
+    let reference: FileReference = serde_json::from_value(json!({
+        "$kit": "file", "version": 1, "id": format!("file_{}", "a".repeat(64)),
+        "name": "legacy.png", "mime_type": "image/png", "size_bytes": payload.len(),
+        "image": {"width": 3, "height": 2}
+    }))
+    .unwrap();
+    let header = serde_json::to_vec(&json!({
+        "file": reference, "digest": blake3::hash(&payload).to_hex().to_string()
+    }))
+    .unwrap();
+    let mut envelope = b"KITFILE1".to_vec();
+    envelope.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    envelope.extend_from_slice(&header);
+    envelope.extend_from_slice(&payload);
+    disk::create_dir_all(f.store.session_directory("session")).unwrap();
+    disk::write(f.object(&reference), &envelope).unwrap();
+    assert_eq!(f.store.resolve("session", &reference).unwrap(), payload);
+    f.store
+        .prepare_inheritance("session", "fork")
+        .unwrap()
+        .unwrap()
+        .commit();
+    assert_eq!(f.store.resolve("fork", &reference).unwrap(), payload);
+    assert_eq!(disk::read(f.object(&reference)).unwrap(), envelope);
+}
+
+#[test]
+fn malformed_legacy_fork_fails_closed_without_source_mutation() {
+    for malformed in [b"".as_slice(), b"KITFILE1", b"KITFILE1\x10\x00\x00\x00{}"] {
+        let f = Fixture::new();
+        let reference = f.import("good.png");
+        let valid = disk::read(f.object(&reference)).unwrap();
+        let directory = f.store.session_directory("session");
+        let path = directory.join(format!("file_{}", "0".repeat(64)));
+        disk::write(&path, malformed).unwrap();
+        let error = f
+            .store
+            .prepare_inheritance("session", "failed-fork")
+            .err()
+            .unwrap();
+        assert!(error.contains("Source unchanged; destination authority uncommitted"));
+        assert!(error.contains("Restore the object"));
+        assert!(error.contains("only if loss is acceptable"));
+        assert!(error.contains(path.to_str().unwrap()));
+        assert!(!f.store.session_directory("failed-fork").exists());
+        assert!(f.store.resolve("failed-fork", &reference).is_err());
+        assert_eq!(disk::read(&path).unwrap(), malformed);
+        assert_eq!(disk::read(f.object(&reference)).unwrap(), valid);
+        assert_eq!(disk::read_dir(&directory).unwrap().count(), 2);
+    }
+}
+
+#[test]
+fn snapshot_publication_collision_preserves_existing_object() {
     let f = Fixture::new();
     let reference = f.import("good.png");
-    let directory = f.store.session_directory("session");
-    disk::write(directory.join(format!("file_{}", "0".repeat(64))), b"bad").unwrap();
+    let original = disk::read(f.object(&reference)).unwrap();
+    let bytes = f.store.resolve("session", &reference).unwrap();
     assert!(
         f.store
-            .prepare_inheritance("session", "failed-fork")
+            .write_snapshot("session", reference.clone(), &bytes, None)
             .is_err()
     );
-    assert!(!f.store.session_directory("failed-fork").exists());
-    assert!(f.store.resolve("failed-fork", &reference).is_err());
-    assert!(f.store.resolve("session", &reference).is_ok());
+    assert_eq!(disk::read(f.object(&reference)).unwrap(), original);
+    assert_eq!(disk::read_dir(&f.store.base).unwrap().count(), 1);
 }
 
 #[test]

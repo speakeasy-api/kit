@@ -318,20 +318,30 @@ impl FileStore {
             let entry = entry.map_err(display)?;
             let name = entry.file_name();
             let name = name.to_str().ok_or("invalid managed object filename")?;
-            let mut file = fs::open_beneath(&directory, Path::new(name)).map_err(display)?;
-            let mut prefix = [0_u8; 12];
-            file.read_exact(&mut prefix).map_err(display)?;
-            let length = u32::from_le_bytes(prefix[8..12].try_into().map_err(display)?) as usize;
-            if &prefix[..8] != MAGIC || length > MAX_HEADER_BYTES {
-                return Err("invalid inherited managed file envelope".into());
-            }
-            let mut header = vec![0; length];
-            file.read_exact(&mut header).map_err(display)?;
-            let header: Header = serde_json::from_slice(&header).map_err(display)?;
-            if header.file.id != name {
-                return Err("inherited file ID does not match its storage name".into());
-            }
-            self.grant_to(source, &header.file, self, &staging_session, None)?;
+            let inherit = || -> Result<()> {
+                let mut file = fs::open_beneath(&directory, Path::new(name)).map_err(display)?;
+                let mut prefix = [0_u8; 12];
+                file.read_exact(&mut prefix).map_err(display)?;
+                let length =
+                    u32::from_le_bytes(prefix[8..12].try_into().map_err(display)?) as usize;
+                if &prefix[..8] != MAGIC || length > MAX_HEADER_BYTES {
+                    return Err("invalid inherited managed file envelope".into());
+                }
+                let mut header = vec![0; length];
+                file.read_exact(&mut header).map_err(display)?;
+                let header: Header = serde_json::from_slice(&header).map_err(display)?;
+                if header.file.id != name {
+                    return Err("inherited file ID does not match its storage name".into());
+                }
+                self.grant_to(source, &header.file, self, &staging_session, None)?;
+                Ok(())
+            };
+            inherit().map_err(|error| {
+                format!(
+                    "cannot inherit managed object {}: {error}. Source unchanged; destination authority uncommitted. Restore the object, or investigate and explicitly remove it only if loss is acceptable",
+                    directory.join(name).display()
+                )
+            })?;
         }
         // The preflight is not authority: even an empty destination created
         // concurrently must survive unchanged at the atomic commit boundary.
@@ -393,30 +403,49 @@ impl FileStore {
         }
         fs::create_private_dir_all(&directory).map_err(display)?;
         let destination = directory.join(&reference.id);
-        // No descriptor is published until all durability barriers succeed.
-        // Partial and cancelled imports may leave unreachable objects, never a
-        // reference that claims an in-memory-only snapshot survived a restart.
+        // Stage outside every session authority directory: inheritance enumerates
+        // all entries, including objects whose descriptor was never returned.
+        let mut random = [0_u8; 32];
+        getrandom::fill(&mut random).map_err(display)?;
+        let staged = self.base.join(format!(
+            ".import-{}",
+            blake3::Hash::from_bytes(random).to_hex()
+        ));
         let mut output = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .private(true)
-            .open(&destination)
+            .open(&staged)
             .map_err(display)?;
-        output.write_all(MAGIC).map_err(display)?;
-        output
-            .write_all(&(header.len() as u32).to_le_bytes())
-            .map_err(display)?;
-        output.write_all(&header).map_err(display)?;
-        output.write_all(bytes).map_err(display)?;
-        output.sync_all().map_err(display)?;
-        fs::require_disk(&destination).map_err(display)?;
-        // Include newly created ancestor entries, not just the object contents.
-        for ancestor in durability_directories {
-            fs::sync_directory(ancestor).map_err(display)?;
-            fs::require_disk(ancestor).map_err(display)?;
-        }
-        check_cancelled(cancellation)?;
-        Ok(reference)
+        let result = (|| {
+            output.write_all(MAGIC).map_err(display)?;
+            output
+                .write_all(&(header.len() as u32).to_le_bytes())
+                .map_err(display)?;
+            output.write_all(&header).map_err(display)?;
+            output.write_all(bytes).map_err(display)?;
+            output.sync_all().map_err(display)?;
+            fs::require_disk(&staged).map_err(display)?;
+            check_cancelled(cancellation)?;
+            // Reuse the grant publication primitive; never overwrite a prior
+            // object. A failure after this boundary may leave a complete object.
+            rename_no_replace(&staged, &destination).map_err(display)?;
+            fs::sync_directory(&self.base).map_err(display)?;
+            fs::require_disk(&self.base).map_err(display)?;
+            // Include newly created ancestor entries, not just object contents.
+            for ancestor in durability_directories {
+                fs::sync_directory(ancestor).map_err(display)?;
+                fs::require_disk(ancestor).map_err(display)?;
+            }
+            fs::require_disk(&destination).map_err(display)?;
+            check_cancelled(cancellation)?;
+            Ok(reference)
+        })();
+        drop(output);
+        // Only our create-new staging file is eligible for cleanup. Never remove
+        // a destination, including when exclusive publication finds a collision.
+        let _ = fs::remove_file(&staged);
+        result
     }
 
     pub(crate) fn resolve(&self, session: &str, selected: &FileReference) -> Result<Vec<u8>> {
