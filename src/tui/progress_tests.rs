@@ -854,10 +854,23 @@ fn authoritative_progress_conflicting_duplicates_fail_neutral() {
     }
 }
 
+fn start_progress_session(app: &mut App, session_id: &str) {
+    app.start_session(session_id.into());
+    app.apply(Update::ToolStarted {
+        id: "call-1".into(),
+        title: "compose".into(),
+        kind: ToolKind::Other,
+        script: Some(SCRIPT.into()),
+        backgrounded: false,
+    });
+}
+
 #[test]
-fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
+fn authoritative_progress_recovery_preserves_old_incarnation_tombstones() {
     for explicit in [true, false] {
         let mut app = sample();
+        start_progress_session(&mut app, "session");
+        progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "session".into() });
         progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
         progress_start(&mut app, SCRIPT, 1, false);
         progress_step(
@@ -880,6 +893,15 @@ fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
         }
         assert!(!render(&mut app, 140, 50).contains("# call @"));
         progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+        assert!(!app.runtime_unavailable());
+        progress_start(&mut app, SCRIPT, 1, false);
+        progress_step(
+            &mut app,
+            1,
+            1,
+            progress_node("a", ProgressState::Succeeded, true),
+        );
+        assert!(!render(&mut app, 140, 50).contains("# call @"));
         progress_start(&mut app, SCRIPT, 2, false);
         progress_step(
             &mut app,
@@ -887,7 +909,7 @@ fn authoritative_progress_reset_and_expired_lease_cannot_be_revived() {
             1,
             progress_node("b", ProgressState::Succeeded, true),
         );
-        assert!(!render(&mut app, 140, 50).contains("# call @"));
+        assert!(render(&mut app, 140, 50).contains("# call @"));
     }
 }
 
@@ -990,6 +1012,8 @@ fn authoritative_progress_terminal_conflicts_invalidate_completed_display() {
 fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
     for explicit in [false, true] {
         let mut app = sample();
+        start_progress_session(&mut app, "session");
+        progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "session".into() });
         let agent = RuntimeEvent::SubagentStateChanged {
             id: "child-agent".into(),
             name: "Child worker".into(),
@@ -1066,8 +1090,7 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
                 compacted: true,
                 millis: 2,
             },
-            RuntimeEvent::RunletTransport { available: true },
-            agent,
+            agent.clone(),
         ] {
             progress_wire(&mut app, event);
         }
@@ -1086,5 +1109,71 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
         assert!(!frame.contains("working child"));
         assert!(!frame.contains("compacting context"));
         assert!(!frame.contains("context compacted"));
+
+        progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted && !app.compacting);
+        let frame = render(&mut app, 140, 50);
+        assert!(!frame.contains("Runtime status unavailable"));
+        assert!(frame.contains("Runtime status resumed"));
+        assert!(frame.contains("state remains unknown"));
+        assert!(!frame.contains("Child worker"));
+        assert!(!frame.contains("working child"));
+
+        // Fresh observations are accepted without reviving cleared state.
+        progress_wire(&mut app, agent);
+        progress_wire(
+            &mut app,
+            RuntimeEvent::StorageStatus { pending: true, exhausted: false },
+        );
+        assert_eq!(app.agent_counts().working, 1);
+        assert!(app.storage_pending);
+        assert!(app.needs_redraw_tick());
+        app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending);
+    }
+}
+
+#[test]
+fn runtime_recovery_keeps_session_filtering_across_attachment_gaps() {
+    for explicit in [false, true] {
+        for attach_during_gap in [false, true] {
+            let mut app = sample();
+            start_progress_session(&mut app, "old");
+            progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "old".into() });
+            if explicit {
+                progress_wire(&mut app, RuntimeEvent::RunletTransport { available: false });
+            } else {
+                app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+            }
+            start_progress_session(&mut app, "new");
+            if attach_during_gap {
+                progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "new".into() });
+            }
+            let compaction = RuntimeEvent::CompactionStarted { reason: "test".into(), at: 1 };
+            progress_wire(&mut app, compaction.clone());
+            progress_start(&mut app, SCRIPT, 1, false);
+            assert!(app.runtime_unavailable());
+            assert!(!app.compacting);
+            assert!(!render(&mut app, 140, 50).contains("# call @"));
+            progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+            progress_wire(&mut app, compaction.clone());
+            progress_start(&mut app, SCRIPT, 2, false);
+            progress_step(&mut app, 2, 1, progress_node("a", ProgressState::Succeeded, true));
+            assert_eq!(app.compacting, attach_during_gap);
+            assert_eq!(render(&mut app, 140, 50).contains("# call @"), attach_during_gap);
+            // A heartbeat must not guess that the stream belongs to the selected session.
+            if !attach_during_gap {
+                progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "new".into() });
+                progress_wire(&mut app, compaction);
+                progress_start(&mut app, SCRIPT, 3, false);
+                progress_step(&mut app, 3, 1, progress_node("a", ProgressState::Succeeded, true));
+                assert!(app.compacting);
+                assert!(render(&mut app, 140, 50).contains("# call @"));
+            }
+        }
     }
 }

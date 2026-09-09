@@ -1891,7 +1891,8 @@ impl App {
         self.cleaned_agent_ids.clear();
         self.cleaned_agent_ancestors.clear();
         self.agents_scroll = 0;
-        self.runtime_session_id = None;
+        // Attachment identity survives transport loss; ACP emits it only when
+        // attaching. Keep it distinct from session_id to reject another session.
         self.compacting = false;
         self.storage_pending = false;
         self.storage_exhausted = false;
@@ -1935,26 +1936,35 @@ impl App {
         // Check expiry before any frame can refresh the lease or revive a
         // lifecycle map. Loss applies to all runtime events, not only progress.
         self.progress_activity();
+        if let RuntimeEvent::RunletTransport { available } = event {
+            if available {
+                if self.progress_unavailable {
+                    // A heartbeat restores transport, not the observations lost
+                    // during the gap. Keep cleared state and progress tombstones.
+                    self.note("Runtime status resumed; earlier agent, child, compaction and storage state remains unknown");
+                }
+                self.progress_unavailable = false;
+                self.progress_last_frame = Some(Instant::now());
+            } else {
+                self.disable_runtime();
+            }
+            return;
+        }
+        // Attachment markers identify the stream even during a gap, but do not
+        // restore transport health or any lifecycle observations.
+        if let RuntimeEvent::SessionStarted { session_id } = event {
+            self.runtime_session_id = Some(session_id);
+            return;
+        }
         if self.runtime_unavailable() {
             return;
         }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
-            RuntimeEvent::RunletTransport { available } => {
-                if available {
-                    self.progress_activity();
-                } else {
-                    self.disable_runtime();
-                }
-                return;
-            }
+            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => return,
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
-                return;
-            }
-            RuntimeEvent::SessionStarted { session_id } => {
-                self.runtime_session_id = Some(session_id);
                 return;
             }
             _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => return,
@@ -6531,6 +6541,37 @@ mod tests {
         assert_eq!(app.agent_counts().total, 0);
         assert!(!app.storage_pending && !app.storage_exhausted);
         assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
+    fn healthy_heartbeat_expires_old_state_before_renewing_lease() {
+        let mut app = app();
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert!(!app.runtime_unavailable());
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(app.needs_redraw_tick());
+        assert!(
+            matches!(app.blocks.last(), Some(Block::Notice(text)) if text.contains("state remains unknown"))
+        );
+
+        let blocks = app.blocks.len();
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert_eq!(app.blocks.len(), blocks);
+        app.tick();
+        assert!(!app.runtime_unavailable());
+
+        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.tick();
+        assert!(app.runtime_unavailable());
     }
 
     #[test]
