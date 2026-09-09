@@ -2334,15 +2334,15 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     assert!(prompt.contains("Do not dump whole trees"));
     assert!(prompt.contains("Use compose as a dependency graph"));
     assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
-    assert!(prompt.contains("when it can run across a turn boundary"));
-    assert!(prompt.contains("it also suits one-shot triggers"));
+    assert!(prompt.contains("Background long-running compose work across turn boundaries"));
+    assert!(prompt.contains("monitors that wait or poll for EXTERNAL events or state changes"));
     assert!(prompt.contains("including launching more detached work"));
     assert!(prompt.contains("STOP: end your turn now."));
     assert!(prompt.contains("Stopping is a valid intermediate response"));
-    assert!(prompt.contains("The harness automatically resumes you with the background result"));
+    assert!(prompt.contains("the harness automatically resumes you when it finishes"));
     assert!(
         prompt.contains(
-            "Do not call tools to wait, sleep, poll for completion, or keep the turn alive"
+            "Do not issue additional tool calls to wait or poll for a background tool call to finish, or to keep the turn alive"
         )
     );
     assert!(prompt.contains("the next step needs its result in the current turn"));
