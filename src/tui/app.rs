@@ -1891,7 +1891,8 @@ impl App {
         self.cleaned_agent_ids.clear();
         self.cleaned_agent_ancestors.clear();
         self.agents_scroll = 0;
-        self.runtime_session_id = None;
+        // Attachment identity survives transport loss; ACP emits it only when
+        // attaching. Keep it distinct from session_id to reject another session.
         self.compacting = false;
         self.storage_pending = false;
         self.storage_exhausted = false;
@@ -1949,19 +1950,21 @@ impl App {
             }
             return;
         }
+        // Attachment markers identify the stream even during a gap, but do not
+        // restore transport health or any lifecycle observations.
+        if let RuntimeEvent::SessionStarted { session_id } = event {
+            self.runtime_session_id = Some(session_id);
+            return;
+        }
         if self.runtime_unavailable() {
             return;
         }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
-            RuntimeEvent::RunletTransport { .. } => unreachable!(),
+            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => return,
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
-                return;
-            }
-            RuntimeEvent::SessionStarted { session_id } => {
-                self.runtime_session_id = Some(session_id);
                 return;
             }
             _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => return,
