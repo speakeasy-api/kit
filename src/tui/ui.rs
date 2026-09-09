@@ -47,7 +47,7 @@ type TranscriptTag = (Option<String>, Option<CodeHit>, Option<usize>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
-    // Two border columns plus the `›` gutter; the prompt grows as the wrapped
+    // Two border columns plus the `>` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let start_width = frame
         .area()
@@ -2026,7 +2026,7 @@ fn draw_prompt_editor(
     let [gutter, field] =
         Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(area);
     frame.render_widget(
-        Paragraph::new(Span::styled("›", theme::bold(theme::accent_color()))),
+        Paragraph::new(Span::styled(">", theme::bold(theme::accent_color()))),
         gutter,
     );
 
@@ -4467,7 +4467,7 @@ mod tests {
         let rows = frame.lines().collect::<Vec<_>>();
         let input = rows
             .iter()
-            .position(|row| row.starts_with("│› message kit…"))
+            .position(|row| row.starts_with("│> message kit…"))
             .expect("prompt input");
 
         assert!(rows[input - 1].starts_with('╭'));
@@ -4494,6 +4494,6 @@ mod tests {
         assert!(frame.lines().any(|line| line.trim() == "▔".repeat(86)));
         assert!(frame.contains(" ready"));
         assert!(frame.contains("⏎ send   ⇧⏎ newline   ^l log   ^c quit"));
-        assert!(frame.contains("message kit"));
+        assert!(frame.contains("> message kit…"));
     }
 }
