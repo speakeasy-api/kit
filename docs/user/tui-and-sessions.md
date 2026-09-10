@@ -81,6 +81,14 @@ If a request fails, Kit retains the replacement text and the parked original dra
 
 Active steering continues to support media attachments. Pending-message **edits are text-only**: messages accepted with image, audio, or other non-text content cannot be edited in the queue, but can still be removed. Kit determines editability from the content actually sent, not stale attachments left in the composer. Media paths pasted during a queue edit are ordinary text, not new attachments. Attachments in the parked original draft remain unchanged when you save or cancel.
 
+### Assistant image previews
+
+Assistant Markdown images, such as `![Chart](charts/result.png)`, display a static image preview when the terminal supports Kitty, Sixel, or iTerm2 graphics. Absolute local paths, paths relative to the session project root, `file://` URLs, and HTTP(S) URLs are supported. Inline images keep their position in the message: text before the image appears before its preview, and text after it appears below. Image syntax inside fenced or inline code stays literal; incomplete streamed syntax is not fetched.
+
+Kit automatically reads local image files and fetches remote images when their preview scrolls into view, without a permission prompt. Remote requests follow at most five redirects and have a ten-second total timeout (three seconds to connect). A single background worker uses a bounded queue for fetching and decoding, with a 10 MiB source limit, dimension and decoded-allocation limits, and a bounded preview cache. Cached images are reused across redraws; successful previews can be fetched again after cache eviction. Failed previews are not retried during the current image-runtime lifetime. Starting another session clears the cache.
+
+The Markdown text or structured image label remains visible while loading and if reading, fetching, or decoding fails. Unsupported terminals show text only and do not fetch Markdown images. Previews reserve a fixed-height viewport, show only the first frame of animated images, and are downscaled to at most 1600 × 1200 pixels before terminal encoding. Reference-style Markdown images are not expanded.
+
 ### Attach local images and audio
 
 Drag one or more supported local media files into the terminal while editing a prompt. Terminals deliver a drop as pasted, shell-escaped paths rather than as a dedicated file-drop event. Kit treats the paste as attachments only when every parsed token resolves to a supported regular file. Mixed text and paths, unsupported files, invalid shell quoting, missing files, and ambiguous input remain ordinary pasted text. There is no `/attach` command.
@@ -91,7 +99,7 @@ An accepted file appears in the editor as `[Image #N]` or `[Audio #N]`. Add surr
 
 The model-facing prompt retains canonical `file://` Markdown links, while Kit also reads and sends the file bytes because remote providers cannot access local files. Image and audio acceptance remains model-dependent. Kit supports these request shapes through OpenRouter and OpenAI subscription; an individual model can still reject a modality it does not support. Video is not supported.
 
-User-attached images render inline as a bounded static first frame when Kit detects Kitty, Sixel, or iTerm2 graphics support. No setting is required. Unsupported terminals, malformed or oversized images, and decode failures retain the safe clickable attachment label. Animated GIF and WebP files currently show only their first frame. Assistant- and tool-produced media remains portable Markdown placeholders or links, and audio is not played. Only bounded `file://`, `http://`, and `https://` links are displayed; base64 and `data:` URLs are never copied into terminal text or Markdown links.
+User-attached images render inline as a bounded static first frame when Kit detects Kitty, Sixel, or iTerm2 graphics support. No setting is required. Unsupported terminals, malformed or oversized images, and decode failures retain the safe clickable attachment label. Animated GIF and WebP files currently show only their first frame. Structured assistant and tool images use the same static preview renderer. Audio is not played. Only bounded `file://`, `http://`, and `https://` links are displayed; base64 and `data:` URLs are never copied into terminal text or Markdown links.
 
 ### Interrupt a running turn or quit
 

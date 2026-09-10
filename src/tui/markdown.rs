@@ -21,6 +21,19 @@ pub(super) fn render_copyable_at_width(
     source: &str,
     max_width: Option<usize>,
 ) -> Vec<(LinkedLine, Option<Range<usize>>)> {
+    render_copyable_with_sources(source, max_width, false)
+        .into_iter()
+        .map(|(line, code, _)| (line, code))
+        .collect()
+}
+
+/// Render the complete document while retaining source ranges for viewport placement.
+/// A table is one layout unit: its source range belongs to its final rendered line.
+pub(super) fn render_copyable_with_sources(
+    source: &str,
+    max_width: Option<usize>,
+    split_images: bool,
+) -> Vec<(LinkedLine, Option<Range<usize>>, Range<usize>)> {
     let mut next_offset = 0;
     let raw_lines: Vec<(usize, &str)> = source
         .split('\n')
@@ -37,6 +50,7 @@ pub(super) fn render_copyable_at_width(
         if index < table_end {
             continue;
         }
+        let source_range = offset..offset + raw.len();
         let trimmed = raw.trim_start();
         let candidate = fence_line(raw);
         if let Some((language, marker, length, content)) = fence.as_ref() {
@@ -51,10 +65,11 @@ pub(super) fn render_copyable_at_width(
                         }
                     )),
                     Some(content.clone()),
+                    source_range,
                 ));
                 fence = None;
             } else {
-                lines.push((code_line(raw), Some(content.clone())));
+                lines.push((code_line(raw), Some(content.clone()), source_range));
             }
             continue;
         }
@@ -85,19 +100,67 @@ pub(super) fn render_copyable_at_width(
                     }
                 )),
                 Some(content.clone()),
+                source_range,
             ));
             fence = Some((language, marker, length, content));
             continue;
         }
         if let Some((end, table)) = table_at(&raw_lines, index, max_width) {
-            lines.extend(table.into_iter().map(|line| (line, None)));
+            let last = table.len() - 1;
+            let source_end = raw_lines[end - 1].0 + raw_lines[end - 1].1.len();
+            lines.extend(table.into_iter().enumerate().map(|(index, line)| {
+                let range = if index == last {
+                    offset..source_end
+                } else {
+                    offset..offset
+                };
+                (line, None, range)
+            }));
             table_end = end;
             continue;
         }
-        lines.push((block_line(raw, trimmed), None));
+        let mut line = block_line(raw, trimmed);
+        if split_images {
+            // Parse the whole line first, so emphasis spanning a preview retains
+            // its style. Only prose is split: tables and fences remain intact.
+            let mut references = image_references(raw).into_iter();
+            let mut start = offset;
+            let mut pending = Vec::new();
+            for span in line.spans.clone() {
+                let image_end = span.image_end;
+                pending.push(span);
+                if image_end && let Some((range, _)) = references.next() {
+                    let end = offset + range.end;
+                    let segment_spans = std::mem::take(&mut pending);
+                    let segment = if start == offset {
+                        let mut segment = line.clone();
+                        segment.spans = segment_spans;
+                        segment
+                    } else {
+                        line.continuation(segment_spans)
+                    };
+                    lines.push((segment, None, start..end));
+                    start = end;
+                }
+            }
+            if !pending.is_empty() {
+                if start == offset {
+                    line.spans = pending;
+                } else {
+                    line = line.continuation(pending);
+                }
+                lines.push((line, None, start..source_range.end));
+            }
+        } else {
+            lines.push((line, None, source_range));
+        }
     }
     if let Some((_, _, _, content)) = fence {
-        lines.push((code_frame("└─ code"), Some(content)));
+        lines.push((
+            code_frame("└─ code"),
+            Some(content),
+            source.len()..source.len(),
+        ));
     }
     lines
 }
@@ -426,6 +489,7 @@ fn plain_span(content: impl Into<std::borrow::Cow<'static, str>>, style: Style) 
     LinkedSpan {
         span: Span::styled(content, style),
         url: None,
+        image_end: false,
     }
 }
 
@@ -437,6 +501,7 @@ fn link_span(
     LinkedSpan {
         span: Span::styled(content, style),
         url: Some(url.to_string()),
+        image_end: false,
     }
 }
 
@@ -447,10 +512,181 @@ struct Link<'a> {
     url: &'a str,
 }
 
+/// Returns byte ranges for complete inline images and their destinations, in source order.
+/// Reference-style images are left literal. Destinations may contain local-path spaces;
+/// Markdown punctuation escapes are decoded, but URI validation belongs to the caller.
+pub(super) fn image_references(source: &str) -> Vec<(Range<usize>, String)> {
+    let mut images = Vec::new();
+    let mut fence = None;
+    let mut prose_start = 0;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let marker_line = fence_line(raw);
+        if let Some((marker, minimum)) = fence {
+            if marker_line.is_some_and(|line| closing_fence(line, marker, minimum)) {
+                fence = None;
+                prose_start = offset + line.len();
+            }
+        } else if let Some((marker, length, _)) = marker_line.and_then(opening_fence) {
+            collect_inline_images(&source[prose_start..offset], prose_start, &mut images);
+            fence = Some((marker, length));
+        }
+        offset += line.len();
+    }
+    if fence.is_none() {
+        collect_inline_images(&source[prose_start..], prose_start, &mut images);
+    }
+    images
+}
+
+fn collect_inline_images(source: &str, base: usize, images: &mut Vec<(Range<usize>, String)>) {
+    let bytes = source.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\\' if bytes.get(offset + 1).is_some_and(u8::is_ascii_punctuation) => {
+                offset += 2;
+            }
+            b'`' => {
+                let length = bytes[offset..].iter().take_while(|&&b| b == b'`').count();
+                let mut end = offset + length;
+                let mut closing = None;
+                while end < bytes.len() {
+                    if bytes[end] != b'`' {
+                        end += 1;
+                        continue;
+                    }
+                    let run = bytes[end..].iter().take_while(|&&b| b == b'`').count();
+                    end += run;
+                    if run == length {
+                        closing = Some(end);
+                        break;
+                    }
+                }
+                // Unmatched backticks are literal, not an unfinished code span.
+                offset = closing.unwrap_or(offset + length);
+            }
+            b'!' if bytes.get(offset + 1) == Some(&b'[') => {
+                if let Some((end, destination)) = image_at(source, offset) {
+                    images.push((base + offset..base + end, destination));
+                    offset = end;
+                } else {
+                    offset += 2;
+                }
+            }
+            _ => offset += 1,
+        }
+    }
+}
+
+fn image_at(source: &str, start: usize) -> Option<(usize, String)> {
+    let bytes = source.as_bytes();
+    let mut cursor = start + 2;
+    let mut depth = 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' if bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) => {
+                cursor += 2;
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if bytes.get(cursor..cursor + 2)? != b"](" {
+        return None;
+    }
+    cursor += 2;
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    let angle = bytes.get(cursor) == Some(&b'<');
+    cursor += usize::from(angle);
+    let destination_start = cursor;
+    depth = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\r' | b'\n' => return None,
+            b'\\' if bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) => {
+                cursor += 2;
+                continue;
+            }
+            b'>' if angle => break,
+            b'"' | b'\''
+                if !angle
+                    && depth == 0
+                    && cursor > destination_start
+                    && bytes[cursor - 1].is_ascii_whitespace() =>
+            {
+                break;
+            }
+            b'<' if angle => return None,
+            b'(' if !angle => depth += 1,
+            b')' if !angle && depth == 0 => break,
+            b')' if !angle => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    bytes.get(cursor)?;
+    let destination = source[destination_start..cursor].trim();
+    if angle {
+        cursor += 1;
+    }
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    // An optional quoted title is part of the syntax, not the destination.
+    if matches!(bytes.get(cursor), Some(b'"' | b'\'')) {
+        let quote = bytes[cursor];
+        cursor += 1;
+        loop {
+            match *bytes.get(cursor)? {
+                b'\r' | b'\n' => return None,
+                b'\\' => cursor += 2,
+                byte if byte == quote => {
+                    cursor += 1;
+                    break;
+                }
+                _ => cursor += 1,
+            }
+        }
+        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+    }
+    if bytes.get(cursor) != Some(&b')') {
+        return None;
+    }
+    let mut decoded = String::new();
+    let mut characters = destination.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && characters.peek().is_some_and(char::is_ascii_punctuation) {
+            decoded.push(characters.next()?);
+        } else {
+            decoded.push(character);
+        }
+    }
+    Some((cursor + 1, decoded))
+}
+
 fn next_markdown_link(source: &str) -> Option<Link<'_>> {
     let mut offset = 0;
     while let Some(relative_start) = source[offset..].find('[') {
         let start = offset + relative_start;
+        // Images have their own rendering path; do not consume their alt text as a link.
+        if start > 0 && source.as_bytes()[start - 1] == b'!' {
+            offset = image_at(source, start - 1).map_or(start + 1, |(end, _)| end);
+            continue;
+        }
         let label_end = source[start + 1..].find(']').map(|end| start + 1 + end)?;
         if !source[label_end..].starts_with("](") {
             offset = label_end + 1;
@@ -555,7 +791,27 @@ fn inline_with_link_destinations(
         let marker = rest
             .find(['`', '*', '_'])
             .map(|index| (index, &rest[index..]));
-        if let Some(link) = next_link(rest)
+        let image = image_references(rest).into_iter().next();
+        let link = next_link(rest);
+        if let Some((range, _)) = image
+            && marker
+                .as_ref()
+                .is_none_or(|(index, _)| range.start <= *index)
+            && link.as_ref().is_none_or(|link| range.start <= link.start)
+        {
+            plain.push_str(&rest[..range.start]);
+            if !plain.is_empty() {
+                spans.push(plain_span(std::mem::take(&mut plain), base));
+            }
+            // Keep complete image syntax atomic, including punctuation in its
+            // destination, and retain the surrounding inline style.
+            let mut span = plain_span(rest[range.clone()].to_string(), base);
+            span.image_end = true;
+            spans.push(span);
+            rest = &rest[range.end..];
+            continue;
+        }
+        if let Some(link) = link
             && marker.as_ref().is_none_or(|(index, _)| link.start < *index)
         {
             plain.push_str(&rest[..link.start]);
@@ -979,6 +1235,79 @@ mod tests {
 
         assert_eq!(joined, "`[label](https://example.com/docs)`");
         assert!(linked_urls(source).is_empty());
+    }
+
+    #[test]
+    fn extracts_complete_images_in_source_order_with_byte_ranges() {
+        let source =
+            "é ![nested [alt]](https://example.com/a_(b(c)).png) then ![](</tmp/my image.png>)";
+        let images = image_references(source);
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            &source[images[0].0.clone()],
+            "![nested [alt]](https://example.com/a_(b(c)).png)"
+        );
+        assert_eq!(images[0].0.start, 3);
+        assert_eq!(images[0].1, "https://example.com/a_(b(c)).png");
+        assert_eq!(&source[images[1].0.clone()], "![](</tmp/my image.png>)");
+        assert_eq!(images[1].1, "/tmp/my image.png");
+    }
+
+    #[test]
+    fn images_ignore_fences_code_spans_and_escaped_syntax() {
+        let source = "![a](a)\r\n```md\r\n![no](no)\r\n~~~\r\n![no](no)\r\n```\r\n\
+            `![no](no)` ``with ` ![no](no)\ncode`` \\![no](no) !\\[no](no) \\\\![b](b)\n\
+            ~~~~\n![no](no)\n~~~\n![no](no)\n~~~~\n![c](c)\n```\n![no](no)";
+        let destinations: Vec<_> = image_references(source)
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect();
+        assert_eq!(destinations, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn images_support_local_spaces_escapes_and_quoted_titles() {
+        let source = r#"![a\]](/tmp/my image\(1\).png "a ) title") ![b](<https://example.com/a(b)> 'title')"#;
+        let images = image_references(source);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].1, "/tmp/my image(1).png");
+        assert_eq!(images[1].1, "https://example.com/a(b)");
+        assert_eq!(
+            &source[images[0].0.clone()],
+            r#"![a\]](/tmp/my image\(1\).png "a ) title")"#
+        );
+        assert_eq!(images[1].0.end, source.len());
+    }
+
+    #[test]
+    fn incomplete_images_and_reference_images_remain_literal() {
+        for source in [
+            "![alt",
+            "![alt]",
+            "![alt](",
+            "![alt](a(b)",
+            "![alt](<a)",
+            "![alt](<a>",
+            "![alt](a \"title)",
+            "![alt][ref]",
+        ] {
+            assert!(image_references(source).is_empty(), "{source}");
+        }
+        assert_eq!(image_references("![alt]()"), vec![(0..8, String::new())]);
+        // An unmatched inline-code marker does not hide subsequent complete syntax.
+        assert_eq!(image_references("` ![ok](ok)")[0].1, "ok");
+    }
+
+    #[test]
+    fn markdown_link_parser_does_not_consume_images() {
+        assert!(next_markdown_link("![alt](https://example.com/image.png)").is_none());
+        let source = "![alt](https://example.com/image.png) [docs](https://example.com/docs)";
+        let link = next_markdown_link(source).unwrap();
+        assert_eq!(link.label, Some("docs"));
+        assert_eq!(
+            &source[link.start..link.end],
+            "[docs](https://example.com/docs)"
+        );
     }
 
     #[test]

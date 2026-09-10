@@ -71,8 +71,8 @@ use crate::{
 };
 
 use app::{
-    Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
-    UserImage,
+    Action, AgentPart, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt,
+    Update, UserImage,
 };
 
 struct ModelSwitchCompletion {
@@ -1158,7 +1158,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
                     let event = {
-                        let redraw = app.needs_redraw_tick();
+                        let redraw = app.needs_redraw_tick() || images.pending();
                         let mut stopped = pin!(stop.requested());
                         // Rotate the first eligible source after every winner.
                         // If none is ready, poll every eligible source with the
@@ -1347,7 +1347,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     let event = {
-                        let redraw = app.needs_redraw_tick();
+                        let redraw = app.needs_redraw_tick() || images.pending();
                         let mut stopped = pin!(stop.requested());
                         let mut shutdown = pin!(storage_shutdown.cancelled());
                         // A local round-robin race keeps hot input/update queues
@@ -2547,14 +2547,11 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 append: true,
             }]
         }
-        SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
-            .map(|text| Update::AgentMessage {
-                id: chunk.message_id.to_string(),
-                text,
-                append: true,
-            })
-            .into_iter()
-            .collect(),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            agent_content_update(chunk.message_id.to_string(), chunk.content, true)
+                .into_iter()
+                .collect()
+        }
         SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Update::AgentThought {
                 id: chunk.message_id.to_string(),
@@ -2718,11 +2715,24 @@ fn message_patch(
                 append: false,
             }];
         }
-        MessageKind::Agent => |id, text| Update::AgentMessage {
-            id,
-            text,
-            append: false,
-        },
+        MessageKind::Agent => {
+            if !blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+            {
+                let text = blocks
+                    .into_iter()
+                    .filter_map(message_of)
+                    .collect::<String>();
+                return vec![Update::AgentMessage {
+                    id,
+                    text,
+                    append: false,
+                }];
+            }
+            let parts = blocks.into_iter().filter_map(agent_part_of).collect();
+            return vec![Update::AgentParts { id, parts }];
+        }
         MessageKind::Thought => |id, text| Update::AgentThought {
             id,
             text,
@@ -2735,6 +2745,32 @@ fn message_patch(
         .collect::<Vec<_>>()
         .join("");
     vec![patch(id, text)]
+}
+
+fn agent_content_update(id: String, content: ContentBlock, append: bool) -> Option<Update> {
+    agent_part_of(content).map(|part| match part {
+        AgentPart::Text(text) => Update::AgentMessage { id, text, append },
+        AgentPart::Image(image) => Update::AgentImage { id, image, append },
+    })
+}
+
+fn agent_part_of(content: ContentBlock) -> Option<AgentPart> {
+    if let ContentBlock::Image(image) = content {
+        let fallback = image
+            .uri
+            .as_deref()
+            .filter(|uri| safe_media_uri(uri))
+            .map_or_else(|| "[Image]".to_string(), |uri| format!("[Image]({uri})"));
+        // Bound encoded source retention here; base64 and raster decoding stay
+        // in the image worker, whose failures use the renderer's text fallback.
+        if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), 0)
+            && !image.data.is_empty()
+        {
+            return Some(AgentPart::Image(image));
+        }
+        return Some(AgentPart::Text(fallback));
+    }
+    message_of(content).map(AgentPart::Text)
 }
 
 fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
@@ -3041,6 +3077,7 @@ mod tests {
         StateUpdate, TextContent, UpdateSessionNotification, UserMessage,
     };
     use agent_client_protocol::{Channel, ConnectTo};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use crossterm::event::Event;
 
     use serde_json::json;
@@ -3049,18 +3086,18 @@ mod tests {
         ActiveSessionRoute, AgentInvocation, ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST,
         ModelChoice, OPENROUTER_API_KEY_ENV, ProtocolVersion, QueuedUpdate, accept_queued_update,
         active_config_matches, active_session_config, agent_command_for_launch,
-        apply_pending_updates, attachments_from_paste, authentication_required,
-        client_capabilities, command, credential_storage_for_launch, current_model_choice,
-        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
-        message_of, osc52, previous_session_for_resume, prompt_blocks, readable,
-        refresh_config_state, refresh_session_after_auth, save_effort_default_to,
+        agent_content_update, apply_pending_updates, attachments_from_paste,
+        authentication_required, client_capabilities, command, credential_storage_for_launch,
+        current_model_choice, detach_from_controlling_terminal, durable_session_id, effort_state,
+        error_detail, handle, message_of, osc52, previous_session_for_resume, prompt_blocks,
+        readable, refresh_config_state, refresh_session_after_auth, save_effort_default_to,
         save_model_defaults_to, terminal_auth_command, transition_route, translate,
         translate_for_session, usable_terminal_auth_methods, user_message_of,
         wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
-        tui::app::{Action, App, SessionDialog, SessionRename, SubmittedPrompt, Update},
+        tui::app::{Action, AgentPart, App, SessionDialog, SessionRename, SubmittedPrompt, Update},
     };
 
     fn command_args(command: &tokio::process::Command) -> Vec<String> {
@@ -4109,8 +4146,73 @@ mod tests {
             );
             assert!(
                 matches!(translate_for_session(update, "session").as_slice(),
-                [Update::AgentMessage { text, .. }] if text == "[Image]")
+                [Update::AgentParts { parts, .. }] if matches!(parts.as_slice(), [AgentPart::Image(image)] if image.data == "c2VjcmV0"))
             );
+        }
+    }
+
+    #[test]
+    fn assistant_image_content_survives_replay_in_order() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let content = vec![
+            ContentBlock::Text(wire::TextContent::new("before")),
+            ContentBlock::Image(wire::ImageContent::new("AQID", "image/png")),
+            ContentBlock::Text(wire::TextContent::new("after")),
+        ];
+        for _ in 0..2 {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::AgentMessage(AgentMessage::new("agent").content(content.clone())),
+            );
+            for update in translate_for_session(notification, "session") {
+                app.apply(update);
+            }
+            let [Block::AgentParts(parts)] = app.blocks.as_slice() else {
+                panic!("expected one multipart message");
+            };
+            let [
+                AgentPart::Text(before),
+                AgentPart::Image(image),
+                AgentPart::Text(after),
+            ] = parts.as_slice()
+            else {
+                panic!("expected ordered replay content");
+            };
+            assert_eq!(before, "before");
+            assert_eq!(image.data, "AQID");
+            assert_eq!(STANDARD.decode(&image.data).unwrap(), [1, 2, 3]);
+            assert_eq!(image.mime_type, "image/png");
+            assert_eq!(after, "after");
+        }
+    }
+
+    #[test]
+    fn assistant_image_translation_defers_decode_to_worker() {
+        let update = agent_content_update(
+            "agent".into(),
+            ContentBlock::Image(wire::ImageContent::new("not base64!", "image/png")),
+            true,
+        );
+        assert!(
+            matches!(update, Some(Update::AgentImage { image, .. }) if image.data == "not base64!")
+        );
+    }
+
+    #[test]
+    fn assistant_image_invalid_source_uses_textual_fallback() {
+        for data in [String::new(), "A".repeat(14 * 1024 * 1024 + 1)] {
+            let update = agent_content_update(
+                "agent".into(),
+                ContentBlock::Image(wire::ImageContent::new(data, "image/png")),
+                true,
+            );
+            assert!(matches!(update, Some(Update::AgentMessage { text, .. }) if text == "[Image]"));
         }
     }
 

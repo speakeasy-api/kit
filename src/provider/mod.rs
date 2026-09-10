@@ -1,6 +1,6 @@
 mod adapter;
 pub mod chatgpt;
-mod openai_auth;
+pub(crate) mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
 
