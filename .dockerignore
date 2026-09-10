@@ -1,9 +1,14 @@
-# Send only inputs required to compile the Kit binary.
+# Send only inputs required to build and package Kit.
 **
 !Cargo.toml
 !Cargo.lock
 !rust-toolchain.toml
 !build.rs
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!third_party/
+!third_party/licenses/
+!third_party/licenses/**
 !src/
 !src/**
 !docs/

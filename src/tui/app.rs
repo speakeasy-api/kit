@@ -38,6 +38,7 @@ pub(super) const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
+    markdown,
     wrap::LinkHit,
 };
 
@@ -321,21 +322,17 @@ fn replace_image_uri_on_line(
     let end = text[start..]
         .find('\n')
         .map_or(text.len(), |offset| start + offset);
-    let target = format!("]({source_uri})");
-    let offset = text[start..end]
-        .match_indices(&target)
-        .find_map(|(offset, _)| {
-            let (_, label) = text[start..start + offset].rsplit_once('[')?;
-            let image_label = label == "Image"
-                || label.strip_prefix("Image #").is_some_and(|number| {
-                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                });
-            image_label.then_some(offset)
-        });
-    if let Some(offset) = offset {
-        let target_start = start + offset;
-        let replacement = local_uri.map_or_else(|| "]".to_string(), |uri| format!("]({uri})"));
-        text.replace_range(target_start..target_start + target.len(), &replacement);
+    let destination = markdown::image_label_link_destinations(&text[start..end])
+        .into_iter()
+        .find_map(|(range, uri)| (uri == source_uri).then_some(range));
+    if let Some(destination) = destination {
+        let destination = start + destination.start..start + destination.end;
+        if let Some(local_uri) = local_uri {
+            text.replace_range(destination, local_uri);
+        } else {
+            // Remove the complete `](destination)` suffix, leaving the label as plain text.
+            text.replace_range(destination.start - 2..destination.end + 1, "]");
+        }
     }
 }
 
@@ -1526,7 +1523,7 @@ impl App {
             .map(|(text, _)| text.as_str())
     }
 
-    fn toast(&mut self, text: impl Into<String>) {
+    pub(super) fn toast(&mut self, text: impl Into<String>) {
         self.toast = Some((text.into(), Instant::now()));
     }
 
@@ -3467,6 +3464,7 @@ impl App {
                 return Action::Quit;
             }
             self.editor.clear();
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
             self.toast("prompt cleared — ctrl+c again to quit");
             return Action::None;
         }
@@ -3708,6 +3706,9 @@ impl App {
                     }
                 }
                 let input = self.editor.submit();
+                // Pending clipboard reads belong to the submitted draft, not
+                // the empty composer that replaces it (including commands).
+                self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
                 return match parse(&input, !self.auth_methods.is_empty()) {
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Resume {
@@ -4323,7 +4324,7 @@ mod tests {
     use super::{
         Action, AgentPart, App, Attachment, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
         MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase, Update,
-        UserImage,
+        UserImage, replace_image_uri_on_line,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -4736,6 +4737,34 @@ mod tests {
         assert_eq!(app.retained_image_source_bytes, 2 * bytes);
         app.apply(patch(Vec::new(), false));
         assert_eq!(app.retained_image_source_bytes, bytes);
+    }
+
+    #[test]
+    fn replay_replaces_parsed_repeated_image_links_but_not_inline_code() {
+        let source_uri = "file:///tmp/source.png";
+        let mut text =
+            format!("`[Image #1]({source_uri})` [Image #2]({source_uri}) [Image #3]({source_uri})");
+
+        replace_image_uri_on_line(
+            &mut text,
+            0,
+            Some(source_uri),
+            Some("file:///tmp/first.png"),
+        );
+        replace_image_uri_on_line(
+            &mut text,
+            0,
+            Some(source_uri),
+            Some("file:///tmp/second.png"),
+        );
+
+        assert_eq!(
+            text,
+            format!(
+                "`[Image #1]({source_uri})` [Image #2](file:///tmp/first.png) \
+                 [Image #3](file:///tmp/second.png)"
+            )
+        );
     }
 
     #[test]
