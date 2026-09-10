@@ -762,12 +762,23 @@ fn next_link(source: &str) -> Option<Link<'_>> {
     }
 }
 
-pub(super) fn line_with_link(source: &str, url: &str) -> Option<usize> {
-    source.split('\n').position(|line| {
-        inline(line, Style::default())
-            .iter()
-            .any(|span| span.url.as_deref() == Some(url))
-    })
+pub(super) fn image_label_links(source: &str) -> Vec<(usize, String)> {
+    source
+        .split('\n')
+        .enumerate()
+        .flat_map(|(line, source)| {
+            inline(source, Style::default())
+                .into_iter()
+                .filter_map(move |span| {
+                    let label = span.span.content.as_ref();
+                    let image_label = label == "Image"
+                        || label.strip_prefix("Image #").is_some_and(|number| {
+                            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                        });
+                    image_label.then_some((line, span.url?))
+                })
+        })
+        .collect()
 }
 
 pub(super) fn inline_spans(source: &str, base: Style) -> Vec<LinkedSpan> {

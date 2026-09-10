@@ -23,7 +23,9 @@ use crossterm::event::{
 use ratatui::{layout::Rect, text::Line};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::attachment::{RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment};
+use super::attachment::{
+    MaterializedImage, RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment,
+};
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
@@ -371,9 +373,18 @@ struct SteerEdit {
     next_attachment: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardRoute {
+    Blocked(u64),
+    Composer(u64),
+    Rename(u64),
+    Steer { id: String, token: u64 },
+}
+
 pub enum Action {
     None,
     Redraw,
+    ReadClipboard(ClipboardRoute),
     Submit {
         prompt: SubmittedPrompt,
         inject: bool,
@@ -749,6 +760,7 @@ pub struct App {
     retained_attachment_files: RetainedAttachmentFiles,
     next_attachment: usize,
     submitted_attachment: usize,
+    clipboard_route_epoch: u64,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     pub can_steer: bool,
@@ -1002,6 +1014,7 @@ impl App {
             retained_attachment_files: RetainedAttachmentFiles::default(),
             next_attachment: 0,
             submitted_attachment: 0,
+            clipboard_route_epoch: 0,
             phase: Phase::Idle,
             turn_started: None,
             can_steer: false,
@@ -1648,9 +1661,7 @@ impl App {
                 .as_deref()
                 .is_some_and(|uri| uri.starts_with("file:"))
             {
-                let uri = self
-                    .attachment_cache
-                    .image_uri(image.key, &image.data, &image.mime_type);
+                let uri = self.attachment_cache.image_uri(image.key);
                 replace_image_uri_on_line(
                     &mut text,
                     image.line,
@@ -1841,6 +1852,13 @@ impl App {
         if let Some(millis) = turn_millis {
             self.push_block(Block::TurnDuration(millis));
         }
+    }
+
+    pub(super) fn apply_materialized(&mut self, update: Update, images: Vec<MaterializedImage>) {
+        for image in images {
+            self.attachment_cache.admit(image);
+        }
+        self.apply(update);
     }
 
     pub fn apply(&mut self, update: Update) {
@@ -2750,6 +2768,32 @@ impl App {
         self.session_dialog
             .as_ref()
             .is_some_and(|dialog| dialog.rename.is_some())
+    }
+
+    pub(super) fn clipboard_route(&self) -> ClipboardRoute {
+        if self.model_switch.is_some()
+            || self.model_dialog.is_some()
+            || self.effort_dialog.is_some()
+            || (self.session_dialog.is_some() && !self.session_rename_active())
+            || (self.queue_focused && !self.session_rename_active())
+        {
+            ClipboardRoute::Blocked(self.clipboard_route_epoch)
+        } else if self.session_rename_active() {
+            ClipboardRoute::Rename(self.clipboard_route_epoch)
+        } else if let Some(edit) = &self.steer_edit {
+            ClipboardRoute::Steer {
+                id: edit.id.clone(),
+                token: edit.token,
+            }
+        } else {
+            ClipboardRoute::Composer(self.clipboard_route_epoch)
+        }
+    }
+
+    pub(super) fn finish_clipboard_route_event(&mut self, before: &ClipboardRoute) {
+        if std::mem::discriminant(before) != std::mem::discriminant(&self.clipboard_route()) {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+        }
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -4723,13 +4767,29 @@ mod tests {
             url::Url::parse(uri).unwrap().to_file_path().unwrap()
         };
 
+        let prepared = || {
+            let image = UserImage::new(encoded.clone(), "image/png".into(), 0).unwrap();
+            super::super::attachment::materialize_image(
+                image.key,
+                &image.data,
+                &image.mime_type,
+                10 * 1024 * 1024,
+            )
+            .unwrap()
+        };
         let mut app = app();
-        app.apply(replay("one", "file:///tmp/deleted-one.png"));
+        app.apply_materialized(
+            replay("one", "file:///tmp/deleted-one.png"),
+            vec![prepared()],
+        );
         let first = linked_path(&app, 0);
         assert!(first.exists());
         assert!(matches!(&app.blocks[0], Block::User(message)
             if message.text.starts_with("[reference](file:///tmp/deleted-one.png)")));
-        app.apply(replay("two", "file:///tmp/deleted-two.png"));
+        app.apply_materialized(
+            replay("two", "file:///tmp/deleted-two.png"),
+            vec![prepared()],
+        );
         let second = linked_path(&app, 1);
         assert_eq!(second, first, "equal image content should reuse one file");
 

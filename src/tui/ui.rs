@@ -1025,7 +1025,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         let Some(source) = sources.get(source_index) else {
             continue;
         };
-        if let Some(image) = images.prepare(source, inner.width.max(1)) {
+        if let Some(image) = images.prepare_assistant(source, inner.width.max(1)) {
             images.render(frame, image, inner, y);
         }
     }
@@ -2386,7 +2386,7 @@ mod tests {
     use agent_client_protocol::schema::v2::{
         IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
     };
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
@@ -2896,6 +2896,26 @@ mod tests {
         columns
             .map(|column| buffer[(column, row)].symbol())
             .collect()
+    }
+
+    fn wait_for_image_decode(images: &mut ImageRuntime) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while images.pending() && std::time::Instant::now() < deadline {
+            images.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        images.poll();
+        assert!(!images.pending(), "background image decode did not finish");
+    }
+
+    fn buffer_contains_black_image_cell(buffer: &ratatui::buffer::Buffer) -> bool {
+        (0..buffer.area.height).any(|row| {
+            (0..buffer.area.width).any(|column| {
+                let cell = &buffer[(column, row)];
+                cell.fg == ratatui::style::Color::Rgb(0, 0, 0)
+                    && cell.bg == ratatui::style::Color::Rgb(0, 0, 0)
+            })
+        })
     }
 
     #[test]
@@ -4786,7 +4806,16 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
+        assert_eq!(images.cached_entries(), 0);
+        wait_for_image_decode(&mut images);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
         assert_eq!(images.cached_entries(), 1);
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
+
         let mut disabled = ImageRuntime::disabled();
         terminal
             .draw(|frame| draw(frame, &mut app, &mut disabled))
@@ -4848,18 +4877,39 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
-        assert_eq!(images.cached_entries(), 1, "visible image is prepared");
+        assert_eq!(images.cached_entries(), 0, "visible image decode is queued");
+        wait_for_image_decode(&mut images);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 1, "visible image is rendered");
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
         let reserved_rows = app.transcript_cache[0].as_ref().unwrap().rows.len();
 
         images.clear();
+        assert_eq!(
+            images.cached_entries(),
+            0,
+            "decoded image cache was evicted"
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 0, "evicted image decode is queued");
+        wait_for_image_decode(&mut images);
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
         assert_eq!(
             images.cached_entries(),
             1,
-            "an evicted visible image is prepared again before rendering"
+            "an evicted visible image is rendered again after decoding"
         );
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
         assert_eq!(
             app.transcript_cache[0].as_ref().unwrap().rows.len(),
             reserved_rows,

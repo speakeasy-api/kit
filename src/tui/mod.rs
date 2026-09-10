@@ -73,9 +73,10 @@ use crate::{
 };
 
 use app::{
-    Action, AgentPart, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt,
-    Update, UserImage,
+    Action, AgentPart, App, Attachment, AttachmentKind, ClipboardRoute, EffortChoice, ModelChoice,
+    SubmittedPrompt, Update, UserImage,
 };
+use attachment::MaterializedImage;
 
 struct ModelSwitchCompletion {
     generation: u64,
@@ -199,6 +200,178 @@ struct ActiveSessionRoute {
 struct QueuedUpdate {
     generation: Option<u64>,
     update: Update,
+}
+
+const BACKGROUND_QUEUE: usize = 8;
+
+struct BackgroundWorkers {
+    updates: Option<std::sync::mpsc::SyncSender<QueuedUpdate>>,
+    clipboard: Option<std::sync::mpsc::SyncSender<(u64, ClipboardRoute)>>,
+    stopping: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundWorkers {
+    fn try_update(
+        &self,
+        update: QueuedUpdate,
+    ) -> Result<(), Box<std::sync::mpsc::TrySendError<QueuedUpdate>>> {
+        let Some(sender) = &self.updates else {
+            return Err(Box::new(std::sync::mpsc::TrySendError::Disconnected(
+                update,
+            )));
+        };
+        sender.try_send(update).map_err(Box::new)
+    }
+
+    fn try_clipboard(
+        &self,
+        generation: u64,
+        route: ClipboardRoute,
+    ) -> Result<(), std::sync::mpsc::TrySendError<(u64, ClipboardRoute)>> {
+        let Some(sender) = &self.clipboard else {
+            return Err(std::sync::mpsc::TrySendError::Disconnected((
+                generation, route,
+            )));
+        };
+        sender.try_send((generation, route))
+    }
+}
+
+impl Drop for BackgroundWorkers {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.updates.take();
+        self.clipboard.take();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+enum ClipboardResult {
+    Text(String),
+    Attachment(Attachment),
+    Error(String),
+}
+
+enum BackgroundCompletion {
+    Update {
+        queued: QueuedUpdate,
+        images: Vec<MaterializedImage>,
+    },
+    Clipboard {
+        generation: u64,
+        route: ClipboardRoute,
+        result: ClipboardResult,
+    },
+}
+
+fn send_background_completion(
+    completed: &mpsc::Sender<BackgroundCompletion>,
+    stopping: &AtomicBool,
+    mut completion: BackgroundCompletion,
+) -> bool {
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        match completed.try_send(completion) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                completion = returned;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+}
+
+fn spawn_background_workers(
+    completed: mpsc::Sender<BackgroundCompletion>,
+) -> std::io::Result<BackgroundWorkers> {
+    let (updates, update_rx) = std::sync::mpsc::sync_channel::<QueuedUpdate>(BACKGROUND_QUEUE);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let update_stopping = stopping.clone();
+    let update_completed = completed.clone();
+    let update_thread = std::thread::Builder::new()
+        .name("kit-tui-images".into())
+        .spawn(move || {
+            while let Ok(queued) = update_rx.recv() {
+                if update_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut remaining = 64 * 1024 * 1024;
+                let images = match &queued.update {
+                    Update::UserMessage { images, .. } => images
+                        .iter()
+                        .take_while(|_| !update_stopping.load(Ordering::Acquire))
+                        .filter(|image| {
+                            image
+                                .source_uri
+                                .as_deref()
+                                .is_some_and(|uri| uri.starts_with("file:"))
+                        })
+                        .take(64)
+                        .filter_map(|image| {
+                            let prepared = attachment::materialize_image(
+                                image.key,
+                                &image.data,
+                                &image.mime_type,
+                                remaining,
+                            )?;
+                            if prepared.bytes > remaining {
+                                return None;
+                            }
+                            remaining -= prepared.bytes;
+                            Some(prepared)
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if !send_background_completion(
+                    &update_completed,
+                    &update_stopping,
+                    BackgroundCompletion::Update { queued, images },
+                ) {
+                    break;
+                }
+            }
+        })?;
+    let (clipboard, clipboard_rx) =
+        std::sync::mpsc::sync_channel::<(u64, ClipboardRoute)>(BACKGROUND_QUEUE);
+    let clipboard_stopping = stopping.clone();
+    let clipboard_thread = std::thread::Builder::new()
+        .name("kit-tui-clipboard".into())
+        .spawn(move || {
+            while let Ok((generation, route)) = clipboard_rx.recv() {
+                if clipboard_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let result = read_clipboard(&route);
+                if !send_background_completion(
+                    &completed,
+                    &clipboard_stopping,
+                    BackgroundCompletion::Clipboard {
+                        generation,
+                        route,
+                        result,
+                    },
+                ) {
+                    break;
+                }
+            }
+        })?;
+    drop(clipboard_thread);
+    Ok(BackgroundWorkers {
+        updates: Some(updates),
+        clipboard: Some(clipboard),
+        stopping,
+        // Native clipboard APIs provide no portable cancellation mechanism.
+        // Detach that thread so a wedged platform clipboard cannot wedge exit;
+        // the closed completion receiver still rejects stale results.
+        threads: vec![update_thread],
+    })
 }
 
 impl QueuedUpdate {
@@ -1317,6 +1490,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     events = EventStream::new();
                                 }
                                 Action::None | Action::Redraw => {}
+                                Action::ReadClipboard(_) => {
+                                    app.note("authenticate before reading the clipboard");
+                                }
                                 _ => app.note("authenticate before starting a session"),
                             }
                         }
@@ -1348,6 +1524,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             refresh_config_state(&mut app, Some(&config_options));
             let mut saved_model_default = current_model_choice(Some(&config_options));
             let (switch_tx, mut switch_rx) = mpsc::unbounded_channel::<ModelSwitchCompletion>();
+            let (background_tx, mut background_rx) =
+                mpsc::channel::<BackgroundCompletion>(BACKGROUND_QUEUE);
+            let background_workers = spawn_background_workers(background_tx)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
             if let Ok(mut active) = transition_session.lock() {
                 active.id = active_session_id.clone();
             }
@@ -1358,13 +1538,26 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     StorageShutdown,
                     Terminal(Option<std::io::Result<Event>>),
                     ModelSwitch(ModelSwitchCompletion),
+                    Background(Option<BackgroundCompletion>),
                     Update(Option<QueuedUpdate>),
                     Tick,
                     Stop,
                 }
                 let mut next_priority = 0;
                 let mut switches_closed = false;
+                let mut pending_update = None;
                 loop {
+                    if let Some(queued) = pending_update.take() {
+                        match background_workers.try_update(queued) {
+                            Ok(()) => {}
+                            Err(error) => match *error {
+                                std::sync::mpsc::TrySendError::Full(queued) => {
+                                    pending_update = Some(queued);
+                                }
+                                std::sync::mpsc::TrySendError::Disconnected(_) => return Ok(()),
+                            },
+                        }
+                    }
                     let native_links = terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
                         .map(|frame| {
@@ -1396,8 +1589,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         // until this wait ends. This scope drops all losers and
                         // releases input borrows before handlers drain/reset them.
                         poll_fn(|cx| {
-                            for offset in 0..6 {
-                                let branch = (next_priority + offset) % 6;
+                            for offset in 0..7 {
+                                let branch = (next_priority + offset) % 7;
                                 let ready = match branch {
                                     0 => shutdown.as_mut().poll(cx).map(|()| SessionEvent::StorageShutdown),
                                     1 => events.poll_next_unpin(cx).map(SessionEvent::Terminal),
@@ -1411,13 +1604,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         }
                                         Poll::Pending => Poll::Pending,
                                     },
-                                    3 => updates_rx.poll_recv(cx).map(SessionEvent::Update),
-                                    4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
-                                    5 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
+                                    3 => background_rx.poll_recv(cx).map(SessionEvent::Background),
+                                    4 if pending_update.is_none() => updates_rx.poll_recv(cx).map(SessionEvent::Update),
+                                    5 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
+                                    6 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
-                                    next_priority = (branch + 1) % 6;
+                                    next_priority = (branch + 1) % 7;
                                     return ready;
                                 }
                             }
@@ -1941,8 +2135,39 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         ));
                                     });
                                 }
+                                Action::ReadClipboard(route) => {
+                                    let generation = transition_session
+                                        .lock()
+                                        .map(|route| route.generation)
+                                        .unwrap_or_default();
+                                    match background_workers.try_clipboard(generation, route) {
+                                        Ok(()) => {}
+                                        Err(std::sync::mpsc::TrySendError::Full(_)) => app.note("clipboard is busy; try again"),
+                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => app.note("clipboard worker is unavailable"),
+                                    }
+                                }
                                 Action::None | Action::Redraw => {}
                             }
+                        },
+                        SessionEvent::Background(completion) => match completion {
+                            Some(BackgroundCompletion::Update { queued, images }) => {
+                                if let Some(update) = accept_queued_update(&transition_session, queued) {
+                                    if let Update::ConfigOptions(options) = &update {
+                                        refresh_config_state(&mut app, Some(options));
+                                    }
+                                    app.apply_materialized(update, images);
+                                }
+                            }
+                            Some(BackgroundCompletion::Clipboard { generation, route, result }) => {
+                                apply_clipboard_completion(
+                                    &mut app,
+                                    &transition_session,
+                                    generation,
+                                    route,
+                                    result,
+                                );
+                            }
+                            None => return Ok(()),
                         },
                         SessionEvent::ModelSwitch(completion) => {
                             let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation)? else { continue; };
@@ -1976,12 +2201,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         SessionEvent::Update(update) => match update {
-                            Some(update) => apply_pending_updates(
-                                &mut app,
-                                &transition_session,
-                                &mut updates_rx,
-                                update,
-                            ),
+                            Some(update) => match background_workers.try_update(update) {
+                                Ok(()) => {}
+                                Err(error) => match *error {
+                                    std::sync::mpsc::TrySendError::Full(update) => {
+                                        pending_update = Some(update);
+                                    }
+                                    std::sync::mpsc::TrySendError::Disconnected(_) => return Ok(()),
+                                },
+                            },
                             None => return Ok(()),
                         },
                         SessionEvent::Tick => app.tick(),
@@ -2235,29 +2463,29 @@ fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
 
 /// Applies one terminal event, returning the work it asks for.
 fn handle(app: &mut App, event: Event) -> Action {
+    let route = app.clipboard_route();
+    let action = handle_inner(app, event);
+    app.finish_clipboard_route_event(&route);
+    action
+}
+
+fn handle_inner(app: &mut App, event: Event) -> Action {
     match event {
         Event::Key(key) if clipboard_paste_key(key) => {
-            paste_from_clipboard(app);
-            Action::None
+            if paste_blocked(app) {
+                Action::None
+            } else {
+                Action::ReadClipboard(app.clipboard_route())
+            }
         }
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            if terminal_paste_requests_clipboard(&text) {
-                // macOS terminals can turn Command+V with an image clipboard into an
-                // empty bracketed paste instead of reporting the Command key.
-                paste_from_clipboard(app);
-            } else {
-                handle_paste(app, &text);
-            }
+            handle_paste(app, &text);
             Action::None
         }
         _ => Action::None,
     }
-}
-
-fn terminal_paste_requests_clipboard(text: &str) -> bool {
-    text.is_empty()
 }
 
 fn clipboard_paste_key(key: KeyEvent) -> bool {
@@ -2283,30 +2511,45 @@ fn paste_blocked(app: &App) -> bool {
         || (app.queue_focused && !app.session_rename_active())
 }
 
-fn paste_from_clipboard(app: &mut App) {
-    if paste_blocked(app) {
-        return;
-    }
+fn read_clipboard(route: &ClipboardRoute) -> ClipboardResult {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(clipboard) => clipboard,
-        Err(error) => {
-            app.note(format!("clipboard unavailable: {error}"));
-            return;
-        }
+        Err(error) => return ClipboardResult::Error(format!("clipboard unavailable: {error}")),
     };
-    if !app.session_rename_active()
-        && !app.editing_steer()
+    if matches!(route, ClipboardRoute::Composer(_))
         && let Ok(image) = clipboard.get_image()
     {
-        match clipboard_image_attachment(image) {
-            Ok(attachment) => attach_pasted(app, vec![attachment]),
-            Err(error) => app.note(error),
-        }
-        return;
+        return match clipboard_image_attachment(image) {
+            Ok(attachment) => ClipboardResult::Attachment(attachment),
+            Err(error) => ClipboardResult::Error(error),
+        };
     }
     match clipboard.get_text() {
-        Ok(text) => handle_paste(app, &text),
-        Err(_) => app.note("clipboard does not contain text or a supported image"),
+        Ok(text) => ClipboardResult::Text(text),
+        Err(_) => {
+            ClipboardResult::Error("clipboard does not contain text or a supported image".into())
+        }
+    }
+}
+
+fn apply_clipboard_completion(
+    app: &mut App,
+    active: &Arc<Mutex<ActiveSessionRoute>>,
+    generation: u64,
+    route: ClipboardRoute,
+    result: ClipboardResult,
+) {
+    let current_generation = active.lock().map(|route| route.generation).ok();
+    if current_generation != Some(generation)
+        || app.clipboard_route() != route
+        || paste_blocked(app)
+    {
+        return;
+    }
+    match result {
+        ClipboardResult::Text(text) => handle_paste(app, &text),
+        ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
+        ClipboardResult::Error(error) => app.note(error),
     }
 }
 
@@ -2937,15 +3180,19 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
     let mut images = Vec::new();
     let mut image_ordinal = 0;
     let mut separate_after_image = false;
+    let mut available_image_links = Vec::new();
 
     for block in blocks {
         match block {
             ContentBlock::Image(image) => {
                 image_ordinal += 1;
                 let uri = image.uri.filter(|uri| safe_media_uri(uri));
-                let existing_line = uri
-                    .as_deref()
-                    .and_then(|uri| markdown::line_with_link(&text, uri));
+                let existing_line = uri.as_deref().and_then(|uri| {
+                    let index = available_image_links
+                        .iter()
+                        .position(|(_, candidate)| candidate == uri)?;
+                    Some(available_image_links.remove(index).0)
+                });
                 let line =
                     existing_line.unwrap_or_else(|| {
                         if !text.is_empty() && !text.ends_with('\n') {
@@ -2977,6 +3224,12 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                 {
                     text.push('\n');
                 }
+                let first_line = text.bytes().filter(|&byte| byte == b'\n').count();
+                available_image_links.extend(
+                    markdown::image_label_links(&content)
+                        .into_iter()
+                        .map(|(line, uri)| (first_line + line, uri)),
+                );
                 text.push_str(&content);
                 separate_after_image = false;
             }
@@ -3245,22 +3498,26 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActiveSessionRoute, AgentInvocation, ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST,
-        ModelChoice, OPENROUTER_API_KEY_ENV, ProtocolVersion, QueuedUpdate, accept_queued_update,
-        active_config_matches, active_session_config, agent_command_for_launch,
-        agent_content_update, apply_pending_updates, attachments_from_paste,
+        ActiveSessionRoute, AgentInvocation, BackgroundCompletion, ClipboardResult,
+        ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST, ModelChoice, OPENROUTER_API_KEY_ENV,
+        ProtocolVersion, QueuedUpdate, accept_queued_update, active_config_matches,
+        active_session_config, agent_command_for_launch, agent_content_update,
+        apply_clipboard_completion, apply_pending_updates, attachments_from_paste,
         authentication_required, client_capabilities, clipboard_image_attachment,
         clipboard_paste_key, command, credential_storage_for_launch, current_model_choice,
         detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
         keyboard_enhancement_flags, message_of, osc52, previous_session_for_resume, prompt_blocks,
         readable, refresh_config_state, refresh_session_after_auth, save_effort_default_to,
-        save_model_defaults_to, terminal_auth_command, terminal_paste_requests_clipboard,
+        save_model_defaults_to, send_background_completion, terminal_auth_command,
         transition_route, translate, translate_for_session, usable_terminal_auth_methods,
         user_message_of, wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
-        tui::app::{Action, AgentPart, App, SessionDialog, SessionRename, SubmittedPrompt, Update},
+        tui::app::{
+            Action, AgentPart, App, ClipboardRoute, SessionDialog, SessionRename, SubmittedPrompt,
+            Update,
+        },
     };
 
     fn command_args(command: &tokio::process::Command) -> Vec<String> {
@@ -5097,9 +5354,85 @@ mod tests {
     }
 
     #[test]
-    fn empty_terminal_paste_requests_native_clipboard() {
-        assert!(terminal_paste_requests_clipboard(""));
-        assert!(!terminal_paste_requests_clipboard("ordinary text"));
+    fn empty_terminal_paste_never_requests_native_clipboard() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        assert!(app.editor.text().is_empty());
+    }
+
+    #[test]
+    fn full_completion_queue_observes_worker_shutdown() {
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        assert!(send_background_completion(
+            &completed,
+            &stopping,
+            BackgroundCompletion::Clipboard {
+                generation: 1,
+                route: ClipboardRoute::Composer(0),
+                result: ClipboardResult::Error("first".into()),
+            },
+        ));
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!send_background_completion(
+            &completed,
+            &stopping,
+            BackgroundCompletion::Clipboard {
+                generation: 1,
+                route: ClipboardRoute::Composer(0),
+                result: ClipboardResult::Error("second".into()),
+            },
+        ));
+        assert!(completions.try_recv().is_ok());
+    }
+
+    #[test]
+    fn clipboard_completion_is_rejected_after_session_or_modal_change() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let active = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 2,
+        }));
+
+        apply_clipboard_completion(
+            &mut app,
+            &active,
+            1,
+            ClipboardRoute::Composer(0),
+            ClipboardResult::Text("stale".into()),
+        );
+        assert!(app.editor.is_empty());
+
+        let before_modal = app.clipboard_route();
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: None,
+        });
+        app.finish_clipboard_route_event(&before_modal);
+        let during_modal = app.clipboard_route();
+        app.session_dialog = None;
+        app.finish_clipboard_route_event(&during_modal);
+        apply_clipboard_completion(
+            &mut app,
+            &active,
+            2,
+            ClipboardRoute::Composer(0),
+            ClipboardResult::Text("misrouted".into()),
+        );
+        assert!(app.editor.is_empty());
     }
 
     #[test]
@@ -5283,6 +5616,93 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, "AQID");
         assert_eq!(images[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn repeated_image_uri_occurrences_are_consumed_in_order() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[Image #1]({uri})\n[Image #2]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri})\n[Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn repeated_image_uri_occurrences_on_one_line_share_the_line() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[Image #1]({uri}) [Image #2]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri}) [Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn generated_placeholders_are_not_reconsumed() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri})\n[Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn ordinary_link_does_not_consume_an_image_uri_occurrence() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[reference]({uri})\n[Image #1]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[reference]({uri})\n[Image #1]({uri})"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 1);
     }
 
     #[test]

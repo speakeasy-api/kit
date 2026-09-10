@@ -74,7 +74,8 @@ impl ImageRuntime {
         self.decoded_backing_bytes = 0;
     }
 
-    pub fn prepare(&mut self, image: &UserImage, width: u16) -> Option<PreparedImage> {
+    #[cfg(test)]
+    fn prepare(&mut self, image: &UserImage, width: u16) -> Option<PreparedImage> {
         self.picker.as_ref()?;
         if width == 0 {
             return None;

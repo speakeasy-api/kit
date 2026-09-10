@@ -70,6 +70,53 @@ impl RetainedAttachmentFiles {
     }
 }
 
+pub(super) struct MaterializedImage {
+    key: [u8; 32],
+    file: Arc<TemporaryAttachment>,
+    pub(super) bytes: usize,
+}
+
+/// Validates and materializes one bounded inline image. This performs decoding
+/// and filesystem I/O, so callers must run it outside the terminal event loop.
+pub(super) fn materialize_image(
+    key: [u8; 32],
+    encoded: &str,
+    mime_type: &str,
+    max_bytes: usize,
+) -> Option<MaterializedImage> {
+    if encoded.len() > MAX_ENCODED_BYTES {
+        return None;
+    }
+    let bytes = STANDARD.decode(encoded).ok()?;
+    if bytes.len() > MAX_IMAGE_BYTES || bytes.len() > max_bytes {
+        return None;
+    }
+    let (format, suffix) = match mime_type {
+        "image/png" => (ImageFormat::Png, ".png"),
+        "image/jpeg" => (ImageFormat::Jpeg, ".jpg"),
+        "image/gif" => (ImageFormat::Gif, ".gif"),
+        "image/webp" => (ImageFormat::WebP, ".webp"),
+        _ => return None,
+    };
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_ALLOCATION);
+    reader.limits(limits);
+    drop(reader.decode().ok()?);
+    let (mut file, path) = create_private_image(suffix).ok()?;
+    file.write_all(&bytes).ok()?;
+    file.flush().ok()?;
+    let size = bytes.len();
+    drop(file);
+    Some(MaterializedImage {
+        key,
+        file: own_temp_path(path),
+        bytes: size,
+    })
+}
+
 #[derive(Default)]
 pub(super) struct SessionAttachmentCache {
     files: HashMap<[u8; 32], Arc<TemporaryAttachment>>,
@@ -82,57 +129,23 @@ impl SessionAttachmentCache {
         self.bytes = 0;
     }
 
-    /// Validates and materializes bounded inline images without following source
-    /// URIs. Non-evicting admission keeps existing links valid for the session.
-    pub(super) fn image_uri(
-        &mut self,
-        key: [u8; 32],
-        encoded: &str,
-        mime_type: &str,
-    ) -> Option<String> {
-        if let Some(file) = self.files.get(&key) {
-            return url::Url::from_file_path(file.path())
-                .ok()
-                .map(|uri| uri.to_string());
-        }
-        if self.files.len() >= MAX_SESSION_FILES
-            || encoded.len() > MAX_ENCODED_BYTES
-            || self.bytes == MAX_SESSION_BYTES
+    /// Admits a worker-produced file without evicting existing session links.
+    pub(super) fn admit(&mut self, image: MaterializedImage) {
+        if self.files.contains_key(&image.key)
+            || self.files.len() >= MAX_SESSION_FILES
+            || image.bytes > MAX_SESSION_BYTES.saturating_sub(self.bytes)
         {
-            return None;
+            return;
         }
-        let bytes = STANDARD.decode(encoded).ok()?;
-        if bytes.len() > MAX_IMAGE_BYTES
-            || bytes.len() > MAX_SESSION_BYTES.saturating_sub(self.bytes)
-        {
-            return None;
-        }
-        let (format, suffix) = match mime_type {
-            "image/png" => (ImageFormat::Png, ".png"),
-            "image/jpeg" => (ImageFormat::Jpeg, ".jpg"),
-            "image/gif" => (ImageFormat::Gif, ".gif"),
-            "image/webp" => (ImageFormat::WebP, ".webp"),
-            _ => return None,
-        };
-        let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(MAX_DIMENSION);
-        limits.max_image_height = Some(MAX_DIMENSION);
-        limits.max_alloc = Some(MAX_DECODED_ALLOCATION);
-        reader.limits(limits);
-        drop(reader.decode().ok()?);
-        // Keep the original encoding (including animation), rather than adding
-        // another PNG encode on the TUI event loop.
-        let (mut file, path) = create_private_image(suffix).ok()?;
-        file.write_all(&bytes).ok()?;
-        file.flush().ok()?;
-        let size = bytes.len();
-        drop(file);
-        let owned = own_temp_path(path);
-        let uri = url::Url::from_file_path(owned.path()).ok()?.to_string();
-        self.bytes += size;
-        self.files.insert(key, owned);
-        Some(uri)
+        self.bytes += image.bytes;
+        self.files.insert(image.key, image.file);
+    }
+
+    pub(super) fn image_uri(&self, key: [u8; 32]) -> Option<String> {
+        let file = self.files.get(&key)?;
+        url::Url::from_file_path(file.path())
+            .ok()
+            .map(|uri| uri.to_string())
     }
 }
 
@@ -155,11 +168,14 @@ mod tests {
         bytes: &[u8],
         mime: &str,
     ) -> Option<std::path::PathBuf> {
-        let uri = cache.image_uri(
-            *blake3::hash(bytes).as_bytes(),
+        let key = *blake3::hash(bytes).as_bytes();
+        cache.admit(materialize_image(
+            key,
             &STANDARD.encode(bytes),
             mime,
-        )?;
+            MAX_IMAGE_BYTES,
+        )?);
+        let uri = cache.image_uri(key)?;
         url::Url::parse(&uri).ok()?.to_file_path().ok()
     }
 
@@ -207,11 +223,19 @@ mod tests {
         let mut cache = SessionAttachmentCache::default();
         assert!(cached_path(&mut cache, b"not a PNG", "image/png").is_none());
         assert!(
-            cache
-                .image_uri([0; 32], &"A".repeat(MAX_ENCODED_BYTES + 1), "image/png")
-                .is_none()
+            materialize_image(
+                [0; 32],
+                &"A".repeat(MAX_ENCODED_BYTES + 1),
+                "image/png",
+                MAX_IMAGE_BYTES,
+            )
+            .is_none()
         );
         let png = source(ImageFormat::Png, 20);
+        assert!(
+            materialize_image([1; 32], &STANDARD.encode(&png), "image/png", png.len() - 1,)
+                .is_none()
+        );
         assert!(cached_path(&mut cache, &png, "image/jpeg").is_none());
         assert!(cached_path(&mut cache, &png, "image/svg+xml").is_none());
     }
