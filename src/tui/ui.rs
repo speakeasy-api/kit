@@ -1220,8 +1220,8 @@ fn user_block_rows(
     (rows, placements)
 }
 
-/// Parse Markdown once, then place viewports after the containing layout line.
-/// Wrapped lines (and tables) stay intact, including their inline style context.
+/// Place viewports at complete image boundaries before wrapping following prose.
+/// Preserve inline style context and keep tables intact as layout units.
 fn agent_block_rows(
     text: &str,
     block_index: usize,
@@ -1236,7 +1236,7 @@ fn agent_block_rows(
     }
     let mut references = markdown::image_references(text).into_iter().peekable();
     for (line_index, (line, code, source)) in
-        markdown::render_copyable_with_sources(text, Some(width))
+        markdown::render_copyable_with_sources(text, Some(width), true)
             .into_iter()
             .enumerate()
     {
@@ -1250,7 +1250,7 @@ fn agent_block_rows(
         ));
         while references
             .peek()
-            .is_some_and(|(range, _)| range.start < source.end)
+            .is_some_and(|(range, _)| range.end <= source.end)
         {
             let Some((_, destination)) = references.next() else {
                 break;
@@ -1473,6 +1473,7 @@ fn user_line(text: &str, first: bool) -> LinkedLine {
             theme::bold(theme::user_color()),
         ),
         url: None,
+        image_end: false,
     }];
     spans.extend(markdown::inline_spans(
         text,
@@ -2474,7 +2475,11 @@ mod tests {
         assert_eq!(placements[1].destination.as_deref(), Some("chart.png"));
         assert!(line_text(&rows[0].0).contains("before"));
         assert!(line_text(&rows[placements[1].row - 1].0).contains("after"));
-        assert!(line_text(&rows[placements[1].row - 1].0).contains("end"));
+        assert!(!line_text(&rows[placements[1].row - 1].0).contains("end"));
+        assert_eq!(
+            line_text(&rows[placements[1].row + super::RESERVED_ROWS as usize].0),
+            " end"
+        );
         assert!(super::agent_parts_rows(&parts, 0, 120, false).1.is_empty());
     }
 
@@ -2492,11 +2497,39 @@ mod tests {
                 assert_eq!(plain.len(), expected.len());
                 let (images, placements) = super::agent_block_rows(source, 0, width, true);
                 assert_eq!(placements.len(), 1);
-                assert_eq!(placements[0].row, plain.len());
-                assert_eq!(images.len(), plain.len() + super::RESERVED_ROWS as usize);
-                for ((expected, plain), image) in expected.iter().zip(&plain).zip(&images) {
+                let preview = placements[0].row;
+                let after = preview + super::RESERVED_ROWS as usize;
+                assert!(line_text(&images[preview - 1].0).ends_with(")"));
+                assert_eq!(
+                    images[..preview]
+                        .iter()
+                        .map(|row| line_text(&row.0))
+                        .collect::<String>()
+                        .split_whitespace()
+                        .collect::<String>(),
+                    "before![alt](image.png)"
+                );
+                assert_eq!(line_text(&images[after].0).trim(), "after");
+                assert!(
+                    !images[..preview]
+                        .iter()
+                        .any(|row| line_text(&row.0).contains("after"))
+                );
+                for (expected, plain) in expected.iter().zip(&plain) {
                     assert_eq!(plain.0, expected.0);
-                    assert_eq!(image.0, expected.0);
+                }
+                if source.starts_with("**") {
+                    for row in images[..preview].iter().chain(&images[after..]) {
+                        assert!(
+                            row.0
+                                .spans
+                                .iter()
+                                .filter(|span| !span.content.trim().is_empty())
+                                .all(|span| {
+                                    span.style.add_modifier.contains(super::Modifier::BOLD)
+                                })
+                        );
+                    }
                 }
                 if width == 120 {
                     assert_eq!(plain.len(), 1);
@@ -2514,8 +2547,8 @@ mod tests {
     #[test]
     fn assistant_image_viewports_follow_layout_units() {
         for source in [
-            "# Heading\n**before ![alt](a.png) after**\nnext ![other](b.png) end\n```rust\nlet x = 1;\n```",
-            "| A | B |\n| --- | --- |\n| ![alt](a.png) | **after** |\nnext ![other](b.png) end",
+            "# Heading\n**before ![alt](a.png)**\nnext ![other](b.png)\n```rust\nlet x = 1;\n```",
+            "| A | B |\n| --- | --- |\n| ![alt](a.png) | **after** |\nnext ![other](b.png)",
         ] {
             for width in [18, 120] {
                 let (plain, _) = super::agent_block_rows(source, 3, width, false);
@@ -2557,8 +2590,13 @@ mod tests {
             Some("https://example.invalid/b.png")
         );
         assert!(line_text(&rows[placements[0].row - 1].0).contains("before"));
-        assert!(line_text(&rows[placements[0].row - 1].0).contains("between"));
-        assert!(line_text(&rows[placements[0].row - 1].0).contains("after"));
+        assert!(!line_text(&rows[placements[0].row - 1].0).contains("between"));
+        assert!(line_text(&rows[placements[1].row - 1].0).contains("between"));
+        assert!(!line_text(&rows[placements[1].row - 1].0).contains("after"));
+        assert_eq!(
+            line_text(&rows[placements[1].row + super::RESERVED_ROWS as usize].0),
+            " after"
+        );
         assert!(placements[1].row >= placements[0].row + super::RESERVED_ROWS as usize);
         let (_, disabled) = super::agent_block_rows(source, 0, 120, false);
         assert!(disabled.is_empty());
@@ -2569,6 +2607,63 @@ mod tests {
         ] {
             assert!(super::agent_block_rows(source, 0, 120, true).1.is_empty());
         }
+    }
+
+    fn assert_same_line_image_order(width: usize) {
+        let source =
+            "**before ![first](a.png) between ![second](b.png) after**\n```rust\nlet x = 1;\n```";
+        let (rows, images) = super::agent_block_rows(source, 3, width, true);
+        assert_eq!(images.len(), 2);
+        let end_first = images[0].row + super::RESERVED_ROWS as usize;
+        let end_second = images[1].row + super::RESERVED_ROWS as usize;
+        let text = |range: std::ops::Range<usize>| {
+            rows[range]
+                .iter()
+                .map(|row| line_text(&row.0))
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<String>()
+        };
+        assert_eq!(text(0..images[0].row), "before![first](a.png)");
+        assert_eq!(text(end_first..images[1].row), "between![second](b.png)");
+        assert_eq!(line_text(&rows[end_second].0), " after");
+        for row in rows[..images[0].row]
+            .iter()
+            .chain(&rows[end_first..images[1].row])
+            .chain(&rows[end_second..end_second + 1])
+        {
+            assert!(
+                row.0
+                    .spans
+                    .iter()
+                    .filter(|span| !span.content.trim().is_empty())
+                    .all(|span| span.style.add_modifier.contains(super::Modifier::BOLD))
+            );
+        }
+        let (plain, _) = super::agent_block_rows(source, 3, width, false);
+        let code_rows = |rows: Vec<super::CachedTranscriptRow>| {
+            rows.into_iter()
+                .filter_map(|row| row.1.1.map(|hit| (row.0, hit.block, hit.range)))
+                .collect::<Vec<_>>()
+        };
+        let actual = code_rows(rows);
+        assert!(!actual.is_empty());
+        assert!(
+            actual
+                .iter()
+                .all(|(_, block, range)| *block == 3 && &source[range.clone()] == "let x = 1;")
+        );
+        assert_eq!(actual, code_rows(plain));
+    }
+
+    #[test]
+    fn assistant_same_line_images_order_wide() {
+        assert_same_line_image_order(120);
+    }
+
+    #[test]
+    fn assistant_same_line_images_order_wrapped() {
+        assert_same_line_image_order(12);
     }
 
     #[test]

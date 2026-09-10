@@ -15,6 +15,8 @@ use unicode_width::UnicodeWidthStr;
 pub struct LinkedSpan {
     pub span: Span<'static>,
     pub url: Option<String>,
+    /// Complete Markdown image syntax; consumed before word wrapping.
+    pub image_end: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,7 +38,11 @@ impl LinkedLine {
             spans: line
                 .spans
                 .into_iter()
-                .map(|span| LinkedSpan { span, url: None })
+                .map(|span| LinkedSpan {
+                    span,
+                    url: None,
+                    image_end: false,
+                })
                 .collect(),
             leading_gutter: None,
         }
@@ -124,6 +130,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
                 spans.push(LinkedSpan {
                     span: Span::raw(" ".repeat(indent)),
                     url: None,
+                    image_end: false,
                 });
                 used = indent;
             }
@@ -132,6 +139,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
             spans.push(LinkedSpan {
                 span: Span::raw(" ".repeat(indent)),
                 url: None,
+                image_end: false,
             });
             used = indent;
         }
@@ -140,6 +148,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
             spans.push(LinkedSpan {
                 span: Span::styled(chunk, style),
                 url,
+                image_end: false,
             });
             continue;
         }
@@ -155,6 +164,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
                     spans.push(LinkedSpan {
                         span: Span::raw(" ".repeat(indent)),
                         url: None,
+                        image_end: false,
                     });
                 }
             }
@@ -162,6 +172,7 @@ fn wrap_linked_line(line: &LinkedLine, width: usize) -> Vec<(Vec<LinkedSpan>, St
             spans.push(LinkedSpan {
                 span: Span::styled(character, style),
                 url: url.clone(),
+                image_end: false,
             });
         }
     }

@@ -21,7 +21,7 @@ pub(super) fn render_copyable_at_width(
     source: &str,
     max_width: Option<usize>,
 ) -> Vec<(LinkedLine, Option<Range<usize>>)> {
-    render_copyable_with_sources(source, max_width)
+    render_copyable_with_sources(source, max_width, false)
         .into_iter()
         .map(|(line, code, _)| (line, code))
         .collect()
@@ -32,6 +32,7 @@ pub(super) fn render_copyable_at_width(
 pub(super) fn render_copyable_with_sources(
     source: &str,
     max_width: Option<usize>,
+    split_images: bool,
 ) -> Vec<(LinkedLine, Option<Range<usize>>, Range<usize>)> {
     let mut next_offset = 0;
     let raw_lines: Vec<(usize, &str)> = source
@@ -118,7 +119,31 @@ pub(super) fn render_copyable_with_sources(
             table_end = end;
             continue;
         }
-        lines.push((block_line(raw, trimmed), None, source_range));
+        let mut line = block_line(raw, trimmed);
+        if split_images {
+            // Parse the whole line first, so emphasis spanning a preview retains
+            // its style. Only prose is split: tables and fences remain intact.
+            let mut references = image_references(raw).into_iter();
+            let mut start = offset;
+            let mut pending = Vec::new();
+            for span in std::mem::take(&mut line.spans) {
+                let image_end = span.image_end;
+                pending.push(span);
+                if image_end && let Some((range, _)) = references.next() {
+                    let end = offset + range.end;
+                    let mut segment = line.clone();
+                    segment.spans = std::mem::take(&mut pending);
+                    lines.push((segment, None, start..end));
+                    start = end;
+                }
+            }
+            if !pending.is_empty() {
+                line.spans = pending;
+                lines.push((line, None, start..source_range.end));
+            }
+        } else {
+            lines.push((line, None, source_range));
+        }
     }
     if let Some((_, _, _, content)) = fence {
         lines.push((
@@ -454,6 +479,7 @@ fn plain_span(content: impl Into<std::borrow::Cow<'static, str>>, style: Style) 
     LinkedSpan {
         span: Span::styled(content, style),
         url: None,
+        image_end: false,
     }
 }
 
@@ -465,6 +491,7 @@ fn link_span(
     LinkedSpan {
         span: Span::styled(content, style),
         url: Some(url.to_string()),
+        image_end: false,
     }
 }
 
@@ -754,7 +781,27 @@ fn inline_with_link_destinations(
         let marker = rest
             .find(['`', '*', '_'])
             .map(|index| (index, &rest[index..]));
-        if let Some(link) = next_link(rest)
+        let image = image_references(rest).into_iter().next();
+        let link = next_link(rest);
+        if let Some((range, _)) = image
+            && marker
+                .as_ref()
+                .is_none_or(|(index, _)| range.start <= *index)
+            && link.as_ref().is_none_or(|link| range.start <= link.start)
+        {
+            plain.push_str(&rest[..range.start]);
+            if !plain.is_empty() {
+                spans.push(plain_span(std::mem::take(&mut plain), base));
+            }
+            // Keep complete image syntax atomic, including punctuation in its
+            // destination, and retain the surrounding inline style.
+            let mut span = plain_span(rest[range.clone()].to_string(), base);
+            span.image_end = true;
+            spans.push(span);
+            rest = &rest[range.end..];
+            continue;
+        }
+        if let Some(link) = link
             && marker.as_ref().is_none_or(|(index, _)| link.start < *index)
         {
             plain.push_str(&rest[..link.start]);
