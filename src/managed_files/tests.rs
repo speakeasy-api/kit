@@ -428,6 +428,7 @@ fn current_writer_descriptor_has_strict_shape_and_roundtrips() {
             "version": 1,
             "id": reference.id,
             "name": "shape.png",
+            "path": source.canonicalize().unwrap(),
             "mime_type": "image/png",
             "size_bytes": disk::metadata(&source).unwrap().len(),
             "image": {"width": 3, "height": 2}
@@ -436,7 +437,12 @@ fn current_writer_descriptor_has_strict_shape_and_roundtrips() {
     let decoded: FileReference = serde_json::from_value(encoded.clone()).unwrap();
     assert_eq!(decoded, reference);
     assert_eq!(f.select(&json!(decoded)).unwrap().len(), 2);
-    for key in encoded.as_object().unwrap().keys() {
+    for key in encoded
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|key| *key != "path")
+    {
         let mut missing = encoded.clone();
         missing.as_object_mut().unwrap().remove(key);
         assert!(
@@ -445,7 +451,7 @@ fn current_writer_descriptor_has_strict_shape_and_roundtrips() {
         );
     }
     let mut unknown = encoded.clone();
-    unknown["path"] = json!(source);
+    unknown["unknown"] = json!(source);
     assert!(serde_json::from_value::<FileReference>(unknown).is_err());
     let mut unknown_dimension = encoded;
     unknown_dimension["image"]["channels"] = json!(1);
@@ -556,3 +562,114 @@ fn fresh_process_resolve_child() {
 }
 
 mod faults;
+
+#[test]
+fn generated_exports_are_real_movable_images_with_independent_snapshots() {
+    for (format, name) in [
+        (ImageFormat::Png, "generated.png"),
+        (ImageFormat::Jpeg, "generated.jpg"),
+    ] {
+        let f = Fixture::new();
+        let source = f.source(name, format, 3, 2);
+        let bytes = disk::read(&source).unwrap();
+        let reference = f.store.import_bytes("session", name, &bytes, None).unwrap();
+        let path = Path::new(reference.path.as_deref().unwrap());
+        assert!(path.is_absolute());
+        assert!(disk::symlink_metadata(path).unwrap().is_file());
+        assert_ne!(path, f.object(&reference));
+        assert_eq!(disk::read(path).unwrap(), bytes);
+        assert_eq!(
+            image::guess_format(&disk::read(path).unwrap()).unwrap(),
+            format
+        );
+        let moved = f.dir.path().join("moved image");
+        assert!(
+            std::process::Command::new("mv")
+                .arg(path)
+                .arg(&moved)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(disk::read(&moved).unwrap(), bytes);
+        assert!(!path.exists());
+        let restarted = FileStore {
+            base: f.store.base.clone(),
+        };
+        assert_eq!(restarted.resolve("session", &reference).unwrap(), bytes);
+        disk::remove_file(moved).unwrap();
+        assert_eq!(restarted.resolve("session", &reference).unwrap(), bytes);
+        assert!(restarted.resolve("other-session", &reference).is_err());
+    }
+}
+
+#[test]
+fn imports_reuse_source_path_without_exporting_or_changing_bytes() {
+    let f = Fixture::new();
+    let source = f.source("original.png", ImageFormat::Png, 3, 2);
+    let bytes = disk::read(&source).unwrap();
+    let reference = f.store.import("session", &source, None).unwrap();
+    assert_eq!(
+        Path::new(reference.path.as_deref().unwrap()),
+        source.canonicalize().unwrap()
+    );
+    assert!(
+        !f.store
+            .session_directory("session")
+            .join("exports")
+            .exists()
+    );
+    assert_eq!(disk::read(&source).unwrap(), bytes);
+    let moved = f.dir.path().join("relocated.png");
+    disk::rename(source, moved).unwrap();
+    assert_eq!(f.store.resolve("session", &reference).unwrap(), bytes);
+}
+
+#[test]
+fn historical_references_and_envelopes_migrate_without_rewriting() {
+    let f = Fixture::new();
+    let reference = f.import("legacy.png");
+    let bytes = f.store.resolve("session", &reference).unwrap();
+    let mut legacy = json!(reference);
+    legacy.as_object_mut().unwrap().remove("path");
+    let decoded: FileReference = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(decoded.path.is_none());
+    assert_eq!(f.store.resolve("session", &decoded).unwrap(), bytes);
+    assert_eq!(
+        f.select(&json!([legacy.clone(), reference])).unwrap().len(),
+        2
+    );
+    let header = serde_json::to_vec(
+        &json!({"file":legacy, "digest":blake3::hash(&bytes).to_hex().to_string()}),
+    )
+    .unwrap();
+    let mut envelope = MAGIC.to_vec();
+    envelope.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    envelope.extend_from_slice(&header);
+    envelope.extend_from_slice(&bytes);
+    disk::write(f.object(&reference), &envelope).unwrap();
+    assert_eq!(f.store.resolve("session", &reference).unwrap(), bytes);
+    assert_eq!(f.store.resolve("session", &decoded).unwrap(), bytes);
+    assert_eq!(disk::read(f.object(&reference)).unwrap(), envelope);
+    let mut migrated = legacy;
+    migrate_file_reference(&mut migrated);
+    let once = migrated.clone();
+    migrate_file_reference(&mut migrated);
+    assert_eq!(migrated, once);
+    assert!(migrated["path"].is_null());
+    let mut current = json!(reference);
+    let before = current.clone();
+    migrate_file_reference(&mut current);
+    assert_eq!(current, before);
+    for invalid in [
+        json!("relative.png"),
+        json!(123),
+        json!("/bad\u{0}path"),
+        json!(format!("/{}", "x".repeat(4096))),
+    ] {
+        let mut malformed = before.clone();
+        malformed["path"] = invalid;
+        assert!(serde_json::from_value::<FileReference>(malformed.clone()).is_err());
+        assert!(f.select(&malformed).is_err());
+    }
+}

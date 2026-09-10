@@ -99,7 +99,7 @@ An artifact-storage error does not turn an already-completed tool into a failed 
 
 ## Return images with `read_file`
 
-`read_file` is a hidden compose callable, not another model-exposed tool. It imports a local image into Kit-managed storage and returns a small JSON **File reference**, not a path or a base64 string:
+`read_file` is a hidden compose callable, not another model-exposed tool. It imports a local image into Kit-managed storage and returns a small JSON **File reference**, not a base64 string. Its `path` field is the full absolute path to the original standalone image bytes, ready for `shell` commands such as `mv`:
 
 ```text
 image = read_file({ path: "screenshot.png" })
@@ -122,7 +122,7 @@ The canonical tool result retains typed images. Supported terminal graphics rend
 
 ### File identity, durability, and lifetime
 
-File descriptors reserve `"$kit": "file"` and use schema version 1. They contain an opaque ID, a bounded display name, MIME type, encoded byte count, and image dimensions. Unknown fields, unknown versions, altered metadata, missing objects, and inaccessible IDs fail rather than appearing as successful text-only image delivery. Do not edit descriptors or invent IDs.
+File descriptors reserve `"$kit": "file"` and use schema version 1. New references contain an opaque ID, a bounded display name, MIME type, encoded byte count, image dimensions, and an absolute `path` to a regular PNG/JPEG file. For imports, this is the canonical source path (the display name still comes from the supplied source). For generated images, it is a separate export under the session’s `exports/` directory, not the private binary envelope. You can move or delete this file with `shell` without affecting durable resolution; the recorded path then becomes stale. The path is informational, not an authorization capability or snapshot identity. Historical version-1 references without `path` remain valid, including edit inputs; they have no local export and are not rewritten or exported on read. A missing legacy path normalizes to `null` internally. Unknown fields, unknown versions, altered metadata, missing objects, and inaccessible IDs fail rather than appearing as successful text-only image delivery. Do not edit descriptors or invent IDs.
 
 Kit stores immutable snapshots under `~/.kit/files/<session-namespace>/` (or `<root>/.kit/files` when HOME is unavailable). A descriptor is returned only after the binary object and directory entries cross the disk durability barrier. Storage failure returns no usable descriptor. Each versioned binary envelope has a bounded metadata header and a digest-verified payload; truncated or corrupted objects are rejected.
 
@@ -177,3 +177,24 @@ Start with the smallest failing Runlet and identify its failure stage:
 - **Interrupted turn:** cancellation propagates to running `shell` and `a2a` calls. Re-inspect project state before retrying because earlier effectful calls may already have completed.
 
 For a Kit-specific error, ask the agent to search the bundled version-matched docs with the exact error text. For command-line syntax, use `kit --help` or `kit <command> --help`.
+
+## Generate and edit subscription images with `image_gen`
+
+`image_gen` is a native compose callable. Sign in with `kit auth login openai --credential-store keychain` first, and select the same persistent credential store when running Kit. The default in-memory store does not support standalone login. It uses your ChatGPT subscription credentials and image quota, **not OpenAI API-key billing**; it never falls back to an API key. Availability and quota depend on your subscription. The server selects the image capability, as it does for Codex; Kit does not offer a model selector or promise a particular model identity.
+
+```text
+image = image_gen({ prompt: "A watercolor illustration of a lighthouse" })
+return image
+```
+
+To edit an image, supply one to four File references authorized in the current session. References from `read_file` and earlier `image_gen` results both work:
+
+```text
+source = read_file({ path: "lighthouse.png" })
+edited = image_gen({ prompt: "Change the scene to sunset", images: [source] })
+return edited
+```
+
+Each call requests one image with automatic size, quality, and background. Prompts are limited to 32,000 UTF-8 bytes. Edit inputs must meet the managed PNG/JPEG limits above and total at most 16 MiB. Output must be a valid nonanimated PNG at most 8 MiB, 8,192 pixels per axis, and 16 megapixels. Kit bounds the HTTP response to 12 MiB and the overall invocation to 180 seconds. Generated images use the same durable, session-scoped storage and final-return delivery rules as `read_file`. Their `path` points to standalone image bytes that you can relocate with `shell` (`mv -- <path> <destination>`); Kit retains a separate immutable snapshot for delivery and edits even after that export is moved, changed, or deleted.
+
+This is an **effectful, quota-consuming** tool. Kit refreshes subscription credentials before submission when needed but does not retry image submissions, including authentication failures. A timeout, cancellation, interrupted response, or storage/delivery failure can occur after the server generates an image and charges quota. Do not put `image_gen` inside an automatic retry boundary or rerun it just because delivery failed. Cancellation stops waiting; it does not guarantee server-side cancellation or a quota refund. Independent calls run concurrently in compose; use data dependencies to order edits.

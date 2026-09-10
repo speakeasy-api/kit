@@ -78,6 +78,14 @@ pub enum Update {
         text: String,
         append: bool,
     },
+    /// A structured assistant image, kept separate from surrounding prose.
+    AgentImage {
+        id: String,
+        image: UserImage,
+        append: bool,
+    },
+    /// Atomic replacement of an assistant message with ordered content parts.
+    AgentParts { id: String, parts: Vec<AgentPart> },
     /// Agent reasoning, either appended as a chunk or replaced by an upsert.
     AgentThought {
         id: String,
@@ -517,9 +525,16 @@ impl From<String> for UserMessage {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum AgentPart {
+    Text(String),
+    Image(UserImage),
+}
+
 pub enum Block {
     User(UserMessage),
     Agent(String),
+    AgentParts(Vec<AgentPart>),
     Thought {
         text: String,
         started: Instant,
@@ -534,6 +549,7 @@ pub enum Block {
 pub(super) struct CachedTranscriptImage {
     pub source: usize,
     pub row: usize,
+    pub destination: Option<String>,
 }
 
 pub(super) struct CachedTranscriptBlock {
@@ -1397,6 +1413,103 @@ impl App {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    fn apply_agent_parts(&mut self, id: String, incoming: Vec<AgentPart>, append: bool) {
+        self.close_thought();
+        self.collapse_last_tool_output();
+        let existing =
+            self.message_blocks.get(&id).copied().filter(|&index| {
+                matches!(self.blocks[index], Block::Agent(_) | Block::AgentParts(_))
+            });
+        let previous = existing
+            .map(|index| match &mut self.blocks[index] {
+                Block::Agent(text) => vec![AgentPart::Text(std::mem::take(text))],
+                Block::AgentParts(parts) => std::mem::take(parts),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        let previous_text = previous
+            .iter()
+            .filter_map(|part| match part {
+                AgentPart::Text(text) => Some(text.as_str()),
+                AgentPart::Image(_) => None,
+            })
+            .collect::<String>();
+        if !append {
+            let released = previous
+                .iter()
+                .map(|part| match part {
+                    AgentPart::Image(image) => image.data.len(),
+                    AgentPart::Text(_) => 0,
+                })
+                .sum::<usize>();
+            self.retained_image_source_bytes =
+                self.retained_image_source_bytes.saturating_sub(released);
+        }
+        let mut parts = if append { previous } else { Vec::new() };
+        let mut added_text = String::new();
+        for part in incoming {
+            let part = match part {
+                AgentPart::Image(image) => {
+                    let retained = self
+                        .retained_image_source_bytes
+                        .saturating_add(image.data.len());
+                    if retained <= MAX_RETAINED_IMAGE_SOURCE_BYTES {
+                        self.retained_image_source_bytes = retained;
+                        AgentPart::Image(image)
+                    } else {
+                        AgentPart::Text("[Image]".into())
+                    }
+                }
+                part => part,
+            };
+            match part {
+                AgentPart::Text(text) => {
+                    added_text.push_str(&text);
+                    if let Some(AgentPart::Text(previous)) = parts.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        parts.push(AgentPart::Text(text));
+                    }
+                }
+                part => parts.push(part),
+            }
+        }
+        if !append && existing.is_some() {
+            if self.latest_agent_source.ends_with(&previous_text) {
+                self.latest_agent_source
+                    .truncate(self.latest_agent_source.len() - previous_text.len());
+                self.latest_agent_source.push_str(&added_text);
+            } else {
+                self.latest_agent_source = added_text;
+            }
+        } else if self.agent_stream_sealed {
+            self.latest_agent_source = added_text;
+        } else {
+            self.latest_agent_source.push_str(&added_text);
+        }
+        self.agent_stream_sealed = false;
+        let block = if parts.iter().any(|part| matches!(part, AgentPart::Image(_))) {
+            Block::AgentParts(parts)
+        } else {
+            Block::Agent(
+                parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        AgentPart::Text(text) => Some(text),
+                        AgentPart::Image(_) => None,
+                    })
+                    .collect(),
+            )
+        };
+        if let Some(index) = existing {
+            self.blocks[index] = block;
+            self.mark_block_dirty(index);
+        } else {
+            self.push_block(block);
+            self.message_blocks.insert(id, self.blocks.len() - 1);
+        }
+    }
+
     fn apply_message(
         &mut self,
         id: String,
@@ -1405,6 +1518,16 @@ impl App {
         append: bool,
         role: MessageRole,
     ) {
+        if !append
+            && matches!(role, MessageRole::Agent)
+            && self
+                .message_blocks
+                .get(&id)
+                .is_some_and(|&index| matches!(self.blocks[index], Block::AgentParts(_)))
+        {
+            self.apply_agent_parts(id, vec![AgentPart::Text(text)], append);
+            return;
+        }
         if !text.is_empty() || !images.is_empty() {
             self.collapse_last_tool_output();
         }
@@ -1462,6 +1585,15 @@ impl App {
                         existing.text = text.clone();
                         existing.images = std::mem::take(&mut images);
                     }
+                    changed = true;
+                }
+                (Block::AgentParts(parts), MessageRole::Agent) => {
+                    if let Some(AgentPart::Text(previous)) = parts.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        parts.push(AgentPart::Text(text.clone()));
+                    }
+                    self.latest_agent_source.push_str(&text);
                     changed = true;
                 }
                 (Block::Agent(existing), MessageRole::Agent) => {
@@ -1694,6 +1826,12 @@ impl App {
             } => {
                 self.remove_pending_steer(&id);
                 self.apply_message(id, text, images, append, MessageRole::User);
+            }
+            Update::AgentImage { id, image, append } => {
+                self.apply_agent_parts(id, vec![AgentPart::Image(image)], append);
+            }
+            Update::AgentParts { id, parts } => {
+                self.apply_agent_parts(id, parts, false);
             }
             Update::AgentMessage { id, text, append } => {
                 self.apply_message(id, text, Vec::new(), append, MessageRole::Agent);
@@ -3630,6 +3768,21 @@ impl App {
             .and_then(|hit| self.blocks.get(hit.block).map(|block| (block, hit)))
             .and_then(|(block, hit)| match block {
                 Block::Agent(source) => source.get(hit.range.clone()),
+                Block::AgentParts(parts) => {
+                    let mut offset = 0;
+                    parts.iter().find_map(|part| {
+                        let AgentPart::Text(source) = part else {
+                            return None;
+                        };
+                        let start = offset;
+                        offset += source.len();
+                        if hit.range.start >= start && hit.range.end <= offset {
+                            source.get(hit.range.start - start..hit.range.end - start)
+                        } else {
+                            None
+                        }
+                    })
+                }
                 _ => None,
             })
             .map(str::to_string);
@@ -3872,8 +4025,8 @@ mod tests {
     };
 
     use super::{
-        Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
-        MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+        Action, AgentPart, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
+        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -6065,6 +6218,120 @@ mod tests {
         });
 
         assert_eq!(app.latest_agent_text().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn assistant_images_preserve_bytes_and_split_streamed_text() {
+        let mut app = app();
+        app.apply(Update::test_text("before".into()));
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        let key = image.key;
+        app.apply(Update::AgentImage {
+            id: "test-agent".into(),
+            image,
+            append: true,
+        });
+        app.apply(Update::test_text("after".into()));
+        app.apply(Update::test_text(" more".into()));
+        let [Block::AgentParts(parts)] = app.blocks.as_slice() else {
+            panic!("expected one multipart message");
+        };
+        let [
+            AgentPart::Text(before),
+            AgentPart::Image(image),
+            AgentPart::Text(after),
+        ] = parts.as_slice()
+        else {
+            panic!("expected ordered text, image, text");
+        };
+        assert_eq!(before, "before");
+        assert_eq!(after, "after more");
+        assert_eq!(image.data, "AQID");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.key, key);
+        assert_eq!(app.retained_image_source_bytes, 4);
+        assert_eq!(app.latest_agent_text().as_deref(), Some("beforeafter more"));
+    }
+
+    #[test]
+    fn assistant_images_complete_upsert_replaces_stream_and_shrinks_in_place() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        app.apply(Update::test_text("before".into()));
+        app.apply(Update::AgentImage {
+            id: "test-agent".into(),
+            image: image.clone(),
+            append: true,
+        });
+        app.apply(Update::test_text("after".into()));
+        app.push_block(Block::Notice("following block".into()));
+        for _ in 0..2 {
+            app.apply(Update::AgentParts {
+                id: "test-agent".into(),
+                parts: vec![
+                    AgentPart::Text("complete".into()),
+                    AgentPart::Image(image.clone()),
+                    AgentPart::Image(image.clone()),
+                    AgentPart::Text("end".into()),
+                ],
+            });
+            assert_eq!(app.blocks.len(), 2);
+            assert_eq!(app.retained_image_source_bytes, 8);
+            assert!(matches!(&app.blocks[0], Block::AgentParts(parts) if parts.len() == 4));
+            assert_eq!(app.latest_agent_text().as_deref(), Some("completeend"));
+        }
+        app.apply(Update::AgentParts {
+            id: "test-agent".into(),
+            parts: vec![AgentPart::Image(image)],
+        });
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.retained_image_source_bytes, 4);
+        assert!(matches!(&app.blocks[0], Block::AgentParts(parts) if parts.len() == 1));
+        app.apply(Update::AgentMessage {
+            id: "test-agent".into(),
+            text: "only text".into(),
+            append: false,
+        });
+        assert_eq!(app.retained_image_source_bytes, 0);
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text == "only text"));
+        assert!(matches!(&app.blocks[1], Block::Notice(text) if text == "following block"));
+        app.apply(Update::AgentParts {
+            id: "test-agent".into(),
+            parts: Vec::new(),
+        });
+        assert_eq!(app.blocks.len(), 2);
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text.is_empty()));
+    }
+
+    #[test]
+    fn assistant_images_share_source_budget_and_release_replaced_bytes() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        for _ in 0..2 {
+            app.apply(Update::AgentImage {
+                id: "image".into(),
+                image: image.clone(),
+                append: false,
+            });
+            assert_eq!(app.retained_image_source_bytes, 4);
+            assert_eq!(app.blocks.len(), 1);
+        }
+        app.apply(Update::AgentMessage {
+            id: "image".into(),
+            text: "replacement".into(),
+            append: false,
+        });
+        assert_eq!(app.retained_image_source_bytes, 0);
+        let large = UserImage::new("A".repeat(12 * 1024 * 1024), "image/png".into(), 0).unwrap();
+        for index in 0..3 {
+            app.apply(Update::AgentImage {
+                id: format!("large-{index}"),
+                image: large.clone(),
+                append: true,
+            });
+        }
+        assert_eq!(app.retained_image_source_bytes, 24 * 1024 * 1024);
+        assert!(matches!(app.blocks.last(), Some(Block::Agent(text)) if text == "[Image]"));
     }
 
     #[test]

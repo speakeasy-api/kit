@@ -1138,6 +1138,10 @@ impl Runtime {
                 &self.root,
             ))))
             .with(Observed::new(ReadFileTool::new(self.root.clone())))
+            .with(Observed::new(crate::tools::ImageGenTool::new(
+                self.root.clone(),
+                self.credential_storage.clone(),
+            )))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())));

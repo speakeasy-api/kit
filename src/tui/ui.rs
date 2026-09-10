@@ -20,7 +20,7 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 
 use super::{
     app::{
-        AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
+        AgentPart, AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
         CachedTranscriptRow, Child, CodeHit, ComposeView, EffortDialog, FilePickerDialog,
         FilePickerStatus, ModelDialog, Phase, SessionRename, ToolCall, UserMessage,
     },
@@ -47,6 +47,7 @@ type TranscriptTag = (Option<String>, Option<CodeHit>, Option<usize>);
 type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
+    images.poll();
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let start_width = frame
@@ -933,7 +934,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         Vec::new(),
         String::new(),
     );
-    let mut visible_images: Vec<(usize, usize, i16)> = Vec::new();
+    let mut visible_images: Vec<(usize, usize, Option<String>, i16)> = Vec::new();
     let mut materialize = |row: &crate::tui::app::CachedTranscriptRow| {
         visible.push(row.0.clone());
         app.row_calls.push(row.1.0.clone());
@@ -973,6 +974,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                         visible_images.push((
                             block_index,
                             placement.source,
+                            placement.destination.clone(),
                             y.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
                         ));
                     }
@@ -998,7 +1000,23 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     let row_widths: Vec<usize> = visible.iter().map(ratatui::text::Line::width).collect();
     frame.render_widget(Paragraph::new(visible), inner);
     draw_selection(frame, app, inner, offset, &row_widths);
-    for (block_index, source_index, y) in visible_images {
+    for (block_index, source_index, destination, y) in visible_images {
+        if let Some(destination) = destination {
+            if let Some(image) =
+                images.prepare_destination(&destination, &app.root, inner.width.max(1))
+            {
+                images.render(frame, image, inner, y);
+            }
+            continue;
+        }
+        if let Some(Block::AgentParts(parts)) = app.blocks.get(block_index) {
+            if let Some(AgentPart::Image(source)) = parts.get(source_index)
+                && let Some(image) = images.prepare_assistant(source, inner.width.max(1))
+            {
+                images.render(frame, image, inner, y);
+            }
+            continue;
+        }
         let sources = match app.blocks.get(block_index) {
             Some(Block::User(message)) => &message.images,
             Some(Block::Tool(call)) => &call.images,
@@ -1191,7 +1209,143 @@ fn user_block_rows(
                         String::new(),
                     )
                 }));
-                placements.push(CachedTranscriptImage { source, row });
+                placements.push(CachedTranscriptImage {
+                    source,
+                    row,
+                    destination: None,
+                });
+            }
+        }
+    }
+    (rows, placements)
+}
+
+/// Parse Markdown once, then place viewports after the containing layout line.
+/// Wrapped lines (and tables) stay intact, including their inline style context.
+fn agent_block_rows(
+    text: &str,
+    block_index: usize,
+    width: usize,
+    reserve_images: bool,
+) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+    let mut rows = Vec::new();
+    let mut placements = Vec::new();
+    if !reserve_images {
+        append_agent_rows(&mut rows, text, 0, block_index, width);
+        return (rows, placements);
+    }
+    let mut references = markdown::image_references(text).into_iter().peekable();
+    for (line_index, (line, code, source)) in
+        markdown::render_copyable_with_sources(text, Some(width))
+            .into_iter()
+            .enumerate()
+    {
+        let code = code.map(|range| CodeHit {
+            block: block_index,
+            range,
+        });
+        rows.extend(wrap_linked_tagged(
+            &[(line, (None, code, Some(line_index)))],
+            width,
+        ));
+        while references
+            .peek()
+            .is_some_and(|(range, _)| range.start < source.end)
+        {
+            let Some((_, destination)) = references.next() else {
+                break;
+            };
+            let row = rows.len();
+            rows.extend((0..RESERVED_ROWS).map(|_| {
+                (
+                    Line::default(),
+                    (None, None, None),
+                    Vec::new(),
+                    String::new(),
+                )
+            }));
+            placements.push(CachedTranscriptImage {
+                source: 0,
+                row,
+                destination: Some(destination),
+            });
+        }
+    }
+    (rows, placements)
+}
+
+fn append_agent_rows(
+    rows: &mut Vec<CachedTranscriptRow>,
+    text: &str,
+    offset: usize,
+    block: usize,
+    width: usize,
+) {
+    let lines = markdown::render_copyable_at_width(text, Some(width))
+        .into_iter()
+        .enumerate()
+        .map(|(line_index, (line, code))| {
+            let code = code.map(|range| CodeHit {
+                block,
+                range: range.start + offset..range.end + offset,
+            });
+            (line, (None, code, Some(line_index)))
+        })
+        .collect::<Vec<TaggedTranscriptLine>>();
+    rows.extend(wrap_linked_tagged(&lines, width));
+}
+
+fn agent_parts_rows(
+    parts: &[AgentPart],
+    block_index: usize,
+    width: usize,
+    reserve_images: bool,
+) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+    let mut rows = Vec::new();
+    let mut placements = Vec::new();
+    let mut text_offset = 0;
+    for (source, part) in parts.iter().enumerate() {
+        match part {
+            AgentPart::Text(text) => {
+                let (mut part_rows, part_images) =
+                    agent_block_rows(text, block_index, width, reserve_images);
+                for row in &mut part_rows {
+                    if let Some(hit) = &mut row.1.1 {
+                        hit.range.start += text_offset;
+                        hit.range.end += text_offset;
+                    }
+                }
+                placements.extend(part_images.into_iter().map(|mut image| {
+                    image.row += rows.len();
+                    image
+                }));
+                rows.extend(part_rows);
+                text_offset += text.len();
+            }
+            AgentPart::Image(image) => {
+                append_agent_rows(
+                    &mut rows,
+                    &format!("[Image: {}]", image.mime_type),
+                    text_offset,
+                    block_index,
+                    width,
+                );
+                if reserve_images {
+                    let row = rows.len();
+                    rows.extend((0..RESERVED_ROWS).map(|_| {
+                        (
+                            Line::default(),
+                            (None, None, None),
+                            Vec::new(),
+                            String::new(),
+                        )
+                    }));
+                    placements.push(CachedTranscriptImage {
+                        source,
+                        row,
+                        destination: None,
+                    });
+                }
             }
         }
     }
@@ -1207,7 +1361,10 @@ fn transcript_block_rows(
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
         Block::User(message) => return user_block_rows(message, width, reserve_images),
-        Block::Agent(text) => (markdown::render_copyable_at_width(text, Some(width)), None),
+        Block::Agent(text) => return agent_block_rows(text, block_index, width, reserve_images),
+        Block::AgentParts(parts) => {
+            return agent_parts_rows(parts, block_index, width, reserve_images);
+        }
         Block::Thought {
             text,
             started,
@@ -1291,7 +1448,11 @@ fn transcript_block_rows(
                     String::new(),
                 )
             }));
-            placements.push(CachedTranscriptImage { source, row });
+            placements.push(CachedTranscriptImage {
+                source,
+                row,
+                destination: None,
+            });
         }
     }
     (rows, placements)
@@ -2297,6 +2458,117 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn structured_assistant_images_share_viewports_with_markdown_images() {
+        let parts = vec![
+            super::AgentPart::Text("before".into()),
+            super::AgentPart::Image(UserImage::new("AQID".into(), "image/png".into(), 0).unwrap()),
+            super::AgentPart::Text("after ![markdown](chart.png) end".into()),
+        ];
+        let (rows, placements) = super::agent_parts_rows(&parts, 0, 120, true);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].source, 1);
+        assert!(placements[0].destination.is_none());
+        assert_eq!(placements[1].destination.as_deref(), Some("chart.png"));
+        assert!(line_text(&rows[0].0).contains("before"));
+        assert!(line_text(&rows[placements[1].row - 1].0).contains("after"));
+        assert!(line_text(&rows[placements[1].row - 1].0).contains("end"));
+        assert!(super::agent_parts_rows(&parts, 0, 120, false).1.is_empty());
+    }
+
+    #[test]
+    fn assistant_inline_images_preserve_text_rows_and_emphasis() {
+        for source in [
+            "before ![alt](image.png) after",
+            "**before ![alt](image.png) after**",
+        ] {
+            for width in [12, 120] {
+                let mut expected = Vec::new();
+                super::append_agent_rows(&mut expected, source, 0, 0, width);
+                let (plain, disabled) = super::agent_block_rows(source, 0, width, false);
+                assert!(disabled.is_empty());
+                assert_eq!(plain.len(), expected.len());
+                let (images, placements) = super::agent_block_rows(source, 0, width, true);
+                assert_eq!(placements.len(), 1);
+                assert_eq!(placements[0].row, plain.len());
+                assert_eq!(images.len(), plain.len() + super::RESERVED_ROWS as usize);
+                for ((expected, plain), image) in expected.iter().zip(&plain).zip(&images) {
+                    assert_eq!(plain.0, expected.0);
+                    assert_eq!(image.0, expected.0);
+                }
+                if width == 120 {
+                    assert_eq!(plain.len(), 1);
+                    assert_eq!(line_text(&plain[0].0), "before ![alt](image.png) after");
+                    if source.starts_with("**") {
+                        assert!(plain[0].0.spans.iter().all(|span| {
+                            span.style.add_modifier.contains(super::Modifier::BOLD)
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_image_viewports_follow_layout_units() {
+        for source in [
+            "# Heading\n**before ![alt](a.png) after**\nnext ![other](b.png) end\n```rust\nlet x = 1;\n```",
+            "| A | B |\n| --- | --- |\n| ![alt](a.png) | **after** |\nnext ![other](b.png) end",
+        ] {
+            for width in [18, 120] {
+                let (plain, _) = super::agent_block_rows(source, 3, width, false);
+                let (images, placements) = super::agent_block_rows(source, 3, width, true);
+                assert_eq!(placements.len(), 2);
+                assert_eq!(placements[0].destination.as_deref(), Some("a.png"));
+                assert_eq!(placements[1].destination.as_deref(), Some("b.png"));
+                let text_rows: Vec<_> = images
+                    .iter()
+                    .enumerate()
+                    .filter(|(row, _)| {
+                        !placements.iter().any(|image| {
+                            (image.row..image.row + super::RESERVED_ROWS as usize).contains(row)
+                        })
+                    })
+                    .map(|(_, row)| row)
+                    .collect();
+                assert_eq!(text_rows.len(), plain.len());
+                for (actual, expected) in text_rows.iter().zip(&plain) {
+                    assert_eq!(actual.0, expected.0);
+                    assert_eq!(
+                        actual.1.1.as_ref().map(|hit| &hit.range),
+                        expected.1.1.as_ref().map(|hit| &hit.range)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_markdown_images_keep_prose_order_and_code_literal() {
+        let source =
+            "before ![first](a.png) between ![second](https://example.invalid/b.png) after";
+        let (rows, placements) = super::agent_block_rows(source, 0, 120, true);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].destination.as_deref(), Some("a.png"));
+        assert_eq!(
+            placements[1].destination.as_deref(),
+            Some("https://example.invalid/b.png")
+        );
+        assert!(line_text(&rows[placements[0].row - 1].0).contains("before"));
+        assert!(line_text(&rows[placements[0].row - 1].0).contains("between"));
+        assert!(line_text(&rows[placements[0].row - 1].0).contains("after"));
+        assert!(placements[1].row >= placements[0].row + super::RESERVED_ROWS as usize);
+        let (_, disabled) = super::agent_block_rows(source, 0, 120, false);
+        assert!(disabled.is_empty());
+        for source in [
+            "`![literal](a.png)`",
+            "```md\n![literal](a.png)\n```",
+            "![incomplete](a.png",
+        ] {
+            assert!(super::agent_block_rows(source, 0, 120, true).1.is_empty());
+        }
     }
 
     #[test]
