@@ -3348,7 +3348,7 @@ impl App {
                         .min(completions.len().saturating_sub(1));
                     return Action::None;
                 }
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::Enter if key.code == KeyCode::Tab || !pasted => {
                     let selected = self
                         .command_completion_selected
                         .min(completions.len().saturating_sub(1));
@@ -3356,7 +3356,10 @@ impl App {
                     self.editor.replace_command_token(&replacement);
                     self.command_completion_query = Some(replacement.clone());
                     self.command_completion_dismissed = Some(replacement);
-                    return Action::None;
+                    if key.code == KeyCode::Tab {
+                        return Action::None;
+                    }
+                    // Enter submits the completed command through the normal safety checks.
                 }
                 _ => {}
             }
@@ -5226,6 +5229,90 @@ mod tests {
         assert!(matches!(app.handle_key(press(KeyCode::Tab)), Action::None));
         assert_eq!(app.editor.text(), "/model");
         assert!(app.command_completions().is_empty());
+    }
+
+    #[test]
+    fn enter_activates_the_filtered_slash_command() {
+        let mut app = app();
+        app.paste("/ses");
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ListSessions
+        ));
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn enter_activates_the_arrow_selected_slash_command() {
+        let mut app = app();
+        app.paste("/");
+        let index = app
+            .command_completions()
+            .iter()
+            .position(|cmd| cmd.name == "/sessions")
+            .unwrap();
+        for _ in 0..index + 1 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Up));
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ListSessions
+        ));
+    }
+
+    #[test]
+    fn enter_does_not_complete_a_dismissed_slash_command() {
+        let mut app = app();
+        app.paste("/ses");
+        app.handle_key(press(KeyCode::Esc));
+        app.last_key = None;
+
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected the dismissed input to be submitted unchanged");
+        };
+        assert_eq!(prompt.text, "/ses");
+    }
+
+    #[test]
+    fn enter_completion_preserves_active_turn_command_guard() {
+        let mut app = app();
+        app.phase = Phase::Working;
+        app.can_steer = true;
+        app.paste("/ses");
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "/sessions");
+        assert_eq!(
+            app.toast_text(),
+            Some("commands are available only while idle")
+        );
+    }
+
+    #[test]
+    fn modified_or_pasted_enter_does_not_accept_slash_completion() {
+        for pasted in [false, true] {
+            let mut app = app();
+            app.paste("/ses");
+            let key = if pasted {
+                app.last_key = Some(Instant::now());
+                press(KeyCode::Enter)
+            } else {
+                app.last_key = None;
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            };
+
+            assert!(matches!(app.handle_key(key), Action::None));
+            assert_eq!(app.editor.text(), "/ses\n");
+        }
     }
 
     #[test]
