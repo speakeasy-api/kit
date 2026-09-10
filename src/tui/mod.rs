@@ -73,8 +73,8 @@ use crate::{
 };
 
 use app::{
-    Action, AgentPart, App, Attachment, AttachmentKind, ClipboardRoute, EffortChoice, ModelChoice,
-    SubmittedPrompt, Update, UserImage,
+    Action, AgentPart, App, Attachment, AttachmentKind, ClipboardMode, ClipboardRoute,
+    EffortChoice, ModelChoice, SubmittedPrompt, Update, UserImage,
 };
 use attachment::MaterializedImage;
 
@@ -266,7 +266,7 @@ const BACKGROUND_QUEUE: usize = 8;
 
 struct BackgroundWorkers {
     updates: Option<std::sync::mpsc::SyncSender<QueuedUpdate>>,
-    clipboard: Option<std::sync::mpsc::SyncSender<(u64, ClipboardRoute)>>,
+    clipboard: Option<std::sync::mpsc::SyncSender<(u64, ClipboardRoute, ClipboardMode)>>,
     stopping: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -288,13 +288,14 @@ impl BackgroundWorkers {
         &self,
         generation: u64,
         route: ClipboardRoute,
-    ) -> Result<(), std::sync::mpsc::TrySendError<(u64, ClipboardRoute)>> {
+        mode: ClipboardMode,
+    ) -> Result<(), std::sync::mpsc::TrySendError<(u64, ClipboardRoute, ClipboardMode)>> {
         let Some(sender) = &self.clipboard else {
             return Err(std::sync::mpsc::TrySendError::Disconnected((
-                generation, route,
+                generation, route, mode,
             )));
         };
-        sender.try_send((generation, route))
+        sender.try_send((generation, route, mode))
     }
 }
 
@@ -310,6 +311,7 @@ impl Drop for BackgroundWorkers {
 }
 
 enum ClipboardResult {
+    NoImage,
     Text(String),
     Attachment(Attachment),
     Error(String),
@@ -399,16 +401,16 @@ fn spawn_background_workers(
             }
         })?;
     let (clipboard, clipboard_rx) =
-        std::sync::mpsc::sync_channel::<(u64, ClipboardRoute)>(BACKGROUND_QUEUE);
+        std::sync::mpsc::sync_channel::<(u64, ClipboardRoute, ClipboardMode)>(BACKGROUND_QUEUE);
     let clipboard_stopping = stopping.clone();
     let clipboard_thread = std::thread::Builder::new()
         .name("kit-tui-clipboard".into())
         .spawn(move || {
-            while let Ok((generation, route)) = clipboard_rx.recv() {
+            while let Ok((generation, route, mode)) = clipboard_rx.recv() {
                 if clipboard_stopping.load(Ordering::Acquire) {
                     break;
                 }
-                let result = read_clipboard(&route);
+                let result = read_clipboard(&route, mode);
                 if !send_background_completion(
                     &completed,
                     &clipboard_stopping,
@@ -1546,7 +1548,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     events = EventStream::new();
                                 }
                                 Action::None | Action::Redraw => {}
-                                Action::ReadClipboard(_) => {
+                                Action::ReadClipboard(_, _) => {
                                     app.note("authenticate before reading the clipboard");
                                 }
                                 _ => app.note("authenticate before starting a session"),
@@ -2198,12 +2200,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         ));
                                     });
                                 }
-                                Action::ReadClipboard(route) => {
+                                Action::ReadClipboard(route, mode) => {
                                     let generation = transition_session
                                         .lock()
                                         .map(|route| route.generation)
                                         .unwrap_or_default();
-                                    match background_workers.try_clipboard(generation, route.clone()) {
+                                    match background_workers.try_clipboard(generation, route.clone(), mode) {
                                         Ok(()) => clipboard_pastes.queued(generation, route),
                                         Err(std::sync::mpsc::TrySendError::Full(_)) => app.note("clipboard is busy; try again"),
                                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => app.note("clipboard worker is unavailable"),
@@ -2584,11 +2586,21 @@ fn handle_inner(app: &mut App, event: Event) -> Action {
             if paste_blocked(app) {
                 Action::None
             } else {
-                Action::ReadClipboard(app.clipboard_route())
+                Action::ReadClipboard(app.clipboard_route(), ClipboardMode::ImageOrText)
             }
         }
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
+        Event::Paste(text) if text.is_empty() => {
+            // VS Code/xterm can represent Command+V with an image-only
+            // clipboard as an empty bracketed paste, not a Super+V key.
+            let route = app.clipboard_route();
+            if matches!(route, ClipboardRoute::Composer(_)) {
+                Action::ReadClipboard(route, ClipboardMode::ImageOnly)
+            } else {
+                Action::None
+            }
+        }
         Event::Paste(text) => {
             handle_paste(app, &text);
             Action::None
@@ -2620,18 +2632,30 @@ fn paste_blocked(app: &App) -> bool {
         || (app.queue_focused && !app.session_rename_active())
 }
 
-fn read_clipboard(route: &ClipboardRoute) -> ClipboardResult {
+fn read_clipboard(route: &ClipboardRoute, mode: ClipboardMode) -> ClipboardResult {
+    if mode == ClipboardMode::ImageOnly && !matches!(route, ClipboardRoute::Composer(_)) {
+        return ClipboardResult::NoImage;
+    }
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(clipboard) => clipboard,
         Err(error) => return ClipboardResult::Error(format!("clipboard unavailable: {error}")),
     };
-    if matches!(route, ClipboardRoute::Composer(_))
-        && let Ok(image) = clipboard.get_image()
-    {
-        return match clipboard_image_attachment(image) {
-            Ok(attachment) => ClipboardResult::Attachment(attachment),
-            Err(error) => ClipboardResult::Error(error),
-        };
+    if matches!(route, ClipboardRoute::Composer(_)) {
+        match clipboard.get_image() {
+            Ok(image) => {
+                return match clipboard_image_attachment(image) {
+                    Ok(attachment) => ClipboardResult::Attachment(attachment),
+                    Err(error) => ClipboardResult::Error(error),
+                };
+            }
+            Err(arboard::Error::ContentNotAvailable) if mode == ClipboardMode::ImageOnly => {
+                return ClipboardResult::NoImage;
+            }
+            Err(error) if mode == ClipboardMode::ImageOnly => {
+                return ClipboardResult::Error(format!("could not read clipboard image: {error}"));
+            }
+            Err(_) => {}
+        }
     }
     match clipboard.get_text() {
         Ok(text) => ClipboardResult::Text(text),
@@ -2656,6 +2680,7 @@ fn apply_clipboard_completion(
         return false;
     }
     match result {
+        ClipboardResult::NoImage => true,
         ClipboardResult::Text(text) => handle_paste(app, &text),
         ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
         ClipboardResult::Error(error) => {
@@ -5471,7 +5496,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_terminal_paste_never_requests_native_clipboard() {
+    fn empty_terminal_paste_requests_only_images_in_the_composer() {
         let mut app = App::new(
             PathBuf::from("."),
             "provider".into(),
@@ -5480,9 +5505,103 @@ mod tests {
         );
         assert!(matches!(
             handle(&mut app, Event::Paste(String::new())),
-            Action::None
+            Action::ReadClipboard(ClipboardRoute::Composer(_), super::ClipboardMode::ImageOnly)
         ));
         assert!(app.editor.text().is_empty());
+        assert!(matches!(
+            handle(&mut app, Event::Paste("ordinary text".into())),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "ordinary text");
+
+        app.queue_focused = true;
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        app.queue_focused = false;
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: None,
+        });
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        app.session_dialog.as_mut().unwrap().rename = Some(SessionRename::Editing("name".into()));
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "ordinary text");
+    }
+
+    #[test]
+    fn vscode_image_paste_finishes_before_enter_submits() {
+        for has_image in [true, false] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("describe screenshot");
+            let Action::ReadClipboard(route, super::ClipboardMode::ImageOnly) =
+                super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste(String::new()))
+            else {
+                panic!("empty bracketed paste must request an image-only read");
+            };
+            pastes.queued(1, route.clone());
+            let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(
+                super::handle_with_clipboard(&mut app, &mut pastes, enter.clone()),
+                Action::None
+            ));
+            assert_eq!(app.editor.text(), "describe screenshot");
+            let result = if has_image {
+                ClipboardResult::Attachment(
+                    clipboard_image_attachment(arboard::ImageData {
+                        width: 1,
+                        height: 1,
+                        bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+                    })
+                    .unwrap(),
+                )
+            } else {
+                ClipboardResult::NoImage
+            };
+            assert!(super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                route,
+                result
+            ));
+            let Action::Submit { prompt, .. } =
+                super::handle_with_clipboard(&mut app, &mut pastes, enter)
+            else {
+                panic!("expected deferred submission");
+            };
+            assert_eq!(prompt.attachments.len(), usize::from(has_image));
+            let blocks = prompt_blocks(&prompt).unwrap();
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| matches!(block, ContentBlock::Image(_)))
+                    .count(),
+                usize::from(has_image)
+            );
+            if !has_image {
+                assert_eq!(prompt.text, "describe screenshot");
+            }
+            assert!(app.editor.is_empty());
+        }
     }
 
     #[test]
@@ -5553,11 +5672,13 @@ mod tests {
     }
 
     fn queue_composer_paste(app: &mut App, pastes: &mut super::ClipboardPastes) -> ClipboardRoute {
-        let Action::ReadClipboard(route) = super::handle_with_clipboard(
-            app,
-            pastes,
-            Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
-        ) else {
+        let Action::ReadClipboard(route, super::ClipboardMode::ImageOrText) =
+            super::handle_with_clipboard(
+                app,
+                pastes,
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            )
+        else {
             panic!("expected clipboard request");
         };
         pastes.queued(1, route.clone());
@@ -5738,7 +5859,7 @@ mod tests {
                 "a2a".into(),
             );
             app.paste("first prompt");
-            let Action::ReadClipboard(route) = handle(
+            let Action::ReadClipboard(route, super::ClipboardMode::ImageOrText) = handle(
                 &mut app,
                 Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
             ) else {

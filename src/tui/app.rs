@@ -378,10 +378,16 @@ pub(super) enum ClipboardRoute {
     Steer { id: String, token: u64 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardMode {
+    ImageOrText,
+    ImageOnly,
+}
+
 pub enum Action {
     None,
     Redraw,
-    ReadClipboard(ClipboardRoute),
+    ReadClipboard(ClipboardRoute, ClipboardMode),
     Submit {
         prompt: SubmittedPrompt,
         inject: bool,
