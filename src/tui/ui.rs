@@ -2656,6 +2656,63 @@ mod tests {
         assert_eq!(actual, code_rows(plain));
     }
 
+    fn assert_image_continuation_gutter(prefix: &str, indent: usize) {
+        for two_images in [false, true] {
+            let prose = "alpha bravo charlie delta echo foxtrot";
+            let tail = if two_images {
+                format!("{prose} ![second](b.png) {prose}")
+            } else {
+                prose.to_string()
+            };
+            let source = format!("{prefix}![alt](a.png) {tail}");
+            let (rows, images) = super::agent_block_rows(&source, 0, 20, true);
+            assert_eq!(images.len(), if two_images { 2 } else { 1 });
+            for (index, image) in images.iter().enumerate() {
+                let start = image.row + super::RESERVED_ROWS as usize;
+                let end = images.get(index + 1).map_or(rows.len(), |next| next.row);
+                let text: Vec<_> = rows[start..end]
+                    .iter()
+                    .map(|row| line_text(&row.0))
+                    .collect();
+                assert!(text.len() > 1);
+                for line in &text {
+                    assert_eq!(
+                        line.len() - line.trim_start().len(),
+                        indent,
+                        "{source}: {line:?}"
+                    );
+                    assert!(unicode_width::UnicodeWidthStr::width(line.as_str()) <= 20);
+                }
+                let actual = text
+                    .iter()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let expected = if index + 1 < images.len() {
+                    format!("{prose} ![second](b.png)")
+                } else {
+                    prose.to_string()
+                };
+                assert_eq!(actual, expected, "{source}");
+                // Words fit this width: the gutter must not make prose atomic
+                // and force character wrapping or half-width indentation.
+                assert_eq!(text[0], format!("{}alpha bravo", " ".repeat(indent)));
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_list_images_preserve_wrapped_continuation_gutter() {
+        assert_image_continuation_gutter("- ", 2);
+        assert_image_continuation_gutter("  - ", 4);
+    }
+
+    #[test]
+    fn assistant_quote_images_preserve_wrapped_continuation_gutter() {
+        assert_image_continuation_gutter("> ", 2);
+        assert_image_continuation_gutter("  > ", 4);
+    }
+
     #[test]
     fn assistant_same_line_images_order_wide() {
         assert_same_line_image_order(120);

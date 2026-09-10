@@ -126,19 +126,29 @@ pub(super) fn render_copyable_with_sources(
             let mut references = image_references(raw).into_iter();
             let mut start = offset;
             let mut pending = Vec::new();
-            for span in std::mem::take(&mut line.spans) {
+            for span in line.spans.clone() {
                 let image_end = span.image_end;
                 pending.push(span);
                 if image_end && let Some((range, _)) = references.next() {
                     let end = offset + range.end;
-                    let mut segment = line.clone();
-                    segment.spans = std::mem::take(&mut pending);
+                    let segment_spans = std::mem::take(&mut pending);
+                    let segment = if start == offset {
+                        let mut segment = line.clone();
+                        segment.spans = segment_spans;
+                        segment
+                    } else {
+                        line.continuation(segment_spans)
+                    };
                     lines.push((segment, None, start..end));
                     start = end;
                 }
             }
             if !pending.is_empty() {
-                line.spans = pending;
+                if start == offset {
+                    line.spans = pending;
+                } else {
+                    line = line.continuation(pending);
+                }
                 lines.push((line, None, start..source_range.end));
             }
         } else {

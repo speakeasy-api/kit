@@ -53,6 +53,34 @@ impl LinkedLine {
         self
     }
 
+    /// Continue a split logical line without mistaking its first prose span for
+    /// the original gutter. The split's separating whitespace is replaced by
+    /// the original content indent, just as at a normal word-wrap boundary.
+    pub fn continuation(&self, mut spans: Vec<LinkedSpan>) -> Self {
+        if self.leading_gutter == Some(true) {
+            for span in &mut spans {
+                let content = span.span.content.trim_start().to_string();
+                let has_content = !content.is_empty();
+                span.span.content = content.into();
+                if has_content {
+                    break;
+                }
+            }
+            spans.insert(
+                0,
+                LinkedSpan {
+                    span: Span::raw(" ".repeat(hanging_indent(&self.line(), self.leading_gutter))),
+                    url: None,
+                    image_end: false,
+                },
+            );
+        }
+        Self {
+            spans,
+            leading_gutter: self.leading_gutter,
+        }
+    }
+
     pub fn line(&self) -> Line<'static> {
         Line::from(
             self.spans
