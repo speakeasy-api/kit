@@ -7,8 +7,10 @@
 //! ([`crate::events`]) that reports tool-call and subagent activity.
 
 mod app;
+mod attachment;
 mod command;
 mod editor;
+mod hyperlinks;
 mod image;
 mod markdown;
 mod progress;
@@ -37,8 +39,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -1122,6 +1124,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let (mut terminal, mut images) =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
+            let mut native_hyperlinks = hyperlinks::HyperlinkRenderer::default();
             let mut app = App::new(
                 root.clone(),
                 provider.as_str().to_string(),
@@ -1151,8 +1154,27 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     }
                     let mut next_priority = 0;
                     loop {
+                    let native_links = match terminal
+                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
+                    {
+                        Ok(frame) => native_hyperlinks.prepare(
+                            &frame,
+                            &app.row_links,
+                            app.transcript_left,
+                            app.transcript_top,
+                            app.model_switch.is_some()
+                                || app.file_picker.is_some()
+                                || app.session_dialog.is_some()
+                                || app.model_dialog.is_some()
+                                || app.effort_dialog.is_some(),
+                        ),
+                        Err(error) => {
+                            leave(&mut terminal);
+                            return Err(agent_client_protocol::Error::into_internal_error(error));
+                        }
+                    };
                     if let Err(error) =
-                        terminal.draw(|frame| ui::draw(frame, &mut app, &mut images))
+                        native_hyperlinks.draw(terminal.backend_mut(), native_links)
                     {
                         leave(&mut terminal);
                         return Err(agent_client_protocol::Error::into_internal_error(error));
@@ -1343,8 +1365,24 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut next_priority = 0;
                 let mut switches_closed = false;
                 loop {
-                    terminal
+                    let native_links = terminal
                         .draw(|frame| ui::draw(frame, &mut app, &mut images))
+                        .map(|frame| {
+                            native_hyperlinks.prepare(
+                                &frame,
+                                &app.row_links,
+                                app.transcript_left,
+                                app.transcript_top,
+                                app.model_switch.is_some()
+                                    || app.file_picker.is_some()
+                                    || app.session_dialog.is_some()
+                                    || app.model_dialog.is_some()
+                                    || app.effort_dialog.is_some(),
+                            )
+                        })
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    native_hyperlinks
+                        .draw(terminal.backend_mut(), native_links)
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     let event = {
                         let redraw = app.needs_redraw_tick() || images.pending();
@@ -1428,7 +1466,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         }
                                     };
                                     let editable = pending_steer_is_editable(&blocks);
-                                    app.clear_attachments();
                                     let outcome = if inject {
                                         connection
                                             .send_request(wire::InjectSessionRequest::new(
@@ -1447,12 +1484,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             .map(|_| None)
                                     };
                                     match outcome {
-                                        Ok(Some(message_id)) => app.apply(Update::SteerAccepted {
-                                            id: message_id.to_string(),
-                                            text: prompt.text,
-                                            editable,
-                                        }),
-                                        Ok(None) => {}
+                                        Ok(Some(message_id)) => {
+                                            app.accept_attachments(&prompt.attachments);
+                                            app.apply(Update::SteerAccepted {
+                                                id: message_id.to_string(),
+                                                text: prompt.text,
+                                                editable,
+                                            });
+                                        }
+                                        Ok(None) => app.accept_attachments(&prompt.attachments),
                                         Err(error) => {
                                             app.paste(&prompt.text);
                                             app.restore_attachments(prompt.attachments);
@@ -2196,49 +2236,162 @@ fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
 /// Applies one terminal event, returning the work it asks for.
 fn handle(app: &mut App, event: Event) -> Action {
     match event {
+        Event::Key(key) if clipboard_paste_key(key) => {
+            paste_from_clipboard(app);
+            Action::None
+        }
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
         Event::Paste(text) => {
-            if app.model_switch.is_some() {
-                return Action::None;
-            }
-            if app.queue_focused && !app.session_rename_active() {
-                return Action::None;
-            }
-            if app.session_rename_active() || app.editing_steer() {
-                app.paste(&text);
-            } else if let Some(attachments) = attachments_from_paste(&app.root, &text) {
-                app.prune_attachments();
-                let pending_bytes = app
-                    .attachments
-                    .iter()
-                    .chain(&attachments)
-                    .try_fold(0_u64, |total, attachment| {
-                        total.checked_add(attachment.size)
-                    });
-                if app.attachments.len() + attachments.len() > MAX_ATTACHMENTS {
-                    app.note(format!(
-                        "at most {MAX_ATTACHMENTS} attachments can be pending"
-                    ));
-                } else if pending_bytes.is_none_or(|total| total > MAX_TOTAL_ATTACHMENT_BYTES) {
-                    app.note("attachments exceed the 20 MiB total limit");
-                } else {
-                    for attachment in attachments {
-                        app.attach(
-                            attachment.path,
-                            attachment.mime_type,
-                            attachment.kind,
-                            attachment.size,
-                        );
-                    }
-                }
+            if terminal_paste_requests_clipboard(&text) {
+                // macOS terminals can turn Command+V with an image clipboard into an
+                // empty bracketed paste instead of reporting the Command key.
+                paste_from_clipboard(app);
             } else {
-                app.paste(&text);
+                handle_paste(app, &text);
             }
             Action::None
         }
         _ => Action::None,
     }
+}
+
+fn terminal_paste_requests_clipboard(text: &str) -> bool {
+    text.is_empty()
+}
+
+fn clipboard_paste_key(key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    match key.code {
+        KeyCode::Insert => key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::Char('v' | 'V') => {
+            key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::SUPER
+                || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
+        _ => false,
+    }
+}
+
+fn paste_blocked(app: &App) -> bool {
+    app.model_switch.is_some()
+        || app.model_dialog.is_some()
+        || app.effort_dialog.is_some()
+        || (app.session_dialog.is_some() && !app.session_rename_active())
+        || (app.queue_focused && !app.session_rename_active())
+}
+
+fn paste_from_clipboard(app: &mut App) {
+    if paste_blocked(app) {
+        return;
+    }
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            app.note(format!("clipboard unavailable: {error}"));
+            return;
+        }
+    };
+    if !app.session_rename_active()
+        && !app.editing_steer()
+        && let Ok(image) = clipboard.get_image()
+    {
+        match clipboard_image_attachment(image) {
+            Ok(attachment) => attach_pasted(app, vec![attachment]),
+            Err(error) => app.note(error),
+        }
+        return;
+    }
+    match clipboard.get_text() {
+        Ok(text) => handle_paste(app, &text),
+        Err(_) => app.note("clipboard does not contain text or a supported image"),
+    }
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    if paste_blocked(app) {
+        return;
+    }
+    if app.session_rename_active() || app.editing_steer() {
+        app.paste(text);
+    } else if let Some(attachments) = attachments_from_paste(&app.root, text) {
+        attach_pasted(app, attachments);
+    } else {
+        app.paste(text);
+    }
+}
+
+fn attach_pasted(app: &mut App, attachments: Vec<Attachment>) {
+    app.prune_attachments();
+    let pending_bytes = app
+        .attachments
+        .iter()
+        .chain(&attachments)
+        .try_fold(0_u64, |total, attachment| {
+            total.checked_add(attachment.size)
+        });
+    if app.attachments.len() + attachments.len() > MAX_ATTACHMENTS {
+        app.note(format!(
+            "at most {MAX_ATTACHMENTS} attachments can be pending"
+        ));
+    } else if pending_bytes.is_none_or(|total| total > MAX_TOTAL_ATTACHMENT_BYTES) {
+        app.note("attachments exceed the 20 MiB total limit");
+    } else {
+        for attachment in attachments {
+            if attachment.temporary.is_some() {
+                app.attach_attachment(attachment);
+            } else {
+                app.attach(
+                    attachment.path,
+                    attachment.mime_type,
+                    attachment.kind,
+                    attachment.size,
+                );
+            }
+        }
+    }
+}
+
+fn clipboard_image_attachment(image: arboard::ImageData<'_>) -> Result<Attachment, String> {
+    use ::image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let width = u32::try_from(image.width).map_err(|_| "clipboard image is too wide")?;
+    let height = u32::try_from(image.height).map_err(|_| "clipboard image is too tall")?;
+    let expected = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("clipboard image dimensions overflow")?;
+    // Bound source pixels as well as the compressed attachment: a solid-color
+    // image can otherwise be arbitrarily expensive while encoding to a tiny PNG.
+    if expected > 64 * 1024 * 1024 {
+        return Err("clipboard image exceeds the 64 MiB pixel-data limit".into());
+    }
+    if width == 0 || height == 0 || image.bytes.len() != expected {
+        return Err("clipboard image data is invalid".into());
+    }
+
+    let (mut file, path) = attachment::create_private_png()
+        .map_err(|error| format!("could not create clipboard image: {error}"))?;
+    let encoded = PngEncoder::new(&mut file)
+        .write_image(&image.bytes, width, height, ExtendedColorType::Rgba8)
+        .and_then(|()| {
+            file.metadata()
+                .map(|metadata| metadata.len())
+                .map_err(Into::into)
+        });
+    drop(file);
+    let size = match encoded {
+        Ok(size) if size <= MAX_ATTACHMENT_BYTES => size,
+        Ok(_) => return Err("clipboard image exceeds the 10 MiB attachment limit".into()),
+        Err(error) => return Err(format!("could not encode clipboard image: {error}")),
+    };
+    Ok(Attachment::clipboard_image(
+        attachment::own_temp_path(path),
+        size,
+    ))
 }
 
 fn attachments_from_paste(root: &Path, text: &str) -> Option<Vec<Attachment>> {
@@ -2285,6 +2438,7 @@ fn media_attachment(root: &Path, value: &str) -> Option<Attachment> {
         mime_type,
         kind,
         size: metadata.len(),
+        temporary: None,
     })
 }
 
@@ -2347,13 +2501,18 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
     Ok(blocks)
 }
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
 fn enable_tui_modes() {
     let mut stdout = std::io::stdout();
     let _ = execute!(stdout, EnableBracketedPaste, EnableMouseCapture);
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
         ENHANCED.store(true, Ordering::Relaxed);
     }
@@ -2801,7 +2960,9 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                         separate_after_image = true;
                         line
                     });
-                if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), line) {
+                if let Some(image) =
+                    UserImage::with_source(image.data, image.mime_type.to_string(), line, uri)
+                {
                     images.push(image);
                 }
             }
@@ -3066,6 +3227,7 @@ fn readable(text: &str) -> Vec<String> {
 )]
 mod tests {
     use std::{
+        borrow::Cow,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
@@ -3078,7 +3240,7 @@ mod tests {
     };
     use agent_client_protocol::{Channel, ConnectTo};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use crossterm::event::Event;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
 
     use serde_json::json;
 
@@ -3087,13 +3249,14 @@ mod tests {
         ModelChoice, OPENROUTER_API_KEY_ENV, ProtocolVersion, QueuedUpdate, accept_queued_update,
         active_config_matches, active_session_config, agent_command_for_launch,
         agent_content_update, apply_pending_updates, attachments_from_paste,
-        authentication_required, client_capabilities, command, credential_storage_for_launch,
-        current_model_choice, detach_from_controlling_terminal, durable_session_id, effort_state,
-        error_detail, handle, message_of, osc52, previous_session_for_resume, prompt_blocks,
+        authentication_required, client_capabilities, clipboard_image_attachment,
+        clipboard_paste_key, command, credential_storage_for_launch, current_model_choice,
+        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
+        keyboard_enhancement_flags, message_of, osc52, previous_session_for_resume, prompt_blocks,
         readable, refresh_config_state, refresh_session_after_auth, save_effort_default_to,
-        save_model_defaults_to, terminal_auth_command, transition_route, translate,
-        translate_for_session, usable_terminal_auth_methods, user_message_of,
-        wait_for_connected_authentication, wire,
+        save_model_defaults_to, terminal_auth_command, terminal_paste_requests_clipboard,
+        transition_route, translate, translate_for_session, usable_terminal_auth_methods,
+        user_message_of, wait_for_connected_authentication, wire,
     };
     use crate::{
         tools::mcp::CredentialStorage,
@@ -4717,6 +4880,59 @@ mod tests {
     }
 
     #[test]
+    fn paste_does_not_modify_the_composer_behind_dialogs() {
+        for dialog in 0..3 {
+            let mut app = App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("parked draft");
+            match dialog {
+                0 => {
+                    app.model_dialog = Some(super::app::ModelDialog {
+                        query: String::new(),
+                        selected: 0,
+                        save_defaults: false,
+                    })
+                }
+                1 => {
+                    app.effort_dialog = Some(super::app::EffortDialog {
+                        selected: 0,
+                        save_defaults: false,
+                    })
+                }
+                _ => {
+                    app.session_dialog = Some(super::app::SessionDialog {
+                        selected: 0,
+                        rename: None,
+                    })
+                }
+            }
+            for event in [
+                Event::Paste("hidden text".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            ] {
+                assert!(matches!(handle(&mut app, event), Action::None));
+                assert_eq!(app.editor.text(), "parked draft");
+                assert!(app.attachments.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_image_rejects_excessive_pixel_dimensions() {
+        let result = clipboard_image_attachment(arboard::ImageData {
+            width: 8192,
+            height: 8192,
+            bytes: Cow::Borrowed(&[]),
+        });
+        assert!(result.unwrap_err().contains("pixel-data limit"));
+    }
+
+    #[test]
     fn pending_attachment_limit_applies_across_pastes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.png");
@@ -4878,6 +5094,98 @@ mod tests {
             assert!(app.editor.is_empty());
             assert!(app.session_rename_active());
         }
+    }
+
+    #[test]
+    fn empty_terminal_paste_requests_native_clipboard() {
+        assert!(terminal_paste_requests_clipboard(""));
+        assert!(!terminal_paste_requests_clipboard("ordinary text"));
+    }
+
+    #[test]
+    fn native_clipboard_shortcut_requires_control_or_reported_command() {
+        assert!(clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn native_clipboard_supports_forwarded_terminal_paste_shortcuts() {
+        for key in [
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+            KeyEvent::new(
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert!(clipboard_paste_key(key));
+            let mut release = key;
+            release.kind = crossterm::event::KeyEventKind::Release;
+            assert!(!clipboard_paste_key(release));
+        }
+        for key in [
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
+            KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+        ] {
+            assert!(!clipboard_paste_key(key));
+        }
+    }
+
+    #[test]
+    fn keyboard_protocol_reports_command_modified_printable_keys() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn clipboard_image_file_lives_with_drafts_and_submissions() {
+        let attachment = clipboard_image_attachment(arboard::ImageData {
+            width: 1,
+            height: 1,
+            bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+        })
+        .unwrap();
+        let path = attachment.path.clone();
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.attach_attachment(attachment);
+        assert!(path.is_file());
+
+        let Action::Submit { prompt, .. } =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected clipboard image submission");
+        };
+        assert!(path.is_file());
+        let restored = prompt.attachments.clone();
+        drop(prompt);
+        assert!(path.is_file());
+        app.restore_attachments(restored);
+        assert!(path.is_file());
+        app.clear_attachments();
+        assert!(!path.exists());
     }
 
     #[test]

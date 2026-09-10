@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ops::Range,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,6 +23,7 @@ use crossterm::event::{
 use ratatui::{layout::Rect, text::Line};
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::attachment::{RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment};
 use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
@@ -241,13 +243,98 @@ pub enum AttachmentKind {
     Audio,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Attachment {
     pub path: PathBuf,
     pub placeholder: String,
     pub mime_type: &'static str,
     pub kind: AttachmentKind,
     pub size: u64,
+    pub(super) temporary: Option<Arc<TemporaryAttachment>>,
+}
+
+impl PartialEq for Attachment {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.placeholder == other.placeholder
+            && self.mime_type == other.mime_type
+            && self.kind == other.kind
+            && self.size == other.size
+    }
+}
+
+impl Eq for Attachment {}
+
+impl Attachment {
+    pub(super) fn clipboard_image(temporary: Arc<TemporaryAttachment>, size: u64) -> Self {
+        Self {
+            path: temporary.path().to_path_buf(),
+            temporary: Some(temporary),
+            placeholder: String::new(),
+            mime_type: "image/png",
+            kind: AttachmentKind::Image,
+            size,
+        }
+    }
+}
+
+fn attachment_number(attachment: &Attachment) -> Option<usize> {
+    attachment
+        .placeholder
+        .strip_suffix(']')
+        .and_then(|placeholder| placeholder.rsplit_once('#'))
+        .and_then(|(_, number)| number.parse().ok())
+}
+
+fn max_attachment_number(text: &str) -> Option<usize> {
+    ["[Image #", "[Audio #"]
+        .into_iter()
+        .flat_map(|prefix| text.match_indices(prefix))
+        .filter_map(|(start, prefix)| {
+            let (number, target) = text[start + prefix.len()..].split_once("](")?;
+            let (uri, _) = target.split_once(')')?;
+            uri.starts_with("file://")
+                .then(|| number.parse().ok())
+                .flatten()
+        })
+        .max()
+}
+
+fn replace_image_uri_on_line(
+    text: &mut String,
+    line: usize,
+    source_uri: Option<&str>,
+    local_uri: Option<&str>,
+) {
+    let Some(source_uri) = source_uri else {
+        return;
+    };
+    let start = if line == 0 {
+        0
+    } else if let Some((index, _)) = text.match_indices('\n').nth(line - 1) {
+        index + 1
+    } else {
+        return;
+    };
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    let target = format!("]({source_uri})");
+    let offset = text[start..end]
+        .match_indices(&target)
+        .find_map(|(offset, _)| {
+            let (_, label) = text[start..start + offset].rsplit_once('[')?;
+            let image_label = label == "Image"
+                || label.strip_prefix("Image #").is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                });
+            image_label.then_some(offset)
+        });
+    if let Some(offset) = offset {
+        let target_start = start + offset;
+        let replacement = local_uri.map_or_else(|| "]".to_string(), |uri| format!("]({uri})"));
+        text.replace_range(target_start..target_start + target.len(), &replacement);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,12 +558,22 @@ pub struct UserImage {
     pub(super) key: [u8; 32],
     pub(super) data: String,
     pub(super) mime_type: String,
+    pub(super) source_uri: Option<String>,
     /// Source line after which the fixed image viewport is reserved.
     pub(super) line: usize,
 }
 
 impl UserImage {
     pub(super) fn new(data: String, mime_type: String, line: usize) -> Option<Self> {
+        Self::with_source(data, mime_type, line, None)
+    }
+
+    pub(super) fn with_source(
+        data: String,
+        mime_type: String,
+        line: usize,
+        source_uri: Option<String>,
+    ) -> Option<Self> {
         // Check the encoded and maximum decoded lengths before hashing or retaining
         // attacker-controlled ACP payloads. The exact decode stays lazy.
         if data.len() > MAX_IMAGE_BASE64_BYTES {
@@ -505,6 +602,7 @@ impl UserImage {
             key: *hasher.finalize().as_bytes(),
             data,
             mime_type,
+            source_uri,
             line,
         })
     }
@@ -643,11 +741,14 @@ pub struct App {
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
     retained_image_source_bytes: usize,
+    attachment_cache: SessionAttachmentCache,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
     pub editor: Editor,
     pub attachments: Vec<Attachment>,
+    retained_attachment_files: RetainedAttachmentFiles,
     next_attachment: usize,
+    submitted_attachment: usize,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     pub can_steer: bool,
@@ -893,11 +994,14 @@ impl App {
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
             retained_image_source_bytes: 0,
+            attachment_cache: SessionAttachmentCache::default(),
             next_transcript_revision: 0,
             transcript_focus_index: None,
             editor: Editor::default(),
             attachments: Vec::new(),
+            retained_attachment_files: RetainedAttachmentFiles::default(),
             next_attachment: 0,
+            submitted_attachment: 0,
             phase: Phase::Idle,
             turn_started: None,
             can_steer: false,
@@ -1513,7 +1617,7 @@ impl App {
     fn apply_message(
         &mut self,
         id: String,
-        text: String,
+        mut text: String,
         images: Vec<UserImage>,
         append: bool,
         role: MessageRole,
@@ -1531,7 +1635,30 @@ impl App {
         if !text.is_empty() || !images.is_empty() {
             self.collapse_last_tool_output();
         }
+        if matches!(role, MessageRole::User)
+            && let Some(number) = max_attachment_number(&text)
+        {
+            self.submitted_attachment = self.submitted_attachment.max(number);
+            self.next_attachment = self.next_attachment.max(self.submitted_attachment);
+        }
         let mut images = images;
+        for image in &images {
+            if image
+                .source_uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("file:"))
+            {
+                let uri = self
+                    .attachment_cache
+                    .image_uri(image.key, &image.data, &image.mime_type);
+                replace_image_uri_on_line(
+                    &mut text,
+                    image.line,
+                    image.source_uri.as_deref(),
+                    uri.as_deref(),
+                );
+            }
+        }
         let existing_index = self.message_blocks.get(&id).copied();
         if !append
             && matches!(role, MessageRole::User)
@@ -2360,6 +2487,7 @@ impl App {
         self.transcript_prefixes.push(0);
         self.transcript_cache_width = 0;
         self.retained_image_source_bytes = 0;
+        self.attachment_cache.clear();
         self.transcript_focus_index = None;
         self.clear_attachments();
         self.latest_agent_source.clear();
@@ -2475,54 +2603,79 @@ impl App {
         kind: AttachmentKind,
         size: u64,
     ) {
+        self.attach_attachment(Attachment {
+            path,
+            placeholder: String::new(),
+            mime_type,
+            kind,
+            size,
+            temporary: None,
+        });
+    }
+
+    pub(super) fn attach_attachment(&mut self, mut attachment: Attachment) {
         if self.editing_steer() {
             self.toast("pending-message edits are text-only");
             return;
         }
         self.queue_handoff = false;
-        self.next_attachment += 1;
-        let label = match kind {
+        self.file_picker = None;
+        self.prune_attachments();
+        let Some(number) = self.next_attachment.checked_add(1) else {
+            self.toast("attachment numbering exhausted — start a new session");
+            return;
+        };
+        self.next_attachment = number;
+        let label = match attachment.kind {
             AttachmentKind::Image => "Image",
             AttachmentKind::Audio => "Audio",
         };
         let placeholder = format!("[{label} #{}]", self.next_attachment);
-        if self
-            .editor
-            .text()
-            .chars()
-            .last()
-            .is_some_and(|character| !character.is_whitespace())
-        {
+        let cursor = self.editor.cursor();
+        let before = self.editor.text()[..cursor].chars().next_back();
+        let after = self.editor.text()[cursor..].chars().next();
+        if before.is_some_and(|character| !character.is_whitespace()) {
             self.editor.insert_char(' ');
         }
         self.editor.insert_str(&placeholder);
-        self.attachments.push(Attachment {
-            path,
-            placeholder,
-            mime_type,
-            kind,
-            size,
-        });
+        if after.is_none_or(|character| !character.is_whitespace()) {
+            self.editor.insert_char(' ');
+        } else {
+            self.editor.move_right();
+        }
+        attachment.placeholder = placeholder;
+        self.attachments.push(attachment);
         self.toast(format!("attached {label} #{}", self.next_attachment));
     }
 
     pub fn clear_attachments(&mut self) {
         self.attachments.clear();
+        self.retained_attachment_files.clear();
         self.next_attachment = 0;
+        self.submitted_attachment = 0;
+    }
+
+    pub fn accept_attachments(&mut self, accepted: &[Attachment]) {
+        if let Some(number) = accepted.iter().filter_map(attachment_number).max() {
+            self.submitted_attachment = self.submitted_attachment.max(number);
+        }
+        self.retained_attachment_files.extend(
+            accepted
+                .iter()
+                .filter_map(|attachment| attachment.temporary.clone()),
+        );
+        self.attachments.clear();
+        self.next_attachment = self.submitted_attachment;
     }
 
     pub fn restore_attachments(&mut self, attachments: Vec<Attachment>) {
-        self.next_attachment = attachments
-            .iter()
-            .filter_map(|attachment| {
-                attachment
-                    .placeholder
-                    .strip_suffix(']')
-                    .and_then(|placeholder| placeholder.rsplit_once('#'))
-                    .and_then(|(_, number)| number.parse().ok())
-            })
-            .max()
-            .unwrap_or(0);
+        self.next_attachment = self.submitted_attachment.max(
+            attachments
+                .iter()
+                .filter_map(attachment_number)
+                .max()
+                .unwrap_or(0),
+        );
         self.attachments = attachments;
     }
 
@@ -2530,6 +2683,62 @@ impl App {
         let prompt = self.editor.text();
         self.attachments
             .retain(|attachment| prompt.contains(&attachment.placeholder));
+        self.next_attachment = self.submitted_attachment.max(
+            self.attachments
+                .iter()
+                .filter_map(attachment_number)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+
+    fn delete_with_attachments(&mut self, backwards: bool, delete: fn(&mut Editor)) {
+        if self.attachments.is_empty() {
+            delete(&mut self.editor);
+            return;
+        }
+        let old_text = self.editor.text().to_owned();
+        let old_cursor = self.editor.cursor();
+        delete(&mut self.editor);
+        let removed = old_text.len().saturating_sub(self.editor.text().len());
+        if removed == 0 {
+            return;
+        }
+        let deleted = if backwards {
+            old_cursor - removed..old_cursor
+        } else {
+            old_cursor..old_cursor + removed
+        };
+        let mut expanded = deleted.clone();
+        for attachment in &self.attachments {
+            for (start, placeholder) in old_text.match_indices(&attachment.placeholder) {
+                let end = start + placeholder.len();
+                let deleted_separator = backwards
+                    && end == deleted.start
+                    && old_text.as_bytes().get(end) == Some(&b' ')
+                    && deleted.end == end + 1;
+                if start < deleted.end && deleted.start < end || deleted_separator {
+                    expanded.start = expanded.start.min(start);
+                    expanded.end = expanded.end.max(end);
+                }
+            }
+        }
+        if expanded == deleted {
+            self.prune_attachments();
+            return;
+        }
+        if old_text.as_bytes().get(expanded.end) == Some(&b' ')
+            && (expanded.start == 0
+                || old_text[..expanded.start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
+        {
+            expanded.end += 1;
+        }
+        let remaining_end = deleted.start + expanded.end - deleted.end;
+        self.editor.replace_range(expanded.start..remaining_end, "");
+        self.prune_attachments();
     }
 
     /// Inserts pasted text into the prompt.
@@ -3568,15 +3777,29 @@ impl App {
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Char('j') if control => self.editor.insert_char('\n'),
             KeyCode::Tab => self.editor.insert_str("    "),
-            KeyCode::Backspace if command => self.editor.delete_to_line_start(),
-            KeyCode::Backspace if alt || control => self.editor.delete_word_back(),
-            KeyCode::Backspace => self.editor.backspace(),
-            KeyCode::Delete if word => self.editor.delete_word_forward(),
-            KeyCode::Delete => self.editor.delete_forward(),
-            KeyCode::Char('w') if control => self.editor.delete_word_back(),
-            KeyCode::Char('u') if control => self.editor.delete_to_line_start(),
-            KeyCode::Char('k') if control => self.editor.delete_to_line_end(),
-            KeyCode::Char('d') if alt => self.editor.delete_word_forward(),
+            KeyCode::Backspace if command => {
+                self.delete_with_attachments(true, Editor::delete_to_line_start);
+            }
+            KeyCode::Backspace if alt || control => {
+                self.delete_with_attachments(true, Editor::delete_word_back);
+            }
+            KeyCode::Backspace => self.delete_with_attachments(true, Editor::backspace),
+            KeyCode::Delete if word => {
+                self.delete_with_attachments(false, Editor::delete_word_forward);
+            }
+            KeyCode::Delete => self.delete_with_attachments(false, Editor::delete_forward),
+            KeyCode::Char('w') if control => {
+                self.delete_with_attachments(true, Editor::delete_word_back);
+            }
+            KeyCode::Char('u') if control => {
+                self.delete_with_attachments(true, Editor::delete_to_line_start);
+            }
+            KeyCode::Char('k') if control => {
+                self.delete_with_attachments(false, Editor::delete_to_line_end);
+            }
+            KeyCode::Char('d') if alt => {
+                self.delete_with_attachments(false, Editor::delete_word_forward);
+            }
             // Legacy terminal encoding reports option+left/right as alt+b/f.
             KeyCode::Char('b') if alt => self.editor.move_word_left(),
             KeyCode::Char('f') if alt => self.editor.move_word_right(),
@@ -3941,7 +4164,36 @@ fn has_graphical_session(display: Option<&OsStr>, wayland_display: Option<&OsStr
         .any(|value| !value.is_empty())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    if url.contains('\0') {
+        return;
+    }
+    let operation = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated UTF-16 strings and live for the call.
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn open_url(_url: &str) {}
 
 /// Fixtures and test accessors; not an alternate live event protocol.
@@ -4025,8 +4277,9 @@ mod tests {
     };
 
     use super::{
-        Action, AgentPart, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
-        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+        Action, AgentPart, App, Attachment, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
+        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase, Update,
+        UserImage,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -4439,6 +4692,75 @@ mod tests {
         assert_eq!(app.retained_image_source_bytes, 2 * bytes);
         app.apply(patch(Vec::new(), false));
         assert_eq!(app.retained_image_source_bytes, bytes);
+    }
+
+    #[test]
+    fn replayed_native_image_links_are_reused_and_live_for_the_session() {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        ::image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, ::image::ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let replay = |id: &str, stale: &str| Update::UserMessage {
+            id: id.into(),
+            text: format!("[reference]({stale}) [Image]({stale})"),
+            images: vec![
+                UserImage::with_source(encoded.clone(), "image/png".into(), 0, Some(stale.into()))
+                    .unwrap(),
+            ],
+            append: false,
+        };
+        let linked_path = |app: &App, index: usize| {
+            let Block::User(message) = &app.blocks[index] else {
+                panic!("expected user message");
+            };
+            let uri = message
+                .text
+                .rsplit_once("](")
+                .and_then(|(_, target)| target.strip_suffix(')'))
+                .unwrap();
+            url::Url::parse(uri).unwrap().to_file_path().unwrap()
+        };
+
+        let mut app = app();
+        app.apply(replay("one", "file:///tmp/deleted-one.png"));
+        let first = linked_path(&app, 0);
+        assert!(first.exists());
+        assert!(matches!(&app.blocks[0], Block::User(message)
+            if message.text.starts_with("[reference](file:///tmp/deleted-one.png)")));
+        app.apply(replay("two", "file:///tmp/deleted-two.png"));
+        let second = linked_path(&app, 1);
+        assert_eq!(second, first, "equal image content should reuse one file");
+
+        app.start_session("replacement".into());
+        assert!(
+            !first.exists(),
+            "session switch should release native links"
+        );
+    }
+
+    #[test]
+    fn unavailable_replayed_native_image_is_not_left_as_a_dead_link() {
+        let mut app = app();
+        app.apply(Update::UserMessage {
+            id: "bad".into(),
+            text: "[Image](file:///tmp/deleted.png)".into(),
+            images: vec![
+                UserImage::with_source(
+                    "not base64".into(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///tmp/deleted.png".into()),
+                )
+                .unwrap(),
+            ],
+            append: false,
+        });
+        assert!(matches!(
+            app.blocks.first(),
+            Some(Block::User(message)) if message.text == "[Image]"
+        ));
     }
 
     #[test]
@@ -5061,9 +5383,189 @@ mod tests {
     }
 
     #[test]
-    fn rejected_prompt_restores_unique_attachment_numbering() {
+    fn attachment_placeholders_are_deleted_atomically_from_the_requested_direction() {
+        for (key, offset) in [
+            (KeyCode::Delete, 0),
+            (KeyCode::Delete, "[Image #1]".len() / 2),
+            (KeyCode::Backspace, "[Image #1]".len() / 2),
+            (KeyCode::Backspace, "[Image #1] ".len()),
+        ] {
+            let mut app = app();
+            app.paste("left");
+            app.attach(
+                PathBuf::from("/tmp/media"),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+            app.paste("right");
+
+            let cursor = "left ".len() + offset;
+            while app.editor.cursor() > cursor {
+                assert!(matches!(app.handle_key(press(KeyCode::Left)), Action::None));
+            }
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+
+            assert_eq!(app.editor.text(), "left right");
+            assert!(app.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn attachment_deletion_does_not_cross_the_opposite_boundary() {
         let mut app = app();
-        for name in ["one.png", "two.png"] {
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.handle_key(press(KeyCode::Delete));
+        assert_eq!(app.editor.text(), "[Image #1] ");
+
+        while app.editor.cursor() > 0 {
+            app.handle_key(press(KeyCode::Left));
+        }
+        app.handle_key(press(KeyCode::Backspace));
+        assert_eq!(app.editor.text(), "[Image #1] ");
+        assert_eq!(app.attachments.len(), 1);
+    }
+
+    #[test]
+    fn modified_deletion_never_leaves_a_partial_attachment_placeholder() {
+        let mut app = app();
+        app.paste("left");
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("right");
+        while app.editor.cursor() > "left [Image".len() {
+            app.handle_key(press(KeyCode::Left));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+
+        assert!(!app.editor.text().contains("[Image"));
+        assert!(!app.editor.text().contains("#1]"));
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn attachment_placeholder_includes_a_separator_before_following_text() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("describe this");
+
+        assert_eq!(app.editor.text(), "[Image #1] describe this");
+    }
+
+    #[test]
+    fn attachment_insert_before_existing_separator_leaves_cursor_after_it() {
+        let mut app = app();
+        app.paste("left right");
+        for _ in 0..6 {
+            app.handle_key(press(KeyCode::Left));
+        }
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("typed ");
+
+        assert_eq!(app.editor.text(), "left [Image #1] typed right");
+    }
+
+    #[test]
+    fn deleting_an_attachment_never_consumes_a_following_newline() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.insert_char('\n');
+        app.handle_key(press(KeyCode::Left));
+        app.handle_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.editor.text(), "\n");
+    }
+
+    #[test]
+    fn stale_cleared_attachment_metadata_does_not_consume_a_number() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/stale.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/current.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+        assert_eq!(app.attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_numbering_resets_after_the_only_placeholder_is_deleted() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/first.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.handle_key(press(KeyCode::Backspace));
+        app.attach(
+            PathBuf::from("/tmp/second.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #1] ");
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn accepted_clipboard_image_file_lives_until_the_session_is_cleared() {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let path_buf = path.to_path_buf();
+        let mut app = app();
+        app.attach_attachment(Attachment::clipboard_image(
+            crate::tui::attachment::own_temp_path(path),
+            0,
+        ));
+
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        assert!(path_buf.exists());
+        drop(accepted);
+
+        app.clear_attachments();
+        assert!(!path_buf.exists());
+    }
+
+    #[test]
+    fn accepting_only_submitted_attachments_reuses_the_highest_omitted_number() {
+        let mut app = app();
+        for name in ["accepted.png", "omitted.png"] {
             app.attach(
                 PathBuf::from(format!("/tmp/{name}")),
                 "image/png",
@@ -5071,9 +5573,205 @@ mod tests {
                 3,
             );
         }
-        let rejected = std::mem::take(&mut app.attachments);
+        let accepted = vec![app.attachments[0].clone()];
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/reused.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #2]");
+    }
+
+    #[test]
+    fn attachment_numbering_continues_after_a_prompt_is_accepted() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/first.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/second.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #2] ");
+        assert_eq!(app.attachments[0].placeholder, "[Image #2]");
+    }
+
+    #[test]
+    fn attachment_numbering_continues_from_replayed_session_history() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "look [Image #3](file:///tmp/third.png)".into(),
+            vec![UserImage::new("AQID".into(), "image/png".into(), 0).unwrap()],
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/fourth.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #4] ");
+    }
+
+    #[test]
+    fn audio_only_history_resumes_numbering_and_reset_starts_over() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "listen [Audio #7](file:///tmp/seven.wav)".into(),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/eight.wav"),
+            "audio/wav",
+            AttachmentKind::Audio,
+            3,
+        );
+        assert_eq!(app.attachments[0].placeholder, "[Audio #8]");
+
         app.clear_attachments();
-        app.restore_attachments(rejected);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/one.wav"),
+            "audio/wav",
+            AttachmentKind::Audio,
+            3,
+        );
+        assert_eq!(app.attachments[0].placeholder, "[Audio #1]");
+    }
+
+    #[test]
+    fn literal_image_marker_does_not_change_numbering() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "literal [Image #999]".into(),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn maximum_history_attachment_number_does_not_overflow_or_reuse_a_number() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            format!("[Image #{}](file:///tmp/image.png)", usize::MAX),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert!(app.attachments.is_empty());
+        assert!(app.editor.is_empty());
+        assert_eq!(
+            app.toast_text(),
+            Some("attachment numbering exhausted — start a new session")
+        );
+    }
+
+    #[test]
+    fn attachment_aware_deletion_does_not_change_normal_text_behavior() {
+        for key in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut app = app();
+            app.paste("abc");
+            if key == KeyCode::Delete {
+                assert!(matches!(app.handle_key(press(KeyCode::Left)), Action::None));
+            }
+
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+            assert_eq!(app.editor.text(), "ab");
+        }
+    }
+
+    #[test]
+    fn deleting_highest_pending_attachment_reuses_its_number_after_an_accept() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/one.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        for name in ["two.png", "three.png"] {
+            app.attach(
+                PathBuf::from(format!("/tmp/{name}")),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+        }
+        app.handle_key(press(KeyCode::Backspace));
+        app.attach(
+            PathBuf::from("/tmp/reused.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments.last().unwrap().placeholder, "[Image #3]");
+    }
+
+    #[test]
+    fn rejected_prompt_restores_draft_and_submitted_attachment_watermark() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/one.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/two.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected submission");
+        };
+
+        app.paste(&prompt.text);
+        app.restore_attachments(prompt.attachments);
         app.attach(
             PathBuf::from("/tmp/three.png"),
             "image/png",
@@ -5081,12 +5779,13 @@ mod tests {
             3,
         );
 
+        assert_eq!(app.editor.text(), "[Image #2] [Image #3] ");
         assert_eq!(
             app.attachments
                 .iter()
                 .map(|attachment| attachment.placeholder.as_str())
                 .collect::<Vec<_>>(),
-            ["[Image #1]", "[Image #2]", "[Image #3]"]
+            ["[Image #2]", "[Image #3]"]
         );
     }
 

@@ -76,6 +76,8 @@ RUN apt-get update \
     && chown kit:kit /workspace
 
 COPY --from=builder-gnu /kit /usr/local/bin/kit
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/kit/
+COPY third_party/licenses /usr/share/doc/kit/third_party/licenses
 
 ENV HOME=/home/kit
 WORKDIR /workspace
@@ -107,6 +109,8 @@ RUN apt-get update \
     && chown kit:kit /workspace
 
 COPY --from=builder-gnu /kit /usr/local/bin/kit
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/kit/
+COPY third_party/licenses /usr/share/doc/kit/third_party/licenses
 
 ENV HOME=/home/kit
 WORKDIR /workspace
@@ -138,6 +142,8 @@ RUN apk add --no-cache ca-certificates git \
     && chown kit:kit /workspace
 
 COPY --from=builder-musl /kit /usr/local/bin/kit
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/kit/
+COPY third_party/licenses /usr/share/doc/kit/third_party/licenses
 
 ENV HOME=/home/kit
 WORKDIR /workspace

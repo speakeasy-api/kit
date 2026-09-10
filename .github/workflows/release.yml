@@ -196,8 +196,12 @@ jobs:
           cargo build --locked --release --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
+          cp LICENSE THIRD_PARTY_NOTICES.md stage/
+          mkdir -p stage/third_party
+          cp -R third_party/licenses stage/third_party/licenses
           stage/kit --version
-          tar -C stage -czf "dist/kit-v${version}-x86_64-unknown-linux-gnu.tar.gz" kit
+          tar -C stage -czf "dist/kit-v${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            kit LICENSE THIRD_PARTY_NOTICES.md third_party/licenses
       - uses: actions/upload-artifact@v4
         with:
           name: kit-linux-x64
@@ -279,6 +283,9 @@ jobs:
           cargo build --locked --release --target aarch64-apple-darwin --bin kit
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
+          cp LICENSE THIRD_PARTY_NOTICES.md stage/
+          mkdir -p stage/third_party
+          cp -R third_party/licenses stage/third_party/licenses
           if [[ $SIGN_RELEASE == true ]]; then
             codesign --force --options runtime --timestamp \
               --identifier com.speakeasy.kit \
@@ -301,7 +308,8 @@ jobs:
             }
           fi
           stage/kit --version
-          tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
+          tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" \
+            kit LICENSE THIRD_PARTY_NOTICES.md third_party/licenses
       - uses: actions/upload-artifact@v4
         with:
           name: kit-macos-cli-arm64
@@ -339,7 +347,7 @@ jobs:
         run: |
           mkdir -p target/aarch64-apple-darwin/release
           tar -xzf "$RUNNER_TEMP/macos-cli/kit-v${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz" \
-            -C target/aarch64-apple-darwin/release
+            -C target/aarch64-apple-darwin/release kit
           test -x target/aarch64-apple-darwin/release/kit
       - name: Check optional signing credentials
         id: signing
