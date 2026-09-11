@@ -2011,10 +2011,13 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             value
                         };
                         kit::config_editor::set(&path, &key, &value)?;
+                        // One-shot edits cannot succeed with only an in-memory copy.
+                        fs::finish_recovery(fs::global())?;
                         Ok(None)
                     }
                     ConfigAction::Unset { key } => {
                         kit::config_editor::unset(&path, &key)?;
+                        fs::finish_recovery(fs::global())?;
                         Ok(None)
                     }
                 }
@@ -2025,11 +2028,6 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !output.ends_with('\n') && !output.is_empty() {
                     println!();
                 }
-            }
-            if fs::global().status().pending_operations > 0 {
-                eprintln!(
-                    "Config updated in memory only; persistence is pending and will not survive process termination."
-                );
             }
         }
         Command::Sessions { action, root } => {
@@ -2355,6 +2353,11 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+// Real disk fault boundary, compiled only for tests.
+#[cfg(test)]
+#[path = "../tests/support/capacity.rs"]
+mod capacity;
 
 #[cfg(test)]
 #[allow(
@@ -3384,6 +3387,71 @@ future_option = true
                 assert!(help.to_string().contains(setting), "{setting}: {help}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn config_edits_require_disk_before_success() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "KIT_TEST_CONFIG_DISK_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["set", "unset", "missing-key", "missing-file"] {
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join(".kit/config.toml");
+                let original = "# preserved\r\nmodel = 'old'\r\n";
+                if case != "missing-file" {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, original).unwrap();
+                }
+                let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::config_edits_require_disk_before_success",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("HOME", home.path())
+                    .output()
+                    .await
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    case.starts_with("missing-"),
+                    "{case}: {stderr}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                if !case.starts_with("missing-") {
+                    assert!(
+                        stderr.contains("could not be persisted before exit"),
+                        "{stderr}"
+                    );
+                }
+                assert!(!stderr.contains("Config updated in memory only"));
+                if case == "missing-file" {
+                    assert!(!home.path().join(".kit").exists());
+                } else {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+                }
+            }
+            return Ok(());
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let backend = std::sync::Arc::new(crate::capacity::Capacity {
+            exhausted: std::sync::atomic::AtomicBool::new(true),
+            exhaust_on_write: std::sync::atomic::AtomicBool::new(false),
+            repaired: home.join("capacity-repaired"),
+        });
+        super::fs::initialize_global(super::fs::Fs::new(std::sync::Arc::new(
+            crate::capacity::CapacityDisk(backend),
+        )))
+        .unwrap();
+        let args = match case.as_str() {
+            "set" => vec!["kit", "config", "set", "model", "new"],
+            "unset" => vec!["kit", "config", "unset", "model"],
+            _ => vec!["kit", "config", "unset", "absent"],
+        };
+        // Return the real dispatch error to the subprocess test runner: an
+        // accepted memory-only edit must be an unsuccessful process result.
+        super::run_cli(Cli::try_parse_from(args).unwrap()).await
     }
 
     #[tokio::test]

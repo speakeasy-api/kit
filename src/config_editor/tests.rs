@@ -15,6 +15,22 @@ fn assert_unchanged(path: &Path, contents: &str, modified: std::time::SystemTime
     assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
 }
 
+// Verify both strict TOML-value syntax and get -> set semantic compatibility.
+fn assert_keyed_round_trip(path: &Path, key: &str, expected: &toml::Value) {
+    let original = fs::read_to_string(path).unwrap();
+    let modified = fs::metadata(path).unwrap().modified().unwrap();
+    let output = get(path, Some(key)).unwrap();
+    output.parse::<toml_edit::Value>().unwrap();
+    let parsed: toml::Value = toml::from_str(&format!("value = {output}")).unwrap();
+    assert_eq!(&parsed["value"], expected, "{key}: {output}");
+    assert_eq!(get(path, None).unwrap(), original);
+    assert_unchanged(path, &original, modified);
+    let destination = tempfile::tempdir().unwrap();
+    let copy = destination.path().join("copy.toml");
+    set(&copy, "copied", &output).unwrap();
+    assert_eq!(&document(&copy)["copied"], expected, "{key}: {output}");
+}
+
 #[test]
 fn all_toml_value_types_round_trip_through_api() {
     let dir = tempfile::tempdir().unwrap();
@@ -34,9 +50,7 @@ fn all_toml_value_types_round_trip_through_api() {
         set(&path, key, input).unwrap();
         let expected: toml::Value = toml::from_str(&format!("value = {input}")).unwrap();
         assert_eq!(document(&path)[key], expected["value"], "{key}");
-        let returned: toml::Value =
-            toml::from_str(&format!("value = {}", get(&path, Some(key)).unwrap())).unwrap();
-        assert_eq!(returned["value"], expected["value"], "{key}");
+        assert_keyed_round_trip(&path, key, &expected["value"]);
     }
 }
 
@@ -382,15 +396,12 @@ fn keyed_values_round_trip_without_outer_comments() {
 }
 
 #[test]
-fn keyed_table_output_remains_a_toml_document() {
+fn keyed_table_output_is_a_reusable_toml_value() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let original = "[custom] # table comment\nvalue = true # value comment\n";
     fs::write(&path, original).unwrap();
-    let output = get(&path, Some("custom")).unwrap();
-    let parsed: toml::Value = toml::from_str(&output).unwrap();
-    assert_eq!(parsed, document(&path)["custom"]);
-    assert_eq!(get(&path, None).unwrap(), original);
+    assert_keyed_round_trip(&path, "custom", &document(&path)["custom"]);
 }
 
 #[test]
@@ -398,13 +409,17 @@ fn keyed_tables_return_the_complete_selected_subtree() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     for source in [
+        "[selected]\n",
+        "[selected.\"quoted.child\"]\n\"quoted.key\" = { nested = [{ value = 3 }] }\n",
         "[selected]\nvalue = 1\n[selected.child]\nvalue = 2\n[selected.child.deep]\nvalue = 3\n[other]\nvalue = 4\n",
         "[selected.child.deep]\nvalue = 3\n[other]\nvalue = 4\n",
         "[selected]\nvalue = 1\n[[selected.children]]\nvalue = 2\n[selected.children.nested]\nvalue = 3\n[[selected.children]]\nvalue = 4\n[[selected.children.more]]\nvalue = 5\n[other]\nvalue = 6\n",
     ] {
         fs::write(&path, source).unwrap();
-        let selected: toml::Value = toml::from_str(&get(&path, Some("selected")).unwrap()).unwrap();
-        assert_eq!(selected, document(&path)["selected"], "{source}");
+        assert_keyed_round_trip(&path, "selected", &document(&path)["selected"]);
+        if let Some(children) = document(&path)["selected"].get("children") {
+            assert_keyed_round_trip(&path, "selected.children", children);
+        }
     }
 }
 
@@ -467,10 +482,7 @@ fn keyed_dotted_tables_return_the_complete_selected_subtree() {
         ),
     ] {
         fs::write(&path, source).unwrap();
-        let output = get(&path, Some(key)).unwrap();
-        let actual: toml::Value = toml::from_str(&output).unwrap();
         let expected: toml::Value = toml::from_str(expected).unwrap();
-        assert_eq!(actual, expected, "{source} => {key}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+        assert_keyed_round_trip(&path, key, &expected);
     }
 }

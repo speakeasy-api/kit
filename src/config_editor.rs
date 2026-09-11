@@ -36,18 +36,14 @@ pub fn get(path: &Path, key: Option<&str>) -> io::Result<String> {
             .get(key.get())
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config key not found"))?;
     }
-    // A keyed value is reusable TOML, not the surrounding assignment's comments.
-    // Tables retain their document representation, including nested table headers.
-    let mut item = item.clone();
-    if let Item::Table(mut table) = item {
-        // A selected dotted table is now the root, with no parent to emit its values.
-        table.set_dotted(false);
-        return Ok(DocumentMut::from(table).to_string().trim().to_owned());
-    }
-    if let Some(value) = item.as_value_mut() {
-        value.decor_mut().clear();
-    }
-    Ok(item.to_string().trim().to_owned())
+    // Convert tables and arrays of tables recursively, retaining the complete subtree.
+    // A keyed result is a TOML value reusable by set, not a document fragment.
+    let mut value = item
+        .clone()
+        .into_value()
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "config key not found"))?;
+    value.decor_mut().clear();
+    Ok(value.to_string().trim().to_owned())
 }
 
 /// Set any dotted/quoted TOML key. Valid TOML values retain their type; otherwise

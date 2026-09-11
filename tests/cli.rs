@@ -156,3 +156,43 @@ fn sessions_rename_sets_replaces_lists_and_clears_a_display_name() {
     );
     assert_eq!(fs::read_to_string(metadata).unwrap(), "{}\n");
 }
+
+#[test]
+fn config_commands_report_disk_errors_and_preserve_missing_unsets() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join(".kit/config.toml");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["config", "unset", "missing"]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stdout.is_empty());
+    assert!(!home.path().join(".kit").exists());
+
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# keep formatting\r\nmodel = 'old'\r\n";
+    fs::write(&path, original).unwrap();
+    let output = run(&["config", "unset", "missing"]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    // A directory at the config path is a real filesystem failure, not a
+    // parse or argument error. Both mutating commands must exit unsuccessfully.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    for args in [
+        vec!["config", "set", "model", "new"],
+        vec!["config", "unset", "model"],
+    ] {
+        let output = run(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(path.is_dir());
+    }
+}
