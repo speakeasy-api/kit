@@ -102,6 +102,10 @@ echo "Building Kit $version from commit $commit for $target..."
   CARGO_TARGET_DIR="$target_dir" cargo build --locked --release --target "$target"
 )
 cp "$source_binary" "$binary"
+cp "$source_dir/LICENSE" "$source_dir/THIRD_PARTY_NOTICES.md" "$out_dir/"
+mkdir -p "$out_dir/third_party"
+rm -rf "$out_dir/third_party/licenses"
+cp -R "$source_dir/third_party/licenses" "$out_dir/third_party/licenses"
 
 echo "Signing with $identity..."
 codesign --force --options runtime --timestamp \
@@ -125,7 +129,8 @@ if ! grep -Eq '(^|[[:space:]])status: Accepted([[:space:]]|$)' "$log"; then
   exit 1
 fi
 
-tar -C "$out_dir" -czf "$archive" kit
+tar -C "$out_dir" -czf "$archive" \
+  kit LICENSE THIRD_PARTY_NOTICES.md third_party/licenses
 shasum -a 256 "$archive" > "$archive.sha256"
 
 echo

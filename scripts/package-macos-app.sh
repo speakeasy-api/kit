@@ -29,6 +29,12 @@ for binary in "$executable" "$helper"; do
 done
 cmp -s "$source_helper" "$helper" || { echo "archived helper does not match the release build" >&2; exit 1; }
 
+resources=$app/Contents/Resources
+mkdir -p "$resources/third_party"
+rm -rf "$resources/third_party/licenses"
+cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$resources/"
+cp -R "$root/third_party/licenses" "$resources/third_party/licenses"
+
 mkdir -p "$dist"
 if [[ $signed == true ]]; then
   : "${MACOS_SIGNING_IDENTITY:?MACOS_SIGNING_IDENTITY must be set}"

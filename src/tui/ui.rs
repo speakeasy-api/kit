@@ -33,6 +33,15 @@ use super::{
 const SIDE_BY_SIDE_WIDTH: u16 = 108;
 const AGENTS_WIDTH: u16 = 46;
 const MAX_PROMPT_ROWS: usize = 10;
+
+pub(super) fn native_links_obscured(app: &App) -> bool {
+    app.model_switch.is_some()
+        || app.file_picker.is_some()
+        || app.session_dialog.is_some()
+        || app.model_dialog.is_some()
+        || app.effort_dialog.is_some()
+        || !app.command_completions().is_empty()
+}
 const MAX_PENDING_STEER_ROWS: usize = 3;
 const START_MAX_WIDTH: u16 = 96;
 const START_LOGO_ROWS: u16 = 3;
@@ -1025,7 +1034,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
         let Some(source) = sources.get(source_index) else {
             continue;
         };
-        if let Some(image) = images.prepare(source, inner.width.max(1)) {
+        if let Some(image) = images.prepare_assistant(source, inner.width.max(1)) {
             images.render(frame, image, inner, y);
         }
     }
@@ -2386,29 +2395,65 @@ mod tests {
     use agent_client_protocol::schema::v2::{
         IdleStateUpdate, RunningStateUpdate, StateUpdate, StopReason,
     };
-    use std::path::PathBuf;
+    use std::{
+        cell::RefCell,
+        io::{self, Write},
+        path::PathBuf,
+        rc::Rc,
+        time::Duration,
+    };
 
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal,
+        backend::{CrosstermBackend, TestBackend},
+    };
     use ratatui_image::picker::Picker;
     use unicode_width::UnicodeWidthStr;
 
     use super::{
         ImageRuntime, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
-        model_dialog_rows, model_dialog_viewport, prompt_lines,
+        model_dialog_rows, model_dialog_viewport, native_links_obscured, prompt_lines,
         refresh_transcript_cache_with_images, truncate_to_width, user_block_rows, user_line,
     };
     use crate::{
         events::{GenerationOutcome, RuntimeEvent, SubagentStatus},
         file_search::FileMatch,
-        tui::app::{
-            Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog,
-            FilePickerDialog, FilePickerStatus, ModelDialog, Phase, SessionDialog, SessionRename,
-            Update, UserImage, UserMessage,
+        tui::{
+            app::{
+                Action, AgentRow, AgentTreeRow, App, Block, EffortChoice, EffortDialog,
+                FilePickerDialog, FilePickerStatus, ModelDialog, Phase, SessionDialog,
+                SessionRename, Update, UserImage, UserMessage,
+            },
+            hyperlinks::HyperlinkRenderer,
         },
     };
+
+    #[derive(Clone, Default)]
+    struct Capture(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Capture {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.borrow().clone()
+        }
+
+        fn clear(&self) {
+            self.0.borrow_mut().clear();
+        }
+    }
 
     fn refresh_transcript_cache(app: &mut App, width: usize) {
         let mut images = ImageRuntime::disabled();
@@ -2898,6 +2943,26 @@ mod tests {
             .collect()
     }
 
+    fn wait_for_image_decode(images: &mut ImageRuntime) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while images.pending() && std::time::Instant::now() < deadline {
+            images.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        images.poll();
+        assert!(!images.pending(), "background image decode did not finish");
+    }
+
+    fn buffer_contains_black_image_cell(buffer: &ratatui::buffer::Buffer) -> bool {
+        (0..buffer.area.height).any(|row| {
+            (0..buffer.area.width).any(|column| {
+                let cell = &buffer[(column, row)];
+                cell.fg == ratatui::style::Color::Rgb(0, 0, 0)
+                    && cell.bg == ratatui::style::Color::Rgb(0, 0, 0)
+            })
+        })
+    }
+
     #[test]
     fn agents_panel_keeps_footer_fixed_while_overflowing_rows_scroll() {
         let mut app = panel_app(5);
@@ -3373,6 +3438,88 @@ mod tests {
         let compact = render(&mut app, 80, 24);
         assert!(compact.contains("/model"), "{compact}");
         assert!(compact.contains("Choose a model"), "{compact}");
+    }
+
+    #[test]
+    fn command_popup_obscures_native_links_and_clears_stale_footprints() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai".into(),
+            "gpt".into(),
+            "127.0.0.1:7331".into(),
+        );
+        app.blocks.push(Block::Agent(
+            "[visible link](https://example.com/target)".into(),
+        ));
+        app.phase = Phase::Working;
+        let mut terminal = Terminal::new(TestBackend::new(50, 10)).expect("terminal");
+        let mut images = ImageRuntime::disabled();
+        let mut renderer = HyperlinkRenderer::default();
+        let capture = Capture::default();
+        let mut native_backend = CrosstermBackend::new(capture.clone());
+
+        let linked = terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .expect("draw linked frame");
+        assert!(!native_links_obscured(&app));
+        let (row, hit) = app
+            .row_links
+            .iter()
+            .enumerate()
+            .find_map(|(row, hits)| hits.first().map(|hit| (row, hit)))
+            .expect("visible transcript link");
+        let link_x = u16::try_from(app.transcript_left + hit.start).unwrap();
+        let link_y = u16::try_from(app.transcript_top + row).unwrap();
+        let linked_symbol = linked.buffer[(link_x, link_y)].symbol().to_string();
+        let prepared = renderer.prepare(
+            &linked,
+            &app.row_links,
+            app.transcript_left,
+            app.transcript_top,
+            false,
+        );
+        renderer.draw(&mut native_backend, prepared).unwrap();
+        let open = b"\x1b]8;;https://example.com/target\x1b\\";
+        assert!(capture.bytes().windows(open.len()).any(|part| part == open));
+        capture.clear();
+
+        app.paste("/");
+        let popup = terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .expect("draw popup frame");
+        assert!(native_links_obscured(&app));
+        assert!(app.row_links.iter().flatten().next().is_some());
+        assert_ne!(
+            popup.buffer[(link_x, link_y)].symbol(),
+            linked_symbol,
+            "command popup should cover the transcript link"
+        );
+        let prepared = renderer.prepare(
+            &popup,
+            &app.row_links,
+            app.transcript_left,
+            app.transcript_top,
+            native_links_obscured(&app),
+        );
+        renderer.draw(&mut native_backend, prepared).unwrap();
+
+        let cleared = capture.bytes();
+        assert!(cleared.starts_with(b"\x1b7"));
+        assert!(cleared.ends_with(b"\x1b8"));
+        // Clearing a stale footprint still emits OSC-8 close; it must not
+        // reopen the hidden transcript destination over the popup cells.
+        assert!(!cleared.windows(open.len()).any(|part| part == open));
+        capture.clear();
+
+        let prepared = renderer.prepare(
+            &popup,
+            &app.row_links,
+            app.transcript_left,
+            app.transcript_top,
+            true,
+        );
+        renderer.draw(&mut native_backend, prepared).unwrap();
+        assert!(capture.bytes().is_empty());
     }
 
     #[test]
@@ -4786,7 +4933,16 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
+        assert_eq!(images.cached_entries(), 0);
+        wait_for_image_decode(&mut images);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
         assert_eq!(images.cached_entries(), 1);
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
+
         let mut disabled = ImageRuntime::disabled();
         terminal
             .draw(|frame| draw(frame, &mut app, &mut disabled))
@@ -4848,18 +5004,39 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
-        assert_eq!(images.cached_entries(), 1, "visible image is prepared");
+        assert_eq!(images.cached_entries(), 0, "visible image decode is queued");
+        wait_for_image_decode(&mut images);
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 1, "visible image is rendered");
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
         let reserved_rows = app.transcript_cache[0].as_ref().unwrap().rows.len();
 
         images.clear();
+        assert_eq!(
+            images.cached_entries(),
+            0,
+            "decoded image cache was evicted"
+        );
+        terminal
+            .draw(|frame| draw(frame, &mut app, &mut images))
+            .unwrap();
+        assert_eq!(images.cached_entries(), 0, "evicted image decode is queued");
+        wait_for_image_decode(&mut images);
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
         assert_eq!(
             images.cached_entries(),
             1,
-            "an evicted visible image is prepared again before rendering"
+            "an evicted visible image is rendered again after decoding"
         );
+        assert!(buffer_contains_black_image_cell(
+            terminal.backend().buffer()
+        ));
         assert_eq!(
             app.transcript_cache[0].as_ref().unwrap().rows.len(),
             reserved_rows,

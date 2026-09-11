@@ -510,6 +510,7 @@ struct Link<'a> {
     end: usize,
     label: Option<&'a str>,
     url: &'a str,
+    url_range: Range<usize>,
 }
 
 /// Returns byte ranges for complete inline images and their destinations, in source order.
@@ -714,11 +715,33 @@ fn next_markdown_link(source: &str) -> Option<Link<'_>> {
                 end: url_end + 1,
                 label: Some(&source[start + 1..label_end]),
                 url,
+                url_range: url_start..url_end,
             });
         }
         offset = url_end + 1;
     }
     None
+}
+
+/// Extract destinations through the rendering parser so replay rewrites exactly
+/// the links displayed by the terminal, including within nested emphasis.
+pub(super) fn image_label_link_destinations(source: &str) -> Vec<(Range<usize>, String)> {
+    let mut destinations = Vec::new();
+    inline_with_link_destinations_and_ranges(
+        source,
+        Style::default(),
+        false,
+        0,
+        Some(&mut destinations),
+    );
+    destinations
+}
+
+fn is_image_label(label: &str) -> bool {
+    label == "Image"
+        || label.strip_prefix("Image #").is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn next_link(source: &str) -> Option<Link<'_>> {
@@ -752,6 +775,7 @@ fn next_link(source: &str) -> Option<Link<'_>> {
                 end,
                 label: None,
                 url: &source[start..end],
+                url_range: start..end,
             }
         });
     let markdown = next_markdown_link(source);
@@ -762,12 +786,16 @@ fn next_link(source: &str) -> Option<Link<'_>> {
     }
 }
 
-pub(super) fn line_with_link(source: &str, url: &str) -> Option<usize> {
-    source.split('\n').position(|line| {
-        inline(line, Style::default())
-            .iter()
-            .any(|span| span.url.as_deref() == Some(url))
-    })
+pub(super) fn image_label_links(source: &str) -> Vec<(usize, String)> {
+    source
+        .split('\n')
+        .enumerate()
+        .flat_map(|(line, source)| {
+            image_label_link_destinations(source)
+                .into_iter()
+                .map(move |(_, uri)| (line, uri))
+        })
+        .collect()
 }
 
 pub(super) fn inline_spans(source: &str, base: Style) -> Vec<LinkedSpan> {
@@ -783,6 +811,16 @@ fn inline_with_link_destinations(
     source: &str,
     base: Style,
     show_link_destinations: bool,
+) -> Vec<LinkedSpan> {
+    inline_with_link_destinations_and_ranges(source, base, show_link_destinations, 0, None)
+}
+
+fn inline_with_link_destinations_and_ranges(
+    source: &str,
+    base: Style,
+    show_link_destinations: bool,
+    offset: usize,
+    mut destinations: Option<&mut Vec<(Range<usize>, String)>>,
 ) -> Vec<LinkedSpan> {
     let mut spans = Vec::new();
     let mut plain = String::new();
@@ -822,6 +860,15 @@ fn inline_with_link_destinations(
                 .patch(theme::accent())
                 .add_modifier(Modifier::UNDERLINED);
             if let Some(label) = link.label {
+                if is_image_label(label)
+                    && let Some(destinations) = destinations.as_deref_mut()
+                {
+                    let start = offset + source.len() - rest.len();
+                    destinations.push((
+                        start + link.url_range.start..start + link.url_range.end,
+                        link.url.to_string(),
+                    ));
+                }
                 spans.push(link_span(label.to_string(), link_style, link.url));
                 if show_link_destinations {
                     spans.push(plain_span(" (", base));
@@ -890,10 +937,12 @@ fn inline_with_link_destinations(
         if delimiter == "`" {
             spans.push(plain_span(format!("`{}`", &body[..close]), style));
         } else {
-            spans.extend(inline_with_link_destinations(
+            spans.extend(inline_with_link_destinations_and_ranges(
                 &body[..close],
                 style,
                 show_link_destinations,
+                offset + source.len() - body.len(),
+                destinations.as_deref_mut(),
             ));
         }
         rest = &body[close + delimiter.len()..];
@@ -1235,6 +1284,18 @@ mod tests {
 
         assert_eq!(joined, "`[label](https://example.com/docs)`");
         assert!(linked_urls(source).is_empty());
+    }
+
+    #[test]
+    fn image_label_destination_ranges_skip_inline_code_and_preserve_occurrences() {
+        let uri = "file:///tmp/source.png";
+        let source = format!("`[Image #1]({uri})` [Image #2]({uri}) and [Image #3]({uri})");
+        let destinations = image_label_link_destinations(&source);
+
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(&source[destinations[0].0.clone()], uri);
+        assert_eq!(&source[destinations[1].0.clone()], uri);
+        assert!(destinations[0].0.start < destinations[1].0.start);
     }
 
     #[test]
