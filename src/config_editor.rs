@@ -39,7 +39,9 @@ pub fn get(path: &Path, key: Option<&str>) -> io::Result<String> {
     // A keyed value is reusable TOML, not the surrounding assignment's comments.
     // Tables retain their document representation, including nested table headers.
     let mut item = item.clone();
-    if let Item::Table(table) = item {
+    if let Item::Table(mut table) = item {
+        // A selected dotted table is now the root, with no parent to emit its values.
+        table.set_dotted(false);
         return Ok(DocumentMut::from(table).to_string().trim().to_owned());
     }
     if let Some(value) = item.as_value_mut() {

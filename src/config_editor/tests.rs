@@ -438,3 +438,39 @@ fn unset_through_non_tables_is_a_byte_preserving_noop() {
         assert_unchanged(&path, source, modified);
     }
 }
+
+#[test]
+fn keyed_dotted_tables_return_the_complete_selected_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    for (source, key, expected) in [
+        ("selected.enabled = true\n", "selected", "enabled = true\n"),
+        (
+            "selected.child.value = 1\nselected.child.deep.value = 2\n",
+            "selected",
+            "child.value = 1\nchild.deep.value = 2\n",
+        ),
+        (
+            "selected.child.value = 1\nselected.child.deep.value = 2\n",
+            "selected.child",
+            "value = 1\ndeep.value = 2\n",
+        ),
+        (
+            "[parent]\nselected.value = 1\nselected.child.value = 2\n",
+            "parent.selected",
+            "value = 1\nchild.value = 2\n",
+        ),
+        (
+            "selected.\"quoted.child\".value = 3\n",
+            "selected.\"quoted.child\"",
+            "value = 3\n",
+        ),
+    ] {
+        fs::write(&path, source).unwrap();
+        let output = get(&path, Some(key)).unwrap();
+        let actual: toml::Value = toml::from_str(&output).unwrap();
+        let expected: toml::Value = toml::from_str(expected).unwrap();
+        assert_eq!(actual, expected, "{source} => {key}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    }
+}
