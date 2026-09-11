@@ -63,6 +63,7 @@ subtle = "=2.6.1"
 tar = { version = "=0.4.46", default-features = false }
 tempfile = "=3.27.0"
 toml = "=1.1.5"
+toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["compat"] }
 tower = { version = "=0.5.3", features = ["util"] }

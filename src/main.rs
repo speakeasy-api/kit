@@ -585,12 +585,138 @@ impl SessionsAction {
     }
 }
 
+const CONFIG_HELP: &str =
+    "Keys use TOML dotted paths; quote components containing dots, for example
+plugins.\"my.plugin\".source. Unknown and future settings are supported.
+Get fails when KEY is missing; unset leaves absent settings unchanged.
+Values accept plain strings or TOML values (booleans, numbers, arrays, inline
+tables, and quoted strings). Use --string to force literal string input.
+
+Root settings:
+  root                              Working directory and project context
+  model                             Default model ID
+  provider                          Model provider: openai-subscription, openrouter, speakeasy
+  reasoning_effort                  Reasoning effort: low, medium, high; unset for provider default
+  a2a                               A2A listener bind address (e.g. 127.0.0.1:7331)
+  mcp_config                        MCP server configuration path
+  credential_store                  Credential backend: memory, keychain, file
+  credential_dir                    Directory for the file credential backend
+  capture_error_spans                Capture error spans
+  otel_endpoint                     OTLP trace export endpoint URL
+  otel_protocol                     OTLP transport: grpc, http/protobuf, http/json
+  otel_capture_message_content      Capture message contents in telemetry
+  otel_message_content_max_messages  Maximum captured message count
+  otel_message_content_max_bytes     Maximum captured message bytes
+
+Dynamic settings:
+  plugins.<name>.source              path, archive, or git
+  plugins.<name>.path                Local plugin directory (path source)
+  plugins.<name>.url                 Archive or Git URL
+  plugins.<name>.sha256              Required SHA-256 checksum (archive source)
+  plugins.<name>.rev                 Optional Git revision (git source)
+  plugins.<name>.subdir              Optional archive or Git subdirectory
+  acp.<name>.command                 ACP harness executable
+  acp.<name>.args                    ACP harness argument array
+  acp.<name>.permissions             Permission policy: deny or cancel
+  subagent.harness                   Default subagent harness
+  subagent.harnesses.<name>.models.<alias>
+                                    Model alias mapping
+  subagent.harnesses.<name>.allow_model_overrides
+                                    Allowed explicit model override array
+
+These commands edit the file directly without authentication, networking,
+runtime validation, configuration loading, or migrations.";
+
+enum ConfigAction {
+    Get {
+        key: Option<String>,
+    },
+    Set {
+        key: String,
+        value: String,
+        string: bool,
+    },
+    Unset {
+        key: String,
+    },
+}
+
+impl ConfigAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let key = || {
+            clap::Arg::new("key")
+                .value_name("KEY")
+                .help("TOML dotted or quoted key path")
+        };
+        command
+            .subcommand(
+                clap::Command::new("get")
+                    .about("Print a setting, or the whole config when KEY is omitted")
+                    .after_help(CONFIG_HELP)
+                    .arg(key()),
+            )
+            .subcommand(
+                clap::Command::new("set")
+                    .about("Set a setting to a plain string or TOML value")
+                    .after_help(CONFIG_HELP)
+                    .arg(key().required(true))
+                    .arg(
+                        clap::Arg::new("value")
+                            .value_name("VALUE")
+                            .required(true)
+                            .allow_hyphen_values(true)
+                            .help("Plain string or TOML value"),
+                    )
+                    .arg(
+                        clap::Arg::new("string")
+                            .long("string")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Store VALUE as a literal string, even if it looks like TOML"),
+                    ),
+            )
+            .subcommand(
+                clap::Command::new("unset")
+                    .about("Remove a setting; absent settings are a no-op")
+                    .after_help(CONFIG_HELP)
+                    .arg(key().required(true)),
+            )
+    }
+
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "get" => Ok(Self::Get {
+                key: optional_arg(matches, "key")?,
+            }),
+            "set" => Ok(Self::Set {
+                key: required_arg(matches, "key")?,
+                value: required_arg(matches, "value")?,
+                string: required_arg(matches, "string")?,
+            }),
+            "unset" => Ok(Self::Unset {
+                key: required_arg(matches, "key")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
 impl Command {
     fn augment_command(command: clap::Command) -> clap::Command {
         let command = command.subcommand({
             clap::Command::new("init")
                 .about("Write the recommended configuration to ~/.kit/config.toml")
         });
+        let command = command.subcommand(ConfigAction::augment_command(
+            clap::Command::new("config")
+                .about("Get, set, or unset settings in ~/.kit/config.toml")
+                .after_help(CONFIG_HELP)
+                .subcommand_required(true)
+                .arg_required_else_help(true),
+        ));
         let command = command.subcommand({
             let command = clap::Command::new("auth")
                 .about("Manage provider authentication without starting a runtime");
@@ -980,6 +1106,9 @@ impl Command {
         let (name, matches) = required_subcommand(matches)?;
         match name {
             "init" => Ok(Self::Init),
+            "config" => Ok(Self::Config {
+                action: ConfigAction::from_matches(matches)?,
+            }),
             "auth" => Ok(Self::Auth {
                 action: AuthAction::from_matches(matches)?,
                 credentials: CredentialArgs::from_matches(matches)?,
@@ -1429,6 +1558,8 @@ enum SessionsAction {
 enum Command {
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
+    /// Edit global configuration without loading runtime settings.
+    Config { action: ConfigAction },
     /// Manage provider authentication without starting a runtime.
     Auth {
         action: AuthAction,
@@ -1831,7 +1962,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Only auth and runtime commands poll this future. Init must not load the
-    // config, and sessions must not resolve credentials or initialize telemetry.
+    // config. Config commands edit TOML directly; sessions must not resolve
+    // credentials or initialize telemetry.
     let initialize = async {
         let config = tokio::task::spawn_blocking(Config::load_default).await??;
         cli.request_budget_seconds
@@ -1873,6 +2005,44 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
                 env!("CARGO_PKG_VERSION")
             );
+        }
+        Command::Config { action } => {
+            let output = tokio::task::spawn_blocking(move || {
+                let home = env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .ok_or_else(|| {
+                        io::Error::other("HOME is not set; cannot access global config")
+                    })?;
+                let path = PathBuf::from(home).join(".kit/config.toml");
+                match action {
+                    ConfigAction::Get { key } => {
+                        kit::config_editor::get(&path, key.as_deref()).map(Some)
+                    }
+                    ConfigAction::Set { key, value, string } => {
+                        let value = if string {
+                            toml::Value::String(value).to_string()
+                        } else {
+                            value
+                        };
+                        kit::config_editor::set(&path, &key, &value)?;
+                        // One-shot edits cannot succeed with only an in-memory copy.
+                        fs::finish_recovery(fs::global())?;
+                        Ok(None)
+                    }
+                    ConfigAction::Unset { key } => {
+                        kit::config_editor::unset(&path, &key)?;
+                        fs::finish_recovery(fs::global())?;
+                        Ok(None)
+                    }
+                }
+            })
+            .await??;
+            if let Some(output) = output {
+                print!("{output}");
+                if !output.ends_with('\n') && !output.is_empty() {
+                    println!();
+                }
+            }
         }
         Command::Sessions { action, root } => {
             let config = tokio::task::spawn_blocking(Config::load_default).await??;
@@ -2198,6 +2368,11 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Real disk fault boundary, compiled only for tests.
+#[cfg(test)]
+#[path = "../tests/support/capacity.rs"]
+mod capacity;
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2256,6 +2431,10 @@ mod tests {
         for path in [
             vec![],
             vec!["init"],
+            vec!["config"],
+            vec!["config", "get"],
+            vec!["config", "set"],
+            vec!["config", "unset"],
             vec!["auth"],
             vec!["auth", "login"],
             vec!["auth", "status"],
@@ -3189,6 +3368,138 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "init"]).is_ok());
     }
 
+    #[test]
+    fn config_cli_parses_paths_values_and_required_arguments() {
+        use super::ConfigAction;
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "get"])
+                .unwrap()
+                .command,
+            Command::Config {
+                action: ConfigAction::Get { key: None }
+            }
+        ));
+        let key = r#"plugins."my.plugin".source"#;
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "get", key]).unwrap().command,
+            Command::Config { action: ConfigAction::Get { key: Some(value) } } if value == key
+        ));
+        for value in ["vendor/model", "true", "-42", "[1, 2]", "{ x = true }"] {
+            assert!(matches!(
+                Cli::try_parse_from(["kit", "config", "set", key, value]).unwrap().command,
+                Command::Config { action: ConfigAction::Set { key: parsed, value: actual, string: false } }
+                    if parsed == key && actual == value
+            ));
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "set", "--string", "model", "true"])
+                .unwrap()
+                .command,
+            Command::Config {
+                action: ConfigAction::Set { string: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "unset", key]).unwrap().command,
+            Command::Config { action: ConfigAction::Unset { key: parsed } } if parsed == key
+        ));
+        for args in [
+            vec!["kit", "config"],
+            vec!["kit", "config", "set"],
+            vec!["kit", "config", "set", "model"],
+            vec!["kit", "config", "unset"],
+            vec!["kit", "default-model", "old"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for action in ["get", "set", "unset"] {
+            let help = Cli::try_parse_from(["kit", "config", action, "--help"])
+                .err()
+                .unwrap();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            for setting in [
+                "Default model ID",
+                "Model provider: openai-subscription, openrouter, speakeasy",
+                "Reasoning effort: low, medium, high; unset for provider default",
+                "A2A listener bind address (e.g. 127.0.0.1:7331)",
+                "Credential backend: memory, keychain, file",
+                "Directory for the file credential backend",
+                "OTLP trace export endpoint URL",
+                "OTLP transport: grpc, http/protobuf, http/json",
+                "plugins.<name>",
+                "acp.<name>",
+                "subagent.harnesses",
+            ] {
+                assert!(help.to_string().contains(setting), "{setting}: {help}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn config_edits_require_disk_before_success() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "KIT_TEST_CONFIG_DISK_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["set", "unset", "missing-key", "missing-file"] {
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join(".kit/config.toml");
+                let original = "# preserved\r\nmodel = 'old'\r\n";
+                if case != "missing-file" {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, original).unwrap();
+                }
+                let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::config_edits_require_disk_before_success",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("HOME", home.path())
+                    .output()
+                    .await
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    case.starts_with("missing-"),
+                    "{case}: {stderr}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                if !case.starts_with("missing-") {
+                    assert!(
+                        stderr.contains("could not be persisted before exit"),
+                        "{stderr}"
+                    );
+                }
+                assert!(!stderr.contains("Config updated in memory only"));
+                if case == "missing-file" {
+                    assert!(!home.path().join(".kit").exists());
+                } else {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+                }
+            }
+            return Ok(());
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let backend = std::sync::Arc::new(crate::capacity::Capacity {
+            exhausted: std::sync::atomic::AtomicBool::new(true),
+            exhaust_on_write: std::sync::atomic::AtomicBool::new(false),
+            repaired: home.join("capacity-repaired"),
+        });
+        super::fs::initialize_global(super::fs::Fs::new(std::sync::Arc::new(
+            crate::capacity::CapacityDisk(backend),
+        )))
+        .unwrap();
+        let args = match case.as_str() {
+            "set" => vec!["kit", "config", "set", "model", "new"],
+            "unset" => vec!["kit", "config", "unset", "model"],
+            _ => vec!["kit", "config", "unset", "absent"],
+        };
+        // Return the real dispatch error to the subprocess test runner: an
+        // accepted memory-only edit must be an unsuccessful process result.
+        super::run_cli(Cli::try_parse_from(args).unwrap()).await
+    }
+
     #[tokio::test]
     async fn command_dispatch_preserves_initialization_boundaries() {
         const CHILD: &str = "KIT_TEST_COMMAND_DISPATCH_CHILD";
@@ -3241,6 +3552,41 @@ future_option = true
         // must finish before runtime configuration is validated.
         fs::write(&config_path, "[subagent]\nharness = \"missing-harness\"\n").unwrap();
         if case == "bypass" {
+            // Invalid typed settings and legacy keys must not trigger loading or migration.
+            fs::write(&config_path, "model = 42\ncredential_storage = 'file'\n[subagent]\nharness = 'missing-harness'\n").unwrap();
+            for args in [
+                vec!["kit", "config", "get"],
+                vec!["kit", "config", "get", "model"],
+                vec!["kit", "config", "set", "model", "vendor/future"],
+                vec!["kit", "config", "set", "capture_error_spans", "true"],
+                vec!["kit", "config", "set", "--string", "future.literal", "true"],
+                vec!["kit", "config", "set", r#"future."dotted.key""#, "[1, 2]"],
+                vec!["kit", "config", "get"],
+                vec!["kit", "config", "get", "model"],
+                vec!["kit", "config", "unset", "absent.key"],
+                vec!["kit", "config", "unset", "capture_error_spans"],
+            ] {
+                super::run_cli(Cli::try_parse_from(args).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let contents = fs::read_to_string(&config_path).unwrap();
+            let values: toml::Value = toml::from_str(&contents).unwrap();
+            assert_eq!(values["model"].as_str(), Some("vendor/future"));
+            assert_eq!(values["future"]["literal"].as_str(), Some("true"));
+            assert_eq!(values["future"]["dotted.key"].as_array().unwrap().len(), 2);
+            assert!(values.get("capture_error_spans").is_none());
+            assert!(values.get("credential_storage").is_some());
+            assert!(values.get("credential_store").is_none());
+            let error = super::run_cli(
+                Cli::try_parse_from(["kit", "config", "get", "absent.key"]).unwrap(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::NotFound
+            );
             super::run_cli(
                 Cli::try_parse_from(["kit", "sessions", "--root", home.to_str().unwrap()]).unwrap(),
             )
