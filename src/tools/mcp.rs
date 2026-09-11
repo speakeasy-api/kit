@@ -3412,22 +3412,33 @@ impl McpTool {
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
         let tool_name = ToolName::new(name.clone());
-        if self.catalog.get(&tool_name).is_none() {
-            return ToolExecutionOutcome::Failed(ToolError::InvalidInput(format!(
-                "unknown MCP tool: {}",
-                tool_name.0
-            )));
-        }
         let Some(scope) = context.execution_scope.clone() else {
             return ToolExecutionOutcome::Failed(ToolError::Unavailable(
                 "tool requires an execution scope".into(),
             ));
         };
         let timeout_name = name.clone();
-        let call = tokio::time::timeout(
-            timeout,
-            self.dispatch_call(request, scope, name, tool_name, args),
-        );
+        let call = tokio::time::timeout(timeout, async {
+            // A resumed conversation can invoke a previously discovered tool
+            // without searching this attachment's fresh, lazily populated catalog.
+            if self.catalog.get(&tool_name).is_none() {
+                if let Some((server, _, _, _)) = self.runtime.server_for_tool(&name).await {
+                    self.runtime
+                        .initialize_servers(&[server])
+                        .await
+                        .map_err(ToolError::Unavailable)?;
+                }
+                if self.catalog.get(&tool_name).is_none() {
+                    return Err(ToolError::InvalidInput(format!(
+                        "unknown MCP tool: {}",
+                        tool_name.0
+                    )));
+                }
+            }
+            Ok(self
+                .dispatch_call(request, scope, name, tool_name, args)
+                .await)
+        });
         let result = if let Some(cancellation) = context.cancellation.clone() {
             // A ready cancellation wins a simultaneous ready result. Cancellation
             // drops dispatch (including its process/ownership guards), but cannot
@@ -3444,7 +3455,8 @@ impl McpTool {
             call.await
         };
         match result {
-            Ok(call) => self.finish_dispatch(call).await,
+            Ok(Ok(call)) => self.finish_dispatch(call).await,
+            Ok(Err(error)) => ToolExecutionOutcome::FailedBeforeInvocation(error),
             Err(_) => ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(format!(
                 "MCP tool {timeout_name} timed out after {} seconds; inspect remote state before retrying side effects",
                 timeout.as_secs()
@@ -6960,7 +6972,7 @@ for line in sys.stdin:
     async fn call_session_stdio(runtime: &super::McpRuntime) -> Value {
         use agentkit_core::{SessionId, ToolOutput, TurnId};
         use agentkit_tools_core::{
-            AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+            AllowAllPermissions, Tool, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
         };
         let tool = McpTool::new(runtime.clone());
         let scope = ToolExecutionScope {
@@ -6979,7 +6991,7 @@ for line in sys.stdin:
             "fixture",
             "turn",
         );
-        let outcome = tool.dispatch(request, &mut context.borrowed()).await;
+        let outcome = tool.invoke_outcome(request, &mut context.borrowed()).await;
         let ToolExecutionOutcome::Completed(result) = outcome else {
             panic!("stdio call did not complete: {outcome:?}");
         };
@@ -7039,7 +7051,8 @@ for line in sys.stdin:
         assert_eq!(found["servers"][0]["status"], "authenticated");
         assert!(cwd.join("first.started").exists());
         assert!(!cwd.join("second.started").exists());
-        second.search("inspect").await.unwrap();
+        // Reattachment has a fresh catalog, but remembers the discovered name.
+        // Direct invocation must initialize only this attachment's server.
         let first_result = call_session_stdio(&first).await;
         let second_result = call_session_stdio(&second).await;
         assert_eq!(first_result["value"], "first");
@@ -7065,6 +7078,135 @@ for line in sys.stdin:
                 .get(&agentkit_tools_core::ToolName::new("mcp_local_inspect"))
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_lazy_invocation_interrupts_initialization() {
+        use agentkit_core::{CancellationController, SessionId, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, Tool, ToolError, ToolExecutionOutcome, ToolExecutionScope,
+            ToolRequest,
+        };
+
+        for cancel in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().canonicalize().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let agentkit_acp::McpServer::Stdio(mut server) = session_stdio_fixture(&cwd, "blocked")
+            else {
+                unreachable!();
+            };
+            // Signal at the actual initialize request, then withhold the response.
+            // This exercises cancellation/timeout at the external stdio boundary.
+            server.args[3] = server.args[3].replace(
+                "if method == 'initialize':",
+                &format!(
+                    "if method == 'initialize':\n        import socket\n        signal = socket.create_connection(('127.0.0.1', {}))\n        sys.stdin.read()\n        sys.exit(0)",
+                    listener.local_addr().unwrap().port()
+                ),
+            );
+            let runtime = super::empty()
+                .with_session_servers(vec![agentkit_acp::McpServer::Stdio(server)], &cwd)
+                .await
+                .unwrap();
+            let tool = McpTool::new(runtime.clone());
+            let controller = CancellationController::new();
+            let scope = ToolExecutionScope {
+                executor: Arc::clone(&tool.executor),
+                session_id: SessionId::new("fixture"),
+                turn_id: TurnId::new("turn"),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+            };
+            let mut context = scope.nested_context(MetadataMap::new());
+            context.cancellation = Some(controller.handle().checkpoint());
+            let request = ToolRequest::new(
+                "call",
+                "tool",
+                json!({"name": "mcp_local_inspect", "args": {}, "timeout_seconds": 1}),
+                "fixture",
+                "turn",
+            );
+            let mut borrowed = context.borrowed();
+            let (outcome, ()) =
+                tokio::join!(tool.invoke_outcome(request.clone(), &mut borrowed), async {
+                    let _connection =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    if cancel {
+                        controller.interrupt();
+                    }
+                });
+            if cancel {
+                assert!(matches!(
+                    outcome,
+                    ToolExecutionOutcome::Failed(ToolError::Cancelled)
+                ));
+            } else {
+                assert!(
+                    matches!(outcome, ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(ref error)) if error.contains("timed out"))
+                );
+            }
+            // Incomplete backend publication must fence subsequent real calls.
+            let context = scope.nested_context(MetadataMap::new());
+            assert!(matches!(
+                tool.invoke(request, &mut context.borrowed()).await,
+                Err(ToolError::Unavailable(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_direct_invocation_initializes_configured_server_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let path = cwd.join("mcp.json");
+        let agentkit_acp::McpServer::Stdio(configured) = session_stdio_fixture(&cwd, "configured")
+        else {
+            unreachable!();
+        };
+        let env = configured
+            .env
+            .into_iter()
+            .map(|variable| (variable.name, Value::String(variable.value)))
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"mcpServers": {"local": {
+                "command": configured.command, "args": configured.args, "env": env
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        base.search("inspect").await.unwrap();
+        let original = call_session_stdio(&base).await;
+        std::fs::remove_file(cwd.join("configured.started")).unwrap();
+
+        let agentkit_acp::McpServer::Stdio(mut unrelated) =
+            session_stdio_fixture(&cwd, "unrelated")
+        else {
+            unreachable!();
+        };
+        unrelated.name = "other".into();
+        let attached = base
+            .with_session_servers(vec![agentkit_acp::McpServer::Stdio(unrelated)], &cwd)
+            .await
+            .unwrap();
+        assert!(!cwd.join("configured.started").exists());
+        assert!(!cwd.join("unrelated.started").exists());
+        let result = call_session_stdio(&attached).await;
+        assert_eq!(result["value"], "configured");
+        assert_ne!(result["pid"], original["pid"]);
+        assert!(cwd.join("configured.started").exists());
+        assert!(!cwd.join("unrelated.started").exists());
     }
 
     #[tokio::test]
