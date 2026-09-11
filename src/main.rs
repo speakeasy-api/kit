@@ -29,6 +29,7 @@ use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
 struct Cli {
+    request_budget_seconds: Option<kit::request_budget::RequestBudget>,
     telemetry: TelemetryArgs,
 
     openrouter: OpenRouterArgs,
@@ -228,6 +229,13 @@ impl Cli {
             .version(env!("CARGO_PKG_VERSION"))
             .about("Coding agent runtime and terminal client");
         let command = command.group(clap::ArgGroup::new("Cli").multiple(true));
+        let command = command.arg(
+            clap::Arg::new("request_budget_seconds")
+                .long("request-budget-seconds")
+                .global(true)
+                .value_parser(clap::value_parser!(kit::request_budget::RequestBudget))
+                .help("Total provider logical-request budget in seconds (1-3600; default 60)"),
+        );
         let command = TelemetryArgs::augment_command(command);
         let command = OpenRouterArgs::augment_command(command);
         Command::augment_command(command)
@@ -251,6 +259,7 @@ impl Cli {
 
     fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         Ok(Self {
+            request_budget_seconds: optional_arg(matches, "request_budget_seconds")?,
             telemetry: TelemetryArgs::from_matches(matches)?,
             openrouter: OpenRouterArgs::from_matches(matches)?,
             command: Command::from_matches(matches)?,
@@ -1135,6 +1144,7 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    request_budget_seconds: Option<kit::request_budget::RequestBudget>,
     root: Option<PathBuf>,
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
@@ -1824,6 +1834,10 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // config, and sessions must not resolve credentials or initialize telemetry.
     let initialize = async {
         let config = tokio::task::spawn_blocking(Config::load_default).await??;
+        cli.request_budget_seconds
+            .or(config.request_budget_seconds)
+            .unwrap_or_default()
+            .initialize()?;
         let openrouter_api_key =
             resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
                 env::var(name).ok()
@@ -2204,6 +2218,38 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn request_budget_cli_and_config() {
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "hello"])
+                .unwrap()
+                .request_budget_seconds
+                .is_none()
+        );
+        let cli =
+            Cli::try_parse_from(["kit", "prompt", "--request-budget-seconds", "300", "hello"])
+                .unwrap();
+        assert_eq!(cli.request_budget_seconds.unwrap().seconds(), 300);
+        for invalid in ["0", "3601", "-1", "abc", "1.5"] {
+            assert!(
+                Cli::try_parse_from([
+                    "kit",
+                    "prompt",
+                    "--request-budget-seconds",
+                    invalid,
+                    "hello"
+                ])
+                .is_err()
+            );
+            assert!(
+                toml::from_str::<Config>(&format!("request_budget_seconds = {invalid}")).is_err()
+            );
+        }
+        let config: Config = toml::from_str("request_budget_seconds = 300").unwrap();
+        assert_eq!(config.request_budget_seconds.unwrap().seconds(), 300);
+        assert!(Config::default().request_budget_seconds.is_none());
+    }
 
     #[test]
     fn cli_builder_preserves_help_version_and_hidden_flags() {
