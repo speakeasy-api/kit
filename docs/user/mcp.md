@@ -2,6 +2,8 @@
 
 Kit merges Model Context Protocol (MCP) servers from Agent Plugins, `mcp_config` in `~/.kit/config.toml`, `.mcp.json` in the canonical runtime root, and `--mcp-config`, in that precedence order. A higher layer replaces a whole same-named server; non-conflicting lower-layer servers remain. The project file is optional, while configured and command-line files are required when specified. Relative configured and command-line paths retain launch-directory resolution. Run `kit --help` and `kit <command> --help` for the exhaustive CLI reference.
 
+Use `kit config set mcp_config ~/.kit/mcp.json` to select the global MCP file, `kit config get mcp_config` to inspect the saved path, or `kit config unset mcp_config` to remove the override. These commands edit `~/.kit/config.toml`, not the MCP JSON file or its server entries. See [configuration editing](getting-started-and-configuration.md#edit-configuration-from-the-command-line).
+
 ## Ask the agent to add a server
 
 Kit does not provide an MCP-specific slash command. In a `kit tui` session, describe the server and the scope that you want:

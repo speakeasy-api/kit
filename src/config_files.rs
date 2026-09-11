@@ -9,6 +9,7 @@ fn resolve_in(
     filesystem: &crate::resilient_fs::Fs,
     path: &Path,
     links: &mut usize,
+    allow_missing: bool,
 ) -> io::Result<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
 
@@ -23,22 +24,23 @@ fn resolve_in(
             Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !filesystem.metadata(&resolved)?.is_dir() {
+                if !is_directory(filesystem, &resolved, allow_missing)? {
                     return Err(io::ErrorKind::NotADirectory.into());
                 }
                 // Popping a root has no effect, as with native path traversal.
                 resolved.pop();
             }
             Component::Normal(name) => {
-                if !filesystem.metadata(&resolved)?.is_dir() {
+                if !is_directory(filesystem, &resolved, allow_missing)? {
                     return Err(io::ErrorKind::NotADirectory.into());
                 }
                 resolved.push(name);
-                if filesystem
-                    .symlink_metadata(&resolved)?
-                    .file_type()
-                    .is_symlink()
-                {
+                let metadata = match filesystem.symlink_metadata(&resolved) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
                     if *links == 40 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
@@ -55,7 +57,7 @@ fn resolve_in(
                             .unwrap_or_else(|| Path::new("."))
                             .join(target)
                     };
-                    resolved = resolve_in(filesystem, &target, links)?;
+                    resolved = resolve_in(filesystem, &target, links, allow_missing)?;
                 }
             }
         }
@@ -64,7 +66,7 @@ fn resolve_in(
 }
 
 pub fn read_in(filesystem: &crate::resilient_fs::Fs, path: &Path) -> io::Result<Vec<u8>> {
-    filesystem.read(resolve_in(filesystem, path, &mut 0)?)
+    filesystem.read(resolve_in(filesystem, path, &mut 0, false)?)
 }
 
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
@@ -74,4 +76,21 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
 pub fn read_to_string(path: &Path) -> io::Result<String> {
     String::from_utf8(read(path)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn is_directory(
+    filesystem: &crate::resilient_fs::Fs,
+    path: &Path,
+    allow_missing: bool,
+) -> io::Result<bool> {
+    match filesystem.metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolve links before replacing a config, allowing a new file or dangling target.
+pub(crate) fn resolve_for_write(path: &Path) -> io::Result<std::path::PathBuf> {
+    resolve_in(crate::resilient_fs::global(), path, &mut 0, true)
 }

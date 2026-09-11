@@ -2363,16 +2363,11 @@ fn save_effort_default(effort: &str) -> Result<(), String> {
 }
 
 fn save_effort_default_to(path: &Path, effort: &str) -> Result<(), String> {
-    update_config(path, |root| {
-        if effort == "default" {
-            root.remove("reasoning_effort");
-        } else {
-            root.insert(
-                "reasoning_effort".into(),
-                toml::Value::String(effort.to_string()),
-            );
-        }
-    })
+    crate::config_editor::set_strings(
+        path,
+        &[("reasoning_effort", (effort != "default").then_some(effort))],
+    )
+    .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
@@ -2386,42 +2381,14 @@ fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
 }
 
 fn save_model_defaults_to(path: &Path, choice: &ModelChoice) -> Result<(), String> {
-    update_config(path, |root| {
-        root.insert(
-            "provider".into(),
-            toml::Value::String(choice.provider.clone()),
-        );
-        root.insert("model".into(), toml::Value::String(choice.model.clone()));
-    })
-}
-
-fn update_config(
-    path: &Path,
-    update: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
-) -> Result<(), String> {
-    let contents = match crate::resilient_fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
-    };
-    let mut config = if contents.is_empty() {
-        toml::Value::Table(Default::default())
-    } else {
-        toml::from_str::<toml::Value>(&contents)
-            .map_err(|error| format!("invalid {}: {error}", path.display()))?
-    };
-    let root = config
-        .as_table_mut()
-        .ok_or_else(|| format!("invalid {}: root must be a table", path.display()))?;
-    update(root);
-    let output = toml::to_string_pretty(&config)
-        .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "config path has no parent".to_string())?;
-    crate::resilient_fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    crate::resilient_fs::replace(path, output.as_bytes())
-        .map_err(|error| format!("could not save {}: {error}", path.display()))
+    crate::config_editor::set_strings(
+        path,
+        &[
+            ("provider", Some(&choice.provider)),
+            ("model", Some(&choice.model)),
+        ],
+    )
+    .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 /// An ACP error prints its whole JSON-RPC envelope; on the way out of the
@@ -6261,7 +6228,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_defaults_by_parsing_and_reserializing_valid_toml() {
+    fn saves_defaults_by_editing_valid_toml() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -6291,6 +6258,31 @@ a = [still text]
         assert_eq!(saved["model"].as_str(), Some("anthropic/claude-sonnet-4"));
         assert_eq!(saved["message"].as_str(), Some("a = [still text]\n"));
         assert_eq!(saved["custom"]["quoted.key"].as_str(), Some("preserved"));
+    }
+
+    #[test]
+    fn default_saves_preserve_bom_comments_and_unknown_formatting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "\u{feff}# user defaults\nprovider = 'old' # provider note\n[custom] # custom note\nvalue  =  [1,  2] # keep spacing\n";
+        std::fs::write(&path, original).unwrap();
+        let choice = ModelChoice {
+            id: "openrouter:new".into(),
+            provider: "openrouter".into(),
+            model: "new".into(),
+        };
+        save_model_defaults_to(&path, &choice).unwrap();
+        save_effort_default_to(&path, "high").unwrap();
+        save_effort_default_to(&path, "default").unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("\u{feff}# user defaults\n"));
+        assert!(saved.contains("# provider note"));
+        assert!(saved.contains("[custom] # custom note\nvalue  =  [1,  2] # keep spacing\n"));
+        assert_eq!(
+            crate::config_editor::get(&path, Some("model")).unwrap(),
+            "\"new\""
+        );
+        assert!(crate::config_editor::get(&path, Some("reasoning_effort")).is_err());
     }
 
     #[test]

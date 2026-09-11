@@ -4,7 +4,7 @@ Kit is a coding agent runtime and terminal client. Choose a project working dire
 
 Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when those files do not exist. It selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. The command leaves existing files unchanged.
 
-Set the saved default model with `kit default-model <MODEL>` (for example, `kit default-model gpt-5.6-sol`). This updates only the top-level `model` in `~/.kit/config.toml`, preserving comments, other settings, and unknown keys, or creates the file if absent. Model IDs must be nonblank but are otherwise accepted without network validation. The provider is unchanged; choose a model supported by your provider. A per-command `--model` still overrides this default.
+Use `kit config get`, `kit config set`, and `kit config unset` to inspect and edit `~/.kit/config.toml`. For example, `kit config set model gpt-6-astra` saves a plain-string model ID without changing the provider or checking model availability. Choose a model supported by your provider; a per-command `--model` still overrides the saved value.
 
 ## Install and verify the `kit` binary
 
@@ -150,6 +150,30 @@ kit acp --root /path/to/project --protocol-version 2
 ## Configure `~/.kit/config.toml`
 
 At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.
+
+### Edit configuration from the command line
+
+Use these noninteractive commands as the recommended way to edit the saved configuration:
+
+```sh
+kit config get                         # print the whole TOML document
+kit config get model                   # read one value
+kit config set model gpt-6-astra        # a plain string needs no TOML quotes
+kit config unset model                 # remove the saved value
+kit config set capture_error_spans true
+kit config set 'plugins.local-plugin' '{ source = "path", path = "./plugins/local-plugin" }'
+kit config get 'plugins.local-plugin.path'
+```
+
+Paths use generic TOML dotted-key syntax, not a fixed list of Kit settings. Quote a TOML path segment when a key contains a literal dot: `kit config set 'custom."key.with.dots"' value`. The outer single quotes in these shell examples preserve the inner TOML quotes.
+
+`set` parses valid TOML values, including booleans, numbers, arrays, and inline tables. Plain text such as `gpt-6-astra` is accepted as a string. To force a literal string rather than a typed value, pass a quoted TOML string: `kit config set custom.value '"true"'` stores the string `true`, not the boolean. Use `--string` to pass literal text without TOML quoting, for example `kit config set --string custom.value true`. Malformed quoted, structured, or numeric-looking input (such as `123abc`) is rejected rather than silently stored as text; use `--string` for these strings.
+
+If the config file is missing, `set` creates it, `get` reports an error, and `unset` is a no-op. `get` without a key prints the whole document, not the runtime's merged defaults. Edits preserve comments, unrelated settings and unknown keys, an existing UTF-8 BOM, and symlinks (updating the target without replacing the link). The TOML editor may normalize CRLF line endings to LF when changing the document; unsetting an absent key leaves the file untouched.
+
+These commands only inspect or edit the local configuration: they do not run migrations, authenticate, or access the network. They do not open an interactive dialog. Use standard help such as `kit config --help` or `kit config set --help` for command syntax. Runtime commands still validate the settings they consume.
+
+### Configuration example
 
 A representative configuration is:
 

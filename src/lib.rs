@@ -18,6 +18,7 @@ mod acp_child;
 mod artifacts;
 pub mod compaction;
 mod compose_output;
+pub mod config_editor;
 #[doc(hidden)]
 pub mod config_files;
 mod credentials;

@@ -4,7 +4,18 @@ Kit can load Agent Plugin packages from a local directory, a checksum-pinned onl
 
 ## Configure a source
 
-Add a named table to `~/.kit/config.toml`:
+Use `kit config set` to add a named table to `~/.kit/config.toml`:
+
+```sh
+kit config set 'plugins.local-plugin' '{ source = "path", path = "./plugins/local-plugin" }'
+kit config get 'plugins.local-plugin'
+# Remove the source when it is no longer needed:
+kit config unset 'plugins.local-plugin'
+```
+
+See [configuration editing](getting-started-and-configuration.md#edit-configuration-from-the-command-line) for dotted and quoted TOML paths and value parsing. The commands edit local configuration only; plugin fetching and validation happen when Kit loads the plugins.
+
+The equivalent local source and other source types look like this:
 
 ```toml
 [plugins.local-plugin]
