@@ -1828,6 +1828,20 @@ mod tests {
 
     #[test]
     fn request_budget_inherited_for_new_and_resumed_children() {
+        // Keep this OnceLock initialization out of the shared test runner.
+        const CHILD: &str = "KIT_TEST_CHILD_REQUEST_BUDGET";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "acp_child::tests::request_budget_inherited_for_new_and_resumed_children",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         crate::request_budget::RequestBudget::try_from(300)
             .unwrap()
             .initialize()
