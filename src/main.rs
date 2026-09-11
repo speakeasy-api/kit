@@ -582,6 +582,11 @@ impl Command {
             clap::Command::new("init")
                 .about("Write the recommended configuration to ~/.kit/config.toml")
         });
+        let command = command.subcommand(
+            clap::Command::new("default-model")
+                .about("Set the default model in ~/.kit/config.toml without changing the provider")
+                .arg(clap::Arg::new("model").value_name("MODEL").required(true)),
+        );
         let command = command.subcommand({
             let command = clap::Command::new("auth")
                 .about("Manage provider authentication without starting a runtime");
@@ -971,6 +976,9 @@ impl Command {
         let (name, matches) = required_subcommand(matches)?;
         match name {
             "init" => Ok(Self::Init),
+            "default-model" => Ok(Self::DefaultModel {
+                model: required_arg(matches, "model")?,
+            }),
             "auth" => Ok(Self::Auth {
                 action: AuthAction::from_matches(matches)?,
                 credentials: CredentialArgs::from_matches(matches)?,
@@ -1419,6 +1427,8 @@ enum SessionsAction {
 enum Command {
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
+    /// Set the default model without changing the provider.
+    DefaultModel { model: String },
     /// Manage provider authentication without starting a runtime.
     Auth {
         action: AuthAction,
@@ -1601,6 +1611,36 @@ fn init_default_config() -> io::Result<PathBuf> {
         .filter(|home| !home.is_empty())
         .ok_or_else(|| io::Error::other("HOME is not set; cannot initialize global config"))?;
     init_config(Path::new(&home))
+}
+
+fn set_default_model(home: &Path, model: &str) -> io::Result<()> {
+    if model.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "model must not be blank",
+        ));
+    }
+    let path = home.join(".kit/config.toml");
+    let (mut contents, path) = match kit::config_files::read_to_string(&path) {
+        Ok(contents) => (contents, fs::canonicalize(&path)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), path),
+        Err(error) => return Err(error),
+    };
+    let values: BTreeMap<String, toml::Spanned<toml::Value>> =
+        toml::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid config {}: {error}", path.display()),
+            )
+        })?;
+    let value = toml::Value::String(model.to_owned()).to_string();
+    if let Some(existing) = values.get("model") {
+        contents.replace_range(existing.span(), &value);
+    } else {
+        contents.insert_str(0, &format!("model = {value}\n"));
+    }
+    fs::create_dir_all(absolute_parent(&path)?)?;
+    fs::write(path, contents)
 }
 
 fn validate_auth_storage(action: &AuthAction, storage: &CredentialStorage) -> io::Result<()> {
@@ -1821,7 +1861,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Only auth and runtime commands poll this future. Init must not load the
-    // config, and sessions must not resolve credentials or initialize telemetry.
+    // config. Default-model edits TOML directly; sessions must not resolve
+    // credentials or initialize telemetry.
     let initialize = async {
         let config = tokio::task::spawn_blocking(Config::load_default).await??;
         let openrouter_api_key =
@@ -1859,6 +1900,22 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
                 env!("CARGO_PKG_VERSION")
             );
+        }
+        Command::DefaultModel { model } => {
+            tokio::task::spawn_blocking(move || {
+                let home = env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .ok_or_else(|| {
+                        io::Error::other("HOME is not set; cannot update global config")
+                    })?;
+                set_default_model(Path::new(&home), &model)
+            })
+            .await??;
+            if fs::global().status().pending_operations > 0 {
+                eprintln!(
+                    "Default model updated in memory only; persistence is pending and will not survive process termination."
+                );
+            }
         }
         Command::Sessions { action, root } => {
             let config = tokio::task::spawn_blocking(Config::load_default).await??;
@@ -2210,6 +2267,7 @@ mod tests {
         for path in [
             vec![],
             vec!["init"],
+            vec!["default-model"],
             vec!["auth"],
             vec!["auth", "login"],
             vec!["auth", "status"],
@@ -3114,6 +3172,110 @@ future_option = true
     }
 
     #[test]
+    fn default_model_cli_requires_model_and_accepts_provider_ids() {
+        let error = Cli::try_parse_from(["kit", "default-model"]).err().unwrap();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let cli = Cli::try_parse_from(["kit", "default-model", "vendor/future:model"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::DefaultModel { model } if model == "vendor/future:model")
+        );
+        let help = Cli::try_parse_from(["kit", "default-model", "--help"])
+            .err()
+            .unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("<MODEL>"));
+    }
+
+    #[test]
+    fn default_model_creates_config_and_round_trips_escaping() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".kit/config.toml");
+        for model in ["vendor/future:model", "quote\"slash\\newline\n\t雪"] {
+            super::set_default_model(home.path(), model).unwrap();
+            let config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(config["model"].as_str(), Some(model));
+            assert_eq!(config.as_table().unwrap().len(), 1);
+        }
+        assert!(!home.path().join(".kit/mcp.json").exists());
+    }
+
+    #[test]
+    fn default_model_preserves_comments_settings_and_unknown_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".kit/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "# héader\nprovider = 'openrouter'\n\"model\" = 'old' # keep\nunknown = 42\n\n[future]\nmodel = 'nested'\nvalue = { x = true }\n";
+        fs::write(&path, original).unwrap();
+        super::set_default_model(home.path(), "vendor/new").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replace("'old'", "\"vendor/new\"")
+        );
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.model(None), "vendor/new");
+        assert_eq!(config.model(Some("override".into())), "override");
+        let missing = "# keep\n[future]\nmodel = 'nested'\n";
+        fs::write(&path, missing).unwrap();
+        super::set_default_model(home.path(), "new").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("model = \"new\"\n{missing}")
+        );
+    }
+
+    #[test]
+    fn default_model_rejects_blank_and_malformed_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".kit/config.toml");
+        for model in ["", " \n\t"] {
+            assert_eq!(
+                super::set_default_model(home.path(), model)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(!path.exists());
+        }
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "model = 'old'\ninvalid [";
+        fs::write(&path, original).unwrap();
+        assert_eq!(
+            super::set_default_model(home.path(), "new")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(super::set_default_model(home.path(), " ").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_model_preserves_config_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(".kit/config.toml");
+        let target = home.path().join("actual.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&target, "model = 'old' # keep\n").unwrap();
+        std::os::unix::fs::symlink("../actual.toml", &path).unwrap();
+        super::set_default_model(home.path(), "new").unwrap();
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "model = \"new\" # keep\n"
+        );
+    }
+
+    #[test]
     fn init_writes_recommended_global_config() {
         let home = tempfile::tempdir().unwrap();
         let path = init_config(home.path()).unwrap();
@@ -3195,6 +3357,14 @@ future_option = true
         // must finish before runtime configuration is validated.
         fs::write(&config_path, "[subagent]\nharness = \"missing-harness\"\n").unwrap();
         if case == "bypass" {
+            super::run_cli(Cli::try_parse_from(["kit", "default-model", "vendor/future"]).unwrap())
+                .await
+                .unwrap();
+            assert!(
+                fs::read_to_string(&config_path)
+                    .unwrap()
+                    .starts_with("model = \"vendor/future\"\n")
+            );
             super::run_cli(
                 Cli::try_parse_from(["kit", "sessions", "--root", home.to_str().unwrap()]).unwrap(),
             )

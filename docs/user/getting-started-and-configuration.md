@@ -4,6 +4,8 @@ Kit is a coding agent runtime and terminal client. Choose a project working dire
 
 Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when those files do not exist. It selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. The command leaves existing files unchanged.
 
+Set the saved default model with `kit default-model <MODEL>` (for example, `kit default-model gpt-5.6-sol`). This updates only the top-level `model` in `~/.kit/config.toml`, preserving comments, other settings, and unknown keys, or creates the file if absent. Model IDs must be nonblank but are otherwise accepted without network validation. The provider is unchanged; choose a model supported by your provider. A per-command `--model` still overrides this default.
+
 ## Install and verify the `kit` binary
 
 Install the latest packaged release with mise, then verify that the executable is on `PATH`:

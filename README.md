@@ -277,6 +277,8 @@ Any ACP-compatible client can use Kit. Use `kit acp` for stdio. Use `kit serve -
 
 `kit init` writes this configuration. Command-line flags override the configuration.
 
+Set the saved default model with `kit default-model <MODEL>` (for example, `kit default-model gpt-5.6-sol`). This updates only the top-level `model` in `~/.kit/config.toml`, preserving comments, other settings, and unknown keys, or creates the file if absent. Model IDs must be nonblank but are otherwise accepted without network validation. The provider is unchanged; choose a model supported by your provider. A per-command `--model` still overrides this default.
+
 ```toml
 provider = "openai-subscription"   # openrouter | speakeasy
 model = "gpt-5.6-sol"
