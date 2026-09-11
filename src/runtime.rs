@@ -1038,12 +1038,25 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    pub(crate) fn subscribe_mcp(
+    pub(crate) async fn session_mcp(
         &self,
-        session_id: String,
-    ) -> Result<crate::tools::mcp::McpSubscription, AcpRuntimeError> {
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<crate::tools::mcp::McpRuntime, AcpRuntimeError> {
+        let cwd = crate::resilient_fs::canonicalize(cwd)
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        if cwd != self.root {
+            return Err(AcpRuntimeError::Loop(format!(
+                "this Kit runtime is fixed to {}",
+                self.root.display()
+            )));
+        }
+        if servers.is_empty() {
+            return Ok(self.mcp.clone());
+        }
         self.mcp
-            .subscribe(session_id)
+            .with_session_servers(servers, &cwd)
+            .await
             .map_err(AcpRuntimeError::Loop)
     }
 
@@ -1133,6 +1146,17 @@ impl Runtime {
         background_jobs: BackgroundJobs,
         skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
+        self.compose_with_jobs_and_mcp(depth, subagents, background_jobs, skills, self.mcp.clone())
+    }
+
+    fn compose_with_jobs_and_mcp(
+        &self,
+        depth: usize,
+        subagents: Subagents,
+        background_jobs: BackgroundJobs,
+        skills: Arc<SkillRegistry>,
+        mcp: crate::tools::mcp::McpRuntime,
+    ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
                 &self.root,
@@ -1164,9 +1188,9 @@ impl Runtime {
                 }
             })))
             .register(Observed::new(A2aTool::new()))
-            .register(Observed::new(ToolSearch::new(self.mcp.clone())))
-            .register(Observed::new(AuthTool::new(self.mcp.clone())))
-            .register(Observed::new(McpTool::new(self.mcp.clone())));
+            .register(Observed::new(ToolSearch::new(mcp.clone())))
+            .register(Observed::new(AuthTool::new(mcp.clone())))
+            .register(Observed::new(McpTool::new(mcp)));
         if let Some(skill_tool) = &self.dynamic_skill_tool {
             children.register(observe_shared(Arc::clone(skill_tool)));
         } else {
@@ -1446,23 +1470,12 @@ impl Runtime {
         })
     }
 
-    pub(crate) async fn start_acp_driver<I>(
-        self: &Arc<Self>,
-        context: AcpDriverContext<I>,
-        claim: &mut SessionClaim,
-    ) -> Result<AcpDriver, AcpRuntimeError>
-    where
-        I: LoopObserver + Clone + 'static,
-    {
-        self.start_acp_driver_with_initial(context, claim, None)
-            .await
-    }
-
-    pub(crate) async fn start_acp_driver_with_initial<I>(
+    pub(crate) async fn start_acp_driver_with_mcp<I>(
         self: &Arc<Self>,
         context: AcpDriverContext<I>,
         claim: &mut SessionClaim,
         forked: Option<AcpForkState>,
+        mcp: crate::tools::mcp::McpRuntime,
     ) -> Result<AcpDriver, AcpRuntimeError>
     where
         I: LoopObserver + Clone + 'static,
@@ -1555,11 +1568,12 @@ impl Runtime {
         let driver = Agent::builder()
             .model(adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
+            .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
                 subagents,
                 background_jobs.clone(),
                 skills,
+                mcp,
             ))
             .task_manager(task_manager)
             .mutator(compactor)

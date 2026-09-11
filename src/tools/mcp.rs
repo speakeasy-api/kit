@@ -175,6 +175,8 @@ pub(crate) struct ConfigSource {
     path: PathBuf,
     required: bool,
     default_stdio_cwd: Option<PathBuf>,
+    // Immutable request configuration; never read from or written to disk.
+    session_bytes: Option<Arc<[u8]>>,
 }
 
 impl ConfigSource {
@@ -183,6 +185,7 @@ impl ConfigSource {
             path,
             required: true,
             default_stdio_cwd: None,
+            session_bytes: None,
         }
     }
 
@@ -191,6 +194,7 @@ impl ConfigSource {
             path,
             required: false,
             default_stdio_cwd: Some(cwd),
+            session_bytes: None,
         }
     }
 }
@@ -1402,6 +1406,9 @@ fn prepare_plugins(
 }
 
 async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
+    if let Some(bytes) = &source.session_bytes {
+        return Ok(Some(bytes.to_vec()));
+    }
     let path = source.path.clone();
     match tokio::task::spawn_blocking(move || crate::config_files::read(&path))
         .await
@@ -1423,6 +1430,7 @@ fn prepare_sources(
 ) -> Result<PreparedConfiguration, String> {
     let mut prepared = plugin_prepared.clone();
     let mut entries = plugin_entries.clone();
+    let mut session_names = BTreeSet::new();
     for state in sources {
         let Some(bytes) = &state.raw else {
             continue;
@@ -1432,6 +1440,18 @@ fn prepare_sources(
             &state.source.path,
             state.source.default_stdio_cwd.as_deref(),
         )?;
+        for name in source_prepared.keys() {
+            if session_names.contains(name)
+                || (state.source.session_bytes.is_some() && prepared.contains_key(name))
+            {
+                return Err(format!(
+                    "session MCP server {name:?} conflicts with an existing server"
+                ));
+            }
+        }
+        if state.source.session_bytes.is_some() {
+            session_names.extend(source_prepared.keys().cloned());
+        }
         prepared.extend(source_prepared);
         entries.extend(source_entries);
     }
@@ -1488,6 +1508,26 @@ async fn connect_inner(
         let raw = read_source(&source).await?;
         source_states.push(SourceState { source, raw });
     }
+    let runtime = build_runtime(
+        source_states,
+        plugin_prepared,
+        plugin_entries,
+        plugin_source,
+        interactive_oauth_enabled,
+        credential_storage,
+    )?;
+    runtime.spawn_eager_initialization();
+    Ok(runtime)
+}
+
+fn build_runtime(
+    source_states: Vec<SourceState>,
+    plugin_prepared: PreparedServers,
+    plugin_entries: ServerFingerprints,
+    plugin_source: Option<crate::plugins::PluginRuntime>,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+) -> Result<McpRuntime, String> {
     let (prepared, entries) = prepare_sources(&source_states, &plugin_prepared, &plugin_entries)?;
     validate_server_names(prepared.keys())?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1532,11 +1572,106 @@ async fn connect_inner(
         },
         interactive_oauth_enabled,
     );
-    runtime.spawn_eager_initialization();
     Ok(runtime)
 }
 
 impl McpRuntime {
+    /// Build an isolated runtime with request-scoped stdio servers. Credentials
+    /// supplied in the request remain in an immutable in-memory config source.
+    /// Initialization is lazy: rejected or cancelled attachment must not leave
+    /// a detached initializer owning this runtime or starting its processes.
+    pub(crate) async fn with_session_servers(
+        &self,
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<McpRuntime, String> {
+        self.ensure_healthy()?;
+        let mut entries = BTreeMap::new();
+        for server in servers {
+            let agentkit_acp::McpServer::Stdio(server) = server else {
+                return Err("session MCP servers support only stdio transport".into());
+            };
+            if entries.contains_key(&server.name) {
+                return Err(format!("duplicate session MCP server {:?}", server.name));
+            }
+            let mut env = BTreeMap::new();
+            for variable in server.env {
+                if env.insert(variable.name, variable.value).is_some() {
+                    return Err(format!(
+                        "duplicate environment variable for session MCP server {:?}",
+                        server.name
+                    ));
+                }
+            }
+            let command = server.command.to_str().ok_or_else(|| {
+                format!("session MCP server {:?} command is not UTF-8", server.name)
+            })?;
+            entries.insert(
+                server.name,
+                Value::Object(serde_json::Map::from_iter([
+                    ("type".into(), Value::String("stdio".into())),
+                    ("command".into(), Value::String(command.into())),
+                    (
+                        "args".into(),
+                        Value::Array(server.args.into_iter().map(Value::String).collect()),
+                    ),
+                    (
+                        "env".into(),
+                        Value::Object(
+                            env.into_iter()
+                                .map(|(name, value)| (name, Value::String(value)))
+                                .collect(),
+                        ),
+                    ),
+                ])),
+            );
+        }
+        let config = Value::Object(serde_json::Map::from_iter([(
+            "mcpServers".into(),
+            Value::Object(entries.into_iter().collect()),
+        )]));
+        let bytes = serde_json::to_vec(&config)
+            .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+        // Clone a consistent source/plugin generation. Release the reload lock
+        // before reads, validation, backend work, or initialization.
+        let (sources, plugins, plugin_entries, plugin_source) = {
+            let state = self.inner.reload.lock().await;
+            self.ensure_healthy()?;
+            (
+                state
+                    .sources
+                    .iter()
+                    .map(|state| state.source.clone())
+                    .collect::<Vec<_>>(),
+                state.plugins.clone(),
+                state.plugin_entries.clone(),
+                state.plugin_source.clone(),
+            )
+        };
+        let mut source_states = Vec::with_capacity(sources.len() + 1);
+        for source in sources {
+            let raw = read_source(&source).await?;
+            source_states.push(SourceState { source, raw });
+        }
+        source_states.push(SourceState {
+            source: ConfigSource {
+                path: PathBuf::from("<session MCP servers>"),
+                required: true,
+                default_stdio_cwd: Some(cwd.to_path_buf()),
+                session_bytes: Some(Arc::from(bytes.clone())),
+            },
+            raw: Some(bytes),
+        });
+        build_runtime(
+            source_states,
+            plugins,
+            plugin_entries,
+            plugin_source,
+            self.inner.interactive_oauth_enabled,
+            self.inner.credential_storage.clone(),
+        )
+    }
+
     fn ensure_healthy(&self) -> Result<(), String> {
         if self.inner.healthy.load(Ordering::Acquire) {
             Ok(())
@@ -6693,6 +6828,330 @@ mod tests {
         assert_eq!(
             runtime.inner.servers.read().await["shared"].description,
             "tools-manifest plugin MCP server"
+        );
+    }
+
+    fn session_server(name: &str) -> agentkit_acp::McpServer {
+        serde_json::from_value(json!({
+            "name": name, "command": "/kit-test-missing-session-command",
+            "args": ["session-argument"],
+            "env": [{"name": "SESSION_SECRET", "value": "memory-only-secret"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_overlay_is_isolated_and_survives_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"configured":{"command":"kit-test-missing-command"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let first = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let second = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let empty = base
+            .with_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&base.inner, &first.inner));
+        assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+        assert!(!Arc::ptr_eq(&base.inner, &empty.inner));
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+        assert!(!empty.inner.servers.read().await.contains_key("local"));
+        first.reload_config().await.unwrap();
+        let state = first.inner.reload.lock().await;
+        let (prepared, _) =
+            super::prepare_sources(&state.sources, &state.plugins, &state.plugin_entries).unwrap();
+        assert!(prepared.contains_key("configured"));
+        let McpTransportBinding::Stdio(stdio) = &prepared["local"].config.transport else {
+            panic!("expected stdio");
+        };
+        assert_eq!(stdio.cwd.as_deref(), Some(directory.path()));
+        assert_eq!(stdio.args, ["session-argument"]);
+        assert_eq!(
+            stdio
+                .env
+                .iter()
+                .find(|(name, _)| name == "SESSION_SECRET")
+                .map(|(_, value)| value.as_str()),
+            Some("memory-only-secret")
+        );
+        drop(state);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_overlay_rejects_invalid_requests_without_mutating_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = super::connect(None::<&Path>, &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let duplicate_env = serde_json::from_value(json!({
+            "name": "local", "command": "/missing", "args": [],
+            "env": [{"name": "KEY", "value": "secret-one"}, {"name": "KEY", "value": "secret-two"}]
+        }))
+        .unwrap();
+        let http = serde_json::from_value(json!({"type": "http", "name": "http", "url": "https://example.invalid/mcp", "headers": []})).unwrap();
+        let sse = serde_json::from_value(json!({"type": "sse", "name": "sse", "url": "https://example.invalid/sse", "headers": []})).unwrap();
+        for servers in [
+            vec![session_server("local"), session_server("local")],
+            vec![duplicate_env],
+            vec![http],
+            vec![sse],
+            vec![session_server("")],
+        ] {
+            let error = match base.with_session_servers(servers, directory.path()).await {
+                Ok(_) => panic!("invalid session servers accepted"),
+                Err(error) => error,
+            };
+            assert!(!error.contains("secret-one"));
+            assert!(!error.contains("secret-two"));
+        }
+        assert!(base.inner.servers.read().await.is_empty());
+        base.with_session_servers(vec![session_server("valid")], directory.path())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn session_stdio_fixture(directory: &Path, value: &str) -> agentkit_acp::McpServer {
+        // A real line-delimited JSON-RPC stdio server. Its marker is an external
+        // process effect, not instrumentation in the production runtime.
+        let script = r#"
+import json, os, sys
+with open(os.environ['MARKER'], 'w') as marker:
+    marker.write('started')
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'inspect', 'description': 'Inspect session environment', 'inputSchema': {'type': 'object'}}]}
+    elif method == 'tools/call':
+        data = {'value': os.environ['SESSION_VALUE'], 'cwd': os.getcwd(), 'pid': os.getpid()}
+        result = {'content': [{'type': 'text', 'text': json.dumps(data)}], 'structuredContent': data, 'isError': False}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        serde_json::from_value(json!({
+            "name": "local", "command": "/usr/bin/env", "args": ["python3", "-u", "-c", script],
+            "env": [
+                {"name": "SESSION_VALUE", "value": value},
+                {"name": "MARKER", "value": directory.join(format!("{value}.started"))}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn call_session_stdio(runtime: &super::McpRuntime) -> Value {
+        use agentkit_core::{SessionId, ToolOutput, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+        };
+        let tool = McpTool::new(runtime.clone());
+        let scope = ToolExecutionScope {
+            executor: Arc::clone(&tool.executor),
+            session_id: SessionId::new("fixture"),
+            turn_id: TurnId::new("turn"),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        };
+        let context = scope.nested_context(MetadataMap::new());
+        let request = ToolRequest::new(
+            "call",
+            "tool",
+            json!({"name": "mcp_local_inspect", "args": {}}),
+            "fixture",
+            "turn",
+        );
+        let outcome = tool.dispatch(request, &mut context.borrowed()).await;
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("stdio call did not complete: {outcome:?}");
+        };
+        assert!(!result.result.is_error);
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("expected structured MCP response");
+        };
+        value
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_stdio_is_lazy_and_executes_in_isolation() {
+        use agentkit_tools_core::ToolSource;
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let path = cwd.join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+
+        let abandoned = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "abandoned")], &cwd)
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&abandoned.inner);
+        drop(abandoned);
+        // A detached initializer would retain the runtime even before polling.
+        assert!(weak.upgrade().is_none());
+        assert!(!cwd.join("abandoned.started").exists());
+        assert!(
+            base.with_session_servers(
+                vec![
+                    session_stdio_fixture(&cwd, "rejected"),
+                    session_stdio_fixture(&cwd, "duplicate")
+                ],
+                &cwd
+            )
+            .await
+            .is_err()
+        );
+        assert!(!cwd.join("rejected.started").exists());
+        assert!(!cwd.join("duplicate.started").exists());
+
+        let first = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "first")], &cwd)
+            .await
+            .unwrap();
+        let second = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "second")], &cwd)
+            .await
+            .unwrap();
+        assert!(!cwd.join("first.started").exists());
+        assert!(!cwd.join("second.started").exists());
+        let found = first.search("inspect").await.unwrap();
+        assert_eq!(found["servers"][0]["status"], "authenticated");
+        assert!(cwd.join("first.started").exists());
+        assert!(!cwd.join("second.started").exists());
+        second.search("inspect").await.unwrap();
+        let first_result = call_session_stdio(&first).await;
+        let second_result = call_session_stdio(&second).await;
+        assert_eq!(first_result["value"], "first");
+        assert_eq!(second_result["value"], "second");
+        assert_eq!(first_result["cwd"], cwd.to_str().unwrap());
+        assert_eq!(second_result["cwd"], cwd.to_str().unwrap());
+        assert_ne!(first_result["pid"], second_result["pid"]);
+
+        // Only the refreshed overlay observes a configured-source addition.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"added":{"command":"kit-test-missing-command"}}}"#,
+        )
+        .unwrap();
+        first.reload_config().await.unwrap();
+        assert!(first.inner.servers.read().await.contains_key("added"));
+        assert!(!second.inner.servers.read().await.contains_key("added"));
+        assert!(base.inner.servers.read().await.is_empty());
+        assert_eq!(call_session_stdio(&first).await, first_result);
+        assert_eq!(call_session_stdio(&second).await, second_result);
+        assert!(
+            base.catalog()
+                .get(&agentkit_tools_core::ToolName::new("mcp_local_inspect"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_overlay_preserves_plugin_snapshot_and_rejects_plugin_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "plugin-local".into(),
+                transport: PluginMcpTransport::Stdio {
+                    command: "kit-test-missing-plugin".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    cwd: None,
+                },
+            }],
+        );
+        let base = super::connect(None::<&Path>, &[plugin], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert!(
+            base.with_session_servers(vec![session_server("plugin-local")], directory.path())
+                .await
+                .is_err()
+        );
+        let overlay = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        overlay.reload_config().await.unwrap();
+        let records = overlay.inner.servers.read().await;
+        assert!(records["plugin-local"].plugin_owned);
+        assert!(!records["local"].plugin_owned);
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+    }
+
+    #[tokio::test]
+    async fn session_overlay_collision_rejects_refresh_without_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"configured":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert!(
+            base.with_session_servers(vec![session_server("configured")], directory.path())
+                .await
+                .is_err()
+        );
+        let overlay = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let before = overlay.inner.reload.lock().await.entries.clone();
+        std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"missing"}}}"#).unwrap();
+        assert!(
+            overlay
+                .reload_config()
+                .await
+                .unwrap_err()
+                .contains("conflicts")
+        );
+        assert_eq!(overlay.inner.reload.lock().await.entries, before);
+        assert!(
+            overlay
+                .inner
+                .servers
+                .read()
+                .await
+                .contains_key("configured")
+        );
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        overlay.reload_config().await.unwrap();
+        assert!(overlay.inner.servers.read().await.contains_key("local"));
+        assert!(
+            !overlay
+                .inner
+                .servers
+                .read()
+                .await
+                .contains_key("configured")
         );
     }
 

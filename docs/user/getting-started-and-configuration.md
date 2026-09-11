@@ -136,7 +136,7 @@ kit serve --root /path/to/project --http 127.0.0.1:7331
 kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # daemon
 ```
 
-Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection remains ACP v1. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection defaults to ACP v1; the hidden `--stdio-protocol-version 2` flag selects v2 for that connection only. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
 
 Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener. Select the wire version explicitly with `--protocol-version 1|2`; omitting it defaults to ACP v1:
 
@@ -144,6 +144,8 @@ Add `--server-credential-file /private/token` to require the file's single beare
 kit acp --root /path/to/project --protocol-version 1
 kit acp --root /path/to/project --protocol-version 2
 ```
+
+ACP clients can supply additional stdio MCP servers per session: use `mcpServers` on v1 `session/new`, `session/load`, or `session/fork`, or on v2 `session/new` or `session/resume`. V2 stdio entries require `type: "stdio"`. These servers are attachment-scoped, preserve configured servers, and must be supplied again when reattaching; Kit does not persist their launch configuration.
 
 ## Configure `~/.kit/config.toml`
 

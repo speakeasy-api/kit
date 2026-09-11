@@ -943,6 +943,12 @@ async fn logout_authentication(
     }
 }
 
+struct SessionSetup {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<agentkit_acp::McpServer>,
+}
+
 struct AttachedSession<C> {
     session_id: agentkit_acp::SessionId,
     config_options: Vec<SessionConfigOption>,
@@ -1256,8 +1262,11 @@ impl Server {
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 None,
@@ -1328,8 +1337,11 @@ impl Server {
             .claim_session_load(&request.session_id.to_string())?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 None,
@@ -1349,11 +1361,6 @@ impl Server {
         request: ForkSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<PreparedFork, AcpRuntimeError> {
-        if !request.mcp_servers.is_empty() {
-            return Err(AcpRuntimeError::Loop(
-                "Kit does not accept per-session MCP servers".into(),
-            ));
-        }
         let parent_context = fork_parent_context(request.meta.as_ref());
         let sender = self.sender(&request.session_id).await?;
         let (tx, rx) = oneshot::channel();
@@ -1370,8 +1377,11 @@ impl Server {
         let claim = self.runtime.claim_session_fork()?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 Some(forked),
@@ -1388,13 +1398,17 @@ impl Server {
 
     async fn attach_session<C>(
         self: &Arc<Self>,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
+        setup: SessionSetup,
         connection: ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
         commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
     ) -> Result<AttachedSession<C>, AcpRuntimeError> {
+        let SessionSetup {
+            cwd,
+            additional_directories,
+            mcp_servers,
+        } = setup;
         // Validate path serialization before admission or any binding/actor effects.
         let cwd_metadata =
             serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
@@ -1410,7 +1424,16 @@ impl Server {
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
-        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string())?;
+        if !additional_directories.is_empty() {
+            return Err(AcpRuntimeError::Loop(
+                "this Kit runtime does not accept additional directories".into(),
+            ));
+        }
+        // Client overlays own their manager, catalog, reload state, and event routes.
+        let mcp = self.runtime.session_mcp(mcp_servers, &cwd).await?;
+        let mcp_events = mcp
+            .subscribe(session_id.to_string())
+            .map_err(AcpRuntimeError::Loop)?;
         if crate::resilient_fs::shutdown_token().is_cancelled() {
             return Err(AcpRuntimeError::ClientClosed);
         }
@@ -1457,7 +1480,7 @@ impl Server {
         };
         let driver = match self
             .runtime
-            .start_acp_driver_with_initial(context, &mut claim, forked)
+            .start_acp_driver_with_mcp(context, &mut claim, forked, mcp)
             .await
         {
             Ok(driver) => driver,
@@ -6326,6 +6349,116 @@ pub(super) mod tests {
                 delivery == "success"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn client_mcp_servers_are_honored_by_new_load_and_fork() {
+        use agentkit_acp::{McpServer, McpServerHttp, McpServerStdio};
+
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                let unsupported = vec![McpServer::Http(McpServerHttp::new(
+                    "kithub",
+                    "https://example.invalid/mcp",
+                ))];
+                // Missing executables remain discoverable connection failures; they
+                // must not prevent attachment or leak into another session.
+                let stdio = vec![McpServer::Stdio(McpServerStdio::new(
+                    "kithub",
+                    root.path().join("missing-bridge"),
+                ))];
+                connection
+                    .send_request(
+                        NewSessionRequest::new(root.path().to_path_buf())
+                            .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("new must validate client MCP servers");
+                let source = connection
+                    .send_request(
+                        NewSessionRequest::new(root.path().to_path_buf())
+                            .mcp_servers(stdio.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(
+                        ForkSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("fork must validate client MCP servers");
+                let fork = connection
+                    .send_request(
+                        ForkSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(stdio.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(fork.session_id))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(source.session_id.clone()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(
+                        LoadSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(unsupported),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("load must validate client MCP servers");
+                connection
+                    .send_request(
+                        LoadSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(stdio),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(source.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
