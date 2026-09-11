@@ -39,6 +39,9 @@ pub fn get(path: &Path, key: Option<&str>) -> io::Result<String> {
     // A keyed value is reusable TOML, not the surrounding assignment's comments.
     // Tables retain their document representation, including nested table headers.
     let mut item = item.clone();
+    if let Item::Table(table) = item {
+        return Ok(DocumentMut::from(table).to_string().trim().to_owned());
+    }
     if let Some(value) = item.as_value_mut() {
         value.decor_mut().clear();
     }
@@ -106,13 +109,28 @@ fn put(item: &mut Item, keys: &[Key], value: Option<Value>) -> io::Result<bool> 
         .split_first()
         .ok_or_else(|| invalid("empty config key"))?;
     let inline = item.is_inline_table();
-    let table = item
-        .as_table_like_mut()
-        .ok_or_else(|| invalid("config path crosses a non-table value"))?;
+    let Some(table) = item.as_table_like_mut() else {
+        return if value.is_none() {
+            Ok(false)
+        } else {
+            Err(invalid("config path crosses a non-table value"))
+        };
+    };
     if rest.is_empty() {
         if let Some(mut value) = value {
             if let Some(old) = table.get(key.get()).and_then(Item::as_value) {
                 *value.decor_mut() = old.decor().clone();
+            } else if let Some(old) = table.get(key.get()).and_then(Item::as_table) {
+                let decor = old.decor().clone();
+                // Header-leading comments belong before the new assignment, not its value.
+                if let Some(prefix) = decor.prefix()
+                    && let Some(mut key) = table.key_mut(key.get())
+                {
+                    key.leaf_decor_mut().set_prefix(prefix.clone());
+                }
+                if let Some(suffix) = decor.suffix() {
+                    value.decor_mut().set_suffix(suffix.clone());
+                }
             }
             if let Some(item) = table.get_mut(key.get()) {
                 *item = Item::Value(value);
@@ -187,4 +205,12 @@ fn update(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests;

@@ -237,10 +237,7 @@ fn malformed_documents_values_and_paths_never_write() {
         set(&path, "scalar.child", "new").unwrap_err().kind(),
         ErrorKind::InvalidInput
     );
-    assert_eq!(
-        unset(&path, "scalar.child").unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
+    unset(&path, "scalar.child").unwrap();
     assert_unchanged(&path, original, modified);
     let absent = dir.path().join("missing/config.toml");
     assert!(set(&absent, "model", "[broken").is_err());
@@ -394,4 +391,50 @@ fn keyed_table_output_remains_a_toml_document() {
     let parsed: toml::Value = toml::from_str(&output).unwrap();
     assert_eq!(parsed, document(&path)["custom"]);
     assert_eq!(get(&path, None).unwrap(), original);
+}
+
+#[test]
+fn keyed_tables_return_the_complete_selected_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    for source in [
+        "[selected]\nvalue = 1\n[selected.child]\nvalue = 2\n[selected.child.deep]\nvalue = 3\n[other]\nvalue = 4\n",
+        "[selected.child.deep]\nvalue = 3\n[other]\nvalue = 4\n",
+        "[selected]\nvalue = 1\n[[selected.children]]\nvalue = 2\n[selected.children.nested]\nvalue = 3\n[[selected.children]]\nvalue = 4\n[[selected.children.more]]\nvalue = 5\n[other]\nvalue = 6\n",
+    ] {
+        fs::write(&path, source).unwrap();
+        let selected: toml::Value = toml::from_str(&get(&path, Some("selected")).unwrap()).unwrap();
+        assert_eq!(selected, document(&path)["selected"], "{source}");
+    }
+}
+
+#[test]
+fn replacing_table_preserves_its_leading_and_header_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = "# leading\n[replace] # header\nold = 1\n[replace.child]\nold = 2\n\n# unrelated\n[keep] # keep header\nvalue = 3\n";
+    fs::write(&path, source).unwrap();
+    set(&path, "replace", "false").unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "# leading\nreplace= false # header\n\n# unrelated\n[keep] # keep header\nvalue = 3\n"
+    );
+    assert_eq!(document(&path)["replace"], toml::Value::from(false));
+}
+
+#[test]
+fn unset_through_non_tables_is_a_byte_preserving_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let source = "scalar = 1\r\narray = [1, 2]\r\n[[tables]]\r\nvalue = 3\r\n";
+    fs::write(&path, source).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    for key in ["scalar.child", "array.child", "tables.child"] {
+        unset(&path, key).unwrap();
+        assert_eq!(
+            set(&path, key, "4").unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_unchanged(&path, source, modified);
+    }
 }

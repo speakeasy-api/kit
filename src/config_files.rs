@@ -24,7 +24,7 @@ fn resolve_in(
             Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                if !is_directory(filesystem, &resolved, allow_missing)? {
+                if !is_directory(filesystem, &resolved, false)? {
                     return Err(io::ErrorKind::NotADirectory.into());
                 }
                 // Popping a root has no effect, as with native path traversal.
@@ -93,4 +93,63 @@ fn is_directory(
 /// Resolve links before replacing a config, allowing a new file or dangling target.
 pub(crate) fn resolve_for_write(path: &Path) -> io::Result<std::path::PathBuf> {
     resolve_in(crate::resilient_fs::global(), path, &mut 0, true)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod tests {
+    use super::resolve_for_write;
+    use std::{fs, io::ErrorKind};
+
+    #[test]
+    fn write_resolution_rejects_missing_directory_before_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing/../config.toml");
+
+        assert_eq!(
+            resolve_for_write(&path).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert!(!dir.path().join("missing").exists());
+        assert!(!dir.path().join("config.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_through_missing_directory_before_parent_does_not_write_destination() {
+        use std::{os::unix::fs::symlink, path::Path};
+
+        for existing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join("config.toml");
+            let original = "model = 'old'\n";
+            if existing {
+                fs::write(&destination, original).unwrap();
+            }
+            let link = dir.path().join("link.toml");
+            let target = Path::new("missing/../config.toml");
+            symlink(target, &link).unwrap();
+
+            assert_eq!(
+                crate::config_editor::set(&link, "model", "new")
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+            if existing {
+                assert_eq!(fs::read_to_string(&destination).unwrap(), original);
+            } else {
+                assert!(!destination.exists());
+            }
+            assert!(!dir.path().join("missing").exists());
+            assert_eq!(fs::read_link(&link).unwrap(), target);
+        }
+    }
 }
