@@ -295,3 +295,19 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.
 - **Unexpected project or model**: check the command line first, then `~/.kit/config.toml`, then the built-in defaults. Use `kit <command> --help` to confirm which options that command accepts.
 - **Provider authentication failure**: for `openai-subscription`, use the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` for login, status, and runtime commands; standalone login rejects `memory`. Also check that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier. For `speakeasy`, use the same persistent credential store for login and runtime commands, and confirm that the stored project can access the selected model.
+
+### Provider request budget
+
+`kit prompt --request-budget-seconds 300 "..."` gives each logical provider
+request a total 300-second budget, including retries, backoff, and streamed
+response reads. The global CLI option overrides `request_budget_seconds = 300`
+in the existing Kit TOML configuration. Accepted values are integer seconds
+from 1 through 3600; omission preserves the 60-second default. Stream idle
+and attempt timeouts remain 30 seconds, and retry/backoff policy is unchanged.
+This applies to the resilient OpenRouter and Speakeasy completions paths, not
+the OpenAI subscription transport. It does not extend an external container
+or task deadline (keep the trial's 1800-second limit).
+
+The setting is resolved once per Kit process. Native Kit ACP children and the
+TUI's Kit server receive the exact resolved value as a CLI argument, for both
+new and resumed sessions; their local TOML cannot override it.

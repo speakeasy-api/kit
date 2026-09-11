@@ -271,6 +271,12 @@ impl AcpHarnesses {
                     .reasoning_effort
                     .map_or("default", crate::ReasoningEffort::as_str),
             )
+            .arg("--request-budget-seconds")
+            .arg(
+                crate::request_budget::RequestBudget::current()
+                    .seconds()
+                    .to_string(),
+            )
             .arg("--session-id")
             .arg(id)
             .arg("--subagent-depth")
@@ -341,6 +347,12 @@ pub(crate) fn serve_command(
         .arg(provider.as_str())
         .arg("--reasoning-effort")
         .arg(reasoning_effort.map_or("default", crate::ReasoningEffort::as_str))
+        .arg("--request-budget-seconds")
+        .arg(
+            crate::request_budget::RequestBudget::current()
+                .seconds()
+                .to_string(),
+        )
         .arg("--session-id")
         .arg(session_id);
     if resume {
@@ -1812,6 +1824,67 @@ mod tests {
             harness_diagnostic("kit", "ordinary diagnostic").as_deref(),
             Some("ACP harness kit: ordinary diagnostic")
         );
+    }
+
+    #[test]
+    fn request_budget_inherited_for_new_and_resumed_children() {
+        crate::request_budget::RequestBudget::try_from(300)
+            .unwrap()
+            .initialize()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let harnesses = AcpHarnesses::default();
+        let config = ChildConfig {
+            root: root.path().into(),
+            model: "model".into(),
+            provider: crate::ProviderKind::OpenRouter,
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses: harnesses.clone(),
+            default_harness: BUILTIN_HARNESS.into(),
+            parent_id: None,
+            parent_name: None,
+        };
+        for resume in [false, true] {
+            let command = harnesses
+                .kit_command(&config, Some(("session", resume)), 1)
+                .unwrap();
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--request-budget-seconds", "300"])
+            );
+            assert_eq!(args.iter().any(|arg| arg == "--resume"), resume);
+            let command = serve_command(
+                root.path(),
+                "model",
+                crate::ProviderKind::OpenRouter,
+                None,
+                None,
+                "session",
+                resume,
+            )
+            .unwrap();
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--request-budget-seconds", "300"])
+            );
+        }
     }
 
     #[test]

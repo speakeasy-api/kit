@@ -609,7 +609,7 @@ impl KitAdapter {
                 let models_url = models_url(&config.base_url);
                 let inner = OpenRouterAdapter::new(config)
                     .map_err(|error| error.to_string())?
-                    .with_resilience(agentkit_http::ResilienceConfig::default());
+                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -787,7 +787,7 @@ impl ModelAdapter for KitAdapter {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
                 let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
-                    .with_resilience(agentkit_http::ResilienceConfig::default());
+                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 inner.start_session(config).await.map(|inner| {
                     KitSession::Speakeasy(SpeakeasyKitSession {
                         inner,

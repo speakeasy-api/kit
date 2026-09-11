@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+# Local amd64 trial: build the pinned source and retain factory tooling.
+ARG RUST_VERSION=1.94.0
+ARG DEBIAN_SUITE=bookworm
+
+FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder-gnu
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+ARG TARGETARCH
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY src ./src
+COPY docs/user ./docs/user
+
+RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=kit-gnu-target-${TARGETARCH},sharing=locked,target=/src/target \
+    cargo build --locked --release --bin kit \
+    && strip --strip-unneeded target/release/kit \
+    && cp target/release/kit /kit
+
+# Local-only trial runtime retains factory tools and lint-guide.
+FROM mcp-setup-docs-kit:0.1.130 AS request-budget-trial
+COPY --from=builder-gnu /kit /usr/local/bin/kit
