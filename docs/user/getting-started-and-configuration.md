@@ -306,7 +306,7 @@ from 1 through 3600; omission preserves the 60-second default. Stream idle
 and attempt timeouts remain 30 seconds, and retry/backoff policy is unchanged.
 This applies to the resilient OpenRouter and Speakeasy completions paths, not
 the OpenAI subscription transport. It does not extend an external container
-or task deadline (keep the trial's 1800-second limit).
+or task deadline.
 
 The setting is resolved once per Kit process. Native Kit ACP children and the
 TUI's Kit server receive the exact resolved value as a CLI argument, for both
