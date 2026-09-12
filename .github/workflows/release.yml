@@ -32,10 +32,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          components: rustfmt, clippy
+      - uses: jdx/mise-action@v4
       - name: Prepare release candidate
         id: release
         shell: bash
@@ -162,9 +159,8 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked
+      - run: mise run lint
+      - run: mise run test
       - uses: actions/upload-artifact@v4
         with:
           name: release-candidate
@@ -185,15 +181,12 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: x86_64-unknown-linux-gnu
+      - uses: jdx/mise-action@v4
       - name: Build and package
         shell: bash
         run: |
           version=$RELEASE_VERSION
-          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          mise run build:release -- --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
           cp LICENSE THIRD_PARTY_NOTICES.md stage/
@@ -228,10 +221,7 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
+      - uses: jdx/mise-action@v4
       - name: Check optional signing credentials
         id: signing
         shell: bash
@@ -280,7 +270,7 @@ jobs:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
           version=${{ needs.verify.outputs.version }}
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          mise run build:release -- --target aarch64-apple-darwin
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
           cp LICENSE THIRD_PARTY_NOTICES.md stage/
@@ -391,29 +381,16 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Install pinned XcodeGen
-        shell: bash
-        run: |
-          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: jdx/mise-action@v4
       - name: Archive, sign, notarize, and package app
         shell: bash
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
+          KIT_ARCHIVE_PATH: ${{ runner.temp }}/Kit.xcarchive
         run: |
-          version=${{ needs.verify.outputs.version }}
-          scripts/generate-macos-project.sh
-          archive="$RUNNER_TEMP/Kit.xcarchive"
-          xcodebuild archive -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Release \
-            -archivePath "$archive" \
-            -destination 'generic/platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO
-          mkdir -p dist
-          scripts/package-macos-app.sh \
-            "$archive/Products/Applications/Kit.app" dist "$version"
+          mise run macos:archive
+          mise run macos:package -- \
+            "$KIT_ARCHIVE_PATH/Products/Applications/Kit.app" dist "${{ needs.verify.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
           name: kit-macos-app-arm64
@@ -705,6 +682,8 @@ jobs:
             family: musl
     env:
       IMAGE: ghcr.io/${{ github.repository }}
+      # Container jobs only need the docker tasks; skip the Rust toolchain install.
+      MISE_DISABLE_TOOLS: rust
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -714,10 +693,6 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - name: Read container version
-        id: version
-        shell: bash
-        run: echo "version=${{ needs.verify.outputs.version }}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Log in to GitHub Container Registry
@@ -726,65 +701,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push slim image by digest
-        if: matrix.family == 'gnu'
-        id: slim
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: slim
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Build and push Bookworm image by digest
-        if: matrix.family == 'gnu'
-        id: bookworm
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: bookworm
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Build and push Alpine image by digest
-        if: matrix.family == 'musl'
-        id: alpine
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: alpine
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Export GNU image digests
-        if: matrix.family == 'gnu'
-        env:
-          SLIM_DIGEST: ${{ steps.slim.outputs.digest }}
-          BOOKWORM_DIGEST: ${{ steps.bookworm.outputs.digest }}
+      - uses: jdx/mise-action@v4
+      - name: Build and push images by digest
         shell: bash
-        run: |
-          mkdir -p /tmp/digests/{slim,bookworm}
-          touch "/tmp/digests/slim/${SLIM_DIGEST#sha256:}"
-          touch "/tmp/digests/bookworm/${BOOKWORM_DIGEST#sha256:}"
-      - name: Export Alpine image digest
-        if: matrix.family == 'musl'
         env:
-          ALPINE_DIGEST: ${{ steps.alpine.outputs.digest }}
-        shell: bash
+          # Tags are applied later by docker:tag from the pushed digests.
+          KIT_IMAGE: ""
+          CACHE: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
         run: |
-          mkdir -p /tmp/digests/alpine
-          touch "/tmp/digests/alpine/${ALPINE_DIGEST#sha256:}"
+          case ${{ matrix.family }} in
+            gnu) flavors=(slim bookworm) ;;
+            musl) flavors=(alpine) ;;
+          esac
+          for flavor in "${flavors[@]}"; do
+            metadata=$RUNNER_TEMP/$flavor-metadata.json
+            cache_to=()
+            # slim aliases the bookworm build, whose run also refreshes the cache.
+            if [[ $flavor != slim ]]; then
+              cache_to=(--cache-to "$CACHE,mode=max,ignore-error=true")
+            fi
+            mise run docker:build "$flavor" -- \
+              --platform ${{ matrix.platform }} \
+              --cache-from "$CACHE" ${cache_to[@]+"${cache_to[@]}"} \
+              --output type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true \
+              --provenance "mode=max,builder-id=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+              --metadata-file "$metadata"
+            digest=$(jq -r '."containerimage.digest"' "$metadata")
+            [[ $digest == sha256:* ]] || { echo "no image digest for $flavor" >&2; exit 1; }
+            mkdir -p "/tmp/digests/$flavor"
+            touch "/tmp/digests/$flavor/${digest#sha256:}"
+          done
       - name: Upload image digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -803,7 +749,16 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      KIT_IMAGE: ghcr.io/${{ github.repository }}
+      KIT_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      MISE_DISABLE_TOOLS: rust
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -837,67 +792,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate slim image metadata
-        id: slim-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}
-            type=raw,value=${{ needs.verify.outputs.tag }}-slim
-            type=raw,value=latest,enable=${{ steps.release.outputs.floating == 'true' }}
-            type=raw,value=slim,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish slim manifest
-        env:
-          METADATA: ${{ steps.slim-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/slim -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag slim -- "${digests[@]}"
 
-      - name: Generate Bookworm image metadata
-        id: bookworm-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}-bookworm
-            type=raw,value=bookworm,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Bookworm manifest
-        env:
-          METADATA: ${{ steps.bookworm-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/bookworm -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag bookworm -- "${digests[@]}"
 
-      - name: Generate Alpine image metadata
-        id: alpine-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}-alpine
-            type=raw,value=alpine,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Alpine manifest
-        env:
-          METADATA: ${{ steps.alpine-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/alpine -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag alpine -- "${digests[@]}"
 
       - name: Verify container package is public
         env:

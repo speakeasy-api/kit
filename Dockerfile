@@ -21,7 +21,7 @@ RUN apt-get update \
 WORKDIR /src
 ARG TARGETARCH
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY docs/user ./docs/user
 
@@ -45,7 +45,7 @@ RUN apk add --no-cache \
 WORKDIR /src
 ARG TARGETARCH
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY docs/user ./docs/user
 

@@ -2,7 +2,6 @@
 **
 !Cargo.toml
 !Cargo.lock
-!rust-toolchain.toml
 !build.rs
 !LICENSE
 !THIRD_PARTY_NOTICES.md

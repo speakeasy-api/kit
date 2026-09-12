@@ -1,0 +1,96 @@
+min_version = "2026.7.0"
+
+[tools]
+rust = { version = "1.94.0", profile = "minimal", components = "rustfmt,clippy" }
+python = { version = "3.13", os = ["macos"] }
+# Checksum-pinned release archive; scripts/generate-macos-project.sh also verifies the binary hash.
+"http:xcodegen" = { version = "2.45.4", os = ["macos"], url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip", checksum = "sha256:090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef", bin_path = "xcodegen/bin" }
+
+[tasks.build]
+description = "Debug build of the kit binary"
+run = "cargo build --locked --bin kit"
+
+[tasks."build:release"]
+description = "Optimized build; pass --target to cross-target, e.g. mise run build:release -- --target aarch64-apple-darwin"
+run = "cargo build --locked --release --bin kit"
+
+[tasks.sign]
+description = "macOS: release build, then codesign target/release/kit for the Keychain credential store"
+run = "scripts/sign-release.sh"
+
+[tasks.dev]
+description = "Run a debug build; arguments pass through, e.g. mise run dev -- tui --root ."
+run = "cargo run --locked --bin kit --"
+
+[tasks.install]
+description = "Install kit from this checkout into CARGO_HOME/bin"
+run = "cargo install --locked --path . --bin kit"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt"
+
+[tasks.lint]
+description = "Format check and Clippy with warnings denied"
+run = [
+    "cargo fmt --check",
+    "cargo clippy --locked --all-targets --all-features -- -D warnings",
+]
+
+[tasks.test]
+description = "Rust tests; arguments pass through, e.g. mise run test -- --test cli or mise run test -- --test runtime some_case"
+run = "cargo test --locked"
+
+[tasks."test:scripts"]
+description = "Shell tests for the release scripts"
+run = "scripts/tests/test_next_release_version.sh"
+
+[tasks.check]
+description = "Everything CI runs on Linux"
+depends = ["lint", "test", "test:scripts"]
+
+[tasks."macos:generate"]
+description = "Regenerate the Swift ACP models and the Xcode project"
+run = "scripts/generate-macos-project.sh"
+
+[tasks."macos:check"]
+description = "Generator tests plus a drift check of the committed Swift models and Xcode project"
+env = { PYTHONDONTWRITEBYTECODE = "1" }
+run = [
+    "python3 -m unittest scripts/tests/test_generate_acp_swift.py",
+    "scripts/generate-acp-swift.py --check",
+    "scripts/generate-macos-project.sh",
+    "git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj",
+]
+
+[tasks."macos:build"]
+description = "Debug build of Kit.app bundling target/debug/kit"
+depends = ["build", "macos:generate"]
+run = "scripts/xcodebuild.sh Debug build"
+
+[tasks."macos:run"]
+description = "Build and open the debug Kit.app"
+depends = ["macos:build"]
+run = 'open "${KIT_DERIVED_DATA:-macos/.build}/Build/Products/Debug/Kit.app"'
+
+[tasks."macos:test"]
+description = "Swift tests, including the real Kit lifecycle smoke against the debug helper"
+depends = ["build", "macos:generate"]
+run = "scripts/xcodebuild.sh Debug test"
+
+[tasks."macos:archive"]
+description = "Release archive of Kit.app; requires target/aarch64-apple-darwin/release/kit"
+depends = ["macos:generate"]
+run = "scripts/xcodebuild.sh Release archive"
+
+[tasks."macos:package"]
+description = "Package (and optionally sign and notarize) an archived Kit.app: mise run macos:package -- PATH/Kit.app DIST_DIR VERSION"
+run = "scripts/package-macos-app.sh"
+
+[tasks."docker:build"]
+description = "Build a container flavor (slim, bookworm, alpine); extra arguments go to docker buildx build"
+run = "scripts/docker-build.sh"
+
+[tasks."docker:tag"]
+description = "Tag pushed image digests with the release tags for a flavor: mise run docker:tag -- FLAVOR IMAGE@sha256:... [...]"
+run = "scripts/docker-tag.sh"
