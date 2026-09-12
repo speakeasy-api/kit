@@ -63,9 +63,11 @@ mise use -g github:speakeasy-api/kit@0.1.108
 ### Docker
 
 ```sh
-docker run --rm -it -v "$PWD:/workspace" -v ~/.kit:/home/kit/.kit \
-  ghcr.io/speakeasy-api/kit:latest tui --credential-store file
+docker run --rm -i -v "$PWD:/workspace" -v ~/.kit:/home/kit/.kit \
+  ghcr.io/speakeasy-api/kit:latest acp --credential-store file
 ```
+
+Images are headless: they serve ACP, A2A, and `prompt` but omit the `tui` command and native voice. Use a release binary or `mise run install` for the terminal client.
 
 Kit publishes images for `linux/amd64` and `linux/arm64`. Each image has three variants: `slim`, `bookworm`, and `alpine`. The default `slim` variant uses Debian slim. The `alpine` variant uses a native musl build.
 

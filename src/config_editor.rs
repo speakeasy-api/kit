@@ -84,6 +84,7 @@ pub fn unset(path: &Path, key: &str) -> io::Result<()> {
 }
 
 // Apply TUI defaults together so a failed parse/edit cannot partially save a selection.
+#[cfg(any(test, feature = "tui"))]
 pub(crate) fn set_strings(path: &Path, values: &[(&str, Option<&str>)]) -> io::Result<()> {
     let values = values
         .iter()

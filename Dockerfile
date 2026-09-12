@@ -8,6 +8,10 @@ ARG DEBIAN_SUITE=bookworm
 ARG ALPINE_VERSION=3.23
 ARG VERSION=source
 ARG REVISION=unknown
+# Container images are headless: no terminal client or voice session. A full
+# build (empty value) also needs the Linux audio development packages listed
+# in docs/user/native-voice.md, which these builder stages do not install.
+ARG CARGO_ARGS="--no-default-features"
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder-gnu
 
@@ -15,13 +19,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
-        libasound2-dev \
-        libpulse-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 ARG TARGETARCH
+ARG CARGO_ARGS
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
@@ -29,7 +32,7 @@ COPY docs/user ./docs/user
 
 RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=kit-gnu-target-${TARGETARCH},sharing=locked,target=/src/target \
-    cargo build --locked --release --bin kit \
+    cargo build --locked --release --bin kit $CARGO_ARGS \
     && strip --strip-unneeded target/release/kit \
     && cp target/release/kit /kit
 
@@ -37,21 +40,20 @@ RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/ca
 # this stage or add a libc compatibility shim to the runtime image.
 FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder-musl
 
-# cubeb loads optional audio libraries with dlopen, which requires dynamic musl.
-# Keep this scoped to Alpine: this is not a fully static musl distribution.
+# Dynamic musl matches the runtime image's shared libstdc++. Keep this scoped
+# to Alpine: this is not a fully static musl distribution.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 RUN apk add --no-cache \
-        alsa-lib-dev \
         build-base \
         cmake \
         linux-headers \
         perl \
-        pkgconf \
-        pulseaudio-dev
+        pkgconf
 
 WORKDIR /src
 ARG TARGETARCH
+ARG CARGO_ARGS
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
@@ -59,7 +61,7 @@ COPY docs/user ./docs/user
 
 RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=kit-musl-target-${TARGETARCH},sharing=locked,target=/src/target \
-    cargo build --locked --release --bin kit \
+    cargo build --locked --release --bin kit $CARGO_ARGS \
     && strip --strip-unneeded target/release/kit \
     && cp target/release/kit /kit
 
@@ -68,7 +70,7 @@ FROM debian:${DEBIAN_SUITE} AS bookworm
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Coding agent runtime and terminal client" \
+      org.opencontainers.image.description="Headless coding agent runtime" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \
@@ -102,7 +104,7 @@ FROM debian:${DEBIAN_SUITE}-slim AS slim
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Coding agent runtime and terminal client" \
+      org.opencontainers.image.description="Headless coding agent runtime" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \
@@ -138,7 +140,7 @@ FROM alpine:${ALPINE_VERSION} AS alpine
 ARG VERSION
 ARG REVISION
 LABEL org.opencontainers.image.title="Kit" \
-      org.opencontainers.image.description="Coding agent runtime and terminal client" \
+      org.opencontainers.image.description="Headless coding agent runtime" \
       org.opencontainers.image.source="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.url="https://github.com/speakeasy-api/kit" \
       org.opencontainers.image.documentation="https://github.com/speakeasy-api/kit#readme" \

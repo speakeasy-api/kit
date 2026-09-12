@@ -81,6 +81,7 @@ impl<'a> AuthenticationRequiredData<'a> {
         Self { method_id, detail }
     }
 
+    #[cfg(any(test, feature = "tui"))]
     pub(crate) fn from_value(value: &'a serde_json::Value) -> Option<Self> {
         let data = value.as_object()?;
         (data.get("kind")?.as_str()? == AUTH_REQUIRED_KIND).then_some(Self {

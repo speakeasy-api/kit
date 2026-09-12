@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -325,8 +325,9 @@ impl LaunchContext {
 }
 
 /// The combined `kit serve` command used by the TUI.
+#[cfg(any(test, feature = "tui"))]
 pub(crate) fn serve_command(
-    root: &Path,
+    root: &std::path::Path,
     model: &str,
     provider: crate::ProviderKind,
     reasoning_effort: Option<crate::ReasoningEffort>,

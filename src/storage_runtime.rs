@@ -20,6 +20,7 @@ pub fn request_shutdown() {
 /// Use only static writes and best-effort terminal cleanup, then skip destructors
 /// and runtime teardown. This is not the configurable overlay-budget exit path.
 fn noallocation_failure_exit() -> ! {
+    #[cfg(feature = "tui")]
     crate::tui::restore_after_allocation_failure();
     let _ = std::io::stderr().write_all(
         b"kit: memory allocation failed; exiting immediately. Unpersisted internal storage changes will be lost.\n",
