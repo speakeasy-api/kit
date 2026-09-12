@@ -1544,6 +1544,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "cubeb"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6d91c16b292c8c5fec14285a32c07fe471cc0d87b582d066dcccfdff2b61dd5"
+dependencies = [
+ "cubeb-core",
+]
+
+[[package]]
+name = "cubeb-core"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d1ae61351fb92da246f75ce1501e32a54d5e3f713a315f18e683b04c90b4dde"
+dependencies = [
+ "bitflags 1.3.2",
+ "cc",
+ "cubeb-sys",
+]
+
+[[package]]
+name = "cubeb-sys"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "820cb70dc4e0fb2646c3bfcf254c3f46ff450db6bc29ddab59f048cf511c9c9f"
+dependencies = [
+ "cmake",
+ "pkg-config",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3020,6 +3050,8 @@ dependencies = [
  "clap",
  "cpal",
  "crossterm",
+ "cubeb",
+ "cubeb-sys",
  "flate2",
  "futures-util",
  "getrandom 0.4.3",

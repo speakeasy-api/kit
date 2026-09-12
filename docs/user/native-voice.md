@@ -8,13 +8,14 @@ Native voice is a runtime opt-in TUI feature. It connects directly to the ChatGP
 
 ## Build, authenticate, and launch
 
-Every build includes voice and native audio dependencies. Building Kit needs Rust, a C/C++ toolchain, and the platform's audio development libraries (ALSA development headers on Linux). The pure-Rust Opus codec does not need CMake. The existing `aws-lc-rs` crypto backend is unchanged and can still require CMake on some targets/configurations. On macOS, install the Xcode Command Line Tools; install CMake if the crypto build requests it. On Debian/Ubuntu, install `build-essential cmake pkg-config libasound2-dev`. Windows needs the MSVC C++ build tools and may need CMake for the crypto build. Cross-platform builds and physical devices still need validation on each target.
+Every build includes voice and native audio dependencies. Building Kit needs Rust, a C/C++ toolchain, and the platform's audio development libraries (ALSA and PulseAudio development headers on Linux). The pure-Rust Opus codec does not need CMake. The existing `aws-lc-rs` crypto backend is unchanged and can still require CMake on some targets/configurations. On macOS, install the Xcode Command Line Tools; install CMake if the crypto build requests it. On Debian/Ubuntu, install `build-essential cmake pkg-config libasound2-dev libpulse-dev`. On Alpine, install `build-base cmake linux-headers perl pkgconf alsa-lib-dev pulseaudio-dev`. Windows needs the MSVC C++ build tools and may need CMake for the crypto build. Cross-platform builds and physical devices still need validation on each target.
 
-Linux runtime dependencies apply even with voice disabled. The GNU tarball needs
-`libasound.so.2`; the Alpine container uses dynamic musl and bundles `alsa-lib`.
-See [Linux runtime libraries](getting-started-and-configuration.md#linux-runtime-libraries)
-for distribution package names and the static-linking limitation. Disabling
-`cpal` default features does not remove its Linux ALSA dependency.
+Linux uses cubeb's production C ALSA/PulseAudio backends with lazy library loading.
+Audio libraries are optional at runtime and are loaded only for voice. Missing
+libraries or usable devices cause a local error before a subscription call is
+created. See [Linux runtime libraries](getting-started-and-configuration.md#linux-runtime-libraries)
+for optional package names and container requirements. The Linux native build
+requires CMake; the pure-Rust Opus codec does not.
 
 ```sh
 cargo build --locked --release
@@ -83,7 +84,7 @@ Run these checks manually only when you accept subscription usage and microphone
 
 ## Dependency scope and offline validation
 
-The included native stack is `str0m =0.23.1` (defaults disabled, `aws-lc-rs`), `cpal =0.18.2` (defaults disabled), `opus-pure =0.2.1` (defaults disabled; no dependencies or native build script), and `tokio-tungstenite =0.29.0` (defaults disabled, `handshake`). Relative to the preceding voice worktree, this codec switch adds only `opus-pure 0.2.1` and removes `opus 0.4.0` and `opusic-sys 0.7.5`. It does not upgrade any existing release. `cmake` remains locked through the existing crypto stack.
+The included native stack is `str0m =0.23.1` (defaults disabled, `aws-lc-rs`), `cubeb`, `cubeb-core`, and `cubeb-sys =0.38.0` on Linux, `cpal =0.18.2` (defaults disabled) on non-Linux platforms, `opus-pure =0.2.1` (defaults disabled; no dependencies or native build script), and `tokio-tungstenite =0.29.0` (defaults disabled, `handshake`). Relative to the preceding voice worktree, this codec switch adds only `opus-pure 0.2.1` and removes `opus 0.4.0` and `opusic-sys 0.7.5`. It does not upgrade any existing release. `cmake` remains locked through the existing crypto stack.
 
 Activation was explicitly approved by the user. The earlier dependency assessment collected archive/source evidence but did **not** finish its deeper semantic/native/transitive review; user approval does not make that review complete. The prior review limitations still apply to the unchanged native/crypto stack; switching the codec does not complete that broader review. Cross-platform native bindings and publisher/tag provenance remain residual review limitations. RustSec checks are not proof of native-code safety.
 
@@ -199,3 +200,11 @@ For an unclassified denial, ask the operator to investigate the route and client
 identity using the approximate attempt time. Do not collect raw headers/bodies or
 export credentials. Header corrections alone were not demonstrated to resolve
 this 403; the supported-voice probe above succeeded without impersonating Codex.
+
+Linux pins the cubeb family to 0.38.0. The `cubeb-sys` `unittest-build` feature
+selects real production C backends by disabling `BUILD_RUST_LIBS`; it does not
+replace audio with test stubs. This avoids the unlocked nested Cargo build for
+the Rust backend. `LAZY_LOAD_LIBS` stays enabled. Re-audit this upstream feature
+and bundled licenses on every upgrade. Controlled builds install ALSA/PulseAudio
+headers but no optional JACK, sndio, or system SpeexDSP development packages,
+and use a fresh CMake cache without backend or lazy-loading overrides.

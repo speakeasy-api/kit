@@ -20,17 +20,24 @@ A version can be pinned with a mise package such as `github:speakeasy-api/kit@0.
 
 ### Linux runtime libraries
 
-The Linux GNU tarball dynamically links ALSA and requires `libasound.so.2`
-even when experimental voice is disabled. Install `libasound2` on Debian 12
-(Bookworm), or `libasound2t64` on Ubuntu 24.04, before running Kit. Building
-from source additionally needs `libasound2-dev` and `pkg-config` (see
-[native voice build requirements](native-voice.md#build-authenticate-and-launch)).
+Linux builds load ALSA/PulseAudio libraries only when voice is started. Ordinary
+Kit commands and the TUI do not require audio libraries or devices. The GNU
+binary needs the standard C/C++ runtime libraries (`libstdc++6` on Debian/Ubuntu).
 
-The Debian container flavors include this runtime library. The Alpine container
-is a separate dynamically linked musl build and includes `alsa-lib`; it is not a
-fully static binary that can be copied into arbitrary distributions or `scratch`.
-The release workflow publishes an x86-64 GNU Linux tarball, not a static musl
-tarball. Container audio devices still need explicit host access to use voice.
+For voice, install `libpulse0` for PulseAudio (including PipeWire's PulseAudio
+compatibility service), or `libasound2` on Debian 12 / `libasound2t64` on Ubuntu
+24.04 for ALSA. A working audio service/device and microphone and speaker access
+are also required. If audio libraries or usable devices are missing, `/voice on`
+fails locally before creating a paid subscription call. Build dependencies are
+listed in [native voice build requirements](native-voice.md#build-authenticate-and-launch).
+
+The standard container images omit ALSA/PulseAudio runtime packages. Debian
+flavors include `libstdc++6`; Alpine includes `libstdc++`. To use voice in a
+container, add the optional audio packages (`pulseaudio-libs` or `alsa-lib` on
+Alpine) and explicitly provide host audio service/device access. The Alpine
+container is a separate dynamically linked musl build: `dlopen` requires dynamic
+musl, so it is not a fully static binary for arbitrary distributions or `scratch`.
+The release workflow publishes an x86-64 GNU Linux tarball, not a static musl tarball.
 
 ## Choose a provider and authenticate
 

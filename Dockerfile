@@ -16,6 +16,7 @@ RUN apt-get update \
         build-essential \
         cmake \
         libasound2-dev \
+        libpulse-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,8 +37,8 @@ RUN --mount=type=cache,id=kit-cargo-registry,sharing=locked,target=/usr/local/ca
 # this stage or add a libc compatibility shim to the runtime image.
 FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder-musl
 
-# alsa-sys 0.4 requests dynamic ALSA linking. Keep this scoped to the
-# Alpine container: it is not a portable, fully static musl distribution.
+# cubeb loads optional audio libraries with dlopen, which requires dynamic musl.
+# Keep this scoped to Alpine: this is not a fully static musl distribution.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 RUN apk add --no-cache \
@@ -46,7 +47,8 @@ RUN apk add --no-cache \
         cmake \
         linux-headers \
         perl \
-        pkgconf
+        pkgconf \
+        pulseaudio-dev
 
 WORKDIR /src
 ARG TARGETARCH
@@ -74,7 +76,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.revision="${REVISION}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libasound2 \
+    && apt-get install -y --no-install-recommends ca-certificates git libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 kit \
     && useradd --uid 1000 --gid 1000 --create-home --no-log-init --shell /bin/sh kit \
@@ -108,7 +110,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.revision="${REVISION}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git libasound2 \
+    && apt-get install -y --no-install-recommends ca-certificates git libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 kit \
     && useradd --uid 1000 --gid 1000 --create-home --no-log-init --shell /bin/sh kit \
@@ -143,7 +145,7 @@ LABEL org.opencontainers.image.title="Kit" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 
-RUN apk add --no-cache ca-certificates git alsa-lib \
+RUN apk add --no-cache ca-certificates git libstdc++ \
     && addgroup -S -g 1000 kit \
     && adduser -S -D -u 1000 -G kit -h /home/kit -s /bin/sh kit \
     && mkdir -p /workspace \

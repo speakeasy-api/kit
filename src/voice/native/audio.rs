@@ -1,9 +1,86 @@
 //! Device PCM conversion with fixed history and no callback allocations.
 use super::*;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, SupportedStreamConfig,
     SupportedStreamConfigRange,
 };
+
+pub(super) struct Audio {
+    input: Option<cpal::Stream>,
+    input_device: cpal::Device,
+    capture_tx: SyncSender<Captured>,
+    error_tx: SyncSender<String>,
+    _output: cpal::Stream,
+    pub(super) captured: Receiver<Captured>,
+    pub(super) playback: SyncSender<Playback>,
+    pub(super) errors: Receiver<String>,
+}
+fn audio_config(device: &cpal::Device, input: bool) -> Result<cpal::SupportedStreamConfig> {
+    // CoreAudio reports the current stream format here. Prefer it over the
+    // Opus rate to avoid an unnecessary hardware sample-rate transition.
+    let default = if input {
+        device.default_input_config()
+    } else {
+        device.default_output_config()
+    };
+    if let Ok(config) = select(default.ok(), &[], input) {
+        return Ok(config);
+    }
+    let configs: Vec<_> = if input {
+        device.supported_input_configs().map_err(message)?.collect()
+    } else {
+        device
+            .supported_output_configs()
+            .map_err(message)?
+            .collect()
+    };
+    select(None, &configs, input)
+}
+impl Audio {
+    pub(super) fn set_capture(&mut self, enabled: bool) -> Result<()> {
+        if !enabled {
+            // CPAL stream destruction stops the device callback.
+            self.input = None;
+        } else if self.input.is_none() {
+            let input = capture(
+                &self.input_device,
+                audio_config(&self.input_device, true)?,
+                self.capture_tx.clone(),
+                self.error_tx.clone(),
+            )?;
+            input.play().map_err(message)?;
+            self.input = Some(input);
+        }
+        Ok(())
+    }
+    pub(super) fn new() -> Result<Self> {
+        let host = cpal::default_host();
+        let input_device = host.default_input_device().ok_or("No default microphone")?;
+        let output_device = host
+            .default_output_device()
+            .ok_or("No default audio output")?;
+        // Validate availability without opening a recording stream.
+        audio_config(&input_device, true)?;
+        let (capture_tx, captured) = mpsc::sync_channel(8);
+        let (playback, playback_rx) = mpsc::sync_channel::<Playback>(4);
+        let (error_tx, errors) = mpsc::sync_channel(2);
+        // Muting drops capture instead of requiring hardware pause support.
+        let output_config = audio_config(&output_device, false)?;
+        let output = self::playback(&output_device, output_config, playback_rx, error_tx.clone())?;
+        output.play().map_err(message)?;
+        Ok(Self {
+            input: None,
+            input_device,
+            capture_tx,
+            error_tx,
+            _output: output,
+            captured,
+            playback,
+            errors,
+        })
+    }
+}
 
 // Keep the native configuration intact; callbacks resample device PCM.
 fn usable(format: SampleFormat, channels: u16, min: u32, max: u32) -> bool {

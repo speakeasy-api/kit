@@ -6,7 +6,6 @@ rust-version = "1.94.0"
 publish = false
 
 [dependencies]
-cpal = { version = "=0.18.2", default-features = false }
 opus-pure = { version = "=0.2.1", default-features = false }
 str0m = { version = "=0.23.1", default-features = false, features = ["aws-lc-rs"] }
 tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
@@ -80,6 +79,15 @@ url = "=2.5.8"
 uuid = { version = "=1.26.0", features = ["v5"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = { version = "=0.18.2", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cubeb = { version = "=0.38.0", default-features = false }
+# In 0.38.0 this selects production C backends, not test implementations.
+# Avoid the Rust backends' independent, unlocked Cargo build; re-audit on upgrade.
+cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
