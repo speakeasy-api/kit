@@ -80,13 +80,66 @@ pub enum RuntimeEvent {
         parent_id: Option<String>,
         parent_name: Option<String>,
         harness: String,
+        #[serde(default)]
+        vendor: HarnessVendor,
         model: Option<String>,
         created_at_unix_ms: u64,
         generation_started_at_unix_ms: u64,
         generation_finished_at_unix_ms: Option<u64>,
     },
+    /// A subagent's ACP session reported its context window occupancy.
+    SubagentUsage { id: String, used: u64, size: u64 },
     /// Every observable strict descendant of an ancestor should be removed.
     SubagentDescendantsRemoved { ancestor_id: String },
+}
+
+/// The product behind an ACP harness, inferred from its launch command.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessVendor {
+    Kit,
+    Claude,
+    Codex,
+    OpenCode,
+    Copilot,
+    Cursor,
+    Pi,
+    Antigravity,
+    #[default]
+    Unknown,
+}
+
+impl HarnessVendor {
+    /// Classifies an argv-only launch line by its command basename and args.
+    ///
+    /// Tokens are matched whole so `copilot` never reads as `pi`, and
+    /// `@agentclientprotocol/codex-acp@1.4.0` still yields `codex`.
+    #[must_use]
+    pub fn detect(command: &str, args: &[String]) -> Self {
+        let basename = std::path::Path::new(command)
+            .file_name()
+            .map_or(command, |name| name.to_str().unwrap_or(command));
+        let tokens = std::iter::once(basename)
+            .chain(args.iter().map(String::as_str))
+            .flat_map(|word| word.split(|c: char| !c.is_ascii_alphanumeric()))
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_lowercase);
+        for token in tokens {
+            let vendor = match token.as_str() {
+                "kit" => Self::Kit,
+                "claude" => Self::Claude,
+                "codex" => Self::Codex,
+                "opencode" => Self::OpenCode,
+                "copilot" => Self::Copilot,
+                "cursor" => Self::Cursor,
+                "pi" => Self::Pi,
+                "antigravity" | "agy" => Self::Antigravity,
+                _ => continue,
+            };
+            return vendor;
+        }
+        Self::Unknown
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +166,7 @@ impl RuntimeEvent {
             Self::ChildStarted { .. }
                 | Self::ChildFinished { .. }
                 | Self::SubagentStateChanged { .. }
+                | Self::SubagentUsage { .. }
                 | Self::SubagentDescendantsRemoved { .. }
         )
     }
@@ -129,6 +183,7 @@ impl RuntimeEvent {
             | Self::CompactionStarted { .. }
             | Self::CompactionFinished { .. }
             | Self::SubagentStateChanged { .. }
+            | Self::SubagentUsage { .. }
             | Self::SubagentDescendantsRemoved { .. } => return None,
         };
         call.rsplit_once(":compose:").map(|(parent, _)| parent)
@@ -250,8 +305,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EVENT_MARKER, GenerationOutcome, RuntimeEvent, SubagentStatus, parse, summarize_input,
-        summarize_output, test_support::write_event,
+        EVENT_MARKER, GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus, parse,
+        summarize_input, summarize_output, test_support::write_event,
     };
 
     #[test]
@@ -292,6 +347,7 @@ mod tests {
             parent_id: None,
             parent_name: None,
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: Some("test-model".into()),
             created_at_unix_ms: 1_000,
             generation_started_at_unix_ms: 2_000,
@@ -327,6 +383,7 @@ mod tests {
             parent_id: Some("s-parent".into()),
             parent_name: Some("偵察 🦀".into()),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: None,
             created_at_unix_ms: 10,
             generation_started_at_unix_ms: 20,
@@ -342,6 +399,112 @@ mod tests {
             assert_eq!(parsed, event);
             assert!(parsed.forward_from_child());
         }
+    }
+
+    #[test]
+    fn subagent_usage_round_trips_and_forwards_from_children() {
+        let usage = RuntimeEvent::SubagentUsage {
+            id: "s-child".into(),
+            used: 12_345,
+            size: 200_000,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["event"], "subagent_usage");
+        let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&usage).unwrap());
+        let parsed = parse(&line).unwrap();
+        assert_eq!(parsed, usage);
+        assert!(parsed.forward_from_child());
+        assert_eq!(parsed.parent_call(), None);
+    }
+
+    #[test]
+    fn subagent_state_without_vendor_reads_as_unknown() {
+        let line = format!(
+            "{EVENT_MARKER}{}",
+            json!({
+                "event": "subagent_state_changed",
+                "id": "s-old",
+                "name": "Scout",
+                "status": "working",
+                "outcome": null,
+                "generation": 1,
+                "task": "inspect",
+                "parent_id": null,
+                "parent_name": null,
+                "harness": "acp.kit",
+                "model": null,
+                "created_at_unix_ms": 1,
+                "generation_started_at_unix_ms": 2,
+                "generation_finished_at_unix_ms": null
+            })
+        );
+        let Some(RuntimeEvent::SubagentStateChanged { vendor, .. }) = parse(&line) else {
+            panic!("older roster line still parses");
+        };
+        assert_eq!(vendor, HarnessVendor::Unknown);
+    }
+
+    #[test]
+    fn vendor_detection_reads_whole_tokens_from_command_and_args() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            HarnessVendor::detect(
+                "npx",
+                &args(&["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"])
+            ),
+            HarnessVendor::Claude
+        );
+        assert_eq!(
+            HarnessVendor::detect(
+                "npx",
+                &args(&["-y", "@agentclientprotocol/codex-acp@1.4.0"])
+            ),
+            HarnessVendor::Codex
+        );
+        assert_eq!(
+            HarnessVendor::detect("cursor-agent", &args(&["acp"])),
+            HarnessVendor::Cursor
+        );
+        assert_eq!(
+            HarnessVendor::detect("/usr/local/bin/opencode", &args(&["acp"])),
+            HarnessVendor::OpenCode
+        );
+        assert_eq!(
+            HarnessVendor::detect("copilot", &args(&["--acp"])),
+            HarnessVendor::Copilot
+        );
+        assert_eq!(
+            HarnessVendor::detect("pi", &args(&["--mode", "acp"])),
+            HarnessVendor::Pi
+        );
+        assert_eq!(
+            HarnessVendor::detect("npx", &args(&["pi-acp"])),
+            HarnessVendor::Pi
+        );
+        assert_eq!(
+            HarnessVendor::detect("agy", &args(&["acp"])),
+            HarnessVendor::Antigravity
+        );
+        assert_eq!(
+            HarnessVendor::detect("antigravity", &[]),
+            HarnessVendor::Antigravity
+        );
+        assert_eq!(
+            HarnessVendor::detect("/opt/kit/bin/kit", &args(&["acp"])),
+            HarnessVendor::Kit
+        );
+        assert_eq!(
+            HarnessVendor::detect("python3", &args(&["mock-acp.py"])),
+            HarnessVendor::Unknown
+        );
+        assert_eq!(
+            HarnessVendor::detect("Copilot.exe", &[]),
+            HarnessVendor::Copilot
+        );
     }
 
     #[test]

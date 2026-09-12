@@ -176,6 +176,18 @@ impl AcpHarnesses {
         Ok(resolved.to_owned())
     }
 
+    /// The product a harness reference launches, for roster marks.
+    pub fn vendor(&self, reference: &str) -> crate::events::HarnessVendor {
+        if self.is_kit(reference) {
+            return crate::events::HarnessVendor::Kit;
+        }
+        self.profile_name(reference)
+            .and_then(|name| self.profiles.get(name))
+            .map_or(crate::events::HarnessVendor::Unknown, |profile| {
+                crate::events::HarnessVendor::detect(&profile.command, &profile.args)
+            })
+    }
+
     fn profile_name<'a>(&self, reference: &'a str) -> Option<&'a str> {
         let name = reference.strip_prefix("acp.")?;
         (!name.is_empty() && !name.contains('.')).then_some(name)
@@ -429,6 +441,8 @@ struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
     serial: tokio::sync::OwnedMutexGuard<()>,
     session_id: SessionId,
+    /// The subagent id that owns this turn, so usage events name the roster row.
+    owner: String,
     text: String,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
@@ -506,6 +520,13 @@ struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
     descendant_parent: Option<String>,
+}
+
+/// Where one in-flight prompt's session updates land.
+#[derive(Clone)]
+struct Route {
+    owner: String,
+    output: Arc<Mutex<ChildOutput>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -796,6 +817,7 @@ impl ChildSession {
 
     pub async fn prompt(
         &self,
+        owner: String,
         text: String,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
@@ -814,6 +836,7 @@ impl ChildSession {
         let request = Request::Prompt(Prompt {
             serial,
             session_id: self.session_id.clone(),
+            owner,
             text,
             cancellation: cancellation.clone(),
             reply,
@@ -929,9 +952,7 @@ async fn run(
         .await;
     });
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
-    let routes = Arc::new(Mutex::new(
-        HashMap::<SessionId, Arc<Mutex<ChildOutput>>>::new(),
-    ));
+    let routes = Arc::new(Mutex::new(HashMap::<SessionId, Route>::new()));
     let notification_routes = Arc::clone(&routes);
     let root = config.root.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -944,9 +965,17 @@ async fn run(
                     .lock()
                     .ok()
                     .and_then(|routes| routes.get(&notification.session_id).cloned());
-                if let Some(route) = route
-                    && let Ok(mut output) = route.lock()
-                {
+                let Some(route) = route else {
+                    return Ok(());
+                };
+                if let SessionUpdate::UsageUpdate(usage) = &notification.update {
+                    crate::events::emit(&crate::events::RuntimeEvent::SubagentUsage {
+                        id: route.owner.clone(),
+                        used: usage.used,
+                        size: usage.size,
+                    });
+                }
+                if let Ok(mut output) = route.output.lock() {
                     output.record(notification.update);
                 }
                 Ok(())
@@ -1168,7 +1197,9 @@ async fn run(
                             let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
-                            if let Ok(mut routes) = routes.lock() { routes.insert(session_id.clone(), Arc::clone(&output)); }
+                            if let Ok(mut routes) = routes.lock() {
+                                routes.insert(session_id.clone(), Route { owner: prompt.owner, output: Arc::clone(&output) });
+                            }
                             let request = connection.send_request(agentkit_acp::PromptRequest::new(
                                 session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
                             )).block_task();
@@ -1648,6 +1679,7 @@ mod tests {
             .send(Request::Prompt(Prompt {
                 serial,
                 session_id: child.session_id.clone(),
+                owner: "s-test".into(),
                 text: "queued".into(),
                 cancellation: controller.handle().checkpoint(),
                 reply,
@@ -1692,7 +1724,7 @@ mod tests {
                         child.fork(None, None, &cancellation).await.map(|_| ())
                     } else {
                         child
-                            .prompt("blocked".into(), cancellation.clone())
+                            .prompt("s-test".into(), "blocked".into(), cancellation.clone())
                             .await
                             .map(|_| ())
                     }
@@ -1725,7 +1757,7 @@ mod tests {
                     child.fork(None, None, &cancellation).await.map(|_| ())
                 } else {
                     child
-                        .prompt("ready".into(), cancellation.clone())
+                        .prompt("s-test".into(), "ready".into(), cancellation.clone())
                         .await
                         .map(|_| ())
                 }
@@ -1774,7 +1806,7 @@ mod tests {
                         .map(|_| ())
                 } else {
                     caller
-                        .prompt("first".into(), TurnCancellation::default())
+                        .prompt("s-test".into(), "first".into(), TurnCancellation::default())
                         .await
                         .map(|_| ())
                 }
@@ -1796,7 +1828,7 @@ mod tests {
             };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::join!(
-                    child.prompt("next".into(), TurnCancellation::default()),
+                    child.prompt("s-test".into(), "next".into(), TurnCancellation::default()),
                     answer
                 )
             })
@@ -2547,10 +2579,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            base.prompt("standard".into(), TurnCancellation::default())
-                .await
-                .unwrap()
-                .text,
+            base.prompt(
+                "s-test".into(),
+                "standard".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
             "standard"
         );
         let closed = base
@@ -2559,10 +2595,14 @@ mod tests {
             .unwrap();
         closed.close().await.unwrap();
         assert_eq!(
-            base.prompt("after sibling close".into(), TurnCancellation::default())
-                .await
-                .unwrap()
-                .text,
+            base.prompt(
+                "s-test".into(),
+                "after sibling close".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
             "after sibling close"
         );
 
@@ -2576,8 +2616,12 @@ mod tests {
             .unwrap();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
-            first.prompt("first".into(), TurnCancellation::default()),
-            second.prompt("second".into(), TurnCancellation::default()),
+            first.prompt("s-test".into(), "first".into(), TurnCancellation::default()),
+            second.prompt(
+                "s-test".into(),
+                "second".into(),
+                TurnCancellation::default()
+            ),
         );
         assert_eq!(first.unwrap().text, "first");
         assert_eq!(second.unwrap().text, "second");
@@ -2594,8 +2638,16 @@ mod tests {
         let same_session_clone = same_session.clone();
         let started = std::time::Instant::now();
         let (first, second) = tokio::join!(
-            same_session.prompt("same-first".into(), TurnCancellation::default()),
-            same_session_clone.prompt("same-second".into(), TurnCancellation::default()),
+            same_session.prompt(
+                "s-test".into(),
+                "same-first".into(),
+                TurnCancellation::default()
+            ),
+            same_session_clone.prompt(
+                "s-test".into(),
+                "same-second".into(),
+                TurnCancellation::default()
+            ),
         );
         assert_eq!(first.unwrap().text, "same-first");
         assert_eq!(second.unwrap().text, "same-second");
@@ -2666,7 +2718,11 @@ mod tests {
                     let mut ready = Some(ready);
                     loop {
                         match sibling
-                            .prompt("flowing".into(), TurnCancellation::default())
+                            .prompt(
+                                "s-test".into(),
+                                "flowing".into(),
+                                TurnCancellation::default(),
+                            )
                             .await
                         {
                             Ok(output) => {
@@ -2686,7 +2742,11 @@ mod tests {
             let controller = agentkit_core::CancellationController::new();
             let cancellation = controller.handle().checkpoint();
             let child = base.clone();
-            let held = tokio::spawn(async move { child.prompt("held".into(), cancellation).await });
+            let held = tokio::spawn(async move {
+                child
+                    .prompt("s-test".into(), "held".into(), cancellation)
+                    .await
+            });
             // Observe acceptance at the real protocol boundary before cancelling.
             while !std::fs::read_to_string(&log)
                 .unwrap_or_default()
@@ -2775,6 +2835,7 @@ mod tests {
             }
             assert!(base.serial.try_lock().is_err());
             let mut next = Box::pin(base.prompt(
+                "s-test".into(),
                 "source survives cancellation".into(),
                 TurnCancellation::default(),
             ));
@@ -2917,6 +2978,7 @@ mod tests {
                 parent_id: Some("s-parent".into()),
                 parent_name: Some("Pip".into()),
                 harness: BUILTIN_HARNESS.into(),
+                vendor: crate::events::HarnessVendor::Kit,
                 model: Some("model".into()),
                 created_at_unix_ms: 10,
                 generation_started_at_unix_ms: 20,
@@ -2965,6 +3027,7 @@ mod tests {
                 parent_id: Some("s-owner".into()),
                 parent_name: Some("Pip".into()),
                 harness: BUILTIN_HARNESS.into(),
+                vendor: crate::events::HarnessVendor::Kit,
                 model: None,
                 created_at_unix_ms: 10,
                 generation_started_at_unix_ms: 20,
@@ -3091,6 +3154,56 @@ mod tests {
                     .any(|pair| pair == ["--subagent-parent-id", "s-parent"])
             );
             assert!(args.contains(&"--subagent-parent-name=偵察 🦀".into()));
+        }
+
+        #[test]
+        fn vendor_follows_the_profile_launch_line_and_kit_is_always_kit() {
+            let harnesses = AcpHarnesses::new(BTreeMap::from([
+                (
+                    "designer".to_string(),
+                    AcpHarnessProfile {
+                        command: "npx".into(),
+                        args: vec![
+                            "-y".into(),
+                            "@agentclientprotocol/claude-agent-acp@0.69.0".into(),
+                        ],
+                        permissions: AcpPermissionPolicy::Deny,
+                    },
+                ),
+                (
+                    "cursor".to_string(),
+                    AcpHarnessProfile {
+                        command: "cursor-agent".into(),
+                        args: vec!["acp".into()],
+                        permissions: AcpPermissionPolicy::Deny,
+                    },
+                ),
+                (
+                    "kit".to_string(),
+                    AcpHarnessProfile {
+                        command: "/opt/custom/agent".into(),
+                        args: vec![],
+                        permissions: AcpPermissionPolicy::Deny,
+                    },
+                ),
+            ]))
+            .unwrap();
+            assert_eq!(
+                harnesses.vendor("acp.designer"),
+                crate::events::HarnessVendor::Claude
+            );
+            assert_eq!(
+                harnesses.vendor("acp.cursor"),
+                crate::events::HarnessVendor::Cursor
+            );
+            assert_eq!(
+                harnesses.vendor(BUILTIN_HARNESS),
+                crate::events::HarnessVendor::Kit
+            );
+            assert_eq!(
+                harnesses.vendor("acp.missing"),
+                crate::events::HarnessVendor::Unknown
+            );
         }
 
         #[test]

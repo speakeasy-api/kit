@@ -1847,8 +1847,12 @@ fn agent_duration(millis: u64) -> String {
     duration
 }
 
+/// Task text keeps at least this many cells before the usage readout yields.
+const MIN_AGENT_TASK_WIDTH: usize = 8;
+
 fn agent_lines(
     tree_row: &AgentTreeRow<'_>,
+    show_vendor: bool,
     tick: usize,
     now_unix_ms: u64,
     width: usize,
@@ -1905,28 +1909,48 @@ fn agent_lines(
             "   "
         });
     }
-    let first = Line::from(vec![
+    let mut first = vec![
         Span::styled(first_prefix, theme::faint()),
         Span::styled(format!("{glyph} "), glyph_style),
-        Span::styled(row.name.clone(), theme::text()),
-        Span::styled(ancestry, theme::faint()),
-    ]);
+    ];
+    if show_vendor {
+        let (mark, mark_style) = theme::vendor_mark(row.vendor);
+        first.push(Span::styled(format!("{mark} "), mark_style));
+    }
+    first.push(Span::styled(row.name.clone(), theme::text()));
+    first.push(Span::styled(ancestry, theme::faint()));
+    let first = Line::from(first);
 
     let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
-    let duration = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
-    let duration_full_width = UnicodeWidthStr::width(duration.as_str());
-    let duration_width = duration_full_width.min(width);
-    let displayed_duration = if duration_width < duration_full_width {
-        visible_query_tail(&duration, duration_width).to_string()
-    } else {
-        duration
-    };
-    let prefix_width = width.saturating_sub(duration_width);
+    let mut tail = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
     let tree_prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
+    if let Some(usage) = row.usage {
+        let with_usage = format!(
+            "{} {}/{} · {tail}",
+            percent(usage.used, usage.size),
+            compact(usage.used),
+            compact(usage.size)
+        );
+        let needed = tree_prefix_width
+            + MIN_AGENT_TASK_WIDTH
+            + 1
+            + UnicodeWidthStr::width(with_usage.as_str());
+        if needed <= width {
+            tail = with_usage;
+        }
+    }
+    let tail_full_width = UnicodeWidthStr::width(tail.as_str());
+    let tail_width = tail_full_width.min(width);
+    let displayed_tail = if tail_width < tail_full_width {
+        visible_query_tail(&tail, tail_width).to_string()
+    } else {
+        tail
+    };
+    let prefix_width = width.saturating_sub(tail_width);
     let second = if prefix_width <= tree_prefix_width {
         Line::from(vec![
             Span::raw(" ".repeat(prefix_width)),
-            Span::styled(displayed_duration, theme::faint()),
+            Span::styled(displayed_tail, theme::faint()),
         ])
     } else {
         let task_width = prefix_width - tree_prefix_width - 1;
@@ -1936,7 +1960,7 @@ fn agent_lines(
             Span::styled(second_prefix, theme::faint()),
             Span::styled(task, theme::dim()),
             Span::raw(" ".repeat(task_padding + 1)),
-            Span::styled(displayed_duration, theme::faint()),
+            Span::styled(displayed_tail, theme::faint()),
         ])
     };
     [first, second]
@@ -1954,12 +1978,13 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let visible_rows = usize::from(row_area_height / 2);
     app.set_agents_viewport(area, visible_rows);
     let now = crate::events::now_millis();
+    let show_vendor = !app.agents_all_kit();
     let lines = app
         .agent_tree_rows()
         .into_iter()
         .skip(app.agents_scroll())
         .take(visible_rows)
-        .flat_map(|row| agent_lines(&row, app.tick, now, inner.width as usize))
+        .flat_map(|row| agent_lines(&row, show_vendor, app.tick, now, inner.width as usize))
         .collect::<Vec<_>>();
     let rows_area = Rect {
         height: row_area_height,
@@ -2477,10 +2502,12 @@ mod tests {
             parent_id: parent_name.map(|_| "parent-id".into()),
             parent_name: parent_name.map(Into::into),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: Some("test".into()),
             created_at_unix_ms: 1_000,
             generation_started_at_unix_ms: 2_000,
             generation_finished_at_unix_ms: None,
+            usage: None,
         }
     }
 
@@ -2777,7 +2804,7 @@ mod tests {
             None,
             "Trace ACP lifecycle",
         );
-        let lines = agent_lines(&tree_row(&top, vec![], false, false), 0, 74_000, 48);
+        let lines = agent_lines(&tree_row(&top, vec![], false, false), false, 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠋ Scout");
         let second = line_text(&lines[1]);
         assert_eq!(second, "  Trace ACP lifecycle                     1m 12s");
@@ -2795,15 +2822,27 @@ mod tests {
             Some("Pip"),
             "Trace ACP lifecycle",
         );
-        let lines = agent_lines(&tree_row(&nested, vec![true], false, false), 0, 74_000, 48);
+        let lines = agent_lines(
+            &tree_row(&nested, vec![true], false, false),
+            false,
+            0,
+            74_000,
+            48,
+        );
         assert_eq!(line_text(&lines[0]), "│  └─ ⠁ Scout");
         assert!(line_text(&lines[1]).starts_with("│     Trace ACP lifecycle"));
 
-        let lines = agent_lines(&tree_row(&nested, vec![false], true, false), 0, 74_000, 48);
+        let lines = agent_lines(
+            &tree_row(&nested, vec![false], true, false),
+            false,
+            0,
+            74_000,
+            48,
+        );
         assert_eq!(line_text(&lines[0]), "   ├─ ⠁ Scout");
         assert!(line_text(&lines[1]).starts_with("   │  Trace ACP lifecycle"));
 
-        let lines = agent_lines(&tree_row(&nested, vec![], true, true), 0, 74_000, 48);
+        let lines = agent_lines(&tree_row(&nested, vec![], true, true), false, 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠁ Scout · via Pip");
         assert!(line_text(&lines[1]).starts_with("│ Trace ACP lifecycle"));
         assert_eq!(
@@ -2812,7 +2851,7 @@ mod tests {
         );
 
         let idle = test_agent("Scout", SubagentStatus::Idle, None, None, "done");
-        let idle_lines = agent_lines(&tree_row(&idle, vec![], false, false), 0, 74_000, 20);
+        let idle_lines = agent_lines(&tree_row(&idle, vec![], false, false), false, 0, 74_000, 20);
         assert_eq!(line_text(&idle_lines[0]), "○ Scout");
         assert!(
             idle_lines[0].spans[1]
@@ -2828,14 +2867,28 @@ mod tests {
             "failed",
         );
         failed.generation_finished_at_unix_ms = Some(72_000);
-        let failed_lines = agent_lines(&tree_row(&failed, vec![], false, false), 0, 74_000, 20);
+        let failed_lines = agent_lines(
+            &tree_row(&failed, vec![], false, false),
+            false,
+            0,
+            74_000,
+            20,
+        );
         assert_eq!(line_text(&failed_lines[0]), "✗ Scout");
         assert_eq!(
             failed_lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Red)
         );
         assert_eq!(
-            line_text(&agent_lines(&tree_row(&failed, vec![], false, false), 0, 77_000, 20,)[0]),
+            line_text(
+                &agent_lines(
+                    &tree_row(&failed, vec![], false, false),
+                    false,
+                    0,
+                    77_000,
+                    20,
+                )[0]
+            ),
             "○ Scout"
         );
     }
@@ -2855,6 +2908,84 @@ mod tests {
     }
 
     #[test]
+    fn agent_rows_show_usage_before_duration_and_drop_it_when_narrow() {
+        let mut row = test_agent(
+            "Scout",
+            SubagentStatus::Working,
+            None,
+            None,
+            "Trace ACP lifecycle",
+        );
+        row.usage = Some(super::super::app::ContextUsage {
+            used: 41_200,
+            size: 200_000,
+        });
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
+        let second = line_text(&lines[1]);
+        assert_eq!(second, "  Trace ACP lifecycle    20.6% 41k/200k · 1m 12s");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
+
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 30);
+        assert_eq!(line_text(&lines[1]), "  Trace ACP lifecycle   1m 12s");
+    }
+
+    #[test]
+    fn agent_rows_mark_the_harness_vendor_only_when_asked() {
+        let mut row = test_agent(
+            "Designer",
+            SubagentStatus::Idle,
+            None,
+            None,
+            "Propose a palette",
+        );
+        row.vendor = crate::events::HarnessVendor::Claude;
+        let plain = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
+        assert_eq!(line_text(&plain[0]), "○ Designer");
+        let marked = agent_lines(&tree_row(&row, vec![], false, false), true, 0, 74_000, 48);
+        assert_eq!(line_text(&marked[0]), "○ ✱ Designer");
+        assert_eq!(
+            marked[0].spans[2].style,
+            super::theme::vendor_mark(crate::events::HarnessVendor::Claude).1
+        );
+    }
+
+    #[test]
+    fn agents_panel_marks_vendors_only_for_mixed_rosters() {
+        let mut app = panel_app(1);
+        let mut terminal = Terminal::new(TestBackend::new(46, 8)).expect("terminal");
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        assert_eq!(
+            buffer_cells(terminal.backend().buffer(), 1, 1..10),
+            "○ Scout 0"
+        );
+
+        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+            id: "codex".into(),
+            name: "Fixer".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "Patch the parser".into(),
+            parent_id: None,
+            parent_name: None,
+            harness: "acp.codex".into(),
+            vendor: crate::events::HarnessVendor::Codex,
+            model: None,
+            created_at_unix_ms: 3_000,
+            generation_started_at_unix_ms: 3_000,
+            generation_finished_at_unix_ms: None,
+        }));
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer_cells(buffer, 1, 1..10), "⠋ ◎ Fixer");
+        assert_eq!(buffer_cells(buffer, 3, 1..12), "○ ▙ Scout 0");
+    }
+
+    #[test]
     fn agent_rows_truncate_unicode_before_reserved_duration() {
         let row = test_agent(
             "Scout",
@@ -2863,14 +2994,14 @@ mod tests {
             None,
             "🦀🦀 lifecycle work",
         );
-        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 12);
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 3_500, 12);
         assert_eq!(line_text(&lines[1]), "  🦀🦀… 1.5s");
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
             12
         );
 
-        let lines = agent_lines(&tree_row(&row, vec![], false, false), 0, 3_500, 4);
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 3_500, 4);
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
             4
@@ -2918,6 +3049,7 @@ mod tests {
                 parent_id: None,
                 parent_name: None,
                 harness: "acp.kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
                 model: Some("test".into()),
                 created_at_unix_ms: 1_000 + index as u64,
                 generation_started_at_unix_ms: 2_000,

@@ -7,6 +7,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::events::HarnessVendor;
+
 const BRAND_RGB: [Color; 9] = [
     Color::Rgb(0x32, 0x0f, 0x1e),
     Color::Rgb(0xc8, 0x32, 0x28),
@@ -162,6 +164,27 @@ pub fn selection() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+/// One-cell brand mark for the harness behind a subagent.
+pub fn vendor_mark(vendor: HarnessVendor) -> (&'static str, Style) {
+    vendor_mark_for(vendor, crossterm::style::available_color_count())
+}
+
+fn vendor_mark_for(vendor: HarnessVendor, color_count: u16) -> (&'static str, Style) {
+    let brand = |rgb: Color, ansi: Color| if color_count == u16::MAX { rgb } else { ansi };
+    let (glyph, color) = match vendor {
+        HarnessVendor::Kit => ("▙", accent_color()),
+        HarnessVendor::Claude => ("✱", brand(Color::Rgb(0xd9, 0x7a, 0x57), Color::LightRed)),
+        HarnessVendor::Codex => ("◎", text_color()),
+        HarnessVendor::OpenCode => ("◇", brand(Color::Rgb(0xf5, 0xa6, 0x23), Color::Yellow)),
+        HarnessVendor::Copilot => ("◈", brand(Color::Rgb(0x8b, 0x5c, 0xf6), Color::Magenta)),
+        HarnessVendor::Cursor => ("▸", text_color()),
+        HarnessVendor::Pi => ("π", Color::Cyan),
+        HarnessVendor::Antigravity => ("◭", brand(Color::Rgb(0x42, 0x85, 0xf4), Color::Blue)),
+        HarnessVendor::Unknown => return ("·", faint()),
+    };
+    (glyph, Style::default().fg(color))
+}
+
 /// The frame this indicator shows on an animation tick.
 pub fn pulse(kind: Pulse, tick: usize) -> &'static str {
     let frames = kind.frames();
@@ -211,8 +234,8 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
 
     use super::{
-        BRAND_ANSI, BRAND_RGB, bar, brand_rainbow_for, code, composer, composer_for, duration,
-        selection, text,
+        BRAND_ANSI, BRAND_RGB, HarnessVendor, bar, brand_rainbow_for, code, composer, composer_for,
+        duration, selection, text, vendor_mark_for,
     };
 
     #[test]
@@ -255,6 +278,38 @@ mod tests {
         );
         assert_eq!(composer_for(256).bg, Some(Color::Indexed(238)));
         assert_eq!(composer_for(8).bg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn vendor_marks_are_one_cell_and_fall_back_to_the_palette() {
+        let vendors = [
+            HarnessVendor::Kit,
+            HarnessVendor::Claude,
+            HarnessVendor::Codex,
+            HarnessVendor::OpenCode,
+            HarnessVendor::Copilot,
+            HarnessVendor::Cursor,
+            HarnessVendor::Pi,
+            HarnessVendor::Antigravity,
+        ];
+        for vendor in vendors.into_iter().chain([HarnessVendor::Unknown]) {
+            let (glyph, style) = vendor_mark_for(vendor, 8);
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(glyph),
+                1,
+                "{vendor:?}"
+            );
+            assert!(!matches!(style.fg, Some(Color::Rgb(..))), "{vendor:?}");
+        }
+        assert_eq!(
+            vendor_mark_for(HarnessVendor::Claude, u16::MAX).1.fg,
+            Some(Color::Rgb(0xd9, 0x7a, 0x57))
+        );
+        let glyphs: std::collections::HashSet<_> = vendors
+            .into_iter()
+            .map(|vendor| vendor_mark_for(vendor, 8).0)
+            .collect();
+        assert_eq!(glyphs.len(), vendors.len());
     }
 
     #[test]
