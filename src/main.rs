@@ -1240,9 +1240,26 @@ struct ConfigMigration {
 // Migrations are shape-driven and must be idempotent because hand-written config
 // files do not carry a schema version. Add one migration for every schema change
 // so typed deserialization only ever sees the latest config shape.
-const CONFIG_MIGRATIONS: &[ConfigMigration] = &[ConfigMigration {
-    apply: migrate_credentials_to_shared_store,
-}];
+const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
+    ConfigMigration {
+        apply: migrate_credentials_to_shared_store,
+    },
+    ConfigMigration {
+        apply: migrate_experimental_voice,
+    },
+];
+
+fn migrate_experimental_voice(config: &mut toml::Table) {
+    let experimental = config
+        .entry("experimental")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    // Leave malformed shapes intact for strict typed deserialization.
+    if let Some(experimental) = experimental.as_table_mut() {
+        experimental
+            .entry("voice")
+            .or_insert(toml::Value::Boolean(false));
+    }
+}
 
 fn migrate_credentials_to_shared_store(config: &mut toml::Table) {
     for (old, new) in [
@@ -1273,6 +1290,8 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    #[serde(default, deserialize_with = "deserialize_experimental_config")]
+    experimental: ExperimentalConfig,
     request_budget_seconds: Option<kit::request_budget::RequestBudget>,
     root: Option<PathBuf>,
     model: Option<String>,
@@ -1298,6 +1317,20 @@ struct Config {
     config_dir: PathBuf,
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn deserialize_experimental_config<'de, D>(deserializer: D) -> Result<ExperimentalConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let table = toml::Table::deserialize(deserializer)?;
+    table.try_into().map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExperimentalConfig {
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2341,6 +2374,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
             let _ = config.plugin_runtime(&root).await?;
+            let voice_enabled = config.experimental.voice;
             let config_path = config.config_path.clone();
             tokio::task::spawn_blocking(move || {
                 if let Some(path) = config_path {
@@ -2361,6 +2395,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 openrouter_api_key.as_ref().map(|(key, _)| key),
                 resume.as_deref(),
                 force,
+                voice_enabled,
             )
             .await?
         }
@@ -2393,6 +2428,67 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn config_experimental_voice_defaults_and_strict_boolean() {
+        assert!(!Config::default().experimental.voice);
+        for (text, expected) in [
+            ("", false),
+            ("[experimental]", false),
+            ("[experimental]\nvoice = true", true),
+            ("[experimental]\nvoice = false", false),
+            ("[experimental]\nfuture = true", false),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.experimental.voice, expected);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert_eq!(Config::load(&path).unwrap().experimental.voice, expected);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let migrated = super::migrate_config(toml::from_str(text).unwrap());
+            assert_eq!(super::migrate_config(migrated.clone()), migrated);
+        }
+        for text in [
+            "[experimental]\nvoice = 'true'",
+            "[experimental]\nvoice = 1",
+            "[experimental]\nvoice = 0.0",
+            "[experimental]\nvoice = []",
+            "[experimental]\nvoice = {}",
+            "experimental = true",
+            "experimental = []",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err(), "{text}");
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert!(Config::load(&path).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn config_experimental_voice_writer_preserves_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original =
+            "# preserved\nmodel = 'old'\n[experimental]\nvoice = true # opt in\nfuture = 'keep'\n";
+        fs::write(&path, original).unwrap();
+        kit::config_editor::set(&path, "model", "'new'").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("voice = true # opt in"));
+        assert!(updated.contains("future = 'keep'"));
+        assert!(updated.starts_with("# preserved\n"));
+        assert!(Config::load(&path).unwrap().experimental.voice);
+        kit::config_editor::set(&path, "experimental.voice", "false").unwrap();
+        assert!(!Config::load(&path).unwrap().experimental.voice);
+        kit::config_editor::unset(&path, "experimental.voice").unwrap();
+        assert!(!Config::load(&path).unwrap().experimental.voice);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("future = 'keep'")
+        );
+    }
 
     #[test]
     fn request_budget_cli_and_config() {

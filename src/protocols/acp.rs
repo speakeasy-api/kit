@@ -426,6 +426,14 @@ pub(crate) struct FileSearchResponse {
     pub matches: Vec<crate::file_search::FileMatch>,
 }
 
+/// Kit-private client-to-server status; never submits input or starts a turn.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[notification(method = "kit/voice/state")]
+pub(crate) struct VoiceStateNotification {
+    pub session_id: agentkit_acp::SessionId,
+    pub active: bool,
+}
+
 /// Kit-private ACP notification that keeps the bundled TUI synchronized with
 /// turns started autonomously by background task results.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
@@ -483,6 +491,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
@@ -1131,6 +1140,19 @@ struct Server {
 }
 
 impl Server {
+    fn voice_state(&self, notification: VoiceStateNotification) -> Result<(), AcpRuntimeError> {
+        let id = notification.session_id;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(id.to_string()))?;
+        session.voice_state.set_active(notification.active);
+        Ok(())
+    }
+
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             runtime,
@@ -1509,7 +1531,9 @@ impl Server {
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
             .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
+        let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            voice_monitor: voice_state.monitor(claim.is_resumed() || claim.is_fork()),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -1558,6 +1582,7 @@ impl Server {
             &mut admission,
             registered,
             SessionHandle {
+                voice_state,
                 token,
                 commands: tx,
                 background_jobs,
@@ -1753,6 +1778,7 @@ pub(super) async fn detach_compose_call(
 }
 
 struct SessionActor<S: ModelSession> {
+    voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: agentkit_acp::SessionId,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -1771,6 +1797,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
+        mut voice_monitor,
         session_id,
         runtime,
         integration,
@@ -1820,6 +1847,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 &runtime,
                                 &integration,
                                 &mut skill_catalog,
+                                &mut voice_monitor,
                                 &mut driver,
                                 request,
                                 &tasks,
@@ -2227,6 +2255,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
     runtime: &Arc<Runtime>,
     integration: &AcpIntegration,
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
+    voice_monitor: &mut crate::runtime::voice_state::VoiceMonitor,
     driver: &mut LoopDriver<S>,
     request: PromptRequest,
     tasks: &TaskManagerHandle,
@@ -2243,7 +2272,9 @@ async fn drive_runtime_prompt<S: ModelSession>(
     background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
     skill_catalog
-        .submit(&current.skills, items, |items| driver.submit_input(items))
+        .submit(&current.skills, items, |items| {
+            voice_monitor.submit(items, |items| driver.submit_input(items))
+        })
         .map_err(|error| match error {
             skill_catalog::SubmitError::Catalog(error) => {
                 record_acp_runtime_failure(session_id, "skill_catalog", error)
@@ -2702,6 +2733,16 @@ fn component(
                 }
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notification: VoiceStateNotification, _cx| {
+                    state.voice_state(notification).map_err(sdk_error)?;
+                    Ok(Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
             {
@@ -3237,6 +3278,7 @@ pub(super) mod tests {
         });
         let (commands, received) = mpsc::channel(1);
         let session = SessionHandle {
+            voice_state: Default::default(),
             token,
             commands,
             background_jobs: BackgroundJobs::default(),
@@ -5058,6 +5100,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                voice_state: Default::default(),
                 token: 1,
                 commands,
                 background_jobs: BackgroundJobs::default(),
@@ -5122,6 +5165,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                voice_state: Default::default(),
                 token: 1,
                 commands,
                 background_jobs: jobs.clone(),
@@ -5274,6 +5318,7 @@ pub(super) mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let response = drive_runtime_prompt(
@@ -5281,6 +5326,7 @@ pub(super) mod tests {
             &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             PromptRequest::new(
                 acp_session_id.clone(),
@@ -5395,11 +5441,13 @@ pub(super) mod tests {
             .unwrap();
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let response = drive_runtime_prompt(
             &acp_session_id,
             &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             PromptRequest::new(
                 acp_session_id.clone(),
@@ -5481,6 +5529,7 @@ pub(super) mod tests {
             .unwrap();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let request = PromptRequest::new(
             acp_session_id.clone(),
             vec![agentkit_acp::ContentBlock::Text(
@@ -5494,6 +5543,7 @@ pub(super) mod tests {
             &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             request,
             &tasks,
@@ -5757,6 +5807,7 @@ pub(super) mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
+            voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(false),
             session_id: acp_session_id.clone(),
             runtime,
             integration: Arc::clone(&integration),

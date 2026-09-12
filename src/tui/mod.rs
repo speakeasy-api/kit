@@ -80,6 +80,251 @@ use app::{
 };
 use attachment::MaterializedImage;
 
+// This state is local to one ACP UI lifecycle. Dropping startup cancels the
+// connection attempt; dropping a live session stops audio even on early returns.
+
+type VoiceStartup =
+    std::pin::Pin<Box<dyn Future<Output = Result<crate::voice::VoiceSession, String>>>>;
+
+#[derive(Default)]
+struct NativeVoice {
+    starting: Option<VoiceStartup>,
+    microphone_enabled: bool,
+    session: Option<crate::voice::VoiceSession>,
+    handoff: Option<VoiceHandoff>,
+    ready: bool,
+    // The ACP session whose active notice was queued, not a mutable
+    // pointer to whichever session the UI happens to display next.
+    announced_session: Option<wire::SessionId>,
+}
+
+#[derive(Default)]
+struct VoiceHandoff {
+    id: String,
+    running: bool,
+    // Only the most recent assistant message is spoken back, never thoughts or
+    // tool output. Both message identity and content have bounded storage.
+    message_id: String,
+    text: String,
+}
+
+impl NativeVoice {
+    fn mark_ready(&mut self, app: &mut App) {
+        self.ready = true;
+        app.note(if self.microphone_enabled {
+            "voice ready — microphone enable requested; /voice mute to stop listening, /voice off to disconnect"
+        } else {
+            "voice ready — microphone muted; /voice on to listen, /voice off to disconnect"
+        });
+    }
+
+    fn state_notifications(
+        &mut self,
+        current: &wire::SessionId,
+    ) -> Vec<crate::protocols::acp::VoiceStateNotification> {
+        let desired = self.ready.then_some(current);
+        if self.announced_session.as_ref() == desired {
+            return Vec::new();
+        }
+        let mut notices = Vec::with_capacity(2);
+        if let Some(previous) = self.announced_session.take() {
+            notices.push(crate::protocols::acp::VoiceStateNotification {
+                session_id: agentkit_acp::SessionId::new(previous.to_string()),
+                active: false,
+            });
+        }
+        if let Some(current) = desired {
+            self.announced_session = Some(current.clone());
+            notices.push(crate::protocols::acp::VoiceStateNotification {
+                session_id: agentkit_acp::SessionId::new(current.to_string()),
+                active: true,
+            });
+        }
+        notices
+    }
+
+    fn notify_state(
+        &mut self,
+        connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+        current: &wire::SessionId,
+    ) {
+        for notice in self.state_notifications(current) {
+            // Queue-only, no request/response or model turn. On a disconnected
+            // transport the server's connection teardown clears the state.
+            let _ = connection.send_notification(notice);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.ready = false;
+        self.starting = None;
+        self.microphone_enabled = false;
+        if let Some(mut session) = self.session.take() {
+            session.stop();
+        }
+        self.handoff = None;
+    }
+
+    fn control(&mut self, control: &str, storage: &CredentialStorage, app: &mut App) {
+        if !app.voice_enabled {
+            app.note("voice is disabled; set experimental.voice = true in ~/.kit/config.toml and restart Kit");
+            return;
+        }
+        match control {
+            "on" if self.starting.is_none() && self.session.is_none() => {
+                self.microphone_enabled = true;
+                self.starting = Some(Box::pin(crate::voice::VoiceSession::start(storage.clone())));
+                app.note(
+                    "voice connecting: this starts a billable session using subscription usage. Use headphones; microphone capture starts when connected; /voice mute stops listening; /voice off cancels",
+                );
+            }
+            "off" => {
+                self.stop();
+                app.note(
+                    "voice off (any accepted Kit task continues; use normal cancel to stop it)",
+                );
+            }
+            "on" | "mute" => {
+                self.microphone_enabled = control == "on";
+                if let Some(session) = self.session.as_mut() {
+                    match session.set_microphone(self.microphone_enabled) {
+                        Ok(()) => app.note(if self.microphone_enabled {
+                            "voice microphone enable requested — headphones required; /voice mute requests stopping capture"
+                        } else {
+                            "voice microphone mute requested"
+                        }),
+                        Err(error) => self.fail(error, app),
+                    }
+                } else if self.starting.is_some() {
+                    app.note(if self.microphone_enabled {
+                        "voice connecting — microphone will start when ready"
+                    } else {
+                        "voice connecting — microphone will stay muted"
+                    });
+                } else {
+                    app.note("voice is not ready; /voice on first");
+                }
+            }
+            _ => app.note("usage: /voice on (billable subscription session) | mute | off; headphones required"),
+        }
+    }
+
+    fn fail(&mut self, error: String, app: &mut App) {
+        self.stop();
+        app.note(format!("voice stopped: {}", voice_display_text(&error)));
+    }
+
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<crate::voice::VoiceEvent> {
+        if let Some(starting) = self.starting.as_mut() {
+            match starting.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.starting = None;
+                    match result {
+                        Ok(mut session) => {
+                            if let Err(error) = session.set_microphone(self.microphone_enabled) {
+                                session.stop();
+                                return Poll::Ready(crate::voice::VoiceEvent::Error(error));
+                            }
+                            self.session = Some(session);
+                        }
+                        Err(error) => return Poll::Ready(crate::voice::VoiceEvent::Error(error)),
+                    }
+                }
+            }
+        }
+        match self.session.as_mut() {
+            Some(session) => session
+                .events
+                .poll_recv(cx)
+                .map(|event| event.unwrap_or(crate::voice::VoiceEvent::Stopped)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn result(&mut self, id: String, text: String, app: &mut App) {
+        if let Some(session) = self.session.as_mut()
+            && let Err(error) = session.send_result(id, text)
+        {
+            self.fail(error, app);
+        }
+    }
+
+    fn observe(&mut self, update: &Update, app: &mut App) {
+        if matches!(update, Update::ProcessExited(_)) {
+            self.stop();
+            return;
+        }
+        let Some(handoff) = self.handoff.as_mut() else {
+            return;
+        };
+        match update {
+            Update::State(wire::StateUpdate::Running(_) | wire::StateUpdate::RequiresAction(_)) => {
+                handoff.running = true;
+            }
+            Update::AgentMessage { id, text, append } if handoff.running => {
+                handoff.record(id, text, *append);
+            }
+            Update::AgentParts { id, parts } if handoff.running => {
+                handoff.record(id, "", false);
+                for part in parts {
+                    if let AgentPart::Text(text) = part {
+                        handoff.record(id, text, true);
+                    }
+                }
+            }
+            Update::State(wire::StateUpdate::Idle(idle)) if handoff.running => {
+                let Some(handoff) = self.handoff.take() else {
+                    return;
+                };
+                let text = format!(
+                    "Kit task stopped ({:?}).\n{}",
+                    idle.stop_reason, handoff.text
+                );
+                self.result(handoff.id, text, app);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl VoiceHandoff {
+    fn record(&mut self, id: &str, text: &str, append: bool) {
+        if id.len() > 1024 {
+            return;
+        }
+        if self.message_id != id || !append {
+            self.message_id = id.to_owned();
+            self.text.clear();
+        }
+        let remaining = 16_384_usize.saturating_sub(self.text.len());
+        let end = text.floor_char_boundary(remaining.min(text.len()));
+        self.text.push_str(&text[..end]);
+    }
+}
+
+// Voice text is untrusted remote display content, not terminal instructions.
+// Bound the inspected prefix as well as the stored result, and neutralize C0,
+// C1, DEL and Unicode directional controls before handing it to the renderer.
+
+fn voice_display_text(text: &str) -> String {
+    text.chars().take(4096).map(|character| {
+        if character.is_control()
+            || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            ' '
+        } else {
+            character
+        }
+    }).collect()
+}
+
+impl Drop for NativeVoice {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[derive(Default)]
 struct ClipboardPastes {
     pending: Option<PendingClipboardPastes>,
@@ -1081,6 +1326,7 @@ pub async fn run_with_reasoning_effort(
         None,
         resume,
         force,
+        false,
     )
     .await
 }
@@ -1099,6 +1345,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
     resume: Option<&str>,
     force: bool,
+    voice_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
@@ -1368,6 +1615,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 model.clone(),
                 a2a,
             );
+            app.voice_enabled = voice_enabled;
             app.can_steer = can_steer;
             app.can_replace_steer = supports_pending_replace(
                 initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
@@ -1593,8 +1841,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             }
             app.start_session(active_session_id.clone());
             let storage_shutdown = crate::resilient_fs::shutdown_token();
+            let mut voice = NativeVoice::default();
             let result: Result<(), agent_client_protocol::Error> = async {
                 enum SessionEvent {
+
+                    Voice(crate::voice::VoiceEvent),
                     StorageShutdown,
                     Terminal(Option<std::io::Result<Event>>),
                     ModelSwitch(ModelSwitchCompletion),
@@ -1609,6 +1860,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
                 loop {
+                    // Reconcile after every prior event, including failures in
+                    // result/observe, before accepting any next user input.
+                    voice.notify_state(&connection, &session_id);
                     clipboard_pastes.retain_current(
                         transition_session.lock().map(|active| active.generation).ok(),
                         &app.clipboard_route(),
@@ -1656,8 +1910,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         // until this wait ends. This scope drops all losers and
                         // releases input borrows before handlers drain/reset them.
                         poll_fn(|cx| {
-                            for offset in 0..7 {
-                                let branch = (next_priority + offset) % 7;
+                            let sources = 8;
+                            for offset in 0..sources {
+                                let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
                                     0 => shutdown.as_mut().poll(cx).map(|()| SessionEvent::StorageShutdown),
                                     1 => events.poll_next_unpin(cx).map(SessionEvent::Terminal),
@@ -1675,10 +1930,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     4 if pending_update.is_none() => updates_rx.poll_recv(cx).map(SessionEvent::Update),
                                     5 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
                                     6 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
+
+                                    7 => voice.poll(cx).map(SessionEvent::Voice),
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
-                                    next_priority = (branch + 1) % 7;
+                                    next_priority = (branch + 1) % sources;
                                     return ready;
                                 }
                             }
@@ -1686,6 +1943,47 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         }).await
                     };
                     match event {
+
+                        SessionEvent::Voice(event) => match event {
+                            crate::voice::VoiceEvent::Ready => voice.mark_ready(&mut app),
+                            crate::voice::VoiceEvent::Transcript { speaker, text } => {
+                                // Transcripts are display-only. Only explicit tool delegation
+                                // enters the same Kit ACP request/approval path as typed work.
+                                app.note(format!("voice {}: {}", voice_display_text(&speaker), voice_display_text(&text)));
+                            }
+                            crate::voice::VoiceEvent::Delegation { id, text } => {
+                                if app.working() || app.model_switch.is_some() || voice.handoff.is_some() {
+                                    voice.result(id, "Kit is busy. Task was NOT submitted; ask the user to try again when idle.".into(), &mut app);
+                                } else if text.trim().is_empty() || text.len() > 32_768 || id.len() > 1024 {
+                                    voice.result(id, "Task was NOT submitted: empty or oversized delegation.".into(), &mut app);
+                                } else {
+                                    voice.handoff = Some(VoiceHandoff { id, ..Default::default() });
+                                    let prompt = SubmittedPrompt { text, attachments: Vec::new() };
+                                    match prompt_blocks(&prompt) {
+                                        Ok(blocks) => {
+                                            // This is Kit's existing session, not a second agent
+                                            // or a Codex execution channel. ACP owns approvals.
+                                            if let Err(error) = connection
+                                                .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
+                                                .block_task().await
+                                            {
+                                                let Some(handoff) = voice.handoff.take() else { continue; };
+                                                voice.result(handoff.id, format!("Kit did not accept the task: {}", error.message), &mut app);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let Some(handoff) = voice.handoff.take() else { continue; };
+                                            voice.result(handoff.id, format!("Task was NOT submitted: {error}"), &mut app);
+                                        }
+                                    }
+                                }
+                            }
+                            crate::voice::VoiceEvent::Error(error) => voice.fail(error, &mut app),
+                            crate::voice::VoiceEvent::Stopped => {
+                                voice.stop();
+                                app.note("voice disconnected");
+                            }
+                        },
                         SessionEvent::StorageShutdown => return Ok(()),
                         SessionEvent::Terminal(terminal_event) => {
                             // A paste is a burst: one bracketed-paste event, or
@@ -1716,7 +2014,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                             match action {
                                 Action::Quit => return Ok(()),
+
+                                Action::Voice(control) => voice.control(&control, credential_storage, &mut app),
                                 Action::Submit { prompt, inject } => {
+
+                                    if voice.handoff.is_some() {
+                                        app.paste(&prompt.text);
+                                        app.restore_attachments(prompt.attachments);
+                                        app.note("a voice task is pending; cancel it or wait before submitting another prompt");
+                                        continue;
+                                    }
                                     let blocks = match prompt_blocks(&prompt) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
@@ -1804,6 +2111,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     });
                                 }
                                 Action::New(first_prompt) => {
+                                    voice.stop();
+                                    voice.notify_state(&connection, &session_id);
                                     connection
                                         .send_request(CloseSessionRequest::new(session_id.clone()))
                                         .block_task()
@@ -1910,6 +2219,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     });
                                 }
                                 Action::Resume(requested_id) => {
+                                    voice.stop();
+                                    voice.notify_state(&connection, &session_id);
                                     if let Err(error) = crate::session::validate_id(&requested_id) {
                                         app.note(format!("invalid session id: {error}"));
                                         continue;
@@ -2222,6 +2533,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     if let Update::ConfigOptions(options) = &update {
                                         refresh_config_state(&mut app, Some(options));
                                     }
+
+                                    voice.observe(&update, &mut app);
                                     app.apply_materialized(update, images);
                                 }
                             }
@@ -2286,6 +2599,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 }
             }
             .await;
+            // Best effort, nonblocking even on quit or an early error. Audio
+            // stops first; connection teardown is the final cleanup boundary.
+            voice.stop();
+            voice.notify_state(&connection, &session_id);
             leave(&mut terminal);
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
@@ -6893,5 +7210,317 @@ mod signal_tests {
         tokio::time::timeout(Duration::from_secs(3), session)
             .await
             .expect("the loop leaves on the signal");
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod native_voice_tests {
+    use super::{App, NativeVoice, Update, VoiceHandoff, voice_display_text, wire};
+
+    fn voice_app() -> App {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "local".into(),
+        );
+        app.voice_enabled = true;
+        app
+    }
+
+    fn notices(voice: &mut NativeVoice, session: &str) -> Vec<(String, bool)> {
+        voice
+            .state_notifications(&wire::SessionId::new(session))
+            .into_iter()
+            .map(|notice| (notice.session_id.to_string(), notice.active))
+            .collect()
+    }
+
+    #[test]
+    fn voice_notices_require_readiness_and_ignore_microphone_changes() {
+        let mut voice = NativeVoice::default();
+        let mut app = voice_app();
+        let storage = crate::credentials::CredentialStorage::Memory;
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("on", &storage, &mut app);
+        // Startup is deliberately unpolled: no network or audio access.
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("mute", &storage, &mut app);
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.mark_ready(&mut app);
+        assert_eq!(notices(&mut voice, "old"), [("old".into(), true)]);
+        voice.control("on", &storage, &mut app);
+        voice.control("mute", &storage, &mut app);
+        voice.mark_ready(&mut app);
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("off", &storage, &mut app);
+        assert_eq!(notices(&mut voice, "old"), [("old".into(), false)]);
+        assert!(notices(&mut voice, "old").is_empty());
+    }
+
+    #[test]
+    fn voice_failure_and_observed_disconnect_retire_announced_session() {
+        for disconnect in [false, true] {
+            let mut voice = NativeVoice::default();
+            let mut app = voice_app();
+            voice.fail("startup failure".into(), &mut app);
+            assert!(notices(&mut voice, "old").is_empty());
+            voice.mark_ready(&mut app);
+            assert_eq!(notices(&mut voice, "old"), [("old".into(), true)]);
+            if disconnect {
+                voice.observe(&Update::ProcessExited("disconnected".into()), &mut app);
+            } else {
+                // All transport/control/result failures converge at fail().
+                voice.fail("transport failure".into(), &mut app);
+            }
+            // Even if the displayed session has changed, retire the old ID.
+            assert_eq!(notices(&mut voice, "new"), [("old".into(), false)]);
+            voice.stop();
+            assert!(notices(&mut voice, "new").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_state_notifications_cross_real_acp_transport_in_order() {
+        use crate::protocols::acp::VoiceStateNotification;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(async move {
+            agent_client_protocol::Agent
+                .v2()
+                .on_receive_request(
+                    async move |request: wire::InitializeRequest, responder, _cx| {
+                        responder.respond(wire::InitializeResponse::new(
+                            request.protocol_version,
+                            wire::Implementation::new("voice-test-agent", "0"),
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |notice: VoiceStateNotification, _cx| {
+                        sent.send((notice.session_id.to_string(), notice.active))
+                            .unwrap();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(agent_transport)
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent_client_protocol::Client.v2().connect_with(
+                client_transport,
+                async move |connection| {
+                    // The pinned SDK rejects ordinary notifications before the
+                    // ACP v2 handshake. Match real TUI startup rather than sending
+                    // status into an uninitialized transport.
+                    connection
+                        .send_request(wire::InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V2,
+                            wire::Implementation::new("voice-test-client", "0"),
+                        ))
+                        .block_task()
+                        .await?;
+                    let mut voice = NativeVoice::default();
+                    let mut app = voice_app();
+                    let old = wire::SessionId::new("old");
+                    voice.notify_state(&connection, &old);
+                    voice.mark_ready(&mut app);
+                    voice.notify_state(&connection, &old);
+                    assert_eq!(received.recv().await, Some(("old".into(), true)));
+                    // This is the same stop/notify ordering used before New/Resume
+                    // and on quit. No request, prompt, or response is needed.
+                    voice.stop();
+                    voice.notify_state(&connection, &old);
+                    assert_eq!(received.recv().await, Some(("old".into(), false)));
+                    voice.notify_state(&connection, &wire::SessionId::new("new"));
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        serving.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn disabled_voice_never_starts_or_enables_microphone() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "local".into(),
+        );
+        let storage = crate::credentials::CredentialStorage::Memory;
+        let mut voice = NativeVoice::default();
+        for control in ["on", "mute", "off", "invalid"] {
+            voice.control(control, &storage, &mut app);
+            assert!(voice.starting.is_none());
+            assert!(voice.session.is_none());
+            assert!(!voice.microphone_enabled);
+        }
+    }
+
+    #[test]
+    fn on_listens_and_mute_preserves_pending_session() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let storage = crate::credentials::CredentialStorage::Memory;
+        let mut voice = NativeVoice::default();
+        app.voice_enabled = true;
+        assert!(voice.starting.is_none());
+        assert!(voice.session.is_none());
+        assert!(!voice.microphone_enabled);
+        // Do not poll startup: this test never connects or opens audio devices.
+        voice.control("on", &storage, &mut app);
+        assert!(voice.starting.is_some());
+        assert!(voice.microphone_enabled);
+        voice.control("mute", &storage, &mut app);
+        assert!(voice.starting.is_some());
+        assert!(!voice.microphone_enabled);
+        voice.control("talk", &storage, &mut app);
+        assert!(!voice.microphone_enabled);
+        voice.control("on", &storage, &mut app);
+        assert!(voice.microphone_enabled);
+        voice.control("off", &storage, &mut app);
+        assert!(voice.starting.is_none());
+        assert!(voice.session.is_none());
+        assert!(!voice.microphone_enabled);
+    }
+
+    #[test]
+    fn remote_voice_text_cannot_emit_terminal_or_directional_controls() {
+        let rendered =
+            voice_display_text("remote\x1b]52;c;clipboard\x07\r\n\u{009b}31m\u{202e}evil");
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(voice_display_text(&"声".repeat(5000)).chars().count() <= 4096);
+    }
+
+    #[test]
+    fn handoff_waits_through_approval_and_finishes_only_on_acp_idle() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff {
+                id: "task".into(),
+                ..Default::default()
+            }),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        let idle = Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new()));
+        voice.observe(&idle, &mut app);
+        assert!(voice.handoff.is_some());
+        for state in [
+            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
+            wire::StateUpdate::RequiresAction(wire::RequiresActionStateUpdate::new()),
+            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
+        ] {
+            let update = Update::State(state);
+            voice.observe(&update, &mut app);
+            app.apply(update);
+            assert!(voice.handoff.is_some());
+            assert!(app.working());
+        }
+        voice.observe(&idle, &mut app);
+        app.apply(idle);
+        assert!(voice.handoff.is_none());
+        assert!(!app.working());
+        voice.observe(
+            &Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+            &mut app,
+        );
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn acp_process_error_retires_the_handoff() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff::default()),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.observe(&Update::ProcessExited("disconnected".into()), &mut app);
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn stopping_drops_unfinished_startup_without_connecting() {
+        struct PendingStart(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Drop for PendingStart {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        impl std::future::Future for PendingStart {
+            type Output = Result<crate::voice::VoiceSession, String>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut voice = NativeVoice {
+            starting: Some(Box::pin(PendingStart(dropped.clone()))),
+            handoff: Some(VoiceHandoff::default()),
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.stop();
+        assert!(dropped.get());
+        assert!(voice.handoff.is_none());
+        assert!(voice.starting.is_none());
+        voice.stop();
+    }
+
+    #[test]
+    fn spoken_result_tracks_replacements_and_bounds_unicode() {
+        let mut handoff = VoiceHandoff::default();
+        handoff.record("one", "first", true);
+        handoff.record("one", " second", true);
+        assert_eq!(handoff.text, "first second");
+        handoff.record("one", "replacement", false);
+        assert_eq!(handoff.text, "replacement");
+        handoff.record("two", &"声".repeat(10_000), true);
+        assert!(handoff.text.len() <= 16_384);
+        assert!(handoff.text.chars().all(|character| character == '声'));
+        handoff.record("two", "extra", true);
+        assert!(handoff.text.len() <= 16_384);
     }
 }

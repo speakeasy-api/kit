@@ -18,6 +18,20 @@ kit --help
 
 A version can be pinned with a mise package such as `github:speakeasy-api/kit@0.1.83`. The examples below invoke the installed binary directly; they do not use `cargo run`.
 
+### Linux runtime libraries
+
+The Linux GNU tarball dynamically links ALSA and requires `libasound.so.2`
+even when experimental voice is disabled. Install `libasound2` on Debian 12
+(Bookworm), or `libasound2t64` on Ubuntu 24.04, before running Kit. Building
+from source additionally needs `libasound2-dev` and `pkg-config` (see
+[native voice build requirements](native-voice.md#build-authenticate-and-launch)).
+
+The Debian container flavors include this runtime library. The Alpine container
+is a separate dynamically linked musl build and includes `alsa-lib`; it is not a
+fully static binary that can be copied into arbitrary distributions or `scratch`.
+The release workflow publishes an x86-64 GNU Linux tarball, not a static musl
+tarball. Container audio devices still need explicit host access to use voice.
+
 ## Choose a provider and authenticate
 
 Kit supports `openai-subscription`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
@@ -197,6 +211,9 @@ mcp_config = "/path/to/mcp.json"
 credential_store = "file" # "memory", "keychain", or "file"
 credential_dir = "/path/to/private/credentials"
 
+[experimental]
+voice = false # opt in to native TUI voice with true
+
 [acp.review]
 command = "review-agent"
 args = ["acp"]
@@ -226,6 +243,8 @@ url = "https://plugins.example.com/repository.git"
 rev = "main"
 subdir = "agent-plugins/example"
 ```
+
+`experimental.voice` enables experimental native voice in the TUI. It defaults to `false` when the table or key is absent and accepts only TOML booleans (`true` or `false`), not strings or numbers. Enable it with `kit config set experimental.voice true`; disable it with `kit config set experimental.voice false` or remove it with `kit config unset experimental.voice`. The TUI snapshots this setting at startup; restart the TUI after changing it. Enabling the setting only makes the controls available: it does not connect a paid session or start microphone capture. Use `/voice on` explicitly to connect or resume capture, `/voice mute` to pause capture, and `/voice off` to end the call. When disabled, voice completion/help is hidden and local `/voice` commands are rejected. See [Native Voice](native-voice.md) for requirements and usage.
 
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 

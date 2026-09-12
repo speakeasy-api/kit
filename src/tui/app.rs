@@ -385,6 +385,7 @@ pub(super) enum ClipboardMode {
 }
 
 pub enum Action {
+    Voice(String),
     None,
     Redraw,
     ReadClipboard(ClipboardRoute, ClipboardMode),
@@ -739,6 +740,8 @@ pub struct App {
     session_catalog_pending: bool,
     pub auth_methods: Vec<AuthMethodTerminal>,
     pub available_commands: Vec<SlashCommand>,
+    /// Availability captured at TUI startup; config edits require a restart.
+    pub(super) voice_enabled: bool,
     pub command_completion_selected: usize,
     command_completion_query: Option<String>,
     command_completion_dismissed: Option<String>,
@@ -994,6 +997,7 @@ impl App {
             session_catalog_pending: false,
             auth_methods: Vec::new(),
             available_commands: Vec::new(),
+            voice_enabled: false,
             command_completion_selected: 0,
             command_completion_query: None,
             command_completion_dismissed: None,
@@ -1092,6 +1096,7 @@ impl App {
             self.editor.cursor(),
             &self.available_commands,
             !self.auth_methods.is_empty(),
+            self.voice_enabled,
         )
     }
 
@@ -1107,6 +1112,7 @@ impl App {
             self.editor.cursor(),
             &self.available_commands,
             !self.auth_methods.is_empty(),
+            self.voice_enabled,
         )
         .len();
         self.command_completion_selected = self
@@ -3689,6 +3695,18 @@ impl App {
                         text: self.editor.text().to_owned(),
                     };
                 }
+
+                if let Parsed::Voice { control } =
+                    parse(self.editor.text(), !self.auth_methods.is_empty())
+                {
+                    let control = control.unwrap_or("").to_owned();
+                    self.editor.submit();
+                    if !self.voice_enabled {
+                        self.note("voice is disabled; set experimental.voice = true in ~/.kit/config.toml and restart Kit");
+                        return Action::None;
+                    }
+                    return Action::Voice(control);
+                }
                 let inject = self.working();
                 if inject {
                     if self.phase != Phase::Working {
@@ -3719,6 +3737,7 @@ impl App {
                 // the empty composer that replaces it (including commands).
                 self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
                 return match parse(&input, !self.auth_methods.is_empty()) {
+                    Parsed::Voice { control } => Action::Voice(control.unwrap_or("").to_owned()),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Resume {
                         session_id: Some(session_id),
@@ -6023,6 +6042,52 @@ mod tests {
         assert!(matches!(app.handle_key(press(KeyCode::Tab)), Action::None));
         assert_eq!(app.editor.text(), "/model");
         assert!(app.command_completions().is_empty());
+    }
+
+    #[test]
+    fn voice_availability_snapshot_survives_session_changes() {
+        for enabled in [false, true] {
+            let mut app = app();
+            app.voice_enabled = enabled;
+            app.start_session("first".into());
+            app.start_session("second".into());
+            app.paste("/voi");
+            assert_eq!(!app.command_completions().is_empty(), enabled);
+        }
+        // A fresh TUI defaults to disabled rather than inheriting availability.
+        assert!(!app().voice_enabled);
+    }
+
+    #[test]
+    fn disabled_voice_is_hidden_and_rejected_locally() {
+        let mut app = app();
+        app.paste("/voi");
+        assert!(app.command_completions().is_empty());
+        app.editor.clear();
+        app.paste("/voice on");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn voice_off_and_mute_remain_available_while_working() {
+        for control in ["off", "mute"] {
+            for phase in [Phase::Working, Phase::Blocked, Phase::Cancelling] {
+                let mut app = app();
+                app.voice_enabled = true;
+                app.phase = phase;
+                app.paste(&format!("/voice {control}"));
+                app.last_key = None;
+                assert!(
+                    matches!(app.handle_key(press(KeyCode::Enter)), Action::Voice(value) if value == control)
+                );
+                assert!(app.editor.is_empty());
+            }
+        }
     }
 
     #[test]

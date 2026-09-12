@@ -214,6 +214,8 @@ mod test_support {
 )]
 mod tests;
 
+pub(crate) mod voice_state;
+
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 const MAX_BACKGROUND_AFTER_SECONDS: u64 = 86_400;
 const MAX_COMPOSE_RESULT_BYTES: usize = 64 * 1024 * 1024;
@@ -362,6 +364,10 @@ impl SessionClaim {
 
     fn guard_uncommitted_transcript(&mut self, observer: &crate::session::SessionObserver) {
         self.uncommitted_observer = Some(observer.clone());
+    }
+
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.request.resume
     }
 
     pub(crate) fn is_fork(&self) -> bool {
