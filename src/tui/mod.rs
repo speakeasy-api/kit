@@ -101,7 +101,8 @@ struct NativeVoice {
 #[derive(Default)]
 struct VoiceHandoff {
     id: String,
-    running: bool,
+    accepted: bool,
+    user_message_id: Option<String>,
     // Only the most recent assistant message is spoken back, never thoughts or
     // tool output. Both message identity and content have bounded storage.
     message_id: String,
@@ -259,13 +260,23 @@ impl NativeVoice {
             return;
         };
         match update {
-            Update::State(wire::StateUpdate::Running(_) | wire::StateUpdate::RequiresAction(_)) => {
-                handoff.running = true;
+            Update::VoicePromptAccepted { id, result } if id == &handoff.id => match result {
+                Ok(()) => handoff.accepted = true,
+                Err(error) => {
+                    let id = handoff.id.clone();
+                    self.handoff = None;
+                    self.result(id, format!("Kit did not accept the task: {error}"), app);
+                }
+            },
+            Update::UserMessage { id, .. }
+                if handoff.accepted && handoff.user_message_id.is_none() =>
+            {
+                handoff.user_message_id = Some(id.clone());
             }
-            Update::AgentMessage { id, text, append } if handoff.running => {
+            Update::AgentMessage { id, text, append } if handoff.user_message_id.is_some() => {
                 handoff.record(id, text, *append);
             }
-            Update::AgentParts { id, parts } if handoff.running => {
+            Update::AgentParts { id, parts } if handoff.user_message_id.is_some() => {
                 handoff.record(id, "", false);
                 for part in parts {
                     if let AgentPart::Text(text) = part {
@@ -273,7 +284,7 @@ impl NativeVoice {
                     }
                 }
             }
-            Update::State(wire::StateUpdate::Idle(idle)) if handoff.running => {
+            Update::State(wire::StateUpdate::Idle(idle)) if handoff.user_message_id.is_some() => {
                 let Some(handoff) = self.handoff.take() else {
                     return;
                 };
@@ -1957,15 +1968,26 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 } else if text.trim().is_empty() || text.len() > 32_768 || id.len() > 1024 {
                                     voice.result(id, "Task was NOT submitted: empty or oversized delegation.".into(), &mut app);
                                 } else {
+                                    let task_id = id.clone();
                                     voice.handoff = Some(VoiceHandoff { id, ..Default::default() });
                                     let prompt = SubmittedPrompt { text, attachments: Vec::new() };
                                     match prompt_blocks(&prompt) {
                                         Ok(blocks) => {
                                             // This is Kit's existing session, not a second agent
                                             // or a Codex execution channel. ACP owns approvals.
+                                            // PromptResponse has no message ID. Ordered receipt
+                                            // consumption places this boundary after prior wire
+                                            // updates and before the accepted user_message.
+                                            let updates = updates_tx.clone();
                                             if let Err(error) = connection
                                                 .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
-                                                .block_task().await
+                                                .on_receiving_result(move |result| async move {
+                                                    let _ = updates.send(QueuedUpdate::global(Update::VoicePromptAccepted {
+                                                        id: task_id,
+                                                        result: result.map(|_| ()).map_err(|error| error.message.to_string()),
+                                                    }));
+                                                    Ok(())
+                                                })
                                             {
                                                 let Some(handoff) = voice.handoff.take() else { continue; };
                                                 voice.result(handoff.id, format!("Kit did not accept the task: {}", error.message), &mut app);
@@ -7413,7 +7435,7 @@ mod native_voice_tests {
     }
 
     #[test]
-    fn handoff_waits_through_approval_and_finishes_only_on_acp_idle() {
+    fn handoff_ignores_queued_prior_turn_and_waits_through_approval_until_own_idle() {
         let mut app = App::new(
             "/tmp".into(),
             "openai-subscription".into(),
@@ -7434,6 +7456,63 @@ mod native_voice_tests {
         let idle = Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new()));
         voice.observe(&idle, &mut app);
         assert!(voice.handoff.is_some());
+        // The entire previous turn can still be queued when admission succeeds.
+        // Identical text must not identify the delegated turn.
+        let user = |id: &str| Update::UserMessage {
+            id: id.into(),
+            text: "same prompt".into(),
+            images: Vec::new(),
+            append: false,
+        };
+        for update in [
+            user("prior-user"),
+            Update::State(wire::StateUpdate::Running(wire::RunningStateUpdate::new())),
+            Update::AgentMessage {
+                id: "prior-agent".into(),
+                text: "wrong answer".into(),
+                append: true,
+            },
+            Update::State(wire::StateUpdate::RequiresAction(
+                wire::RequiresActionStateUpdate::new(),
+            )),
+            Update::State(wire::StateUpdate::Running(wire::RunningStateUpdate::new())),
+            Update::AgentParts {
+                id: "prior-agent".into(),
+                parts: vec![super::AgentPart::Text("wrong answer".into())],
+            },
+            Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+        ] {
+            voice.observe(&update, &mut app);
+            let handoff = voice
+                .handoff
+                .as_ref()
+                .expect("prior turn cannot finish handoff");
+            assert!(handoff.user_message_id.is_none());
+            assert!(handoff.text.is_empty());
+        }
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Ok(()),
+            },
+            &mut app,
+        );
+        voice.observe(&idle, &mut app);
+        assert!(voice.handoff.is_some());
+        voice.observe(&user("accepted-user"), &mut app);
+        assert_eq!(
+            voice.handoff.as_ref().unwrap().user_message_id.as_deref(),
+            Some("accepted-user")
+        );
+        voice.observe(
+            &Update::AgentMessage {
+                id: "new-agent".into(),
+                text: "right answer".into(),
+                append: true,
+            },
+            &mut app,
+        );
+        assert_eq!(voice.handoff.as_ref().unwrap().text, "right answer");
         for state in [
             wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
             wire::StateUpdate::RequiresAction(wire::RequiresActionStateUpdate::new()),
@@ -7451,6 +7530,38 @@ mod native_voice_tests {
         assert!(!app.working());
         voice.observe(
             &Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+            &mut app,
+        );
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn handoff_receipt_ignores_other_tasks_and_rejection_retires_pending_task() {
+        let mut app = voice_app();
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff {
+                id: "task".into(),
+                ..Default::default()
+            }),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "other-task".into(),
+                result: Ok(()),
+            },
+            &mut app,
+        );
+        assert!(!voice.handoff.as_ref().unwrap().accepted);
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Err("busy".into()),
+            },
             &mut app,
         );
         assert!(voice.handoff.is_none());

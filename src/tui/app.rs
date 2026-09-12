@@ -45,6 +45,11 @@ use super::{
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    /// Ordered ACP prompt receipt, before the accepted turn's user message.
+    VoicePromptAccepted {
+        id: String,
+        result: Result<(), String>,
+    },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
     /// Result of listing sessions without blocking the terminal event loop.
@@ -1872,6 +1877,7 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         match update {
+            Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
             Update::SessionCatalog(result) => {
                 self.session_catalog_pending = false;

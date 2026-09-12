@@ -1,5 +1,5 @@
 //! Linux audio uses bundled libcubeb's dynamically loaded PulseAudio/ALSA backends.
-//! Separate streams keep the microphone unopened until the user enables it.
+//! Separate streams keep recording stopped until the user enables it.
 use super::*;
 use cubeb::{Context, DeviceState, DeviceType, MonoFrame, State, Stream, StreamBuilder};
 use std::sync::Mutex;
@@ -66,14 +66,33 @@ fn context() -> Result<Context> {
 
 impl Audio {
     pub(super) fn new() -> Result<Self> {
-        // All device/backend errors occur before the caller can signal an offer.
-        // Enumerating input devices does not open a microphone stream.
+        // Check initial device availability before the caller can signal an offer.
+        // Devices can still disappear later, so capture startup remains fallible.
         let context = context()?;
         let params = params();
         let latency = context
             .min_latency(&params)
             .map_err(message)?
             .max(FRAME as u32);
+        if context.backend_id() == "alsa" {
+            // cubeb-sys 0.38 ALSA enumeration probes playback even for INPUT.
+            // Init instead opens/configures SND_PCM_STREAM_CAPTURE. It leaves
+            // the stream INACTIVE: rebuild/alsa_run exclude it from polling and
+            // callbacks; only alsa_stream_start starts the prepared capture PCM.
+            // Drop the probe without starting it, leaving the microphone closed.
+            let mut probe = StreamBuilder::<Pcm>::new();
+            probe
+                .name("Kit voice microphone preflight")
+                .default_input(&params)
+                .latency(latency)
+                .data_callback(|input, _| input.len() as isize)
+                .state_callback(|_| {});
+            drop(
+                probe
+                    .init(&context)
+                    .map_err(|error| format!("Microphone preflight failed: {error}"))?,
+            );
+        }
         let (capture_tx, captured) = mpsc::sync_channel(8);
         let (playback, playback_rx) = mpsc::sync_channel(4);
         let (error_tx, errors) = mpsc::sync_channel(2);
@@ -284,6 +303,33 @@ mod tests {
     #[ignore = "Run only in a sandbox without audio libraries, devices, or server sockets"]
     fn no_audio_environment_fails_before_transport_startup() {
         assert!(Audio::new().is_err());
+    }
+
+    #[test]
+    #[ignore = "Run with ALSA_CONFIG_PATH pointing to fixtures/alsa-playback-only.conf, libasound available, and no audio devices/server sockets"]
+    fn alsa_playback_only_default_fails_before_transport_startup() {
+        // A real ALSA asym PCM accepts playback but has no capture slave.
+        // Enumeration alone incorrectly advertises an enabled input device.
+        let context = context().expect("fixture must pass device enumeration");
+        assert_eq!(context.backend_id(), "alsa");
+        let params = params();
+        let mut builder = StreamBuilder::<Pcm>::new();
+        builder
+            .default_output(&params)
+            .latency(context.min_latency(&params).unwrap().max(FRAME as u32))
+            .data_callback(|_, output| output.len() as isize)
+            .state_callback(|_| {});
+        drop(
+            builder
+                .init(&context)
+                .expect("fixture must support playback"),
+        );
+        drop(context);
+        let error = match Audio::new() {
+            Ok(_) => panic!("playback-only default must fail microphone preflight"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Microphone preflight failed"), "{error}");
     }
 
     #[test]
