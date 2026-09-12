@@ -12,6 +12,8 @@ mod command;
 mod editor;
 mod hyperlinks;
 mod image;
+#[cfg(all(test, unix))]
+mod keyboard_tests;
 mod markdown;
 mod progress;
 mod theme;
@@ -5932,12 +5934,6 @@ mod tests {
         ] {
             assert!(!clipboard_paste_key(key));
         }
-    }
-
-    #[test]
-    fn keyboard_protocol_requests_shifted_characters() {
-        let flags = keyboard_enhancement_flags();
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
     }
 
     #[test]
