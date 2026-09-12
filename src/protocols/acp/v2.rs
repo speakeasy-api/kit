@@ -695,16 +695,19 @@ impl Server {
         &self,
         request: wire::InitializeRequest,
     ) -> Result<wire::InitializeResponse, AcpRuntimeError> {
-        if request.protocol_version < wire::ProtocolVersion::V2 {
-            return Err(AcpRuntimeError::Unsupported(
-                "ACP v2 requires protocol version 2 or newer".into(),
-            ));
-        }
+        // This handler only speaks v2. Initialization must return our supported
+        // version even when the requested version is unsupported; the client
+        // then disconnects if it cannot speak v2. It does not switch wire schemas.
+        let mut capabilities = agentkit_acp::v2::agent_capabilities();
+        capabilities
+            .session
+            .get_or_insert_with(wire::SessionCapabilities::new)
+            .mcp = Some(wire::McpCapabilities::new().stdio(wire::McpStdioCapabilities::new()));
         Ok(wire::InitializeResponse::new(
             wire::ProtocolVersion::V2,
             wire::Implementation::new("kit", env!("CARGO_PKG_VERSION")),
         )
-        .capabilities(agentkit_acp::v2::agent_capabilities())
+        .capabilities(capabilities)
         .auth_methods(if self.runtime.supports_logout_authentication() {
             terminal_auth_methods(&request.capabilities, |provider| {
                 self.runtime.supports_terminal_authentication(provider)
@@ -728,6 +731,7 @@ impl Server {
                     .into_iter()
                     .map(|path| path.0)
                     .collect(),
+                request.mcp_servers,
                 connection,
                 claim,
             )
@@ -787,6 +791,7 @@ impl Server {
                     .into_iter()
                     .map(|path| path.0)
                     .collect(),
+                request.mcp_servers,
                 connection,
                 claim,
             )
@@ -847,6 +852,7 @@ impl Server {
         self: &Arc<Self>,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
+        mcp_servers: Vec<wire::McpServer>,
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
@@ -857,7 +863,36 @@ impl Server {
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
-        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string())?;
+        if !additional_directories.is_empty() {
+            return Err(AcpRuntimeError::Loop(
+                "this Kit runtime does not accept additional directories".into(),
+            ));
+        }
+        let servers = mcp_servers
+            .into_iter()
+            .map(|server| match server {
+                wire::McpServer::Stdio(server) => Ok(agentkit_acp::McpServer::Stdio(
+                    agentkit_acp::McpServerStdio::new(server.name, server.command.0)
+                        .args(server.args)
+                        .env(
+                            server
+                                .env
+                                .into_iter()
+                                .map(|entry| {
+                                    agentkit_acp::EnvVariable::new(entry.name, entry.value)
+                                })
+                                .collect(),
+                        ),
+                )),
+                _ => Err(AcpRuntimeError::Unsupported(
+                    "client MCP servers support only stdio transport".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mcp = self.runtime.session_mcp(servers, &cwd).await?;
+        let mcp_events = mcp
+            .subscribe(session_id.to_string())
+            .map_err(AcpRuntimeError::Loop)?;
         let cancellation = CancellationController::new();
         let sink = ResponseReplacementSink::new(ConnectionSink(connection));
         let activity = native_activity(session_id.clone(), sink.clone());
@@ -882,7 +917,10 @@ impl Server {
             cancellation: handle.cancellation_handle(),
             response_attempt_replacement: true,
         };
-        let driver = self.runtime.start_acp_driver(context, &mut claim).await?;
+        let driver = self
+            .runtime
+            .start_acp_driver_with_mcp(context, &mut claim, None, mcp)
+            .await?;
         let current = driver.adapter.selection().map_err(AcpRuntimeError::Loop)?;
         let reasoning = driver
             .adapter
@@ -5049,6 +5087,108 @@ mod tests {
             .expect("replacement client failed");
     }
 
+    #[tokio::test]
+    async fn v2_client_mcp_servers_are_honored_by_new_and_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = v2_router(runtime, SessionRegistry::new());
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let client = agent_client_protocol::Client.v2().connect_with(
+            client_transport,
+            async move |connection| {
+                connection
+                    .send_request(terminal_auth_initialize_request())
+                    .block_task()
+                    .await?;
+                let unsupported = vec![wire::McpServer::Http(wire::McpServerHttp::new(
+                    "kithub",
+                    "https://example.invalid/mcp",
+                ))];
+                // A failed connection remains discoverable; it does not reject attachment.
+                let stdio = vec![wire::McpServer::Stdio(
+                    wire::McpServerStdio::new("kithub", root.path().join("missing-bridge"))
+                        .args(vec!["--bridge".into()])
+                        .env(vec![wire::EnvVariable::new("KIT_TEST", "value")]),
+                )];
+                let error = connection
+                    .send_request(
+                        wire::NewSessionRequest::new(root.path().to_path_buf())
+                            .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("new must reject HTTP MCP transport");
+                assert!(error.data.unwrap().to_string().contains("only stdio"));
+                let error = connection
+                    .send_request(
+                        wire::NewSessionRequest::new(root.path().to_path_buf())
+                            .additional_directories(vec![root.path().to_path_buf()])
+                            .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("additional directories must be rejected before MCP construction");
+                assert!(
+                    error
+                        .data
+                        .unwrap()
+                        .to_string()
+                        .contains("additional directories")
+                );
+                let source = connection
+                    .send_request(
+                        wire::NewSessionRequest::new(root.path().to_path_buf())
+                            .mcp_servers(stdio.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(source.session_id.clone()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(
+                        wire::ResumeSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(unsupported),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("resume must validate client MCP servers");
+                connection
+                    .send_request(
+                        wire::ResumeSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(stdio),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(source.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(15), client).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("MCP lifecycle client timed out").unwrap();
+    }
+
     #[test]
     fn initialize_negotiates_v2_and_advertises_injection_and_authentication() {
         let root = tempfile::tempdir().unwrap();
@@ -5109,27 +5249,24 @@ mod tests {
             serde_json::Value::Bool(true),
         )]));
         assert!(terminal_auth_methods(&metadata_only, |_| true).is_empty());
-        let mut newer = wire::InitializeRequest::new(
-            wire::ProtocolVersion::V2,
-            wire::Implementation::new("newer-client", "0"),
-        );
-        newer.protocol_version = serde_json::from_value(json!(99)).unwrap();
-        assert_eq!(
-            server.initialize(newer).unwrap().protocol_version,
-            wire::ProtocolVersion::V2
-        );
+        for requested_version in [0, 1, 2, 99] {
+            let request = wire::InitializeRequest::new(
+                serde_json::from_value(json!(requested_version)).unwrap(),
+                wire::Implementation::new("version-test-client", "0"),
+            );
+            assert_eq!(
+                server.initialize(request).unwrap().protocol_version,
+                wire::ProtocolVersion::V2,
+                "v2 handler must advertise its supported version for request {requested_version}"
+            );
+        }
         let session = response.capabilities.session.expect("session capabilities");
+        let mcp = session.mcp.expect("session MCP capabilities");
+        assert!(mcp.stdio.is_some());
+        assert!(mcp.http.is_none());
         assert!(session.inject.is_some());
         assert!(session.delete.is_none());
         assert!(session.fork.is_none());
-        assert!(
-            server
-                .initialize(wire::InitializeRequest::new(
-                    wire::ProtocolVersion::V1,
-                    wire::Implementation::new("test-client", "0"),
-                ))
-                .is_err()
-        );
     }
 
     #[test]
