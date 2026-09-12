@@ -8,8 +8,9 @@ ARG DEBIAN_SUITE=bookworm
 ARG ALPINE_VERSION=3.23
 ARG VERSION=source
 ARG REVISION=unknown
-# Container images are headless: no terminal client or voice session. Override
-# with an empty value to build the full binary.
+# Container images are headless: no terminal client or voice session. A full
+# build (empty value) also needs the Linux audio development packages listed
+# in docs/user/native-voice.md, which these builder stages do not install.
 ARG CARGO_ARGS="--no-default-features"
 
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder-gnu
