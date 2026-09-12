@@ -81,6 +81,12 @@ A name is reserved when creation starts. A failed creation releases it; otherwis
 
 Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
 
+## Read the agent roster
+
+The terminal client's agent roster lists every live subagent with its status, task, and elapsed time. When a harness reports context usage over ACP, the row also shows the same `percent used/size` readout as the header; Kit's own ACP server always reports it, so nested Kit subagents show usage without configuration. The readout yields to the task text when the panel is narrow.
+
+When every subagent runs on `acp.kit`, rows carry no harness mark. Once the roster mixes harnesses, each row gains a one-cell mark next to its name: `▙` for Kit, `✱` for Claude, `◎` for Codex, `◇` for OpenCode, `◈` for Copilot, `▸` for Cursor, `π` for Pi, `◭` for Antigravity, and `·` when the launch line names none of them. Kit infers the mark from the configured profile's command and arguments, matching whole tokens such as `claude-agent-acp` or `codex-acp`; the `[acp.<name>]` label itself is not consulted.
+
 ## Require structured JSON output with `output_schema`
 
 Pass a JSON Schema object or boolean to any turn-producing call:

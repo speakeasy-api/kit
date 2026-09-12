@@ -125,6 +125,7 @@ struct State {
     output: Value,
     updates: Option<SubagentUpdates>,
     harness: String,
+    vendor: events::HarnessVendor,
     model: Option<String>,
     kit: bool,
     root: PathBuf,
@@ -145,6 +146,7 @@ impl State {
             parent_id: None,
             parent_name: None,
             harness: self.harness.clone(),
+            vendor: self.vendor,
             model: self.model.clone(),
             created_at_unix_ms: self.created_at_unix_ms,
             generation_started_at_unix_ms: self.generation_started_at_unix_ms,
@@ -256,6 +258,7 @@ struct ForkOperation {
     prompt: String,
     name: Option<String>,
     harness: String,
+    vendor: events::HarnessVendor,
     model: Option<String>,
     kit: bool,
     root: PathBuf,
@@ -367,6 +370,7 @@ impl Subagents {
             .transpose()
             .map_err(ChildError::Failed)?;
         let kit = self.config.harnesses.is_kit(&harness);
+        let vendor = self.config.harnesses.vendor(&harness);
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
@@ -383,6 +387,7 @@ impl Subagents {
                 output: Value::Null,
                 updates: None,
                 harness: harness.clone(),
+                vendor,
                 model: model.clone(),
                 kit,
                 root: root.clone(),
@@ -437,7 +442,11 @@ impl Subagents {
         }
         self.monitor_child_exit(id.clone(), &state, &child);
         let output = match child
-            .prompt(structured_prompt(prompt, contract), cancellation)
+            .prompt(
+                id.clone(),
+                structured_prompt(prompt, contract),
+                cancellation,
+            )
             .await
         {
             Ok(output) => output,
@@ -512,7 +521,11 @@ impl Subagents {
         drop(locked);
         self.emit_event(event);
         match child
-            .prompt(structured_prompt(prompt, contract), cancellation)
+            .prompt(
+                prior.id.clone(),
+                structured_prompt(prompt, contract),
+                cancellation,
+            )
             .await
         {
             Ok(output) => {
@@ -617,6 +630,7 @@ impl Subagents {
             prompt,
             name,
             harness: source.harness.clone(),
+            vendor: source.vendor,
             model: source.model.clone(),
             kit: source.kit,
             root: source.root.clone(),
@@ -674,6 +688,7 @@ impl Subagents {
             prompt,
             name,
             harness,
+            vendor,
             model,
             kit,
             root,
@@ -705,6 +720,7 @@ impl Subagents {
                 output: Value::Null,
                 updates: None,
                 harness: harness.clone(),
+                vendor,
                 model: model.clone(),
                 kit,
                 root: root.clone(),
@@ -805,7 +821,11 @@ impl Subagents {
                 .await);
         }
         let output = match child
-            .prompt(structured_prompt(prompt, contract.as_deref()), cancellation)
+            .prompt(
+                id.clone(),
+                structured_prompt(prompt, contract.as_deref()),
+                cancellation,
+            )
             .await
         {
             Ok(output) => output,

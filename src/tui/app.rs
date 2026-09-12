@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::attachment::{
     MaterializedImage, RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment,
 };
-use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
+use crate::events::{GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
@@ -703,10 +703,12 @@ pub struct AgentRow {
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
     pub harness: String,
+    pub vendor: HarnessVendor,
     pub model: Option<String>,
     pub created_at_unix_ms: u64,
     pub generation_started_at_unix_ms: u64,
     pub generation_finished_at_unix_ms: Option<u64>,
+    pub usage: Option<ContextUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1483,6 +1485,13 @@ impl App {
             );
         }
         rows
+    }
+
+    /// Harness marks only earn their column when the roster mixes vendors.
+    pub fn agents_all_kit(&self) -> bool {
+        self.agents
+            .values()
+            .all(|row| row.vendor == HarnessVendor::Kit)
     }
 
     pub fn agent_counts(&self) -> AgentCounts {
@@ -2288,6 +2297,7 @@ impl App {
                 parent_id,
                 parent_name,
                 harness,
+                vendor,
                 model,
                 created_at_unix_ms,
                 generation_started_at_unix_ms,
@@ -2324,6 +2334,9 @@ impl App {
                 {
                     self.agents.remove(&id);
                 } else {
+                    // Usage arrives on its own event stream; a lifecycle
+                    // transition must not blank a reading already shown.
+                    let usage = self.agents.get(&id).and_then(|row| row.usage);
                     self.agents.insert(
                         id.clone(),
                         AgentRow {
@@ -2336,14 +2349,22 @@ impl App {
                             parent_id,
                             parent_name,
                             harness,
+                            vendor,
                             model,
                             created_at_unix_ms,
                             generation_started_at_unix_ms,
                             generation_finished_at_unix_ms,
+                            usage,
                         },
                     );
                 }
                 self.clamp_agents_scroll();
+                return;
+            }
+            RuntimeEvent::SubagentUsage { id, used, size } => {
+                if let Some(row) = self.agents.get_mut(&id) {
+                    row.usage = Some(ContextUsage { used, size });
+                }
                 return;
             }
             RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
@@ -7879,11 +7900,92 @@ mod tests {
             parent_id: parent.map(|(id, _)| id.into()),
             parent_name: parent.map(|(_, name)| name.into()),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: Some("test".into()),
             created_at_unix_ms: created,
             generation_started_at_unix_ms: started,
             generation_finished_at_unix_ms: finished,
         }
+    }
+
+    #[test]
+    fn subagent_usage_tracks_known_rows_and_survives_lifecycle_updates() {
+        use crate::events::{HarnessVendor, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 1,
+                size: 2,
+            },
+            10,
+        );
+        assert!(app.agents.is_empty(), "usage for an unknown row is dropped");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        assert!(app.agents_all_kit());
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 40_000,
+                size: 200_000,
+            },
+            11,
+        );
+        assert_eq!(
+            app.agents["scout"].usage,
+            Some(super::ContextUsage {
+                used: 40_000,
+                size: 200_000
+            })
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(crate::events::GenerationOutcome::Success),
+                1,
+                None,
+                (1, 2, Some(9)),
+            ),
+            12,
+        );
+        assert_eq!(
+            app.agents["scout"].usage.map(|usage| usage.used),
+            Some(40_000),
+            "a lifecycle transition keeps the last reading"
+        );
+
+        let mut claude = agent_event(
+            "designer",
+            "Designer",
+            SubagentStatus::Working,
+            None,
+            1,
+            None,
+            (1, 2, None),
+        );
+        if let RuntimeEvent::SubagentStateChanged {
+            vendor, harness, ..
+        } = &mut claude
+        {
+            *vendor = HarnessVendor::Claude;
+            *harness = "acp.claude".into();
+        }
+        app.apply_runtime_at(claude, 13);
+        assert!(!app.agents_all_kit());
+        assert_eq!(app.agents["designer"].vendor, HarnessVendor::Claude);
     }
 
     #[test]
