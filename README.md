@@ -82,11 +82,12 @@ USER kit
 
 ### From source
 
-[mise](https://mise.jdx.dev) owns the toolchain: `mise.toml` pins Rust and every other build tool, and `mise run` exposes the build, test, and packaging tasks. Docker and, on macOS, Xcode are the only tools it does not install.
+[mise](https://mise.jdx.dev) owns the toolchain: `mise.toml` pins Rust and every other build tool, and `mise run` exposes the build, test, and packaging tasks. Docker, Linux system development packages, and, on macOS, Xcode are not installed by `mise install`.
 
 ```sh
 git clone https://github.com/speakeasy-api/kit && cd kit
 mise install                   # Rust 1.94 with rustfmt and clippy; Python and XcodeGen on macOS
+mise run setup:linux           # Debian/Ubuntu only: C/C++, CMake, pkg-config, ALSA/PulseAudio headers (sudo)
 mise run install               # cargo install into ~/.cargo/bin
 mise run dev -- tui --root .   # cargo run; arguments pass through
 mise run test -- --test cli    # cargo test; arguments select a suite or a test name

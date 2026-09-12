@@ -159,6 +159,7 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
+      - run: mise run setup:linux
       - run: mise run lint
       - run: mise run test
       - uses: actions/upload-artifact@v4
@@ -182,6 +183,7 @@ jobs:
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
       - name: Build and package
         shell: bash
         run: |
@@ -189,6 +191,8 @@ jobs:
           mise run build:release -- --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
+          mise run test:linux-no-audio -- stage/kit
+          stage/kit --version
           cp LICENSE THIRD_PARTY_NOTICES.md stage/
           mkdir -p stage/third_party
           cp -R third_party/licenses stage/third_party/licenses

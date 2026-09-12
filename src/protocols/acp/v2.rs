@@ -483,6 +483,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
     commands: mpsc::Sender<Command>,
     integration: AcpSessionHandle,
@@ -577,6 +578,22 @@ struct Server {
 }
 
 impl Server {
+    fn voice_state(
+        &self,
+        notification: super::VoiceStateNotification,
+    ) -> Result<(), AcpRuntimeError> {
+        let id = wire::SessionId::new(notification.session_id.to_string());
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(id.to_string()))?;
+        session.voice_state.set_active(notification.active);
+        Ok(())
+    }
+
     fn new(runtime: Arc<Runtime>, registry: SessionRegistry) -> Self {
         Self {
             runtime,
@@ -936,7 +953,9 @@ impl Server {
         let structured_completion = driver.structured_completion;
         let (tx, rx) = mpsc::channel(8);
         let busy = Arc::new(AtomicBool::new(false));
+        let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            voice_monitor: voice_state.monitor(claim.is_resumed() || claim.is_fork()),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -1005,6 +1024,7 @@ impl Server {
                 completed: completion,
                 session_id: session_id.clone(),
                 session: SessionHandle {
+                    voice_state,
                     token,
                     commands: tx,
                     integration: handle,
@@ -1212,6 +1232,7 @@ impl Server {
 }
 
 struct SessionActor<S: ModelSession> {
+    voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: wire::SessionId,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -1233,6 +1254,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
+        mut voice_monitor,
         session_id,
         runtime,
         integration,
@@ -1283,6 +1305,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &integration,
                         &handle,
                         &mut skill_catalog,
+                        &mut voice_monitor,
                         &mut driver,
                         command,
                         &sink,
@@ -1433,6 +1456,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     integration: &AcpIntegration,
     handle: &AcpSessionHandle,
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
+    voice_monitor: &mut crate::runtime::voice_state::VoiceMonitor,
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
     sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
@@ -1464,7 +1488,9 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     background_jobs.begin_turn();
     let prepared = integration.prompt_to_items(&request).and_then(|items| {
         skill_catalog
-            .submit(&current.skills, items, |items| driver.submit_input(items))
+            .submit(&current.skills, items, |items| {
+                voice_monitor.submit(items, |items| driver.submit_input(items))
+            })
             .map_err(|error| match error {
                 skill_catalog::SubmitError::Catalog(error) => {
                     AcpRuntimeError::Loop(format!("skill catalog error: {error}"))
@@ -2342,6 +2368,16 @@ pub(crate) fn component(
                 }
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notification: super::VoiceStateNotification, _cx| {
+                    state.voice_state(notification).map_err(sdk_error)?;
+                    Ok(Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
             {
@@ -3270,6 +3306,7 @@ mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
@@ -3277,6 +3314,7 @@ mod tests {
                 &integration,
                 &handle,
                 &mut skill_catalog,
+                &mut voice_monitor,
                 &mut driver,
                 command,
                 &sink,
@@ -4277,6 +4315,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_state_routes_only_to_attached_session_without_work() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            SessionRegistry::new(),
+        );
+        let id = wire::SessionId::new("voice-route");
+        let integration = server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                id.clone(),
+                SessionId::new("voice-route"),
+                RecordingSink::default(),
+            ))
+            .unwrap();
+        let state = crate::runtime::voice_state::VoiceState::default();
+        let mut monitor = state.monitor(false);
+        let turns = Arc::new(AtomicU64::new(0));
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: turns.clone(),
+                interrupt: None,
+            })
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("voice-route"))
+            .await
+            .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        server.sessions.lock().unwrap().insert(
+            id.clone(),
+            SessionHandle {
+                voice_state: state,
+                token: 1,
+                commands,
+                integration,
+                busy: busy.clone(),
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        let update = |id: &str, active| super::super::VoiceStateNotification {
+            session_id: agentkit_acp::SessionId::new(id),
+            active,
+        };
+        server.voice_state(update("voice-route", true)).unwrap();
+        server.voice_state(update("voice-route", true)).unwrap();
+        assert!(matches!(
+            server.voice_state(update("missing", false)),
+            Err(AcpRuntimeError::SessionNotFound(_))
+        ));
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(received.try_recv().is_err());
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(turns.load(Ordering::Relaxed), 0);
+        monitor
+            .submit(vec![Item::text(ItemKind::User, "work")], |items| {
+                driver.submit_input(items)
+            })
+            .unwrap();
+        driver.next().await.unwrap();
+        assert!(driver.snapshot().transcript.iter().any(|item| item.kind == ItemKind::Notification
+            && matches!(item.parts.as_slice(), [Part::Text(text)] if text.text.contains("A voice session is active"))));
+        // Connection/session ownership removal resets even a surviving driver.
+        drop(server);
+        monitor
+            .submit(vec![Item::text(ItemKind::User, "continue")], |items| {
+                driver.submit_input(items)
+            })
+            .unwrap();
+        driver.next().await.unwrap();
+        assert!(driver.snapshot().transcript.iter().any(|item| item.kind == ItemKind::Notification
+            && matches!(item.parts.as_slice(), [Part::Text(text)] if text.text.contains("No voice session is active"))));
+    }
+
+    #[tokio::test]
     async fn set_config_rejects_poisoned_session_map_without_queueing_switch() {
         let root = tempfile::tempdir().unwrap();
         let server = Server::new(
@@ -4296,6 +4416,7 @@ mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                voice_state: Default::default(),
                 token: 1,
                 commands,
                 integration,
@@ -4437,6 +4558,7 @@ mod tests {
                 completed: completion,
                 session_id,
                 session: SessionHandle {
+                    voice_state: Default::default(),
                     token,
                     commands,
                     integration,
@@ -4756,6 +4878,7 @@ mod tests {
                     completed: completion,
                     session_id: published_session_id,
                     session: SessionHandle {
+                        voice_state: Default::default(),
                         token,
                         commands,
                         integration,

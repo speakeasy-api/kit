@@ -47,6 +47,26 @@ the reproduced files. The `objc2` notice also preserves the upstream statement
 concerning bindings derived from Apple SDKs. None of these audited releases supplies a separate required
 `NOTICE` file.
 
+## Linux cubeb audio dependencies
+
+Linux uses `cubeb`, `cubeb-core`, and `cubeb-sys` 0.38.0 from
+https://github.com/mozilla/cubeb-rs. Notices below are copied from the audited
+published 0.38.0 crate sources, including the native sources bundled in
+`cubeb-sys`; they are not generated from the Cargo license field alone.
+
+| Component | License | License text / notice |
+| --- | --- | --- |
+| `cubeb`, `cubeb-core`, `cubeb-sys` 0.38.0 | ISC | `third_party/licenses/CUBEB-ISC.txt` (identical upstream `LICENSE` files) |
+| Bundled `libcubeb` | ISC | `third_party/licenses/LIBCUBEB-ISC.txt` |
+| Bundled Speex resampler | BSD-3-Clause | `third_party/licenses/CUBEB-SPEEX-BSD.txt` (verbatim source license headers, including NEON/SSE notices) |
+| Bundled `sanitizers-cmake` build support | MIT | `third_party/licenses/CUBEB-SANITIZERS-CMAKE-MIT.txt` |
+
+The Linux configuration builds the production C backends and bundled Speex
+resampler, not the nested Rust backends. These notices cover that controlled
+build, not redistribution of the entire upstream source archive or its unused
+Windows tooling. Non-Linux builds continue to use CPAL. The existing dependency
+notice baseline limitation below still applies.
+
 ## Cargo dependency notice baseline
 
 The clipboard dependency audit and table above are intentionally limited to the

@@ -51,6 +51,8 @@ pub mod tools;
 pub mod transcript;
 pub mod tui;
 
+mod voice;
+
 pub use acp_child::{
     AcpHarnessProfile, AcpHarnesses, AcpPermissionPolicy, BUILTIN_HARNESS, SubagentHarnessPolicy,
 };

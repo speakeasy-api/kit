@@ -6,6 +6,20 @@ python = { version = "3.13", os = ["macos"] }
 # Checksum-pinned release archive; scripts/generate-macos-project.sh also verifies the binary hash.
 "http:xcodegen" = { version = "2.45.4", os = ["macos"], url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip", checksum = "sha256:090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef", bin_path = "xcodegen/bin" }
 
+# OS development headers are not toolchain binaries managed by mise install.
+# Explicit setup only: ordinary builds must not implicitly run sudo.
+[tasks."setup:linux"]
+description = "Debian/Ubuntu: install native build prerequisites (requires sudo)"
+run = "sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libasound2-dev libpulse-dev"
+
+[tasks."check:linux-audio-linkage"]
+description = "Reject hard ALSA/Pulse ELF dependencies: mise run check:linux-audio-linkage -- PATH/kit"
+run = "scripts/check-linux-audio-linkage.sh"
+
+[tasks."test:linux-no-audio"]
+description = "Linux: check ELF linkage and smoke an existing GNU binary without audio libraries (requires Docker): mise run test:linux-no-audio -- PATH/kit"
+run = "scripts/smoke-linux-no-audio.sh"
+
 [tasks.build]
 description = "Debug build of the kit binary"
 run = "cargo build --locked --bin kit"
@@ -43,7 +57,7 @@ run = "cargo test --locked"
 
 [tasks."test:scripts"]
 description = "Shell tests for the release scripts"
-run = "scripts/tests/test_next_release_version.sh"
+run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_audio_linkage.sh"]
 
 [tasks.check]
 description = "Everything CI runs on Linux"

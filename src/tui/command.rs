@@ -15,6 +15,8 @@ enum Kind {
     Effort,
     Agents,
     Login,
+
+    Voice,
 }
 
 struct Spec {
@@ -48,6 +50,11 @@ impl From<&str> for Command {
 // Agent-advertised commands remain ordinary prompts. Only these commands are
 // interpreted by the client itself.
 const LOCAL_COMMANDS: &[Spec] = &[
+    Spec {
+        token: "/voice",
+        description: "Voice: on connects/listens (billable subscription); mute pauses; off ends (headphones)",
+        kind: Kind::Voice,
+    },
     Spec {
         token: "/new",
         description: "Start a new session",
@@ -100,6 +107,8 @@ pub enum Parsed<'a> {
     Effort { value: Option<&'a str> },
     Agents,
     Login { method_id: Option<&'a str> },
+
+    Voice { control: Option<&'a str> },
     Prompt(&'a str),
 }
 
@@ -127,6 +136,9 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
     let remainder = input[token_end..].trim_start();
     let prompt = (!remainder.is_empty()).then_some(remainder);
     match spec.kind {
+        Kind::Voice => Parsed::Voice {
+            control: prompt.map(str::trim),
+        },
         Kind::New => Parsed::New { prompt },
         Kind::Resume => Parsed::Resume { session_id: prompt },
         Kind::Sessions => Parsed::Sessions,
@@ -185,6 +197,7 @@ pub fn completions(
     cursor: usize,
     advertised: &[Command],
     login_available: bool,
+    voice_enabled: bool,
 ) -> Vec<Command> {
     let Some(prefix) = completion_prefix(input, cursor) else {
         return Vec::new();
@@ -193,12 +206,13 @@ pub fn completions(
     let mut matches: Vec<Command> = LOCAL_COMMANDS
         .iter()
         .filter(|spec| login_available || !matches!(spec.kind, Kind::Login))
+        .filter(|spec| voice_enabled || !matches!(spec.kind, Kind::Voice))
         .filter(|spec| spec.token.starts_with(prefix))
         .map(|spec| Command::new(spec.token, spec.description))
         .collect();
     for command in advertised {
         let name = command.name.strip_prefix('/').unwrap_or(&command.name);
-        if name.is_empty() {
+        if name.is_empty() || (!voice_enabled && name == "voice") {
             continue;
         }
         let token = format!("/{name}");
@@ -233,7 +247,35 @@ mod tests {
     }
 
     fn completions(input: &str, cursor: usize, advertised: &[Command]) -> Vec<Command> {
-        complete_commands(input, cursor, advertised, false)
+        complete_commands(input, cursor, advertised, false, true)
+    }
+
+    #[test]
+    fn disabled_voice_is_hidden_even_when_advertised_by_agent() {
+        let advertised = [Command::new("voice", "remote voice")];
+        assert!(complete_commands("/voi", 4, &advertised, false, false).is_empty());
+        assert_eq!(
+            complete_commands("/voi", 4, &advertised, false, true).len(),
+            1
+        );
+        // Still reserve the local command so it cannot become an agent prompt.
+        assert!(matches!(parse("/voice on"), Parsed::Voice { .. }));
+    }
+
+    #[test]
+    fn voice_controls_are_local_and_require_an_exact_token() {
+        for control in ["on", "off", "mute"] {
+            let input = format!("/voice {control}");
+            assert_eq!(
+                parse(&input),
+                Parsed::Voice {
+                    control: Some(control)
+                }
+            );
+        }
+        assert_eq!(parse("/voice"), Parsed::Voice { control: None });
+        assert_eq!(parse("/voices on"), Parsed::Prompt("/voices on"));
+        assert_eq!(completions("/voi", 4, &[])[0].name, "/voice");
     }
 
     #[test]
@@ -335,7 +377,7 @@ mod tests {
         );
         assert_eq!(find_known_token("/login", &[], true), Some(0..6));
         assert_eq!(
-            complete_commands("/log", 4, &[], true),
+            complete_commands("/log", 4, &[], true, false),
             [Command::new("/login", "Authenticate with the agent")]
         );
     }
@@ -354,6 +396,7 @@ mod tests {
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "/voice",
                 "/new",
                 "/resume",
                 "/sessions",
@@ -364,7 +407,14 @@ mod tests {
                 "/compact",
             ]
         );
-        assert_eq!(matches[0].description, "Start a new session");
+        assert_eq!(
+            matches
+                .iter()
+                .find(|command| command.name == "/new")
+                .unwrap()
+                .description,
+            "Start a new session"
+        );
         assert_eq!(matches.last().unwrap().description, "Compact context");
     }
 
