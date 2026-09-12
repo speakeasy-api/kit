@@ -2855,6 +2855,9 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        // Let crossterm decode layout-aware shifted characters rather than
+        // inserting the base character from an encoded Shift key event.
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
 
@@ -5929,6 +5932,12 @@ mod tests {
         ] {
             assert!(!clipboard_paste_key(key));
         }
+    }
+
+    #[test]
+    fn keyboard_protocol_requests_shifted_characters() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
     }
 
     #[test]
