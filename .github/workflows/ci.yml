@@ -12,12 +12,13 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libasound2-dev libpulse-dev
       - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
       - run: mise run test:scripts
       - run: mise run lint
       - run: mise run test
+      - run: mise run build
+      - run: mise run test:linux-no-audio -- target/debug/kit
 
   macos-rust:
     runs-on: blacksmith-6vcpu-macos-15

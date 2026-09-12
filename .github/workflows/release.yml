@@ -159,8 +159,7 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libasound2-dev libpulse-dev
+      - run: mise run setup:linux
       - run: mise run lint
       - run: mise run test
       - uses: actions/upload-artifact@v4
@@ -184,8 +183,7 @@ jobs:
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
       - uses: jdx/mise-action@v4
-      - name: Install Linux build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config libasound2-dev libpulse-dev
+      - run: mise run setup:linux
       - name: Build and package
         shell: bash
         run: |
@@ -193,17 +191,7 @@ jobs:
           mise run build:release -- --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
-          readelf -d stage/kit > stage/dynamic.txt
-          if grep -E '\(NEEDED\).*lib(asound|pulse[^]]*)\.so' stage/dynamic.txt; then
-            echo '::error::Audio libraries must not be startup dependencies.'
-            exit 1
-          fi
-          # No audio libraries or devices; do not invoke voice or consume quota.
-          printf '%s\n' 'FROM ubuntu:24.04' \
-            'RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 && rm -rf /var/lib/apt/lists/*' \
-            | docker build -t kit-no-audio-smoke -
-          docker run --rm --network none -v "$PWD/stage:/stage:ro" kit-no-audio-smoke \
-            sh -ec 'if ldconfig -p | grep -E "lib(asound|pulse).*\.so"; then exit 1; fi; /stage/kit --version'
+          mise run test:linux-no-audio -- stage/kit
           stage/kit --version
           cp LICENSE THIRD_PARTY_NOTICES.md stage/
           mkdir -p stage/third_party
