@@ -28,6 +28,10 @@ run = "cargo build --locked --bin kit"
 description = "Optimized build; pass --target to cross-target, e.g. mise run build:release -- --target aarch64-apple-darwin"
 run = "cargo build --locked --release --bin kit"
 
+[tasks."build:headless"]
+description = "Debug build without the tui feature, as the container images are built"
+run = "cargo build --locked --bin kit --no-default-features"
+
 [tasks.sign]
 description = "macOS: release build, then codesign target/release/kit for the Keychain credential store"
 run = "scripts/sign-release.sh"
@@ -49,11 +53,16 @@ description = "Format check and Clippy with warnings denied"
 run = [
     "cargo fmt --check",
     "cargo clippy --locked --all-targets --all-features -- -D warnings",
+    "cargo clippy --locked --all-targets --no-default-features -- -D warnings",
 ]
 
 [tasks.test]
 description = "Rust tests; arguments pass through, e.g. mise run test -- --test cli or mise run test -- --test runtime some_case"
 run = "cargo test --locked"
+
+[tasks."test:headless"]
+description = "Rust tests without the tui feature; arguments pass through like test"
+run = "cargo test --locked --no-default-features"
 
 [tasks."test:scripts"]
 description = "Shell tests for the release scripts"
@@ -61,7 +70,7 @@ run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_a
 
 [tasks.check]
 description = "Everything CI runs on Linux"
-depends = ["lint", "test", "test:scripts"]
+depends = ["lint", "test", "test:headless", "test:scripts"]
 
 [tasks."macos:generate"]
 description = "Regenerate the Swift ACP models and the Xcode project"

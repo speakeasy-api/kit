@@ -5,10 +5,30 @@ edition = "2024"
 rust-version = "1.94.0"
 publish = false
 
+[features]
+default = ["tui"]
+# The terminal client and its opt-in voice session. Headless (container) builds
+# use --no-default-features and drop the audio and terminal dependency trees.
+tui = [
+    "dep:arboard",
+    "dep:cpal",
+    "dep:crossterm",
+    "dep:cubeb",
+    "dep:cubeb-sys",
+    "dep:opus-pure",
+    "dep:ratatui",
+    "dep:ratatui-image",
+    "dep:shlex",
+    "dep:str0m",
+    "dep:tokio-tungstenite",
+    "dep:unicode-segmentation",
+    "dep:unicode-width",
+]
+
 [dependencies]
-opus-pure = { version = "=0.2.1", default-features = false }
-str0m = { version = "=0.23.1", default-features = false, features = ["aws-lc-rs"] }
-tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
+opus-pure = { version = "=0.2.1", default-features = false, optional = true }
+str0m = { version = "=0.23.1", default-features = false, features = ["aws-lc-rs"], optional = true }
+tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
 a2a-protocol-client = "=0.11.0"
 a2a-protocol-server = { version = "=0.11.0", default-features = false }
 a2a-protocol-types = "=0.11.0"
@@ -30,7 +50,7 @@ agentkit-task-manager = "=0.10.7"
 agentkit-tool-compose = { version = "=0.10.11", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
-arboard = { version = "=3.6.1", default-features = false, features = ["image-data"] }
+arboard = { version = "=3.6.1", default-features = false, features = ["image-data"], optional = true }
 async-trait = "=0.1.92"
 atomicwrites = "=0.4.4"
 axum = "=0.8.9"
@@ -38,7 +58,7 @@ base64 = "=0.23.1"
 blake3 = "=1.8.7"
 bytes = "=1.12.1"
 clap = { version = "=4.6.6", features = ["derive"] }
-crossterm = { version = "=0.29.0", features = ["event-stream"] }
+crossterm = { version = "=0.29.0", features = ["event-stream"], optional = true }
 flate2 = "=1.1.10"
 ignore = "=0.4.33"
 futures-util = "=0.3.34"
@@ -53,13 +73,13 @@ neo_frizbee = "=0.11.0"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
-ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
-ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
+ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"], optional = true }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-shlex = "=2.0.1"
+shlex = { version = "=2.0.1", optional = true }
 runlet = "=0.6.0"
 sha2 = "=0.11.0"
 subtle = "=2.6.1"
@@ -73,21 +93,21 @@ tower = { version = "=0.5.3", features = ["util"] }
 tracing = "=0.1.44"
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
-unicode-segmentation = "=1.13.3"
-unicode-width = "=0.2.2"
+unicode-segmentation = { version = "=1.13.3", optional = true }
+unicode-width = { version = "=0.2.2", optional = true }
 url = "=2.5.8"
 uuid = { version = "=1.26.0", features = ["v5"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-cpal = { version = "=0.18.2", default-features = false }
+cpal = { version = "=0.18.2", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cubeb = { version = "=0.38.0", default-features = false }
+cubeb = { version = "=0.38.0", default-features = false, optional = true }
 # In 0.38.0 this selects production C backends, not test implementations.
 # Avoid the Rust backends' independent, unlocked Cargo build; re-audit on upgrade.
-cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"] }
+cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"

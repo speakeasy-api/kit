@@ -31,13 +31,12 @@ are also required. If audio libraries or usable devices are missing, `/voice on`
 fails locally before creating a paid subscription call. Build dependencies are
 listed in [native voice build requirements](native-voice.md#build-authenticate-and-launch).
 
-The standard container images omit ALSA/PulseAudio runtime packages. Debian
-flavors include `libstdc++6`; Alpine includes `libstdc++`. To use voice in a
-container, add the optional audio packages (`pulseaudio-libs` or `alsa-lib` on
-Alpine) and explicitly provide host audio service/device access. The Alpine
-container is a separate dynamically linked musl build: `dlopen` requires dynamic
-musl, so it is not a fully static binary for arbitrary distributions or `scratch`.
-The release workflow publishes an x86-64 GNU Linux tarball, not a static musl tarball.
+The container images are headless builds without the `tui` Cargo feature: they
+omit the terminal client, voice, and the audio libraries. Debian flavors include
+`libstdc++6`; Alpine includes `libstdc++`. The Alpine container is a separate
+dynamically linked musl build, not a fully static binary for arbitrary
+distributions or `scratch`. The release workflow publishes an x86-64 GNU Linux
+tarball with the full feature set, not a static musl tarball.
 
 ## Choose a provider and authenticate
 

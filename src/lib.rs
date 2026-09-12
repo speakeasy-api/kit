@@ -49,8 +49,10 @@ mod storage_runtime;
 pub mod telemetry;
 pub mod tools;
 pub mod transcript;
+#[cfg(feature = "tui")]
 pub mod tui;
 
+#[cfg(feature = "tui")]
 mod voice;
 
 pub use acp_child::{

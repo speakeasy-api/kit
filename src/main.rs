@@ -1038,7 +1038,8 @@ impl Command {
                     .help("Prompt text; quote it when it contains spaces"),
             )
         });
-        command.subcommand({
+        #[cfg(feature = "tui")]
+        let command = command.subcommand({
             let command = clap::Command::new("tui").about("Start the ACP-backed terminal client");
             let command = command.group(clap::ArgGroup::new("Tui").multiple(true));
             let command = command.arg(
@@ -1100,7 +1101,8 @@ impl Command {
                     .help("Override the resumed session's stale lock")
                     .requires("resume"),
             )
-        })
+        });
+        command
     }
     fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
         let (name, matches) = required_subcommand(matches)?;
@@ -1163,6 +1165,7 @@ impl Command {
                 force: required_arg(matches, "force")?,
                 prompt: required_arg(matches, "prompt")?,
             }),
+            #[cfg(feature = "tui")]
             "tui" => Ok(Self::Tui {
                 root: optional_arg(matches, "root")?,
                 model: optional_arg(matches, "model")?,
@@ -1290,6 +1293,7 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    #[cfg(feature = "tui")]
     #[serde(default, deserialize_with = "deserialize_experimental_config")]
     experimental: ExperimentalConfig,
     request_budget_seconds: Option<kit::request_budget::RequestBudget>,
@@ -1319,6 +1323,7 @@ struct Config {
     config_path: Option<PathBuf>,
 }
 
+#[cfg(feature = "tui")]
 fn deserialize_experimental_config<'de, D>(deserializer: D) -> Result<ExperimentalConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1327,6 +1332,7 @@ where
     table.try_into().map_err(serde::de::Error::custom)
 }
 
+#[cfg(feature = "tui")]
 #[derive(Debug, Default, Deserialize)]
 struct ExperimentalConfig {
     #[serde(default)]
@@ -1687,6 +1693,7 @@ enum Command {
         prompt: String,
     },
     /// Start the ACP-backed terminal client.
+    #[cfg(feature = "tui")]
     Tui {
         /// Working directory and project context (defaults to config or `.`).
         root: Option<PathBuf>,
@@ -2352,6 +2359,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{output}");
             println!("session_id: {session_id}");
         }
+        #[cfg(feature = "tui")]
         Command::Tui {
             root,
             model,
@@ -2429,6 +2437,7 @@ mod tests {
         supervise_serve_with_trigger, validate_auth_storage,
     };
 
+    #[cfg(feature = "tui")]
     #[test]
     fn config_experimental_voice_defaults_and_strict_boolean() {
         assert!(!Config::default().experimental.voice);
@@ -2466,6 +2475,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn config_experimental_voice_writer_preserves_settings() {
         let directory = tempfile::tempdir().unwrap();
@@ -2540,6 +2550,7 @@ mod tests {
             vec!["serve"],
             vec!["acp"],
             vec!["prompt"],
+            #[cfg(feature = "tui")]
             vec!["tui"],
         ] {
             for flag in ["--help", "-h"] {
@@ -3416,7 +3427,12 @@ future_option = true
         );
         assert!(resolve_openrouter_api_key(None, |_| Some(String::new())).is_none());
 
-        for command in ["serve", "acp", "tui"] {
+        for command in [
+            "serve",
+            "acp",
+            #[cfg(feature = "tui")]
+            "tui",
+        ] {
             assert!(
                 Cli::try_parse_from(["kit", command, "--openrouter-api-key", "secret"]).is_ok()
             );
@@ -3758,8 +3774,13 @@ future_option = true
                 Some((AuthProvider::Openai, _))
             ));
         }
-        assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
-        assert!(Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err());
+        #[cfg(feature = "tui")]
+        {
+            assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
+            assert!(
+                Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err()
+            );
+        }
     }
 
     #[test]
@@ -3786,7 +3807,12 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "2"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "3"]).is_err());
-        for command in ["serve", "acp", "tui"] {
+        for command in [
+            "serve",
+            "acp",
+            #[cfg(feature = "tui")]
+            "tui",
+        ] {
             assert!(Cli::try_parse_from(["kit", command, "--reasoning-effort", "high"]).is_ok());
         }
         assert!(

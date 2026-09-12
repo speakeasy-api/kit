@@ -11,7 +11,9 @@ use std::{num::NonZeroUsize, time::Duration};
 use transport::Transport;
 
 pub const MAX_SOURCE: usize = 64 * 1024;
+#[cfg(feature = "tui")]
 pub const MAX_NODES: usize = 256;
+#[cfg(feature = "tui")]
 pub const MAX_RUNS: usize = 32;
 const MAX_ID: usize = 256;
 
@@ -258,6 +260,7 @@ pub(crate) async fn execute_observed(
 }
 
 /// Retain bounded source bytes even when an ACP caller submits oversized input.
+#[cfg(feature = "tui")]
 pub(crate) fn bounded_source(source: String) -> String {
     if source.len() <= MAX_SOURCE {
         return source;

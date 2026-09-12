@@ -20,6 +20,24 @@ jobs:
       - run: mise run build
       - run: mise run test:linux-no-audio -- target/debug/kit
 
+  # The container images build without the tui feature.
+  test-headless:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
+      - run: mise run test:headless
+      - run: mise run build:headless
+      - name: Check the headless binary
+        run: |
+          mise run check:linux-audio-linkage -- target/debug/kit
+          target/debug/kit --version
+          if target/debug/kit --help | grep -qw tui; then
+            echo "headless build must not expose the tui command" >&2
+            exit 1
+          fi
+
   macos-rust:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
