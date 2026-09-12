@@ -6,55 +6,26 @@ A dependency-free SwiftUI client for Kit's native ACP server. It targets macOS 1
 
 - macOS 14 or newer
 - Xcode 16 or newer
-- Pinned [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.45.4 (`scripts/install-xcodegen.sh` installs and verifies the release archive)
-- Rust toolchain required by the repository
+- [mise](https://mise.jdx.dev): `mise install` at the repository root provides the Rust toolchain, Python for the ACP model generator, and the checksum-pinned [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.45.4 release binary
 
 ## Generate, test, build, and run
 
 Run from the repository root:
 
 ```sh
-scripts/install-xcodegen.sh
-scripts/generate-acp-swift.py --check
-cargo build --locked --bin kit
-scripts/generate-macos-project.sh
-
-xcodebuild \
-  -project macos/KitDesktop.xcodeproj \
-  -scheme KitDesktop \
-  -configuration Debug \
-  -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath macos/.build \
-  CODE_SIGNING_ALLOWED=NO \
-  KIT_BINARY=$PWD/target/debug/kit \
-  test
-
-xcodebuild \
-  -project macos/KitDesktop.xcodeproj \
-  -scheme KitDesktop \
-  -configuration Debug \
-  -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath macos/.build \
-  CODE_SIGNING_ALLOWED=NO \
-  KIT_BINARY=$PWD/target/debug/kit \
-  build
-
-open macos/.build/Build/Products/Debug/Kit.app
+mise run macos:check   # generator tests plus a drift check of the committed models and project
+mise run macos:test    # debug cargo build, project generation, xcodebuild test
+mise run macos:run     # debug cargo build, project generation, xcodebuild build, open Kit.app
 ```
+
+`macos:build` stops before opening the app. The tasks honor `KIT_DERIVED_DATA` (default `macos/.build`), and the Debug tasks bundle `KIT_BINARY` (default `target/debug/kit`).
 
 A Release build must contain an optimized helper and fails rather than creating an incomplete app:
 
 ```sh
-cargo build --locked --release --target aarch64-apple-darwin --bin kit
-scripts/generate-macos-project.sh
-xcodebuild \
-  -project macos/KitDesktop.xcodeproj \
-  -scheme KitDesktop \
-  -configuration Release \
-  -destination 'generic/platform=macOS' \
-  -derivedDataPath macos/.build-release \
-  CODE_SIGNING_ALLOWED=NO \
-  build
+mise run build:release -- --target aarch64-apple-darwin
+mise run macos:archive   # writes KIT_ARCHIVE_PATH, default macos/.build/Kit.xcarchive
+mise run macos:package -- macos/.build/Kit.xcarchive/Products/Applications/Kit.app dist 0.1.133
 ```
 
 Project generation rejects other XcodeGen builds, including a same-version Homebrew binary, unless they came from the checksum-pinned archive installed by the repository script. The generated `Config/Version.xcconfig` is intentionally untracked: every project generation derives it from `Cargo.toml`, so a package version bump does not require a second manual edit. CI regenerates that local version configuration and fails only when the checked-in Swift models or Xcode project drift.

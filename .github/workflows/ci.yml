@@ -12,30 +12,23 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: useblacksmith/checkout@v1
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          components: rustfmt, clippy
-      - run: scripts/tests/test_next_release_version.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked
+      - uses: jdx/mise-action@v4
+      - run: mise run test:scripts
+      - run: mise run lint
+      - run: mise run test
 
   macos-rust:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: useblacksmith/checkout@v1
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
+      - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-rust
       - name: Build shared Kit helper
         shell: bash
         run: |
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          mise run build:release -- --target aarch64-apple-darwin
           tar -czf "$RUNNER_TEMP/kit.tar.gz" -C target/aarch64-apple-darwin/release kit
       - uses: actions/upload-artifact@v4
         with:
@@ -49,18 +42,9 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: useblacksmith/checkout@v1
-      - name: Install pinned XcodeGen
-        shell: bash
-        run: |
-          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: jdx/mise-action@v4
       - name: Check generated Xcode project drift
-        shell: bash
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_generate_acp_swift.py
-          scripts/generate-acp-swift.py --check
-          PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
-          git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
+        run: mise run macos:check
       - uses: actions/download-artifact@v4
         with:
           name: macos-kit-helper
@@ -75,33 +59,24 @@ jobs:
           ln -sf ../aarch64-apple-darwin/release/kit target/debug/kit
       - name: Run Swift tests and real Kit lifecycle smoke
         shell: bash
+        env:
+          KIT_DERIVED_DATA: ${{ runner.temp }}/DesktopDerivedData
+          KIT_BINARY: ${{ github.workspace }}/target/aarch64-apple-darwin/release/kit
         run: |
-          derived="$RUNNER_TEMP/DesktopDerivedData"
-          stale="$derived/Build/Products/Debug/Kit.app/Contents/Helpers/kit"
+          stale="$KIT_DERIVED_DATA/Build/Products/Debug/Kit.app/Contents/Helpers/kit"
           mkdir -p "$(dirname "$stale")"
           printf stale > "$stale"
           chmod +x "$stale"
-          xcodebuild test -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath "$derived" \
-            KIT_BINARY="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/kit" \
-            CODE_SIGNING_ALLOWED=NO
+          # The helper was downloaded above; skip the debug cargo build the task normally depends on.
+          mise run --no-deps macos:test
           cmp target/aarch64-apple-darwin/release/kit "$stale"
       - name: Validate Release archive and bundled helper
         shell: bash
+        env:
+          KIT_ARCHIVE_PATH: ${{ runner.temp }}/Kit.xcarchive
         run: |
-          archive="$RUNNER_TEMP/Kit.xcarchive"
-          xcodebuild archive -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Release \
-            -archivePath "$archive" \
-            -destination 'generic/platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO
-          app="$archive/Products/Applications/Kit.app"
+          mise run macos:archive
+          app="$KIT_ARCHIVE_PATH/Products/Applications/Kit.app"
           helper="$app/Contents/Helpers/kit"
           test "$(lipo -archs "$app/Contents/MacOS/Kit")" = arm64
           test "$(lipo -archs "$helper")" = arm64

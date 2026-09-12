@@ -82,13 +82,20 @@ USER kit
 
 ### From source
 
-To build Kit from source, use the Rust toolchain specified in `rust-toolchain.toml`.
+[mise](https://mise.jdx.dev) owns the toolchain: `mise.toml` pins Rust and every other build tool, and `mise run` exposes the build, test, and packaging tasks. Docker and, on macOS, Xcode are the only tools it does not install.
 
 ```sh
 git clone https://github.com/speakeasy-api/kit && cd kit
-cargo build --release          # target/release/kit
+mise install                   # Rust 1.94 with rustfmt and clippy; Python and XcodeGen on macOS
+mise run install               # cargo install into ~/.cargo/bin
+mise run dev -- tui --root .   # cargo run; arguments pass through
+mise run test -- --test cli    # cargo test; arguments select a suite or a test name
+mise run check                 # lint, Rust tests, and script tests, as CI runs them
+mise run build:release         # target/release/kit
 scripts/sign-release.sh        # macOS only: sign before using the Keychain credential store
 ```
+
+`mise tasks` lists the rest: `macos:run` builds and opens the desktop app (see [macos/README.md](macos/README.md)), and `docker:build` builds a container flavor with `docker buildx`.
 
 Release binaries for macOS are signed and notarized under `com.speakeasy.kit`; the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
 
