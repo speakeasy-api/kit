@@ -92,7 +92,7 @@ mise run dev -- tui --root .   # cargo run; arguments pass through
 mise run test -- --test cli    # cargo test; arguments select a suite or a test name
 mise run check                 # lint, Rust tests, and script tests, as CI runs them
 mise run build:release         # target/release/kit
-scripts/sign-release.sh        # macOS only: sign before using the Keychain credential store
+mise run sign                  # macOS only: sign before using the Keychain credential store
 ```
 
 `mise tasks` lists the rest: `macos:run` builds and opens the desktop app (see [macos/README.md](macos/README.md)), and `docker:build` builds a container flavor with `docker buildx`.

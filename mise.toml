@@ -14,6 +14,10 @@ run = "cargo build --locked --bin kit"
 description = "Optimized build; pass --target to cross-target, e.g. mise run build:release -- --target aarch64-apple-darwin"
 run = "cargo build --locked --release --bin kit"
 
+[tasks.sign]
+description = "macOS: release build, then codesign target/release/kit for the Keychain credential store"
+run = "scripts/sign-release.sh"
+
 [tasks.dev]
 description = "Run a debug build; arguments pass through, e.g. mise run dev -- tui --root ."
 run = "cargo run --locked --bin kit --"

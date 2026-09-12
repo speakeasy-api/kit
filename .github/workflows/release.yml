@@ -724,6 +724,7 @@ jobs:
               --platform ${{ matrix.platform }} \
               --cache-from "$CACHE" ${cache_to[@]+"${cache_to[@]}"} \
               --output type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true \
+              --provenance "mode=max,builder-id=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
               --metadata-file "$metadata"
             digest=$(jq -r '."containerimage.digest"' "$metadata")
             [[ $digest == sha256:* ]] || { echo "no image digest for $flavor" >&2; exit 1; }

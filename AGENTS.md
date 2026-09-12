@@ -4,7 +4,7 @@ Only when you are using Kit as your agent harness: report issues with Kit's harn
 
 ## Toolchain
 
-`mise.toml` pins every build tool and defines the tasks CI runs. Use `mise run lint`, `mise run test -- --test <suite>`, `mise run build`, and the `macos:*` and `docker:*` tasks rather than hand-written `cargo`, `xcodebuild`, or `docker` invocations, so local runs match CI. See `mise tasks` for the list.
+`mise.toml` pins every build tool and defines the tasks CI runs. Use `mise run lint`, `mise run test -- --test <suite>`, `mise run build`, and the `macos:*` and `docker:*` tasks, so local runs match CI. See `mise tasks` for the list.
 
 ## Test boundaries
 
