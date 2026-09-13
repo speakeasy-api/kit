@@ -164,6 +164,39 @@ References use the fully qualified `acp.<name>` form. Profile names must be non-
 
 An unknown selection fails with `unknown ACP harness "acp.name"` or `unknown subagent ACP harness "acp.name"`. Invalid references may report `ACP harness references must use acp.<name>`.
 
+## Configure child session options
+
+Set trusted initial options per harness in the subagent profile:
+
+```toml
+[subagent.harnesses."acp.review".config_options]
+thought_level = "high"
+mode = "code"
+auto_compact = true
+```
+
+Values must be strings for ACP select options or booleans for ACP boolean options.
+Use the child's advertised option ID. If no ID matches, Kit accepts an unambiguous
+advertised category such as `thought_level` (which may map to `reasoning_effort`).
+Missing, ambiguous, or incompatible options fail startup; a child rejection also
+fails startup rather than silently using its default. Option names and accepted
+values depend on the harness. Model selection continues to use the dedicated
+`model` argument and alias/allowlist policy, not `config_options`.
+
+Kit applies an explicit model first, then profile options in key order, using the
+updated option list returned after each selection. Native forks inherit the
+child's current configuration; they do not reset it to profile defaults. An
+explicit fork model still overrides the inherited model. Fallback forks start a
+new child and apply the profile again.
+
+Returned `updates.items` includes the latest complete `config_option_update`
+snapshot advertised by the child, including changes received between prompts.
+Snapshots replace earlier state rather than merging option lists. They share the
+existing bounded update budget: Kit prioritizes the latest snapshot over earlier
+activity updates and sets `updates.truncated` when content cannot fit. A single
+oversized snapshot is omitted. This is child-reported state, not an assertion
+that the child accepted an unrequested or unsupported setting.
+
 ## Configure model aliases and allowed overrides per harness
 
 Model namespaces differ between ACP harnesses. Configure aliases and explicit-override policy under the fully qualified harness reference:
