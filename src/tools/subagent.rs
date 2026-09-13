@@ -1,3 +1,5 @@
+mod recovery;
+
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -105,6 +107,7 @@ pub struct Subagents {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
+    observer: Option<session::SessionObserver>,
 }
 
 struct SessionEntry {
@@ -130,6 +133,7 @@ struct State {
     kit: bool,
     root: PathBuf,
     child: Option<ChildSession>,
+    recovery: Option<session::DurableChild>,
     forking: Option<String>,
     permit: Option<OwnedSemaphorePermit>,
 }
@@ -283,6 +287,7 @@ impl Subagents {
             max_depth,
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
+            observer: None,
             event_sink: Arc::new(|event| {
                 events::emit(event);
                 Ok(())
@@ -404,6 +409,7 @@ impl Subagents {
                 kit,
                 root: root.clone(),
                 child: None,
+                recovery: None,
                 forking: None,
                 permit: Some(permit),
             },
@@ -450,6 +456,13 @@ impl Subagents {
             }
             locked.status = SubagentStatus::Working;
             locked.child = Some(child.clone());
+            self.remember_child(&id, &mut locked, &child, depth + 1);
+            if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Interrupted) {
+                drop(locked);
+                return Err(self
+                    .cleanup_installed_child(&id, &state, &child, error)
+                    .await);
+            }
             self.emit_event(locked.runtime_event(id.clone()));
         }
         self.monitor_child_exit(id.clone(), &state, &child);
@@ -476,6 +489,12 @@ impl Subagents {
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
+        if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
+            drop(locked);
+            return Err(self
+                .cleanup_installed_child(&id, &state, &child, error)
+                .await);
+        }
         let name = locked.name.clone();
         let event = locked.runtime_event(id.clone());
         drop(locked);
@@ -497,6 +516,7 @@ impl Subagents {
         contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
         let state = self.lookup(&prior)?;
+        self.reconnect(&prior, &state, &cancellation).await?;
         // Lock-first ties were already allowed by the unbiased select.
         // The losing lock future is dropped before returning cancellation.
         let mut locked =
@@ -518,6 +538,7 @@ impl Subagents {
             .generation
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
+        self.persist_state(&locked, session::ChildLifecycle::Interrupted)?;
         locked.status = SubagentStatus::Working;
         locked.task = task_summary(&prompt.summary());
         locked.generation = generation;
@@ -550,6 +571,12 @@ impl Subagents {
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
                 locked.updates.clone_from(&updates);
+                if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
+                    drop(locked);
+                    return Err(self
+                        .cleanup_installed_child(&prior.id, &state, &child, error)
+                        .await);
+                }
                 let event = locked.runtime_event(prior.id.clone());
                 drop(locked);
                 self.emit_event(event);
@@ -595,6 +622,7 @@ impl Subagents {
         self.check_depth(depth)?;
         let permit = self.reserve()?;
         let source_state = self.lookup(&prior)?;
+        self.reconnect(&prior, &source_state, &cancellation).await?;
         // Lock-first ties were already allowed by the unbiased select.
         // The losing lock future is dropped before returning cancellation.
         let mut source = match select(
@@ -676,11 +704,26 @@ impl Subagents {
             ChildError::Failed("subagent fork task stopped before returning a result".into())
         })? {
             Ok(success) => {
-                success.acknowledge.send(()).map_err(|_| {
-                    ChildError::Failed(
+                let state = self.lookup(&success.value)?;
+                let mut locked = state.lock().await;
+                self.check_active(&locked)?;
+                // No suspension separates durable completion from handing the
+                // branch to the caller. A dropped receiver before this point
+                // leaves only the nonrestorable Interrupted checkpoint.
+                self.check_generation(&success.value, locked.handle_generation)?;
+                self.persist_state(&locked, session::ChildLifecycle::Idle)?;
+                locked.status = SubagentStatus::Idle;
+                locked.outcome = Some(GenerationOutcome::Success);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                let event = locked.runtime_event(success.value.id.clone());
+                drop(locked);
+                if success.acknowledge.send(()).is_err() {
+                    self.cleanup_abandoned_fork(&success.value).await;
+                    return Err(ChildError::Failed(
                         "subagent fork task stopped before transferring ownership".into(),
-                    )
-                })?;
+                    ));
+                }
+                self.emit_event(event);
                 Ok(success.value)
             }
             Err(error) => Err(error),
@@ -737,6 +780,7 @@ impl Subagents {
                 kit,
                 root: root.clone(),
                 child: None,
+                recovery: None,
                 forking: None,
                 permit: None,
             },
@@ -823,6 +867,13 @@ impl Subagents {
             locked.child = Some(child.clone());
             locked.permit = Some(permit);
             locked.status = SubagentStatus::Working;
+            self.remember_child(&id, &mut locked, &child, depth + 1);
+            if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Interrupted) {
+                drop(locked);
+                return Err(self
+                    .cleanup_installed_child(&id, &state, &child, error)
+                    .await);
+            }
             self.emit_event(locked.runtime_event(id.clone()));
         }
         self.monitor_child_exit(id.clone(), &state, &child);
@@ -861,15 +912,11 @@ impl Subagents {
                 .cleanup_installed_child(&id, &state, &child, error)
                 .await);
         }
-        locked.status = SubagentStatus::Idle;
-        locked.outcome = Some(GenerationOutcome::Success);
-        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        // Remain Working until the response consumer commits ownership.
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
         let name = locked.name.clone();
-        let event = locked.runtime_event(id.clone());
         drop(locked);
-        self.emit_event(event);
         Ok(SubagentValue {
             id,
             name: Some(name),
@@ -943,6 +990,23 @@ impl Subagents {
                 }
             };
         self.check_active(&locked)?;
+        if locked.status == SubagentStatus::Starting
+            && locked.recovery.is_some()
+            && locked.child.is_none()
+        {
+            return Err(ChildError::Failed(
+                "subagent reconnect is still starting; retry close after startup finishes".into(),
+            ));
+        }
+        let reconnect_permit = if locked.child.is_none() && locked.recovery.is_some() {
+            Some(self.capacity.clone().try_acquire_owned().map_err(|_| {
+                ChildError::Failed("live subagent session limit (120) reached".into())
+            })?)
+        } else {
+            None
+        };
+        self.persist_state(&locked, session::ChildLifecycle::Closed)?;
+        let recovery = locked.recovery.clone();
         locked.status = SubagentStatus::Removed;
         locked.forking = None;
         let child = locked.child.take();
@@ -951,8 +1015,40 @@ impl Subagents {
         self.remove_if_same(id, &state);
         self.emit_event(event);
 
-        let Some(child) = child else {
-            return Ok(());
+        let child = match (child, recovery) {
+            (Some(child), _) => child,
+            (None, Some(record)) => {
+                let config = self
+                    .config
+                    .clone()
+                    .with_root(record.root)
+                    .with_parent_context(id.into(), record.name);
+                let cancellation = cancellation.clone();
+                // Tombstoned cleanup owns startup and capacity independently of
+                // the caller. Dropping close must not release a running actor's
+                // permit or abandon its explicit history deletion.
+                return tokio::spawn(async move {
+                    let (child, _) = ChildSession::start_with_output(
+                        config,
+                        record.harness,
+                        Some((record.acp_session_id, true)),
+                        None,
+                        record.depth,
+                        cancellation,
+                    )
+                    .await?;
+                    Self::watch_permit_until_process_exit(reconnect_permit, &child);
+                    match child.discard().await {
+                        Ok(None) => Ok(()),
+                        Ok(Some(error)) | Err(error) => Err(error),
+                    }
+                })
+                .await
+                .map_err(|error| {
+                    ChildError::Failed(format!("detached child deletion task failed: {error}"))
+                })?;
+            }
+            (None, None) => return Ok(()),
         };
         match child.discard().await {
             Ok(None) => Ok(()),
@@ -1058,7 +1154,12 @@ impl Subagents {
         let Ok(state) = self.lookup(value) else {
             return;
         };
-        let child = state.lock().await.child.clone();
+        let locked = state.lock().await;
+        // Lost handoff is not a completed parent-owned branch. The tombstone
+        // prevents its previously completed output from resurrecting on reload.
+        let _ = self.persist_state(&locked, session::ChildLifecycle::Closed);
+        let child = locked.child.clone();
+        drop(locked);
         if let Some(child) = child {
             let _ = self
                 .cleanup_installed_child(&value.id, &state, &child, ChildError::Cancelled)

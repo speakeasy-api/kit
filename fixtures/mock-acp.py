@@ -61,7 +61,7 @@ def log_request(request):
         entry["requestId"] = params["requestId"]
     if "sessionId" in params:
         entry["sessionId"] = params["sessionId"]
-    if request.get("method") in ("session/new", "session/fork"):
+    if request.get("method") in ("session/new", "session/fork", "session/load", "session/resume"):
         entry["cwd"] = params["cwd"]
         entry["additionalDirectories"] = params.get("additionalDirectories", [])
     if request.get("method") == "session/prompt":
@@ -331,12 +331,15 @@ for line in sys.stdin:
             assert params["capabilities"] == {}
             respond(request["id"], {
                 "protocolVersion": 2, "info": {"name": "mock", "version": "1"},
-                "capabilities": {"session": {"fork": {}} if supports_fork else {}}
+                "capabilities": {"session": (({"fork": {}} if supports_fork else {})
+                    | ({"delete": {}} if "--delete" in sys.argv else {})
+                    | ({} if "--no-additional-directories" in sys.argv else {"additionalDirectories": {}}))}
             })
             continue
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {
+                "loadSession": "--load" in sys.argv,
                 "promptCapabilities": {
                     "image": "--prompt-content" in sys.argv,
                     "embeddedContext": "--prompt-content" in sys.argv,
@@ -358,9 +361,10 @@ for line in sys.stdin:
         if supports_models or supports_config_options:
             result["configOptions"] = config_options("base")
         respond(request["id"], result)
-    elif method == "session/resume":
+    elif method in ("session/resume", "session/load"):
         params = request["params"]
-        if "--v2" not in sys.argv or params.get("replayFrom") != {"type": "start"}:
+        if ((method == "session/resume" and ("--v2" not in sys.argv or params.get("replayFrom") != {"type": "start"}))
+                or (method == "session/load" and "--load" not in sys.argv)):
             send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "replay required"}})
             continue
         session_id = params["sessionId"]

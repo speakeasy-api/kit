@@ -938,7 +938,7 @@ impl ChildSession {
             .map(|(session, _)| session)
     }
 
-    /// Reconnect a generic v2 child using a known ACP session id in `persisted`.
+    /// Reconnect a generic child using v2 resume or advertised v1 load.
     /// Returns replay separately from the next turn; durable id discovery is owned
     /// by the caller. Built-in Kit persistence retains its existing launch path.
     pub async fn start_with_output(
@@ -1027,6 +1027,10 @@ impl ChildSession {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn session_id(&self) -> String {
+        self.session_id.to_string()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1443,8 +1447,12 @@ async fn run(
             // Failure/cancellation drops the entire startup connection and its route.
             let replay_output = Arc::new(Mutex::new(ChildOutput::default()));
             let session_result = if let Some((id, true)) = &persisted
-                && harness != BUILTIN_HARNESS
+                && !config.harnesses.is_kit(&harness)
             {
+                if version == protocol::Version::V1 && !capabilities.load_session {
+                    let _ = ready.send(Err("ACP harness does not advertise session/load for restart recovery".into()));
+                    return std::future::pending().await;
+                }
                 let id = SessionId::new(id.clone());
                 let (idle, _) = watch::channel(protocol::Foreground::Waiting);
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
