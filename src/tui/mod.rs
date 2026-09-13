@@ -1434,28 +1434,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let update = match events::parse(&line) {
-                    // ACP owns tool rendering. Keep the legacy reducer for PR2,
-                    // but do not render the same dispatch again from stderr.
-                    Some(
-                        RuntimeEvent::ChildStarted { .. }
-                        | RuntimeEvent::ChildFinished { .. }
-                        | RuntimeEvent::RunletProgress { .. }
-                        | RuntimeEvent::RunletTransport { .. },
-                    ) => continue,
-                    Some(event) => Update::Runtime(event),
-                    None if line.starts_with("A2A listening on ") => {
-                        Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
-                    }
-                    None => {
-                        if let Ok(mut recent) = recorder.lock() {
-                            recent.push(line.clone());
-                            let extra = recent.len().saturating_sub(FAILURE_LINES);
-                            recent.drain(..extra);
-                        }
-                        Update::Log(line)
-                    }
+                let Some(update) = stderr_update(line) else {
+                    continue;
                 };
+                if let Update::Log(line) = &update
+                    && let Ok(mut recent) = recorder.lock()
+                {
+                    recent.push(line.clone());
+                    let extra = recent.len().saturating_sub(FAILURE_LINES);
+                    recent.drain(..extra);
+                }
                 if diagnostics.send(QueuedUpdate::global(update)).is_err() {
                     return;
                 }
@@ -2767,6 +2755,23 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+/// ACP owns tool cards, but the stderr transport lease and general diagnostics
+/// still drive runtime availability, subagent status, storage, and failure reports.
+fn stderr_update(line: String) -> Option<Update> {
+    match events::parse(&line) {
+        Some(
+            RuntimeEvent::ChildStarted { .. }
+            | RuntimeEvent::ChildFinished { .. }
+            | RuntimeEvent::RunletProgress { .. },
+        ) => None,
+        Some(event) => Some(Update::Runtime(event)),
+        None if line.starts_with("A2A listening on ") => Some(Update::A2aAddress(
+            line.trim_start_matches("A2A listening on ").to_string(),
+        )),
+        None => Some(Update::Log(line)),
+    }
+}
+
 /// Explains an agent exit, quoting the last thing it said.
 async fn died(
     status: Option<std::process::ExitStatus>,
@@ -4010,6 +4015,86 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn stderr_filter_preserves_transport_recovery_and_general_diagnostics() {
+        use super::stderr_update;
+        use crate::events::{self, RuntimeEvent};
+
+        let line = |event: RuntimeEvent| {
+            format!(
+                "{}{}",
+                events::EVENT_MARKER,
+                serde_json::to_string(&event).unwrap()
+            )
+        };
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let heartbeat = || line(RuntimeEvent::RunletTransport { available: true });
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(!app.runtime_unavailable());
+        app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+        assert!(app.runtime_unavailable());
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(
+            !app.runtime_unavailable(),
+            "stderr heartbeats must recover the status lease"
+        );
+        app.apply(stderr_update(line(RuntimeEvent::RunletTransport { available: false })).unwrap());
+        assert!(app.runtime_unavailable());
+        for event in [
+            RuntimeEvent::SessionStarted {
+                session_id: "session".into(),
+            },
+            RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: false,
+            },
+        ] {
+            assert!(
+                matches!(stderr_update(line(event.clone())), Some(Update::Runtime(actual)) if actual == event)
+            );
+        }
+        for event in [
+            RuntimeEvent::ChildStarted {
+                call: "child".into(),
+                tool: "shell".into(),
+                summary: "running".into(),
+                at: 1,
+            },
+            RuntimeEvent::ChildFinished {
+                call: "child".into(),
+                tool: "shell".into(),
+                ok: true,
+                summary: "done".into(),
+                millis: 1,
+            },
+            RuntimeEvent::RunletProgress {
+                progress: crate::runlet_progress::Progress {
+                    owner: "root".into(),
+                    incarnation: 1,
+                    sequence: 1,
+                    change: crate::runlet_progress::Change::Finished { complete: true },
+                },
+            },
+        ] {
+            assert!(stderr_update(line(event)).is_none());
+        }
+        assert!(
+            matches!(stderr_update("ordinary diagnostic".into()), Some(Update::Log(line)) if line == "ordinary diagnostic")
+        );
+        assert!(
+            matches!(stderr_update("A2A listening on localhost:1234".into()), Some(Update::A2aAddress(address)) if address == "localhost:1234")
+        );
+        let malformed = format!("{}not json", events::EVENT_MARKER);
+        assert!(
+            matches!(stderr_update(malformed.clone()), Some(Update::Log(line)) if line == malformed)
+        );
     }
 
     #[test]

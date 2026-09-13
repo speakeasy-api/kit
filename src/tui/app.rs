@@ -3893,8 +3893,8 @@ impl App {
             return Action::Quit;
         }
         if key.modifiers == KeyModifiers::ALT
-            && matches!(key.code, KeyCode::Left | KeyCode::Right)
-            && self.page_children(key.code == KeyCode::Right)
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            && self.page_children(key.code == KeyCode::PageDown)
         {
             return Action::None;
         }
@@ -9685,6 +9685,34 @@ mod tests {
                     elapsed.as_nanos() / count
                 );
             }
+        }
+
+        #[test]
+        fn canonical_automatic_focus_preserves_word_movement_and_separate_paging() {
+            let mut app = app();
+            app.paste("first second");
+            start(&mut app, "root", true, false);
+            for i in 0..70 {
+                let id = format!("child {i}");
+                start(&mut app, &id, false, false);
+                parent(&mut app, &id, "root");
+            }
+            assert_eq!(app.focus_call().unwrap().id, "child 69");
+            let page = call(&app, "root").child_page;
+            assert!(page > 0);
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 6);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page - 1);
+            assert_eq!(app.editor.cursor(), 12);
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page);
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(app.editor.text(), "first second");
         }
 
         #[test]

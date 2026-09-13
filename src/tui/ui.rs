@@ -1415,7 +1415,7 @@ fn transcript_block_rows(
     let show = call.expanded && call.compose_view == ComposeView::Output;
     let label = if show {
         format!(
-            "   ↳ calls {}–{} of {total} · alt+←/→ pages",
+            "   ↳ calls {}–{} of {total} · alt+PgUp/PgDn pages",
             start + 1,
             start + children.len()
         )
