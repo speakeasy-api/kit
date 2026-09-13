@@ -148,7 +148,7 @@ def prompt(request):
         # A startup idle can race the new prompt; it must not settle this turn.
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": request["params"]["sessionId"],
-            "update": {"sessionUpdate": "state_update", "state": "idle"}
+            "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"}
         }})
         respond(request["id"], {})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
@@ -256,7 +256,7 @@ def prompt(request):
     if "--v2" in sys.argv:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session_id, "update": {
-                "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"
+                "sessionUpdate": "state_update", "state": "idle", "stopReason": (text.removeprefix("MOCK_STOP:") if text.startswith("MOCK_STOP:") else "end_turn")
             }
         }})
     else:
@@ -342,6 +342,38 @@ for line in sys.stdin:
         if supports_models or supports_config_options:
             result["configOptions"] = config_options("base")
         respond(request["id"], result)
+    elif method == "session/resume":
+        params = request["params"]
+        if "--v2" not in sys.argv or params.get("replayFrom") != {"type": "start"}:
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "replay required"}})
+            continue
+        session_id = params["sessionId"]
+        for text in ["replayed ", "history"]:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }})
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"
+                }
+            }})
+        if session_id == "replay-stall":
+            with open(os.path.join(params["cwd"], "replay-stalled"), "w") as marker:
+                marker.write(str(os.getpid()))
+            while True:
+                time.sleep(0.01)
+        if session_id == "replay-eof":
+            sys.exit(0)
+        if session_id == "replay-failure":
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "replay failed"}})
+            continue
+        with state_lock:
+            selected_models[session_id] = model_ids[0]
+            selected_options[session_id] = {}
+        respond(request["id"], {"configOptions": config_options(session_id)})
     elif method == "session/fork":
         threading.Thread(target=fork, args=(request,), daemon=True).start()
     elif method == "session/prompt":
