@@ -16,6 +16,7 @@ selected_options = {}
 fail_first_close = "--fail-first-close" in sys.argv
 failed_close = False
 selected_models = {}
+v2_cancellations = {}
 
 
 def option(name):
@@ -98,6 +99,9 @@ def config_options(session_id):
             "id": "custom_enabled", "name": "Custom enabled", "type": "boolean",
             "currentValue": values.get("custom_enabled", False),
         })
+    if "--v2" in sys.argv:
+        for option in result:
+            option["configId"] = option.pop("id")
     return result
 
 
@@ -140,9 +144,28 @@ def fork(request):
 
 
 def prompt(request):
+    if "--v2" in sys.argv:
+        # A startup idle can race the new prompt; it must not settle this turn.
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": request["params"]["sessionId"],
+            "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"}
+        }})
+        respond(request["id"], {})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": request["params"]["sessionId"],
+            "update": {"sessionUpdate": "state_update", "state": "running"}
+        }})
     params = request["params"]
     session_id = params["sessionId"]
     text = " ".join(block["text"] for block in params["prompt"] if block["type"] == "text")
+    if "--v2" in sys.argv and text == "MOCK_WAIT_CANCEL":
+        event = threading.Event()
+        with state_lock:
+            v2_cancellations[session_id] = event
+        with open(option("--accepted-marker"), "w", encoding="utf-8") as marker:
+            marker.write("accepted")
+        event.wait()
+
     should_gate = prompt_release is not None and (
         prompt_release_text is None or prompt_release_text == text
     )
@@ -169,6 +192,22 @@ def prompt(request):
         text = json.dumps(config_options(session_id))
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
+    if "--v2" in sys.argv and text in ("MOCK_WHOLE", "MOCK_REPLACE", "MOCK_CLEAR"):
+        updates = []
+        if text != "MOCK_WHOLE":
+            updates.append({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": "stale"}})
+        updates.append({"sessionUpdate": "agent_message", "messageId": "answer", "content": [{"type": "text", "text": "whole answer" if text == "MOCK_WHOLE" else "replacement"}]})
+        updates.append({"sessionUpdate": "agent_message", "messageId": "answer"})
+        if text == "MOCK_REPLACE":
+            updates.append({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": " tail"}})
+        if text == "MOCK_CLEAR":
+            updates.append({"sessionUpdate": "agent_message", "messageId": "answer", "content": None})
+        for update in updates:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+        text = ""
+    if "--v2" in sys.argv and text == "MOCK_WHOLE_IMAGE":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "agent_message", "messageId": "answer", "content": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]}}})
+        text = ""
     if "MOCK_REFUSAL" in text:
         respond(request["id"], {"stopReason": "refusal"})
         return
@@ -230,7 +269,14 @@ def prompt(request):
             },
         },
     })
-    respond(request["id"], {"stopReason": "end_turn"})
+    if "--v2" in sys.argv:
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id, "update": {
+                "sessionUpdate": "state_update", "state": "idle", "stopReason": (text.removeprefix("MOCK_STOP:") if text.startswith("MOCK_STOP:") else "end_turn")
+            }
+        }})
+    else:
+        respond(request["id"], {"stopReason": "end_turn"})
     if idle_config_update:
         while idle_config_release is not None and not os.path.exists(idle_config_release):
             time.sleep(0.01)
@@ -276,6 +322,18 @@ for line in sys.stdin:
     if method == "initialize":
         if "--require-compaction" in sys.argv:
             assert request["params"]["clientCapabilities"]["session"]["compaction"] == {}
+        params = request["params"]
+        assert params["protocolVersion"] == 2
+        assert params["clientInfo"]["name"] == "kit"
+        assert params["clientInfo"]["version"]
+        if "--v2" in sys.argv:
+            assert params["info"] == params["clientInfo"]
+            assert params["capabilities"] == {}
+            respond(request["id"], {
+                "protocolVersion": 2, "info": {"name": "mock", "version": "1"},
+                "capabilities": {"session": {"fork": {}} if supports_fork else {}}
+            })
+            continue
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -300,6 +358,38 @@ for line in sys.stdin:
         if supports_models or supports_config_options:
             result["configOptions"] = config_options("base")
         respond(request["id"], result)
+    elif method == "session/resume":
+        params = request["params"]
+        if "--v2" not in sys.argv or params.get("replayFrom") != {"type": "start"}:
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "replay required"}})
+            continue
+        session_id = params["sessionId"]
+        for text in ["replayed ", "history"]:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }})
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id, "update": {
+                    "sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"
+                }
+            }})
+        if session_id == "replay-stall":
+            with open(os.path.join(params["cwd"], "replay-stalled"), "w") as marker:
+                marker.write(str(os.getpid()))
+            while True:
+                time.sleep(0.01)
+        if session_id == "replay-eof":
+            sys.exit(0)
+        if session_id == "replay-failure":
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "replay failed"}})
+            continue
+        with state_lock:
+            selected_models[session_id] = model_ids[0]
+            selected_options[session_id] = {}
+        respond(request["id"], {"configOptions": config_options(session_id)})
     elif method == "session/fork":
         threading.Thread(target=fork, args=(request,), daemon=True).start()
     elif method == "session/prompt":
@@ -309,7 +399,7 @@ for line in sys.stdin:
         value = params["value"]
         option_id = params["configId"]
         advertised = next((item for item in config_options(params["sessionId"])
-                           if item["id"] == option_id), None)
+                           if item.get("configId", item.get("id")) == option_id), None)
         valid = advertised is not None and (
             (advertised["type"] == "boolean" and type(value) is bool) or
             (advertised["type"] == "select" and type(value) is str and
@@ -328,7 +418,10 @@ for line in sys.stdin:
                     selected_options[params["sessionId"]][option_id] = value
             respond(request["id"], {"configOptions": config_options(params["sessionId"])})
     elif method == "session/cancel":
-        pass
+        with state_lock:
+            event = v2_cancellations.pop(request["params"]["sessionId"], None)
+        if event is not None:
+            event.set()
     elif method == "session/close":
         threading.Thread(target=close, args=(request,), daemon=True).start()
 
