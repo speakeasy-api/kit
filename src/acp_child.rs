@@ -1126,13 +1126,15 @@ fn child_auth_required(
         return None;
     }
     let mut ids = BTreeSet::new();
-    for id in methods.iter().map(|method| method.id().0.as_ref()).chain(
-        error
-            .data
-            .as_ref()
-            .and_then(|data| data.get("methodId"))
-            .and_then(Value::as_str),
-    ) {
+    // Reserve a slot for the method selected by the error before advertisements.
+    for id in error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("methodId"))
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(methods.iter().map(|method| method.id().0.as_ref()))
+    {
         if !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic()) {
             ids.insert(id);
         }
@@ -1293,12 +1295,23 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
+            let initialized = match connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(agentkit_acp::ClientCapabilities::new().session(
                     agentkit_acp::ClientSessionCapabilities::new().compaction(
                         agentkit_acp::CompactionCapabilities::default(),
                     ),
-                ))).block_task().await?;
+                ))).block_task().await {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    if let Some(message) = child_auth_required(&error, &[]) {
+                        // Publish a received auth response before process-exit
+                        // classification can replace it with a generic failure.
+                        let _ = ready.send(Err(format!("ACP harness {harness:?}: {message}")));
+                        return std::future::pending().await;
+                    }
+                    return Err(error);
+                }
+            };
             let auth_methods = initialized.auth_methods;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
@@ -2741,9 +2754,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn child_auth_error_method_takes_priority_over_advertised_methods() {
+        let methods = (1..=16)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("method-{i:02}"), "name": "Login"
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let error = agent_client_protocol::Error::auth_required().data(serde_json::json!({
+            "methodId": "required-login"
+        }));
+        let message = child_auth_required(&error, &methods).unwrap();
+        assert!(message.contains("required-login"), "{message}");
+        assert!(message.contains("method-15"), "{message}");
+        assert!(!message.contains("method-16"), "{message}");
+    }
+
     #[tokio::test]
     async fn child_auth_required_at_initialize_new_session_and_prompt() {
-        for stage in ["initialize", "session/new", "session/prompt"] {
+        for (stage, exit_after_error) in [
+            ("initialize", false),
+            ("initialize", true),
+            ("session/new", false),
+            ("session/prompt", false),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let script = r#"
 import json,sys
@@ -2762,12 +2799,19 @@ for line in sys.stdin:
     else:
         response['result']={}
     print(json.dumps(response),flush=True)
+    if 'error' in response and sys.argv[2] == 'true':
+        sys.exit(42)
 "#;
             let profiles = BTreeMap::from([(
                 "broken".into(),
                 AcpHarnessProfile {
                     command: "python3".into(),
-                    args: vec!["-c".into(), script.into(), stage.into()],
+                    args: vec![
+                        "-c".into(),
+                        script.into(),
+                        stage.into(),
+                        exit_after_error.to_string(),
+                    ],
                     permissions: AcpPermissionPolicy::Deny,
                 },
             )]);
@@ -2808,7 +2852,7 @@ for line in sys.stdin:
                     child
                         .prompt(
                             "test-owner".into(),
-                            vec![ContentBlock::Text(agentkit_acp::TextContent::new("hello"))],
+                            "hello".into(),
                             TurnCancellation::default(),
                         )
                         .await
