@@ -1248,11 +1248,12 @@ async fn run(
             async move |message: UntypedMessage, _cx| {
                 if message.method != "session/update" { return Ok(()); }
                 let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
-                let mut params = message.params.clone();
+                let mut params = message.params;
                 protocol::normalize_config_options(&mut params["update"]);
-                if let Ok(notification) = serde_json::from_value::<SessionNotification>(params)
-                    && let SessionUpdate::ConfigOptionUpdate(update) = notification.update {
-                    notification_configs.set(notification.session_id, update.config_options)?;
+                let notification = serde_json::from_value::<SessionNotification>(params.clone()).ok();
+                if let Some(notification) = &notification
+                    && let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
+                    notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
                 }
                 let route = notification_routes
                     .lock()
@@ -1261,14 +1262,13 @@ async fn run(
                 let Some(route) = route else {
                     return Ok(());
                 };
-                if let Some(state) = protocol::foreground(&message.params)? {
+                if let Some(state) = protocol::foreground(&params)? {
                     // Startup/replayed idle cannot settle a newly submitted turn.
                     route.idle.send_if_modified(|current| current.advance(state));
                     return Ok(());
                 }
-                // Common v1/v2 output projections share their wire shape. Unknown
-                // updates remain out of scope, as they were for v1 children.
-                let Ok(notification) = serde_json::from_value::<SessionNotification>(message.params) else { return Ok(()); };
+                // Reuse normalized configuration identifiers for captured output.
+                let Some(notification) = notification else { return Ok(()); };
                 if let Some(activity) = roster_activity(&notification.update) {
                     crate::events::emit(&crate::events::RuntimeEvent::SubagentActivity {
                         id: route.owner.clone(), activity,
