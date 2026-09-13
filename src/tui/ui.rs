@@ -802,11 +802,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ));
     }
     if let Some(cost) = &app.cost {
-        fields.push((
-            4,
-            cost_label(cost.amount, &cost.currency),
-            theme::dim(),
-        ));
+        fields.push((4, cost_label(cost.amount, &cost.currency), theme::dim()));
     }
     fields.push((
         5,
@@ -3134,10 +3130,7 @@ mod tests {
         terminal
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
-        assert!(
-            buffer_row(terminal.backend().buffer(), 7)
-                .contains("EUR 2.0000 + $1.7500")
-        );
+        assert!(buffer_row(terminal.backend().buffer(), 7).contains("EUR 2.0000 + $1.7500"));
     }
 
     #[test]
