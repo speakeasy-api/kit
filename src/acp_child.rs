@@ -1269,6 +1269,7 @@ async fn run(
     let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
     let ready_flag = Arc::clone(&startup_complete);
+    let startup_closed = closed.clone();
     let connected = agent_client_protocol::Builder::new(protocol::Client)
         .on_receive_notification(
             async move |message: UntypedMessage, _cx| {
@@ -1436,6 +1437,11 @@ async fn run(
             let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
             let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
             let mut tasks = JoinSet::new();
+            // A bounded post-exit drain may deliver buffered success responses.
+            // It may publish an auth diagnostic, but never a ready dead child.
+            if *startup_closed.borrow() {
+                return Err(agent_client_protocol::Error::internal_error());
+            }
             ready_flag.store(true, Ordering::Release);
             let _ = ready.send(Ok(Ready {
                 session_id: session.session_id,
