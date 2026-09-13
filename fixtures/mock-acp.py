@@ -201,7 +201,15 @@ def prompt(request):
                     {"content": "Inspect", "priority": "high", "status": "completed"}
                 ],
             },
-            {"sessionUpdate": "usage_update", "used": 10, "size": 100},
+            {"sessionUpdate": "usage_update", "used": 10, "size": 100,
+             "cost": {"amount": 0.25, "currency": "USD"}},
+            {"sessionUpdate": "session_info_update", "title": "Child title"},
+            {"sessionUpdate": "available_commands_update", "availableCommands": []},
+            {"sessionUpdate": "notice", "severity": "info", "title": "Working"},
+            {"sessionUpdate": "compaction_update", "compactionId": "compact-1",
+             "status": "in_progress"},
+            {"sessionUpdate": "compaction_summary_chunk", "compactionId": "compact-1",
+             "content": {"type": "text", "text": "Retained context"}},
         ]
         for update in updates:
             send({
@@ -265,6 +273,8 @@ for line in sys.stdin:
     method = request.get("method")
     log_request(request)
     if method == "initialize":
+        if "--require-compaction" in sys.argv:
+            assert request["params"]["clientCapabilities"]["session"]["compaction"] == {}
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {

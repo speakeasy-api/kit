@@ -582,7 +582,7 @@ async fn subagent_exposes_bounded_rich_updates_without_changing_text_output() {
         "rich".into(),
         kit::AcpHarnessProfile {
             command: "python3".into(),
-            args: vec![fixture],
+            args: vec![fixture, "--require-compaction".into()],
             permissions: Default::default(),
         },
     )]))
@@ -628,7 +628,16 @@ return { output: child.output, updates: child.updates }"#,
                         "entries": [
                             {"content": "Inspect", "priority": "high", "status": "completed"}
                         ]
-                    }
+                    },
+                    {"sessionUpdate": "usage_update", "used": 10, "size": 100,
+                     "cost": {"amount": 0.25, "currency": "USD"}},
+                    {"sessionUpdate": "session_info_update", "title": "Child title"},
+                    {"sessionUpdate": "available_commands_update", "availableCommands": []},
+                    {"sessionUpdate": "notice", "severity": "info", "title": "Working"},
+                    {"sessionUpdate": "compaction_update", "compactionId": "compact-1",
+                     "status": "in_progress"},
+                    {"sessionUpdate": "compaction_summary_chunk", "compactionId": "compact-1",
+                     "content": {"type": "text", "text": "Retained context"}}
                 ],
                 "truncated": false
             }
