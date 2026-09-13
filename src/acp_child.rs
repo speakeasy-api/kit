@@ -401,6 +401,7 @@ pub(crate) fn serve_command(
 #[derive(Clone)]
 pub(crate) struct ChildConfig {
     pub root: PathBuf,
+    pub additional_directories: Vec<PathBuf>,
     pub model: String,
     pub provider: crate::ProviderKind,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
@@ -1187,6 +1188,7 @@ async fn run(
     let config_snapshots = Arc::new(ConfigSnapshots::default());
     let notification_configs = Arc::clone(&config_snapshots);
     let root = config.root.clone();
+    let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
     let ready_flag = Arc::clone(&startup_complete);
     let connected = agent_client_protocol::Client
@@ -1252,7 +1254,16 @@ async fn run(
                 ))).block_task().await?;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
-            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            // Reject before creating any session rather than silently dropping
+            // the owning parent's project context. Native forks reuse this
+            // initialized connection and the same immutable directory list.
+            if !additional_directories.is_empty()
+                && capabilities.session_capabilities.additional_directories.is_none()
+            {
+                let _ = ready.send(Err(format!("ACP harness {harness:?} does not advertise additional project directory support")));
+                return std::future::pending().await;
+            }
+            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).block_task().await?;
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
             }
@@ -1313,11 +1324,13 @@ async fn run(
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
+                        let additional_directories = additional_directories.clone();
                         let config_snapshots = Arc::clone(&config_snapshots);
                         tasks.spawn(async move {
                             let serial = fork.serial;
                             let source_id = fork.session_id.clone();
-                            let mut request = ForkSessionRequest::new(fork.session_id, root);
+                            let mut request = ForkSessionRequest::new(fork.session_id, root)
+                                .additional_directories(additional_directories);
                             if let Some((id, name)) = fork.parent {
                                 request.meta = Some(serde_json::Map::from_iter([
                                     (FORK_PARENT_ID_META.into(), Value::String(id)),
@@ -2275,6 +2288,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let harnesses = AcpHarnesses::default();
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().into(),
             model: "model".into(),
             provider: crate::ProviderKind::OpenRouter,
@@ -2376,6 +2390,7 @@ mod tests {
             None,
         ] {
             let config = ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.path().into(),
                 model: "model".into(),
                 provider: crate::ProviderKind::OpenRouter,
@@ -2656,6 +2671,7 @@ mod tests {
             },
         )]);
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().into(),
             model: "unused".into(),
             provider: Default::default(),
@@ -2719,6 +2735,7 @@ mod tests {
             },
         )]);
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().into(),
             model: "unused".into(),
             provider: Default::default(),
@@ -2777,6 +2794,7 @@ mod tests {
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -2823,6 +2841,7 @@ mod tests {
         assert!(configured_mcp.is_absolute());
         assert!(!configured_mcp.starts_with(root.path()));
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "test-model".into(),
             provider: crate::ProviderKind::OpenRouter,
@@ -2963,6 +2982,7 @@ mod tests {
             },
         );
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -3030,6 +3050,7 @@ mod tests {
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -3108,6 +3129,7 @@ mod tests {
             );
             let harnesses = AcpHarnesses::new(profiles).unwrap();
             let config = ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.path().to_path_buf(),
                 model: "unused".into(),
                 provider: Default::default(),
@@ -3216,6 +3238,7 @@ mod tests {
         );
         let harnesses = AcpHarnesses::new(profiles).unwrap();
         let config = ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -3345,6 +3368,7 @@ mod tests {
             .unwrap();
             let base = ChildSession::start(
                 ChildConfig {
+                    additional_directories: Vec::new(),
                     root: root.path().to_path_buf(),
                     model: "unused".into(),
                     provider: Default::default(),
@@ -3485,6 +3509,7 @@ mod tests {
                 },
             );
             let config = ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.path().to_path_buf(),
                 model: "unused".into(),
                 provider: Default::default(),
@@ -3943,6 +3968,7 @@ mod tests {
 
         fn config(parent_id: Option<&str>, parent_name: Option<&str>) -> ChildConfig {
             ChildConfig {
+                additional_directories: Vec::new(),
                 root: PathBuf::from("/tmp"),
                 model: "model".into(),
                 provider: Default::default(),

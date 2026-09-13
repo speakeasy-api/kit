@@ -298,11 +298,17 @@ impl Subagents {
         Self::new(self.config.clone(), self.max_depth)
     }
 
-    pub(crate) fn fresh_with_parent(&self, id: String, name: String) -> Self {
-        Self::new(
-            self.config.clone().with_parent_context(id, name),
-            self.max_depth,
-        )
+    pub(crate) fn fresh_for_workspace(
+        &self,
+        additional_directories: Vec<PathBuf>,
+        parent: Option<(String, String)>,
+    ) -> Self {
+        let mut config = self.config.clone();
+        config.additional_directories = additional_directories;
+        if let Some((id, name)) = parent {
+            config = config.with_parent_context(id, name);
+        }
+        Self::new(config, self.max_depth)
     }
 
     fn emit_event(&self, mut event: events::RuntimeEvent) {
