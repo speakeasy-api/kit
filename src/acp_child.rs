@@ -1099,7 +1099,9 @@ async fn run(
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
                                 ]));
                             }
-                            let mut request = Box::pin(connection.send_request(request).block_task());
+                            let request = connection.send_request(request);
+                            let request_id = request.id().clone();
+                            let mut request = Box::pin(request.block_task());
                             // This one-shot race permits a completed fork to win
                             // simultaneous cancellation/deadline. Keep the owned
                             // request and gate for remote cleanup when it loses.
@@ -1157,6 +1159,9 @@ async fn run(
                                     Err(error) => Err(ChildError::Failed(error.to_string())),
                                 },
                                 Either::Right((Either::Left(((), _)), _)) => {
+                                    // Keep awaiting late success for cleanup, but ask the peer
+                                    // to stop work before returning to the caller.
+                                    let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
@@ -1185,6 +1190,9 @@ async fn run(
                                     Err(ChildError::Cancelled)
                                 },
                                 Either::Right((Either::Right(((), _)), _)) => {
+                                    // Keep awaiting late success for cleanup, but ask the peer
+                                    // to stop work before returning to the caller.
+                                    let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
                                     tokio::spawn(async move {
@@ -1226,6 +1234,8 @@ async fn run(
                             let request = connection
                                 .send_request(CloseSessionRequest::new(close.session_id.clone()))
                                 .block_task();
+                            // Dropping the SDK request future on timeout sends
+                            // $/cancel_request before discarding its response.
                             let result = tokio::time::timeout(CANCEL_SETTLE, request)
                                 .await
                                 .map_err(|_| {
@@ -2942,11 +2952,39 @@ mod tests {
         .unwrap();
     }
 
+    async fn assert_request_cancelled(log: &std::path::Path, method: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entries: Vec<Value> = std::fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let request = entries.iter().find(|entry| {
+                    entry["method"] == method
+                        && (method != "session/close" || entry["sessionId"] == "base")
+                });
+                if let Some(request) = request
+                    && entries.iter().any(|entry| {
+                        entry["method"] == "$/cancel_request" && entry["requestId"] == request["id"]
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation must target the in-flight request");
+    }
+
     #[tokio::test]
     async fn cancelled_or_timed_out_fork_retains_serialization_until_remote_settlement() {
         for cancel in [true, false] {
             let root = tempfile::tempdir().unwrap();
             let release = root.path().join("release-fork");
+            let log = root.path().join("requests.jsonl");
+            let close_release = root.path().join("release-close");
             let mut profiles = BTreeMap::new();
             profiles.insert(
                 "mock".into(),
@@ -2955,6 +2993,9 @@ mod tests {
                     args: vec![
                         format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
                         format!("--fork-release={}", release.display()),
+                        format!("--request-log={}", log.display()),
+                        format!("--close-release={}", close_release.display()),
+                        "--close-release-session=base".into(),
                     ],
                     permissions: AcpPermissionPolicy::Deny,
                 },
@@ -3003,6 +3044,7 @@ mod tests {
             } else {
                 assert!(matches!(outcome, Err(ChildError::Failed(_))));
             }
+            assert_request_cancelled(&log, "session/fork").await;
             assert!(base.serial.try_lock().is_err());
             let mut next = Box::pin(base.prompt(
                 "s-test".into(),
@@ -3023,6 +3065,9 @@ mod tests {
                     .text,
                 "source survives cancellation"
             );
+            assert!(base.close().await.is_err());
+            assert_request_cancelled(&log, "session/close").await;
+            std::fs::write(close_release, b"ready").unwrap();
             base.close().await.unwrap();
         }
     }
