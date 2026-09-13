@@ -202,6 +202,10 @@ Nested agents cannot ask the user interactively. ACP permission requests therefo
 
 Kit never selects an allow option. Configure any additional non-interactive policy in the generic agent itself, with the same care as when running that executable directly.
 
+## Child elicitation
+
+Nested agents cannot collect interactive input. Kit answers child ACP `elicitation/create` requests with `cancel`, for both form and URL modes, rather than a method-not-found error. Kit does not supply form values, open URLs, or forward these requests to the parent model. This is independent of the child's permission policy; the child decides how to continue after cancellation.
+
 ## Cancellation, stop reasons, and retired sessions
 
 Cancelling an outer turn propagates to nested work. For a dispatched prompt, Kit sends ACP `session/cancel` and allows up to five seconds for the child to settle; a child that does not settle is terminated. Cancellation while starting, waiting for the session lock, prompting, or forking returns a cancelled tool result.
