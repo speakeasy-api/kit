@@ -892,6 +892,9 @@ impl Server {
         connection: V2ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
     ) -> Result<AttachedSession, AcpRuntimeError> {
+        let additional_directories = self
+            .runtime
+            .additional_directories(&additional_directories)?;
         // Reject exhaustion before admission or any binding, driver, or actor effects.
         let token = self.registry.next_token()?;
         let mut admission = self
@@ -899,11 +902,6 @@ impl Server {
             .begin_attachment()
             .map_err(|()| AcpRuntimeError::ClientClosed)?;
         let session_id = wire::SessionId::new(claim.id());
-        if !additional_directories.is_empty() {
-            return Err(AcpRuntimeError::Loop(
-                "this Kit runtime does not accept additional directories".into(),
-            ));
-        }
         let servers = mcp_servers
             .into_iter()
             .map(|server| match server {
@@ -1995,6 +1993,7 @@ fn set_v2_config(
 fn catalog_session_info(entry: &crate::session::CatalogEntry, cwd: &Path) -> wire::SessionInfo {
     let mut info =
         wire::SessionInfo::new(wire::SessionId::new(entry.id.clone()), cwd.to_path_buf())
+            .additional_directories(entry.additional_directories.clone())
             .title(entry.title.as_deref().map(str::to_owned))
             .updated_at(entry.updated_at_rfc3339());
     if entry.is_subagent {
@@ -5257,6 +5256,8 @@ mod tests {
     #[tokio::test]
     async fn v2_client_mcp_servers_are_honored_by_new_and_resume() {
         let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let extra_path = std::fs::canonicalize(extra.path()).unwrap();
         let credentials = crate::credentials::CredentialStorage::Memory;
         crate::provider::store_openrouter_test_credentials(&credentials);
         let runtime = Runtime::new_with_provider_and_credentials(
@@ -5298,7 +5299,7 @@ mod tests {
                 let error = connection
                     .send_request(
                         wire::NewSessionRequest::new(root.path().to_path_buf())
-                            .additional_directories(vec![root.path().to_path_buf()])
+                            .additional_directories(vec![root.path().join("missing-directory")])
                             .mcp_servers(unsupported.clone()),
                     )
                     .block_task()
@@ -5314,10 +5315,24 @@ mod tests {
                 let source = connection
                     .send_request(
                         wire::NewSessionRequest::new(root.path().to_path_buf())
+                            .additional_directories(vec![extra_path.clone()])
                             .mcp_servers(stdio.clone()),
                     )
                     .block_task()
                     .await?;
+                let listed = connection
+                    .send_request(wire::ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                let listed = listed
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == source.session_id)
+                    .unwrap();
+                assert_eq!(
+                    listed.additional_directories,
+                    vec![extra_path.clone().into()]
+                );
                 connection
                     .send_request(wire::CloseSessionRequest::new(source.session_id.clone()))
                     .block_task()
@@ -5339,6 +5354,7 @@ mod tests {
                             source.session_id.clone(),
                             root.path().to_path_buf(),
                         )
+                        .additional_directories(vec![extra_path.clone()])
                         .mcp_servers(stdio),
                     )
                     .block_task()
@@ -5823,6 +5839,7 @@ mod tests {
     fn catalog_entries_enrich_v2_session_info() {
         let info = catalog_session_info(
             &crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: "saved".into(),
                 title: Some("Saved session".into()),
                 preview: Some("Saved session preview".into()),

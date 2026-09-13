@@ -5767,6 +5767,7 @@ mod tests {
             assert_eq!(app.queue_focused, populated);
             app.apply(Update::SessionCatalog(Ok(vec![
                 crate::session::CatalogEntry {
+                    additional_directories: Vec::new(),
                     id: "saved".into(),
                     title: Some("Saved".into()),
                     preview: None,

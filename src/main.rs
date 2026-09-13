@@ -3299,6 +3299,7 @@ future_option = true
         ));
 
         let output = format_sessions(&[kit::session::CatalogEntry {
+            additional_directories: Vec::new(),
             id: "session-1".into(),
             title: Some("OAuth token bug".into()),
             preview: Some("Fix tests in the catalog".into()),
