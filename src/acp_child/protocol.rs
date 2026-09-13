@@ -57,7 +57,8 @@ pub(super) enum Version {
     V2,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "session/request_permission", response = v1::RequestPermissionResponse)]
 pub(super) struct PermissionRequest {
     pub options: Vec<v1::PermissionOption>,
 }

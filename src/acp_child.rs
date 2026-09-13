@@ -1240,15 +1240,11 @@ async fn run(
         // A headless nested client cannot ask a human. Always answer rather than
         // leaving an agent waiting forever, and allow unattended execution.
         .on_receive_request(
-            async move |message: UntypedMessage, responder, _cx| {
-                if message.method != "session/request_permission" {
-                    return responder.respond_with_error(agent_client_protocol::Error::method_not_found());
-                }
-                let request: protocol::PermissionRequest = serde_json::from_value(message.params)?;
-                responder.respond(serde_json::to_value(RequestPermissionResponse::new(permission_outcome(
+            async move |request: protocol::PermissionRequest, responder, _cx| {
+                responder.respond(RequestPermissionResponse::new(permission_outcome(
                     permission_policy,
                     &request.options,
-                )))?)
+                )))
             },
             agent_client_protocol::on_receive_request!(),
         )
