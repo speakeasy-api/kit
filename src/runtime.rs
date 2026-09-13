@@ -1342,7 +1342,18 @@ impl Runtime {
                 error,
             )
         })?;
-        let subagents = self.subagents.fresh();
+        let subagents = self
+            .subagents
+            .fresh()
+            .with_observer(opened.observer.clone(), opened.children)
+            .map_err(|error| {
+                record_runtime_failure(
+                    &session_id,
+                    crate::fatal::Surface::Prompt,
+                    "subagent_restore",
+                    error,
+                )
+            })?;
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
@@ -1626,7 +1637,9 @@ impl Runtime {
         .map_err(AcpRuntimeError::Loop)?;
         let subagents = self
             .subagents
-            .fresh_for_workspace(additional_directories, parent_context);
+            .fresh_for_workspace(additional_directories, parent_context)
+            .with_observer(opened.observer.clone(), opened.children)
+            .map_err(AcpRuntimeError::Loop)?;
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();

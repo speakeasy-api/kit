@@ -448,10 +448,17 @@ pub(super) async fn resume(
     root: std::path::PathBuf,
     additional_directories: Vec<std::path::PathBuf>,
 ) -> Result<v1::NewSessionResponse, Error> {
-    if version != Version::V2 {
-        return Err(Error::into_internal_error(std::io::Error::other(
-            "ACP child replay requires protocol v2",
-        )));
+    if version == Version::V1 {
+        let response = connection
+            .send_request(
+                v1::LoadSessionRequest::new(session_id.clone(), root)
+                    .additional_directories(additional_directories),
+            )
+            .block_task()
+            .await?;
+        let mut value = serde_json::to_value(response)?;
+        value["sessionId"] = serde_json::to_value(session_id)?;
+        return session_response(value);
     }
     let response = connection
         .send_request(

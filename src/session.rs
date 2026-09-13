@@ -6,6 +6,7 @@
 //! persistence for this process; acceptance is not a durability guarantee.
 
 use std::{
+    collections::BTreeMap,
     env,
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -22,6 +23,11 @@ use agentkit_core::{Item, ItemKind, Part, Timestamp};
 use agentkit_loop::{TranscriptEvent, TranscriptObserver};
 use serde::{Deserialize, Serialize};
 
+mod children;
+pub(crate) use children::{ChildLifecycle, DurableChild};
+
+// Separate from v4 redirects: pre-child readers must reject these records before writing.
+const CHILD_SCHEMA_VERSION: u32 = 5;
 pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -45,6 +51,10 @@ struct Record {
     replacement: Option<Vec<Item>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redirect: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child: Option<DurableChild>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<ChildSnapshot>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -58,6 +68,7 @@ struct SessionMetadata {
 pub struct OpenSession {
     pub transcript: Vec<Item>,
     pub observer: SessionObserver,
+    pub(crate) children: Vec<DurableChild>,
 }
 
 /// Read-only metadata for one durable session in a workspace.
@@ -397,6 +408,10 @@ fn open_with_initial_timestamps_in(
                 break (sources, authority);
             }
         };
+        let children = authority
+            .as_ref()
+            .map(|a| a.children.clone())
+            .unwrap_or_default();
         let transcript = if resume {
             authority
                 .ok_or_else(|| format!("session {session_id:?} does not exist"))?
@@ -420,7 +435,15 @@ fn open_with_initial_timestamps_in(
             created: (!resume).then(|| CreatedTranscript::new(None, filesystem, None)),
             publication: None,
         };
-        return finish_open(writer, transcript, initial, resume, false, initial_options);
+        return finish_open(
+            writer,
+            transcript,
+            children,
+            initial,
+            resume,
+            false,
+            initial_options,
+        );
     }
     let (migration_locks, authority) = loop {
         let sources = lock_migration_sources(
@@ -451,6 +474,10 @@ fn open_with_initial_timestamps_in(
             break (sources, authority);
         }
     };
+    let children = authority
+        .as_ref()
+        .map(|a| a.children.clone())
+        .unwrap_or_default();
     if resume {
         let authority =
             authority.ok_or_else(|| format!("session {session_id:?} does not exist"))?;
@@ -464,6 +491,7 @@ fn open_with_initial_timestamps_in(
             session_id,
             &workspace_root,
             &authority.items,
+            &authority.children,
             title_seed.as_deref(),
         )?;
         for legacy in authority.legacy_histories {
@@ -551,6 +579,7 @@ fn open_with_initial_timestamps_in(
     finish_open(
         writer,
         transcript,
+        children,
         initial,
         resume,
         stored_workspace.is_none(),
@@ -561,6 +590,7 @@ fn open_with_initial_timestamps_in(
 fn finish_open(
     mut writer: Writer,
     mut transcript: Vec<Item>,
+    children: Vec<DurableChild>,
     initial: Vec<Item>,
     resume: bool,
     bind_workspace: bool,
@@ -594,12 +624,23 @@ fn finish_open(
         writer.commit_creation()?;
     }
     Ok(OpenSession {
+        children,
         transcript,
         observer: SessionObserver(Arc::new(Mutex::new(writer))),
     })
 }
 
 impl SessionObserver {
+    /// Appends parent-owned child state under the transcript lease and generation lock.
+    /// Unlike ordinary transcript output, child lifecycle writes require disk.
+    /// No registry callback runs while this writer guard is held; poison is isolation.
+    pub(crate) fn persist_child(&self, child: &DurableChild) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .persist_child(child)
+    }
+
     pub(crate) fn prepare_creation(&self) -> Result<PreparedCreation, String> {
         let published = Arc::new(AtomicBool::new(false));
         let mut writer = self
@@ -653,6 +694,39 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
+    fn persist_child(&mut self, child: &DurableChild) -> Result<(), String> {
+        child.validate()?;
+        self.ensure_lock()?;
+        if self.file.is_none() {
+            return Err("child recovery requires available transcript storage".into());
+        }
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        let record = Record {
+            schema_version: CHILD_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation,
+            workspace_root: Some(self.workspace_root.clone()),
+            item: None,
+            replacement: None,
+            redirect: None,
+            child: Some(child.clone()),
+            snapshot: None,
+        };
+        self.write_record(record, generation)?;
+        if self.file.is_none() {
+            return Err("child checkpoint could not be persisted".into());
+        }
+        // Unlike ordinary best-effort transcript output, a lifecycle checkpoint
+        // must reach disk before a mutable prompt or explicit deletion proceeds.
+        self.lock
+            .filesystem()?
+            .require_disk(&self.path)
+            .map_err(|error| format!("child checkpoint is not durable: {error}"))
+    }
+
     fn commit_creation(&mut self) -> Result<(), String> {
         if self
             .publication
@@ -689,6 +763,8 @@ impl Writer {
             item: Some(item.clone()),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         self.write_record(record, generation)
     }
@@ -707,6 +783,8 @@ impl Writer {
             item: None,
             replacement: Some(transcript.to_vec()),
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         self.write_record(record, generation)
     }
@@ -897,7 +975,28 @@ fn stamp_item(item: &mut Item, now: Timestamp) {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildSnapshot {
+    replacement: Vec<Item>,
+    children: Vec<DurableChild>,
+    // Catalog context only: this is not an independently committed state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_seed: Option<Vec<Item>>,
+}
+
+// One delta per record, never one accumulated child map per checkpoint.
+// Replay borrows these payloads and runs only when comparing authorities.
+enum HistoryEntry {
+    Item(Item),
+    Replacement(Vec<Item>),
+    Child(Box<DurableChild>),
+    Snapshot(ChildSnapshot),
+}
+
 struct TranscriptHistory {
+    children: Vec<DurableChild>,
+    ancestry: Vec<HistoryEntry>,
     items: Vec<Item>,
     generation: u64,
     states: Vec<Vec<Item>>,
@@ -969,6 +1068,8 @@ fn read_record_lines(
     lines: impl Iterator<Item = Result<String, String>>,
 ) -> Result<StoredTranscript, String> {
     let mut items = Vec::new();
+    let mut children = BTreeMap::new();
+    let mut ancestry = Vec::new();
     let mut expected = 1_u64;
     let mut states = Vec::new();
     let mut redirect = None;
@@ -982,12 +1083,13 @@ fn read_record_lines(
                 | PREVIOUS_SCHEMA_VERSION
                 | SCHEMA_VERSION
                 | REDIRECT_SCHEMA_VERSION
+                | CHILD_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
                 record.schema_version,
                 index + 1,
-                REDIRECT_SCHEMA_VERSION
+                CHILD_SCHEMA_VERSION
             ));
         }
         if record.session_id != session_id || record.generation != expected {
@@ -1002,9 +1104,18 @@ fn read_record_lines(
                 path.display()
             ));
         }
-        match (record.item, record.replacement, record.redirect) {
-            (Some(item), None, None) if record.schema_version <= SCHEMA_VERSION => items.push(item),
-            (None, Some(replacement), None)
+        match (
+            record.item,
+            record.replacement,
+            record.redirect,
+            record.child,
+            record.snapshot,
+        ) {
+            (Some(item), None, None, None, None) if record.schema_version <= SCHEMA_VERSION => {
+                items.push(item.clone());
+                ancestry.push(HistoryEntry::Item(item));
+            }
+            (None, Some(replacement), None, None, None)
                 if matches!(
                     record.schema_version,
                     PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
@@ -1013,17 +1124,51 @@ fn read_record_lines(
                 if !items.is_empty() {
                     states.push(items.clone());
                 }
-                items = replacement;
+                items = replacement.clone();
+                ancestry.push(HistoryEntry::Replacement(replacement));
             }
-            (None, None, Some(target))
+            (None, None, Some(target), None, None)
                 if record.schema_version == REDIRECT_SCHEMA_VERSION
                     && record.workspace_root.is_some() =>
             {
                 redirect = Some(target);
             }
+            (None, None, None, Some(child), None)
+                if record.schema_version == CHILD_SCHEMA_VERSION
+                    && record.workspace_root.is_some() =>
+            {
+                child.validate()?;
+                children.insert(child.id.clone(), child.clone());
+                ancestry.push(HistoryEntry::Child(Box::new(child)));
+            }
+            (None, None, None, None, Some(snapshot))
+                if record.schema_version == CHILD_SCHEMA_VERSION
+                    && record.workspace_root.is_some()
+                    && !snapshot.replacement.is_empty() =>
+            {
+                let mut next = BTreeMap::new();
+                for child in &snapshot.children {
+                    child.validate()?;
+                    if next.insert(child.id.clone(), child.clone()).is_some() {
+                        return Err("duplicate child identity in session snapshot".into());
+                    }
+                }
+                if !items.is_empty() {
+                    states.push(items.clone());
+                }
+                if let Some(seed) = &snapshot.title_seed {
+                    if seed.is_empty() {
+                        return Err("empty title seed in session snapshot".into());
+                    }
+                    states.push(seed.clone());
+                }
+                items = snapshot.replacement.clone();
+                children = next;
+                ancestry.push(HistoryEntry::Snapshot(snapshot));
+            }
             _ => {
                 return Err(format!(
-                    "transcript line {} must contain exactly one item, replacement, or redirect",
+                    "transcript line {} must contain exactly one item, replacement, redirect, child, or snapshot",
                     index + 1
                 ));
             }
@@ -1038,6 +1183,8 @@ fn read_record_lines(
     }
     states.push(items.clone());
     Ok(StoredTranscript::History(TranscriptHistory {
+        children: children.into_values().collect(),
+        ancestry,
         items,
         generation: expected - 1,
         states,
@@ -1584,6 +1731,7 @@ pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
 }
 
 struct Authority {
+    children: Vec<DurableChild>,
     items: Vec<Item>,
     historical_items: Vec<Vec<Item>>,
     path: PathBuf,
@@ -1595,11 +1743,39 @@ struct HistoryCandidate {
     history: TranscriptHistory,
 }
 
-fn history_descends_from(history: &TranscriptHistory, ancestor: &[Item]) -> bool {
-    history
-        .states
-        .iter()
-        .any(|state| state.starts_with(ancestor))
+fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHistory) -> bool {
+    let mut items: Vec<&Item> = Vec::new();
+    let mut children: BTreeMap<&str, &DurableChild> = BTreeMap::new();
+    // A match must hold at one committed record boundary. In particular, a
+    // catalog title seed must never supply transcript ancestry for a snapshot.
+    for entry in &history.ancestry {
+        match entry {
+            HistoryEntry::Item(item) => items.push(item),
+            HistoryEntry::Replacement(replacement) => items = replacement.iter().collect(),
+            HistoryEntry::Child(child) => {
+                children.insert(&child.id, child);
+            }
+            HistoryEntry::Snapshot(snapshot) => {
+                items = snapshot.replacement.iter().collect();
+                children = snapshot
+                    .children
+                    .iter()
+                    .map(|child| (child.id.as_str(), child))
+                    .collect();
+            }
+        }
+        if items.len() == ancestor.items.len()
+            && items.iter().zip(&ancestor.items).all(|(a, b)| *a == b)
+            && children.len() == ancestor.children.len()
+            && children
+                .values()
+                .zip(&ancestor.children)
+                .all(|(a, b)| *a == b)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn select_authority(
@@ -1763,8 +1939,8 @@ fn select_authority_with(
             authority = Some(candidate);
             continue;
         };
-        let candidate_descends = history_descends_from(&candidate.history, &current.history.items);
-        let current_descends = history_descends_from(&current.history, &candidate.history.items);
+        let candidate_descends = history_descends_from(&candidate.history, &current.history);
+        let current_descends = history_descends_from(&current.history, &candidate.history);
         match (candidate_descends, current_descends) {
             (true, false) => *current = candidate,
             (false, true) => {}
@@ -1780,6 +1956,7 @@ fn select_authority_with(
         }
     }
     Ok(authority.map(|candidate| Authority {
+        children: candidate.history.children,
         items: candidate.history.items,
         historical_items: candidate.history.states,
         path: candidate.path,
@@ -2044,15 +2221,17 @@ fn establish_scoped_authority(
     session_id: &str,
     root: &Path,
     items: &[Item],
+    children: &[DurableChild],
     title_seed: Option<&[Item]>,
 ) -> Result<(), String> {
     let exists = fs::best_effort_global()
         .try_exists(path)
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
-    let (mut generation, existing_items) = if exists {
+    let (mut generation, existing_items, had_children) = if exists {
         match read_records_direct(path, session_id)? {
             StoredTranscript::History(history)
                 if history.items == items
+                    && history.children == children
                     && transcript_workspace(path, session_id)?.as_deref() == Some(root) =>
             {
                 return Ok(());
@@ -2063,6 +2242,7 @@ fn establish_scoped_authority(
                     .checked_add(1)
                     .ok_or_else(|| "session generation overflowed".to_string())?,
                 Some(history.items),
+                !history.children.is_empty(),
             ),
             StoredTranscript::Redirect(_) => {
                 return Err(format!(
@@ -2072,10 +2252,32 @@ fn establish_scoped_authority(
             }
         }
     } else {
-        (1, None)
+        (1, None, false)
     };
     let title_seed =
         title_seed.filter(|seed| *seed != items && existing_items.as_deref() != Some(*seed));
+    if !children.is_empty() || had_children {
+        return write_migration_record(
+            filesystem,
+            path,
+            &Record {
+                schema_version: CHILD_SCHEMA_VERSION,
+                session_id: session_id.into(),
+                generation,
+                workspace_root: Some(root.to_path_buf()),
+                item: None,
+                replacement: None,
+                redirect: None,
+                child: None,
+                snapshot: Some(ChildSnapshot {
+                    replacement: items.to_vec(),
+                    children: children.to_vec(),
+                    title_seed: title_seed.map(<[Item]>::to_vec),
+                }),
+            },
+            !exists,
+        );
+    }
     let mut create = !exists;
     if let Some(title_seed) = title_seed {
         write_migration_record(
@@ -2089,6 +2291,8 @@ fn establish_scoped_authority(
                 item: None,
                 replacement: Some(title_seed.to_vec()),
                 redirect: None,
+                child: None,
+                snapshot: None,
             },
             create,
         )?;
@@ -2108,9 +2312,12 @@ fn establish_scoped_authority(
             item: None,
             replacement: Some(items.to_vec()),
             redirect: None,
+            child: None,
+            snapshot: None,
         },
         create,
-    )
+    )?;
+    Ok(())
 }
 
 fn redirect_legacy_transcript(
@@ -2144,6 +2351,8 @@ fn redirect_legacy_transcript(
             item: None,
             replacement: None,
             redirect: Some(target),
+            child: None,
+            snapshot: None,
         },
         false,
     )
@@ -2327,6 +2536,8 @@ mod tests {
                     item: Some(item.clone()),
                     replacement: None,
                     redirect: None,
+                    child: None,
+                    snapshot: None,
                 })
                 .unwrap()
             })
@@ -2334,6 +2545,440 @@ mod tests {
             .join("\n");
         fs::write(path, format!("{encoded}\n")).unwrap();
         items
+    }
+
+    fn durable_child() -> DurableChild {
+        DurableChild {
+            id: "handle-1".into(),
+            acp_session_id: "actual-acp-session".into(),
+            name: "Ada".into(),
+            task: "Inspect recovery".into(),
+            generation: 2,
+            handle_generation: 2,
+            output: json!({"answer": "done"}),
+            updates: Some(json!({"items": [], "truncated": false})),
+            harness: "acp.kit".into(),
+            model: None,
+            root: PathBuf::from("/workspace"),
+            depth: 1,
+            lifecycle: ChildLifecycle::Idle,
+            created_at_unix_ms: 123,
+        }
+    }
+
+    // Each input value is one committed record; use the real strict reader.
+    fn child_history_bytes(payloads: impl IntoIterator<Item = serde_json::Value>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (index, mut payload) in payloads.into_iter().enumerate() {
+            payload["schema_version"] = json!(if payload.get("child").is_some()
+                || payload.get("snapshot").is_some()
+            {
+                CHILD_SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION
+            });
+            payload["session_id"] = json!("abc");
+            payload["generation"] = json!(index + 1);
+            payload["workspace_root"] = json!("/workspace");
+            serde_json::to_writer(&mut bytes, &payload).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn parsed_child_history(bytes: &[u8]) -> TranscriptHistory {
+        let StoredTranscript::History(history) =
+            read_records_bytes(Path::new("abc.jsonl"), "abc", bytes).unwrap()
+        else {
+            panic!("expected history");
+        };
+        history
+    }
+
+    #[test]
+    fn child_ancestry_requires_a_joint_record_boundary() {
+        let t1 = vec![Item::text(ItemKind::System, "first")];
+        let t2 = vec![Item::text(ItemKind::System, "second")];
+        let child = durable_child();
+        let ancestor = parsed_child_history(&child_history_bytes([
+            json!({"replacement": t1}),
+            json!({"child": child}),
+        ]));
+        let divergent = parsed_child_history(&child_history_bytes([
+            json!({"replacement": t1}),
+            json!({"replacement": t2}),
+            json!({"child": child}),
+        ]));
+        assert!(!history_descends_from(&divergent, &ancestor));
+        let descendant = parsed_child_history(&child_history_bytes([
+            json!({"replacement": t1}),
+            json!({"child": child}),
+            json!({"replacement": t2}),
+        ]));
+        assert!(history_descends_from(&descendant, &ancestor));
+        let seeded = parsed_child_history(&child_history_bytes([json!({
+            "snapshot": {"replacement": t2, "children": [child], "title_seed": t1}
+        })]));
+        assert!(!history_descends_from(&seeded, &ancestor));
+    }
+
+    #[test]
+    fn child_history_retains_individual_deltas_not_accumulated_maps() {
+        let children: Vec<_> = (0..128)
+            .map(|index| {
+                let mut child = durable_child();
+                child.id = format!("child-{index}");
+                child
+            })
+            .collect();
+        let payloads = std::iter::once(json!({
+            "replacement": [Item::text(ItemKind::System, "system")]
+        }))
+        .chain(children.iter().map(|child| json!({"child": child})));
+        let history = parsed_child_history(&child_history_bytes(payloads));
+        // HistoryEntry::Child owns exactly the incoming child, not a snapshot.
+        // Iterate the real record boundary rather than adding work counters.
+        let retained = history.ancestry.iter().filter_map(|entry| match entry {
+            HistoryEntry::Child(child) => Some(child.as_ref()),
+            HistoryEntry::Replacement(_) => None,
+            _ => panic!("ordinary child records must remain individual deltas"),
+        });
+        assert!(retained.eq(children.iter()));
+    }
+
+    #[test]
+    fn reordered_child_migration_is_atomic_and_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("abc.jsonl");
+        let lock = SessionLock::acquire(path.with_extension("lock"), true).unwrap();
+        let filesystem = lock.filesystem().unwrap();
+        let items = vec![Item::text(ItemKind::System, "system")];
+        let mut a = durable_child();
+        a.id = "a".into();
+        let mut b = a.clone();
+        b.id = "b".into();
+        let before = child_history_bytes([
+            json!({"replacement": items}),
+            json!({"child": a}),
+            json!({"child": b}),
+        ]);
+        b.lifecycle = ChildLifecycle::Closed;
+        a.lifecycle = ChildLifecycle::Closed;
+        // Source advances B before A, opposite to snapshot's ID order.
+        let mut source = before.clone();
+        for (generation, child) in [(4, &b), (5, &a)] {
+            let record = json!({"schema_version": CHILD_SCHEMA_VERSION,
+                "session_id": "abc", "generation": generation,
+                "workspace_root": "/workspace", "child": child});
+            serde_json::to_writer(&mut source, &record).unwrap();
+            source.push(b'\n');
+        }
+        let authority = parsed_child_history(&source);
+        fs::write(&path, &before).unwrap();
+        establish_scoped_authority(
+            &filesystem,
+            &path,
+            "abc",
+            Path::new("/workspace"),
+            &items,
+            &authority.children,
+            None,
+        )
+        .unwrap();
+        let complete = fs::read_to_string(&path).unwrap();
+        let checkpoint: Record = serde_json::from_str(complete.lines().last().unwrap()).unwrap();
+        assert!(checkpoint.snapshot.is_some());
+        assert!(checkpoint.child.is_none());
+        let encoded_len = serde_json::to_vec(&checkpoint).unwrap().len() + 1;
+        for cut in [1, encoded_len / 2, encoded_len - 1] {
+            fs::write(&path, &before).unwrap();
+            let error = write_migration_record_with(
+                &filesystem,
+                &path,
+                &checkpoint,
+                false,
+                |file, encoded| {
+                    file.write_all(&encoded[..cut])?;
+                    Err(io::Error::other("injected snapshot failure"))
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("injected snapshot failure"));
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(history_descends_from(
+                &authority,
+                &parsed_child_history(&fs::read(&path).unwrap())
+            ));
+            establish_scoped_authority(
+                &filesystem,
+                &path,
+                "abc",
+                Path::new("/workspace"),
+                &items,
+                &authority.children,
+                None,
+            )
+            .unwrap();
+            let restored = parsed_child_history(&fs::read(&path).unwrap());
+            assert_eq!(restored.children, authority.children);
+            assert!(history_descends_from(&restored, &authority));
+        }
+    }
+
+    #[test]
+    fn failed_joint_snapshot_creation_removes_partial_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("abc.jsonl");
+        let lock = SessionLock::acquire(path.with_extension("lock"), true).unwrap();
+        let filesystem = lock.filesystem().unwrap();
+        let bytes = child_history_bytes([json!({"snapshot": {
+            "replacement": [Item::text(ItemKind::System, "system")],
+            "children": [durable_child()]
+        }})]);
+        let record: Record = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            write_migration_record_with(&filesystem, &path, &record, true, |file, encoded| {
+                file.write_all(&encoded[..encoded.len() / 2])?;
+                Err(io::Error::other("injected snapshot creation failure"))
+            })
+            .is_err()
+        );
+        assert!(!filesystem.try_exists(&path).unwrap());
+        write_migration_record(&filesystem, &path, &record, true).unwrap();
+        assert_eq!(
+            parsed_child_history(&fs::read(&path).unwrap()).children,
+            vec![durable_child()]
+        );
+    }
+
+    #[test]
+    fn joint_snapshot_replaces_children_but_ordinary_replacement_preserves_them() {
+        let child = durable_child();
+        let initial = json!({"snapshot": {
+            "replacement": [Item::text(ItemKind::System, "initial")],
+            "children": [child]
+        }});
+        let replacement = json!({"replacement": [Item::text(ItemKind::System, "summary")]});
+        let history =
+            parsed_child_history(&child_history_bytes([initial.clone(), replacement.clone()]));
+        assert_eq!(history.children, vec![child]);
+        let cleared = parsed_child_history(&child_history_bytes([
+            initial,
+            replacement,
+            json!({"snapshot": {
+                "replacement": [Item::text(ItemKind::System, "reset")], "children": []
+            }}),
+        ]));
+        assert!(cleared.children.is_empty());
+    }
+
+    #[test]
+    fn joint_snapshot_rejects_malformed_and_mixed_payloads() {
+        let snapshot = json!({"snapshot": {
+            "replacement": [Item::text(ItemKind::System, "system")],
+            "children": [durable_child()]
+        }});
+        let mut duplicate = snapshot.clone();
+        duplicate["snapshot"]["children"] = json!([durable_child(), durable_child()]);
+        let mut malformed = snapshot.clone();
+        malformed["snapshot"]["children"][0]["generation"] = json!(0);
+        let mut unknown = snapshot.clone();
+        unknown["snapshot"]["extra"] = json!(true);
+        let mut empty = snapshot.clone();
+        empty["snapshot"]["replacement"] = json!([]);
+        let mut mixed = snapshot.clone();
+        mixed["child"] = json!(durable_child());
+        for payload in [duplicate, malformed, unknown, empty, mixed] {
+            let bytes = child_history_bytes([payload]);
+            assert!(read_records_bytes(Path::new("abc.jsonl"), "abc", &bytes).is_err());
+        }
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&child_history_bytes([snapshot])).unwrap();
+        for version in [SCHEMA_VERSION, REDIRECT_SCHEMA_VERSION] {
+            old["schema_version"] = json!(version);
+            assert!(
+                read_records_bytes(
+                    Path::new("abc.jsonl"),
+                    "abc",
+                    &serde_json::to_vec(&old).unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn durable_child_write_respects_pending_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open_with_initial_timestamps_in(
+            &project_root(root.path()),
+            &session_directory(root.path()),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+            InitialTranscriptOptions {
+                stamp_items: true,
+                commit_creation: false,
+            },
+        )
+        .unwrap();
+        let prepared = opened.observer.prepare_creation().unwrap();
+        let path = transcript_path(root.path(), "abc");
+        let before = fs::read(&path).unwrap();
+        let child = durable_child();
+        assert!(opened.observer.persist_child(&child).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        prepared.commit();
+        opened.observer.persist_child(&child).unwrap();
+        drop(opened);
+        assert_eq!(
+            open(root.path(), "abc", true, false, Vec::new())
+                .unwrap()
+                .children,
+            vec![child]
+        );
+    }
+
+    #[test]
+    fn durable_children_survive_replacement_reopen_and_close() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        assert!(opened.children.is_empty());
+        let mut child = durable_child();
+        opened.observer.persist_child(&child).unwrap();
+        child.lifecycle = ChildLifecycle::Interrupted;
+        opened.observer.persist_child(&child).unwrap();
+        opened.observer.replace(&opened.transcript).unwrap();
+        drop(opened);
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.children, vec![child.clone()]);
+        assert_eq!(opened.transcript.len(), 1);
+        child.lifecycle = ChildLifecycle::Closed;
+        opened.observer.persist_child(&child).unwrap();
+        drop(opened);
+        let reopened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(reopened.children, vec![child]);
+        let records: Vec<Record> = fs::read_to_string(transcript_path(root.path(), "abc"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let child_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.child.is_some())
+            .collect();
+        assert_eq!(child_records.len(), 3);
+        assert!(
+            child_records
+                .iter()
+                .all(|record| record.schema_version == CHILD_SCHEMA_VERSION
+                    && record.item.is_none()
+                    && record.replacement.is_none()
+                    && record.redirect.is_none())
+        );
+    }
+
+    #[test]
+    fn durable_children_survive_reconstruction_and_are_not_forked() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let child = durable_child();
+        opened.observer.persist_child(&child).unwrap();
+        fs::remove_file(transcript_path(root.path(), "abc")).unwrap();
+        write(&opened.observer, &Item::text(ItemKind::User, "continued"));
+        clone_completed(root.path(), "abc", "fork").unwrap();
+        let fork = open(root.path(), "fork", true, false, Vec::new()).unwrap();
+        assert!(fork.children.is_empty());
+        drop(opened);
+        let reopened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(reopened.children, vec![child]);
+    }
+
+    #[test]
+    fn durable_child_records_reject_malformed_and_mixed_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        opened.observer.persist_child(&durable_child()).unwrap();
+        drop(opened);
+        let path = transcript_path(root.path(), "abc");
+        let records: Vec<Record> = fs::read_to_string(transcript_path(root.path(), "abc"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let initial = serde_json::to_string(&records[0]).unwrap();
+        let child = serde_json::to_value(&records[1]).unwrap();
+        let mut malformed = child.clone();
+        malformed["child"]["unexpected"] = json!(true);
+        let mut wrong_type = child.clone();
+        wrong_type["child"]["generation"] = json!("two");
+        let mut mixed = child.clone();
+        mixed["item"] = serde_json::to_value(Item::text(ItemKind::System, "mixed")).unwrap();
+        let mut legacy = child;
+        legacy["schema_version"] = json!(SCHEMA_VERSION);
+        for invalid in [malformed, wrong_type, mixed, legacy] {
+            let encoded = format!("{initial}\n{}\n", serde_json::to_string(&invalid).unwrap());
+            assert!(read_records_bytes(&path, "abc", encoded.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn durable_children_survive_legacy_relocation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = canonical_workspace(&project_root(root.path()));
+        let legacy = super::transcript_path(&session_directory(root.path()), "abc");
+        write_history(
+            &legacy,
+            SCHEMA_VERSION,
+            "abc",
+            &["system"],
+            Some(project.clone()),
+        );
+        let child = durable_child();
+        write_migration_record(
+            fs::global(),
+            &legacy,
+            &Record {
+                schema_version: CHILD_SCHEMA_VERSION,
+                session_id: "abc".into(),
+                generation: 2,
+                workspace_root: Some(project),
+                item: None,
+                replacement: None,
+                redirect: None,
+                child: Some(child.clone()),
+                snapshot: None,
+            },
+            false,
+        )
+        .unwrap();
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.children, vec![child.clone()]);
+        drop(opened);
+        let reopened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(reopened.children, vec![child]);
     }
 
     #[test]
@@ -2885,6 +3530,8 @@ mod tests {
                     item: None,
                     replacement: None,
                     redirect: Some(target),
+                    child: None,
+                    snapshot: None,
                 };
                 let mut contents = fs::read_to_string(&path).unwrap();
                 contents.push_str(&serde_json::to_string(&redirect).unwrap());
@@ -2944,6 +3591,8 @@ mod tests {
             item: Some(item.clone()),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         fs::write(
             legacy.join("abc.jsonl"),
@@ -3074,6 +3723,8 @@ mod tests {
             item: None,
             replacement: None,
             redirect: Some(root.path().join("scoped/abc.jsonl")),
+            child: None,
+            snapshot: None,
         };
 
         let error = write_migration_record_with(
@@ -3185,6 +3836,8 @@ mod tests {
                 item: None,
                 replacement: Some(compacted.clone()),
                 redirect: None,
+                child: None,
+                snapshot: None,
             },
             false,
         )
@@ -3215,6 +3868,8 @@ mod tests {
             item: None,
             replacement: Some(expected.clone()),
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
         fs::write(&scoped, &encoded[..encoded.len() / 2]).unwrap();
@@ -3253,6 +3908,8 @@ mod tests {
             item: None,
             replacement: None,
             redirect: Some(normalized_absolute(&scoped).unwrap()),
+            child: None,
+            snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
         OpenOptions::new()
@@ -3301,6 +3958,8 @@ mod tests {
                     item: Some(Item::text(ItemKind::User, "downgraded write")),
                     replacement: None,
                     redirect: None,
+                    child: None,
+                    snapshot: None,
                 },
                 false,
             )
@@ -3364,6 +4023,8 @@ mod tests {
             item: Some(Item::text(ItemKind::System, "legacy")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         fs::write(
             legacy.join("abc.jsonl"),
@@ -3718,6 +4379,8 @@ mod tests {
             item: Some(Item::text(ItemKind::Assistant, "concurrent append")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let mut encoded = serde_json::to_vec(&record).unwrap();
         encoded.push(b'\n');
@@ -4034,6 +4697,8 @@ mod tests {
             item: Some(Item::text(ItemKind::System, "system")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let original_user = Record {
             schema_version: SCHEMA_VERSION,
@@ -4043,6 +4708,8 @@ mod tests {
             item: Some(Item::text(ItemKind::User, "Original title")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let current = vec![
             Item::text(ItemKind::System, "summary"),
@@ -4056,6 +4723,8 @@ mod tests {
             item: None,
             replacement: Some(current.clone()),
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let legacy = super::transcript_path(storage.path(), id);
         fs::write(
@@ -4139,6 +4808,8 @@ mod tests {
             item: Some(Item::text(ItemKind::User, "private prompt")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         fs::write(
             super::transcript_path(storage.path(), "legacy"),
@@ -4192,6 +4863,8 @@ mod tests {
                 item: Some(Item::text(ItemKind::User, "first private prompt")),
                 replacement: None,
                 redirect: None,
+                child: None,
+                snapshot: None,
             },
             Record {
                 schema_version: SCHEMA_VERSION,
@@ -4201,6 +4874,8 @@ mod tests {
                 item: Some(Item::text(ItemKind::User, "second private prompt")),
                 replacement: None,
                 redirect: None,
+                child: None,
+                snapshot: None,
             },
         ];
         let transcript = records
@@ -4249,6 +4924,8 @@ mod tests {
             item: Some(Item::text(ItemKind::User, "private global prompt")),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         fs::write(
             super::transcript_path(storage.path(), id),
@@ -4378,6 +5055,8 @@ mod tests {
             item: Some(item.clone()),
             replacement: None,
             redirect: None,
+            child: None,
+            snapshot: None,
         };
         let unscoped = super::transcript_path(storage.path(), "legacy-id");
         fs::write(

@@ -51,6 +51,7 @@ impl Subagents {
                     kit: true,
                     root: self.config.root.clone(),
                     child: None,
+                    recovery: None,
                     forking: None,
                     permit: Some(self.reserve().unwrap()),
                 },
@@ -346,6 +347,7 @@ fn manager_with_disconnected_session(
         kit: true,
         root: root.to_path_buf(),
         child: Some(ChildSession::disconnected_for_test()),
+        recovery: None,
         forking: None,
         permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
     }));
@@ -2177,3 +2179,6 @@ async fn additional_directories_reject_unsupported_harness_before_session_creati
         .await
         .unwrap();
 }
+
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
