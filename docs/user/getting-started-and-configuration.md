@@ -223,7 +223,7 @@ voice = false # opt in to native TUI voice with true
 [acp.review]
 command = "review-agent"
 args = ["acp"]
-permissions = "deny" # "deny" or "cancel"
+permissions = "allow" # default; legacy "deny" and "cancel" also allow
 
 [subagent]
 harness = "acp.review"
