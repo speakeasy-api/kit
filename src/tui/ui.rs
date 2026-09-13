@@ -759,10 +759,15 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
 }
 
 fn cost_label(amount: f64, currency: &str) -> String {
-    if amount > 0.0 && amount < 0.0001 {
-        format!("{currency} <0.0001")
+    let prefix = if currency == "USD" {
+        "$".to_owned()
     } else {
-        format!("{currency} {amount:.4}")
+        format!("{currency} ")
+    };
+    if amount > 0.0 && amount < 0.0001 {
+        format!("{prefix}<0.0001")
+    } else {
+        format!("{prefix}{amount:.4}")
     }
 }
 
@@ -799,7 +804,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(cost) = &app.cost {
         fields.push((
             4,
-            format!("cost {}", cost_label(cost.amount, &cost.currency)),
+            cost_label(cost.amount, &cost.currency),
             theme::dim(),
         ));
     }
@@ -2005,7 +2010,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .map(|(currency, amount)| cost_label(amount, &currency))
             .collect::<Vec<_>>();
         if !costs.is_empty() {
-            parts.push(format!("reported cost {}", costs.join(" + ")));
+            parts.push(costs.join(" + "));
         }
         if counts.starting > 0 {
             parts.push(format!("{} starting", counts.starting));
@@ -3131,7 +3136,7 @@ mod tests {
             .expect("draw succeeds");
         assert!(
             buffer_row(terminal.backend().buffer(), 7)
-                .contains("reported cost EUR 2.0000 + USD 1.7500")
+                .contains("EUR 2.0000 + $1.7500")
         );
     }
 
@@ -4836,7 +4841,7 @@ mod tests {
                 .lines()
                 .next()
                 .unwrap()
-                .contains("cost")
+                .contains('$')
         );
         app.apply(Update::Usage {
             used: 1,
@@ -4848,7 +4853,7 @@ mod tests {
                 .lines()
                 .next()
                 .unwrap()
-                .contains("cost USD 0.0000")
+                .contains("$0.0000")
         );
         app.apply(Update::Usage {
             used: 1,
@@ -4860,9 +4865,9 @@ mod tests {
                 .lines()
                 .next()
                 .unwrap()
-                .contains("cost EUR 1.2345")
+                .contains("EUR 1.2345")
         );
-        assert_eq!(super::cost_label(0.000001, "USD"), "USD <0.0001");
+        assert_eq!(super::cost_label(0.000001, "USD"), "$<0.0001");
     }
 
     #[test]
@@ -4870,7 +4875,7 @@ mod tests {
         let mut row = test_agent("Scout", SubagentStatus::Working, None, None, "Explore");
         row.cost = Some(agent_client_protocol::schema::v2::Cost::new(0.125, "USD"));
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
-        assert!(line_text(&lines[2]).contains("USD 0.1250"));
+        assert!(line_text(&lines[2]).contains("$0.1250"));
     }
 
     #[test]
