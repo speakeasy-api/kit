@@ -863,6 +863,7 @@ pub struct App {
     pub storage_exhausted: bool,
     pub show_thoughts: bool,
     agents_visible: bool,
+    agents_auto_opened: bool,
     agents: HashMap<String, AgentRow>,
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
@@ -1114,6 +1115,7 @@ impl App {
             storage_exhausted: false,
             show_thoughts: false,
             agents_visible: false,
+            agents_auto_opened: false,
             agents: HashMap::new(),
             agent_versions: HashMap::new(),
             cleaned_agent_ids: HashSet::new(),
@@ -2404,6 +2406,10 @@ impl App {
                 {
                     self.agents.remove(&id);
                 } else {
+                    if !self.agents_auto_opened && status != SubagentStatus::Removed {
+                        self.agents_visible = true;
+                        self.agents_auto_opened = true;
+                    }
                     // Usage arrives on its own event stream; a lifecycle
                     // transition must not blank a reading already shown.
                     let usage = self.agents.get(&id).and_then(|row| row.usage);
@@ -2646,6 +2652,7 @@ impl App {
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
+        self.agents_auto_opened = false;
         self.agents.clear();
         self.agent_versions.clear();
         self.cleaned_agent_ids.clear();
@@ -8973,6 +8980,54 @@ mod tests {
             100,
         );
         assert!(app.agents().iter().any(|row| row.id == "unrelated"));
+    }
+
+    #[test]
+    fn agents_roster_auto_opens_once_per_session() {
+        use crate::events::SubagentStatus;
+
+        let mut app = app();
+        app.editor.insert_str("draft");
+        assert!(!app.show_agents());
+
+        let launch = agent_event(
+            "scout",
+            "Scout",
+            SubagentStatus::Starting,
+            None,
+            1,
+            None,
+            (10, 10, None),
+        );
+        app.apply_runtime_at(launch.clone(), 10);
+        assert!(app.show_agents());
+        assert_eq!(app.editor.text(), "draft");
+
+        app.toggle_agents();
+        app.apply_runtime_at(launch.clone(), 11);
+        app.apply_runtime_at(
+            agent_event(
+                "second",
+                "Second",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (12, 12, None),
+            ),
+            12,
+        );
+        assert!(!app.show_agents());
+
+        app.start_session("replacement".into());
+        app.apply_runtime_at(
+            RuntimeEvent::SessionStarted {
+                session_id: "replacement".into(),
+            },
+            13,
+        );
+        app.apply_runtime_at(launch, 13);
+        assert!(app.show_agents());
     }
 
     #[test]

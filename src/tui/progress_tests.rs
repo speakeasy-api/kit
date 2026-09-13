@@ -1115,7 +1115,8 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
         assert!(!app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 0);
         assert!(!app.storage_pending && !app.storage_exhausted && !app.compacting);
-        let frame = render(&mut app, 140, 50);
+        // Leave room for the recovery note alongside the automatically opened roster.
+        let frame = render(&mut app, 200, 50);
         assert!(!frame.contains("Runtime status unavailable"));
         assert!(frame.contains("Runtime status resumed"));
         assert!(frame.contains("state remains unknown"));
