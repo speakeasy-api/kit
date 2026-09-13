@@ -290,7 +290,7 @@ impl AcpHarnesses {
             command
         } else {
             let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-            command.arg("acp");
+            command.args(["acp", "--protocol-version", "2"]);
             command
         };
         let (id, resume) = persisted.ok_or("Kit harness requires a persistent session")?;
@@ -2632,6 +2632,7 @@ mod tests {
                 args.windows(2)
                     .any(|pair| pair == ["--request-budget-seconds", "300"])
             );
+            assert_eq!(&args[..3], ["acp", "--protocol-version", "2"]);
             assert_eq!(args.iter().any(|arg| arg == "--resume"), resume);
             let command = serve_command(
                 root.path(),
