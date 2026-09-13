@@ -170,7 +170,12 @@ macro_rules! session_requests {
         impl SessionRequest for v1::$name { type V2 = v2::$name; }
     )*};
 }
-session_requests!(NewSessionRequest, ForkSessionRequest, CloseSessionRequest,);
+session_requests!(
+    NewSessionRequest,
+    ForkSessionRequest,
+    CloseSessionRequest,
+    DeleteSessionRequest
+);
 
 impl SessionRequest for v1::SetSessionConfigOptionRequest {
     type V2 = v2::SetSessionConfigOptionRequest;
