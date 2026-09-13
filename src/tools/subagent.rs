@@ -2272,6 +2272,7 @@ mod steer_tests {
             kit: true,
             root: root.to_path_buf(),
             child: Some(ChildSession::disconnected_for_test()),
+            recovery: None,
             forking: None,
             permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
         }));

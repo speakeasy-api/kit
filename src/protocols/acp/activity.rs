@@ -50,6 +50,7 @@ struct Activity {
 /// be rolled back or safely retried after unwind or cancellation.
 #[derive(Clone)]
 pub(super) struct SessionActivity {
+    pub(super) tool_projection: Arc<std::sync::OnceLock<super::tool_projection::Subscription>>,
     state: Arc<Mutex<Activity>>,
     project: Arc<dyn Fn(Transition) -> Result<(), AcpRuntimeError> + Send + Sync>,
 }
@@ -59,9 +60,19 @@ impl SessionActivity {
         project: impl Fn(Transition) -> Result<(), AcpRuntimeError> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            tool_projection: Arc::new(std::sync::OnceLock::new()),
             state: Arc::new(Mutex::new(Activity::default())),
             project: Arc::new(project),
         }
+    }
+
+    /// Called after domain cleanup and before the protocol content flush/Idle.
+    /// No activity guard is held while waiting for the projection owner.
+    pub(super) async fn drain_tool_projection(&self) -> Result<(), AcpRuntimeError> {
+        if let Some(projection) = self.tool_projection.get() {
+            projection.drain().await?;
+        }
+        Ok(())
     }
 
     pub(super) fn observe(&self, event: &AgentEvent) {

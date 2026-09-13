@@ -425,6 +425,24 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
+            self.activity.tool_projection.get_or_init(|| {
+                let sink = self.sink.clone();
+                let session_id = self.session_id.clone();
+                super::tool_projection::Subscription::start(
+                    event.session_id.0.clone(),
+                    move |update| {
+                        update.v2().is_ok_and(|update| {
+                            sink.update(wire::UpdateSessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ))
+                            .is_ok()
+                        })
+                    },
+                )
+            });
+        }
         self.activity.observe(&event.event);
         if let AgentEvent::UsageUpdated(usage) = &event.event {
             let Some(update) = usage_update(usage) else {
@@ -475,9 +493,18 @@ where
 }
 
 fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<wire::SessionUpdate> {
+    if call.name != agentkit_tool_compose::COMPOSE_TOOL_NAME {
+        return None;
+    }
     Some(wire::SessionUpdate::ToolCallUpdate(
         wire::ToolCallUpdate::new(wire::ToolCallId::new(call.id.to_string()))
-            .title(super::compose_intent(call)?.to_owned()),
+            .title(
+                super::compose_intent(call)
+                    .unwrap_or("Running composed tools")
+                    .to_owned(),
+            )
+            .name("compose".to_owned())
+            .kind(wire::ToolKind::Execute),
     ))
 }
 
@@ -1801,7 +1828,11 @@ async fn run_active_turn<S: ModelSession + Send + 'static>(
                 let result = super::activity::finalize(
                     outcome,
                     structured,
-                    integration.flush_session_updates(session_id),
+                    async {
+                        let projected = activity.drain_tool_projection().await;
+                        let delivered = integration.flush_session_updates(session_id).await;
+                        projected.and(delivered)
+                    },
                     |error| sink.update(error_diagnostic_notification(session_id, error)),
                 )
                 .await;
@@ -3288,6 +3319,101 @@ mod tests {
             loop_error_stop_reason(&session_id, &LoopError::Cancelled).unwrap(),
             FinishReason::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn finalization_drains_inner_tool_completion_before_idle() {
+        use agentkit_tools_core::{ToolName, ToolRequest};
+        let integration = AcpIntegration::default();
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("projection-drain-wire");
+        let loop_id = SessionId::new("projection-drain-loop");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let handle = integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                sink.clone(),
+            ))
+            .unwrap();
+        let observer = ResponseReplacementObserver::new(
+            integration.clone(),
+            sink.clone(),
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(TestAdapter {
+                outcome: TestOutcome::Content,
+                turns: Arc::new(AtomicU64::new(0)),
+                interrupt: None,
+            })
+            .observer(observer.clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id.clone()).without_cache())
+            .await
+            .unwrap();
+        for event in [
+            AgentEvent::TurnStarted {
+                session_id: loop_id.clone(),
+                turn_id: agentkit_core::TurnId::new("turn"),
+            },
+            AgentEvent::ToolCallRequested(agentkit_core::ToolCallPart::new(
+                "parent",
+                "compose",
+                json!({"script": "return 1"}),
+            )),
+        ] {
+            observer.handle_event(ObservedEvent {
+                session_id: Arc::new(loop_id.clone()),
+                event,
+            });
+        }
+        let request = ToolRequest::new(
+            agentkit_core::ToolCallId::new("parent:compose:node"),
+            ToolName::new("shell"),
+            json!({}),
+            loop_id,
+            agentkit_core::TurnId::new("turn"),
+        );
+        // No yield between publication and finalization. The projection task has
+        // not run; a sink-only flush cannot account for these queued frames.
+        super::super::tool_projection::Invocation::start(&request, None)
+            .unwrap()
+            .finish(true);
+        run_active_turn(
+            &session_id,
+            &integration,
+            &handle,
+            &mut driver,
+            &sink,
+            handle.cancellation_handle().generation(),
+            None,
+            &activity,
+            ExecutionOrigin::Prompt,
+        )
+        .await
+        .unwrap();
+        let updates = recording.updates.lock().unwrap();
+        let completion = updates
+            .iter()
+            .position(|notification| {
+                let value = serde_json::to_value(&notification.update).unwrap();
+                value["toolCallId"] == "parent:compose:node" && value["status"] == "completed"
+            })
+            .expect("terminal inner card must be drained before completion");
+        let idle = updates
+            .iter()
+            .position(|notification| {
+                matches!(
+                    notification.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+                )
+            })
+            .unwrap();
+        assert!(completion < idle);
     }
 
     #[tokio::test]
