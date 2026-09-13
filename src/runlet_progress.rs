@@ -11,7 +11,6 @@ use std::{num::NonZeroUsize, time::Duration};
 use transport::Transport;
 
 pub const MAX_SOURCE: usize = 64 * 1024;
-#[cfg(feature = "tui")]
 pub const MAX_NODES: usize = 256;
 #[cfg(feature = "tui")]
 pub const MAX_RUNS: usize = 32;

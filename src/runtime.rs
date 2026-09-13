@@ -1211,14 +1211,14 @@ impl Runtime {
             .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
                 &self.root,
             ))))
-            .with(Observed::new(ReadFileTool::new(self.root.clone())))
+            .with(Observed::new(ReadFileTool::new(self.root.clone())).with_root(self.root.clone()))
             .with(Observed::new(crate::tools::ImageGenTool::new(
                 self.root.clone(),
                 self.credential_storage.clone(),
             )))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
-            .with(Observed::new(EditTool::new(self.root.clone())));
+            .with(Observed::new(EditTool::new(self.root.clone())).with_root(self.root.clone()));
         if depth < self.max_subagent_depth {
             children
                 .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))

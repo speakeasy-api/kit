@@ -53,6 +53,7 @@ use tracing::Instrument as _;
 mod activity;
 pub(crate) mod model_switch;
 mod skill_catalog;
+pub(crate) mod tool_projection;
 pub mod v2;
 
 use crate::{
@@ -182,10 +183,20 @@ pub(super) fn compose_intent(call: &agentkit_core::ToolCallPart) -> Option<&str>
 }
 
 fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<SessionUpdate> {
+    if call.name != agentkit_tool_compose::COMPOSE_TOOL_NAME {
+        return None;
+    }
     Some(SessionUpdate::ToolCallUpdate(
         agentkit_acp::ToolCallUpdate::new(
             agentkit_acp::ToolCallId::new(call.id.to_string()),
-            ToolCallUpdateFields::new().title(compose_intent(call)?.to_owned()),
+            ToolCallUpdateFields::new()
+                .title(
+                    compose_intent(call)
+                        .unwrap_or("Running composed tools")
+                        .to_owned(),
+                )
+                .name("compose".to_owned())
+                .kind(agentkit_acp::ToolKind::Execute),
         ),
     ))
 }
@@ -1052,6 +1063,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    projection: Arc<std::sync::OnceLock<tool_projection::Subscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1066,6 +1078,7 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            projection: Arc::new(std::sync::OnceLock::new()),
             activity,
             inner,
             client,
@@ -1076,6 +1089,19 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
+            self.projection.get_or_init(|| {
+                let client = self.client.clone();
+                let session_id = self.session_id.clone();
+                tool_projection::Subscription::start(event.session_id.0.clone(), move |update| {
+                    update.v1().is_ok_and(|update| {
+                        client
+                            .notify_session(SessionNotification::new(session_id.clone(), update))
+                            .is_ok()
+                    })
+                })
+            });
+        }
         self.activity.observe(&event.event);
         if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             let notification = SessionNotification::new(
@@ -4585,7 +4611,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn compose_title_ignores_empty_invalid_and_non_compose_intent() {
+    fn compose_title_falls_back_for_empty_intent_and_ignores_non_compose() {
         for (name, input) in [
             ("compose", json!({})),
             ("compose", json!({"intent": "  "})),
@@ -4593,7 +4619,19 @@ pub(super) mod tests {
             ("shell", json!({"intent": "Checking files"})),
         ] {
             let call = agentkit_core::ToolCallPart::new("call", name, input);
-            assert!(compose_title_update(&call).is_none());
+            let update = compose_title_update(&call);
+            if name == "compose" {
+                let SessionUpdate::ToolCallUpdate(update) = update.unwrap() else {
+                    panic!("expected metadata patch");
+                };
+                assert_eq!(
+                    update.fields.title.as_deref(),
+                    Some("Running composed tools")
+                );
+                assert_eq!(update.fields.kind, Some(agentkit_acp::ToolKind::Execute));
+            } else {
+                assert!(update.is_none());
+            }
         }
     }
 

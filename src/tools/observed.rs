@@ -19,17 +19,22 @@ use serde_json::Value;
 use crate::events::{self, RuntimeEvent, summarize_input, summarize_output};
 
 /// Wraps a tool so its calls appear on the runtime side channel.
-pub struct Observed<T>(T);
+pub struct Observed<T>(T, Option<std::path::PathBuf>);
 
 impl<T: Tool> Observed<T> {
     pub const fn new(tool: T) -> Self {
-        Self(tool)
+        Self(tool, None)
+    }
+
+    pub(crate) fn with_root(mut self, root: std::path::PathBuf) -> Self {
+        self.1 = Some(root);
+        self
     }
 }
 
 /// Wraps a dynamically dispatched tool without hiding its changing spec.
 pub(crate) fn shared(tool: Arc<dyn Tool>) -> impl Tool {
-    Observed(SharedTool(tool))
+    Observed(SharedTool(tool), None)
 }
 
 struct SharedTool(Arc<dyn Tool>);
@@ -91,7 +96,12 @@ impl<T: Tool> Tool for Observed<T> {
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let display = DisplayInvocation::start(&request);
+        let projection =
+            crate::protocols::acp::tool_projection::Invocation::start(&request, self.1.as_deref());
         let outcome = self.0.invoke(request, context).await;
+        if let Some(projection) = projection {
+            projection.finish(outcome.as_ref().is_ok_and(|result| !result.result.is_error));
+        }
         if let Some(display) = display {
             display.finish(outcome.as_ref());
         }
@@ -104,7 +114,12 @@ impl<T: Tool> Tool for Observed<T> {
         context: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
         let display = DisplayInvocation::start(&request);
+        let projection =
+            crate::protocols::acp::tool_projection::Invocation::start(&request, self.1.as_deref());
         let outcome = self.0.invoke_outcome(request, context).await;
+        if let Some(projection) = projection {
+            projection.finish(matches!(&outcome, ToolExecutionOutcome::Completed(result) if !result.result.is_error));
+        }
         if let Some(display) = display {
             match &outcome {
                 ToolExecutionOutcome::Completed(result) => display.finish(Ok(result)),

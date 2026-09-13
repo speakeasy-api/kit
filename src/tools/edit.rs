@@ -256,10 +256,10 @@ impl Tool for EditTool {
 
     async fn invoke(
         &self,
-        request: ToolRequest,
+        mut request: ToolRequest,
         _context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let input: EditInput = serde_json::from_value(request.input)
+        let input: EditInput = serde_json::from_value(std::mem::take(&mut request.input))
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         let path = match &input {
             EditInput::Add { path, .. }
@@ -281,13 +281,19 @@ impl Tool for EditTool {
                 let original = fs::read_to_string(&path).map_err(io_error)?;
                 let crlf = original.contains("\r\n");
                 let mut content = normalize_newlines(&original);
+                let mut first_line = None;
                 for hunk in hunks {
-                    content = apply_hunk(content, hunk)?;
+                    let (updated, line) = apply_hunk(content, hunk)?;
+                    content = updated;
+                    first_line.get_or_insert(line);
                 }
                 if crlf {
                     content = content.replace('\n', "\r\n");
                 }
                 write_atomic(&path, content.as_bytes())?;
+                if let Some(line) = first_line {
+                    crate::protocols::acp::tool_projection::location(&request, &path, line);
+                }
                 "edited"
             }
             EditInput::Delete { .. } => {
@@ -309,7 +315,7 @@ impl Tool for EditTool {
     }
 }
 
-fn apply_hunk(mut content: String, hunk: Hunk) -> Result<String, ToolError> {
+fn apply_hunk(mut content: String, hunk: Hunk) -> Result<(String, u32), ToolError> {
     let before = normalize_newlines(&hunk.context_before);
     let old = normalize_newlines(&hunk.old);
     let new = normalize_newlines(&hunk.new);
@@ -332,8 +338,16 @@ fn apply_hunk(mut content: String, hunk: Hunk) -> Result<String, ToolError> {
         }));
     };
     let old_start = start + before.len();
+    let line = u32::try_from(
+        content[..old_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+    .saturating_add(1);
     content.replace_range(old_start..old_start + old.len(), &new);
-    Ok(content)
+    Ok((content, line))
 }
 
 fn rooted(root: &Path, value: &str) -> Result<PathBuf, ToolError> {
@@ -397,7 +411,10 @@ mod tests {
             new: "x\n".into(),
             context_after: "c\n".into(),
         };
-        assert_eq!(apply_hunk("a\nb\nc\n".into(), hunk()).unwrap(), "a\nx\nc\n");
+        assert_eq!(
+            apply_hunk("a\nb\nc\n".into(), hunk()).unwrap(),
+            ("a\nx\nc\n".into(), 2)
+        );
         assert!(apply_hunk("missing\n".into(), hunk()).is_err());
         assert!(apply_hunk("a\nb\nc\na\nb\nc\n".into(), hunk()).is_err());
     }

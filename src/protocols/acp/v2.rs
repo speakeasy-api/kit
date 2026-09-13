@@ -373,6 +373,7 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 
 #[derive(Clone)]
 struct ResponseReplacementObserver<S> {
+    projection: Arc<std::sync::OnceLock<super::tool_projection::Subscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
     activity: SessionActivity,
@@ -402,6 +403,7 @@ impl<S> ResponseReplacementObserver<S> {
         activity: SessionActivity,
     ) -> Self {
         Self {
+            projection: Arc::new(std::sync::OnceLock::new()),
             inner,
             sink,
             activity,
@@ -425,6 +427,24 @@ where
     S: AcpSessionUpdateSink + Clone,
 {
     fn handle_event(&self, event: ObservedEvent) {
+        if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
+            self.projection.get_or_init(|| {
+                let sink = self.sink.clone();
+                let session_id = self.session_id.clone();
+                super::tool_projection::Subscription::start(
+                    event.session_id.0.clone(),
+                    move |update| {
+                        update.v2().is_ok_and(|update| {
+                            sink.update(wire::UpdateSessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ))
+                            .is_ok()
+                        })
+                    },
+                )
+            });
+        }
         self.activity.observe(&event.event);
         if let AgentEvent::UsageUpdated(usage) = &event.event {
             let Some(update) = usage_update(usage) else {
@@ -475,9 +495,18 @@ where
 }
 
 fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<wire::SessionUpdate> {
+    if call.name != agentkit_tool_compose::COMPOSE_TOOL_NAME {
+        return None;
+    }
     Some(wire::SessionUpdate::ToolCallUpdate(
         wire::ToolCallUpdate::new(wire::ToolCallId::new(call.id.to_string()))
-            .title(super::compose_intent(call)?.to_owned()),
+            .title(
+                super::compose_intent(call)
+                    .unwrap_or("Running composed tools")
+                    .to_owned(),
+            )
+            .name("compose".to_owned())
+            .kind(wire::ToolKind::Execute),
     ))
 }
 
