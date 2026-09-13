@@ -12,13 +12,15 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
+use agent_client_protocol::{ByteStreams, UntypedMessage};
+
+mod protocol;
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ConfigOptionUpdate, ContentBlock,
-    DeleteSessionRequest, ForkSessionRequest, PermissionOption, PermissionOptionKind,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    CloseSessionRequest, ConfigOptionUpdate, ContentBlock, DeleteSessionRequest,
+    ForkSessionRequest, PermissionOption, PermissionOptionKind, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionValue, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
 use futures_util::future::{Either, select};
@@ -589,6 +591,7 @@ struct Ready {
 struct Route {
     owner: String,
     output: Arc<Mutex<ChildOutput>>,
+    idle: watch::Sender<protocol::Foreground>,
 }
 
 /// Complete child-advertised snapshots, including notifications between prompts.
@@ -1189,20 +1192,32 @@ async fn run(
     let root = config.root.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
     let ready_flag = Arc::clone(&startup_complete);
-    let connected = agent_client_protocol::Client
-        .builder()
+    let connected = agent_client_protocol::Builder::new(protocol::Client)
         .on_receive_notification(
-            async move |notification: SessionNotification, _cx| {
-                if let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
-                    notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
+            async move |message: UntypedMessage, _cx| {
+                if message.method != "session/update" { return Ok(()); }
+                let session_id: SessionId = serde_json::from_value(message.params["sessionId"].clone())?;
+                let mut params = message.params.clone();
+                protocol::normalize_config_options(&mut params["update"]);
+                if let Ok(notification) = serde_json::from_value::<SessionNotification>(params)
+                    && let SessionUpdate::ConfigOptionUpdate(update) = notification.update {
+                    notification_configs.set(notification.session_id, update.config_options)?;
                 }
                 let route = notification_routes
                     .lock()
                     .ok()
-                    .and_then(|routes| routes.get(&notification.session_id).cloned());
+                    .and_then(|routes| routes.get(&session_id).cloned());
                 let Some(route) = route else {
                     return Ok(());
                 };
+                if let Some(state) = protocol::foreground(&message.params)? {
+                    // Startup/replayed idle cannot settle a newly submitted turn.
+                    route.idle.send_if_modified(|current| current.advance(state));
+                    return Ok(());
+                }
+                // Common v1/v2 output projections share their wire shape. Unknown
+                // updates remain out of scope, as they were for v1 children.
+                let Ok(notification) = serde_json::from_value::<SessionNotification>(message.params) else { return Ok(()); };
                 if let Some(activity) = roster_activity(&notification.update) {
                     crate::events::emit(&crate::events::RuntimeEvent::SubagentActivity {
                         id: route.owner.clone(), activity,
@@ -1225,11 +1240,15 @@ async fn run(
         // A headless nested client cannot ask a human. Always answer rather than
         // leaving an agent waiting forever, and allow unattended execution.
         .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _cx| {
-                responder.respond(RequestPermissionResponse::new(permission_outcome(
+            async move |message: UntypedMessage, responder, _cx| {
+                if message.method != "session/request_permission" {
+                    return responder.respond_with_error(agent_client_protocol::Error::method_not_found());
+                }
+                let request: protocol::PermissionRequest = serde_json::from_value(message.params)?;
+                responder.respond(serde_json::to_value(RequestPermissionResponse::new(permission_outcome(
                     permission_policy,
                     &request.options,
-                )))
+                )))?)
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1244,15 +1263,9 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
-                .client_capabilities(agentkit_acp::ClientCapabilities::new().session(
-                    agentkit_acp::ClientSessionCapabilities::new().compaction(
-                        agentkit_acp::CompactionCapabilities::default(),
-                    ),
-                ))).block_task().await?;
-            let capabilities = initialized.agent_capabilities;
+            let (version, capabilities) = protocol::initialize(&connection).await?;
             let supports_close = capabilities.session_capabilities.close.is_some();
-            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            let session = protocol::request(connection.clone(), version, agentkit_acp::NewSessionRequest::new(root.clone())).await?;
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
             }
@@ -1264,7 +1277,7 @@ async fn run(
                     let _ = ready.send(Err(format!("ACP harness {harness:?} does not advertise a selectable model session option")));
                     return std::future::pending().await;
                 }
-                match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
+                match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).await {
                     Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
                     Err(error) => {
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected model selection {model:?}: {error}")));
@@ -1282,7 +1295,7 @@ async fn run(
                             return std::future::pending().await;
                         }
                     };
-                    match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).block_task().await {
+                    match protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).await {
                         Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
                         Err(error) => {
                             let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
@@ -1324,9 +1337,14 @@ async fn run(
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
                                 ]));
                             }
-                            let request = connection.send_request(request);
-                            let request_id = request.id().clone();
-                            let mut request = Box::pin(request.block_task());
+                            let (request_id, request) = match protocol::fork(&connection, version, request) {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    let _ = fork.reply.send(Err(ChildError::Failed(error.to_string())));
+                                    return;
+                                }
+                            };
+                            let mut request = Box::pin(request);
                             // This one-shot race permits a completed fork to win
                             // simultaneous cancellation/deadline. Keep the owned
                             // request and gate for remote cleanup when it loses.
@@ -1351,13 +1369,11 @@ async fn run(
                                         if let Some(model) = fork.model {
                                             let selected = match tokio::time::timeout(
                                                 HANDSHAKE,
-                                                connection
-                                                    .send_request(SetSessionConfigOptionRequest::new(
+                                                protocol::request(connection.clone(), version, SetSessionConfigOptionRequest::new(
                                                         session_id.clone(),
                                                         "model",
                                                         model.as_str(),
-                                                    ))
-                                                    .block_task(),
+                                                    )),
                                             )
                                             .await
                                             {
@@ -1371,9 +1387,7 @@ async fn run(
                                                 )),
                                             };
                                             if selected.is_err() && supports_close {
-                                                let close = connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
-                                                    .block_task();
+                                                let close = protocol::request(connection.clone(), version, CloseSessionRequest::new(session_id.clone()));
                                                 if tokio::time::timeout(CANCEL_SETTLE, close)
                                                     .await
                                                     .is_ok_and(|result| result.is_ok())
@@ -1409,9 +1423,7 @@ async fn run(
                                         let closed = supports_close
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
-                                                cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
-                                                    .block_task(),
+                                                protocol::request(cleanup_connection.clone(), version, CloseSessionRequest::new(session_id.clone())),
                                             )
                                             .await
                                             .is_ok_and(|result| result.is_ok());
@@ -1444,9 +1456,7 @@ async fn run(
                                         let closed = supports_close
                                             && tokio::time::timeout(
                                                 CANCEL_SETTLE,
-                                                cleanup_connection
-                                                    .send_request(CloseSessionRequest::new(session_id.clone()))
-                                                    .block_task(),
+                                                protocol::request(cleanup_connection.clone(), version, CloseSessionRequest::new(session_id.clone())),
                                             )
                                             .await
                                             .is_ok_and(|result| result.is_ok());
@@ -1476,9 +1486,7 @@ async fn run(
                             // Dropping an SDK request on timeout sends $/cancel_request.
                             let result = async {
                                 if supports_close {
-                                    tokio::time::timeout(CANCEL_SETTLE, connection
-                                        .send_request(CloseSessionRequest::new(close.session_id.clone()))
-                                        .block_task())
+                                    tokio::time::timeout(CANCEL_SETTLE, protocol::request(connection.clone(), version, CloseSessionRequest::new(close.session_id.clone())))
                                         .await
                                         .map_err(|_| ChildError::Failed("ACP harness did not answer session/close within 5 seconds".into()))?
                                         .map_err(|error| ChildError::Failed(error.to_string()))?;
@@ -1489,9 +1497,7 @@ async fn run(
                                 }
                                 let deletion = async {
                                 if close.delete {
-                                    tokio::time::timeout(CANCEL_SETTLE, connection
-                                        .send_request(DeleteSessionRequest::new(close.session_id.clone()))
-                                        .block_task())
+                                    tokio::time::timeout(CANCEL_SETTLE, protocol::request(connection.clone(), version, DeleteSessionRequest::new(close.session_id.clone())))
                                         .await
                                         .map_err(|_| ChildError::Failed("ACP harness did not answer session/delete within 5 seconds".into()))?
                                         .map_err(|error| ChildError::Failed(format!("session/delete failed: {error}")))?;
@@ -1522,12 +1528,17 @@ async fn run(
                             let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
+                            let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
                             if let Ok(mut routes) = routes.lock() {
-                                routes.insert(session_id.clone(), Route { owner: prompt.owner, output: Arc::clone(&output) });
+                                routes.insert(session_id.clone(), Route { owner: prompt.owner, output: Arc::clone(&output), idle: idle_tx });
                             }
-                            let request = connection.send_request(agentkit_acp::PromptRequest::new(
-                                session_id.clone(), prompt.content,
-                            )).block_task();
+                            let request = async {
+                                let response = protocol::prompt(&connection, version, session_id.clone(), prompt.content).await?;
+                                if version == protocol::Version::V2 {
+                                    idle_rx.wait_for(|state| *state == protocol::Foreground::Idle).await.map_err(agent_client_protocol::Error::into_internal_error)?;
+                                }
+                                Ok::<_, agent_client_protocol::Error>(response)
+                            };
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
                             // Borrow the request so cancellation can still settle it.
@@ -1537,7 +1548,7 @@ async fn run(
                             ).await {
                                 Either::Left((result, _)) => (result.map_err(|error| error.to_string()), false),
                                 Either::Right(((), _)) => {
-                                    let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
+                                    let _ = protocol::cancel(&connection, version, session_id.clone());
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
                                         Ok(result) => (result.map_err(|error| error.to_string()), true),
                                         Err(_) => {
@@ -1574,9 +1585,7 @@ async fn run(
             let session_ids = sessions.lock().map(|sessions| sessions.clone()).unwrap_or_default();
             if supports_close {
                 for session_id in session_ids {
-                    let close = connection
-                        .send_request(CloseSessionRequest::new(session_id))
-                        .block_task();
+                    let close = protocol::request(connection.clone(), version, CloseSessionRequest::new(session_id));
                     if let Ok(result) = tokio::time::timeout(CANCEL_SETTLE, close).await {
                         result?;
                     }
@@ -3197,6 +3206,143 @@ mod tests {
                     .any(|r| r["method"] == "session/close" && r["sessionId"] == "base")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mock_v2_child_waits_for_idle_and_supports_forks() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "mock".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![
+                    format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+                    "--v2".into(),
+                    "--models".into(),
+                    format!(
+                        "--accepted-marker={}",
+                        root.path().join("accepted").display()
+                    ),
+                ],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        );
+        let harnesses = AcpHarnesses::new(profiles).unwrap();
+        let config = ChildConfig {
+            root: root.path().to_path_buf(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses,
+            default_harness: "acp.mock".into(),
+            parent_id: None,
+            parent_name: None,
+        };
+        let base = ChildSession::start(
+            config,
+            "acp.mock".into(),
+            None,
+            Some("mock/requested".into()),
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert!(base.supports_native_fork());
+        assert_eq!(
+            base.prompt(
+                "s-test".into(),
+                "MOCK_SELECTED_MODEL".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
+            "mock/requested"
+        );
+        for text in ["first v2 turn", "second v2 turn"] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(5),
+                base.prompt("s-test".into(), text.into(), TurnCancellation::default()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                output.text, text,
+                "an empty v2 acknowledgement must not finish the turn"
+            );
+        }
+        let controller = agentkit_core::CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        let child = base.clone();
+        let cancelled = tokio::spawn(async move {
+            child
+                .prompt("s-test".into(), "MOCK_WAIT_CANCEL".into(), cancellation)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.path().join("accepted").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        controller.interrupt();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), cancelled)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ChildError::Cancelled)
+        ));
+        assert_eq!(
+            base.prompt(
+                "s-test".into(),
+                "after cancellation".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
+            "after cancellation"
+        );
+        let fork = base
+            .fork(Some("mock/default"), None, &TurnCancellation::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            fork.prompt(
+                "s-test".into(),
+                "forked v2 turn".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
+            "forked v2 turn"
+        );
+        assert_eq!(
+            fork.prompt(
+                "s-test".into(),
+                "MOCK_SELECTED_MODEL".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
+            "mock/default"
+        );
+        fork.close().await.unwrap();
+        base.close().await.unwrap();
     }
 
     #[tokio::test]

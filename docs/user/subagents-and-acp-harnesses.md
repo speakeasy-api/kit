@@ -165,9 +165,11 @@ Kit's ACP server also advertises a separate reasoning-effort session selector wi
 
 Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the owning parent session. Closing that main session drops its subagent manager, which closes every child actor and terminates the retained child processes. A later Kit process cannot pass an old value to `prompt` or `fork`.
 
-## Configure a generic ACP v1 harness
+For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Steering, detailed v2 stop-reason interpretation, and reconnect replay are not yet supported.
 
-Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
+## Configure a generic ACP harness
+
+Kit offers ACP v2 with its client name and version during initialization, uses the version selected by the child, and falls back to ACP v1 when selected. Unsupported versions fail before a session is opened. Generic external child harnesses must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` is optional. `session/close` is optional in v1 and baseline for v2 sessions. Kit does not advertise filesystem or terminal services to children. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
 
 Configure trusted argv profiles in `~/.kit/config.toml`:
 
@@ -272,7 +274,7 @@ Kit currently permits nesting to depth 2 and at most 120 live parent-owned subag
 ACP startup must complete within 30 seconds. Native `session/fork` must also answer within 30 seconds. Common diagnostics include:
 
 - `ACP harness spawn failure`: verify `command`, `args`, executable installation, and `PATH`.
-- `ACP harness handshake timeout` or `ACP harness protocol handshake failure`: verify ACP v1 support, required methods, and that stdout contains only protocol messages. Check stderr for lines prefixed `ACP harness <name>:`.
+- `ACP harness handshake timeout` or `ACP harness protocol handshake failure`: verify ACP v1 or v2 support, required methods, and that stdout contains only protocol messages. Check stderr for lines prefixed `ACP harness <name>:`.
 - `ACP harness did not answer session/fork within 30 seconds`: update or repair the agent, or avoid `fork`; only `acp.kit` has the transcript fallback.
 - `nested agent exited during startup` or `nested agent process exited without a response`: run the configured installed executable directly enough to verify installation and login, then inspect its stderr.
 - Structured output remains text: ask for bare JSON, inspect the raw `output`, and use a repair `prompt` with an appropriate `output_schema`.

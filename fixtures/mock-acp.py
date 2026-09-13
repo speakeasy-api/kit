@@ -16,6 +16,7 @@ selected_options = {}
 fail_first_close = "--fail-first-close" in sys.argv
 failed_close = False
 selected_models = {}
+v2_cancellations = {}
 
 
 def option(name):
@@ -97,6 +98,9 @@ def config_options(session_id):
             "id": "custom_enabled", "name": "Custom enabled", "type": "boolean",
             "currentValue": values.get("custom_enabled", False),
         })
+    if "--v2" in sys.argv:
+        for option in result:
+            option["configId"] = option.pop("id")
     return result
 
 
@@ -139,9 +143,28 @@ def fork(request):
 
 
 def prompt(request):
+    if "--v2" in sys.argv:
+        # A startup idle can race the new prompt; it must not settle this turn.
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": request["params"]["sessionId"],
+            "update": {"sessionUpdate": "state_update", "state": "idle"}
+        }})
+        respond(request["id"], {})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": request["params"]["sessionId"],
+            "update": {"sessionUpdate": "state_update", "state": "running"}
+        }})
     params = request["params"]
     session_id = params["sessionId"]
     text = " ".join(block["text"] for block in params["prompt"] if block["type"] == "text")
+    if "--v2" in sys.argv and text == "MOCK_WAIT_CANCEL":
+        event = threading.Event()
+        with state_lock:
+            v2_cancellations[session_id] = event
+        with open(option("--accepted-marker"), "w", encoding="utf-8") as marker:
+            marker.write("accepted")
+        event.wait()
+
     should_gate = prompt_release is not None and (
         prompt_release_text is None or prompt_release_text == text
     )
@@ -229,7 +252,14 @@ def prompt(request):
             },
         },
     })
-    respond(request["id"], {"stopReason": "end_turn"})
+    if "--v2" in sys.argv:
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id, "update": {
+                "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn"
+            }
+        }})
+    else:
+        respond(request["id"], {"stopReason": "end_turn"})
     if idle_config_update:
         while idle_config_release is not None and not os.path.exists(idle_config_release):
             time.sleep(0.01)
@@ -275,6 +305,18 @@ for line in sys.stdin:
     if method == "initialize":
         if "--require-compaction" in sys.argv:
             assert request["params"]["clientCapabilities"]["session"]["compaction"] == {}
+        params = request["params"]
+        assert params["protocolVersion"] == 2
+        assert params["clientInfo"]["name"] == "kit"
+        assert params["clientInfo"]["version"]
+        if "--v2" in sys.argv:
+            assert params["info"] == params["clientInfo"]
+            assert params["capabilities"] == {}
+            respond(request["id"], {
+                "protocolVersion": 2, "info": {"name": "mock", "version": "1"},
+                "capabilities": {"session": {"fork": {}} if supports_fork else {}}
+            })
+            continue
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -326,7 +368,10 @@ for line in sys.stdin:
                     selected_options[params["sessionId"]][option_id] = value
             respond(request["id"], {"configOptions": config_options(params["sessionId"])})
     elif method == "session/cancel":
-        pass
+        with state_lock:
+            event = v2_cancellations.pop(request["params"]["sessionId"], None)
+        if event is not None:
+            event.set()
     elif method == "session/close":
         threading.Thread(target=close, args=(request,), daemon=True).start()
 
