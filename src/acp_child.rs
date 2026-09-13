@@ -3129,6 +3129,7 @@ mod tests {
             );
             let harnesses = AcpHarnesses::new(profiles).unwrap();
             let config = ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.path().to_path_buf(),
                 model: "unused".into(),
                 provider: Default::default(),
