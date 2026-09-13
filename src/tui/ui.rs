@@ -3663,6 +3663,7 @@ mod tests {
             "127.0.0.1:7331".into(),
         );
         app.session_choices = vec![crate::session::CatalogEntry {
+            additional_directories: Vec::new(),
             id: "s-abc123".into(),
             title: Some("OAuth token bug".into()),
             preview: Some("Preview remains available".into()),

@@ -7541,6 +7541,7 @@ mod tests {
         ));
         app.apply(Update::SessionCatalog(Ok(vec![
             crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: "saved".into(),
                 title: Some("Saved".into()),
                 preview: None,
@@ -7559,6 +7560,7 @@ mod tests {
         app.session_choices = ["newer", "older"]
             .into_iter()
             .map(|id| crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
@@ -7585,6 +7587,7 @@ mod tests {
         app.session_choices = ["newer", "older"]
             .into_iter()
             .map(|id| crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
@@ -7641,6 +7644,7 @@ mod tests {
     fn session_dialog_confirms_before_clearing_a_name() {
         let mut app = app();
         app.session_choices = vec![crate::session::CatalogEntry {
+            additional_directories: Vec::new(),
             id: "saved".into(),
             title: Some("Generated".into()),
             preview: None,

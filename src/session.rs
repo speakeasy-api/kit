@@ -68,6 +68,8 @@ pub struct CatalogEntry {
     pub title: Option<String>,
     pub preview: Option<String>,
     pub is_subagent: bool,
+    /// Additional directories recorded in the latest transcript metadata.
+    pub additional_directories: Vec<PathBuf>,
     /// Last activity as milliseconds since the Unix epoch.
     pub updated_at: u64,
 }
@@ -1326,6 +1328,10 @@ fn catalog_for_workspace(
             title,
             preview,
             is_subagent,
+            additional_directories: catalog_additional_directories(
+                &authority.historical_items,
+                &authority.items,
+            ),
             updated_at: item_updated.max(file_updated),
         });
     }
@@ -1336,6 +1342,31 @@ fn catalog_for_workspace(
             .then_with(|| right.id.cmp(&left.id))
     });
     Ok(entries)
+}
+
+fn catalog_additional_directories(
+    historical_items: &[Vec<Item>],
+    current_items: &[Item],
+) -> Vec<PathBuf> {
+    // Decode only the latest value so malformed or empty updates do not
+    // resurrect older lists. Recorded directories need not still exist.
+    historical_items
+        .iter()
+        .map(Vec::as_slice)
+        .chain(std::iter::once(current_items))
+        .flatten()
+        .rev()
+        .find_map(|item| item.metadata.get("acp.additional_directories"))
+        .and_then(|value| serde_json::from_value::<Vec<PathBuf>>(value.clone()).ok())
+        .filter(|paths| {
+            paths.iter().all(|path| {
+                path.is_absolute()
+                    && !path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn catalog_is_subagent(historical_items: &[Vec<Item>], current_items: &[Item]) -> bool {
@@ -3499,6 +3530,89 @@ mod tests {
         );
         assert!(entries[0].updated_at > entries[1].updated_at);
         drop((older, newer, other));
+    }
+
+    #[test]
+    fn catalog_additional_directories_reads_legacy_valid_and_malformed_metadata() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let additional = tempfile::tempdir().unwrap();
+        let canonical = additional.path().canonicalize().unwrap();
+        let cases = [
+            ("legacy", None, vec![]),
+            (
+                "valid",
+                Some(serde_json::json!([canonical])),
+                vec![canonical.clone()],
+            ),
+            ("empty", Some(serde_json::json!([])), vec![]),
+            ("null", Some(serde_json::Value::Null), vec![]),
+            ("string", Some(serde_json::json!("not an array")), vec![]),
+            ("object", Some(serde_json::json!({})), vec![]),
+            ("mixed", Some(serde_json::json!([canonical, 42])), vec![]),
+            ("relative", Some(serde_json::json!(["relative"])), vec![]),
+            ("parent", Some(serde_json::json!(["/tmp/../other"])), vec![]),
+        ];
+        for (id, value, expected) in cases {
+            let mut item = Item::text(ItemKind::System, "system");
+            if let Some(value) = value {
+                item.metadata
+                    .insert("acp.additional_directories".into(), value);
+            }
+            let opened =
+                open_in(root.path(), storage.path(), id, false, false, vec![item]).unwrap();
+            drop(opened);
+            let entries = catalog_for_workspace(root.path(), storage.path()).unwrap();
+            let entry = entries.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(entry.additional_directories, expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn catalog_additional_directories_uses_latest_value_across_replacements() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().canonicalize().unwrap();
+        let second = storage.path().canonicalize().unwrap();
+        let with_directories = |value| {
+            let mut item = Item::text(ItemKind::System, "system");
+            item.metadata
+                .insert("acp.additional_directories".into(), value);
+            item
+        };
+        let opened = open_in(
+            root.path(),
+            storage.path(),
+            "latest",
+            false,
+            false,
+            vec![with_directories(serde_json::json!([first]))],
+        )
+        .unwrap();
+        opened
+            .observer
+            .replace(&[Item::text(ItemKind::System, "summary")])
+            .unwrap();
+        assert_eq!(
+            catalog_for_workspace(root.path(), storage.path()).unwrap()[0].additional_directories,
+            vec![first],
+        );
+        for (value, expected) in [
+            (serde_json::json!([second]), vec![second]),
+            (serde_json::json!(false), vec![]),
+            (serde_json::json!([]), vec![]),
+        ] {
+            write(&opened.observer, &with_directories(value));
+            write(
+                &opened.observer,
+                &Item::text(ItemKind::User, "later unmarked item"),
+            );
+            assert_eq!(
+                catalog_for_workspace(root.path(), storage.path()).unwrap()[0]
+                    .additional_directories,
+                expected,
+            );
+        }
     }
 
     #[test]

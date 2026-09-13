@@ -1376,6 +1376,7 @@ impl Server {
             .iter()
             .map(|entry| {
                 SessionInfo::new(entry.id.clone(), cwd.clone())
+                    .additional_directories(entry.additional_directories.clone())
                     .title(entry.title.as_deref().map(str::to_owned))
                     .updated_at(entry.updated_at_rfc3339())
             })
@@ -1470,6 +1471,11 @@ impl Server {
         // Validate path serialization before admission or any binding/actor effects.
         let cwd_metadata =
             serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        serde_json::to_value(&additional_directories)
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        let additional_directories = self
+            .runtime
+            .additional_directories(&additional_directories)?;
         let directories_metadata = serde_json::to_value(&additional_directories)
             .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
         // Reject exhaustion before admission or any binding, driver, or actor effects.
@@ -1482,11 +1488,6 @@ impl Server {
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
-        if !additional_directories.is_empty() {
-            return Err(AcpRuntimeError::Loop(
-                "this Kit runtime does not accept additional directories".into(),
-            ));
-        }
         // Client overlays own their manager, catalog, reload state, and event routes.
         let mcp = self.runtime.session_mcp(mcp_servers, &cwd).await?;
         let mcp_events = mcp
@@ -6477,6 +6478,8 @@ pub(super) mod tests {
         use agentkit_acp::{McpServer, McpServerHttp, McpServerStdio};
 
         let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let extra_path = std::fs::canonicalize(extra.path()).unwrap();
         let credentials = crate::credentials::CredentialStorage::Memory;
         crate::provider::store_openrouter_test_credentials(&credentials);
         let runtime = Runtime::new_with_provider_and_credentials(
@@ -6516,10 +6519,21 @@ pub(super) mod tests {
                 let source = connection
                     .send_request(
                         NewSessionRequest::new(root.path().to_path_buf())
+                            .additional_directories(vec![extra_path.clone()])
                             .mcp_servers(stdio.clone()),
                     )
                     .block_task()
                     .await?;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                let listed = listed
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == source.session_id)
+                    .unwrap();
+                assert_eq!(listed.additional_directories, vec![extra_path.clone()]);
                 connection
                     .send_request(
                         ForkSessionRequest::new(
@@ -6537,6 +6551,7 @@ pub(super) mod tests {
                             source.session_id.clone(),
                             root.path().to_path_buf(),
                         )
+                        .additional_directories(vec![extra_path.clone()])
                         .mcp_servers(stdio.clone()),
                     )
                     .block_task()
@@ -6566,6 +6581,7 @@ pub(super) mod tests {
                             source.session_id.clone(),
                             root.path().to_path_buf(),
                         )
+                        .additional_directories(vec![extra_path.clone()])
                         .mcp_servers(stdio),
                     )
                     .block_task()

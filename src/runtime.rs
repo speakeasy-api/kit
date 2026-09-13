@@ -339,6 +339,10 @@ pub(crate) struct SessionClaim {
     request: SessionRequest,
     kind: SessionClaimKind,
     uncommitted_observer: Option<crate::session::SessionObserver>,
+    // Existing transcripts must not change when preparation or admission fails.
+    // This private staged snapshot is written only in the publication commit;
+    // no actor can run before activation and no guard is held during preparation.
+    pending_workspace: Option<(crate::session::SessionObserver, Vec<Item>)>,
     committed: bool,
 }
 
@@ -414,6 +418,11 @@ impl SessionClaim {
             observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
             self.mark_opened();
         }
+        if let Some((observer, transcript)) = &self.pending_workspace {
+            observer
+                .replace(transcript)
+                .map_err(AcpRuntimeError::Loop)?;
+        }
         // Fork claims returned above; the remaining claims either create or load.
         if let SessionClaimKind::New {
             configured,
@@ -434,6 +443,7 @@ impl Drop for SessionClaim {
     fn drop(&mut self) {
         let opened_uncommitted = self.uncommitted_observer.is_some();
         drop(self.uncommitted_observer.take());
+        drop(self.pending_workspace.take());
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -1044,6 +1054,38 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Additional roots are project context, not a filesystem allowlist. The
+    /// primary root continues to own cwd, configuration, and durable identity.
+    pub(crate) fn additional_directories(
+        &self,
+        requested: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, AcpRuntimeError> {
+        let mut directories = Vec::new();
+        for path in requested {
+            if !path.is_absolute() {
+                return Err(AcpRuntimeError::Loop(
+                    "additional directories must be absolute".into(),
+                ));
+            }
+            let path = crate::resilient_fs::canonicalize(path).map_err(|error| {
+                AcpRuntimeError::Loop(format!("invalid additional directories: {error}"))
+            })?;
+            if !crate::resilient_fs::best_effort_global()
+                .metadata(&path)
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+                .is_dir()
+            {
+                return Err(AcpRuntimeError::Loop(
+                    "additional directories must be directories".into(),
+                ));
+            }
+            if path != self.root && !directories.contains(&path) {
+                directories.push(path);
+            }
+        }
+        Ok(directories)
+    }
+
     pub(crate) async fn session_mcp(
         &self,
         servers: Vec<agentkit_acp::McpServer>,
@@ -1440,6 +1482,7 @@ impl Runtime {
                 opened_new: false,
             },
             uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
@@ -1454,6 +1497,7 @@ impl Runtime {
             },
             kind: SessionClaimKind::Fork,
             uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
@@ -1472,6 +1516,7 @@ impl Runtime {
             request,
             kind: SessionClaimKind::Load { configured },
             uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
@@ -1488,12 +1533,14 @@ impl Runtime {
     {
         let cwd = crate::resilient_fs::canonicalize(&context.cwd)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-        if cwd != self.root || !context.additional_directories.is_empty() {
+        if cwd != self.root {
             return Err(AcpRuntimeError::Loop(format!(
-                "this Kit runtime is fixed to {} and does not accept additional directories",
+                "this Kit runtime is fixed to {}",
                 self.root.display()
             )));
         }
+        let additional_directories =
+            self.additional_directories(&context.additional_directories)?;
         let request = claim.request.clone();
         let session_id = request.id.clone();
         let (forked_transcript, selected, parent_context) = match forked {
@@ -1522,7 +1569,7 @@ impl Runtime {
                 .await
                 .map_err(AcpRuntimeError::Loop)?
         };
-        let opened = if is_fork {
+        let mut opened = if is_fork {
             crate::session::open_uncommitted(&self.root, &request.id, false, initial)
         } else if request.resume {
             crate::session::open(&self.root, &request.id, true, request.force, initial)
@@ -1532,6 +1579,22 @@ impl Runtime {
         .map_err(AcpRuntimeError::Loop)?;
         if is_fork || !request.resume {
             claim.guard_uncommitted_transcript(&opened.observer);
+        }
+        // The workspace context is session-owned, not runtime-global. Refresh it
+        // for load/resume/fork too; an empty request removes previous extra roots.
+        if refresh_workspace_context(&mut opened.transcript, &additional_directories)
+            .await
+            .map_err(AcpRuntimeError::Loop)?
+        {
+            if claim.uncommitted_observer.is_some() {
+                opened
+                    .observer
+                    .replace(&opened.transcript)
+                    .map_err(AcpRuntimeError::Loop)?;
+            } else {
+                claim.pending_workspace =
+                    Some((opened.observer.clone(), opened.transcript.clone()));
+            }
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
@@ -2583,6 +2646,60 @@ impl ComposeBackend for HiddenRunletBackend {
     }
 }
 
+async fn refresh_workspace_context(
+    transcript: &mut Vec<Item>,
+    additional_directories: &[PathBuf],
+) -> Result<bool, String> {
+    if additional_directories.is_empty()
+        && !transcript
+            .iter()
+            .any(|item| item.metadata.contains_key("acp.additional_directories"))
+    {
+        return Ok(false);
+    }
+    let mut additions = Vec::new();
+    for root in additional_directories {
+        let context = load_initial_transcript(root, String::new()).await?;
+        for mut item in context.into_iter().skip(1) {
+            let path = item.metadata.get("agentkit.context.path");
+            if transcript
+                .iter()
+                .filter(|item| {
+                    item.metadata.get("acp.workspace_context") != Some(&Value::Bool(true))
+                })
+                .chain(&additions)
+                .any(|existing: &Item| {
+                    path.is_some() && existing.metadata.get("agentkit.context.path") == path
+                })
+            {
+                continue;
+            }
+            item.metadata
+                .insert("acp.workspace_context".into(), Value::Bool(true));
+            additions.push(item);
+        }
+    }
+    let directories =
+        serde_json::to_value(additional_directories).map_err(|error| error.to_string())?;
+    let mut context = Item::text(
+        ItemKind::Context,
+        format!(
+            "[Session workspace]\nAdditional project directories: {directories}. These are project context, not filesystem access boundaries. The primary cwd is unchanged."
+        ),
+    );
+    context
+        .metadata
+        .insert("acp.additional_directories".into(), directories);
+    context
+        .metadata
+        .insert("acp.workspace_context".into(), Value::Bool(true));
+    transcript
+        .retain(|item| item.metadata.get("acp.workspace_context") != Some(&Value::Bool(true)));
+    transcript.push(context);
+    transcript.extend(additions);
+    Ok(true)
+}
+
 async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<Vec<Item>, String> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -2725,5 +2842,168 @@ impl StorageCancellationBridge {
 impl Drop for StorageCancellationBridge {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+mod additional_directory_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workspace_context_refreshes_roots_and_deduplicates_instructions() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        let nested = extra.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "primary instructions").unwrap();
+        std::fs::write(extra.join("AGENTS.md"), "extra instructions").unwrap();
+        let mut transcript = load_initial_transcript(root.path(), "system".into())
+            .await
+            .unwrap();
+        let initial = transcript.clone();
+        assert!(
+            !refresh_workspace_context(&mut transcript, &[])
+                .await
+                .unwrap()
+        );
+        refresh_workspace_context(&mut transcript, &[extra.clone(), nested])
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|item| item.metadata.get("agentkit.context.path")
+                    == Some(&Value::String(
+                        extra.join("AGENTS.md").display().to_string()
+                    )))
+                .count(),
+            1
+        );
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|item| item.metadata.get("agentkit.context.path")
+                    == Some(&Value::String(
+                        root.path().join("AGENTS.md").display().to_string()
+                    )))
+                .count(),
+            1
+        );
+        refresh_workspace_context(&mut transcript, &[])
+            .await
+            .unwrap();
+        assert_eq!(transcript.len(), initial.len() + 1);
+        assert_eq!(
+            transcript.last().unwrap().metadata["acp.additional_directories"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_resume_workspace_is_persisted_only_when_claim_commits() {
+        #[derive(Clone)]
+        struct Observer;
+        impl LoopObserver for Observer {
+            fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let id = crate::session::new_id();
+        let mut original = vec![Item::text(ItemKind::System, "system")];
+        refresh_workspace_context(&mut original, &[extra.path().to_path_buf()])
+            .await
+            .unwrap();
+        let saved = crate::session::open(root.path(), &id, false, false, original.clone()).unwrap();
+        drop(saved);
+        for commit in [false, true] {
+            let mut claim = runtime.claim_session_load(&id).unwrap();
+            let driver = runtime
+                .start_acp_driver_with_mcp(
+                    AcpDriverContext {
+                        cwd: root.path().to_path_buf(),
+                        additional_directories: vec![],
+                        integration: Arc::new(Observer),
+                        cancellation: CancellationController::new().handle(),
+                        response_attempt_replacement: false,
+                    },
+                    &mut claim,
+                    None,
+                    runtime.mcp.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                driver.canonical_transcript.last().unwrap().metadata["acp.additional_directories"],
+                serde_json::json!([])
+            );
+            if commit {
+                claim.commit().unwrap();
+            } else {
+                drop(claim);
+            }
+            drop(driver);
+            let persisted = crate::session::load(root.path(), &id).unwrap();
+            let expected = if commit {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([extra.path()])
+            };
+            assert_eq!(
+                persisted.last().unwrap().metadata["acp.additional_directories"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn additional_roots_validate_and_normalize_without_changing_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let extra_path = crate::resilient_fs::canonicalize(extra.path()).unwrap();
+        assert_eq!(
+            runtime
+                .additional_directories(&[
+                    extra.path().to_path_buf(),
+                    extra_path.clone(),
+                    root.path().to_path_buf()
+                ])
+                .unwrap(),
+            vec![extra_path]
+        );
+        assert!(
+            runtime
+                .additional_directories(&[PathBuf::from("relative")])
+                .is_err()
+        );
+        assert!(
+            runtime
+                .additional_directories(&[root.path().join("missing")])
+                .is_err()
+        );
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(runtime.additional_directories(&[file]).is_err());
+        assert_eq!(
+            runtime.root(),
+            crate::resilient_fs::canonicalize(root.path()).unwrap()
+        );
     }
 }
