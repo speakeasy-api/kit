@@ -977,6 +977,10 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             if span_start >= end {
                 break;
             }
+            if app.transcript_prefixes[block_index + 1] == span_start {
+                block_index += 1;
+                continue;
+            }
             let separator_rows = usize::from(span_start > 0);
             if separator_rows > 0 && offset <= span_start && span_start < end {
                 materialize(&separator);
@@ -997,7 +1001,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
                     if image_start < end && image_end > offset {
                         let y = image_start as isize - offset as isize;
                         visible_images.push((
-                            block_index,
+                            placement.block.unwrap_or(block_index),
                             placement.source,
                             placement.destination.clone(),
                             y.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
@@ -1153,6 +1157,12 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     }
     app.transcript_dirty
         .extend(app.transcript_dynamic.iter().copied());
+    let animated_owners: std::collections::BTreeSet<_> = app
+        .transcript_dynamic
+        .iter()
+        .filter_map(|index| app.tool_owners.get(index).copied())
+        .collect();
+    app.transcript_dirty.extend(animated_owners.iter().copied());
     let dirty = std::mem::take(&mut app.transcript_dirty);
     let mut first_changed_count = app.blocks.len();
     for block_index in dirty {
@@ -1164,6 +1174,7 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         let revision = app.transcript_revisions[block_index];
         if !width_changed
             && !dynamic
+            && !animated_owners.contains(&block_index)
             && app.transcript_cache[block_index]
                 .as_ref()
                 .is_some_and(|cached| cached.revision == revision)
@@ -1195,8 +1206,9 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         let rows = app.transcript_cache[index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
-        app.transcript_prefixes[index + 1] =
-            app.transcript_prefixes[index] + rows + usize::from(app.transcript_prefixes[index] > 0);
+        app.transcript_prefixes[index + 1] = app.transcript_prefixes[index]
+            + rows
+            + usize::from(rows > 0 && app.transcript_prefixes[index] > 0);
     }
     if layout_changed {
         app.clear_transcript_interaction();
@@ -1235,6 +1247,7 @@ fn user_block_rows(
                     )
                 }));
                 placements.push(CachedTranscriptImage {
+                    block: None,
                     source,
                     row,
                     destination: None,
@@ -1290,6 +1303,7 @@ fn agent_block_rows(
                 )
             }));
             placements.push(CachedTranscriptImage {
+                block: None,
                 source: 0,
                 row,
                 destination: Some(destination),
@@ -1366,6 +1380,7 @@ fn agent_parts_rows(
                         )
                     }));
                     placements.push(CachedTranscriptImage {
+                        block: None,
                         source,
                         row,
                         destination: None,
@@ -1377,7 +1392,66 @@ fn agent_parts_rows(
     (rows, placements)
 }
 
+/// Canonical children keep their own selection tags and image sources. Only a
+/// bounded page is materialized, before wrapping rows or reserving image cells.
 fn transcript_block_rows(
+    app: &App,
+    block_index: usize,
+    width: usize,
+    reserve_images: bool,
+) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+    if app.tool_owners.contains_key(&block_index) {
+        return (Vec::new(), Vec::new());
+    }
+    let (mut rows, mut images) =
+        single_transcript_block_rows(app, block_index, width, reserve_images);
+    let Block::Tool(call) = &app.blocks[block_index] else {
+        return (rows, images);
+    };
+    let (children, start, total) = app.child_window(block_index);
+    if total == 0 {
+        return (rows, images);
+    }
+    let show = call.expanded && call.compose_view == ComposeView::Output;
+    let label = if show {
+        format!(
+            "   ↳ calls {}–{} of {total} · alt+←/→ pages",
+            start + 1,
+            start + children.len()
+        )
+    } else {
+        format!("   ↳ {total} calls · expand to view")
+    };
+    rows.extend(wrap_linked_tagged(
+        &[(
+            LinkedLine::plain(Line::from(Span::styled(label, theme::dim()))),
+            (Some(call.id.clone()), None, None),
+        )],
+        width,
+    ));
+    if show {
+        for &child in children {
+            let (mut child_rows, child_images) = single_transcript_block_rows(
+                app,
+                child,
+                width.saturating_sub(3).max(1),
+                reserve_images,
+            );
+            images.extend(child_images.into_iter().map(|mut image| {
+                image.block = Some(child);
+                image.row += rows.len();
+                image
+            }));
+            for row in &mut child_rows {
+                row.0.spans.insert(0, Span::styled("   ", theme::faint()));
+            }
+            rows.extend(child_rows);
+        }
+    }
+    (rows, images)
+}
+
+fn single_transcript_block_rows(
     app: &App,
     block_index: usize,
     width: usize,
@@ -1474,6 +1548,7 @@ fn transcript_block_rows(
                 )
             }));
             placements.push(CachedTranscriptImage {
+                block: None,
                 source,
                 row,
                 destination: None,
@@ -1542,13 +1617,21 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(tool_header(app, call, active))];
     let compose = call.is_compose();
     if call.running() {
-        if compose && !call.script.is_empty() {
+        if compose
+            && ((call.expanded && call.compose_view == ComposeView::Script)
+                || (call.parent_id.is_none()
+                    && !app.has_grouped_tools(&call.id)
+                    && !call.script.is_empty()))
+        {
             lines.extend(script_lines(call));
         } else if let Some(child) = call.children.iter().rev().find(|child| child.running()) {
             lines.push(Line::from(vec![
                 Span::styled("   ↳ ", theme::faint()),
                 Span::styled(child.summary.clone(), theme::dim()),
             ]));
+        }
+        if call.expanded {
+            lines.extend(output_lines(call));
         }
         return lines;
     }
@@ -5314,5 +5397,282 @@ mod tests {
         assert!(frame.contains(" ready"));
         assert!(frame.contains("⏎ send   ⇧⏎ newline   ^l log   ^c quit"));
         assert!(frame.contains("message kit"));
+    }
+
+    mod canonical_group_tests {
+        use super::super::*;
+        use crate::tui::{app::Update, translate_for_session};
+        use agent_client_protocol::schema::v2::{
+            self as wire, SessionUpdate, UpdateSessionNotification,
+        };
+        use serde_json::json;
+
+        fn app() -> App {
+            App::new(
+                std::path::PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            )
+        }
+        fn patch(app: &mut App, value: serde_json::Value) {
+            let patch: wire::ToolCallUpdate = serde_json::from_value(value).unwrap();
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", SessionUpdate::ToolCallUpdate(patch)),
+                "session",
+            ) {
+                app.apply(update);
+            }
+        }
+        fn text(rows: &[CachedTranscriptRow]) -> String {
+            rows.iter()
+                .map(|row| {
+                    row.0
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        fn refresh(app: &mut App) {
+            refresh_transcript_cache_with_images(app, &mut ImageRuntime::disabled(), 100);
+        }
+
+        #[test]
+        fn canonical_first_child_restores_implicit_expansion_but_not_explicit_collapse() {
+            for explicitly_collapsed in [false, true] {
+                let mut app = app();
+                patch(&mut app, json!({"toolCallId":"root", "title":"compose"}));
+                if explicitly_collapsed {
+                    app.toggle_output("root");
+                }
+                // Exercise wire translation and its ordered ToolPatched / ToolParent
+                // updates, including creation of the previously unseen child.
+                patch(
+                    &mut app,
+                    json!({"toolCallId":"child", "title":"first canonical child", "_meta":{"kit/parentToolCallId":"root"}}),
+                );
+                refresh(&mut app);
+                let root = &app.transcript_cache[0].as_ref().unwrap().rows;
+                assert_eq!(
+                    text(root).contains("first canonical child"),
+                    !explicitly_collapsed
+                );
+                assert!(app.transcript_cache[1].as_ref().unwrap().rows.is_empty());
+                assert!(app.transcript_call_is_focused(if explicitly_collapsed { 0 } else { 1 }));
+                let Block::Tool(call) = &app.blocks[0] else {
+                    panic!("root")
+                };
+                assert_eq!(call.expanded, !explicitly_collapsed);
+                assert_eq!(call.expansion_explicit, explicitly_collapsed);
+                if explicitly_collapsed {
+                    app.toggle_output("root");
+                    refresh(&mut app);
+                    assert!(
+                        text(&app.transcript_cache[0].as_ref().unwrap().rows)
+                            .contains("first canonical child")
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn canonical_rows_attach_late_preserve_tags_images_and_absent_metadata() {
+            let mut app = app();
+            patch(
+                &mut app,
+                json!({"toolCallId":"child", "title":"unique-child", "_meta":{"kit/parentToolCallId":"root"}}),
+            );
+            refresh(&mut app);
+            assert!(text(&app.transcript_cache[0].as_ref().unwrap().rows).contains("unique-child"));
+            patch(
+                &mut app,
+                json!({"toolCallId":"unrelated", "title":"other-compose"}),
+            );
+            patch(&mut app, json!({"toolCallId":"root", "title":"compose"}));
+            app.toggle_output("child");
+            app.apply(Update::ToolPatched {
+                id: "child".into(),
+                title: None,
+                kind: None,
+                status: None,
+                script: None,
+                output: Some(vec!["live content".into()]),
+                images: Some(vec![
+                    crate::tui::app::UserImage::new("AQID".into(), "image/png".into(), 0).unwrap(),
+                ]),
+                append_output: false,
+                intent: None,
+                backgrounded: false,
+            });
+            refresh(&mut app);
+            assert!(app.transcript_cache[0].as_ref().unwrap().rows.is_empty());
+            assert_eq!(app.transcript_prefixes[0], app.transcript_prefixes[1]);
+            let root = &app.transcript_cache[2].as_ref().unwrap().rows;
+            assert!(text(root).contains("unique-child"));
+            assert!(text(root).contains("live content"));
+            assert!(root.iter().any(|row| row.1.0.as_deref() == Some("child")));
+            let (_, images) = transcript_block_rows(&app, 2, 100, true);
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].block, Some(0));
+            patch(
+                &mut app,
+                json!({"toolCallId":"child", "status":"completed", "_meta":{"unrelated":true}}),
+            );
+            assert_eq!(app.tool_owners.get(&0), Some(&2));
+            patch(
+                &mut app,
+                json!({"toolCallId":"child", "rawOutput":"late content"}),
+            );
+            refresh(&mut app);
+            assert!(text(&app.transcript_cache[2].as_ref().unwrap().rows).contains("late content"));
+            app.toggle_output("root");
+            refresh(&mut app);
+            assert!(
+                !text(&app.transcript_cache[2].as_ref().unwrap().rows).contains("unique-child")
+            );
+            patch(&mut app, json!({"toolCallId":"child", "_meta":null}));
+            refresh(&mut app);
+            assert!(text(&app.transcript_cache[0].as_ref().unwrap().rows).contains("unique-child"));
+        }
+
+        #[test]
+        fn canonical_completed_owner_refreshes_for_running_child_and_pages_before_rows() {
+            let mut app = app();
+            patch(&mut app, json!({"toolCallId":"root", "title":"compose"}));
+            for i in 0..70 {
+                patch(
+                    &mut app,
+                    json!({"toolCallId":format!("child-{i}"), "title":format!("unique-{i:03}"), "_meta":{"kit/parentToolCallId":"root"}}),
+                );
+            }
+            patch(&mut app, json!({"toolCallId":"root", "status":"completed"}));
+            app.toggle_output("root");
+            refresh(&mut app);
+            let root = &app.transcript_cache[0].as_ref().unwrap().rows;
+            assert!(text(root).contains("unique-069"));
+            assert!(!text(root).contains("unique-000"));
+            // Expanding the canonical child dirties its displayed owner even after
+            // that owner is terminal; late output still remains on the same card.
+            app.toggle_output("child-69");
+            patch(
+                &mut app,
+                json!({"toolCallId":"child-69", "rawOutput":"still running"}),
+            );
+            refresh(&mut app);
+            assert!(
+                text(&app.transcript_cache[0].as_ref().unwrap().rows).contains("still running")
+            );
+            app.tick();
+            refresh(&mut app);
+            assert!(
+                text(&app.transcript_cache[0].as_ref().unwrap().rows).contains("still running")
+            );
+            let (children, _, _) = app.child_window(0);
+            assert_eq!(children.len(), 6);
+            for index in 1..app.blocks.len() {
+                assert!(
+                    app.transcript_cache[index]
+                        .as_ref()
+                        .unwrap()
+                        .rows
+                        .is_empty()
+                );
+            }
+        }
+
+        #[test]
+        fn canonical_selection_separates_children_but_rejoins_wrapped_source_lines() {
+            use crate::tui::app::Selection;
+            for (width, titles) in [
+                (100, ["first-child", "second-child"]),
+                (
+                    24,
+                    [
+                        "first child with a genuinely wrapped long title",
+                        "second child with another genuinely wrapped long title",
+                    ],
+                ),
+            ] {
+                let mut app = app();
+                patch(&mut app, json!({"toolCallId":"root", "title":"compose"}));
+                for (id, title) in ["first", "second"].into_iter().zip(titles) {
+                    patch(
+                        &mut app,
+                        json!({"toolCallId":id, "title":title, "_meta":{"kit/parentToolCallId":"root"}}),
+                    );
+                }
+                refresh_transcript_cache_with_images(
+                    &mut app,
+                    &mut ImageRuntime::disabled(),
+                    width,
+                );
+                let rows = &app.transcript_cache[0].as_ref().unwrap().rows;
+                let selected: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, row)| {
+                        matches!(row.1.0.as_deref(), Some("first" | "second")).then_some(i)
+                    })
+                    .collect();
+                if width == 24 {
+                    assert!(selected.len() > 2, "exercise actual row wrapping");
+                }
+                app.selection = Some(Selection {
+                    anchor: (selected[0], 0),
+                    head: (*selected.last().unwrap(), width - 1),
+                });
+                let copied = app.selection_text().unwrap();
+                let lines: Vec<_> = copied.lines().collect();
+                assert_eq!(
+                    lines.len(),
+                    2,
+                    "distinct canonical source headers: {copied}"
+                );
+                assert!(
+                    lines[0].contains(titles[0]),
+                    "first header rejoins: {copied}"
+                );
+                assert!(
+                    lines[1].contains(titles[1]),
+                    "second header rejoins: {copied}"
+                );
+            }
+        }
+
+        #[test]
+        fn canonical_terminal_reference_keeps_parallel_raw_output() {
+            let mut app = app();
+            patch(
+                &mut app,
+                json!({"toolCallId":"child", "title":"shell", "content":[{"type":"terminal","terminalId":"terminal"}], "rawOutput":"useful terminal result"}),
+            );
+            let Block::Tool(call) = &app.blocks[0] else {
+                panic!("tool")
+            };
+            assert_eq!(call.output, ["useful terminal result"]);
+            patch(&mut app, json!({"toolCallId":"child", "content":[]}));
+            let Block::Tool(call) = &app.blocks[0] else {
+                panic!("tool")
+            };
+            assert!(call.output.is_empty());
+        }
+
+        #[test]
+        fn canonical_foreign_session_metadata_is_not_applied() {
+            let patch: wire::ToolCallUpdate = serde_json::from_value(
+                json!({"toolCallId":"child", "_meta":{"kit/parentToolCallId":"root"}}),
+            )
+            .unwrap();
+            assert!(
+                translate_for_session(
+                    UpdateSessionNotification::new("other", SessionUpdate::ToolCallUpdate(patch)),
+                    "session"
+                )
+                .is_empty()
+            );
+        }
     }
 }

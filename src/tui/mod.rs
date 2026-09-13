@@ -67,7 +67,7 @@ use wire::{
 };
 
 use crate::{
-    events::{self, EVENTS_ENV},
+    events::{self, EVENTS_ENV, RuntimeEvent},
     protocols::acp::{
         FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID, model_switch,
     },
@@ -1435,6 +1435,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let update = match events::parse(&line) {
+                    // ACP owns tool rendering. Keep the legacy reducer for PR2,
+                    // but do not render the same dispatch again from stderr.
+                    Some(
+                        RuntimeEvent::ChildStarted { .. }
+                        | RuntimeEvent::ChildFinished { .. }
+                        | RuntimeEvent::RunletProgress { .. }
+                        | RuntimeEvent::RunletTransport { .. },
+                    ) => continue,
                     Some(event) => Update::Runtime(event),
                     None if line.starts_with("A2A listening on ") => {
                         Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
@@ -3431,6 +3439,21 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             MessageKind::Thought,
         ),
         SessionUpdate::ToolCallUpdate(update) => {
+            let parent = match &update.meta {
+                MaybeUndefined::Value(meta) => meta.get("kit/parentToolCallId").and_then(|value| {
+                    if value.is_null() {
+                        Some(None)
+                    } else {
+                        value.as_str().map(|id| Some(id.to_owned()))
+                    }
+                }),
+                MaybeUndefined::Null => Some(None),
+                MaybeUndefined::Undefined => None,
+            };
+            let parent_update = parent.map(|parent| Update::ToolParent {
+                id: update.tool_call_id.to_string(),
+                parent,
+            });
             let images = match &update.content {
                 MaybeUndefined::Value(content) => Some(tool_images_of(content)),
                 MaybeUndefined::Null => Some(Vec::new()),
@@ -3439,7 +3462,26 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 MaybeUndefined::Undefined => None,
             };
             let output = match &update.content {
-                MaybeUndefined::Value(content) => Some(output_of(Some(content))),
+                MaybeUndefined::Value(content) => {
+                    let text = output_of(Some(content));
+                    // The TUI does not replay terminal streams yet. A parallel raw
+                    // result still provides useful output for terminal-only content.
+                    Some(
+                        if text.is_empty()
+                            && content
+                                .iter()
+                                .any(|item| matches!(item, ToolCallContent::Terminal(_)))
+                        {
+                            update
+                                .raw_output
+                                .value()
+                                .map(raw_output_lines)
+                                .unwrap_or_default()
+                        } else {
+                            text
+                        },
+                    )
+                }
                 MaybeUndefined::Null => Some(Vec::new()),
                 MaybeUndefined::Undefined => match &update.raw_output {
                     MaybeUndefined::Value(output) => Some(raw_output_lines(output)),
@@ -3463,7 +3505,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                         .iter()
                         .any(|line| line.contains("is now running in the background"))
                 });
-            vec![Update::ToolPatched {
+            let mut updates = vec![Update::ToolPatched {
                 id: update.tool_call_id.to_string(),
                 title: match update.title {
                     MaybeUndefined::Value(title) => Some(title),
@@ -3486,7 +3528,9 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 append_output: false,
                 intent: None,
                 backgrounded,
-            }]
+            }];
+            updates.extend(parent_update);
+            updates
         }
         SessionUpdate::ToolCallContentChunk(chunk) => {
             let images = tool_images_of(std::slice::from_ref(&chunk.content));
