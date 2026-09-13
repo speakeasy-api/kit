@@ -84,7 +84,7 @@ fn initialize_params() -> Result<Value, Error> {
     Ok(params)
 }
 
-pub(super) type Initialized = (Version, v1::AgentCapabilities, Vec<v1::AuthMethod>);
+pub(super) type Initialized = (Version, v1::AgentCapabilities, Vec<v1::AuthMethod>, bool);
 
 pub(super) async fn initialize(connection: &ConnectionTo<Agent>) -> Result<Initialized, Error> {
     let response = connection
@@ -108,12 +108,17 @@ fn negotiated(response: Value) -> Result<Initialized, Error> {
                 Version::V1,
                 initialized.agent_capabilities,
                 initialized.auth_methods,
+                false,
             ))
         }
         ProtocolVersion::V2 => {
             let initialized: v2::InitializeResponse = serde_json::from_value(response)?;
             let mut capabilities = v1::AgentCapabilities::default();
+            let supports_steer;
             if let Some(session) = initialized.capabilities.session {
+                supports_steer = session
+                    .inject
+                    .is_some_and(|inject| inject.modes.contains(&v2::SessionInjectMode::Steer));
                 if let Some(prompt) = session.prompt {
                     capabilities.prompt_capabilities.image = prompt.image.is_some();
                     capabilities.prompt_capabilities.audio = prompt.audio.is_some();
@@ -149,7 +154,7 @@ fn negotiated(response: Value) -> Result<Initialized, Error> {
                     ))
                 })
                 .collect();
-            Ok((Version::V2, capabilities, auth_methods))
+            Ok((Version::V2, capabilities, auth_methods, supports_steer))
         }
         other => Err(Error::into_internal_error(std::io::Error::other(format!(
             "ACP harness selected unsupported protocol version {other}"
@@ -246,6 +251,22 @@ where
     }
 }
 
+/// Injection is acknowledged independently of the foreground prompt's settlement.
+pub(super) async fn steer(
+    connection: &ConnectionTo<Agent>,
+    session_id: v1::SessionId,
+    content: Vec<v1::ContentBlock>,
+) -> Result<Value, Error> {
+    let request = v2::InjectSessionRequest::new(
+        session_id.to_string(),
+        v2::SessionInjectMode::Steer,
+        serde_json::from_value(serde_json::to_value(content)?)?,
+    );
+    Ok(serde_json::to_value(
+        connection.send_request(request).block_task().await?,
+    )?)
+}
+
 pub(super) fn fork(
     connection: &ConnectionTo<Agent>,
     version: Version,
@@ -333,14 +354,14 @@ mod tests {
 
     #[test]
     fn selects_version_before_parsing_capabilities() {
-        let (version, caps, _) = negotiated(json!({"protocolVersion": 1,
+        let (version, caps, _, _) = negotiated(json!({"protocolVersion": 1,
             "agentCapabilities": {"sessionCapabilities": {"fork": {}}}
         }))
         .unwrap();
         assert_eq!(version, Version::V1);
         assert!(caps.session_capabilities.fork.is_some());
         assert!(caps.session_capabilities.close.is_none());
-        let (version, caps, _) = negotiated(json!({"protocolVersion": 2,
+        let (version, caps, _, _) = negotiated(json!({"protocolVersion": 2,
             "info": {"name": "child", "version": "1"},
             "capabilities": {"session": {"fork": {}}}
         }))
@@ -348,12 +369,35 @@ mod tests {
         assert_eq!(version, Version::V2);
         assert!(caps.session_capabilities.fork.is_some());
         assert!(caps.session_capabilities.close.is_some());
-        let (_, caps, _) = negotiated(json!({"protocolVersion": 2,
+        let (_, caps, _, _) = negotiated(json!({"protocolVersion": 2,
             "info": {"name": "child", "version": "1"},
             "capabilities": {"session": {}}
         }))
         .unwrap();
         assert!(caps.session_capabilities.fork.is_none());
+    }
+
+    #[test]
+    fn steering_requires_v2_and_an_advertised_steer_mode() {
+        for (session, expected) in [
+            (json!({}), false),
+            (json!({"inject": {"modes": ["queue"]}}), false),
+            (
+                json!({"inject": {"modes": ["steer"], "steerInStream": ["finish"]}}),
+                true,
+            ),
+        ] {
+            let (_, _, _, supported) = negotiated(json!({"protocolVersion": 2,
+                "info": {"name": "child", "version": "1"}, "capabilities": {"session": session}
+            }))
+            .unwrap();
+            assert_eq!(supported, expected);
+        }
+        let (_, _, _, supported) = negotiated(json!({"protocolVersion": 1,
+            "agentCapabilities": {"sessionCapabilities": {"inject": {"modes": ["steer"]}}}
+        }))
+        .unwrap();
+        assert!(!supported);
     }
 
     #[test]

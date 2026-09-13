@@ -37,6 +37,7 @@ fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
 inject_release = option("--inject-release")
+inject_ack_release = option("--inject-ack-release")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -299,6 +300,8 @@ def inject(request):
     with state_lock:
         message_id = f"injected-{next_injection}"
         next_injection += 1
+    while inject_ack_release is not None and not os.path.exists(inject_ack_release):
+        time.sleep(0.01)
     respond(request["id"], {"messageId": message_id})
     while inject_release is not None and not os.path.exists(inject_release):
         time.sleep(0.01)
