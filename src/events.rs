@@ -28,6 +28,15 @@ pub const EVENT_MARKER: &str = "\u{1}kit-runtime\u{1}";
 /// Environment variable that turns emission on for a `serve` process.
 pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 
+/// Scoped authority control. Only a newer `Open` can recover a lost lease.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryState {
+    Open,
+    Heartbeat,
+    Lost,
+}
+
 /// One runtime event sent privately to the terminal client.
 ///
 /// `call` is the compose child call id, shaped `<parent>:compose:<operation>`,
@@ -35,6 +44,18 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
+    /// A publisher-owned stream epoch, separate from all descendant publishers.
+    RuntimeBoundary {
+        source: String,
+        epoch: u64,
+        state: BoundaryState,
+    },
+    /// Authority dependencies are retained recursively when a parent forwards.
+    RuntimeScoped {
+        source: String,
+        epoch: u64,
+        payload: Box<RuntimeEvent>,
+    },
     /// Process-wide progress transport lease/reset, not a source execution.
     RunletTransport { available: bool },
     /// Authoritative, value-free observations owned by an exact compose call.
@@ -187,6 +208,29 @@ pub enum GenerationOutcome {
 }
 
 impl RuntimeEvent {
+    /// Bound recursive provenance and validate progress even inside wrappers.
+    pub(crate) fn valid_wire_payload(&self) -> bool {
+        let mut event = self;
+        for _ in 0..=16 {
+            match event {
+                Self::RuntimeScoped {
+                    source, payload, ..
+                } => {
+                    if source.is_empty() || source.len() > 64 {
+                        return false;
+                    }
+                    event = payload;
+                }
+                Self::RuntimeBoundary { source, .. } => {
+                    return !source.is_empty() && source.len() <= 64;
+                }
+                Self::RunletProgress { progress } => return progress.bounded(),
+                _ => return true,
+            }
+        }
+        false
+    }
+
     /// Whether a parent Kit runtime should forward this child event unchanged.
     pub(crate) fn forward_from_child(&self) -> bool {
         matches!(
@@ -206,7 +250,9 @@ impl RuntimeEvent {
         let call = match self {
             Self::RunletProgress { progress } => return Some(&progress.owner),
             Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::RunletTransport { .. }
+            Self::RuntimeBoundary { .. }
+            | Self::RuntimeScoped { .. }
+            | Self::RunletTransport { .. }
             | Self::StorageStatus { .. }
             | Self::SessionStarted { .. }
             | Self::CompactionStarted { .. }
@@ -245,11 +291,9 @@ pub fn parse(line: &str) -> Option<RuntimeEvent> {
     if body.len() > 64 * 1024 {
         return None;
     }
-    // Existing diagnostic events retain their historical parser shape. The new
-    // bounded payload is checked before it can reach retained UI state.
     let event: RuntimeEvent = serde_json::from_str(body).ok()?;
-    if let RuntimeEvent::RunletProgress { progress } = &event
-        && (body.len() > 4096 || !progress.bounded())
+    if !event.valid_wire_payload()
+        || (matches!(event, RuntimeEvent::RunletProgress { .. }) && body.len() > 4096)
     {
         return None;
     }
@@ -335,8 +379,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EVENT_MARKER, GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus, parse,
-        summarize_input, summarize_output, test_support::write_event,
+        BoundaryState, EVENT_MARKER, GenerationOutcome, HarnessVendor, RuntimeEvent,
+        SubagentStatus, parse, summarize_input, summarize_output, test_support::write_event,
     };
 
     #[test]
@@ -618,6 +662,79 @@ mod tests {
                 ancestor_id: "s-parent".into(),
             },
         );
+    }
+
+    #[test]
+    fn scoped_wire_roundtrips_without_promoting_legacy_status() {
+        for state in [
+            BoundaryState::Open,
+            BoundaryState::Heartbeat,
+            BoundaryState::Lost,
+        ] {
+            let event = RuntimeEvent::RuntimeScoped {
+                source: "parent".into(),
+                epoch: 4,
+                payload: Box::new(RuntimeEvent::RuntimeBoundary {
+                    source: "descendant".into(),
+                    epoch: 2,
+                    state,
+                }),
+            };
+            let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+            assert_eq!(parse(&line), Some(event));
+        }
+        let legacy = format!(
+            "{EVENT_MARKER}{}",
+            r#"{"event":"runlet_transport","available":true}"#
+        );
+        assert_eq!(
+            parse(&legacy),
+            Some(RuntimeEvent::RunletTransport { available: true })
+        );
+    }
+
+    #[test]
+    fn scoped_wire_validates_nested_metadata_and_depth() {
+        let wrap = |payload| RuntimeEvent::RuntimeScoped {
+            source: "publisher".into(),
+            epoch: 0,
+            payload: Box::new(payload),
+        };
+        let parse_event = |event: &RuntimeEvent| {
+            parse(&format!(
+                "{EVENT_MARKER}{}",
+                serde_json::to_string(event).unwrap()
+            ))
+        };
+        let mut event = RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: false,
+        };
+        for _ in 0..16 {
+            event = wrap(event);
+            assert_eq!(parse_event(&event), Some(event.clone()));
+        }
+        assert!(parse_event(&wrap(event)).is_none());
+        for source in [String::new(), "x".repeat(65)] {
+            assert!(
+                parse_event(&wrap(RuntimeEvent::RuntimeBoundary {
+                    source,
+                    epoch: 0,
+                    state: BoundaryState::Open,
+                }))
+                .is_none()
+            );
+        }
+        let malformed = format!(
+            "{EVENT_MARKER}{}",
+            r#"{"event":"runtime_boundary","source":"p","epoch":0,"state":"available"}"#
+        );
+        assert!(parse(&malformed).is_none());
+        let malformed = format!(
+            "{EVENT_MARKER}{}",
+            r#"{"event":"runtime_scoped","source":"p","epoch":0}"#
+        );
+        assert!(parse(&malformed).is_none());
     }
 
     #[test]

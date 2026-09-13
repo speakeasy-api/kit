@@ -1241,6 +1241,8 @@ fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
                 | crate::events::RuntimeEvent::ChildFinished { .. }
                 | crate::events::RuntimeEvent::RunletProgress { .. }
                 | crate::events::RuntimeEvent::RunletTransport { .. }
+                | crate::events::RuntimeEvent::RuntimeBoundary { .. }
+                | crate::events::RuntimeEvent::RuntimeScoped { .. }
         )
     ) {
         return None;
@@ -1944,66 +1946,53 @@ async fn forward_stderr(
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let mut lines = BufReader::new(stderr).lines();
-    let mut deadline = None;
-    let mut unavailable = false;
+    let mut authority = crate::runlet_progress::authority::Authority::default();
     loop {
-        // A nested Kit transport has its own lease. The parent's healthy
-        // heartbeat cannot certify a stalled or failed descendant publisher.
-        let next = if let Some(expires) = deadline {
-            if tokio::time::Instant::now() >= expires {
-                Err(())
-            } else {
-                tokio::time::timeout_at(expires, lines.next_line())
-                    .await
-                    .map_err(|_| ())
+        for event in authority.expire(tokio::time::Instant::now().into_std()) {
+            output(ForwardedStderr::Cleanup(event));
+        }
+        let next = if let Some(expires) = authority.deadline() {
+            match tokio::time::timeout_at(expires.into(), lines.next_line()).await {
+                Ok(next) => next,
+                Err(_) => continue,
             }
         } else {
-            Ok(lines.next_line().await)
+            lines.next_line().await
         };
         let line = match next {
-            Ok(Ok(Some(line))) => line,
-            Ok(_) => break,
-            Err(()) => {
-                unavailable = true;
-                deadline = None;
-                output(ForwardedStderr::Cleanup(
-                    crate::events::RuntimeEvent::RunletTransport { available: false },
-                ));
-                continue;
-            }
+            Ok(Some(line)) => line,
+            _ => break,
         };
+        for event in authority.expire(tokio::time::Instant::now().into_std()) {
+            output(ForwardedStderr::Cleanup(event));
+        }
         if let Some(event) = crate::events::parse(&line) {
-            if unavailable {
+            let admission = authority.observe(&event, tokio::time::Instant::now().into_std());
+            if !admission.accepted {
                 continue;
             }
-            match event {
-                crate::events::RuntimeEvent::RunletTransport { available: true } => {
-                    deadline = Some(
-                        tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE,
-                    );
-                    continue;
-                }
-                crate::events::RuntimeEvent::RunletTransport { available: false } => {
-                    unavailable = true;
-                    deadline = None;
-                    output(ForwardedStderr::RuntimeLine(line));
-                    continue;
-                }
-                _ => {}
+            let payload = crate::runlet_progress::authority::payload(&event);
+            if matches!(
+                payload,
+                crate::events::RuntimeEvent::RunletTransport { available: true }
+            ) {
+                continue;
             }
-            if deadline.is_some() {
-                deadline =
-                    Some(tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE);
-            }
-            if event.forward_from_child() {
+            if payload.forward_from_child()
+                || matches!(
+                    payload,
+                    crate::events::RuntimeEvent::RuntimeBoundary { .. }
+                        | crate::events::RuntimeEvent::RunletTransport { available: false }
+                )
+            {
                 if let crate::events::RuntimeEvent::SubagentStateChanged {
                     parent_id: Some(parent_id),
                     ..
-                } = event
+                } = payload
                 {
-                    ancestors.insert(parent_id);
+                    ancestors.insert(parent_id.clone());
                 }
-                // Preserve recursively forwarded private events byte-for-byte.
+                // Publisher wraps the whole event, preserving nested provenance.
                 output(ForwardedStderr::RuntimeLine(line));
                 continue;
             }
@@ -2072,8 +2061,22 @@ fn prompt_outcome(
     clippy::disallowed_methods,
     clippy::disallowed_macros
 )]
-mod test_support {
+pub(crate) mod test_support {
     use super::*;
+
+    #[cfg(feature = "tui")]
+    /// Runs the real owned stderr receiver into a real parent publisher.
+    pub(crate) async fn forward_runtime(
+        reader: impl tokio::io::AsyncRead + Unpin,
+        parent: crate::runlet_progress::transport::Transport,
+    ) {
+        super::forward_stderr(reader, "acp.kit", None, |item| match item {
+            super::ForwardedStderr::RuntimeLine(line) => parent.publish_runtime_line(&line),
+            super::ForwardedStderr::Cleanup(event) => parent.publish_event(&event),
+            super::ForwardedStderr::Diagnostic(line) => parent.publish_line(&line),
+        })
+        .await;
+    }
 
     impl ChildSession {
         pub(crate) fn closure_probe_for_test() -> (Self, oneshot::Receiver<()>) {
@@ -4763,6 +4766,153 @@ for line in sys.stdin:
         use super::*;
 
         #[tokio::test(start_paused = true)]
+        async fn nested_reader_emits_scoped_loss_despite_parent_heartbeats() {
+            use crate::events::{BoundaryState, EVENT_MARKER, RuntimeEvent};
+            use tokio::io::AsyncWriteExt;
+            let (mut writer, reader) = tokio::io::duplex(8192);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let forward = tokio::spawn(async move {
+                forward_stderr(reader, "acp.kit", None, |item| {
+                    tx.send(item).unwrap();
+                })
+                .await;
+            });
+            let boundary = |source: &str, epoch, state| RuntimeEvent::RuntimeBoundary {
+                source: source.into(),
+                epoch,
+                state,
+            };
+            let nested = |epoch, payload| RuntimeEvent::RuntimeScoped {
+                source: "parent".into(),
+                epoch,
+                payload: Box::new(payload),
+            };
+            let line = |event: &RuntimeEvent| {
+                format!("{EVENT_MARKER}{}\n", serde_json::to_string(event).unwrap())
+            };
+            for event in [
+                boundary("parent", 0, BoundaryState::Open),
+                nested(0, boundary("child", 0, BoundaryState::Open)),
+            ] {
+                writer.write_all(line(&event).as_bytes()).await.unwrap();
+                assert_eq!(
+                    rx.recv().await.unwrap(),
+                    ForwardedStderr::RuntimeLine(line(&event).trim_end().into())
+                );
+            }
+            tokio::time::advance(crate::runlet_progress::transport::LEASE / 2).await;
+            let heartbeat = boundary("parent", 0, BoundaryState::Heartbeat);
+            writer.write_all(line(&heartbeat).as_bytes()).await.unwrap();
+            assert!(matches!(
+                rx.recv().await.unwrap(),
+                ForwardedStderr::RuntimeLine(_)
+            ));
+            tokio::time::advance(crate::runlet_progress::transport::LEASE / 2).await;
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                ForwardedStderr::Cleanup(nested(0, boundary("child", 0, BoundaryState::Lost)))
+            );
+            // Healthy containing epoch rotation cannot revive its expired child.
+            for event in [
+                boundary("parent", 2, BoundaryState::Open),
+                nested(2, boundary("child", 0, BoundaryState::Heartbeat)),
+                nested(2, boundary("child", 0, BoundaryState::Open)),
+                nested(2, boundary("child", 2, BoundaryState::Open)),
+            ] {
+                writer.write_all(line(&event).as_bytes()).await.unwrap();
+            }
+            for expected in [
+                boundary("parent", 2, BoundaryState::Open),
+                nested(2, boundary("child", 2, BoundaryState::Open)),
+            ] {
+                assert_eq!(
+                    rx.recv().await.unwrap(),
+                    ForwardedStderr::RuntimeLine(line(&expected).trim_end().into())
+                );
+            }
+            drop(writer);
+            forward.await.unwrap();
+            assert!(rx.recv().await.is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn scoped_reader_expires_backlog_and_recovers_only_new_open() {
+            use crate::events::{BoundaryState, EVENT_MARKER, RuntimeEvent};
+            use tokio::io::AsyncWriteExt;
+            let (mut writer, reader) = tokio::io::duplex(8192);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let forward = tokio::spawn(async move {
+                forward_stderr(reader, "acp.kit", None, |item| {
+                    tx.send(item).unwrap();
+                })
+                .await;
+            });
+            let boundary = |epoch, state| RuntimeEvent::RuntimeBoundary {
+                source: "child".into(),
+                epoch,
+                state,
+            };
+            let started = |epoch| RuntimeEvent::RuntimeScoped {
+                source: "child".into(),
+                epoch,
+                payload: Box::new(RuntimeEvent::ChildStarted {
+                    call: "parent:compose:0".into(),
+                    tool: "shell".into(),
+                    summary: "working".into(),
+                    at: 1,
+                }),
+            };
+            let line = |event: &RuntimeEvent| {
+                format!("{EVENT_MARKER}{}\n", serde_json::to_string(event).unwrap())
+            };
+            writer
+                .write_all(
+                    format!(
+                        "{}{}",
+                        line(&boundary(0, BoundaryState::Open)),
+                        line(&started(0))
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    rx.recv().await.unwrap(),
+                    ForwardedStderr::RuntimeLine(_)
+                ));
+            }
+            tokio::time::advance(crate::runlet_progress::transport::LEASE).await;
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                ForwardedStderr::Cleanup(boundary(0, BoundaryState::Lost))
+            );
+            writer
+                .write_all(
+                    format!(
+                        "{}{}{}{}{}",
+                        line(&boundary(0, BoundaryState::Heartbeat)),
+                        line(&boundary(0, BoundaryState::Open)),
+                        line(&started(0)),
+                        line(&boundary(2, BoundaryState::Open)),
+                        line(&started(2))
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for expected in [boundary(2, BoundaryState::Open), started(2)] {
+                let ForwardedStderr::RuntimeLine(actual) = rx.recv().await.unwrap() else {
+                    panic!("expected scoped frame")
+                };
+                assert_eq!(crate::events::parse(&actual), Some(expected));
+            }
+            drop(writer);
+            forward.await.unwrap();
+            assert!(rx.recv().await.is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn nested_transport_loss_preserves_diagnostics_not_stale_lifecycle() {
             use crate::events::{EVENT_MARKER, RuntimeEvent};
             use tokio::io::AsyncWriteExt;
@@ -4798,13 +4948,13 @@ for line in sys.stdin:
                     rx.recv().await.unwrap(),
                     ForwardedStderr::RuntimeLine(_)
                 ));
+                let reset_line = format!(
+                    "{EVENT_MARKER}{}\n",
+                    serde_json::to_string(&RuntimeEvent::RunletTransport { available: false })
+                        .unwrap()
+                );
                 if explicit {
-                    let reset = format!(
-                        "{EVENT_MARKER}{}\n",
-                        serde_json::to_string(&RuntimeEvent::RunletTransport { available: false })
-                            .unwrap()
-                    );
-                    writer.write_all(reset.as_bytes()).await.unwrap();
+                    writer.write_all(reset_line.as_bytes()).await.unwrap();
                 } else {
                     tokio::time::advance(crate::runlet_progress::transport::LEASE).await;
                 }
@@ -4814,8 +4964,16 @@ for line in sys.stdin:
                     _ => panic!("expected nested invalidation"),
                 };
                 assert_eq!(reset, RuntimeEvent::RunletTransport { available: false });
+                // Neither a heartbeat nor an explicit reset/recovery pair has
+                // source identity. A healthy intermediate parent must not
+                // revive failed descendant evidence, including after expiry.
                 writer
-                    .write_all(format!("{heartbeat}{start}later child error\n").as_bytes())
+                    .write_all(
+                        format!(
+                            "{heartbeat}{start}{reset_line}{heartbeat}{start}later child error\n"
+                        )
+                        .as_bytes(),
+                    )
                     .await
                     .unwrap();
                 assert!(
@@ -4824,6 +4982,21 @@ for line in sys.stdin:
                 drop(writer);
                 forward.await.unwrap();
                 assert!(rx.try_recv().is_err());
+
+                // Loss belongs to the old stream, not the harness label or
+                // ancestor. A newly owned stream can forward fresh evidence;
+                // its heartbeat is still consumed locally, never promoted to
+                // a certificate for the parent's other descendants.
+                let fresh = format!("{heartbeat}{start}");
+                let mut output = Vec::new();
+                forward_stderr(fresh.as_bytes(), "acp.kit", None, |item| {
+                    output.push(item);
+                })
+                .await;
+                assert_eq!(
+                    output,
+                    vec![ForwardedStderr::RuntimeLine(start.trim_end().to_owned())]
+                );
             }
         }
 

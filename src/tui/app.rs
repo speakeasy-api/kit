@@ -803,8 +803,9 @@ pub struct AgentCounts {
 }
 
 pub struct App {
-    progress_last_frame: Option<Instant>,
+    runtime_authority: crate::runlet_progress::authority::Authority,
     progress_unavailable: bool,
+    runtime_incomplete: bool,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
@@ -1064,8 +1065,9 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
-            progress_last_frame: None,
+            runtime_authority: Default::default(),
             progress_unavailable: false,
+            runtime_incomplete: false,
             root,
             provider,
             model,
@@ -1369,7 +1371,7 @@ impl App {
 
     /// Whether periodic polling must advance animations or expire a runtime lease.
     pub fn needs_redraw_tick(&self) -> bool {
-        (!self.progress_unavailable && self.progress_last_frame.is_some())
+        self.runtime_authority.deadline().is_some()
             || self.working()
             || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
@@ -2272,6 +2274,8 @@ impl App {
             Update::ProcessExited(error) => {
                 // Confirmed process exit can retire known roster rows. A mere
                 // diagnostic gap cannot claim those terminal outcomes.
+                self.runtime_authority
+                    .expire(Instant::now() + crate::runlet_progress::transport::LEASE);
                 self.invalidate_runtime_status();
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
@@ -2290,15 +2294,13 @@ impl App {
     }
 
     fn invalidate_runtime_status(&mut self) {
-        if self.progress_unavailable {
-            return;
-        }
+        // Other healthy scopes can contribute fresh state while one scope is
+        // unavailable. Every subsequent loss must clear that state too.
         self.progress_unavailable = true;
+        self.runtime_incomplete = true;
         // All these fields depend on the same lossy side channel. Absence is
         // unknown, not idle/success/healthy; the UI exposes unavailability.
-        self.agent_versions.clear();
-        self.cleaned_agent_ids.clear();
-        self.cleaned_agent_ancestors.clear();
+        // Lifecycle ordering and removal tombstones survive recovery.
         self.agents_scroll = 0;
         // Attachment identity survives transport loss; ACP emits it only when
         // attaching. Keep it distinct from session_id to reject another session.
@@ -2319,21 +2321,14 @@ impl App {
         self.progress_unavailable
     }
 
+    pub(super) fn runtime_incomplete(&self) -> bool {
+        self.runtime_incomplete
+    }
+
     /// Monotonic transport deadline, also checked before accepting new traffic.
     pub(super) fn progress_tick_at(&mut self, now: Instant) {
-        if !self.progress_unavailable
-            && self.progress_last_frame.is_some_and(|last| {
-                now.saturating_duration_since(last) >= crate::runlet_progress::transport::LEASE
-            })
-        {
+        if !self.runtime_authority.expire(now).is_empty() {
             self.disable_runtime();
-        }
-    }
-    fn progress_activity(&mut self) {
-        let now = Instant::now();
-        self.progress_tick_at(now);
-        if !self.progress_unavailable {
-            self.progress_last_frame = Some(now);
         }
     }
 
@@ -2342,21 +2337,30 @@ impl App {
     }
 
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-        // Check expiry before any frame can refresh the lease or revive a
-        // lifecycle map. Loss applies to all runtime events, not only progress.
-        self.progress_activity();
-        if let RuntimeEvent::RunletTransport { available } = event {
-            if available {
-                if self.progress_unavailable {
-                    // A heartbeat restores transport, not the observations lost
-                    // during the gap. Keep cleared state and progress tombstones.
-                    self.note("Runtime status resumed; earlier agent, child, compaction and storage state remains unknown");
-                }
-                self.progress_unavailable = false;
-                self.progress_last_frame = Some(Instant::now());
-            } else {
-                self.disable_runtime();
+        let now = Instant::now();
+        self.progress_tick_at(now);
+        let admission = self.runtime_authority.observe(&event, now);
+        if admission.invalidated {
+            self.disable_runtime();
+        }
+        if !admission.accepted {
+            return;
+        }
+        if admission.opened {
+            if self.progress_unavailable {
+                self.note("Runtime status resumed; earlier agent, child, compaction and storage state remains unknown");
             }
+            self.progress_unavailable = false;
+        }
+        let scoped = matches!(event, RuntimeEvent::RuntimeScoped { .. });
+        let mut event = event;
+        while let RuntimeEvent::RuntimeScoped { payload, .. } = event {
+            event = *payload;
+        }
+        if matches!(
+            event,
+            RuntimeEvent::RuntimeBoundary { .. } | RuntimeEvent::RunletTransport { .. }
+        ) {
             return;
         }
         // Attachment markers identify the stream even during a gap, but do not
@@ -2365,12 +2369,15 @@ impl App {
             self.runtime_session_id = Some(session_id);
             return;
         }
-        if self.runtime_unavailable() {
+        if self.runtime_unavailable() && !scoped {
             return;
         }
         let parent = event.parent_call().map(str::to_string);
         let owner_id = match event {
-            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => return,
+            RuntimeEvent::RunletTransport { .. }
+            | RuntimeEvent::SessionStarted { .. }
+            | RuntimeEvent::RuntimeBoundary { .. }
+            | RuntimeEvent::RuntimeScoped { .. } => return,
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
@@ -2530,9 +2537,8 @@ impl App {
                 return;
             }
             RuntimeEvent::RunletProgress { progress } => {
-                if self.progress_unavailable {
-                    return;
-                }
+                // Admission already verified this event's own dependency scope.
+                // Another scope's loss must not block fresh healthy progress.
                 let Some(owner) = self.blocks.iter().rev().find_map(|b| match b {
                     Block::Tool(c) if c.id == progress.owner && c.is_compose() => Some(c),
                     _ => None,
@@ -2656,6 +2662,7 @@ impl App {
     /// history and diagnostics remain useful, while transcript-derived state
     /// starts empty.
     pub fn start_session(&mut self, session_id: String) {
+        self.runtime_incomplete = false;
         self.model_switch = None;
         self.cancel_steer_edit();
         self.selected_steer = None;
@@ -7919,11 +7926,8 @@ mod tests {
 
         // Advance the lease age without sleeping, then use the same scheduling
         // predicate and tick entry point as both event loops. No new traffic.
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
         assert!(app.needs_redraw_tick());
-        if app.needs_redraw_tick() {
-            app.tick();
-        }
+        app.progress_tick_at(Instant::now() + crate::runlet_progress::transport::LEASE);
         assert!(app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 0);
         assert!(!app.storage_pending && !app.storage_exhausted);
@@ -7931,34 +7935,60 @@ mod tests {
     }
 
     #[test]
-    fn healthy_heartbeat_expires_old_state_before_renewing_lease() {
+    fn legacy_heartbeat_cannot_recover_expired_authority() {
         let mut app = app();
         app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
             pending: true,
             exhausted: true,
         }));
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.progress_tick_at(Instant::now() + crate::runlet_progress::transport::LEASE);
         app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
             available: true,
         }));
+        assert!(app.runtime_unavailable());
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
+    fn scoped_recovery_preserves_healthy_state_but_never_reconstructs_lost_state() {
+        use crate::events::BoundaryState;
+        let mut app = app();
+        let boundary = |epoch, state| RuntimeEvent::RuntimeBoundary {
+            source: "runtime".into(),
+            epoch,
+            state,
+        };
+        let data = |epoch| RuntimeEvent::RuntimeScoped {
+            source: "runtime".into(),
+            epoch,
+            payload: Box::new(RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: true,
+            }),
+        };
+        app.apply(Update::Runtime(boundary(0, BoundaryState::Open)));
+        app.apply(Update::Runtime(data(0)));
+        app.apply(Update::Runtime(boundary(2, BoundaryState::Open)));
+        assert!(app.storage_pending && app.storage_exhausted);
+        app.progress_tick_at(Instant::now() + crate::runlet_progress::transport::LEASE);
+        assert!(app.runtime_unavailable());
+        for event in [
+            boundary(2, BoundaryState::Heartbeat),
+            boundary(2, BoundaryState::Open),
+            data(2),
+        ] {
+            app.apply(Update::Runtime(event));
+        }
+        assert!(app.runtime_unavailable());
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        app.apply(Update::Runtime(boundary(4, BoundaryState::Open)));
         assert!(!app.runtime_unavailable());
         assert!(!app.storage_pending && !app.storage_exhausted);
-        assert!(app.needs_redraw_tick());
-        assert!(
-            matches!(app.blocks.last(), Some(Block::Notice(text)) if text.contains("state remains unknown"))
-        );
-
-        let blocks = app.blocks.len();
-        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
-            available: true,
-        }));
-        assert_eq!(app.blocks.len(), blocks);
-        app.tick();
-        assert!(!app.runtime_unavailable());
-
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
-        app.tick();
-        assert!(app.runtime_unavailable());
+        app.apply(Update::Runtime(data(2)));
+        assert!(!app.storage_pending);
+        app.apply(Update::Runtime(data(4)));
+        assert!(app.storage_pending && app.storage_exhausted);
     }
 
     #[test]

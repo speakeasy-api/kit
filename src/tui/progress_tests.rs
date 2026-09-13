@@ -11,6 +11,58 @@ fn progress_wire(app: &mut App, event: RuntimeEvent) {
         crate::events::parse(line.trim_end()).unwrap(),
     ));
 }
+fn scoped_progress_wire(app: &mut App, epoch: u64, event: RuntimeEvent) {
+    let event = match event {
+        RuntimeEvent::RunletTransport { available } => RuntimeEvent::RuntimeBoundary {
+            source: "tui-test".into(),
+            epoch,
+            state: if available {
+                crate::events::BoundaryState::Open
+            } else {
+                crate::events::BoundaryState::Lost
+            },
+        },
+        event => RuntimeEvent::RuntimeScoped {
+            source: "tui-test".into(),
+            epoch,
+            payload: Box::new(event),
+        },
+    };
+    progress_wire(app, event);
+}
+fn scoped_progress_start(app: &mut App, epoch: u64, source: &str, incarnation: u64, healed: bool) {
+    scoped_progress_wire(
+        app,
+        epoch,
+        source_event(
+            "call-1",
+            incarnation,
+            0,
+            ProgressChange::Started {
+                digest: crate::tui::progress::source_digest(source),
+                healed,
+            },
+        ),
+    );
+}
+fn scoped_progress_step(
+    app: &mut App,
+    epoch: u64,
+    incarnation: u64,
+    sequence: u64,
+    node: ProgressNode,
+) {
+    scoped_progress_wire(
+        app,
+        epoch,
+        source_event(
+            "call-1",
+            incarnation,
+            sequence,
+            ProgressChange::Step { node: Some(node) },
+        ),
+    );
+}
 fn source_event(
     owner: &str,
     incarnation: u64,
@@ -869,42 +921,71 @@ fn start_progress_session(app: &mut App, session_id: &str) {
 fn authoritative_progress_recovery_preserves_old_incarnation_tombstones() {
     for explicit in [true, false] {
         let mut app = sample();
-        start_progress_session(&mut app, "session");
-        progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "session".into() });
-        progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
-        progress_start(&mut app, SCRIPT, 1, false);
-        progress_step(
+        let mut epoch = 0;
+        scoped_progress_wire(
             &mut app,
+            epoch,
+            RuntimeEvent::RunletTransport { available: true },
+        );
+        start_progress_session(&mut app, "session");
+        scoped_progress_wire(
+            &mut app,
+            epoch,
+            RuntimeEvent::SessionStarted {
+                session_id: "session".into(),
+            },
+        );
+        scoped_progress_wire(
+            &mut app,
+            epoch,
+            RuntimeEvent::RunletTransport { available: true },
+        );
+        scoped_progress_start(&mut app, epoch, SCRIPT, 1, false);
+        scoped_progress_step(
+            &mut app,
+            epoch,
             1,
             1,
             progress_node("a", ProgressState::Succeeded, true),
         );
-        progress_wire(
+        scoped_progress_wire(
             &mut app,
+            epoch,
             source_event("call-1", 1, 1, ProgressChange::Finished { complete: true }),
         );
         assert!(render(&mut app, 140, 50).contains("1 succeeded"));
         if explicit {
-            progress_wire(&mut app, RuntimeEvent::RunletTransport { available: false });
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::RunletTransport { available: false },
+            );
         } else {
             app.progress_tick_at(
                 std::time::Instant::now() + crate::runlet_progress::transport::LEASE,
             );
         }
         assert!(!render(&mut app, 140, 50).contains("# call @"));
-        progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
-        assert!(!app.runtime_unavailable());
-        progress_start(&mut app, SCRIPT, 1, false);
-        progress_step(
+        epoch = 2;
+        scoped_progress_wire(
             &mut app,
+            epoch,
+            RuntimeEvent::RunletTransport { available: true },
+        );
+        assert!(!app.runtime_unavailable());
+        scoped_progress_start(&mut app, epoch, SCRIPT, 1, false);
+        scoped_progress_step(
+            &mut app,
+            epoch,
             1,
             1,
             progress_node("a", ProgressState::Succeeded, true),
         );
         assert!(!render(&mut app, 140, 50).contains("# call @"));
-        progress_start(&mut app, SCRIPT, 2, false);
-        progress_step(
+        scoped_progress_start(&mut app, epoch, SCRIPT, 2, false);
+        scoped_progress_step(
             &mut app,
+            epoch,
             2,
             1,
             progress_node("b", ProgressState::Succeeded, true),
@@ -957,7 +1038,10 @@ async fn authoritative_progress_production_publication_completes_and_cancels_wit
         reader.read_to_string(&mut wire).unwrap();
         assert!(wire.lines().any(|line| matches!(
             crate::events::parse(line),
-            Some(RuntimeEvent::RunletTransport { available: false })
+            Some(RuntimeEvent::RuntimeBoundary {
+                state: crate::events::BoundaryState::Lost,
+                ..
+            })
         )));
     }
 }
@@ -1012,8 +1096,20 @@ fn authoritative_progress_terminal_conflicts_invalidate_completed_display() {
 fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
     for explicit in [false, true] {
         let mut app = sample();
+        let mut epoch = 0;
+        scoped_progress_wire(
+            &mut app,
+            epoch,
+            RuntimeEvent::RunletTransport { available: true },
+        );
         start_progress_session(&mut app, "session");
-        progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "session".into() });
+        scoped_progress_wire(
+            &mut app,
+            epoch,
+            RuntimeEvent::SessionStarted {
+                session_id: "session".into(),
+            },
+        );
         let agent = RuntimeEvent::SubagentStateChanged {
             id: "child-agent".into(),
             name: "Child worker".into(),
@@ -1030,9 +1126,10 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
             generation_started_at_unix_ms: 2,
             generation_finished_at_unix_ms: None,
         };
-        progress_wire(&mut app, agent.clone());
-        progress_wire(
+        scoped_progress_wire(&mut app, epoch, agent.clone());
+        scoped_progress_wire(
             &mut app,
+            epoch,
             RuntimeEvent::ChildStarted {
                 call: "call-1:compose:0".into(),
                 tool: "shell".into(),
@@ -1040,15 +1137,17 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
                 at: 1,
             },
         );
-        progress_wire(
+        scoped_progress_wire(
             &mut app,
+            epoch,
             RuntimeEvent::StorageStatus {
                 pending: true,
                 exhausted: true,
             },
         );
-        progress_wire(
+        scoped_progress_wire(
             &mut app,
+            epoch,
             RuntimeEvent::CompactionStarted {
                 reason: "test".into(),
                 at: 1,
@@ -1062,7 +1161,11 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
                 .any(|block| matches!(block, Block::Tool(call) if !call.children.is_empty()))
         );
         if explicit {
-            progress_wire(&mut app, RuntimeEvent::RunletTransport { available: false });
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::RunletTransport { available: false },
+            );
         } else {
             app.progress_tick_at(
                 std::time::Instant::now() + crate::runlet_progress::transport::LEASE,
@@ -1093,7 +1196,7 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
             },
             agent.clone(),
         ] {
-            progress_wire(&mut app, event);
+            scoped_progress_wire(&mut app, epoch, event);
         }
         assert!(app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 0);
@@ -1111,7 +1214,12 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
         assert!(!frame.contains("compacting context"));
         assert!(!frame.contains("context compacted"));
 
-        progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
+        epoch = 2;
+        scoped_progress_wire(
+            &mut app,
+            epoch,
+            RuntimeEvent::RunletTransport { available: true },
+        );
         assert!(!app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 0);
         assert!(!app.storage_pending && !app.storage_exhausted && !app.compacting);
@@ -1123,11 +1231,20 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
         assert!(!frame.contains("Child worker"));
         assert!(!frame.contains("working child"));
 
-        // Fresh observations are accepted without reviving cleared state.
-        progress_wire(&mut app, agent);
-        progress_wire(
+        // A newer lifecycle observation is accepted; transport recovery alone
+        // cannot erase per-agent ordering tombstones or replay the old snapshot.
+        let mut fresh_agent = agent;
+        if let RuntimeEvent::SubagentStateChanged { generation, .. } = &mut fresh_agent {
+            *generation += 1;
+        }
+        scoped_progress_wire(&mut app, epoch, fresh_agent);
+        scoped_progress_wire(
             &mut app,
-            RuntimeEvent::StorageStatus { pending: true, exhausted: false },
+            epoch,
+            RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: false,
+            },
         );
         assert_eq!(app.agent_counts().working, 1);
         assert!(app.storage_pending);
@@ -1139,43 +1256,339 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn real_publishers_forward_scoped_expiry_and_recovery_into_tui() {
+    use crate::{events::BoundaryState, runlet_progress::transport::Transport};
+    use std::os::unix::net::UnixStream;
+    use tokio::io::AsyncBufReadExt;
+
+    async fn receive(
+        lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::UnixStream>>,
+        app: &mut App,
+    ) -> RuntimeEvent {
+        // Deadlock watchdog only; no timing or work-count assertion.
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event = crate::events::parse(&line).unwrap();
+        app.apply(Update::Runtime(event.clone()));
+        event
+    }
+    let (child_writer, child_reader) = UnixStream::pair().unwrap();
+    let (parent_writer, parent_reader) = UnixStream::pair().unwrap();
+    child_reader.set_nonblocking(true).unwrap();
+    parent_reader.set_nonblocking(true).unwrap();
+    let child = Transport::start(child_writer, 64, true).unwrap();
+    let parent = Transport::start(parent_writer, 64, true).unwrap();
+    let forwarding = tokio::spawn(crate::acp_child::test_support::forward_runtime(
+        tokio::net::UnixStream::from_std(child_reader).unwrap(),
+        parent,
+    ));
+    let mut lines =
+        tokio::io::BufReader::new(tokio::net::UnixStream::from_std(parent_reader).unwrap()).lines();
+    let mut app = sample();
+    let started = |summary: &str| RuntimeEvent::ChildStarted {
+        call: "call-1:compose:0".into(),
+        tool: "shell".into(),
+        summary: summary.into(),
+        at: 1,
+    };
+    child.publish_event(&started("initial nested work"));
+    let (child_source, initial_epoch) = loop {
+        let event = receive(&mut lines, &mut app).await;
+        if let RuntimeEvent::RuntimeScoped { payload, .. } = event
+            && let RuntimeEvent::RuntimeScoped {
+                source,
+                epoch,
+                payload,
+            } = *payload
+            && matches!(*payload, RuntimeEvent::ChildStarted { .. })
+        {
+            break (source, epoch);
+        }
+    };
+    assert!(
+        app.blocks
+            .iter()
+            .any(|block| matches!(block, Block::Tool(call) if !call.children.is_empty()))
+    );
+    // Stall the owned child receiver's lease independently of both real writer
+    // workers. The publisher queues have ample capacity; no overflow is needed.
+    tokio::time::pause();
+    tokio::time::advance(crate::runlet_progress::transport::LEASE).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    loop {
+        let event = receive(&mut lines, &mut app).await;
+        if matches!(crate::runlet_progress::authority::payload(&event), RuntimeEvent::RuntimeBoundary {
+            source, epoch, state: BoundaryState::Lost,
+        } if source == &child_source && *epoch == initial_epoch)
+        {
+            break;
+        }
+    }
+    assert!(app.runtime_incomplete());
+    assert!(
+        app.blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Tool(call) if !call.children.is_empty()))
+    );
+    // The real child worker periodically opens a newer epoch even when no
+    // publication overflow happened. Parent rotation alone cannot hide the loss.
+    loop {
+        let event = receive(&mut lines, &mut app).await;
+        assert!(app.runtime_incomplete());
+        if matches!(crate::runlet_progress::authority::payload(&event), RuntimeEvent::RuntimeBoundary {
+            source, epoch, state: BoundaryState::Open,
+        } if source == &child_source && *epoch > initial_epoch)
+        {
+            break;
+        }
+    }
+    assert!(
+        app.blocks
+            .iter()
+            .all(|block| !matches!(block, Block::Tool(call) if !call.children.is_empty()))
+    );
+    child.publish_event(&started("fresh nested work"));
+    loop {
+        let event = receive(&mut lines, &mut app).await;
+        if matches!(crate::runlet_progress::authority::payload(&event), RuntimeEvent::ChildStarted { summary, .. } if summary == "fresh nested work")
+        {
+            break;
+        }
+    }
+    assert!(
+        app.blocks
+            .iter()
+            .any(|block| matches!(block, Block::Tool(call) if !call.children.is_empty()))
+    );
+    assert!(render(&mut app, 180, 50).contains("Runtime status incomplete"));
+    drop(child);
+    tokio::time::timeout(std::time::Duration::from_secs(10), forwarding)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn healthy_parent_recovery_cannot_hide_descendant_or_historical_loss() {
+    use crate::events::BoundaryState;
+    let mut app = sample();
+    scoped_progress_wire(
+        &mut app,
+        0,
+        RuntimeEvent::RunletTransport { available: true },
+    );
+    scoped_progress_wire(
+        &mut app,
+        0,
+        RuntimeEvent::RuntimeBoundary {
+            source: "child".into(),
+            epoch: 0,
+            state: BoundaryState::Open,
+        },
+    );
+    scoped_progress_start(&mut app, 0, SCRIPT, 1, false);
+    scoped_progress_step(
+        &mut app,
+        0,
+        1,
+        1,
+        progress_node("a", ProgressState::Running, true),
+    );
+    scoped_progress_wire(
+        &mut app,
+        0,
+        RuntimeEvent::RuntimeBoundary {
+            source: "child".into(),
+            epoch: 0,
+            state: BoundaryState::Lost,
+        },
+    );
+    assert!(app.runtime_unavailable());
+    // The live parent remains eligible to publish fresh progress even before
+    // rotating. Global completeness is not an admission gate for its scope.
+    scoped_progress_start(&mut app, 0, SCRIPT, 2, false);
+    scoped_progress_step(
+        &mut app,
+        0,
+        2,
+        1,
+        progress_node("b", ProgressState::Succeeded, true),
+    );
+    assert!(render(&mut app, 180, 50).contains("# call @"));
+    scoped_progress_wire(
+        &mut app,
+        2,
+        RuntimeEvent::RunletTransport { available: true },
+    );
+    assert!(!app.runtime_unavailable());
+    assert!(app.runtime_incomplete());
+    assert!(render(&mut app, 180, 50).contains("Runtime status incomplete"));
+    scoped_progress_wire(
+        &mut app,
+        2,
+        RuntimeEvent::RuntimeBoundary {
+            source: "child".into(),
+            epoch: 2,
+            state: BoundaryState::Open,
+        },
+    );
+    // Even child recovery cannot reconstruct observations lost in the gap.
+    assert!(render(&mut app, 180, 50).contains("Runtime status incomplete"));
+    start_progress_session(&mut app, "fresh");
+    assert!(!app.runtime_incomplete());
+}
+
 #[test]
 fn runtime_recovery_keeps_session_filtering_across_attachment_gaps() {
     for explicit in [false, true] {
         for attach_during_gap in [false, true] {
             let mut app = sample();
+            let mut epoch = 0;
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::RunletTransport { available: true },
+            );
             start_progress_session(&mut app, "old");
-            progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "old".into() });
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::SessionStarted {
+                    session_id: "old".into(),
+                },
+            );
             if explicit {
-                progress_wire(&mut app, RuntimeEvent::RunletTransport { available: false });
+                scoped_progress_wire(
+                    &mut app,
+                    epoch,
+                    RuntimeEvent::RunletTransport { available: false },
+                );
             } else {
-                app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+                app.progress_tick_at(
+                    std::time::Instant::now() + crate::runlet_progress::transport::LEASE,
+                );
             }
             start_progress_session(&mut app, "new");
             if attach_during_gap {
-                progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "new".into() });
+                scoped_progress_wire(
+                    &mut app,
+                    epoch,
+                    RuntimeEvent::SessionStarted {
+                        session_id: "new".into(),
+                    },
+                );
             }
-            let compaction = RuntimeEvent::CompactionStarted { reason: "test".into(), at: 1 };
-            progress_wire(&mut app, compaction.clone());
-            progress_start(&mut app, SCRIPT, 1, false);
+            let compaction = RuntimeEvent::CompactionStarted {
+                reason: "test".into(),
+                at: 1,
+            };
+            scoped_progress_wire(&mut app, epoch, compaction.clone());
+            scoped_progress_start(&mut app, epoch, SCRIPT, 1, false);
             assert!(app.runtime_unavailable());
             assert!(!app.compacting);
             assert!(!render(&mut app, 140, 50).contains("# call @"));
-            progress_wire(&mut app, RuntimeEvent::RunletTransport { available: true });
-            progress_wire(&mut app, compaction.clone());
-            progress_start(&mut app, SCRIPT, 2, false);
-            progress_step(&mut app, 2, 1, progress_node("a", ProgressState::Succeeded, true));
-            assert_eq!(app.compacting, attach_during_gap);
-            assert_eq!(render(&mut app, 140, 50).contains("# call @"), attach_during_gap);
-            // A heartbeat must not guess that the stream belongs to the selected session.
-            if !attach_during_gap {
-                progress_wire(&mut app, RuntimeEvent::SessionStarted { session_id: "new".into() });
-                progress_wire(&mut app, compaction);
-                progress_start(&mut app, SCRIPT, 3, false);
-                progress_step(&mut app, 3, 1, progress_node("a", ProgressState::Succeeded, true));
+            epoch = 2;
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::RunletTransport { available: true },
+            );
+            scoped_progress_wire(&mut app, epoch, compaction.clone());
+            scoped_progress_start(&mut app, epoch, SCRIPT, 2, false);
+            scoped_progress_step(
+                &mut app,
+                epoch,
+                2,
+                1,
+                progress_node("a", ProgressState::Succeeded, true),
+            );
+            assert!(!app.compacting);
+            assert!(!render(&mut app, 140, 50).contains("# call @"));
+            // A new epoch must not guess which session owns the stream.
+            {
+                scoped_progress_wire(
+                    &mut app,
+                    epoch,
+                    RuntimeEvent::SessionStarted {
+                        session_id: "new".into(),
+                    },
+                );
+                scoped_progress_wire(&mut app, epoch, compaction);
+                scoped_progress_start(&mut app, epoch, SCRIPT, 3, false);
+                scoped_progress_step(
+                    &mut app,
+                    epoch,
+                    3,
+                    1,
+                    progress_node("a", ProgressState::Succeeded, true),
+                );
                 assert!(app.compacting);
                 assert!(render(&mut app, 140, 50).contains("# call @"));
             }
+        }
+    }
+}
+
+#[test]
+fn recovered_storage_risk_stays_visible_despite_incomplete_runtime_status() {
+    use crate::events::BoundaryState;
+    for exhausted in [false, true] {
+        for reopen in [false, true] {
+            let mut app = sample();
+            scoped_progress_wire(
+                &mut app,
+                0,
+                RuntimeEvent::RunletTransport { available: true },
+            );
+            scoped_progress_wire(
+                &mut app,
+                0,
+                RuntimeEvent::RuntimeBoundary {
+                    source: "child".into(),
+                    epoch: 0,
+                    state: BoundaryState::Open,
+                },
+            );
+            scoped_progress_wire(
+                &mut app,
+                0,
+                RuntimeEvent::RuntimeBoundary {
+                    source: "child".into(),
+                    epoch: 0,
+                    state: BoundaryState::Lost,
+                },
+            );
+            let epoch = if reopen { 2 } else { 0 };
+            if reopen {
+                scoped_progress_wire(
+                    &mut app,
+                    epoch,
+                    RuntimeEvent::RunletTransport { available: true },
+                );
+            }
+            scoped_progress_wire(
+                &mut app,
+                epoch,
+                RuntimeEvent::StorageStatus {
+                    pending: true,
+                    exhausted,
+                },
+            );
+            let frame = render(&mut app, 180, 50);
+            assert!(frame.contains(if exhausted {
+                "Storage exhausted: shutting down"
+            } else {
+                "Memory-only storage: awaiting disk recovery"
+            }));
+            assert!(frame.contains("data is at risk") || frame.contains("data at risk on exit"));
+            assert!(frame.contains("runtime status incomplete"));
+            assert!(app.runtime_incomplete());
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Bounded, value-free adapter. Ownership is captured from the bridge envelope,
 //! never from thread-local operation context. The consumer lives inside execute.
 use crate::events::RuntimeEvent;
+pub(crate) mod authority;
 pub(crate) mod transport;
 use agentkit_tool_compose::{
     BackendRun, ComposeOutcome, RunletBackend, RunletProgress, RunletProgressEnd,
