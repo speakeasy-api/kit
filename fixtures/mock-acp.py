@@ -11,6 +11,8 @@ state_lock = threading.Lock()
 next_session = 1
 supports_fork = "--no-fork" not in sys.argv
 supports_models = "--models" in sys.argv
+supports_config_options = "--config-options" in sys.argv
+selected_options = {}
 fail_first_close = "--fail-first-close" in sys.argv
 failed_close = False
 selected_models = {}
@@ -22,6 +24,8 @@ def option(name):
 
 
 request_log = option("--request-log")
+idle_config_release = option("--idle-config-release")
+idle_config_sent = option("--idle-config-sent")
 new_release = option("--new-release")
 fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
@@ -66,6 +70,46 @@ def log_request(request):
             log.flush()
 
 
+
+def config_options(session_id):
+    # Copy state under its lock; construct snapshots and write outside it.
+    with state_lock:
+        model = selected_models.get(session_id, model_ids[0])
+        values = selected_options.get(session_id, {}).copy()
+    result = []
+    if supports_models:
+        result.append({
+            "id": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": model,
+            "options": [{"value": value, "name": value} for value in model_ids],
+        })
+    if supports_config_options:
+        for option_id, category, choices, default in [
+            ("reasoning_effort", "thought_level", ["low", "high"], "low"),
+            ("mode", "mode", ["code", "plan"], "code"),
+        ]:
+            result.append({
+                "id": option_id, "name": option_id, "category": category,
+                "type": "select", "currentValue": values.get(option_id, default),
+                "options": [{"value": value, "name": value} for value in choices],
+            })
+        result.append({
+            "id": "custom_enabled", "name": "Custom enabled", "type": "boolean",
+            "currentValue": values.get("custom_enabled", False),
+        })
+    return result
+
+
+def config_update(session_id):
+    send({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"sessionId": session_id, "update": {
+            "sessionUpdate": "config_option_update",
+            "configOptions": config_options(session_id),
+        }},
+    })
+
+
 def fork(request):
     global next_session
     if "--fail-fork" in sys.argv:
@@ -87,9 +131,11 @@ def fork(request):
         session_id = f"branch-{next_session}"
         next_session += 1
         selected_models[session_id] = selected_models.get(source_id, model_ids[0])
+        selected_options[session_id] = selected_options.get(source_id, {}).copy()
     while fork_release is not None and not os.path.exists(fork_release):
         time.sleep(0.01)
-    respond(request["id"], {"sessionId": session_id})
+    respond(request["id"], {"sessionId": session_id,
+                             "configOptions": config_options(session_id)})
 
 
 def prompt(request):
@@ -108,7 +154,18 @@ def prompt(request):
     if "MOCK_CWD" in text:
         text = os.getcwd()
     if "MOCK_SELECTED_MODEL" in text:
-        text = selected_models.get(session_id, model_ids[0])
+        with state_lock:
+            text = selected_models.get(session_id, model_ids[0])
+    idle_config_update = "MOCK_IDLE_CONFIG_UPDATE" in text
+    if supports_config_options and ("MOCK_CONFIG_UPDATE" in text or idle_config_update):
+        with state_lock:
+            selected_options[session_id] = {
+                "reasoning_effort": "low", "mode": "plan", "custom_enabled": False,
+            }
+        if not idle_config_update:
+            config_update(session_id)
+    if "MOCK_CONFIG_OPTIONS" in text:
+        text = json.dumps(config_options(session_id))
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
     if "MOCK_REFUSAL" in text:
@@ -165,6 +222,13 @@ def prompt(request):
         },
     })
     respond(request["id"], {"stopReason": "end_turn"})
+    if idle_config_update:
+        while idle_config_release is not None and not os.path.exists(idle_config_release):
+            time.sleep(0.01)
+        config_update(session_id)
+        if idle_config_sent is not None:
+            with open(idle_config_sent, "w", encoding="utf-8") as marker:
+                marker.write("sent")
     if "--exit-after-prompt" in sys.argv:
         time.sleep(0.05)
         os._exit(0)
@@ -216,19 +280,12 @@ for line in sys.stdin:
     elif method == "session/new":
         while new_release is not None and not os.path.exists(new_release):
             time.sleep(0.01)
-        selected_models["base"] = model_ids[0]
+        with state_lock:
+            selected_models["base"] = model_ids[0]
+            selected_options["base"] = {}
         result = {"sessionId": "base"}
-        if supports_models:
-            result["configOptions"] = [{
-                "id": "model",
-                "name": "Model",
-                "category": "model",
-                "type": "select",
-                "currentValue": model_ids[0],
-                "options": [
-                    {"value": value, "name": value} for value in model_ids
-                ],
-            }]
+        if supports_models or supports_config_options:
+            result["configOptions"] = config_options("base")
         respond(request["id"], result)
     elif method == "session/fork":
         threading.Thread(target=fork, args=(request,), daemon=True).start()
@@ -237,15 +294,26 @@ for line in sys.stdin:
     elif method == "session/set_config_option":
         params = request["params"]
         value = params["value"]
-        if params["configId"] != "model" or value not in model_ids:
+        option_id = params["configId"]
+        advertised = next((item for item in config_options(params["sessionId"])
+                           if item["id"] == option_id), None)
+        valid = advertised is not None and (
+            (advertised["type"] == "boolean" and type(value) is bool) or
+            (advertised["type"] == "select" and type(value) is str and
+             value in [item["value"] for item in advertised["options"]])
+        )
+        if not valid:
             send({
-                "jsonrpc": "2.0",
-                "id": request["id"],
-                "error": {"code": -32602, "message": "unknown model"},
+                "jsonrpc": "2.0", "id": request["id"],
+                "error": {"code": -32602, "message": "invalid config option value"},
             })
         else:
-            selected_models[params["sessionId"]] = value
-            respond(request["id"], {"configOptions": []})
+            with state_lock:
+                if option_id == "model":
+                    selected_models[params["sessionId"]] = value
+                else:
+                    selected_options[params["sessionId"]][option_id] = value
+            respond(request["id"], {"configOptions": config_options(params["sessionId"])})
     elif method == "session/cancel":
         pass
     elif method == "session/close":

@@ -188,6 +188,7 @@ async fn subagent_selects_an_advertised_acp_model() {
         kit::SubagentHarnessPolicy {
             models: BTreeMap::from([("review".into(), "mock/requested".into())]),
             allow_model_overrides: Some(vec!["mock/requested".into()]),
+            ..Default::default()
         },
     )]))
     .unwrap();
@@ -247,6 +248,232 @@ return { child: child.output, branch: branch.output }"#,
         panic!("unsupported model selection unexpectedly succeeded: {outcome:?}");
     };
     assert!(format!("{error:?}").contains("does not advertise a selectable model session option"));
+}
+
+// All helpers here exercise the public runtime API against the external ACP fixture.
+fn config_options_runtime(
+    directory: &std::path::Path,
+    config_options: BTreeMap<String, serde_json::Value>,
+    advertise: bool,
+) -> Arc<kit::Runtime> {
+    let mut args = vec![
+        format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+        "--models".into(),
+        format!(
+            "--idle-config-release={}",
+            directory.join("idle-release").display()
+        ),
+        format!(
+            "--idle-config-sent={}",
+            directory.join("idle-sent").display()
+        ),
+    ];
+    if advertise {
+        args.push("--config-options".into());
+    }
+    let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+        "review".into(),
+        kit::AcpHarnessProfile {
+            command: "python3".into(),
+            args,
+            permissions: Default::default(),
+        },
+    )]))
+    .unwrap()
+    .with_model_policies(BTreeMap::from([(
+        "acp.review".into(),
+        kit::SubagentHarnessPolicy {
+            config_options,
+            ..Default::default()
+        },
+    )]))
+    .unwrap();
+    kit::Runtime::with_acp_harnesses(
+        kit::Runtime::new(directory, "gpt-5.4").unwrap(),
+        harnesses,
+        "acp.review".into(),
+    )
+    .unwrap()
+}
+
+fn latest_config_values(handle: &serde_json::Value) -> serde_json::Value {
+    let snapshot = handle["updates"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|item| item["sessionUpdate"] == "config_option_update")
+        .unwrap_or_else(|| panic!("missing config snapshot: {handle}"));
+    config_values(&snapshot["configOptions"])
+}
+
+fn config_values(options: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Object(
+        options
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                (
+                    option["id"].as_str().unwrap().to_owned(),
+                    option["currentValue"].clone(),
+                )
+            })
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn subagent_applies_select_and_boolean_config_options_and_returns_response_state() {
+    for reasoning_key in ["reasoning_effort", "thought_level"] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = config_options_runtime(
+            directory.path(),
+            BTreeMap::from([
+                (reasoning_key.into(), json!("high")),
+                ("mode".into(), json!("plan")),
+                ("custom_enabled".into(), json!(true)),
+            ]),
+            true,
+        );
+        let outcome = execute_compose(
+            &runtime,
+            r#"return subagent({ prompt: "MOCK_CONFIG_OPTIONS" })"#,
+        )
+        .await;
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("configuring {reasoning_key} failed: {outcome:?}");
+        };
+        let ToolOutput::Structured(handle) = result.result.output else {
+            panic!("missing structured subagent handle");
+        };
+        let expected = json!({
+            "model": "mock/default", "reasoning_effort": "high",
+            "mode": "plan", "custom_enabled": true,
+        });
+        // The prompt emits no config notification: the handle must retain setup responses.
+        assert_eq!(latest_config_values(&handle), expected);
+        let observed: serde_json::Value =
+            serde_json::from_str(handle["output"].as_str().unwrap()).unwrap();
+        assert_eq!(config_values(&observed), expected);
+    }
+}
+
+#[tokio::test]
+async fn subagent_retains_config_notifications_across_prompt_and_native_fork() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = config_options_runtime(
+        directory.path(),
+        BTreeMap::from([
+            ("thought_level".into(), json!("high")),
+            ("mode".into(), json!("code")),
+            ("custom_enabled".into(), json!(true)),
+        ]),
+        true,
+    );
+    let outcome = execute_compose(
+        &runtime,
+        r#"child = subagent({ model: "mock/requested", prompt: "MOCK_CONFIG_UPDATE" })
+continued = prompt({ subagent: child, prompt: "MOCK_CONFIG_OPTIONS" })
+branch = fork({ subagent: continued, prompt: "MOCK_CONFIG_OPTIONS" })
+return { child, continued, branch }"#,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("config notification lifecycle failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(value) = result.result.output else {
+        panic!("missing structured lifecycle output");
+    };
+    for key in ["child", "continued", "branch"] {
+        let expected = json!({
+            "model": "mock/requested",
+            "reasoning_effort": "low", "mode": "plan", "custom_enabled": false,
+        });
+        assert_eq!(latest_config_values(&value[key]), expected, "{key}");
+        if key != "child" {
+            let observed: serde_json::Value =
+                serde_json::from_str(value[key]["output"].as_str().unwrap()).unwrap();
+            assert_eq!(config_values(&observed), expected, "{key}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn subagent_retains_idle_config_notifications_on_next_prompt() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = config_options_runtime(
+        directory.path(),
+        BTreeMap::from([("thought_level".into(), json!("high"))]),
+        true,
+    );
+    let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
+    let outcome = execute_compose_source(
+        Arc::clone(&source),
+        r#"return subagent({ prompt: "MOCK_IDLE_CONFIG_UPDATE" })"#,
+        None,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("initial prompt failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(child) = result.result.output else {
+        panic!("missing child handle");
+    };
+    assert_eq!(latest_config_values(&child)["reasoning_effort"], "high");
+    // Release the notification only after the runtime has returned the completed child.
+    std::fs::write(directory.path().join("idle-release"), "release").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !directory.path().join("idle-sent").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture did not send idle config notification");
+    let outcome = execute_compose_source(
+        source,
+        &format!(
+            "return prompt({{ subagent: {}, prompt: \"MOCK_CONFIG_OPTIONS\" }})",
+            serde_json::to_string(&child).unwrap()
+        ),
+        None,
+    )
+    .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("continuing after idle notification failed: {outcome:?}");
+    };
+    let ToolOutput::Structured(continued) = result.result.output else {
+        panic!("missing continued handle");
+    };
+    assert_eq!(
+        latest_config_values(&continued),
+        json!({"model": "mock/default", "reasoning_effort": "low",
+               "mode": "plan", "custom_enabled": false})
+    );
+}
+
+#[tokio::test]
+async fn subagent_rejects_unsupported_or_mismatched_config_options() {
+    for (advertise, key, value) in [
+        (false, "thought_level", json!("high")),
+        (true, "unknown_option", json!("high")),
+        (true, "reasoning_effort", json!("impossible")),
+        (true, "reasoning_effort", json!(true)),
+        (true, "custom_enabled", json!("true")),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = config_options_runtime(
+            directory.path(),
+            BTreeMap::from([(key.into(), value.clone())]),
+            advertise,
+        );
+        let outcome =
+            execute_compose(&runtime, r#"return subagent({ prompt: "must not run" })"#).await;
+        let ToolExecutionOutcome::Failed(error) = outcome else {
+            panic!("invalid {key}={value} unexpectedly succeeded: {outcome:?}");
+        };
+        assert!(format!("{error:?}").contains(key), "{error:?}");
+    }
 }
 
 #[tokio::test]
@@ -639,6 +866,14 @@ async fn execute_compose_cancelled(
     script: &str,
     cancellation: Option<TurnCancellation>,
 ) -> ToolExecutionOutcome {
+    execute_compose_source(Arc::new(runtime.compose(0)), script, cancellation).await
+}
+
+async fn execute_compose_source(
+    source: Arc<dyn ToolSource>,
+    script: &str,
+    cancellation: Option<TurnCancellation>,
+) -> ToolExecutionOutcome {
     // HOME/session/call-scoped artifacts must not share a spill directory with
     // another parallel invocation that may remove it during cleanup.
     static NEXT_CALL: AtomicUsize = AtomicUsize::new(0);
@@ -646,7 +881,6 @@ async fn execute_compose_cancelled(
         "compose-test-{}",
         NEXT_CALL.fetch_add(1, Ordering::Relaxed)
     ));
-    let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
     let executor = Arc::new(BasicToolExecutor::new([source]));
     let scope = ToolExecutionScope {
         executor,

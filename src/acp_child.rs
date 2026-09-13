@@ -14,9 +14,10 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ContentBlock, ForkSessionRequest, PermissionOption,
-    PermissionOptionKind, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionId,
+    CancelNotification, CloseSessionRequest, ConfigOptionUpdate, ContentBlock, ForkSessionRequest,
+    PermissionOption, PermissionOptionKind, PromptResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionValue, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
@@ -74,6 +75,9 @@ pub struct SubagentHarnessPolicy {
     #[serde(default)]
     pub models: BTreeMap<String, String>,
     pub allow_model_overrides: Option<Vec<String>>,
+    /// Trusted initial ACP option values, keyed by advertised ID or category.
+    #[serde(default)]
+    pub config_options: BTreeMap<String, Value>,
 }
 
 /// Validated named ACP harness profiles. `acp.kit` is always Kit; its launch base may be overridden.
@@ -129,6 +133,16 @@ impl AcpHarnesses {
         for (harness, policy) in &policies {
             if !self.contains(harness) {
                 return Err(format!("unknown subagent model policy harness {harness:?}"));
+            }
+            for (id, value) in &policy.config_options {
+                if id.trim().is_empty() || !(value.is_string() || value.is_boolean()) {
+                    return Err(format!(
+                        "subagent config option {id:?} for {harness:?} must have a non-empty key and a string or boolean value"
+                    ));
+                }
+                if id == "model" {
+                    return Err("use the subagent model override and model policy instead of config_options.model".into());
+                }
             }
             for (alias, model) in &policy.models {
                 if alias.trim().is_empty() {
@@ -576,6 +590,116 @@ struct Route {
     output: Arc<Mutex<ChildOutput>>,
 }
 
+/// Complete child-advertised snapshots, including notifications between prompts.
+/// Writers replace one session atomically; no lock is held across protocol calls,
+/// output callbacks, or awaits. Poison isolates the connection rather than
+/// silently publishing an unknown configuration. Snapshot values have no custom Drop.
+#[derive(Default)]
+struct ConfigSnapshots(Mutex<HashMap<SessionId, Vec<SessionConfigOption>>>);
+
+impl ConfigSnapshots {
+    fn set(
+        &self,
+        id: SessionId,
+        options: Vec<SessionConfigOption>,
+    ) -> agent_client_protocol::Result<()> {
+        let old = self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .insert(id, options);
+        drop(old);
+        Ok(())
+    }
+
+    fn fork(
+        &self,
+        id: SessionId,
+        source: &SessionId,
+        options: Option<Vec<SessionConfigOption>>,
+    ) -> agent_client_protocol::Result<()> {
+        if let Some(options) = options {
+            return self.set(id, options);
+        }
+        let mut snapshots = self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?;
+        // A notification for the new ID can precede the fork response. Never
+        // overwrite child-reported state with an inferred parent fallback.
+        if !snapshots.contains_key(&id)
+            && let Some(inherited) = snapshots.get(source).cloned()
+        {
+            snapshots.insert(id, inherited);
+        }
+        Ok(())
+    }
+
+    fn remove(&self, id: &SessionId) -> agent_client_protocol::Result<()> {
+        let old = self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .remove(id);
+        drop(old);
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        id: &SessionId,
+    ) -> agent_client_protocol::Result<Option<Vec<SessionConfigOption>>> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| agent_client_protocol::Error::internal_error())?
+            .get(id)
+            .cloned())
+    }
+}
+
+fn configured_option(
+    options: &[SessionConfigOption],
+    key: &str,
+    value: &Value,
+) -> Result<(String, SessionConfigOptionValue), String> {
+    let option = options
+        .iter()
+        .find(|option| option.id.to_string() == key)
+        .or_else(|| {
+            let mut matches = options.iter().filter(|option| {
+                option.category.as_ref().is_some_and(|category| {
+                    serde_json::to_value(category).ok().as_ref() == Some(&Value::String(key.into()))
+                })
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+        .ok_or_else(|| {
+            format!("ACP harness does not advertise an unambiguous config option {key:?}")
+        })?;
+    // Model selection must not bypass the dedicated alias/allowlist policy.
+    if option.id.to_string() == "model"
+        || option.category == Some(agentkit_acp::SessionConfigOptionCategory::Model)
+    {
+        return Err("use the subagent model override instead of a model config option".into());
+    }
+    let selected = match (&option.kind, value) {
+        (SessionConfigKind::Select(_), Value::String(value)) => {
+            SessionConfigOptionValue::from(value.as_str())
+        }
+        (SessionConfigKind::Boolean(_), Value::Bool(value)) => {
+            SessionConfigOptionValue::from(*value)
+        }
+        _ => {
+            return Err(format!(
+                "ACP config option {key:?} has an incompatible value type"
+            ));
+        }
+    };
+    Ok((option.id.to_string(), selected))
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ChildOutput {
     pub text: String,
@@ -585,6 +709,42 @@ pub(crate) struct ChildOutput {
 }
 
 impl ChildOutput {
+    fn config_snapshot(&mut self, options: Vec<SessionConfigOption>) {
+        // Reserve the newest complete snapshot within the existing update budget.
+        let Ok(value) = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
+            ConfigOptionUpdate::new(options),
+        )) else {
+            self.updates_truncated = true;
+            return;
+        };
+        let Ok(encoded) = serde_json::to_vec(&value) else {
+            self.updates_truncated = true;
+            return;
+        };
+        let bytes = encoded.len();
+        if bytes > MAX_CAPTURED_UPDATE_BYTES {
+            self.updates_truncated = true;
+            return;
+        }
+        while self.updates.len() >= MAX_CAPTURED_UPDATES
+            || self.update_bytes + bytes > MAX_CAPTURED_UPDATE_BYTES
+        {
+            self.updates_truncated = true;
+            let Some(removed_bytes) = self
+                .updates
+                .last()
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map(|bytes| bytes.len())
+            else {
+                return;
+            };
+            self.updates.pop();
+            self.update_bytes -= removed_bytes;
+        }
+        self.update_bytes += bytes;
+        self.updates.push(value);
+    }
+
     fn record(&mut self, update: SessionUpdate) {
         if let SessionUpdate::AgentMessageChunk(chunk) = &update
             && let ContentBlock::Text(text) = &chunk.content
@@ -1002,6 +1162,8 @@ async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let routes = Arc::new(Mutex::new(HashMap::<SessionId, Route>::new()));
     let notification_routes = Arc::clone(&routes);
+    let config_snapshots = Arc::new(ConfigSnapshots::default());
+    let notification_configs = Arc::clone(&config_snapshots);
     let root = config.root.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
     let ready_flag = Arc::clone(&startup_complete);
@@ -1009,6 +1171,9 @@ async fn run(
         .builder()
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
+                if let SessionUpdate::ConfigOptionUpdate(update) = &notification.update {
+                    notification_configs.set(notification.session_id.clone(), update.config_options.clone())?;
+                }
                 let route = notification_routes
                     .lock()
                     .ok()
@@ -1061,19 +1226,42 @@ async fn run(
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
             let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
+            if let Some(options) = session.config_options.clone() {
+                config_snapshots.set(session.session_id.clone(), options)?;
+            }
             if let Some(model) = model {
                 let selectable = session.config_options.as_deref().unwrap_or_default().iter().any(|option| {
                     option.id.to_string() == "model" && matches!(option.kind, SessionConfigKind::Select(_))
                 });
                 if !selectable {
-                    let error = format!("ACP harness {harness:?} does not advertise a selectable model session option");
-                    let _ = ready.send(Err(error));
+                    let _ = ready.send(Err(format!("ACP harness {harness:?} does not advertise a selectable model session option")));
                     return std::future::pending().await;
                 }
-                if let Err(error) = connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
-                    let error = format!("ACP harness {harness:?} rejected model selection {model:?}: {error}");
-                    let _ = ready.send(Err(error));
-                    return std::future::pending().await;
+                match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
+                    Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                    Err(error) => {
+                        let _ = ready.send(Err(format!("ACP harness {harness:?} rejected model selection {model:?}: {error}")));
+                        return std::future::pending().await;
+                    }
+                }
+            }
+            if let Some(policy) = config.harnesses.model_policies.get(&harness) {
+                for (key, value) in &policy.config_options {
+                    let options = config_snapshots.get(&session.session_id)?.unwrap_or_default();
+                    let (id, value) = match configured_option(&options, key, value) {
+                        Ok(option) => option,
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                            return std::future::pending().await;
+                        }
+                    };
+                    match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).block_task().await {
+                        Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
+                        Err(error) => {
+                            let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
+                            return std::future::pending().await;
+                        }
+                    }
                 }
             }
             let sessions = Arc::new(Mutex::new(vec![session.session_id.clone()]));
@@ -1098,8 +1286,10 @@ async fn run(
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
+                        let config_snapshots = Arc::clone(&config_snapshots);
                         tasks.spawn(async move {
                             let serial = fork.serial;
+                            let source_id = fork.session_id.clone();
                             let mut request = ForkSessionRequest::new(fork.session_id, root);
                             if let Some((id, name)) = fork.parent {
                                 request.meta = Some(serde_json::Map::from_iter([
@@ -1123,6 +1313,11 @@ async fn run(
                                 Either::Left((result, _)) => match result {
                                     Ok(response) => {
                                         let session_id = response.session_id;
+                                        let configured = config_snapshots.fork(session_id.clone(), &source_id, response.config_options);
+                                        if let Err(error) = configured {
+                                            let _ = fork.reply.send(Err(ChildError::Failed(error.to_string())));
+                                            return;
+                                        }
                                         if let Ok(mut sessions) = sessions.lock() {
                                             sessions.push(session_id.clone());
                                         }
@@ -1139,7 +1334,8 @@ async fn run(
                                             )
                                             .await
                                             {
-                                                Ok(Ok(_)) => Ok(session_id.clone()),
+                                                Ok(Ok(response)) => config_snapshots.set(session_id.clone(), response.config_options)
+                                                    .map(|()| session_id.clone()).map_err(|error| ChildError::Failed(error.to_string())),
                                                 Ok(Err(error)) => Err(ChildError::Failed(format!(
                                                     "ACP harness rejected model selection {model:?} for forked session: {error}"
                                                 ))),
@@ -1157,6 +1353,8 @@ async fn run(
                                                     && let Ok(mut sessions) = sessions.lock()
                                                 {
                                                     sessions.retain(|id| id != &session_id);
+                                                    drop(sessions);
+                                                    let _ = config_snapshots.remove(&session_id);
                                                 }
                                             }
                                             selected
@@ -1172,6 +1370,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
+                                    let cleanup_configs = Arc::clone(&config_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -1189,6 +1388,9 @@ async fn run(
                                             )
                                             .await
                                             .is_ok_and(|result| result.is_ok());
+                                        if closed {
+                                            let _ = cleanup_configs.remove(&session_id);
+                                        }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
@@ -1203,6 +1405,7 @@ async fn run(
                                     let _ = connection.send_cancel_request(request_id);
                                     let cleanup_connection = connection.clone();
                                     let cleanup_sessions = Arc::clone(&sessions);
+                                    let cleanup_configs = Arc::clone(&config_snapshots);
                                     tokio::spawn(async move {
                                         // The remote fork still owns source-session
                                         // serialization until its response and cleanup.
@@ -1220,6 +1423,9 @@ async fn run(
                                             )
                                             .await
                                             .is_ok_and(|result| result.is_ok());
+                                        if closed {
+                                            let _ = cleanup_configs.remove(&session_id);
+                                        }
                                         if !closed
                                             && let Ok(mut sessions) = cleanup_sessions.lock()
                                         {
@@ -1236,6 +1442,7 @@ async fn run(
                         });
                     }
                     Request::Close(close) => {
+                        let config_snapshots = Arc::clone(&config_snapshots);
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
@@ -1259,6 +1466,7 @@ async fn run(
                             {
                                 sessions.retain(|id| id != &close.session_id);
                             }
+                            let result = result.and_then(|()| config_snapshots.remove(&close.session_id).map_err(|error| ChildError::Failed(error.to_string())));
                             let _ = close.reply.send(result);
                         });
                     }
@@ -1266,6 +1474,7 @@ async fn run(
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
+                        let config_snapshots = Arc::clone(&config_snapshots);
                         tasks.spawn(async move {
                             let _serial = prompt.serial;
                             let session_id = prompt.session_id.clone();
@@ -1297,7 +1506,15 @@ async fn run(
                                 }
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
-                            let output = output.lock().map(|output| output.clone()).unwrap_or_default();
+                            let mut output = output.lock().map(|output| output.clone()).unwrap_or_default();
+                            match config_snapshots.get(&session_id) {
+                                Ok(Some(options)) => output.config_snapshot(options),
+                                Ok(None) => {},
+                                Err(error) => {
+                                    let _ = prompt.reply.send(Err(ChildError::Failed(error.to_string())));
+                                    return;
+                                }
+                            }
                             let outcome = if cancelled { Err(ChildError::Cancelled) } else {
                                 response.map_err(ChildError::Failed).and_then(|response| prompt_outcome(response, output))
                             };
@@ -3079,6 +3296,133 @@ mod tests {
         }
     }
 
+    fn config_options_fixture() -> Vec<SessionConfigOption> {
+        serde_json::from_value(serde_json::json!([
+            {"id":"effort", "name":"Effort", "type":"select", "category":"thought_level",
+             "currentValue":"low", "options":[{"value":"low", "name":"Low"}, {"value":"high", "name":"High"}]},
+            {"id":"compact", "name":"Compact", "type":"boolean", "currentValue":false}
+        ])).unwrap()
+    }
+
+    #[test]
+    fn config_options_resolve_ids_categories_and_value_types() {
+        let options = config_options_fixture();
+        let (id, value) =
+            configured_option(&options, "thought_level", &serde_json::json!("high")).unwrap();
+        assert_eq!(id, "effort");
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"value":"high"})
+        );
+        let (_, value) = configured_option(&options, "compact", &serde_json::json!(true)).unwrap();
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"type":"boolean", "value":true})
+        );
+        assert!(configured_option(&options, "compact", &serde_json::json!("true")).is_err());
+        assert!(configured_option(&options, "missing", &serde_json::json!(true)).is_err());
+        let mut ambiguous = options.clone();
+        ambiguous.push(options[0].clone());
+        assert!(
+            configured_option(&ambiguous, "thought_level", &serde_json::json!("high")).is_err()
+        );
+        assert!(configured_option(&ambiguous, "effort", &serde_json::json!("high")).is_ok());
+        ambiguous[0].category = Some(agentkit_acp::SessionConfigOptionCategory::Model);
+        assert!(configured_option(&ambiguous, "effort", &serde_json::json!("high")).is_err());
+    }
+
+    #[test]
+    fn config_policy_accepts_legacy_and_current_shapes_and_rejects_malformed_values() {
+        let legacy: SubagentHarnessPolicy = toml::from_str("models = {}\n").unwrap();
+        assert!(legacy.config_options.is_empty());
+        let current: SubagentHarnessPolicy =
+            toml::from_str("[config_options]\nthought_level = 'high'\ncompact = true").unwrap();
+        assert!(
+            AcpHarnesses::default()
+                .with_model_policies(BTreeMap::from([(BUILTIN_HARNESS.into(), current)]))
+                .is_ok()
+        );
+        for (key, value) in [
+            ("model", serde_json::json!("bypass")),
+            ("", serde_json::json!(true)),
+            ("effort", serde_json::json!(3)),
+            ("effort", serde_json::json!(["high"])),
+        ] {
+            let policy = SubagentHarnessPolicy {
+                config_options: BTreeMap::from([(key.into(), value)]),
+                ..Default::default()
+            };
+            assert!(
+                AcpHarnesses::default()
+                    .with_model_policies(BTreeMap::from([(BUILTIN_HARNESS.into(), policy)]))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn config_snapshots_replace_isolate_sessions_and_reject_poison() {
+        let snapshots = ConfigSnapshots::default();
+        let first = SessionId::new("first");
+        let second = SessionId::new("second");
+        snapshots
+            .set(first.clone(), config_options_fixture())
+            .unwrap();
+        snapshots
+            .set(second.clone(), config_options_fixture())
+            .unwrap();
+        let branch = SessionId::new("branch");
+        snapshots.fork(branch.clone(), &first, None).unwrap();
+        assert_eq!(
+            snapshots.get(&branch).unwrap(),
+            snapshots.get(&first).unwrap()
+        );
+        snapshots.set(branch.clone(), vec![]).unwrap();
+        snapshots.fork(branch.clone(), &first, None).unwrap();
+        assert_eq!(snapshots.get(&branch).unwrap(), Some(vec![]));
+        snapshots
+            .fork(branch.clone(), &first, Some(config_options_fixture()))
+            .unwrap();
+        assert_eq!(snapshots.get(&branch).unwrap().unwrap().len(), 2);
+        snapshots.set(first.clone(), vec![]).unwrap();
+        assert_eq!(snapshots.get(&first).unwrap(), Some(vec![]));
+        assert_eq!(snapshots.get(&second).unwrap().unwrap().len(), 2);
+        snapshots.remove(&first).unwrap();
+        assert!(snapshots.get(&first).unwrap().is_none());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = snapshots.0.lock().unwrap();
+            panic!("poison state boundary");
+        });
+        assert!(snapshots.get(&second).is_err());
+        assert!(snapshots.set(second.clone(), vec![]).is_err());
+        assert!(snapshots.remove(&second).is_err());
+    }
+
+    #[test]
+    fn config_snapshot_respects_output_budget_and_prioritizes_current_state() {
+        let mut output = ChildOutput::default();
+        for _ in 0..MAX_CAPTURED_UPDATES {
+            output.record(
+                serde_json::from_value(serde_json::json!({"sessionUpdate":"plan", "entries":[]}))
+                    .unwrap(),
+            );
+        }
+        output.config_snapshot(config_options_fixture());
+        assert_eq!(output.updates.len(), MAX_CAPTURED_UPDATES);
+        assert!(output.updates_truncated);
+        assert_eq!(
+            output.updates.last().unwrap()["sessionUpdate"],
+            "config_option_update"
+        );
+        assert!(output.update_bytes <= MAX_CAPTURED_UPDATE_BYTES);
+        let mut oversized = config_options_fixture();
+        oversized[0].name = "x".repeat(MAX_CAPTURED_UPDATE_BYTES);
+        let mut output = ChildOutput::default();
+        output.config_snapshot(oversized);
+        assert!(output.updates.is_empty());
+        assert!(output.updates_truncated);
+    }
+
     #[test]
     fn model_policies_resolve_aliases_and_only_restrict_explicit_overrides() {
         let unrestricted = AcpHarnesses::default()
@@ -3087,6 +3431,7 @@ mod tests {
                 SubagentHarnessPolicy {
                     models: BTreeMap::from([("review".into(), "provider:model-a".into())]),
                     allow_model_overrides: None,
+                    ..Default::default()
                 },
             )]))
             .unwrap();
@@ -3109,6 +3454,7 @@ mod tests {
                 SubagentHarnessPolicy {
                     models: BTreeMap::new(),
                     allow_model_overrides: Some(Vec::new()),
+                    ..Default::default()
                 },
             )]))
             .unwrap();

@@ -623,6 +623,8 @@ Dynamic settings:
                                     Model alias mapping
   subagent.harnesses.<name>.allow_model_overrides
                                     Allowed explicit model override array
+  subagent.harnesses.<name>.config_options.<id>
+                                    Initial ACP select string or boolean
 
 These commands edit the file directly without authentication, networking,
 runtime validation, configuration loading, or migrations.";
