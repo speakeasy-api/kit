@@ -3,15 +3,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agentkit_tools_core::ToolRequest;
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 
-use super::{CAPACITY, MAX_ID, Update, bus};
+use super::{CAPACITY, MAX_ID, Update, buses, subscribers};
 
 const MAX_ITEMS: usize = CAPACITY / 4;
 const MAX_BYTES: usize = 64 * 1024;
 
 pub(crate) fn publish(request: &ToolRequest, items: &[Value], truncated: bool) {
-    if bus().receiver_count() == 0
+    if subscribers() == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -19,7 +19,7 @@ pub(crate) fn publish(request: &ToolRequest, items: &[Value], truncated: bool) {
         return;
     }
     for patch in patches(request, items, truncated) {
-        let _ = bus().send(Update {
+        buses().publish(Update {
             session: request.session_id.0.clone(),
             call: request.call_id.0.clone(),
             start: None,
@@ -75,23 +75,33 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
         }
         match entry["type"].as_str() {
             Some("diff") => {
-                if let Some(diff) = legacy_diff(entry) {
-                    legacy.push(diff.clone());
-                    content.push(diff);
-                } else if let Ok(diff) =
+                let snapshot = legacy_diff(entry);
+                // Dual-format content can carry a more precise native operation
+                // (for example delete) and a patch. Do not replace it with the
+                // legacy snapshot's inferred operation in the v2 projection.
+                let native =
                     serde_json::from_value::<agentkit_acp::v2::wire::Diff>((*entry).clone())
-                    && !diff.changes.is_empty()
-                    && let Ok(mut diff) = serde_json::to_value(diff)
-                {
+                        .ok()
+                        .filter(|diff| !diff.changes.is_empty())
+                        .and_then(|diff| serde_json::to_value(diff).ok());
+                if let Some(mut diff) = native {
                     diff["type"] = Value::from("diff");
                     content.push(diff);
+                } else if let Some(diff) = &snapshot {
+                    content.push(diff.clone());
+                }
+                if let Some(diff) = snapshot {
+                    legacy.push(diff);
                 }
             }
             Some("terminal") => {
                 if let Some(id) = entry["terminalId"].as_str().filter(|id| id.len() <= MAX_ID) {
                     let mapped = terminal_id(request, id);
                     if terminals.insert(id, mapped.clone()).is_none() {
-                        content.push(json!({"type": "terminal", "terminalId": mapped}));
+                        content.push(object([
+                            ("type", Value::from("terminal")),
+                            ("terminalId", Value::from(mapped)),
+                        ]));
                     }
                 }
             }
@@ -106,7 +116,10 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
     // Explicit upserts make even a truncated capture's references well-defined.
     // A missing real exit is marked incomplete below, never invented.
     for mapped in terminals.values() {
-        patches.push(json!({"sessionUpdate": "terminal_update", "terminalId": mapped}));
+        patches.push(object([
+            ("sessionUpdate", Value::from("terminal_update")),
+            ("terminalId", Value::from(mapped.clone())),
+        ]));
     }
     for item in items {
         let Some(id) = item["terminalId"].as_str() else {
@@ -128,6 +141,28 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
         let Ok(mut value) = serde_json::to_value(update) else {
             continue;
         };
+        // Keep only bounded display metadata. Raw child metadata remains in the
+        // result, but must not bypass the terminal subscription's payload budget.
+        let source_incomplete = value["_meta"]["kit/outputIncomplete"] == true;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("_meta");
+        }
+        for field in ["output", "exitStatus"] {
+            if let Some(object) = value.get_mut(field).and_then(Value::as_object_mut) {
+                object.remove("_meta");
+            }
+        }
+        let oversized_signal = value["exitStatus"]["signal"]
+            .as_str()
+            .is_some_and(|signal| signal.len() > 128);
+        if oversized_signal
+            && let Some(exit) = value.get_mut("exitStatus").and_then(Value::as_object_mut)
+        {
+            exit.remove("signal");
+        }
+        if source_incomplete || oversized_signal {
+            value["_meta"] = object([("kit/outputIncomplete", Value::from(true))]);
+        }
         value["terminalId"] = Value::from(mapped.clone());
         if kind == Some("terminal_update")
             && let Some(status) = value.get("exitStatus")
@@ -142,29 +177,50 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
     }
     for (id, mapped) in terminals {
         if !exited.contains(id) || incomplete {
-            patches.push(
-                json!({"sessionUpdate": "terminal_update", "terminalId": mapped,
-                "_meta": {"kit/outputIncomplete": true}}),
-            );
+            patches.push(object([
+                ("sessionUpdate", Value::from("terminal_update")),
+                ("terminalId", Value::from(mapped)),
+                (
+                    "_meta",
+                    object([("kit/outputIncomplete", Value::Bool(true))]),
+                ),
+            ]));
         }
     }
     // Legacy file snapshots are representable on both protocols. Native v2 diffs
     // without old/new text cannot be truthfully turned into a v1 file snapshot.
     let metadata = if incomplete {
-        Some(json!({"kit/outputIncomplete": true,
-            "kit/parentToolCallId": request.call_id.0.rsplit_once(":compose:").map(|(owner, _)| owner)}))
+        Some(object([
+            ("kit/outputIncomplete", Value::Bool(true)),
+            (
+                "kit/parentToolCallId",
+                Value::from(
+                    request
+                        .call_id
+                        .0
+                        .rsplit_once(":compose:")
+                        .map(|(owner, _)| owner),
+                ),
+            ),
+        ]))
     } else {
         None
     };
     if !legacy.is_empty() {
-        let mut patch = json!({"toolCallId": request.call_id.0, "content": legacy});
+        let mut patch = object([
+            ("toolCallId", Value::from(request.call_id.0.clone())),
+            ("content", Value::Array(legacy)),
+        ]);
         if let Some(metadata) = &metadata {
             patch["_meta"] = metadata.clone();
         }
         patches.push(patch);
     }
-    let mut final_content = json!({"sessionUpdate": "tool_call_update", "toolCallId": request.call_id.0,
-        "content": content});
+    let mut final_content = object([
+        ("sessionUpdate", Value::from("tool_call_update")),
+        ("toolCallId", Value::from(request.call_id.0.clone())),
+        ("content", Value::Array(content)),
+    ]);
     if let Some(metadata) = metadata {
         final_content["_meta"] = metadata;
     }
@@ -175,20 +231,13 @@ fn patches(request: &ToolRequest, items: &[Value], truncated: bool) -> Vec<Value
 fn legacy_diff(entry: &Value) -> Option<Value> {
     let diff: agent_client_protocol::schema::v1::Diff =
         serde_json::from_value(entry.clone()).ok()?;
-    if !diff.path.is_absolute() || diff.path.as_os_str().len() > super::MAX_PATH {
-        return None;
-    }
-    let path = diff.path.to_str()?;
-    let operation = if diff.old_text.is_some() {
-        "modify"
-    } else {
-        "add"
-    };
-    Some(
-        json!({"type": "diff", "path": path, "oldText": diff.old_text,
-        "newText": diff.new_text,
-        "changes": [{"operation": operation, "path": path, "fileType": "text"}]}),
-    )
+    super::diff_content(&diff.path, diff.old_text.as_deref(), Some(&diff.new_text))
+}
+
+fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+    Value::Object(Map::from_iter(
+        fields.into_iter().map(|(key, value)| (key.into(), value)),
+    ))
 }
 
 fn terminal_id(request: &ToolRequest, id: &str) -> String {
@@ -201,5 +250,28 @@ fn terminal_id(request: &ToolRequest, id: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod integration_tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod lifecycle_tests;

@@ -2894,7 +2894,7 @@ mod tests {
                 .updates
                 .iter()
                 .map(|value| serde_json::to_vec(value).unwrap().len())
-                .sum()
+                .sum::<usize>()
         );
     }
 

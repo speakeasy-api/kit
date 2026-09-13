@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 
 fn request(session: &str, name: &str, input: Value) -> ToolRequest {
     ToolRequest {
@@ -147,8 +148,55 @@ fn cleared_terminal_exit_remains_unknown_after_replay() {
 }
 
 #[test]
+fn terminal_presentation_strips_unbudgeted_metadata_and_oversized_signals() {
+    let request = request("metadata", "subagent", json!({}));
+    let items = [
+        json!({"sessionUpdate": "tool_call_update", "toolCallId": "a",
+            "content": [{"type": "terminal", "terminalId": "t"}]}),
+        json!({"sessionUpdate": "terminal_update", "terminalId": "t",
+            "exitStatus": {"signal": "s".repeat(200), "_meta": {"secret": "nested"}},
+            "_meta": {"secret": "x".repeat(1024)}}),
+    ];
+    let result = patches(&request, &items, false);
+    let exit = &result[1];
+    assert!(exit["exitStatus"].get("signal").is_none());
+    assert!(exit["exitStatus"].get("_meta").is_none());
+    assert_eq!(exit["_meta"]["kit/outputIncomplete"], true);
+    assert!(!serde_json::to_string(&result).unwrap().contains("secret"));
+    assert!(items[1]["_meta"].get("secret").is_some());
+}
+
+#[test]
 fn count_and_byte_limits_reject_oversized_snapshots() {
     let request = request("bounds", "subagent", json!({}));
     assert!(patches(&request, &vec![json!({}); MAX_ITEMS + 1], false).is_empty());
     assert!(patches(&request, &[json!({"huge": "x".repeat(MAX_BYTES)})], false).is_empty());
+}
+
+#[test]
+fn dual_format_diff_preserves_native_operation_and_patch() {
+    let request = request("dual-format", "subagent", json!({}));
+    let item = json!({"sessionUpdate": "tool_call_update", "toolCallId": "a", "content": [{
+        "type": "diff", "path": "/deleted", "oldText": "before", "newText": "",
+        "changes": [{"operation": "delete", "path": "/deleted"}],
+        "patch": {"format": "git_patch", "text": "-before"}
+    }]});
+    let result = patches(&request, &[item], false);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0]["content"][0]["oldText"], "before");
+    assert_eq!(result[1]["content"][0]["changes"][0]["operation"], "delete");
+    assert_eq!(result[1]["content"][0]["patch"]["text"], "-before");
+}
+
+#[test]
+fn legacy_snapshots_use_parent_validation_and_text_budget() {
+    assert!(legacy_diff(&diff("relative")).is_none());
+    let mut oversized = diff("/large");
+    oversized["newText"] = Value::from("x".repeat(super::super::MAX_DIFF_TEXT));
+    assert!(legacy_diff(&oversized).is_none());
+    let empty = json!({"type": "diff", "path": "/empty", "newText": ""});
+    assert_eq!(
+        legacy_diff(&empty).unwrap()["changes"][0]["operation"],
+        "add"
+    );
 }
