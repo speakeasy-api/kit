@@ -4,7 +4,7 @@ use agentkit_core::{MetadataMap, SessionId, ToolCallId, TurnId};
 use agentkit_tools_core::ToolName;
 use serde_json::json;
 
-fn request(session: &str, name: &str, input: Value) -> ToolRequest {
+pub(super) fn request(session: &str, name: &str, input: Value) -> ToolRequest {
     ToolRequest {
         session_id: SessionId::new(session),
         turn_id: TurnId::new("turn"),
@@ -138,9 +138,46 @@ async fn real_edit_wrapper_projects_success_and_failure_without_stderr_transport
         let updates = std::iter::from_fn(|| receiver.try_recv().ok())
             .filter(|update| update.session == "real-edit")
             .collect::<Vec<_>>();
-        assert_eq!(updates.len(), if is_hunk { 3 } else { 2 });
+        assert_eq!(updates.len(), 2 + usize::from(is_hunk) + usize::from(ok));
         assert!(updates[0].start.is_some());
         assert_eq!(updates.last().unwrap().ok, ok);
+        if ok {
+            let update = &updates[updates.len() - 2];
+            let v1 = serde_json::to_value(update.v1().unwrap()).unwrap();
+            let v2 = serde_json::to_value(update.v2().unwrap()).unwrap();
+            assert_eq!(v1["content"][0]["type"], "diff");
+            assert_eq!(
+                v1["content"][0]["path"],
+                root.path().join("example.txt").to_str().unwrap()
+            );
+            assert_eq!(
+                v1["content"][0]["newText"],
+                if is_hunk {
+                    "updated contents"
+                } else {
+                    "private file contents"
+                }
+            );
+            assert_eq!(
+                v1["content"][0]["oldText"],
+                if is_hunk {
+                    json!("private file contents")
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(v2["content"][0]["type"], "diff");
+            assert_eq!(
+                v2["content"][0]["changes"][0]["operation"],
+                if is_hunk { "modify" } else { "add" }
+            );
+            assert_eq!(
+                v2["content"][0]["changes"][0]["path"],
+                root.path().join("example.txt").to_str().unwrap()
+            );
+            assert!(v1["content"][0].get("changes").is_none());
+            assert!(v2["content"][0].get("oldText").is_none());
+        }
         if is_hunk {
             for wire in [
                 updates[1].v1().map(|v| serde_json::to_value(v).unwrap()),
