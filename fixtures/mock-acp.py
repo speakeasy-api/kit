@@ -286,6 +286,7 @@ for line in sys.stdin:
                 "sessionCapabilities": (
                     ({"fork": {}, "close": {}} if supports_fork else {"close": {}})
                     | ({"delete": {}} if "--delete" in sys.argv else {})
+                    | ({} if "--no-additional-directories" in sys.argv else {"additionalDirectories": {}})
                 )
             },
         })

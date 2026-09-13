@@ -1254,6 +1254,15 @@ async fn run(
                 ))).block_task().await?;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
+            // Reject before creating any session rather than silently dropping
+            // the owning parent's project context. Native forks reuse this
+            // initialized connection and the same immutable directory list.
+            if !additional_directories.is_empty()
+                && capabilities.session_capabilities.additional_directories.is_none()
+            {
+                let _ = ready.send(Err(format!("ACP harness {harness:?} does not advertise additional project directory support")));
+                return std::future::pending().await;
+            }
             let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).block_task().await?;
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;

@@ -2127,3 +2127,53 @@ async fn delete_failure_releases_closed_branch_capacity() {
     assert_ne!(replacement.id, branch.id);
     assert!(scenario.manager.lookup(&branch).is_err());
 }
+
+#[tokio::test]
+async fn additional_directories_reject_unsupported_harness_before_session_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let requests = root.path().join("requests.jsonl");
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec![
+            fixture_path_arg("--request-log", &requests),
+            "--no-additional-directories".into(),
+        ],
+    );
+    let workspace = manager.fresh_for_workspace(vec![root.path().to_path_buf()], None);
+    let error = workspace
+        .create(
+            "unused".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not advertise additional project directory support"),
+        "{error}"
+    );
+    assert!(
+        !logged_requests(&requests)
+            .iter()
+            .any(|request| matches!(request, LoggedRequest::New { .. }))
+    );
+    // A single-root parent still works with this same unsupported harness.
+    let child = manager
+        .create(
+            "standard".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    manager
+        .close(&child.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}

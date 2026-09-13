@@ -284,3 +284,6 @@ Child sessions inherit the owning ACP session’s additional project directories
 directories are project context, not filesystem access boundaries. An explicit
 `subagent.cwd` changes the primary working directory without discarding the
 additional directories. Each parent session has its own directory list.
+If the parent has additional directories, a child harness must advertise ACP
+additional-directory support; otherwise Kit rejects startup with an explicit
+error instead of silently dropping project context.
