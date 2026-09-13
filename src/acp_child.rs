@@ -1038,6 +1038,16 @@ async fn run(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // No interactive user is available: cancel without collecting form data or
+        // opening a URL. This is independent of the child's permission policy.
+        .on_receive_request(
+            async move |_request: agentkit_acp::CreateElicitationRequest, responder, _cx| {
+                responder.respond(agentkit_acp::CreateElicitationResponse::new(
+                    agentkit_acp::ElicitationAction::Cancel,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(transport, async move |connection| {
             let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
             let capabilities = initialized.agent_capabilities;
@@ -2637,6 +2647,62 @@ mod tests {
             assert!(!error.contains("kit-test-acp-executable-that-does-not-exist"));
             assert!(!error.contains(root.path().to_string_lossy().as_ref()));
         }
+    }
+
+    #[tokio::test]
+    async fn child_elicitation_is_cancelled_and_session_remains_reusable() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "mock".into(),
+            AcpHarnessProfile {
+                command: "python3".into(),
+                args: vec![format!(
+                    "{}/fixtures/mock-acp-elicitation.py",
+                    env!("CARGO_MANIFEST_DIR")
+                )],
+                permissions: AcpPermissionPolicy::Deny,
+            },
+        );
+        let harnesses = AcpHarnesses::new(profiles).unwrap();
+        let config = ChildConfig {
+            root: root.path().to_path_buf(),
+            model: "unused".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses,
+            default_harness: "acp.mock".into(),
+            parent_id: None,
+            parent_name: None,
+        };
+        let base = ChildSession::start(
+            config,
+            "acp.mock".into(),
+            None,
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .unwrap();
+        for mode in ["form", "url", "form"] {
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                base.prompt("s-test".into(), mode.into(), TurnCancellation::default()),
+            )
+            .await
+            .expect("elicitation must not leave the child waiting")
+            .unwrap();
+            assert_eq!(output.text, "elicitation cancelled");
+        }
+        base.close().await.unwrap();
     }
 
     #[tokio::test]
