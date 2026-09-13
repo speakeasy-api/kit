@@ -1,24 +1,14 @@
-//! Lifecycle reporting for the hidden tools behind `compose`.
-//!
-//! The wrapper is transparent to the model and to compose: it forwards the
-//! spec, permission requests, and invocation untouched, and only publishes
-//! start/finish events on the runtime side channel (see [`crate::events`]) so
-//! a client can draw what a Runlet program is doing while it runs.
+//! Transparent hidden-tool wrapper with canonical ACP lifecycle projection.
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
-use agentkit_core::ToolOutput;
 use agentkit_tools_core::{
     PermissionRequest, Tool, ToolContext, ToolError, ToolExecutionOutcome, ToolRequest, ToolResult,
     ToolSpec,
 };
 use async_trait::async_trait;
 
-use serde_json::Value;
-
-use crate::events::{self, RuntimeEvent, summarize_input, summarize_output};
-
-/// Wraps a tool so its calls appear on the runtime side channel.
+/// Wraps a tool so its calls appear in canonical ACP notifications.
 pub struct Observed<T>(T, Option<std::path::PathBuf>);
 
 impl<T: Tool> Observed<T> {
@@ -95,15 +85,11 @@ impl<T: Tool> Tool for Observed<T> {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let display = DisplayInvocation::start(&request);
         let projection =
             crate::protocols::acp::tool_projection::Invocation::start(&request, self.1.as_deref());
         let outcome = self.0.invoke(request, context).await;
         if let Some(projection) = projection {
             projection.finish(outcome.as_ref().is_ok_and(|result| !result.result.is_error));
-        }
-        if let Some(display) = display {
-            display.finish(outcome.as_ref());
         }
         outcome
     }
@@ -113,76 +99,13 @@ impl<T: Tool> Tool for Observed<T> {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let display = DisplayInvocation::start(&request);
         let projection =
             crate::protocols::acp::tool_projection::Invocation::start(&request, self.1.as_deref());
         let outcome = self.0.invoke_outcome(request, context).await;
         if let Some(projection) = projection {
             projection.finish(matches!(&outcome, ToolExecutionOutcome::Completed(result) if !result.result.is_error));
         }
-        if let Some(display) = display {
-            match &outcome {
-                ToolExecutionOutcome::Completed(result) => display.finish(Ok(result)),
-                ToolExecutionOutcome::Failed(error)
-                | ToolExecutionOutcome::FailedBeforeInvocation(error) => display.finish(Err(error)),
-                // An approval interruption is not a completed invocation.
-                ToolExecutionOutcome::Interrupted(_) => {}
-            }
-        }
         outcome
-    }
-}
-
-struct DisplayInvocation {
-    call: String,
-    tool: String,
-    started: Instant,
-}
-
-impl DisplayInvocation {
-    fn start(request: &ToolRequest) -> Option<Self> {
-        if !events::enabled() {
-            return None;
-        }
-        let call = request.call_id.0.clone();
-        let tool = request.tool_name.0.to_string();
-        events::emit(&RuntimeEvent::ChildStarted {
-            call: call.clone(),
-            tool: tool.clone(),
-            summary: summarize_input(&request.input),
-            at: events::now_millis(),
-        });
-        Some(Self {
-            call,
-            tool,
-            started: Instant::now(),
-        })
-    }
-
-    fn finish(self, result: Result<&ToolResult, &ToolError>) {
-        let (ok, summary) = match result {
-            Ok(result) => (
-                !result.result.is_error,
-                summarize_output(&output_value(&result.result.output)),
-            ),
-            Err(error) => (false, summarize_output(&Value::from(error.to_string()))),
-        };
-        events::emit(&RuntimeEvent::ChildFinished {
-            call: self.call,
-            tool: self.tool,
-            ok,
-            summary,
-            millis: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        });
-    }
-}
-
-fn output_value(output: &ToolOutput) -> Value {
-    match output {
-        ToolOutput::Text(text) => Value::from(text.clone()),
-        ToolOutput::Structured(value) => value.clone(),
-        ToolOutput::Parts(parts) => Value::from(format!("{} parts", parts.len())),
-        ToolOutput::Files(files) => Value::from(format!("{} files", files.len())),
     }
 }
 
@@ -197,27 +120,12 @@ fn output_value(output: &ToolOutput) -> Value {
 )]
 mod tests {
     use super::*;
-    use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolResultPart, TurnId};
+    use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolOutput, ToolResultPart, TurnId};
     use agentkit_tools_core::{
         AllowAllPermissions, ApprovalReason, ApprovalRequest, OwnedToolContext, ToolInterruption,
         ToolName,
     };
     use serde_json::json;
-
-    #[test]
-    fn output_summaries_preserve_strings_values_and_counts() {
-        assert_eq!(
-            output_value(&ToolOutput::Text("quoted \"text\"\n".into())),
-            json!("quoted \"text\"\n"),
-        );
-        let structured = json!({"number": 42, "null": null, "array": [true, "text"]});
-        assert_eq!(
-            output_value(&ToolOutput::structured(structured.clone())),
-            structured
-        );
-        assert_eq!(output_value(&ToolOutput::Parts(vec![])), json!("0 parts"));
-        assert_eq!(output_value(&ToolOutput::Files(vec![])), json!("0 files"));
-    }
 
     #[derive(Clone, Copy, Debug)]
     enum Mode {

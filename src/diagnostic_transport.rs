@@ -1,6 +1,5 @@
 //! One process-owned blocking writer, never joined by an execution future.
 //! Publication is bounded and nonblocking, including cancellation/Drop paths.
-use super::Progress;
 use crate::events::{EVENT_MARKER, RuntimeEvent};
 use std::{
     io::{self, Write},
@@ -41,7 +40,7 @@ impl Transport {
         let diagnostics_lost = Arc::new(AtomicBool::new(false));
         let worker_loss = diagnostics_lost.clone();
         std::thread::Builder::new()
-            .name("runlet-diagnostics".into())
+            .name("kit-diagnostics".into())
             .spawn(move || {
                 // Guard invalidates publication on success, error, or unwind. No IO
                 // in its destructor and no restart that could reuse stale evidence.
@@ -54,10 +53,6 @@ impl Transport {
             diagnostics_lost,
         })
     }
-    pub(crate) fn publish(&self, progress: Progress) {
-        self.publish_event(&RuntimeEvent::RunletProgress { progress });
-    }
-
     /// Best-effort diagnostics remain available after authoritative loss.
     pub(crate) fn publish_line(&self, line: &str) {
         const TRUNCATED: &str = " [truncated]";
@@ -150,7 +145,7 @@ fn write_loop(
                     Frame::Authoritative(bytes) | Frame::Diagnostic(bytes) => bytes,
                 };
                 writer.write_all(&bytes)?;
-                // Busy legacy diagnostic traffic must not starve the lease.
+                // Busy diagnostic traffic must not starve the lease.
                 if !disabled.load(Ordering::Acquire) && heartbeat.elapsed() >= HEARTBEAT {
                     transport_status(&mut writer, runtime_events, true)?;
                     heartbeat = Instant::now();
@@ -183,11 +178,6 @@ fn write_frame(writer: &mut impl Write, event: &RuntimeEvent) -> io::Result<()> 
 }
 
 fn encode_frame(event: &RuntimeEvent) -> io::Result<Vec<u8>> {
-    if let RuntimeEvent::RunletProgress { progress } = event
-        && !progress.bounded()
-    {
-        return Err(io::Error::other("invalid progress metadata"));
-    }
     // A bounded writer, not an unbounded serialization followed by a size check.
     let mut frame = vec![0; MAX_FRAME_BYTES];
     let len = {

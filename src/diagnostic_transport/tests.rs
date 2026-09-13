@@ -6,20 +6,7 @@
     clippy::disallowed_macros
 )]
 use super::*;
-use crate::runlet_progress::Change;
 use std::io::{BufRead, BufReader, Read};
-
-fn progress() -> Progress {
-    Progress {
-        owner: "parent".into(),
-        incarnation: 1,
-        sequence: 0,
-        change: Change::Started {
-            digest: "a".repeat(64),
-            healed: false,
-        },
-    }
-}
 
 #[cfg(unix)]
 #[test]
@@ -40,14 +27,15 @@ fn stalled_writer_loss_resets_after_drain_and_never_resumes() {
     writer.set_nonblocking(false).unwrap();
     let transport = Transport::start(writer, 2, true).unwrap();
     for _ in 0..4 {
-        transport.publish_event(&RuntimeEvent::ChildFinished {
-            call: "parent:compose:0".into(),
-            tool: "shell".into(),
+        transport.publish_event(&RuntimeEvent::CompactionFinished {
+            reason: "test".into(),
             ok: true,
-            summary: "done".into(),
+            compacted: true,
             millis: 1,
         });
-        transport.publish(progress());
+        transport.publish_event(&RuntimeEvent::SubagentDescendantsRemoved {
+            ancestor_id: "parent".into(),
+        });
     }
     assert!(transport.disabled.load(Ordering::Acquire));
     reader
@@ -68,7 +56,9 @@ fn stalled_writer_loss_resets_after_drain_and_never_resumes() {
         crate::events::parse(line.trim_end()),
         Some(RuntimeEvent::RunletTransport { available: false })
     );
-    transport.publish(progress());
+    transport.publish_event(&RuntimeEvent::SubagentDescendantsRemoved {
+        ancestor_id: "parent".into(),
+    });
     drop(transport);
     line.clear();
     assert_eq!(reader.read_line(&mut line).unwrap(), 0);
@@ -114,7 +104,9 @@ fn writer_error_and_unwind_fail_closed() {
             diagnostics_lost: Arc::new(AtomicBool::new(false)),
         };
         assert!(transport.disabled.load(Ordering::Acquire));
-        transport.publish(progress());
+        transport.publish_event(&RuntimeEvent::SubagentDescendantsRemoved {
+            ancestor_id: "parent".into(),
+        });
     }
 }
 
@@ -135,12 +127,11 @@ fn last_sender_disconnect_finishes_transport() {
 
 #[cfg(unix)]
 #[test]
-fn lifecycle_frames_share_queue_and_oversize_loss_invalidates_progress() {
-    let event = RuntimeEvent::ChildFinished {
-        call: "owner:compose:0".into(),
-        tool: "shell".into(),
+fn lifecycle_frames_share_queue_and_oversize_loss_invalidates_lifecycle() {
+    let event = RuntimeEvent::CompactionFinished {
+        reason: "test".into(),
         ok: true,
-        summary: "done".into(),
+        compacted: true,
         millis: 1,
     };
     let (writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -166,7 +157,9 @@ fn lifecycle_frames_share_queue_and_oversize_loss_invalidates_progress() {
         session_id: "x".repeat(MAX_FRAME_BYTES),
     });
     assert!(transport.disabled.load(Ordering::Acquire));
-    transport.publish(progress());
+    transport.publish_event(&RuntimeEvent::SubagentDescendantsRemoved {
+        ancestor_id: "parent".into(),
+    });
     transport.publish_line("later child error");
     drop(transport);
     wire.clear();

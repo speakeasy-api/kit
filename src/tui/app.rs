@@ -448,29 +448,6 @@ pub enum Action {
     Quit,
 }
 
-/// One nested tool dispatch inside a compose run.
-pub struct Child {
-    pub call: String,
-    pub tool: String,
-    pub summary: String,
-    pub result: String,
-    pub started: Instant,
-    pub millis: Option<u64>,
-    pub ok: bool,
-}
-
-impl Child {
-    pub fn running(&self) -> bool {
-        self.millis.is_none()
-    }
-
-    pub fn elapsed(&self) -> u64 {
-        self.millis.unwrap_or_else(|| {
-            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ComposeView {
     #[default]
@@ -491,8 +468,6 @@ pub struct ToolCall {
     pub finished: Option<Instant>,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
-    pub(super) progress: Box<super::progress::ScriptProgress>,
-    pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
     /// Typed tool-result images sharing the user-image retention and decode budgets.
@@ -537,54 +512,11 @@ impl ToolCall {
     }
 
     fn finalize_terminal_state(&mut self) {
-        self.progress.parent_finished();
         if self.is_compose() && !self.expansion_explicit {
             self.expanded = false;
             self.compose_view = ComposeView::Output;
         }
         self.finished = Some(Instant::now());
-        self.finish_running_children();
-    }
-
-    /// Records a dispatch whose parent call ID matches this tool call.
-    ///
-    /// Events do not carry source locations. Keep lifecycle state correlated
-    /// by call ID without guessing which script expression owns a dispatch.
-    pub fn attach(&mut self, call: String, tool: String, summary: String) {
-        self.children.push(Child {
-            call,
-            tool,
-            summary,
-            result: String::new(),
-            started: Instant::now(),
-            millis: None,
-            ok: true,
-        });
-    }
-
-    pub fn finish_child(&mut self, call: &str, ok: bool, summary: String, millis: u64) {
-        if let Some(child) = self
-            .children
-            .iter_mut()
-            .rev()
-            .find(|child| child.running() && child.call == call)
-        {
-            child.millis = Some(millis);
-            child.ok = ok;
-            child.result = summary;
-        }
-    }
-
-    pub fn running_children(&self) -> usize {
-        self.children.iter().filter(|child| child.running()).count()
-    }
-
-    fn finish_running_children(&mut self) {
-        let ok = self.status != ToolCallStatus::Failed;
-        for child in self.children.iter_mut().filter(|child| child.running()) {
-            child.millis = Some(child.elapsed());
-            child.ok = ok;
-        }
     }
 }
 
@@ -809,8 +741,8 @@ pub struct AgentCounts {
 }
 
 pub struct App {
-    progress_last_frame: Option<Instant>,
-    progress_unavailable: bool,
+    runtime_last_frame: Option<Instant>,
+    runtime_status_unavailable: bool,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
@@ -1075,8 +1007,8 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
-            progress_last_frame: None,
-            progress_unavailable: false,
+            runtime_last_frame: None,
+            runtime_status_unavailable: false,
             root,
             provider,
             model,
@@ -1277,7 +1209,7 @@ impl App {
     fn block_is_dynamic(block: &Block) -> bool {
         match block {
             Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running() || call.running_children() > 0,
+            Block::Tool(call) => call.running(),
             _ => false,
         }
     }
@@ -1391,7 +1323,7 @@ impl App {
 
     /// Whether periodic polling must advance animations or expire a runtime lease.
     pub fn needs_redraw_tick(&self) -> bool {
-        (!self.progress_unavailable && self.progress_last_frame.is_some())
+        (!self.runtime_status_unavailable && self.runtime_last_frame.is_some())
             || self.working()
             || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
@@ -1409,7 +1341,7 @@ impl App {
 
     /// Advances animations and removes expired transient state.
     pub fn tick(&mut self) {
-        self.progress_tick_at(Instant::now());
+        self.runtime_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
     }
 
@@ -2176,9 +2108,7 @@ impl App {
                     status: ToolCallStatus::Pending,
                     started: Instant::now(),
                     finished: None,
-                    script: crate::runlet_progress::bounded_source(script.unwrap_or_default()),
-                    progress: Box::default(),
-                    children: Vec::new(),
+                    script: super::source::bounded_source(script.unwrap_or_default()),
                     output: Vec::new(),
                     images: Vec::new(),
                     intent: None,
@@ -2269,10 +2199,7 @@ impl App {
                     call.intent = intent;
                 }
                 if let Some(script) = script {
-                    let script = crate::runlet_progress::bounded_source(script);
-                    if call.script != script {
-                        call.progress.invalidate();
-                    }
+                    let script = super::source::bounded_source(script);
                     call.script = script;
                 }
                 if let Some(output) = output {
@@ -2356,10 +2283,10 @@ impl App {
     }
 
     fn invalidate_runtime_status(&mut self) {
-        if self.progress_unavailable {
+        if self.runtime_status_unavailable {
             return;
         }
-        self.progress_unavailable = true;
+        self.runtime_status_unavailable = true;
         // All these fields depend on the same lossy side channel. Absence is
         // unknown, not idle/success/healthy; the UI exposes unavailability.
         self.agent_versions.clear();
@@ -2371,35 +2298,27 @@ impl App {
         self.compacting = false;
         self.storage_pending = false;
         self.storage_exhausted = false;
-        for index in 0..self.blocks.len() {
-            if let Block::Tool(call) = &mut self.blocks[index] {
-                call.progress.invalidate();
-                call.children.clear();
-            }
-            self.mark_block_dirty(index);
-            self.reclassify_dynamic(index);
-        }
     }
 
     pub(super) fn runtime_unavailable(&self) -> bool {
-        self.progress_unavailable
+        self.runtime_status_unavailable
     }
 
     /// Monotonic transport deadline, also checked before accepting new traffic.
-    pub(super) fn progress_tick_at(&mut self, now: Instant) {
-        if !self.progress_unavailable
-            && self.progress_last_frame.is_some_and(|last| {
-                now.saturating_duration_since(last) >= crate::runlet_progress::transport::LEASE
+    pub(super) fn runtime_tick_at(&mut self, now: Instant) {
+        if !self.runtime_status_unavailable
+            && self.runtime_last_frame.is_some_and(|last| {
+                now.saturating_duration_since(last) >= crate::diagnostic_transport::LEASE
             })
         {
             self.disable_runtime();
         }
     }
-    fn progress_activity(&mut self) {
+    fn runtime_activity(&mut self) {
         let now = Instant::now();
-        self.progress_tick_at(now);
-        if !self.progress_unavailable {
-            self.progress_last_frame = Some(now);
+        self.runtime_tick_at(now);
+        if !self.runtime_status_unavailable {
+            self.runtime_last_frame = Some(now);
         }
     }
 
@@ -2409,17 +2328,17 @@ impl App {
 
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
         // Check expiry before any frame can refresh the lease or revive a
-        // lifecycle map. Loss applies to all runtime events, not only progress.
-        self.progress_activity();
+        // lifecycle map. Loss applies to every diagnostic lifecycle event.
+        self.runtime_activity();
         if let RuntimeEvent::RunletTransport { available } = event {
             if available {
-                if self.progress_unavailable {
+                if self.runtime_status_unavailable {
                     // A heartbeat restores transport, not the observations lost
-                    // during the gap. Keep cleared state and progress tombstones.
-                    self.note("Runtime status resumed; earlier agent, child, compaction and storage state remains unknown");
+                    // during the gap. Keep cleared state.
+                    self.note("Runtime status resumed; earlier agent, compaction and storage state remains unknown");
                 }
-                self.progress_unavailable = false;
-                self.progress_last_frame = Some(Instant::now());
+                self.runtime_status_unavailable = false;
+                self.runtime_last_frame = Some(Instant::now());
             } else {
                 self.disable_runtime();
             }
@@ -2434,18 +2353,15 @@ impl App {
         if self.runtime_unavailable() {
             return;
         }
-        let parent = event.parent_call().map(str::to_string);
-        let owner_id = match event {
-            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => return,
+        match event {
+            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => (),
             RuntimeEvent::StorageStatus { pending, exhausted } => {
                 self.storage_pending = pending;
                 self.storage_exhausted = exhausted;
-                return;
             }
-            _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => return,
+            _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => (),
             RuntimeEvent::CompactionStarted { .. } => {
                 self.compacting = true;
-                return;
             }
             RuntimeEvent::CompactionFinished { ok, compacted, .. } => {
                 self.compacting = false;
@@ -2453,7 +2369,6 @@ impl App {
                     self.usage = None;
                     self.note("context compacted");
                 }
-                return;
             }
             RuntimeEvent::SubagentStateChanged {
                 id,
@@ -2541,7 +2456,6 @@ impl App {
                     );
                 }
                 self.clamp_agents_scroll();
-                return;
             }
             RuntimeEvent::SubagentActivity { id, activity } => {
                 if let Some(row) = self.agents.get_mut(&id)
@@ -2553,7 +2467,6 @@ impl App {
                 {
                     row.activity.apply(activity);
                 }
-                return;
             }
             RuntimeEvent::SubagentUsage {
                 id,
@@ -2570,7 +2483,6 @@ impl App {
                 if let Some(row) = self.agents.get_mut(&id) {
                     row.usage = Some(ContextUsage { used, size });
                 }
-                return;
             }
             RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
                 let mut removed = HashSet::new();
@@ -2593,86 +2505,8 @@ impl App {
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
                 self.clamp_agents_scroll();
-                return;
             }
-            RuntimeEvent::RunletProgress { progress } => {
-                if self.progress_unavailable {
-                    return;
-                }
-                let Some(owner) = self.blocks.iter().rev().find_map(|b| match b {
-                    Block::Tool(c) if c.id == progress.owner && c.is_compose() => Some(c),
-                    _ => None,
-                }) else {
-                    return;
-                };
-                let needs_slot = owner.running() && !owner.progress.retained();
-                // Retain at most MAX_RUNS maps across the transcript. Eviction
-                // preserves incarnation tombstones so stale replay cannot revive it.
-                let retained = self
-                    .blocks
-                    .iter()
-                    .filter(|b| matches!(b, Block::Tool(c) if c.progress.retained()))
-                    .count();
-                if needs_slot
-                    && retained >= crate::runlet_progress::MAX_RUNS
-                    && let Some(id) = self.blocks.iter().find_map(|b| match b {
-                        Block::Tool(c) if c.id != progress.owner && c.progress.retained() => {
-                            Some(c.id.clone())
-                        }
-                        _ => None,
-                    })
-                    && let Some(call) = self.call_mut(&id)
-                {
-                    call.progress.invalidate();
-                }
-                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
-                    return;
-                };
-                if !call.is_compose() {
-                    return;
-                }
-                if call.running() {
-                    call.progress.apply(&progress, &call.script);
-                } else {
-                    call.progress.apply_terminal(&progress, &call.script);
-                }
-                call.id.clone()
-            }
-            RuntimeEvent::ChildStarted {
-                call: child_call,
-                tool,
-                summary,
-                ..
-            } => {
-                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
-                    return;
-                };
-                call.attach(child_call, tool, summary);
-                call.id.clone()
-            }
-            RuntimeEvent::ChildFinished {
-                call: child_call,
-                ok,
-                summary,
-                millis,
-                ..
-            } => {
-                let Some(call) = self.runtime_call_mut(parent.as_deref()) else {
-                    return;
-                };
-                call.finish_child(&child_call, ok, summary, millis);
-                call.id.clone()
-            }
-        };
-        if let Some(index) = self.call_index(&owner_id) {
-            self.reclassify_dynamic(index);
         }
-    }
-
-    fn runtime_call_mut(&mut self, parent: Option<&str>) -> Option<&mut ToolCall> {
-        // Descendant events can name an unseen compose call. Without its
-        // owner, the event cannot update another call's counts.
-        self.call_mut(parent?)
     }
 
     fn call_index(&self, id: &str) -> Option<usize> {
@@ -5327,15 +5161,6 @@ mod tests {
         });
     }
 
-    fn child(call: &str, tool: &str) -> RuntimeEvent {
-        RuntimeEvent::ChildStarted {
-            call: call.into(),
-            tool: tool.into(),
-            summary: "ls".into(),
-            at: 0,
-        }
-    }
-
     #[test]
     fn surfaces_compaction_lifecycle_without_a_tool_call() {
         let mut app = app();
@@ -5435,122 +5260,6 @@ mod tests {
             IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
         )));
         assert!(!app.compacting);
-    }
-
-    #[test]
-    fn attributes_nested_calls_to_the_owning_tool_call() {
-        let mut app = app();
-        compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::Runtime(child("call-1:compose:abc", "shell")));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.children.len(), 1);
-        assert_eq!(call.children[0].call, "call-1:compose:abc");
-        assert_eq!(call.running_children(), 1);
-    }
-
-    #[test]
-    fn unknown_child_owner_cannot_change_a_visible_child_lifecycle() {
-        let mut app = app();
-        // No visible owner is a valid event-stream boundary, not a tool variant.
-        app.apply(Update::Runtime(child("unseen:compose:before", "shell")));
-        assert!(app.blocks.is_empty());
-        compose(&mut app, "return shell({ command: \"ls\" })");
-        app.apply(Update::Runtime(child("call-1:compose:known", "shell")));
-        app.note("intervening non-tool block");
-        app.apply(Update::Runtime(child("unseen:compose:abc", "shell")));
-        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-            call: "unseen:compose:abc".into(),
-            tool: "shell".into(),
-            ok: true,
-            summary: "done".into(),
-            millis: 12,
-        }));
-        let Block::Tool(call) = &app.blocks[0] else {
-            panic!("expected the visible compose call");
-        };
-        assert_eq!(call.children.len(), 1);
-        assert_eq!(call.running_children(), 1);
-        assert_eq!(call.children[0].call, "call-1:compose:known");
-        assert!(call.children[0].running());
-    }
-
-    #[test]
-    fn terminal_parent_finishes_children_missing_completion_events() {
-        let mut app = app();
-        compose(&mut app, "a = shell({ command: \"sleep 60\" })\nreturn a");
-        app.apply(Update::Runtime(child("call-1:compose:shell", "shell")));
-
-        app.apply(Update::ToolPatched {
-            id: "call-1".into(),
-            title: None,
-            kind: None,
-            status: Some(ToolCallStatus::Failed),
-            script: None,
-            output: None,
-            images: None,
-            append_output: false,
-            intent: None,
-            backgrounded: false,
-        });
-
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.status, ToolCallStatus::Failed);
-        assert_eq!(call.running_children(), 0);
-        assert!(call.children[0].millis.is_some());
-        assert!(!call.children[0].ok);
-    }
-
-    #[test]
-    fn repeated_dispatches_keep_distinct_call_id_lifecycles() {
-        let mut app = app();
-        compose(
-            &mut app,
-            "a = shell({ command: \"one\" })\nb = shell({ command: \"two\" })\nreturn [a, b]",
-        );
-        app.apply(Update::Runtime(child("call-1:compose:a", "shell")));
-        app.apply(Update::Runtime(child("call-1:compose:b", "shell")));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.running_children(), 2);
-        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-            call: "call-1:compose:b".into(),
-            tool: "shell".into(),
-            ok: true,
-            summary: "two".into(),
-            millis: 10,
-        }));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.running_children(), 1);
-        assert!(call.children[0].running());
-        assert!(!call.children[1].running());
-    }
-
-    #[test]
-    fn unknown_parent_events_do_not_attach_to_the_visible_call() {
-        let mut app = app();
-        compose(&mut app, "a = subagent({prompt: input.prompt})\nreturn a");
-        for id in ["descendant:compose:one", "unscoped"] {
-            app.apply(Update::Runtime(child(id, "subagent")));
-            app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-                call: id.into(),
-                tool: "subagent".into(),
-                ok: true,
-                summary: "done".into(),
-                millis: 10,
-            }));
-        }
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert!(call.children.is_empty());
-        assert_eq!(call.running_children(), 0);
     }
 
     #[test]
@@ -8163,7 +7872,7 @@ mod tests {
 
         // Advance the lease age without sleeping, then use the same scheduling
         // predicate and tick entry point as both event loops. No new traffic.
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
         assert!(app.needs_redraw_tick());
         if app.needs_redraw_tick() {
             app.tick();
@@ -8181,7 +7890,7 @@ mod tests {
             pending: true,
             exhausted: true,
         }));
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
         app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
             available: true,
         }));
@@ -8200,7 +7909,7 @@ mod tests {
         app.tick();
         assert!(!app.runtime_unavailable());
 
-        app.progress_last_frame = Some(Instant::now() - crate::runlet_progress::transport::LEASE);
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
         app.tick();
         assert!(app.runtime_unavailable());
     }

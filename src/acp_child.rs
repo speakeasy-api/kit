@@ -1248,12 +1248,7 @@ struct RunConfig {
 fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
     if matches!(
         crate::events::parse(line),
-        Some(
-            crate::events::RuntimeEvent::ChildStarted { .. }
-                | crate::events::RuntimeEvent::ChildFinished { .. }
-                | crate::events::RuntimeEvent::RunletProgress { .. }
-                | crate::events::RuntimeEvent::RunletTransport { .. }
-        )
+        Some(crate::events::RuntimeEvent::RunletTransport { .. })
     ) {
         return None;
     }
@@ -1361,12 +1356,12 @@ async fn run(
             ancestor_id.as_deref(),
             |output| match output {
                 ForwardedStderr::RuntimeLine(line) => {
-                    if let Some(transport) = crate::runlet_progress::transport::global() {
+                    if let Some(transport) = crate::diagnostic_transport::global() {
                         transport.publish_runtime_line(&line);
                     }
                 }
                 ForwardedStderr::Diagnostic(line) => {
-                    if let Some(transport) = crate::runlet_progress::transport::global() {
+                    if let Some(transport) = crate::diagnostic_transport::global() {
                         transport.publish_line(&line);
                     }
                 }
@@ -2003,9 +1998,8 @@ async fn forward_stderr(
             }
             match event {
                 crate::events::RuntimeEvent::RunletTransport { available: true } => {
-                    deadline = Some(
-                        tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE,
-                    );
+                    deadline =
+                        Some(tokio::time::Instant::now() + crate::diagnostic_transport::LEASE);
                     continue;
                 }
                 crate::events::RuntimeEvent::RunletTransport { available: false } => {
@@ -2017,8 +2011,7 @@ async fn forward_stderr(
                 _ => {}
             }
             if deadline.is_some() {
-                deadline =
-                    Some(tokio::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+                deadline = Some(tokio::time::Instant::now() + crate::diagnostic_transport::LEASE);
             }
             if event.forward_from_child() {
                 if let crate::events::RuntimeEvent::SubagentStateChanged {
@@ -2560,12 +2553,7 @@ mod tests {
 
     #[test]
     fn nested_runtime_events_are_not_forwarded_as_parent_events() {
-        let event = crate::events::RuntimeEvent::ChildStarted {
-            call: "subagent-call:compose:shell".into(),
-            tool: "shell".into(),
-            summary: "inspect".into(),
-            at: 0,
-        };
+        let event = crate::events::RuntimeEvent::RunletTransport { available: true };
         let line = format!(
             "{}{}",
             crate::events::EVENT_MARKER,
@@ -4835,11 +4823,8 @@ for line in sys.stdin:
                     serde_json::to_string(&RuntimeEvent::RunletTransport { available: true })
                         .unwrap()
                 );
-                let started = RuntimeEvent::ChildStarted {
-                    call: "parent:compose:0".into(),
-                    tool: "shell".into(),
-                    summary: "working".into(),
-                    at: 1,
+                let started = RuntimeEvent::SubagentDescendantsRemoved {
+                    ancestor_id: "parent".into(),
                 };
                 let start = format!(
                     "{EVENT_MARKER}{}\n",
@@ -4861,7 +4846,7 @@ for line in sys.stdin:
                     );
                     writer.write_all(reset.as_bytes()).await.unwrap();
                 } else {
-                    tokio::time::advance(crate::runlet_progress::transport::LEASE).await;
+                    tokio::time::advance(crate::diagnostic_transport::LEASE).await;
                 }
                 let reset = match rx.recv().await.unwrap() {
                     ForwardedStderr::RuntimeLine(line) => crate::events::parse(&line).unwrap(),
