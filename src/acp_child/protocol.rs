@@ -456,9 +456,7 @@ pub(super) async fn resume(
     let response = connection
         .send_request(
             v2::ResumeSessionRequest::new(session_id.to_string(), root)
-                .additional_directories(
-                    additional_directories.into_iter().map(Into::into).collect(),
-                )
+                .additional_directories(additional_directories)
                 .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::default())),
         )
         .block_task()

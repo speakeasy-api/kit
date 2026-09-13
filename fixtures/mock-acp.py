@@ -192,6 +192,19 @@ def prompt(request):
         text = json.dumps(config_options(session_id))
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
+    if "--v2" in sys.argv and text in ("MOCK_WHOLE", "MOCK_REPLACE", "MOCK_CLEAR"):
+        updates = []
+        if text != "MOCK_WHOLE":
+            updates.append({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": "stale"}})
+        updates.append({"sessionUpdate": "agent_message", "messageId": "answer", "content": [{"type": "text", "text": "whole answer" if text == "MOCK_WHOLE" else "replacement"}]})
+        updates.append({"sessionUpdate": "agent_message", "messageId": "answer"})
+        if text == "MOCK_REPLACE":
+            updates.append({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": " tail"}})
+        if text == "MOCK_CLEAR":
+            updates.append({"sessionUpdate": "agent_message", "messageId": "answer", "content": None})
+        for update in updates:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+        text = ""
     if "MOCK_REFUSAL" in text:
         respond(request["id"], {"stopReason": "refusal"})
         return

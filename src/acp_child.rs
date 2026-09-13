@@ -14,6 +14,7 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, UntypedMessage};
 
+mod messages;
 mod protocol;
 use agentkit_acp::{
     CloseSessionRequest, ConfigOptionUpdate, ContentBlock, DeleteSessionRequest,
@@ -712,9 +713,14 @@ pub(crate) struct ChildOutput {
     pub updates: Vec<Value>,
     pub updates_truncated: bool,
     update_bytes: usize,
+    messages: messages::Messages,
 }
 
 impl ChildOutput {
+    fn finish_messages(&mut self) {
+        self.text.push_str(&self.messages.finish());
+    }
+
     fn config_snapshot(&mut self, options: Vec<SessionConfigOption>) {
         // Reserve the newest complete snapshot within the existing update budget.
         let Ok(value) = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
@@ -1287,6 +1293,11 @@ async fn run(
                     route.idle.send_if_modified(|current| current.advance(state));
                     return Ok(());
                 }
+                if let Some(update) = messages::parse(&params["update"])?
+                    && let Ok(mut output) = route.output.lock()
+                    && output.messages.record(update) {
+                    return Ok(());
+                }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
                 if !route.owner.is_empty() && let Some(activity) = roster_activity(&notification.update) {
@@ -1380,7 +1391,8 @@ async fn run(
                     return Err(error);
                 }
             };
-            let replay = replay_output.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.clone();
+            let mut replay = replay_output.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.clone();
+            replay.finish_messages();
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
             }
@@ -1687,6 +1699,7 @@ async fn run(
                             };
                             if let Ok(mut routes) = routes.lock() { routes.remove(&session_id); }
                             let mut output = output.lock().map(|output| output.clone()).unwrap_or_default();
+                            output.finish_messages();
                             match config_snapshots.get(&session_id) {
                                 Ok(Some(options)) => output.config_snapshot(options),
                                 Ok(None) => {},
@@ -3522,6 +3535,7 @@ for line in sys.stdin:
         let harnesses = AcpHarnesses::new(profiles).unwrap();
         let config = ChildConfig {
             root: root.path().to_path_buf(),
+            additional_directories: Vec::new(),
             model: "unused".into(),
             provider: Default::default(),
             reasoning_effort: None,
@@ -3652,6 +3666,20 @@ for line in sys.stdin:
         .await
         .unwrap();
         assert!(base.supports_native_fork());
+        for (prompt, expected) in [
+            ("MOCK_WHOLE", "whole answer"),
+            ("MOCK_REPLACE", "replacement tail"),
+            ("MOCK_CLEAR", ""),
+        ] {
+            assert_eq!(
+                base.prompt("s-test".into(), prompt.into(), TurnCancellation::default())
+                    .await
+                    .unwrap()
+                    .text,
+                expected
+            );
+        }
+
         assert_eq!(
             base.prompt(
                 "s-test".into(),
