@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 )]
 mod tests;
 
+pub(crate) mod child;
 pub(crate) mod terminal;
 
 #[cfg(test)]
@@ -221,19 +222,11 @@ pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: O
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
-        || old
-            .map_or(0, str::len)
-            .saturating_add(new.map_or(0, str::len))
-            > MAX_DIFF_TEXT
-        || location_value(path, None).is_none()
     {
         return;
     }
-    let operation = match (old, new) {
-        (None, Some(_)) => "add",
-        (Some(_), None) => "delete",
-        (Some(_), Some(_)) => "modify",
-        (None, None) => return,
+    let Some(content) = diff_content(path, old, new) else {
+        return;
     };
     publish(Update {
         session: request.session_id.0.clone(),
@@ -241,26 +234,42 @@ pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: O
         start: None,
         patch: Some(Value::Object(Map::from_iter([
             ("toolCallId".into(), Value::from(request.call_id.0.clone())),
-            (
-                "content".into(),
-                Value::Array(vec![Value::Object(Map::from_iter([
-                    ("type".into(), Value::from("diff")),
-                    ("path".into(), Value::from(path.to_str())),
-                    ("oldText".into(), Value::from(old)),
-                    ("newText".into(), Value::from(new.unwrap_or_default())),
-                    (
-                        "changes".into(),
-                        Value::Array(vec![Value::Object(Map::from_iter([
-                            ("operation".into(), Value::from(operation)),
-                            ("path".into(), Value::from(path.to_str())),
-                            ("fileType".into(), Value::from("text")),
-                        ]))]),
-                    ),
-                ]))]),
-            ),
+            ("content".into(), Value::Array(vec![content])),
         ]))),
         ok: false,
     });
+}
+
+/// Shared conversion for local committed edits and captured v1 child snapshots.
+fn diff_content(path: &Path, old: Option<&str>, new: Option<&str>) -> Option<Value> {
+    if old
+        .map_or(0, str::len)
+        .saturating_add(new.map_or(0, str::len))
+        > MAX_DIFF_TEXT
+        || location_value(path, None).is_none()
+    {
+        return None;
+    }
+    let operation = match (old, new) {
+        (None, Some(_)) => "add",
+        (Some(_), None) => "delete",
+        (Some(_), Some(_)) => "modify",
+        (None, None) => return None,
+    };
+    Some(Value::Object(Map::from_iter([
+        ("type".into(), Value::from("diff")),
+        ("path".into(), Value::from(path.to_str())),
+        ("oldText".into(), Value::from(old)),
+        ("newText".into(), Value::from(new.unwrap_or_default())),
+        (
+            "changes".into(),
+            Value::Array(vec![Value::Object(Map::from_iter([
+                ("operation".into(), Value::from(operation)),
+                ("path".into(), Value::from(path.to_str())),
+                ("fileType".into(), Value::from("text")),
+            ]))]),
+        ),
+    ])))
 }
 
 fn location_value(path: &Path, line: Option<u32>) -> Option<Value> {
@@ -453,7 +462,7 @@ fn forward_event(
     event: Result<Update, broadcast::error::RecvError>,
     receiver: &mut broadcast::Receiver<Update>,
     session: &str,
-    active: &mut HashMap<String, terminal::State>,
+    active: &mut HashMap<String, HashMap<String, terminal::State>>,
     budget: &mut terminal::Budget,
     send: &impl Fn(Update) -> bool,
 ) -> Result<(), agentkit_acp::AcpRuntimeError> {
@@ -463,16 +472,43 @@ fn forward_event(
                 if active.len() >= CAPACITY || active.contains_key(&update.call) {
                     return Ok(());
                 }
-                active.insert(update.call.clone(), terminal::State::default());
+                active.insert(update.call.clone(), HashMap::new());
             } else if let Some(patch) = &update.patch {
-                let Some(state) = active.get_mut(&update.call) else {
+                let Some(terminals) = active.get_mut(&update.call) else {
                     return Ok(());
                 };
-                if patch.get("sessionUpdate").and_then(Value::as_str) == Some("terminal_update") {
-                    state.running = patch.get("exitStatus").is_none();
-                }
-                if !budget.admit(&mut update, state) {
-                    return Ok(());
+                let kind = patch.get("sessionUpdate").and_then(Value::as_str);
+                if matches!(kind, Some("terminal_update" | "terminal_output_chunk")) {
+                    let Some(id) = patch
+                        .get("terminalId")
+                        .and_then(Value::as_str)
+                        .filter(|id| id.len() <= MAX_ID)
+                    else {
+                        return Ok(());
+                    };
+                    if !terminals.contains_key(id)
+                        && (terminals.len() >= CAPACITY / 4
+                            || kind == Some("terminal_output_chunk"))
+                    {
+                        return Ok(());
+                    }
+                    let state = terminals
+                        .entry(id.to_owned())
+                        .or_insert_with(terminal::State::running);
+                    if kind == Some("terminal_update")
+                        && let Some(exit) = patch.get("exitStatus")
+                    {
+                        // Omission preserves the last state; null explicitly clears
+                        // an exit, and only an object declares the terminal exited.
+                        if exit.is_null() {
+                            state.running = true;
+                        } else if exit.is_object() {
+                            state.running = false;
+                        }
+                    }
+                    if !budget.admit(&mut update, state) {
+                        return Ok(());
+                    }
                 }
             } else if active.remove(&update.call).is_none() {
                 return Ok(());
@@ -483,30 +519,33 @@ fn forward_event(
         }
         Ok(_) => {}
         Err(error) => {
-            for (call, state) in active.drain() {
-                // Loss invalidates the stream as well as its card. Do not leave
-                // an editor waiting for a terminal exit frame that was dropped.
-                if state.running
-                    && !send(Update {
+            for (call, terminals) in active.drain() {
+                // Child replay terminals have independent IDs. Invalidate each
+                // affected stream, without asserting a child process has exited.
+                for (id, _) in terminals.into_iter().filter(|(_, state)| state.running) {
+                    let mut patch = Map::from_iter([
+                        ("sessionUpdate".into(), Value::from("terminal_update")),
+                        ("terminalId".into(), Value::from(id.clone())),
+                        (
+                            "_meta".into(),
+                            Value::Object(Map::from_iter([(
+                                "kit/outputIncomplete".into(),
+                                Value::from(true),
+                            )])),
+                        ),
+                    ]);
+                    if id == call {
+                        patch.insert("exitStatus".into(), Value::Object(Map::new()));
+                    }
+                    if !send(Update {
                         session: session.into(),
                         call: call.clone(),
                         start: None,
-                        patch: Some(Value::Object(Map::from_iter([
-                            ("sessionUpdate".into(), Value::from("terminal_update")),
-                            ("terminalId".into(), Value::from(call.clone())),
-                            ("exitStatus".into(), Value::Object(Map::new())),
-                            (
-                                "_meta".into(),
-                                Value::Object(Map::from_iter([(
-                                    "kit/outputIncomplete".into(),
-                                    Value::from(true),
-                                )])),
-                            ),
-                        ]))),
+                        patch: Some(Value::Object(patch)),
                         ok: false,
-                    })
-                {
-                    return Err(delivery_error());
+                    }) {
+                        return Err(delivery_error());
+                    }
                 }
                 if !send(Update {
                     session: session.into(),

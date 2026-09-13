@@ -2018,12 +2018,19 @@ fn result(
             ToolError::ExecutionFailed(error)
         }
     })?;
-    let value = serde_json::to_value(value).map_err(|error| {
+    let serialized = serde_json::to_value(&value).map_err(|error| {
         ToolError::ExecutionFailed(format!("failed to serialize subagent value: {error}"))
     })?;
+    if let Some(updates) = &value.updates {
+        crate::protocols::acp::tool_projection::child::publish(
+            &request,
+            &updates.items,
+            updates.truncated,
+        );
+    }
     Ok(ToolResult::new(ToolResultPart::success(
         request.call_id,
-        ToolOutput::structured(value),
+        ToolOutput::structured(serialized),
     )))
 }
 

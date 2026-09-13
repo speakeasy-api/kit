@@ -13,6 +13,15 @@ pub(in super::super) struct State {
     incomplete: bool,
 }
 
+impl State {
+    pub(in super::super) fn running() -> Self {
+        Self {
+            running: true,
+            incomplete: false,
+        }
+    }
+}
+
 pub(in super::super) struct Budget {
     bytes: usize,
     chunks: usize,
@@ -50,7 +59,10 @@ impl Budget {
                     // notice; suppress the rest without dropping the exit.
                     *patch = Map::from_iter([
                         ("sessionUpdate".into(), Value::from("terminal_update")),
-                        ("terminalId".into(), Value::from(update.call.clone())),
+                        (
+                            "terminalId".into(),
+                            patch.get("terminalId").cloned().unwrap_or(Value::Null),
+                        ),
                         (
                             "_meta".into(),
                             Value::Object(Map::from_iter([(
@@ -62,6 +74,29 @@ impl Budget {
                 }
             }
             Some("terminal_update") => {
+                // Child terminals can carry replacement output snapshots, not
+                // just chunks. Charge those against the same lifetime budget.
+                if let Some(bytes) = patch
+                    .get("output")
+                    .and_then(|output| output.get("data"))
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                {
+                    if !state.incomplete && self.chunks > 0 && bytes <= self.bytes {
+                        self.bytes -= bytes;
+                        self.chunks -= 1;
+                    } else {
+                        patch.remove("output");
+                        state.incomplete = true;
+                        patch.insert(
+                            "_meta".into(),
+                            Value::Object(Map::from_iter([(
+                                "kit/outputIncomplete".into(),
+                                Value::from(true),
+                            )])),
+                        );
+                    }
+                }
                 // Command/cwd are optional, variable-size metadata. Charge the
                 // worst-case JSON escape expansion too, across all shell calls.
                 for key in ["command", "cwd"] {
@@ -74,6 +109,19 @@ impl Budget {
                         self.bytes -= bytes;
                     } else {
                         patch.remove(key);
+                    }
+                }
+                // ACP metadata replaces the prior object. Once output admission
+                // loses bytes, later clears/exit metadata cannot hide that fact.
+                if state.incomplete {
+                    let metadata = patch
+                        .entry("_meta")
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if !metadata.is_object() {
+                        *metadata = Value::Object(Map::new());
+                    }
+                    if let Some(metadata) = metadata.as_object_mut() {
+                        metadata.insert("kit/outputIncomplete".into(), Value::from(true));
                     }
                 }
             }
