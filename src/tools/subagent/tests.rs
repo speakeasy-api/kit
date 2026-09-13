@@ -309,6 +309,7 @@ fn manager_with_disconnected_session(
 ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.to_path_buf(),
             model: "test".into(),
             provider: Default::default(),
@@ -380,6 +381,7 @@ async fn close_does_not_block_listings_or_allow_stale_reuse() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -544,6 +546,7 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
     .unwrap();
     Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -622,7 +625,7 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
     );
     wait_for_logged(
         &requests,
-        |request| matches!(request, LoggedRequest::New { cwd } if cwd == &child_root),
+        |request| matches!(request, LoggedRequest::New { cwd, additional_directories } if cwd == &child_root && additional_directories.is_empty()),
     )
     .await;
 
@@ -647,7 +650,92 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
     );
     wait_for_logged(
         &requests,
-        |request| matches!(request, LoggedRequest::Fork { cwd, .. } if cwd == &child_root),
+        |request| matches!(request, LoggedRequest::Fork { cwd, additional_directories, .. } if cwd == &child_root && additional_directories.is_empty()),
+    )
+    .await;
+
+    manager
+        .close(&branch.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn additional_directories_reach_new_and_fork_without_changing_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let child_root = root.path().join("other-worktree");
+    std::fs::create_dir(&child_root).unwrap();
+    let child_root = child_root.canonicalize().unwrap();
+    let requests = root.path().join("requests.jsonl");
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec![fixture_path_arg("--request-log", &requests)],
+    );
+
+    let directories = vec![root.path().join("extra"), root.path().join("second")];
+    for path in &directories {
+        std::fs::create_dir(path).unwrap();
+    }
+    let parent = manager;
+    let manager = parent.fresh_for_workspace(directories.clone(), None);
+    assert!(parent.child_config().additional_directories.is_empty());
+    let sibling = parent.fresh_for_workspace(Vec::new(), None);
+    assert!(sibling.child_config().additional_directories.is_empty());
+
+    let source = manager
+        .create(
+            "MOCK_CWD".into(),
+            CreateOptions {
+                cwd: Some(PathBuf::from("other-worktree")),
+                ..Default::default()
+            },
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(manager.config.root, root.path());
+    assert_eq!(
+        manager.lookup(&source).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::New { cwd, additional_directories } if cwd == &child_root && additional_directories == &directories),
+    )
+    .await;
+
+    let branch = manager
+        .fork(
+            source.clone(),
+            "MOCK_CWD".into(),
+            None,
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branch.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(
+        manager.lookup(&branch).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::Fork { cwd, additional_directories, .. } if cwd == &child_root && additional_directories == &directories),
     )
     .await;
 
@@ -716,12 +804,18 @@ fn fixture_path_arg(name: &str, path: &Path) -> String {
 #[serde(tag = "method")]
 enum LoggedRequest {
     #[serde(rename = "session/new")]
-    New { cwd: PathBuf },
+    New {
+        cwd: PathBuf,
+        #[serde(rename = "additionalDirectories")]
+        additional_directories: Vec<PathBuf>,
+    },
     #[serde(rename = "session/fork")]
     Fork {
         #[serde(rename = "sessionId")]
         session_id: String,
         cwd: PathBuf,
+        #[serde(rename = "additionalDirectories")]
+        additional_directories: Vec<PathBuf>,
     },
     #[serde(rename = "session/prompt")]
     Prompt {
@@ -1607,6 +1701,7 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -1704,6 +1799,7 @@ async fn listing_includes_named_starting_and_idle_subagents() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -1856,6 +1952,7 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),

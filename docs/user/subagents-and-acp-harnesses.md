@@ -278,3 +278,9 @@ ACP startup must complete within 30 seconds. Native `session/fork` must also ans
 - Structured output remains text: ask for bare JSON, inspect the raw `output`, and use a repair `prompt` with an appropriate `output_schema`.
 
 For current top-level and subcommand options, run `kit --help` or `kit <command> --help`.
+
+Child sessions inherit the owning ACP session’s additional project directories on
+`session/new` and native `session/fork`, including the Kit fork fallback. These
+directories are project context, not filesystem access boundaries. An explicit
+`subagent.cwd` changes the primary working directory without discarding the
+additional directories. Each parent session has its own directory list.

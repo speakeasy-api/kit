@@ -62,6 +62,7 @@ def log_request(request):
         entry["sessionId"] = params["sessionId"]
     if request.get("method") in ("session/new", "session/fork"):
         entry["cwd"] = params["cwd"]
+        entry["additionalDirectories"] = params.get("additionalDirectories", [])
     if request.get("method") == "session/prompt":
         entry["text"] = " ".join(block["text"] for block in params["prompt"] if block["type"] == "text")
     with log_lock:

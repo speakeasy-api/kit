@@ -602,6 +602,7 @@ impl Runtime {
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
             ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.clone(),
                 model: model.clone(),
                 provider,
@@ -1033,6 +1034,7 @@ impl Runtime {
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
+                additional_directories: Vec::new(),
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
                 provider: runtime.provider,
@@ -1622,10 +1624,9 @@ impl Runtime {
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
-        let subagents = match parent_context {
-            Some((id, name)) => self.subagents.fresh_with_parent(id, name),
-            None => self.subagents.fresh(),
-        };
+        let subagents = self
+            .subagents
+            .fresh_for_workspace(additional_directories, parent_context);
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
