@@ -778,6 +778,7 @@ async fn wait_for_available_permits(manager: &Subagents, expected: usize) {
 
 #[derive(Default)]
 struct ScenarioOptions {
+    fail_delete: bool,
     gate_new: bool,
     gate_fork: bool,
     gate_prompt: Option<&'static str>,
@@ -801,6 +802,9 @@ impl MockAcpScenario {
         let fork_release = root.path().join("release-fork");
         let prompt_release = root.path().join("release-prompt");
         let mut args = vec![fixture_path_arg("--request-log", &requests)];
+        if options.fail_delete {
+            args.extend(["--delete".into(), "--fail-delete".into()]);
+        }
         if options.gate_new {
             args.push(fixture_path_arg("--new-release", &new_release));
         }
@@ -1997,4 +2001,32 @@ async fn unsupported_prompt_content_preserves_continuation_handle() {
         .close(&continued.id, &TurnCancellation::default())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn delete_failure_releases_closed_branch_capacity() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        fail_delete: true,
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let branch = scenario
+        .spawn_fork(source.clone(), "branch")
+        .await
+        .unwrap()
+        .unwrap();
+    let error = scenario
+        .manager
+        .close(&branch.id, &TurnCancellation::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("delete failed"));
+    wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS - 1).await;
+    let replacement = scenario
+        .spawn_fork(source, "replacement")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement.id, branch.id);
+    assert!(scenario.manager.lookup(&branch).is_err());
 }

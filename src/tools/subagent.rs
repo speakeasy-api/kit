@@ -948,8 +948,10 @@ impl Subagents {
         let Some(child) = child else {
             return Ok(());
         };
-        match child.close().await {
-            Ok(()) => Ok(()),
+        match child.discard().await {
+            Ok(None) => Ok(()),
+            // The live session is closed; history cleanup failure must not retain capacity.
+            Ok(Some(error)) => Err(error),
             Err(error) if child_error_is_terminal(&error, &child) => Err(error),
             Err(error) => {
                 self.retain_permit_until_process_exit(&state, &child).await;
@@ -1766,7 +1768,7 @@ impl CloseTool {
             cancel_background: Arc::new(cancel_background),
             spec: ToolSpec::new(
                 ToolName::new("close"),
-                "Close an active subagent by its complete handle or `{ id }`, or cancel a background tool call with `{ call_id }`. Closed subagent handles become unusable and their capacity is released.",
+                "Close an active subagent by its complete handle or `{ id }`, or cancel a background tool call with `{ call_id }`. Closed subagent handles become unusable and their capacity is released. Explicit close also deletes persistent session history when the harness supports session/delete. History deletion can fail after the live handle has been removed and capacity released. Internal cleanup and process shutdown preserve persistent history.",
                 Value::Object(Map::from_iter([("oneOf".into(), Value::Array(vec![value_schema(), id_schema(), call_id_schema()]))])),
             )
             .with_output_schema(id_schema())

@@ -14,11 +14,11 @@ use std::{
 
 use agent_client_protocol::{ByteStreams, schema::ProtocolVersion};
 use agentkit_acp::{
-    CancelNotification, CloseSessionRequest, ConfigOptionUpdate, ContentBlock, ForkSessionRequest,
-    PermissionOption, PermissionOptionKind, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionValue, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    CancelNotification, CloseSessionRequest, ConfigOptionUpdate, ContentBlock,
+    DeleteSessionRequest, ForkSessionRequest, PermissionOption, PermissionOptionKind,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agentkit_core::TurnCancellation;
 use futures_util::future::{Either, select};
@@ -518,7 +518,8 @@ struct Fork {
 }
 struct Close {
     session_id: SessionId,
-    reply: oneshot::Sender<Result<(), ChildError>>,
+    delete: bool,
+    reply: oneshot::Sender<Result<Option<ChildError>, ChildError>>,
 }
 enum Request {
     Prompt(Prompt),
@@ -939,25 +940,40 @@ impl ChildSession {
         self.capabilities.session_capabilities.fork.is_some()
     }
 
+    /// Release a session without deleting persistent history.
     pub async fn close(&self) -> Result<(), ChildError> {
+        self.close_session(false).await.map(|_| ())
+    }
+
+    /// Explicitly discard a branch and its persistent history when supported.
+    /// An outer error means live-session cleanup failed; an inner error only
+    /// reports history deletion failure after the live session was released.
+    pub async fn discard(&self) -> Result<Option<ChildError>, ChildError> {
+        self.close_session(true).await
+    }
+
+    async fn close_session(&self, discard: bool) -> Result<Option<ChildError>, ChildError> {
+        let delete = discard && self.capabilities.session_capabilities.delete.is_some();
         if let Some(ancestor_id) = &self.descendant_parent {
             crate::events::emit(&crate::events::RuntimeEvent::SubagentDescendantsRemoved {
                 ancestor_id: ancestor_id.clone(),
             });
         }
         if self.capabilities.session_capabilities.close.is_none() {
-            return if self.tx.strong_count() == 1 {
-                Ok(())
-            } else {
-                Err(ChildError::Failed(
+            if self.tx.strong_count() != 1 {
+                return Err(ChildError::Failed(
                     "ACP harness does not support closing one session while sibling sessions share its process".into(),
-                ))
-            };
+                ));
+            }
+            if !delete {
+                return Ok(None);
+            }
         }
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Request::Close(Close {
                 session_id: self.session_id.clone(),
+                delete,
                 reply,
             }))
             .await
@@ -1457,27 +1473,43 @@ async fn run(
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         tasks.spawn(async move {
-                            let request = connection
-                                .send_request(CloseSessionRequest::new(close.session_id.clone()))
-                                .block_task();
-                            // Dropping the SDK request future on timeout sends
-                            // $/cancel_request before discarding its response.
-                            let result = tokio::time::timeout(CANCEL_SETTLE, request)
-                                .await
-                                .map_err(|_| {
-                                    ChildError::Failed("ACP harness did not answer session/close within 5 seconds".into())
-                                })
-                                .and_then(|result| {
-                                    result
-                                        .map(|_| ())
-                                        .map_err(|error| ChildError::Failed(error.to_string()))
-                                });
-                            if result.is_ok()
+                            // Dropping an SDK request on timeout sends $/cancel_request.
+                            let result = async {
+                                if supports_close {
+                                    tokio::time::timeout(CANCEL_SETTLE, connection
+                                        .send_request(CloseSessionRequest::new(close.session_id.clone()))
+                                        .block_task())
+                                        .await
+                                        .map_err(|_| ChildError::Failed("ACP harness did not answer session/close within 5 seconds".into()))?
+                                        .map_err(|error| ChildError::Failed(error.to_string()))?;
+                                }
+                                // Commit live-session removal before fallible history cleanup.
+                                if supports_close && let Ok(mut sessions) = sessions.lock() {
+                                    sessions.retain(|id| id != &close.session_id);
+                                }
+                                let deletion = async {
+                                if close.delete {
+                                    tokio::time::timeout(CANCEL_SETTLE, connection
+                                        .send_request(DeleteSessionRequest::new(close.session_id.clone()))
+                                        .block_task())
+                                        .await
+                                        .map_err(|_| ChildError::Failed("ACP harness did not answer session/delete within 5 seconds".into()))?
+                                        .map_err(|error| ChildError::Failed(format!("session/delete failed: {error}")))?;
+                                }
+                                Ok::<(), ChildError>(())
+                                }.await;
+                                Ok(deletion.err())
+                            }.await;
+                            if !supports_close && matches!(result, Ok(None))
                                 && let Ok(mut sessions) = sessions.lock()
                             {
                                 sessions.retain(|id| id != &close.session_id);
                             }
-                            let result = result.and_then(|()| config_snapshots.remove(&close.session_id).map_err(|error| ChildError::Failed(error.to_string())));
+                            let result = result.map(|deletion| {
+                                let cleanup = config_snapshots.remove(&close.session_id)
+                                    .err().map(|error| ChildError::Failed(error.to_string()));
+                                deletion.or(cleanup)
+                            });
                             let _ = close.reply.send(result);
                         });
                     }
@@ -1886,7 +1918,7 @@ mod tests {
                 panic!("expected actual child close request");
             };
             assert_eq!(close.session_id.to_string(), "test");
-            close.reply.send(Ok(())).unwrap();
+            close.reply.send(Ok(None)).unwrap();
         };
         let (result, ()) = tokio::join!(session.close(), actor);
         result.unwrap();
@@ -1906,6 +1938,7 @@ mod tests {
                         let (reply, response) = oneshot::channel();
                         tx.send(Request::Close(Close {
                             session_id: id.to_string().into(),
+                            delete: false,
                             reply,
                         }))
                         .await
@@ -1940,7 +1973,7 @@ mod tests {
                                 assert_eq!(seen & 1, 0);
                                 seen |= 1;
                                 assert_eq!(close.session_id, SessionId::from(id.to_string()));
-                                close.reply.send(Ok(())).unwrap();
+                                close.reply.send(Ok(None)).unwrap();
                             }
                             ActorEvent::Fatal => {
                                 assert_eq!(seen & 2, 0);
@@ -2004,6 +2037,7 @@ mod tests {
                     let (reply, _response) = oneshot::channel();
                     tx.send(Request::Close(Close {
                         session_id: "wake".into(),
+                        delete: false,
                         reply,
                     }))
                     .await
@@ -3033,6 +3067,136 @@ mod tests {
             assert_eq!(output.text, "elicitation cancelled");
         }
         base.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_disposal_deletes_only_advertised_sessions() {
+        for (delete, fail, fail_close, slow_delete) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let log = root.path().join("requests.jsonl");
+            let mut profiles = BTreeMap::new();
+            profiles.insert(
+                "mock".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: vec![
+                        format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
+                        format!("--request-log={}", log.display()),
+                        if delete { "--delete" } else { "--unused" }.into(),
+                        if fail { "--fail-delete" } else { "--unused" }.into(),
+                        if fail_close {
+                            "--fail-first-close"
+                        } else {
+                            "--unused"
+                        }
+                        .into(),
+                        if slow_delete {
+                            "--slow-delete"
+                        } else {
+                            "--unused"
+                        }
+                        .into(),
+                    ],
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            );
+            let harnesses = AcpHarnesses::new(profiles).unwrap();
+            let config = ChildConfig {
+                root: root.path().to_path_buf(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses,
+                default_harness: "acp.mock".into(),
+                parent_id: None,
+                parent_name: None,
+            };
+            let base = ChildSession::start(
+                config,
+                "acp.mock".into(),
+                None,
+                None,
+                1,
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+            let branch = base
+                .fork(None, None, &TurnCancellation::default())
+                .await
+                .unwrap();
+            let outcome = branch.discard().await;
+            assert_eq!(outcome.is_err(), fail_close);
+            if !fail_close {
+                let deletion = outcome.unwrap();
+                assert_eq!(deletion.is_some(), fail || slow_delete);
+                if let Some(error) = deletion {
+                    assert!(error.to_string().contains("session/delete"));
+                }
+            }
+            assert_eq!(
+                base.prompt(
+                    "s-test".into(),
+                    "survives".into(),
+                    TurnCancellation::default()
+                )
+                .await
+                .unwrap()
+                .text,
+                "survives"
+            );
+            drop(branch);
+            let mut closed = base.closed_signal();
+            drop(base);
+            closed.wait_for(|closed| *closed).await.unwrap();
+            let requests = std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["method"] == "session/close" && r["sessionId"] == "branch-1")
+                    .count(),
+                if fail_close { 2 } else { 1 }
+            );
+            let deletions = requests
+                .iter()
+                .filter(|r| r["method"] == "session/delete")
+                .collect::<Vec<_>>();
+            assert_eq!(deletions.len(), usize::from(delete && !fail_close));
+            if delete && !fail_close {
+                assert_eq!(deletions[0]["sessionId"], "branch-1");
+                let close = requests
+                    .iter()
+                    .position(|r| r["method"] == "session/close" && r["sessionId"] == "branch-1")
+                    .unwrap();
+                let delete = requests
+                    .iter()
+                    .position(|r| r["method"] == "session/delete")
+                    .unwrap();
+                assert!(close < delete);
+            }
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r["method"] == "session/close" && r["sessionId"] == "base")
+            );
+        }
     }
 
     #[tokio::test]

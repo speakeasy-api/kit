@@ -283,7 +283,8 @@ for line in sys.stdin:
                     "embeddedContext": "--prompt-content" in sys.argv,
                 },
                 "sessionCapabilities": (
-                    {"fork": {}, "close": {}} if supports_fork else {"close": {}}
+                    ({"fork": {}, "close": {}} if supports_fork else {"close": {}})
+                    | ({"delete": {}} if "--delete" in sys.argv else {})
                 )
             },
         })
@@ -328,3 +329,11 @@ for line in sys.stdin:
         pass
     elif method == "session/close":
         threading.Thread(target=close, args=(request,), daemon=True).start()
+
+    elif method == "session/delete":
+        if "--slow-delete" in sys.argv:
+            continue
+        if "--fail-delete" in sys.argv:
+            send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "delete failed"}})
+        else:
+            respond(request["id"], {})
