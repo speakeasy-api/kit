@@ -90,9 +90,38 @@ return { main: second.output, alternative: branch.output }
 
 Each successful turn returns a session value with `id`, `name`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and name while incrementing its generation. `fork` creates a different ID and uses its own preferred or fallback name; its generation is one greater than the supplied source value, and it does not advance the source session. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. Explicit `close` also sends `session/delete` when advertised, removing the discarded branch’s persistent history after closing it. Delete failures are reported rather than silently ignored. Process shutdown and internal cleanup do not delete persistent history; this preserves completed child sessions for restart recovery. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
 
-Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
+Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Prompt and fork calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently. Steering injects guidance into a working turn without waiting for that turn to finish.
 
 The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness`, `model`, and `cwd` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. `cwd` selects the new subagent's working directory; relative paths resolve from Kit's working directory, and missing paths or non-directories fail before startup. Omit an argument to retain its configured default. `prompt` and `fork` retain the original session's harness, model, and working directory. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+
+## Steer a working subagent
+
+Use `steer({ id, prompt })` to inject guidance into an existing working turn,
+without cancelling it or starting a new turn. While the originating `compose`
+is backgrounded, call `subagents({})` in a separate compose to find the child's
+immutable ID and confirm its status is `working`. Then use that ID:
+
+```text
+return steer({
+  id: "s-…",
+  prompt: "Keep the change limited to the parser; do not modify the public API."
+})
+```
+
+The prompt accepts the same text or ACP content-block input as `prompt`.
+Steering requires ACP v2 and a child that advertises `steer` support. Starting,
+idle, retired, and fork-reserved sessions are rejected, as are unknown IDs.
+Unsupported peers return an error: Kit does not fall back to cancellation or
+re-prompting. Use `prompt` with the latest completed handle for an idle child.
+
+The returned value is the child's acceptance receipt, **not proof that the
+injection was delivered, applied, or finished**. Steering does not wait for idle
+or change the turn, generation, or reusable handle. The original backgrounded
+compose remains responsible for returning the completed turn's output. The
+child can finish or close between listing and steering, so a working listing
+does not guarantee acceptance. If acknowledgement times out, delivery is unknown;
+Kit does not cancel the original turn or retry the injection. Dropping the
+steering caller also does not revoke an injection already sent to the child.
 
 ## Inspect display names
 
@@ -169,7 +198,7 @@ Persistent parent sessions record their direct children’s ACP session IDs, har
 
 Recovery reattaches the same mutable child session, not a snapshot or a new branch. It is not the generic immutable fork fallback discussed in #12. Interrupted turns are not automatically retried, and explicitly closed children are never restored—even if remote history deletion failed. Existing transcripts without child records remain readable but cannot reconstruct their old child handles. New child-state records require a reader that understands the newer transcript schema.
 
-For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Its stop reason uses the same success, cancellation, refusal, and request-limit handling as v1. An omitted reason permits normal completion; an unknown reason reports an error rather than success. Whole-message updates replace text by message ID; omitted content preserves text, empty or null content clears it, and later chunks append.
+For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Its stop reason uses the same success, cancellation, refusal, and request-limit handling as v1. Steering requires ACP v2 with advertised `steer` support. An omitted reason permits normal completion; an unknown reason reports an error rather than success. Whole-message updates replace text by message ID; omitted content preserves text, empty or null content clears it, and later chunks append.
 
 For generic v2 children, recovery uses `session/resume` with `replayFrom: {"type": "start"}`; v1 children must advertise `loadSession` and are reattached with `session/load`. Built-in Kit children use their persistent-session launch path. Replay completes before the next prompt and never replaces the handle’s last-turn output. Kit uses only IDs recorded by the owning parent; it does not scan and adopt unrelated child sessions. If the harness was removed, cannot load sessions, or lost its history, reconnect fails without creating a replacement session. Restore the harness configuration or explicitly close the obsolete handle. Close during an in-progress reconnect reports an error without retiring the handle; retry after startup completes or is cancelled.
 

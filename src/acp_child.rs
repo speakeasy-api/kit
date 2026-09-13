@@ -525,7 +525,13 @@ struct Close {
     delete: bool,
     reply: oneshot::Sender<Result<Option<ChildError>, ChildError>>,
 }
+struct Steer {
+    session_id: SessionId,
+    content: Vec<ContentBlock>,
+    reply: oneshot::Sender<Result<Value, ChildError>>,
+}
 enum Request {
+    Steer(Steer),
     Prompt(Prompt),
     Fork(Fork),
     Close(Close),
@@ -1149,6 +1155,28 @@ impl ChildSession {
         })
     }
 
+    /// Steer the current turn without acquiring its prompt/fork serialization gate.
+    /// Dropping the caller does not cancel the foreground turn or revoke acceptance.
+    pub async fn steer(&self, prompt: ChildPrompt) -> Result<Value, ChildError> {
+        let content = prompt.into_blocks(&self.capabilities.prompt_capabilities)?;
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Request::Steer(Steer {
+                session_id: self.session_id.clone(),
+                content,
+                reply,
+            }))
+            .await
+            .map_err(|_| {
+                ChildError::TerminalFailed("nested agent process is no longer running".into())
+            })?;
+        response.await.map_err(|_| {
+            ChildError::TerminalFailed(
+                "nested agent process exited without a steer response".into(),
+            )
+        })?
+    }
+
     pub async fn prompt(
         &self,
         owner: String,
@@ -1431,7 +1459,7 @@ async fn run(
                     return Err(error);
                 }
             };
-            let (version, capabilities, auth_methods) = initialized;
+            let (version, capabilities, auth_methods, supports_steer) = initialized;
             let supports_close = capabilities.session_capabilities.close.is_some();
             // Reject before creating any session rather than silently dropping
             // the owning parent's project context. Native forks reuse this
@@ -1539,6 +1567,38 @@ async fn run(
                     ActorEvent::TaskReaped => continue,
                 };
                 match request {
+                    Request::Steer(steer) => {
+                        // Routes are installed/removed only by prompt tasks. Read under
+                        // their lock, then release it before any protocol I/O. Injection
+                        // never owns or changes the foreground output, gate, or idle state.
+                        let active = match routes.lock() {
+                            Ok(routes) => routes.contains_key(&steer.session_id),
+                            Err(_) => {
+                                let _ = steer.reply.send(Err(ChildError::Failed("subagent route lock was poisoned".into())));
+                                continue;
+                            }
+                        };
+                        let rejection = if !supports_steer {
+                            Some("ACP harness does not advertise v2 steer injection")
+                        } else if !active {
+                            Some("subagent has no active prompt to steer")
+                        } else { None };
+                        if let Some(message) = rejection {
+                            let _ = steer.reply.send(Err(ChildError::Failed(message.into())));
+                            continue;
+                        }
+                        let connection = connection.clone();
+                        let auth_methods = auth_methods.clone();
+                        tasks.spawn(async move {
+                            let result = tokio::time::timeout(CANCEL_SETTLE,
+                                protocol::steer(&connection, steer.session_id, steer.content)).await;
+                            let result = match result {
+                                Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
+                                Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
+                            };
+                            let _ = steer.reply.send(result);
+                        });
+                    }
                     Request::Fork(fork) => {
                         let auth_methods = auth_methods.clone();
                         let connection = connection.clone();
@@ -2415,7 +2475,7 @@ mod tests {
                         );
                         prompt.reply.send(Err(ChildError::Cancelled)).unwrap();
                     }
-                    Request::Close(_) => panic!("expected prompt or fork"),
+                    Request::Close(_) | Request::Steer(_) => panic!("expected prompt or fork"),
                 }
             };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
@@ -3650,6 +3710,250 @@ for line in sys.stdin:
         );
         assert_eq!(output.updates.len(), MAX_CAPTURED_UPDATES);
         assert!(output.update_bytes <= MAX_CAPTURED_UPDATE_BYTES);
+    }
+
+    mod steering_test_support {
+        use super::*;
+        pub(super) async fn start(root: &tempfile::TempDir, extra: Vec<String>) -> ChildSession {
+            let mut profiles = BTreeMap::new();
+            profiles.insert(
+                "mock".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: [
+                        vec![
+                            format!("{}/fixtures/mock-acp-v2.py", env!("CARGO_MANIFEST_DIR")),
+                            "--steer".into(),
+                            "--models".into(),
+                            format!("--request-log={}", root.path().join("requests").display()),
+                            format!("--prompt-release={}", root.path().join("release").display()),
+                        ],
+                        extra,
+                    ]
+                    .concat(),
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            );
+            let harnesses = AcpHarnesses::new(profiles).unwrap();
+            let config = ChildConfig {
+                root: root.path().to_path_buf(),
+                additional_directories: Vec::new(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses,
+                default_harness: "acp.mock".into(),
+                parent_id: None,
+                parent_name: None,
+            };
+            ChildSession::start(
+                config,
+                "acp.mock".into(),
+                None,
+                Some("mock/requested".into()),
+                1,
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap()
+        }
+        pub(super) async fn wait_request(root: &tempfile::TempDir, method: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let log =
+                        std::fs::read_to_string(root.path().join("requests")).unwrap_or_default();
+                    if log
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|request| request["method"] == method)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_preserves_in_flight_prompt_and_rejection_is_nonterminal() {
+        let root = tempfile::tempdir().unwrap();
+        let base = steering_test_support::start(&root, vec![]).await;
+        assert!(base.steer("too early".into()).await.is_err());
+        let child = base.clone();
+        let turn = tokio::spawn(async move {
+            child
+                .prompt(
+                    "s-test".into(),
+                    "original turn".into(),
+                    TurnCancellation::default(),
+                )
+                .await
+        });
+        steering_test_support::wait_request(&root, "session/prompt").await;
+        assert!(base.steer("MOCK_REJECT_INJECT".into()).await.is_err());
+        let auth_error = base
+            .steer("MOCK_AUTH_INJECT".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            "auth_required",
+            "outside Kit",
+            "selected-login",
+            "browser-login",
+        ] {
+            assert!(auth_error.contains(expected), "{auth_error}");
+        }
+        for secret in [
+            "remote-secret-message",
+            "remote-secret-data",
+            "secret-name",
+            "secret-description",
+        ] {
+            assert!(!auth_error.contains(secret), "{auth_error}");
+        }
+
+        let receipt = base.steer("change direction".into()).await.unwrap();
+        assert_eq!(receipt["messageId"], "injected-1");
+        assert!(
+            !turn.is_finished(),
+            "acceptance must not finish the original prompt"
+        );
+        assert!(
+            base.serial.try_lock().is_err(),
+            "steering must preserve prompt serialization"
+        );
+        std::fs::write(root.path().join("release"), b"release").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .text,
+            "original turn"
+        );
+        assert!(base.steer("too late".into()).await.is_err());
+        assert_eq!(
+            base.prompt(
+                "s-test".into(),
+                "next turn".into(),
+                TurnCancellation::default()
+            )
+            .await
+            .unwrap()
+            .text,
+            "next turn"
+        );
+        let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+        let requests: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let injections: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "session/inject")
+            .collect();
+        assert_eq!(injections.len(), 3);
+        assert!(injections.iter().all(|r| r["mode"] == "steer"));
+        assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "session/prompt")
+                .count(),
+            2
+        );
+        base.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_steering_survives_caller_drop_timeout_and_foreground_settlement() {
+        for drop_caller in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let base = steering_test_support::start(
+                &root,
+                vec![format!(
+                    "--inject-ack-release={}",
+                    root.path().join("ack").display()
+                )],
+            )
+            .await;
+            let child = base.clone();
+            let turn = tokio::spawn(async move {
+                child
+                    .prompt(
+                        "s-test".into(),
+                        "original".into(),
+                        TurnCancellation::default(),
+                    )
+                    .await
+            });
+            steering_test_support::wait_request(&root, "session/prompt").await;
+            let child = base.clone();
+            let steer = tokio::spawn(async move { child.steer("redirect".into()).await });
+            steering_test_support::wait_request(&root, "session/inject").await;
+            if drop_caller {
+                steer.abort();
+                assert!(steer.await.unwrap_err().is_cancelled());
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(10), steer)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("delivery is unknown"), "{error}");
+            }
+            assert!(!turn.is_finished());
+            assert!(base.serial.try_lock().is_err());
+            // The original turn can settle while its injection acknowledgement is held.
+            std::fs::write(root.path().join("release"), b"release").unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .text,
+                "original"
+            );
+            std::fs::write(root.path().join("ack"), b"ack").unwrap();
+            assert_eq!(
+                base.prompt(
+                    "s-test".into(),
+                    "reused".into(),
+                    TurnCancellation::default()
+                )
+                .await
+                .unwrap()
+                .text,
+                "reused"
+            );
+            base.close().await.unwrap();
+            let log = std::fs::read_to_string(root.path().join("requests")).unwrap();
+            let requests: Vec<Value> = log
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r["method"] == "session/prompt")
+                    .count(),
+                2
+            );
+        }
     }
 
     #[tokio::test]

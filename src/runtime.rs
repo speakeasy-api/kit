@@ -40,8 +40,8 @@ use crate::{
     },
     tools::{
         A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
-        Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents, SubagentsTool,
-        ToolSearch, observe_shared,
+        Observed, PromptTool, ReadFileTool, ShellTool, SteerTool, SubagentTool, Subagents,
+        SubagentsTool, ToolSearch, observe_shared,
     },
 };
 
@@ -1226,6 +1226,7 @@ impl Runtime {
         }
         children
             .register(Observed::new(PromptTool::new(subagents.clone())))
+            .register(Observed::new(SteerTool::new(subagents.clone())))
             .register(Observed::new(SubagentsTool::new(subagents.clone())))
             .register(Observed::new(CloseTool::new(subagents, {
                 let background_jobs = background_jobs.clone();

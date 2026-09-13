@@ -508,6 +508,45 @@ impl Subagents {
         })
     }
 
+    async fn steer(&self, id: &str, prompt: ChildPrompt) -> Result<Value, ChildError> {
+        let state = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .get(id)
+            .map(|entry| Arc::clone(&entry.state))
+            .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))?;
+        let child = {
+            let locked = state.lock().await;
+            self.check_active(&locked)?;
+            if locked.forking.is_some() {
+                return Err(ChildError::Failed(
+                    "subagent session is being forked".into(),
+                ));
+            }
+            match locked.status {
+                SubagentStatus::Working => {}
+                SubagentStatus::Starting => {
+                    return Err(ChildError::Failed(
+                        "subagent session is still starting".into(),
+                    ));
+                }
+                _ => {
+                    return Err(ChildError::Failed(
+                        "steer requires a working subagent session".into(),
+                    ));
+                }
+            }
+            locked
+                .child
+                .clone()
+                .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?
+        };
+        // Steering owns no lifecycle transition or generation. Do not hold state
+        // across the child request: completion and close must remain independent.
+        child.steer(prompt).await
+    }
+
     async fn prompt(
         &self,
         prior: SubagentValue,
@@ -1440,6 +1479,11 @@ pub struct PromptTool {
     spec: ToolSpec,
 }
 #[derive(Clone)]
+pub struct SteerTool {
+    manager: Subagents,
+    spec: ToolSpec,
+}
+#[derive(Clone)]
 pub struct ForkTool {
     manager: Subagents,
     depth: usize,
@@ -1783,6 +1827,38 @@ impl SubagentTool {
         }
     }
 }
+impl SteerTool {
+    pub fn new(manager: Subagents) -> Self {
+        Self {
+            manager,
+            spec: ToolSpec::new(
+                ToolName::new("steer"),
+                "Inject guidance into a working ACP subagent without starting a new turn. Use an ID from subagents while its originating compose is backgrounded. Requires ACP v2 with advertised steer support. Returns acceptance, not delivery or completion; never cancels or re-prompts unsupported peers.",
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("object")),
+                    ("properties".into(), Value::Object(Map::from_iter([
+                        ("id".into(), Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                        ]))),
+                        ("prompt".into(), crate::acp_child::prompt::schema()),
+                    ]))),
+                    ("required".into(), Value::from(vec!["id", "prompt"])),
+                    ("additionalProperties".into(), Value::Bool(false)),
+                ])),
+            )
+            .with_output_schema(Value::Bool(true))
+            .with_annotations(ToolAnnotations::new()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerInput {
+    id: String,
+    prompt: ChildPrompt,
+}
+
 impl PromptTool {
     pub fn new(manager: Subagents) -> Self {
         Self {
@@ -2047,6 +2123,36 @@ impl Tool for SubagentTool {
 }
 
 #[async_trait]
+impl Tool for SteerTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _context: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let input: SteerInput = serde_json::from_value(request.input.clone())
+            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
+        let receipt =
+            self.manager
+                .steer(&input.id, input.prompt)
+                .await
+                .map_err(|error| match error {
+                    ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
+                    ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
+                        ToolError::ExecutionFailed(error)
+                    }
+                })?;
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(receipt),
+        )))
+    }
+}
+
+#[async_trait]
 impl Tool for PromptTool {
     fn spec(&self) -> &ToolSpec {
         &self.spec
@@ -2113,3 +2219,260 @@ impl Tool for ForkTool {
 )]
 #[path = "subagent/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod steer_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn manager_with_disconnected_session(
+        root: &Path,
+    ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
+        let manager = Subagents::new(
+            ChildConfig {
+                root: root.to_path_buf(),
+                additional_directories: Vec::new(),
+                model: "test".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: Default::default(),
+                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+                parent_id: None,
+                parent_name: None,
+            },
+            2,
+        );
+        let state = Arc::new(AsyncMutex::new(State {
+            name: "Scout".into(),
+            status: SubagentStatus::Idle,
+            task: "done".into(),
+            generation: 1,
+            handle_generation: 1,
+            outcome: Some(GenerationOutcome::Success),
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: Some(2),
+            output: Value::String("done".into()),
+            updates: None,
+            harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            vendor: events::HarnessVendor::Kit,
+            model: None,
+            kit: true,
+            root: root.to_path_buf(),
+            child: Some(ChildSession::disconnected_for_test()),
+            forking: None,
+            permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
+        }));
+        manager.sessions.lock().unwrap().insert(
+            "source".into(),
+            SessionEntry {
+                name: "Scout".into(),
+                state: Arc::clone(&state),
+            },
+        );
+        let prior = SubagentValue {
+            id: "source".into(),
+            name: Some("Scout".into()),
+            output: Value::String("done".into()),
+            generation: 1,
+            updates: None,
+        };
+        (manager, state, prior)
+    }
+
+    #[test]
+    fn steer_schema_accepts_ids_and_child_prompts_only() {
+        let (manager, _, _) = manager_with_disconnected_session(Path::new("."));
+        let tool = SteerTool::new(manager);
+        let validator = jsonschema::validator_for(&tool.spec.input_schema).unwrap();
+        for input in [
+            json!({"id": "source", "prompt": "focus on tests"}),
+            json!({"id": "source", "prompt": [{"type": "text", "text": "focus on tests"}]}),
+        ] {
+            assert!(validator.is_valid(&input));
+            assert!(serde_json::from_value::<SteerInput>(input).is_ok());
+        }
+        for input in [
+            json!({"prompt": "missing ID"}),
+            json!({"id": "source"}),
+            json!({"id": 1, "prompt": "work"}),
+            json!({"id": "source", "prompt": "work", "generation": 1}),
+            json!({"id": "source", "prompt": null}),
+        ] {
+            assert!(!validator.is_valid(&input));
+            assert!(serde_json::from_value::<SteerInput>(input).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_steer_preserves_working_turn_and_reusable_session() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let release = root.path().join("release");
+            let request_log = root.path().join("requests");
+            let mut config = manager_with_disconnected_session(root.path())
+                .0
+                .child_config();
+            config.default_harness = "acp.mock".into();
+            config.harnesses =
+                crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                    "mock".into(),
+                    crate::acp_child::AcpHarnessProfile {
+                        command: "python3".into(),
+                        args: vec![
+                            format!("{}/fixtures/mock-acp-v2.py", env!("CARGO_MANIFEST_DIR")),
+                            "--steer".into(),
+                            format!("--prompt-release={}", release.display()),
+                            format!("--request-log={}", request_log.display()),
+                        ],
+                        permissions: Default::default(),
+                    },
+                )]))
+                .unwrap();
+            let manager = Subagents::new(config, 2);
+            let turn_manager = manager.clone();
+            let turn = tokio::spawn(async move {
+                turn_manager
+                    .create(
+                        "original turn".into(),
+                        CreateOptions::default(),
+                        0,
+                        TurnCancellation::default(),
+                        None,
+                    )
+                    .await
+            });
+            // Synchronize with the real protocol boundary, not a sleep that
+            // assumes startup or the foreground prompt has finished dispatching.
+            loop {
+                let log = std::fs::read_to_string(&request_log).unwrap_or_default();
+                if log
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|request| request["method"] == "session/prompt")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let listing = manager.list(&TurnCancellation::default()).await.unwrap();
+            assert_eq!(listing.len(), 1);
+            let id = &listing[0].id;
+            assert_eq!(listing[0].status, SubagentStatus::Working);
+            let state = Arc::clone(&manager.sessions.lock().unwrap().get(id).unwrap().state);
+            let before = {
+                let locked = state.lock().await;
+                (
+                    locked.generation,
+                    locked.handle_generation,
+                    locked.output.clone(),
+                    locked.permit.as_ref().unwrap().num_permits(),
+                )
+            };
+            let capacity = manager.capacity.available_permits();
+            let receipt = manager.steer(id, "change direction".into()).await.unwrap();
+            assert_eq!(receipt, json!({"messageId": "injected-1"}));
+            assert!(
+                !turn.is_finished(),
+                "acceptance must not finish the gated turn"
+            );
+            {
+                let locked = state.lock().await;
+                assert_eq!(locked.status, SubagentStatus::Working);
+                assert_eq!(locked.generation, before.0);
+                assert_eq!(locked.handle_generation, before.1);
+                assert_eq!(locked.output, before.2);
+                assert_eq!(locked.permit.as_ref().unwrap().num_permits(), before.3);
+                assert_eq!(manager.capacity.available_permits(), capacity);
+                assert!(locked.outcome.is_none());
+                assert!(locked.generation_finished_at_unix_ms.is_none());
+            }
+            std::fs::write(&release, b"release").unwrap();
+            let completed = turn.await.unwrap().unwrap();
+            assert_eq!(completed.id, *id);
+            assert_eq!(completed.output, json!("original turn"));
+            assert_eq!(completed.generation, before.0);
+            {
+                let locked = state.lock().await;
+                assert_eq!(locked.status, SubagentStatus::Idle);
+                assert_eq!(locked.handle_generation, completed.generation);
+                assert_eq!(locked.output, completed.output);
+                assert_eq!(locked.outcome, Some(GenerationOutcome::Success));
+                assert!(locked.permit.is_some());
+            }
+            let continued = manager
+                .prompt(
+                    completed,
+                    "next turn".into(),
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(continued.id, *id);
+            assert_eq!(continued.generation, before.0 + 1);
+            assert_eq!(continued.output, json!("next turn"));
+            assert_eq!(state.lock().await.status, SubagentStatus::Idle);
+            manager
+                .close(id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn steer_rejects_ineligible_sessions_without_changing_lifecycle() {
+        let (manager, state, prior) = manager_with_disconnected_session(Path::new("."));
+        for (status, forking, expected) in [
+            (SubagentStatus::Starting, None, "still starting"),
+            (SubagentStatus::Idle, None, "requires a working"),
+            (SubagentStatus::Removed, None, "retired"),
+            (SubagentStatus::Idle, Some("fork"), "being forked"),
+            (SubagentStatus::Working, Some("fork"), "being forked"),
+        ] {
+            {
+                let mut locked = state.lock().await;
+                locked.status = status;
+                locked.forking = forking.map(str::to_owned);
+            }
+            let error = manager
+                .steer(&prior.id, "guidance".into())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            let locked = state.lock().await;
+            assert_eq!(locked.status, status);
+            assert_eq!(locked.forking.as_deref(), forking);
+            assert_eq!(locked.generation, prior.generation);
+            assert_eq!(locked.handle_generation, prior.generation);
+            assert_eq!(locked.output, prior.output);
+            assert!(locked.child.is_some());
+            assert!(locked.permit.is_some());
+        }
+        assert!(
+            manager
+                .steer("unknown", "guidance".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown subagent session")
+        );
+        assert!(manager.sessions.lock().unwrap().contains_key(&prior.id));
+    }
+}
