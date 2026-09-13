@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = 1024;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
 const HEARTBEAT: Duration = Duration::from_millis(500);
 pub(crate) const LEASE: Duration = Duration::from_secs(5);
