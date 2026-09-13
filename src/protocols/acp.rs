@@ -1092,15 +1092,11 @@ impl LoopObserver for ResponseInterruptionNoticeObserver {
                 let client = self.client.clone();
                 let session_id = self.session_id.clone();
                 tool_projection::Subscription::start(event.session_id.0.clone(), move |update| {
-                    update.v2_only()
-                        || update.v1().is_ok_and(|update| {
-                            client
-                                .notify_session(SessionNotification::new(
-                                    session_id.clone(),
-                                    update,
-                                ))
-                                .is_ok()
-                        })
+                    update.v1().is_ok_and(|update| {
+                        client
+                            .notify_session(SessionNotification::new(session_id.clone(), update))
+                            .is_ok()
+                    })
                 })
             });
         }

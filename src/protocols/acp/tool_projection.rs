@@ -19,6 +19,14 @@ mod tests;
 
 pub(crate) mod terminal;
 
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod diff_tests;
+
 const CAPACITY: usize = crate::runlet_progress::MAX_NODES;
 const MAX_ID: usize = 256;
 const MAX_PATH: usize = 4096;
@@ -32,9 +40,46 @@ pub(crate) struct Update {
     ok: bool,
 }
 
+fn subscribers() -> usize {
+    bus().receiver_count() + v2_bus().receiver_count()
+}
+
+// Separate ingress queues: v1 must never lag because of v2-only traffic,
+// including when clients of both protocol versions coexist.
+struct Buses {
+    v1: broadcast::Sender<Update>,
+    v2: broadcast::Sender<Update>,
+}
+
+impl Buses {
+    fn new() -> Self {
+        Self {
+            v1: broadcast::channel(CAPACITY).0,
+            v2: broadcast::channel(CAPACITY).0,
+        }
+    }
+
+    fn publish(&self, update: Update) {
+        if !update.v2_only() {
+            let _ = self.v1.send(update.clone());
+        }
+        let _ = self.v2.send(update);
+    }
+}
+
+fn buses() -> &'static Buses {
+    static BUSES: OnceLock<Buses> = OnceLock::new();
+    BUSES.get_or_init(Buses::new)
+}
+
+fn v2_bus() -> &'static broadcast::Sender<Update> {
+    &buses().v2
+}
 fn bus() -> &'static broadcast::Sender<Update> {
-    static BUS: OnceLock<broadcast::Sender<Update>> = OnceLock::new();
-    BUS.get_or_init(|| broadcast::channel(CAPACITY).0)
+    &buses().v1
+}
+fn publish(update: Update) {
+    buses().publish(update);
 }
 
 /// An invocation owns its terminal update, including cancellation/unwind.
@@ -42,7 +87,7 @@ pub(crate) struct Invocation(Update);
 
 impl Invocation {
     pub(crate) fn start(request: &ToolRequest, root: Option<&Path>) -> Option<Self> {
-        if bus().receiver_count() == 0
+        if subscribers() == 0
             || request.session_id.0.len() > MAX_ID
             || request.call_id.0.len() > MAX_ID
         {
@@ -101,7 +146,7 @@ impl Invocation {
             patch: None,
             ok: false,
         };
-        let _ = bus().send(update.clone());
+        publish(update.clone());
         Some(Self(Update {
             start: None,
             ..update
@@ -115,13 +160,13 @@ impl Invocation {
 
 impl Drop for Invocation {
     fn drop(&mut self) {
-        let _ = bus().send(self.0.clone());
+        publish(self.0.clone());
     }
 }
 
 /// Publish a location established by the tool itself, not a guessed source line.
 pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
-    if bus().receiver_count() == 0
+    if subscribers() == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -131,13 +176,88 @@ pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
     let Some(locations) = location_value(path, Some(line)) else {
         return;
     };
-    let _ = bus().send(Update {
+    publish(Update {
         session: request.session_id.0.clone(),
         call: request.call_id.0.clone(),
         start: None,
         patch: Some(Value::Object(Map::from_iter([
             ("toolCallId".into(), Value::from(request.call_id.0.clone())),
             ("locations".into(), locations),
+        ]))),
+        ok: false,
+    });
+}
+
+/// Maximum combined UTF-8 before/after bytes retained per diff. Larger diffs are
+/// omitted, never truncated into a misleading file replacement. JSON escaping
+/// expands this by at most six, in addition to bounded path/identity overhead.
+const MAX_DIFF_TEXT: usize = 16 * 1024;
+
+/// Capture a deletion without making unreadable, binary, or large files fail an
+/// otherwise valid delete. Reads stop at the bound even if the file grows.
+pub(crate) fn deletion_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    if subscribers() == 0 {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DIFF_TEXT as u64 {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take((MAX_DIFF_TEXT + 1) as u64)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= MAX_DIFF_TEXT).then_some(text)
+}
+
+/// Publish only committed file changes. None denotes an absent file, not empty
+/// text. The patch contains both wire shapes; each protocol's typed decoder
+/// retains only its own fields. No renderable v2 git patch is synthesized.
+pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: Option<&str>) {
+    if subscribers() == 0
+        || request.session_id.0.len() > MAX_ID
+        || request.call_id.0.len() > MAX_ID
+        || !request.call_id.0.contains(":compose:")
+        || old
+            .map_or(0, str::len)
+            .saturating_add(new.map_or(0, str::len))
+            > MAX_DIFF_TEXT
+        || location_value(path, None).is_none()
+    {
+        return;
+    }
+    let operation = match (old, new) {
+        (None, Some(_)) => "add",
+        (Some(_), None) => "delete",
+        (Some(_), Some(_)) => "modify",
+        (None, None) => return,
+    };
+    publish(Update {
+        session: request.session_id.0.clone(),
+        call: request.call_id.0.clone(),
+        start: None,
+        patch: Some(Value::Object(Map::from_iter([
+            ("toolCallId".into(), Value::from(request.call_id.0.clone())),
+            (
+                "content".into(),
+                Value::Array(vec![Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("diff")),
+                    ("path".into(), Value::from(path.to_str())),
+                    ("oldText".into(), Value::from(old)),
+                    ("newText".into(), Value::from(new.unwrap_or_default())),
+                    (
+                        "changes".into(),
+                        Value::Array(vec![Value::Object(Map::from_iter([
+                            ("operation".into(), Value::from(operation)),
+                            ("path".into(), Value::from(path.to_str())),
+                            ("fileType".into(), Value::from("text")),
+                        ]))]),
+                    ),
+                ]))]),
+            ),
         ]))),
         ok: false,
     });
@@ -205,7 +325,21 @@ type Drain = tokio::sync::oneshot::Sender<Result<(), agentkit_acp::AcpRuntimeErr
 
 impl Subscription {
     pub(super) fn start(session: String, send: impl Fn(Update) -> bool + Send + 'static) -> Self {
-        let receiver = bus().subscribe();
+        Self::with_receiver(bus().subscribe(), session, send)
+    }
+
+    pub(super) fn start_v2(
+        session: String,
+        send: impl Fn(Update) -> bool + Send + 'static,
+    ) -> Self {
+        Self::with_receiver(v2_bus().subscribe(), session, send)
+    }
+
+    fn with_receiver(
+        receiver: broadcast::Receiver<Update>,
+        session: String,
+        send: impl Fn(Update) -> bool + Send + 'static,
+    ) -> Self {
         let (drains, commands) = tokio::sync::mpsc::channel(1);
         Self {
             task: tokio::spawn(forward(receiver, session, send, commands)),
@@ -242,8 +376,8 @@ async fn forward(
     mut drains: tokio::sync::mpsc::Receiver<Drain>,
 ) {
     use futures_util::future::{Either, select};
-    // The bool tracks whether this card has a live v2 terminal.
     let mut active = HashMap::new();
+    let mut budget = terminal::Budget::default();
     let mut drains_open = true;
     loop {
         let next = if drains_open {
@@ -279,7 +413,14 @@ async fn forward(
                             Err(broadcast::error::RecvError::Closed)
                         }
                     };
-                    result = forward_event(event, &mut receiver, &session, &mut active, &send);
+                    result = forward_event(
+                        event,
+                        &mut receiver,
+                        &session,
+                        &mut active,
+                        &mut budget,
+                        &send,
+                    );
                     if result.is_err() {
                         break;
                     }
@@ -291,7 +432,16 @@ async fn forward(
                 }
             }
             Either::Right(event) => {
-                if forward_event(event, &mut receiver, &session, &mut active, &send).is_err() {
+                if forward_event(
+                    event,
+                    &mut receiver,
+                    &session,
+                    &mut active,
+                    &mut budget,
+                    &send,
+                )
+                .is_err()
+                {
                     return;
                 }
             }
@@ -303,22 +453,26 @@ fn forward_event(
     event: Result<Update, broadcast::error::RecvError>,
     receiver: &mut broadcast::Receiver<Update>,
     session: &str,
-    active: &mut HashMap<String, bool>,
+    active: &mut HashMap<String, terminal::State>,
+    budget: &mut terminal::Budget,
     send: &impl Fn(Update) -> bool,
 ) -> Result<(), agentkit_acp::AcpRuntimeError> {
     match event {
-        Ok(update) if update.session == session => {
+        Ok(mut update) if update.session == session => {
             if update.start.is_some() {
                 if active.len() >= CAPACITY || active.contains_key(&update.call) {
                     return Ok(());
                 }
-                active.insert(update.call.clone(), false);
+                active.insert(update.call.clone(), terminal::State::default());
             } else if let Some(patch) = &update.patch {
-                let Some(terminal_running) = active.get_mut(&update.call) else {
+                let Some(state) = active.get_mut(&update.call) else {
                     return Ok(());
                 };
                 if patch.get("sessionUpdate").and_then(Value::as_str) == Some("terminal_update") {
-                    *terminal_running = patch.get("exitStatus").is_none();
+                    state.running = patch.get("exitStatus").is_none();
+                }
+                if !budget.admit(&mut update, state) {
+                    return Ok(());
                 }
             } else if active.remove(&update.call).is_none() {
                 return Ok(());
@@ -329,10 +483,10 @@ fn forward_event(
         }
         Ok(_) => {}
         Err(error) => {
-            for (call, terminal_running) in active.drain() {
+            for (call, state) in active.drain() {
                 // Loss invalidates the stream as well as its card. Do not leave
                 // an editor waiting for a terminal exit frame that was dropped.
-                if terminal_running
+                if state.running
                     && !send(Update {
                         session: session.into(),
                         call: call.clone(),

@@ -429,7 +429,7 @@ where
             self.activity.tool_projection.get_or_init(|| {
                 let sink = self.sink.clone();
                 let session_id = self.session_id.clone();
-                super::tool_projection::Subscription::start(
+                super::tool_projection::Subscription::start_v2(
                     event.session_id.0.clone(),
                     move |update| {
                         update.v2().is_ok_and(|update| {

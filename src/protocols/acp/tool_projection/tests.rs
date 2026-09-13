@@ -4,7 +4,7 @@ use agentkit_core::{MetadataMap, SessionId, ToolCallId, TurnId};
 use agentkit_tools_core::ToolName;
 use serde_json::json;
 
-fn request(session: &str, name: &str, input: Value) -> ToolRequest {
+pub(super) fn request(session: &str, name: &str, input: Value) -> ToolRequest {
     ToolRequest {
         session_id: SessionId::new(session),
         turn_id: TurnId::new("turn"),
@@ -138,9 +138,46 @@ async fn real_edit_wrapper_projects_success_and_failure_without_stderr_transport
         let updates = std::iter::from_fn(|| receiver.try_recv().ok())
             .filter(|update| update.session == "real-edit")
             .collect::<Vec<_>>();
-        assert_eq!(updates.len(), if is_hunk { 3 } else { 2 });
+        assert_eq!(updates.len(), 2 + usize::from(is_hunk) + usize::from(ok));
         assert!(updates[0].start.is_some());
         assert_eq!(updates.last().unwrap().ok, ok);
+        if ok {
+            let update = &updates[updates.len() - 2];
+            let v1 = serde_json::to_value(update.v1().unwrap()).unwrap();
+            let v2 = serde_json::to_value(update.v2().unwrap()).unwrap();
+            assert_eq!(v1["content"][0]["type"], "diff");
+            assert_eq!(
+                v1["content"][0]["path"],
+                root.path().join("example.txt").to_str().unwrap()
+            );
+            assert_eq!(
+                v1["content"][0]["newText"],
+                if is_hunk {
+                    "updated contents"
+                } else {
+                    "private file contents"
+                }
+            );
+            assert_eq!(
+                v1["content"][0]["oldText"],
+                if is_hunk {
+                    json!("private file contents")
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(v2["content"][0]["type"], "diff");
+            assert_eq!(
+                v2["content"][0]["changes"][0]["operation"],
+                if is_hunk { "modify" } else { "add" }
+            );
+            assert_eq!(
+                v2["content"][0]["changes"][0]["path"],
+                root.path().join("example.txt").to_str().unwrap()
+            );
+            assert!(v1["content"][0].get("changes").is_none());
+            assert!(v2["content"][0].get("oldText").is_none());
+        }
         if is_hunk {
             for wire in [
                 updates[1].v1().map(|v| serde_json::to_value(v).unwrap()),
@@ -256,7 +293,7 @@ async fn real_shell_streams_bytes_before_exit_and_drains_terminal_before_call() 
         approved_request: None,
     };
     let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
-    let subscription = Subscription::start("real-terminal".into(), move |update| {
+    let subscription = Subscription::start_v2("real-terminal".into(), move |update| {
         send.send(update).is_ok()
     });
     let call = request(
@@ -315,7 +352,7 @@ async fn real_shell_streams_bytes_before_exit_and_drains_terminal_before_call() 
 
 #[test]
 fn terminal_drop_marks_exit_and_bounds_binary_chunks_and_metadata() {
-    let mut receiver = bus().subscribe();
+    let mut receiver = v2_bus().subscribe();
     let request = request("terminal-bounds", "shell", json!({}));
     let invocation = Invocation::start(&request, None).unwrap();
     let terminal = terminal::Terminal::start(
@@ -409,7 +446,7 @@ async fn real_shell_cancellation_and_timeout_exit_terminal_before_failed_card() 
             approved_request: None,
         };
         let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
-        let subscription = Subscription::start(session.into(), move |u| send.send(u).is_ok());
+        let subscription = Subscription::start_v2(session.into(), move |u| send.send(u).is_ok());
         let call = request(
             session,
             "shell",
@@ -449,5 +486,101 @@ async fn real_shell_cancellation_and_timeout_exit_terminal_before_failed_card() 
             .collect();
         assert!(values[values.len() - 2]["exitStatus"].is_object());
         assert_eq!(values.last().unwrap()["status"], "failed");
+    }
+}
+
+#[tokio::test]
+async fn terminal_bursts_never_enter_the_v1_queue_with_mixed_clients() {
+    let buses = Buses::new();
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let (drains, commands) = tokio::sync::mpsc::channel(1);
+    let subscription = Subscription {
+        task: tokio::spawn(forward(
+            buses.v1.subscribe(),
+            "v1-isolated".into(),
+            move |u| send.send(u).is_ok(),
+            commands,
+        )),
+        drains,
+    };
+    let mut v2 = buses.v2.subscribe();
+    let start = Update {
+        session: "v1-isolated".into(),
+        call: "parent:compose:node".into(),
+        start: Some(json!({"toolCallId": "parent:compose:node", "status": "in_progress"})),
+        patch: None,
+        ok: false,
+    };
+    buses.publish(start.clone());
+    for _ in 0..CAPACITY + 1 {
+        buses.publish(Update {
+            session: "v2-burst".into(), call: "parent:compose:other".into(),
+            start: None, patch: Some(json!({"sessionUpdate": "terminal_output_chunk", "terminalId": "parent:compose:other", "data": "YQ=="})), ok: false,
+        });
+    }
+    buses.publish(Update {
+        start: None,
+        ok: true,
+        ..start
+    });
+    // The v2 receiver really did lag, while v1 had only lifecycle traffic.
+    assert!(matches!(
+        v2.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(_))
+    ));
+    subscription.drain().await.unwrap();
+    let start = receive.try_recv().unwrap();
+    let end = receive.try_recv().unwrap();
+    assert!(start.start.is_some());
+    assert_eq!(end.value()["status"], "completed");
+    assert!(receive.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn cumulative_budget_bounds_a_stalled_transport_across_calls() {
+    for size in [1, 8192] {
+        // This external sink deliberately accepts without consumption, like the
+        // SDK's unbounded queue. The budget must hold even without bus lag.
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let subscription =
+            Subscription::start_v2("slow-terminal".into(), move |u| send.send(u).is_ok());
+        for call in 0..4 {
+            let mut request = request("slow-terminal", "shell", json!({}));
+            request.call_id = ToolCallId::new(format!("parent:compose:{call}"));
+            let invocation = Invocation::start(&request, None).unwrap();
+            let terminal = terminal::Terminal::start(&request, "printf lots", Path::new("/tmp"));
+            subscription.drain().await.unwrap();
+            for _ in 0..64 {
+                terminal.output().unwrap().chunk(&vec![255; size]);
+                subscription.drain().await.unwrap();
+            }
+            terminal.finish(Some(0));
+            invocation.finish(true);
+            subscription.drain().await.unwrap();
+        }
+        let values: Vec<_> = std::iter::from_fn(|| receive.try_recv().ok())
+            .map(|u| serde_json::to_value(u.v2().unwrap()).unwrap())
+            .collect();
+        let chunks: Vec<_> = values.iter().filter_map(|v| v["data"].as_str()).collect();
+        assert!(!chunks.is_empty());
+        assert!(chunks.len() <= 128);
+        assert!(chunks.iter().map(|s| s.len()).sum::<usize>() <= 1024 * 1024);
+        assert!(
+            values
+                .iter()
+                .any(|v| v["_meta"]["kit/outputIncomplete"] == true)
+        );
+        assert_eq!(
+            values.iter().filter(|v| v["status"] == "completed").count(),
+            4
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|v| v["exitStatus"]["exitCode"] == 0)
+                .count(),
+            4
+        );
+        assert!(!values.iter().any(|v| v["status"] == "failed"));
     }
 }

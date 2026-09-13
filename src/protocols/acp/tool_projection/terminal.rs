@@ -1,9 +1,12 @@
 //! Agent-owned terminals are v2 only. Frames share the bounded invocation bus.
-use super::{MAX_ID, Update, bus};
+use super::{MAX_ID, Update, publish, v2_bus};
 use agentkit_tools_core::ToolRequest;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
 use std::path::Path;
+
+mod budget;
+pub(super) use budget::{Budget, State};
 
 /// A reader retains only routing IDs, never command text or accumulated output.
 #[derive(Clone)]
@@ -14,7 +17,7 @@ pub(crate) struct Output {
 
 impl Output {
     fn publish(&self, patch: Value) {
-        let _ = bus().send(Update {
+        publish(Update {
             session: self.session.clone(),
             call: self.call.clone(),
             start: None,
@@ -56,7 +59,7 @@ pub(crate) struct Terminal(Option<Output>);
 
 impl Terminal {
     pub(crate) fn start(request: &ToolRequest, command: &str, cwd: &Path) -> Self {
-        if bus().receiver_count() == 0
+        if v2_bus().receiver_count() == 0
             || request.session_id.0.len() > MAX_ID
             || request.call_id.0.len() > MAX_ID
             || !request.call_id.0.contains(":compose:")
