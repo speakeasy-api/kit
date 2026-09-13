@@ -181,67 +181,153 @@ impl Update {
     }
 }
 
-/// The observer owns this subscription; dropping its last clone aborts delivery.
+/// The session activity owns this subscription; its last clone aborts delivery.
 /// Slow consumers invalidate active cards on loss instead of leaving them running.
-pub(super) struct Subscription(tokio::task::JoinHandle<()>);
+pub(super) struct Subscription {
+    task: tokio::task::JoinHandle<()>,
+    drains: tokio::sync::mpsc::Sender<Drain>,
+}
+
+type Drain = tokio::sync::oneshot::Sender<Result<(), agentkit_acp::AcpRuntimeError>>;
 
 impl Subscription {
     pub(super) fn start(session: String, send: impl Fn(Update) -> bool + Send + 'static) -> Self {
         let receiver = bus().subscribe();
-        Self(tokio::spawn(forward(receiver, session, send)))
+        let (drains, commands) = tokio::sync::mpsc::channel(1);
+        Self {
+            task: tokio::spawn(forward(receiver, session, send, commands)),
+            drains,
+        }
+    }
+
+    /// Fence already-published frames, not running tools. Only session finalization
+    /// waits here; publication from an invocation stays synchronous and bounded.
+    pub(super) async fn drain(&self) -> Result<(), agentkit_acp::AcpRuntimeError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.drains
+            .send(reply)
+            .await
+            .map_err(|_| delivery_error())?;
+        response.await.map_err(|_| delivery_error())?
     }
 }
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
+}
+
+fn delivery_error() -> agentkit_acp::AcpRuntimeError {
+    agentkit_acp::AcpRuntimeError::Loop("inner tool projection delivery failed".into())
 }
 
 async fn forward(
     mut receiver: broadcast::Receiver<Update>,
     session: String,
     send: impl Fn(Update) -> bool,
+    mut drains: tokio::sync::mpsc::Receiver<Drain>,
 ) {
+    use futures_util::future::{Either, select};
     let mut active = HashSet::new();
+    let mut drains_open = true;
     loop {
-        match receiver.recv().await {
-            Ok(update) if update.session == session => {
-                if update.start.is_some() {
-                    if active.len() >= CAPACITY || !active.insert(update.call.clone()) {
-                        continue;
-                    }
-                } else if update.patch.is_some() {
-                    if !active.contains(&update.call) {
-                        continue;
-                    }
-                } else if !active.remove(&update.call) {
+        let next = if drains_open {
+            match select(
+                std::pin::pin!(drains.recv()),
+                std::pin::pin!(receiver.recv()),
+            )
+            .await
+            {
+                Either::Left((Some(reply), _)) => Either::Left(reply),
+                Either::Left((None, _)) => {
+                    drains_open = false;
                     continue;
                 }
-                if !send(update) {
-                    break;
-                }
+                Either::Right((event, _)) => Either::Right(event),
             }
-            Ok(_) => {}
-            Err(error) => {
-                for call in active.drain() {
-                    if !send(Update {
-                        session: session.clone(),
-                        call,
-                        start: None,
-                        patch: None,
-                        ok: false,
-                    }) {
+        } else {
+            Either::Right(receiver.recv().await)
+        };
+        match next {
+            Either::Left(reply) => {
+                // Snapshot the pending work: concurrent background tools must not
+                // turn this fence into an unbounded wait for future publication.
+                let mut result = Ok(());
+                for _ in 0..receiver.len().min(CAPACITY) {
+                    let event = match receiver.try_recv() {
+                        Ok(update) => Ok(update),
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            Err(broadcast::error::RecvError::Lagged(n))
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            Err(broadcast::error::RecvError::Closed)
+                        }
+                    };
+                    result = forward_event(event, &mut receiver, &session, &mut active, &send);
+                    if result.is_err() {
                         break;
                     }
                 }
-                if matches!(error, broadcast::error::RecvError::Closed) {
-                    break;
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    return;
                 }
-                // Discard the stale tail after a gap. Unknown completions are
-                // ignored; subsequent starts can establish fresh cards.
-                receiver = receiver.resubscribe();
+            }
+            Either::Right(event) => {
+                if forward_event(event, &mut receiver, &session, &mut active, &send).is_err() {
+                    return;
+                }
             }
         }
     }
+}
+
+fn forward_event(
+    event: Result<Update, broadcast::error::RecvError>,
+    receiver: &mut broadcast::Receiver<Update>,
+    session: &str,
+    active: &mut HashSet<String>,
+    send: &impl Fn(Update) -> bool,
+) -> Result<(), agentkit_acp::AcpRuntimeError> {
+    match event {
+        Ok(update) if update.session == session => {
+            if update.start.is_some() {
+                if active.len() >= CAPACITY || !active.insert(update.call.clone()) {
+                    return Ok(());
+                }
+            } else if update.patch.is_some() {
+                if !active.contains(&update.call) {
+                    return Ok(());
+                }
+            } else if !active.remove(&update.call) {
+                return Ok(());
+            }
+            if !send(update) {
+                return Err(delivery_error());
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            for call in active.drain() {
+                if !send(Update {
+                    session: session.into(),
+                    call,
+                    start: None,
+                    patch: None,
+                    ok: false,
+                }) {
+                    return Err(delivery_error());
+                }
+            }
+            if matches!(error, broadcast::error::RecvError::Closed) {
+                return Err(delivery_error());
+            }
+            // Discard the stale tail after a gap; fresh starts re-establish cards.
+            *receiver = receiver.resubscribe();
+        }
+    }
+    Ok(())
 }

@@ -1063,7 +1063,6 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
-    projection: Arc<std::sync::OnceLock<tool_projection::Subscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1078,7 +1077,6 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
-            projection: Arc::new(std::sync::OnceLock::new()),
             activity,
             inner,
             client,
@@ -1090,7 +1088,7 @@ impl ResponseInterruptionNoticeObserver {
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
         if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
-            self.projection.get_or_init(|| {
+            self.activity.tool_projection.get_or_init(|| {
                 let client = self.client.clone();
                 let session_id = self.session_id.clone();
                 tool_projection::Subscription::start(event.session_id.0.clone(), move |update| {
@@ -1916,6 +1914,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                 &tasks,
                                 &background_jobs,
                                 structured_completion,
+                                &activity,
                             ),
                             |reason| Some(reason.clone()),
                         )
@@ -1976,6 +1975,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                                             &mut driver,
                                             false,
                                             None,
+                                            &activity,
                                         ),
                                         |reason| Some(reason.clone()),
                                     )
@@ -2324,6 +2324,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
+    activity: &activity::SessionActivity,
 ) -> Result<FinishReason, AcpRuntimeError> {
     if structured_completion {
         let _ = settle_background_jobs(tasks, background_jobs).await?;
@@ -2353,6 +2354,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
         driver,
         true,
         structured_completion.then_some((tasks, background_jobs)),
+        activity,
     )
     .await
 }
@@ -2366,7 +2368,7 @@ async fn drive_unsolicited<S: ModelSession>(
     activity
         .execute(
             activity::ExecutionOrigin::Autonomous,
-            drive_finalized(session_id, integration, driver, false, None),
+            drive_finalized(session_id, integration, driver, false, None, activity),
             |reason| Some(reason.clone()),
         )
         .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
@@ -2380,6 +2382,7 @@ async fn drive_finalized<S: ModelSession>(
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+    activity: &activity::SessionActivity,
 ) -> Result<FinishReason, AcpRuntimeError> {
     let cancellation = integration.cancellation_handle(session_id)?;
     let generation = cancellation.generation();
@@ -2388,7 +2391,11 @@ async fn drive_finalized<S: ModelSession>(
     activity::finalize(
         activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
         structured,
-        integration.flush_session_updates(session_id),
+        async {
+            let projected = activity.drain_tool_projection().await;
+            let delivered = integration.flush_session_updates(session_id).await;
+            projected.and(delivered)
+        },
         |_| Ok(()),
     )
     .await
@@ -4755,6 +4762,98 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn finalization_drains_inner_tool_completion_before_client_flush() {
+        let integration = AcpIntegration::builder()
+            .name("projection-fence")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("v1-projection-fence");
+        let loop_id = AgentkitSessionId::new("v1-projection-loop");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let activity = legacy_activity(session_id.clone(), |_| Ok(()));
+        let observer = ResponseInterruptionNoticeObserver::new(
+            integration.clone(),
+            client,
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: Arc::new(AtomicUsize::new(0)),
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::new(AtomicUsize::new(0)),
+            })
+            .observer(observer.clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id.clone()).without_cache())
+            .await
+            .unwrap();
+        observer.handle_event(ObservedEvent {
+            session_id: Arc::new(loop_id.clone()),
+            event: AgentEvent::ToolCallRequested(ToolCallPart::new(
+                "parent",
+                "compose",
+                json!({"script": "return 1"}),
+            )),
+        });
+        let request = ToolRequest::new(
+            ToolCallId::new("parent:compose:node"),
+            ToolName::new("shell"),
+            json!({}),
+            loop_id,
+            agentkit_core::TurnId::new("turn"),
+        );
+        tool_projection::Invocation::start(&request, None)
+            .unwrap()
+            .finish(true);
+        // The receiver observes the exact queue prefix covered by the protocol
+        // flush, not notifications that happen to arrive after its acknowledgement.
+        let (result, covered) = futures_util::future::join(
+            drive_finalized(
+                &session_id,
+                &integration,
+                &mut driver,
+                true,
+                None,
+                &activity,
+            ),
+            async {
+                let mut covered = Vec::new();
+                loop {
+                    match messages.recv().await.unwrap() {
+                        AcpClientMessage::SessionNotification(notification) => {
+                            covered.push(notification)
+                        }
+                        AcpClientMessage::Flush { response } => {
+                            response.send(()).unwrap();
+                            break covered;
+                        }
+                        _ => panic!("unexpected permission request"),
+                    }
+                }
+            },
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            covered.iter().any(|notification| {
+                let value = serde_json::to_value(&notification.update).unwrap();
+                value["toolCallId"] == "parent:compose:node" && value["status"] == "completed"
+            }),
+            "the finalization flush must include the terminal inner-tool card"
+        );
+    }
+
+    #[tokio::test]
     async fn response_interruption_marker_becomes_v1_warning_before_replacement() {
         let integration = AcpIntegration::builder()
             .name("response-interruption-test")
@@ -5446,6 +5545,7 @@ pub(super) mod tests {
             &tasks,
             &background_jobs,
             false,
+            &legacy_activity(acp_session_id.clone(), |_| Ok(())),
         )
         .await
         .expect("cancellation must be an ACP response, not an RPC error");
@@ -5567,6 +5667,7 @@ pub(super) mod tests {
             &tasks,
             &BackgroundJobs::default(),
             false,
+            &legacy_activity(acp_session_id.clone(), |_| Ok(())),
         )
         .await
         .unwrap();
@@ -5647,6 +5748,7 @@ pub(super) mod tests {
         );
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let activity = legacy_activity(acp_session_id.clone(), |_| Ok(()));
         let prompt = drive_runtime_prompt(
             &acp_session_id,
             &runtime,
@@ -5658,6 +5760,7 @@ pub(super) mod tests {
             &tasks,
             &background_jobs,
             true,
+            &activity,
         );
         tokio::pin!(prompt);
 
@@ -5787,9 +5890,16 @@ pub(super) mod tests {
         driver
             .submit_input(vec![Item::text(ItemKind::User, "foreground")])
             .unwrap();
-        let response = drive_finalized(&session_id, &integration, &mut driver, true, None)
-            .await
-            .unwrap();
+        let response = drive_finalized(
+            &session_id,
+            &integration,
+            &mut driver,
+            true,
+            None,
+            &activity,
+        )
+        .await
+        .unwrap();
         activity.settle(None, None).unwrap();
         assert_eq!(
             agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
@@ -5806,9 +5916,16 @@ pub(super) mod tests {
                 async {
                     for text in ["first continuation", "second continuation"] {
                         driver.submit_input(vec![Item::notification(text)]).unwrap();
-                        drive_finalized(&session_id, &integration, &mut driver, false, None)
-                            .await
-                            .unwrap();
+                        drive_finalized(
+                            &session_id,
+                            &integration,
+                            &mut driver,
+                            false,
+                            None,
+                            &activity,
+                        )
+                        .await
+                        .unwrap();
                     }
                     let event = states.try_recv().unwrap();
                     assert!(event.active);

@@ -67,7 +67,7 @@ fn oversized_and_non_compose_ids_are_not_projected() {
 #[tokio::test]
 async fn session_routing_and_drop_report_only_owned_calls() {
     let (client, mut messages) = AcpClientHandle::channel();
-    let _subscription = Subscription::start("routing".into(), move |update| {
+    let subscription = Subscription::start("routing".into(), move |update| {
         client
             .notify_session(SessionNotification::new(
                 "wire-session",
@@ -83,8 +83,10 @@ async fn session_routing_and_drop_report_only_owned_calls() {
         &request("routing", "shell", json!({})),
         None,
     ));
-    let first = messages.recv().await.unwrap();
-    let second = messages.recv().await.unwrap();
+    subscription.drain().await.unwrap();
+    drop(subscription);
+    let first = messages.try_recv().unwrap();
+    let second = messages.try_recv().unwrap();
     let AcpClientMessage::SessionNotification(first) = first else {
         panic!("expected notification")
     };
@@ -161,17 +163,39 @@ async fn real_edit_wrapper_projects_success_and_failure_without_stderr_transport
 }
 
 #[tokio::test]
+async fn drain_fails_when_the_client_has_closed() {
+    let (client, messages) = AcpClientHandle::channel();
+    drop(messages);
+    let subscription = Subscription::start("closed-client".into(), move |update| {
+        client
+            .notify_session(SessionNotification::new("wire", update.v1().unwrap()))
+            .is_ok()
+    });
+    drop(Invocation::start(
+        &request("closed-client", "shell", json!({})),
+        None,
+    ));
+    assert!(subscription.drain().await.is_err());
+}
+
+#[tokio::test]
 async fn lag_invalidates_active_cards_and_recovers_for_fresh_calls() {
     let (sender, receiver) = broadcast::channel(2);
     let (client, mut messages) = AcpClientHandle::channel();
-    let task = tokio::spawn(forward(receiver, "lag".into(), move |update| {
-        client
-            .notify_session(SessionNotification::new(
-                "wire-session",
-                update.v1().unwrap(),
-            ))
-            .is_ok()
-    }));
+    let (_drains, commands) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(forward(
+        receiver,
+        "lag".into(),
+        move |update| {
+            client
+                .notify_session(SessionNotification::new(
+                    "wire-session",
+                    update.v1().unwrap(),
+                ))
+                .is_ok()
+        },
+        commands,
+    ));
     let update = Update {
         session: "lag".into(),
         call: "parent:compose:node".into(),
