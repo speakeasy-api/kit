@@ -50,6 +50,10 @@ def log_request(request):
         return
     params = request.get("params", {})
     entry = {"method": request.get("method")}
+    if "id" in request:
+        entry["id"] = request["id"]
+    if "requestId" in params:
+        entry["requestId"] = params["requestId"]
     if "sessionId" in params:
         entry["sessionId"] = params["sessionId"]
     if request.get("method") in ("session/new", "session/fork"):
