@@ -17,7 +17,11 @@ use tokio::sync::broadcast;
 mod tests;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod diff_tests;
 
 const CAPACITY: usize = crate::runlet_progress::MAX_NODES;
@@ -195,14 +199,26 @@ pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: O
         session: request.session_id.0.clone(),
         call: request.call_id.0.clone(),
         start: None,
-        patch: Some(serde_json::json!({
-            "toolCallId": request.call_id.0,
-            "content": [{
-                "type": "diff", "path": path, "oldText": old,
-                "newText": new.unwrap_or_default(),
-                "changes": [{"operation": operation, "path": path, "fileType": "text"}]
-            }]
-        })),
+        patch: Some(Value::Object(Map::from_iter([
+            ("toolCallId".into(), Value::from(request.call_id.0.clone())),
+            (
+                "content".into(),
+                Value::Array(vec![Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("diff")),
+                    ("path".into(), Value::from(path.to_str())),
+                    ("oldText".into(), Value::from(old)),
+                    ("newText".into(), Value::from(new.unwrap_or_default())),
+                    (
+                        "changes".into(),
+                        Value::Array(vec![Value::Object(Map::from_iter([
+                            ("operation".into(), Value::from(operation)),
+                            ("path".into(), Value::from(path.to_str())),
+                            ("fileType".into(), Value::from("text")),
+                        ]))]),
+                    ),
+                ]))]),
+            ),
+        ]))),
         ok: false,
     });
 }
