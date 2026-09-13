@@ -2,7 +2,7 @@
 
 use agentkit_acp::{ContentBlock, PromptCapabilities, TextContent};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 
 use super::ChildError;
 
@@ -89,26 +89,113 @@ impl ChildPrompt {
     }
 }
 
+fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+    Value::Object(Map::from_iter(
+        fields.map(|(key, value)| (key.into(), value)),
+    ))
+}
+
+fn string() -> Value {
+    object([("type", Value::from("string"))])
+}
+
+fn record<const N: usize>(properties: [(&str, Value); N], required: &[&str]) -> Value {
+    object([
+        ("type", Value::from("object")),
+        ("properties", object(properties)),
+        (
+            "required",
+            Value::Array(required.iter().map(|key| Value::from(*key)).collect()),
+        ),
+    ])
+}
+
+fn kind(name: &str) -> Value {
+    object([("const", Value::from(name))])
+}
+
 pub(crate) fn schema() -> Value {
-    json!({
-        "description": "Text or an ordered array of ACP content blocks. Resource links are forwarded without reading files. Images require the child's image capability; embedded resources require embeddedContext.",
-        "oneOf": [
-            {"type": "string"},
-            {"type": "array", "minItems": 1, "items": {"oneOf": [
-                {"type": "object", "properties": {"type": {"const": "text"}, "text": {"type": "string"}}, "required": ["type", "text"]},
-                {"type": "object", "properties": {"type": {"const": "resource_link"}, "uri": {"type": "string"}, "name": {"type": "string"}, "mimeType": {"type": "string"}, "description": {"type": "string"}}, "required": ["type", "uri", "name"]},
-                {"type": "object", "properties": {"type": {"const": "resource"}, "resource": {"oneOf": [
-                    {"type": "object", "properties": {"uri": {"type": "string"}, "mimeType": {"type": "string"}, "text": {"type": "string"}}, "required": ["uri", "text"]},
-                    {"type": "object", "properties": {"uri": {"type": "string"}, "mimeType": {"type": "string"}, "blob": {"type": "string"}}, "required": ["uri", "blob"]}
-                ]}}, "required": ["type", "resource"]},
-                {"type": "object", "properties": {"type": {"const": "image"}, "data": {"type": "string"}, "mimeType": {"type": "string"}, "uri": {"type": "string"}}, "required": ["type", "data", "mimeType"]}
-            ]}}
-        ]
-    })
+    let blocks = vec![
+        record(
+            [("type", kind("text")), ("text", string())],
+            &["type", "text"],
+        ),
+        record(
+            [
+                ("type", kind("resource_link")),
+                ("uri", string()),
+                ("name", string()),
+                ("mimeType", string()),
+                ("description", string()),
+            ],
+            &["type", "uri", "name"],
+        ),
+        record(
+            [
+                ("type", kind("resource")),
+                (
+                    "resource",
+                    object([(
+                        "oneOf",
+                        Value::Array(vec![
+                            record(
+                                [
+                                    ("uri", string()),
+                                    ("mimeType", string()),
+                                    ("text", string()),
+                                ],
+                                &["uri", "text"],
+                            ),
+                            record(
+                                [
+                                    ("uri", string()),
+                                    ("mimeType", string()),
+                                    ("blob", string()),
+                                ],
+                                &["uri", "blob"],
+                            ),
+                        ]),
+                    )]),
+                ),
+            ],
+            &["type", "resource"],
+        ),
+        record(
+            [
+                ("type", kind("image")),
+                ("data", string()),
+                ("mimeType", string()),
+                ("uri", string()),
+            ],
+            &["type", "data", "mimeType"],
+        ),
+    ];
+    object([
+        (
+            "description",
+            Value::from(
+                "Text or an ordered array of ACP content blocks. Resource links are forwarded without reading files. Images require the child's image capability; embedded resources require embeddedContext.",
+            ),
+        ),
+        (
+            "oneOf",
+            Value::Array(vec![
+                string(),
+                object([
+                    ("type", Value::from("array")),
+                    ("minItems", Value::from(1)),
+                    ("items", object([("oneOf", Value::Array(blocks))])),
+                ]),
+            ]),
+        ),
+    ])
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
