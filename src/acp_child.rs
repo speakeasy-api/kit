@@ -1741,6 +1741,11 @@ async fn run(
             let status = status.map_err(|error| context.error("process status failure", error))?;
             let _ = closed.send(true);
             if !startup_complete.load(Ordering::Acquire) && !status.success() {
+                // A child can flush auth_required and exit before its response
+                // continuation runs. Give already-buffered protocol work a bounded
+                // drain so ready can publish the actionable diagnostic first.
+                // This never waits indefinitely on a descendant holding stdout.
+                let _ = tokio::time::timeout(PRE_HANDSHAKE_EXIT_SETTLE, &mut connected).await;
                 return Err(pre_handshake_exit(&context, status));
             }
             connected.await
