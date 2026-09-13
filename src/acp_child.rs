@@ -1264,6 +1264,9 @@ async fn run(
                         id: route.owner.clone(),
                         used: usage.used,
                         size: usage.size,
+                        cost: usage.cost.as_ref().map(|cost| {
+                            agent_client_protocol::schema::v2::Cost::new(cost.amount, cost.currency.clone())
+                        }),
                     });
                 }
                 if let Ok(mut output) = route.output.lock() {

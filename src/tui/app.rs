@@ -131,7 +131,11 @@ pub enum Update {
     /// Full session configuration snapshot.
     ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
     /// Context window accounting.
-    Usage { used: u64, size: u64 },
+    Usage {
+        used: u64,
+        size: u64,
+        cost: Option<agent_client_protocol::schema::v2::Cost>,
+    },
     /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
     State(StateUpdate),
     /// A nested tool call started or finished inside a compose run.
@@ -140,6 +144,13 @@ pub enum Update {
     Log(String),
     /// The ACP process exited while work could still be active.
     ProcessExited(String),
+}
+
+fn valid_cost(cost: &agent_client_protocol::schema::v2::Cost) -> bool {
+    cost.amount.is_finite()
+        && cost.amount >= 0.0
+        && cost.currency.len() == 3
+        && cost.currency.bytes().all(|byte| byte.is_ascii_uppercase())
 }
 
 /// Latest provider-reported occupancy of the main model's context window.
@@ -692,7 +703,7 @@ enum MessageRole {
     Thought,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,
@@ -709,6 +720,7 @@ pub struct AgentRow {
     pub generation_started_at_unix_ms: u64,
     pub generation_finished_at_unix_ms: Option<u64>,
     pub usage: Option<ContextUsage>,
+    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
     pub activity: AgentActivity,
 }
 
@@ -773,7 +785,7 @@ impl AgentRow {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentTreeRow<'a> {
     pub row: &'a AgentRow,
     pub depth: usize,
@@ -856,6 +868,7 @@ pub struct App {
     latest_agent_source: String,
     pub compacting: bool,
     pub usage: Option<ContextUsage>,
+    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
     pub logs: Vec<String>,
     pub show_logs: bool,
     /// Shared child storage outlives individual sessions.
@@ -865,6 +878,8 @@ pub struct App {
     agents_visible: bool,
     agents_auto_opened: bool,
     agents: HashMap<String, AgentRow>,
+    /// Latest cumulative report per child session, retained after roster removal.
+    agent_costs: HashMap<String, agent_client_protocol::schema::v2::Cost>,
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
     cleaned_agent_ids: HashSet<String>,
@@ -1109,6 +1124,7 @@ impl App {
             latest_agent_source: String::new(),
             compacting: false,
             usage: None,
+            cost: None,
             logs: Vec::new(),
             show_logs: false,
             storage_pending: false,
@@ -1117,6 +1133,7 @@ impl App {
             agents_visible: false,
             agents_auto_opened: false,
             agents: HashMap::new(),
+            agent_costs: HashMap::new(),
             agent_versions: HashMap::new(),
             cleaned_agent_ids: HashSet::new(),
             cleaned_agent_ancestors: HashSet::new(),
@@ -1549,6 +1566,15 @@ impl App {
             );
         }
         rows
+    }
+
+    /// Reported child costs only: unknown costs are not counted as zero.
+    pub fn subagent_cost_totals(&self) -> std::collections::BTreeMap<String, f64> {
+        let mut totals = std::collections::BTreeMap::new();
+        for cost in self.agent_costs.values() {
+            *totals.entry(cost.currency.clone()).or_default() += cost.amount;
+        }
+        totals
     }
 
     /// Harness marks only earn their column when the roster mixes vendors.
@@ -2210,7 +2236,10 @@ impl App {
                     self.reclassify_dynamic(index);
                 }
             }
-            Update::Usage { used, size } => {
+            Update::Usage { used, size, cost } => {
+                if let Some(cost) = cost.filter(valid_cost) {
+                    self.cost = Some(cost);
+                }
                 self.usage = Some(ContextUsage { used, size });
             }
             Update::Runtime(event) => self.apply_runtime(event),
@@ -2255,6 +2284,7 @@ impl App {
     }
 
     fn disable_runtime(&mut self) {
+        // Cost reports remain valid historical observations after transport loss.
         self.agents.clear();
         self.invalidate_runtime_status();
     }
@@ -2424,7 +2454,7 @@ impl App {
                     self.agents.insert(
                         id.clone(),
                         AgentRow {
-                            id,
+                            id: id.clone(),
                             name,
                             status,
                             outcome,
@@ -2439,6 +2469,7 @@ impl App {
                             generation_started_at_unix_ms,
                             generation_finished_at_unix_ms,
                             usage,
+                            cost: self.agent_costs.get(&id).cloned(),
                             activity,
                         },
                     );
@@ -2458,7 +2489,18 @@ impl App {
                 }
                 return;
             }
-            RuntimeEvent::SubagentUsage { id, used, size } => {
+            RuntimeEvent::SubagentUsage {
+                id,
+                used,
+                size,
+                cost,
+            } => {
+                if let Some(cost) = cost.filter(valid_cost) {
+                    self.agent_costs.insert(id.clone(), cost.clone());
+                    if let Some(row) = self.agents.get_mut(&id) {
+                        row.cost = Some(cost);
+                    }
+                }
                 if let Some(row) = self.agents.get_mut(&id) {
                     row.usage = Some(ContextUsage { used, size });
                 }
@@ -2653,6 +2695,8 @@ impl App {
         self.follow = true;
         self.focused_call_id = None;
         self.agents_auto_opened = false;
+        self.cost = None;
+        self.agent_costs.clear();
         self.agents.clear();
         self.agent_versions.clear();
         self.cleaned_agent_ids.clear();
@@ -8159,6 +8203,135 @@ mod tests {
     }
 
     #[test]
+    fn session_cost_reports_replace_totals_and_reset_with_session() {
+        use agent_client_protocol::schema::v2::Cost;
+        let mut app = app();
+        assert!(app.cost.is_none());
+        for amount in [0.0, 1.25, 1.25, 2.0] {
+            app.apply(Update::Usage {
+                used: 1,
+                size: 2,
+                cost: Some(Cost::new(amount, "USD")),
+            });
+            assert_eq!(app.cost.as_ref().unwrap().amount, amount);
+        }
+        for cost in [
+            None,
+            Some(Cost::new(f64::NAN, "USD")),
+            Some(Cost::new(-1.0, "USD")),
+            Some(Cost::new(3.0, "bad")),
+        ] {
+            app.apply(Update::Usage {
+                used: 2,
+                size: 3,
+                cost,
+            });
+            assert_eq!(app.cost.as_ref().unwrap().amount, 2.0);
+        }
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: false,
+        }));
+        assert_eq!(app.cost.as_ref().unwrap().amount, 2.0);
+        app.start_session("replacement".into());
+        assert!(app.cost.is_none());
+    }
+
+    #[test]
+    fn subagent_cost_totals_include_nested_and_removed_sessions_by_currency() {
+        use crate::events::SubagentStatus;
+        use agent_client_protocol::schema::v2::Cost;
+        let mut app = app();
+        assert!(app.subagent_cost_totals().is_empty());
+        for (id, parent) in [
+            ("scout", None),
+            ("nested", Some(("scout", "Scout"))),
+            ("euro", None),
+        ] {
+            app.apply_runtime_at(
+                agent_event(
+                    id,
+                    id,
+                    SubagentStatus::Working,
+                    None,
+                    1,
+                    parent,
+                    (1, 2, None),
+                ),
+                10,
+            );
+        }
+        for (id, amount, currency) in [
+            ("scout", 1.0, "USD"),
+            ("scout", 1.0, "USD"),
+            ("scout", 1.5, "USD"),
+            ("nested", 0.5, "USD"),
+            ("euro", 0.0, "EUR"),
+        ] {
+            app.apply_runtime_at(
+                RuntimeEvent::SubagentUsage {
+                    id: id.into(),
+                    used: 1,
+                    size: 2,
+                    cost: Some(Cost::new(amount, currency)),
+                },
+                11,
+            );
+        }
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 2,
+                size: 3,
+                cost: None,
+            },
+            12,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 2, Some(12)),
+            ),
+            12,
+        );
+        assert_eq!(app.agents["scout"].cost.as_ref().unwrap().amount, 1.5);
+        let totals = app.subagent_cost_totals();
+        assert_eq!(totals["USD"], 2.0);
+        assert_eq!(totals["EUR"], 0.0);
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "scout".into(),
+            },
+            13,
+        );
+        assert!(!app.agents.contains_key("nested"));
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Removed,
+                None,
+                2,
+                None,
+                (1, 2, Some(14)),
+            ),
+            14,
+        );
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: false,
+        }));
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.start_session("replacement".into());
+        assert!(app.subagent_cost_totals().is_empty());
+    }
+
+    #[test]
     fn subagent_usage_tracks_known_rows_and_survives_lifecycle_updates() {
         use crate::events::{HarnessVendor, SubagentStatus};
         let mut app = app();
@@ -8167,6 +8340,7 @@ mod tests {
                 id: "scout".into(),
                 used: 1,
                 size: 2,
+                cost: None,
             },
             10,
         );
@@ -8189,6 +8363,7 @@ mod tests {
                 id: "scout".into(),
                 used: 40_000,
                 size: 200_000,
+                cost: None,
             },
             11,
         );

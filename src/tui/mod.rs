@@ -3521,6 +3521,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
             size: usage.size,
+            cost: usage.cost,
         }],
         SessionUpdate::StateUpdate(state) => vec![Update::State(state)],
         _ => Vec::new(),
@@ -4661,6 +4662,20 @@ mod tests {
             };
             assert_eq!(status.code(), Some(code));
         }
+    }
+
+    #[test]
+    fn translates_cumulative_session_cost() {
+        use agent_client_protocol::schema::v2::{Cost, UsageUpdate};
+        let cost = Cost::new(1.25, "USD");
+        let (session, updates) = translate(UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::UsageUpdate(UsageUpdate::new(1, 2).cost(cost.clone())),
+        ));
+        assert_eq!(session, "session");
+        assert!(
+            matches!(updates.as_slice(), [Update::Usage { used: 1, size: 2, cost: Some(actual) }] if actual == &cost)
+        );
     }
 
     #[test]

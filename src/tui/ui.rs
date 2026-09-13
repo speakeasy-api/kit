@@ -758,6 +758,19 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     }
 }
 
+fn cost_label(amount: f64, currency: &str) -> String {
+    let prefix = if currency == "USD" {
+        "$".to_owned()
+    } else {
+        format!("{currency} ")
+    };
+    if amount > 0.0 && amount < 0.0001 {
+        format!("{prefix}<0.0001")
+    } else {
+        format!("{prefix}{amount:.4}")
+    }
+}
+
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let root = app.root.file_name().map_or_else(
         || app.root.display().to_string(),
@@ -787,6 +800,9 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             theme::dim(),
         ));
+    }
+    if let Some(cost) = &app.cost {
+        fields.push((4, cost_label(cost.amount, &cost.currency), theme::dim()));
     }
     fields.push((
         5,
@@ -1928,6 +1944,9 @@ fn agent_lines(
             compact(usage.size)
         );
     }
+    if let Some(cost) = &row.cost {
+        tail = format!("{} · {tail}", cost_label(cost.amount, &cost.currency));
+    }
     let second_prefix = truncate_to_width(&second_prefix, width);
     let prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
     let excerpt = row
@@ -1981,6 +2000,14 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if inner.height > 0 {
         let counts = app.agent_counts();
         let mut parts = vec![format!("{} agents", counts.total)];
+        let costs = app
+            .subagent_cost_totals()
+            .into_iter()
+            .map(|(currency, amount)| cost_label(amount, &currency))
+            .collect::<Vec<_>>();
+        if !costs.is_empty() {
+            parts.push(costs.join(" + "));
+        }
         if counts.starting > 0 {
             parts.push(format!("{} starting", counts.starting));
         }
@@ -2494,6 +2521,7 @@ mod tests {
             generation_started_at_unix_ms: 2_000,
             generation_finished_at_unix_ms: None,
             usage: None,
+            cost: None,
             activity: Default::default(),
         }
     }
@@ -3078,6 +3106,31 @@ mod tests {
                     && cell.bg == ratatui::style::Color::Rgb(0, 0, 0)
             })
         })
+    }
+
+    #[test]
+    fn agents_panel_shows_accumulated_reported_cost_by_currency() {
+        let mut app = panel_app(3);
+        for (id, amount, currency) in [
+            ("agent-0", 1.25, "USD"),
+            ("agent-0", 1.25, "USD"),
+            ("agent-1", 0.5, "USD"),
+            ("agent-2", 2.0, "EUR"),
+        ] {
+            app.apply(Update::Runtime(RuntimeEvent::SubagentUsage {
+                id: id.into(),
+                used: 1,
+                size: 2,
+                cost: Some(agent_client_protocol::schema::v2::Cost::new(
+                    amount, currency,
+                )),
+            }));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 9)).expect("terminal");
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        assert!(buffer_row(terminal.backend().buffer(), 7).contains("EUR 2.0000 + $1.7500"));
     }
 
     #[test]
@@ -4773,11 +4826,58 @@ mod tests {
     }
 
     #[test]
+    fn session_cost_is_shown_in_header_only_when_reported() {
+        use agent_client_protocol::schema::v2::Cost;
+        let mut app = sample();
+        assert!(
+            !render(&mut app, 160, 24)
+                .lines()
+                .next()
+                .unwrap()
+                .contains('$')
+        );
+        app.apply(Update::Usage {
+            used: 1,
+            size: 2,
+            cost: Some(Cost::new(0.0, "USD")),
+        });
+        assert!(
+            render(&mut app, 160, 24)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("$0.0000")
+        );
+        app.apply(Update::Usage {
+            used: 1,
+            size: 2,
+            cost: Some(Cost::new(1.2345, "EUR")),
+        });
+        assert!(
+            render(&mut app, 160, 24)
+                .lines()
+                .next()
+                .unwrap()
+                .contains("EUR 1.2345")
+        );
+        assert_eq!(super::cost_label(0.000001, "USD"), "$<0.0001");
+    }
+
+    #[test]
+    fn agent_rows_show_reported_cost() {
+        let mut row = test_agent("Scout", SubagentStatus::Working, None, None, "Explore");
+        row.cost = Some(agent_client_protocol::schema::v2::Cost::new(0.125, "USD"));
+        let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
+        assert!(line_text(&lines[2]).contains("$0.1250"));
+    }
+
+    #[test]
     fn shows_reported_context_usage_in_the_header() {
         let mut app = sample();
         app.apply(Update::Usage {
             used: 1_360,
             size: 272_000,
+            cost: None,
         });
         app.session_id = Some("s-1770000000000-12345-0".into());
 
