@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 use tokio::{io::AsyncReadExt, process::Command};
 
 use crate::process_tree::{isolate_tokio_process_tree, terminate_tokio_process_tree};
+use crate::protocols::acp::tool_projection::terminal::{Output, Terminal};
 
 const MAX_INTERNAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
@@ -113,11 +114,11 @@ impl Tool for ShellTool {
 
     async fn invoke(
         &self,
-        request: ToolRequest,
+        mut request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let cancellation = context.cancellation.clone();
-        let input: ShellInput = serde_json::from_value(request.input)
+        let input: ShellInput = serde_json::from_value(std::mem::take(&mut request.input))
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         if input.command.is_empty() || !(1..=3600).contains(&input.timeout_seconds) {
             return Err(ToolError::InvalidInput(
@@ -146,8 +147,9 @@ impl Tool for ShellTool {
             .stderr
             .take()
             .ok_or_else(|| ToolError::Internal("shell stderr was not piped".into()))?;
-        let mut stdout_task = tokio::spawn(read_output(stdout));
-        let mut stderr_task = tokio::spawn(read_output(stderr));
+        let terminal = Terminal::start(&request, &input.command, &self.root);
+        let mut stdout_task = tokio::spawn(read_output(stdout, terminal.output()));
+        let mut stderr_task = tokio::spawn(read_output(stderr, terminal.output()));
         let mut stdout_finished = false;
         let mut stderr_finished = false;
         let mut status = None;
@@ -231,6 +233,7 @@ impl Tool for ShellTool {
             stdout.ok_or_else(|| ToolError::Internal("shell stdout was not collected".into()))?;
         let stderr =
             stderr.ok_or_else(|| ToolError::Internal("shell stderr was not collected".into()))?;
+        terminal.finish(status.code());
         let output = Value::Object(Map::from_iter([
             (
                 "exit_code".into(),
@@ -285,7 +288,10 @@ async fn abort_output_task(task: &mut OutputTask, finished: bool) {
     }
 }
 
-async fn read_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<String> {
+async fn read_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    output: Option<Output>,
+) -> std::io::Result<String> {
     let mut content = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -297,6 +303,9 @@ async fn read_output(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::
             return Err(std::io::Error::other(format!(
                 "shell output exceeds {MAX_INTERNAL_OUTPUT_BYTES} bytes"
             )));
+        }
+        if let Some(output) = &output {
+            output.chunk(&buffer[..read]);
         }
         content.extend_from_slice(&buffer[..read]);
     }
@@ -435,7 +444,7 @@ mod tests {
         writer.write_all(&data).await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let captured = read_output(reader).await.unwrap();
+        let captured = read_output(reader, None).await.unwrap();
 
         assert_eq!(captured.as_bytes(), data);
     }
@@ -446,7 +455,7 @@ mod tests {
         writer.write_all(b"small output").await.unwrap();
         writer.shutdown().await.unwrap();
 
-        let captured = read_output(reader).await.unwrap();
+        let captured = read_output(reader, None).await.unwrap();
 
         assert_eq!(captured, "small output");
     }

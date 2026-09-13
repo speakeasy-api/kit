@@ -1,7 +1,8 @@
 //! Best-effort projection at the evaluated hidden-tool invocation boundary.
-//! No source/input/output retention and no execution waits. The compose call
+//! No execution waits or accumulated source/input/output retention. The compose
 //! budget bounds cards per run; the bus and receiver bound queued/active cards.
-use std::{collections::HashSet, path::Path, sync::OnceLock};
+//! Rich-content patches carry bounded payloads only for the lifetime of delivery.
+use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 use agentkit_tools_core::ToolRequest;
 use serde_json::{Map, Value};
@@ -15,6 +16,8 @@ use tokio::sync::broadcast;
     clippy::disallowed_macros
 )]
 mod tests;
+
+pub(crate) mod terminal;
 
 const CAPACITY: usize = crate::runlet_progress::MAX_NODES;
 const MAX_ID: usize = 256;
@@ -167,6 +170,12 @@ impl Update {
             })
     }
 
+    pub(crate) fn v2_only(&self) -> bool {
+        self.patch
+            .as_ref()
+            .is_some_and(|patch| patch.get("sessionUpdate").is_some())
+    }
+
     pub(crate) fn v1(&self) -> Result<agentkit_acp::SessionUpdate, serde_json::Error> {
         if self.start.is_some() {
             serde_json::from_value(self.value()).map(agentkit_acp::SessionUpdate::ToolCall)
@@ -176,8 +185,12 @@ impl Update {
     }
 
     pub(crate) fn v2(&self) -> Result<agentkit_acp::v2::wire::SessionUpdate, serde_json::Error> {
-        serde_json::from_value(self.value())
-            .map(agentkit_acp::v2::wire::SessionUpdate::ToolCallUpdate)
+        if self.v2_only() {
+            serde_json::from_value(self.value())
+        } else {
+            serde_json::from_value(self.value())
+                .map(agentkit_acp::v2::wire::SessionUpdate::ToolCallUpdate)
+        }
     }
 }
 
@@ -229,7 +242,8 @@ async fn forward(
     mut drains: tokio::sync::mpsc::Receiver<Drain>,
 ) {
     use futures_util::future::{Either, select};
-    let mut active = HashSet::new();
+    // The bool tracks whether this card has a live v2 terminal.
+    let mut active = HashMap::new();
     let mut drains_open = true;
     loop {
         let next = if drains_open {
@@ -289,20 +303,24 @@ fn forward_event(
     event: Result<Update, broadcast::error::RecvError>,
     receiver: &mut broadcast::Receiver<Update>,
     session: &str,
-    active: &mut HashSet<String>,
+    active: &mut HashMap<String, bool>,
     send: &impl Fn(Update) -> bool,
 ) -> Result<(), agentkit_acp::AcpRuntimeError> {
     match event {
         Ok(update) if update.session == session => {
             if update.start.is_some() {
-                if active.len() >= CAPACITY || !active.insert(update.call.clone()) {
+                if active.len() >= CAPACITY || active.contains_key(&update.call) {
                     return Ok(());
                 }
-            } else if update.patch.is_some() {
-                if !active.contains(&update.call) {
+                active.insert(update.call.clone(), false);
+            } else if let Some(patch) = &update.patch {
+                let Some(terminal_running) = active.get_mut(&update.call) else {
                     return Ok(());
+                };
+                if patch.get("sessionUpdate").and_then(Value::as_str) == Some("terminal_update") {
+                    *terminal_running = patch.get("exitStatus").is_none();
                 }
-            } else if !active.remove(&update.call) {
+            } else if active.remove(&update.call).is_none() {
                 return Ok(());
             }
             if !send(update) {
@@ -311,7 +329,31 @@ fn forward_event(
         }
         Ok(_) => {}
         Err(error) => {
-            for call in active.drain() {
+            for (call, terminal_running) in active.drain() {
+                // Loss invalidates the stream as well as its card. Do not leave
+                // an editor waiting for a terminal exit frame that was dropped.
+                if terminal_running
+                    && !send(Update {
+                        session: session.into(),
+                        call: call.clone(),
+                        start: None,
+                        patch: Some(Value::Object(Map::from_iter([
+                            ("sessionUpdate".into(), Value::from("terminal_update")),
+                            ("terminalId".into(), Value::from(call.clone())),
+                            ("exitStatus".into(), Value::Object(Map::new())),
+                            (
+                                "_meta".into(),
+                                Value::Object(Map::from_iter([(
+                                    "kit/outputIncomplete".into(),
+                                    Value::from(true),
+                                )])),
+                            ),
+                        ]))),
+                        ok: false,
+                    })
+                {
+                    return Err(delivery_error());
+                }
                 if !send(Update {
                     session: session.into(),
                     call,
