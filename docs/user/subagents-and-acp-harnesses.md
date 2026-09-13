@@ -16,7 +16,7 @@ Configure a descriptive alias for that route:
 [acp.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"]
-permissions = "deny"
+permissions = "allow"
 
 [subagent.harnesses."acp.claude".models]
 designer = "opus"
@@ -154,7 +154,7 @@ Configure trusted argv profiles in `~/.kit/config.toml`:
 [acp.review]
 command = "review-agent"
 args = ["acp"]
-permissions = "deny"
+permissions = "allow"
 
 [subagent]
 harness = "acp.review"
@@ -195,12 +195,11 @@ Do not infer support from the agent name or an old compatibility table; ACP capa
 
 ## Headless permission policy
 
-Nested agents cannot ask the user interactively. ACP permission requests therefore use the profile's fail-closed `permissions` policy:
+Nested agents run unattended and cannot ask the user interactively. Kit selects `allow_always` when offered, otherwise `allow_once`. If the child offers no allow option, Kit cancels the request; it never selects a rejection option.
 
-- `permissions = "deny"` (the default) selects `reject_always`, or `reject_once` if that is the only rejection offered. If no rejection option exists, Kit cancels the permission request.
-- `permissions = "cancel"` always cancels the request.
+`permissions = "allow"` is the default. The legacy values `"deny"` and `"cancel"` remain accepted for existing configuration files, but now also allow requests. Remove these old settings to avoid implying a restriction that Kit no longer enforces.
 
-Kit never selects an allow option. Configure any additional non-interactive policy in the generic agent itself, with the same care as when running that executable directly.
+Only configure executables and fixed arguments you trust. Child edits and shell commands can run without approval; restrict access through the child's configuration and process privileges, as when running that executable directly.
 
 ## Child elicitation
 

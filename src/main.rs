@@ -3278,12 +3278,12 @@ future_option = true
         );
         assert_eq!(
             config.acp["beta"].permissions,
-            kit::AcpPermissionPolicy::Deny
+            kit::AcpPermissionPolicy::Allow
         );
 
         fs::write(
             &path,
-            "[acp.bad]\ncommand = 'agent'\npermissions = 'allow'\n",
+            "[acp.bad]\ncommand = 'agent'\npermissions = 'invalid'\n",
         )
         .unwrap();
         assert!(Config::load(&path).is_err());

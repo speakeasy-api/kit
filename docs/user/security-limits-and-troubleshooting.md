@@ -43,9 +43,9 @@ Confirm current options with `kit serve --help`.
 
 ## Permission requests and their limitations
 
-A generic nested ACP agent runs headlessly, so Kit cannot ask a human to approve a permission request. Its trusted profile uses `permissions = "deny"` by default: Kit selects `reject_always`, falling back to `reject_once`, when the child offers one. If no reject option exists, Kit cancels the request. `permissions = "cancel"` always cancels it. Kit never selects an allow option.
+A nested ACP agent runs unattended. Kit selects `allow_always`, falling back to `allow_once`. If no allow option exists, Kit cancels the request. Profiles default to `permissions = "allow"`; legacy `"deny"` and `"cancel"` values are still accepted but now also allow requests. Child edits and shell commands can therefore run without interactive approval.
 
-This is fail-closed handling of **ACP permission requests only**. It is not a policy engine for filesystem paths, shell commands, network calls, inherited credentials, MCP tools, or A2A. A child that performs an operation without requesting ACP permission remains governed only by its process privileges and its own implementation. Configure ACP profiles only for executables and fixed arguments you trust.
+This behavior applies to **ACP permission requests only**. It is not a policy engine for filesystem paths, shell commands, network calls, inherited credentials, MCP tools, or A2A. A child that performs an operation without requesting ACP permission remains governed only by its process privileges and its own implementation. Configure ACP profiles only for executables and fixed arguments you trust.
 
 Typical symptoms are a nested task that stops at an approval boundary, `nested agent cancelled`, or `nested agent refused the prompt`. Change the task or the child agent's own setup rather than assuming Kit can grant an interactive approval.
 
@@ -118,7 +118,7 @@ Provider context windows, model token limits, child-agent turn limits, remote ra
 
 1. `unknown ACP harness` means the requested `acp.<name>` is not a configured trusted profile. Check local configuration and omit the `harness` override to use the configured default.
 2. `ACP harness spawn failure` means the configured executable could not start; verify it is installed and executable. `ACP harness handshake timeout` or `protocol handshake failure` means it did not complete ACP v1 startup within 30 seconds. Child-controlled startup errors are intentionally replaced with a fixed local diagnostic to avoid leaking secrets.
-3. A cancelled permission request is expected for children that require interactive approval; Kit's headless policy never allows it.
+3. A permission request is cancelled only when the child offers no allow option. Check which options the child provides.
 4. For a depth or live-session limit, inspect retained handles with `subagents({})`, reuse `prompt`, close unneeded children with `close`, or simplify fan-out.
 5. `ACP harness does not support session/fork` means the generic harness did not advertise native fork; transcript fallback exists only for `acp.kit`.
 6. For `stale subagent generation`, use the newest session value. After an unsuccessful dispatched continuation, start a new child because the old session is retired.
