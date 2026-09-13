@@ -275,6 +275,7 @@ impl Tool for EditTool {
                     )));
                 }
                 write_atomic(&path, content.as_bytes())?;
+                crate::protocols::acp::tool_projection::diff(&request, &path, None, Some(&content));
                 "added"
             }
             EditInput::Edit { hunks, .. } => {
@@ -294,10 +295,25 @@ impl Tool for EditTool {
                 if let Some(line) = first_line {
                     crate::protocols::acp::tool_projection::location(&request, &path, line);
                 }
+                crate::protocols::acp::tool_projection::diff(
+                    &request,
+                    &path,
+                    Some(&original),
+                    Some(&content),
+                );
                 "edited"
             }
             EditInput::Delete { .. } => {
+                let original = crate::protocols::acp::tool_projection::deletion_text(&path);
                 fs::remove_file(&path).map_err(io_error)?;
+                if let Some(original) = original {
+                    crate::protocols::acp::tool_projection::diff(
+                        &request,
+                        &path,
+                        Some(&original),
+                        None,
+                    );
+                }
                 "deleted"
             }
         };

@@ -1,5 +1,5 @@
 //! Best-effort projection at the evaluated hidden-tool invocation boundary.
-//! No source/input/output retention and no execution waits. The compose call
+//! No raw source/input/output retention and no execution waits. The compose call
 //! budget bounds cards per run; the bus and receiver bound queued/active cards.
 use std::{collections::HashSet, path::Path, sync::OnceLock};
 
@@ -15,6 +15,14 @@ use tokio::sync::broadcast;
     clippy::disallowed_macros
 )]
 mod tests;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod diff_tests;
 
 const CAPACITY: usize = crate::runlet_progress::MAX_NODES;
 const MAX_ID: usize = 256;
@@ -135,6 +143,81 @@ pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
         patch: Some(Value::Object(Map::from_iter([
             ("toolCallId".into(), Value::from(request.call_id.0.clone())),
             ("locations".into(), locations),
+        ]))),
+        ok: false,
+    });
+}
+
+/// Maximum combined UTF-8 before/after bytes retained per diff. Larger diffs are
+/// omitted, never truncated into a misleading file replacement. JSON escaping
+/// expands this by at most six, in addition to bounded path/identity overhead.
+const MAX_DIFF_TEXT: usize = 16 * 1024;
+
+/// Capture a deletion without making unreadable, binary, or large files fail an
+/// otherwise valid delete. Reads stop at the bound even if the file grows.
+pub(crate) fn deletion_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    if bus().receiver_count() == 0 {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DIFF_TEXT as u64 {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take((MAX_DIFF_TEXT + 1) as u64)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= MAX_DIFF_TEXT).then_some(text)
+}
+
+/// Publish only committed file changes. None denotes an absent file, not empty
+/// text. The patch contains both wire shapes; each protocol's typed decoder
+/// retains only its own fields. No renderable v2 git patch is synthesized.
+pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: Option<&str>) {
+    if bus().receiver_count() == 0
+        || request.session_id.0.len() > MAX_ID
+        || request.call_id.0.len() > MAX_ID
+        || !request.call_id.0.contains(":compose:")
+        || old
+            .map_or(0, str::len)
+            .saturating_add(new.map_or(0, str::len))
+            > MAX_DIFF_TEXT
+        || location_value(path, None).is_none()
+    {
+        return;
+    }
+    let operation = match (old, new) {
+        (None, Some(_)) => "add",
+        (Some(_), None) => "delete",
+        (Some(_), Some(_)) => "modify",
+        (None, None) => return,
+    };
+    let _ = bus().send(Update {
+        session: request.session_id.0.clone(),
+        call: request.call_id.0.clone(),
+        start: None,
+        patch: Some(Value::Object(Map::from_iter([
+            ("toolCallId".into(), Value::from(request.call_id.0.clone())),
+            (
+                "content".into(),
+                Value::Array(vec![Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("diff")),
+                    ("path".into(), Value::from(path.to_str())),
+                    ("oldText".into(), Value::from(old)),
+                    ("newText".into(), Value::from(new.unwrap_or_default())),
+                    (
+                        "changes".into(),
+                        Value::Array(vec![Value::Object(Map::from_iter([
+                            ("operation".into(), Value::from(operation)),
+                            ("path".into(), Value::from(path.to_str())),
+                            ("fileType".into(), Value::from("text")),
+                        ]))]),
+                    ),
+                ]))]),
+            ),
         ]))),
         ok: false,
     });
