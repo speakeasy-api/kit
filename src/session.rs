@@ -1764,7 +1764,15 @@ fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHisto
                     .collect();
             }
         }
-        if items.len() == ancestor.items.len()
+        // Childless legacy migration can materialize a complete ordinary
+        // replacement before redirecting every stale prefix. Preserve that
+        // historical prefix rule only at a childless replacement boundary;
+        // child snapshots and their title seeds cannot manufacture ancestry.
+        let legacy_prefix = matches!(entry, HistoryEntry::Replacement(_))
+            && children.is_empty()
+            && ancestor.children.is_empty();
+        if (items.len() == ancestor.items.len()
+            || legacy_prefix && items.len() >= ancestor.items.len())
             && items.iter().zip(&ancestor.items).all(|(a, b)| *a == b)
             && children.len() == ancestor.children.len()
             && children
@@ -3801,6 +3809,62 @@ mod tests {
             read_records_direct(&local, "abc").unwrap(),
             StoredTranscript::Redirect(_)
         ));
+    }
+
+    #[test]
+    fn childless_migration_resumes_after_only_global_redirect_is_published() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = canonical_workspace(&project_root(root.path()));
+        let global = super::transcript_path(&session_directory(root.path()), "abc");
+        let local = super::transcript_path(&legacy_directory(root.path()), "abc");
+        let scoped = transcript_path(root.path(), "abc");
+        let expected = write_history(
+            &global,
+            PREVIOUS_SCHEMA_VERSION,
+            "abc",
+            &["S", "U", "A", "U2"],
+            Some(workspace.clone()),
+        );
+        write_history(&local, LEGACY_SCHEMA_VERSION, "abc", &["S", "U", "A"], None);
+        fs::create_dir_all(scoped.parent().unwrap()).unwrap();
+        let scoped_lock = SessionLock::acquire(scoped.with_extension("lock"), true).unwrap();
+        establish_scoped_authority(
+            &scoped_lock.filesystem().unwrap(),
+            &scoped,
+            "abc",
+            &workspace,
+            &expected,
+            &[],
+            Some(&expected[..2]),
+        )
+        .unwrap();
+        drop(scoped_lock);
+        let global_lock = SessionLock::acquire(global.with_extension("lock"), true).unwrap();
+        redirect_legacy_transcript(
+            &global_lock.filesystem().unwrap(),
+            &global,
+            &scoped,
+            "abc",
+            &workspace,
+        )
+        .unwrap();
+        drop(global_lock);
+        // Simulate stopping before the local redirect. Both scoped replacements
+        // have different lengths from the stale local transcript's three items.
+        let opened = open(root.path(), "abc", true, false, Vec::new()).unwrap();
+        assert_eq!(opened.transcript, expected);
+        assert!(opened.children.is_empty());
+        drop(opened);
+        assert!(matches!(
+            read_records_direct(&local, "abc").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        assert_eq!(
+            open(root.path(), "abc", true, false, Vec::new())
+                .unwrap()
+                .transcript,
+            expected
+        );
     }
 
     #[test]
