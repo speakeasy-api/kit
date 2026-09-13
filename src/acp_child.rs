@@ -591,6 +591,12 @@ impl ChildOutput {
                 | SessionUpdate::ToolCall(_)
                 | SessionUpdate::ToolCallUpdate(_)
                 | SessionUpdate::Plan(_)
+                | SessionUpdate::UsageUpdate(_)
+                | SessionUpdate::SessionInfoUpdate(_)
+                | SessionUpdate::AvailableCommandsUpdate(_)
+                | SessionUpdate::Notice(_)
+                | SessionUpdate::CompactionUpdate(_)
+                | SessionUpdate::CompactionSummaryChunk(_)
         ) {
             return;
         }
@@ -1049,7 +1055,12 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)).block_task().await?;
+            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
+                .client_capabilities(agentkit_acp::ClientCapabilities::new().session(
+                    agentkit_acp::ClientSessionCapabilities::new().compaction(
+                        agentkit_acp::CompactionCapabilities::default(),
+                    ),
+                ))).block_task().await?;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
             let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone())).block_task().await?;
@@ -2154,6 +2165,91 @@ mod tests {
         assert_eq!(output.updates[1]["sessionUpdate"], "tool_call");
         assert_eq!(output.updates[2]["sessionUpdate"], "plan");
         assert!(!output.updates_truncated);
+    }
+
+    #[test]
+    fn captures_session_updates_without_polluting_answer_text() {
+        let updates = [
+            json!({"sessionUpdate": "usage_update", "used": 42, "size": 100,
+                "cost": {"amount": 0.25, "currency": "USD"}}),
+            json!({"sessionUpdate": "session_info_update", "title": "Child title"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "help", "description": "Show help"}
+            ]}),
+            json!({"sessionUpdate": "notice", "severity": "warning",
+                "title": "Rate limit", "description": "Try later"}),
+            json!({"sessionUpdate": "compaction_update", "compactionId": "compact-1",
+                "status": "in_progress"}),
+            json!({"sessionUpdate": "compaction_summary_chunk", "compactionId": "compact-1",
+                "content": {"type": "text", "text": "Retained context"}}),
+        ];
+        let expected: Vec<Value> = updates
+            .iter()
+            .map(|value| serde_json::to_value(update(value.clone())).unwrap())
+            .collect();
+        let mut output = ChildOutput::default();
+        for value in updates {
+            output.record(update(value));
+        }
+        assert_eq!(output.updates, expected);
+        assert!(output.text.is_empty());
+        assert!(!output.updates_truncated);
+        assert_eq!(output.updates[0]["cost"]["amount"], 0.25);
+        assert_eq!(output.updates[2]["availableCommands"][0]["name"], "help");
+    }
+
+    #[test]
+    fn session_updates_obey_capture_limits_without_hiding_answer() {
+        let mut output = ChildOutput::default();
+        output.record(update(
+            json!({"sessionUpdate": "notice", "severity": "warning",
+            "title": "x".repeat(MAX_CAPTURED_UPDATE_BYTES)}),
+        ));
+        assert!(output.updates.is_empty());
+        assert!(output.updates_truncated);
+        let mut output = ChildOutput::default();
+        for _ in 0..MAX_CAPTURED_UPDATES {
+            output.record(update(
+                json!({"sessionUpdate": "usage_update", "used": 1, "size": 100}),
+            ));
+        }
+        assert!(!output.updates_truncated);
+        output.record(update(
+            json!({"sessionUpdate": "usage_update", "used": 2, "size": 100}),
+        ));
+        assert_eq!(output.updates.len(), MAX_CAPTURED_UPDATES);
+        assert!(output.updates_truncated);
+        output.record(update(json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Final answer"}})));
+        assert_eq!(output.text, "Final answer");
+        assert!(output.updates_truncated);
+        assert_eq!(
+            output.update_bytes,
+            output
+                .updates
+                .iter()
+                .map(|value| serde_json::to_vec(value).unwrap().len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn session_updates_enforce_cumulative_byte_limit() {
+        let notice = || {
+            update(json!({"sessionUpdate": "notice", "severity": "info",
+            "title": "x".repeat(MAX_CAPTURED_UPDATE_BYTES / 2)}))
+        };
+        let mut output = ChildOutput::default();
+        output.record(notice());
+        assert_eq!(output.updates.len(), 1);
+        assert!(!output.updates_truncated);
+        output.record(notice());
+        assert_eq!(output.updates.len(), 1);
+        assert!(output.updates_truncated);
+        assert_eq!(
+            output.update_bytes,
+            serde_json::to_vec(&output.updates[0]).unwrap().len()
+        );
     }
 
     #[test]

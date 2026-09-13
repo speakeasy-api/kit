@@ -124,7 +124,7 @@ Without `output_schema`, `output` is text. A turn that emits selected non-text a
 }
 ```
 
-Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. When an ACP tool update's rendered content is only a JSON copy of its structured `rawOutput`, Kit retains only `rawOutput` in the parent-visible update. Kit does not expose child thoughts, user-message echoes, usage, modes, commands, configuration, or session metadata through this value.
+Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. When an ACP tool update's rendered content is only a JSON copy of its structured `rawOutput`, Kit retains only `rawOutput` in the parent-visible update. Kit also captures usage (including reported cumulative session cost), session info, available commands, notices, compaction lifecycle updates, and compaction summary chunks. These remain separate from the final answer text. Usage values describe context occupancy, not billable token deltas; cumulative costs must not be summed across updates. Kit does not add child costs to parent billing totals. Child thoughts, user-message echoes, modes, and configuration are not exposed through this value. Session titles and context usage also feed the live agent roster independently of these capture limits; thoughts are not forwarded as activity text.
 
 ## Choose the built-in `acp.kit` harness
 

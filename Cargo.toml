@@ -33,7 +33,7 @@ a2a-protocol-client = "=0.11.0"
 a2a-protocol-server = { version = "=0.11.0", default-features = false }
 a2a-protocol-types = "=0.11.0"
 agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork", "unstable_session_inject"] }
-agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices"] }
+agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices", "unstable_session_compaction"] }
 agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server"] }
 agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
 agentkit-adapter-completions = "=0.10.8"
