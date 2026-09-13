@@ -83,9 +83,11 @@ Use `subagents({})` to inspect live direct children. Each row contains `id`, `na
 
 ## Read the agent roster
 
-The terminal client's agent roster lists every live subagent with its status, task, and elapsed time. When a harness reports context usage over ACP, the row also shows the same `percent used/size` readout as the header; Kit's own ACP server always reports it, so nested Kit subagents show usage without configuration. The readout yields to the task text when the panel is narrow.
+The terminal client's agent roster lists every live subagent with its status, current activity, and elapsed time. The activity excerpt uses a running tool's title, otherwise an in-progress plan entry, otherwise the latest session title, otherwise the original prompt. These updates depend on what the harness reports over ACP. When a turn finishes, tool and plan activity clears and the excerpt returns to the session title or prompt. Kit publishes compose `intent` as an ACP tool-title update, which also supplies the main TUI's tool summary.
 
-When every subagent runs on `acp.kit`, rows carry no harness mark. Once the roster mixes harnesses, each row gains a one-cell mark next to its name: `▙` for Kit, `✱` for Claude, `◎` for Codex, `◇` for OpenCode, `◈` for Copilot, `▸` for Cursor, `π` for Pi, `◭` for Antigravity, and `·` when the launch line names none of them. Kit infers the mark from the configured profile's command and arguments, matching whole tokens such as `claude-agent-acp` or `codex-acp`; the `[acp.<name>]` label itself is not consulted.
+When a harness reports context usage over ACP, the row shows the same `percent used/size` readout as the header on a separate line below the activity excerpt. Kit's own ACP server always reports it, so nested Kit subagents show usage without configuration.
+
+When every subagent runs on `acp.kit`, rows carry no harness mark. Once the roster mixes harnesses, each row gains a one-cell mark next to its name: a blue `k` for Kit, `✱` for Claude, `◎` for Codex, `◇` for OpenCode, `◈` for Copilot, `▸` for Cursor, `π` for Pi, `◭` for Antigravity, and `·` when the launch line names none of them. Kit infers the mark from the configured profile's command and arguments, matching whole tokens such as `claude-agent-acp` or `codex-acp`; the `[acp.<name>]` label itself is not consulted.
 
 ## Require structured JSON output with `output_schema`
 

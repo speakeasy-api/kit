@@ -89,8 +89,30 @@ pub enum RuntimeEvent {
     },
     /// A subagent's ACP session reported its context window occupancy.
     SubagentUsage { id: String, used: u64, size: u64 },
+    /// A child ACP update relevant to its roster excerpt.
+    SubagentActivity {
+        id: String,
+        activity: SubagentActivity,
+    },
     /// Every observable strict descendant of an ancestor should be removed.
     SubagentDescendantsRemoved { ancestor_id: String },
+}
+
+/// Partial activity updates preserve omitted fields from earlier notifications.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubagentActivity {
+    Tool {
+        id: String,
+        title: Option<String>,
+        running: Option<bool>,
+    },
+    Plan {
+        entry: Option<String>,
+    },
+    Title {
+        title: Option<String>,
+    },
 }
 
 /// The product behind an ACP harness, inferred from its launch command.
@@ -167,6 +189,7 @@ impl RuntimeEvent {
                 | Self::ChildFinished { .. }
                 | Self::SubagentStateChanged { .. }
                 | Self::SubagentUsage { .. }
+                | Self::SubagentActivity { .. }
                 | Self::SubagentDescendantsRemoved { .. }
         )
     }
@@ -184,6 +207,7 @@ impl RuntimeEvent {
             | Self::CompactionFinished { .. }
             | Self::SubagentStateChanged { .. }
             | Self::SubagentUsage { .. }
+            | Self::SubagentActivity { .. }
             | Self::SubagentDescendantsRemoved { .. } => return None,
         };
         call.rsplit_once(":compose:").map(|(parent, _)| parent)
@@ -398,6 +422,30 @@ mod tests {
             let parsed = parse(&line).expect("nested roster event parses");
             assert_eq!(parsed, event);
             assert!(parsed.forward_from_child());
+        }
+    }
+
+    #[test]
+    fn subagent_activity_round_trips_and_forwards_from_children() {
+        for activity in [
+            super::SubagentActivity::Tool {
+                id: "tool".into(),
+                title: None,
+                running: Some(false),
+            },
+            super::SubagentActivity::Plan {
+                entry: Some("Implement parser".into()),
+            },
+            super::SubagentActivity::Title { title: None },
+        ] {
+            let event = RuntimeEvent::SubagentActivity {
+                id: "scout".into(),
+                activity,
+            };
+            let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+            assert_eq!(parse(&line), Some(event.clone()));
+            assert!(event.forward_from_child());
+            assert_eq!(event.parent_call(), None);
         }
     }
 

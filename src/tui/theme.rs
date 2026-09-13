@@ -172,7 +172,7 @@ pub fn vendor_mark(vendor: HarnessVendor) -> (&'static str, Style) {
 fn vendor_mark_for(vendor: HarnessVendor, color_count: u16) -> (&'static str, Style) {
     let brand = |rgb: Color, ansi: Color| if color_count == u16::MAX { rgb } else { ansi };
     let (glyph, color) = match vendor {
-        HarnessVendor::Kit => ("▙", accent_color()),
+        HarnessVendor::Kit => ("k", brand(Color::Rgb(0x42, 0x85, 0xf4), Color::Blue)),
         HarnessVendor::Claude => ("✱", brand(Color::Rgb(0xd9, 0x7a, 0x57), Color::LightRed)),
         HarnessVendor::Codex => ("◎", text_color()),
         HarnessVendor::OpenCode => ("◇", brand(Color::Rgb(0xf5, 0xa6, 0x23), Color::Yellow)),
@@ -304,6 +304,10 @@ mod tests {
         assert_eq!(
             vendor_mark_for(HarnessVendor::Claude, u16::MAX).1.fg,
             Some(Color::Rgb(0xd9, 0x7a, 0x57))
+        );
+        assert_eq!(
+            vendor_mark_for(HarnessVendor::Kit, 8),
+            ("k", ratatui::style::Style::default().fg(Color::Blue))
         );
         let glyphs: std::collections::HashSet<_> = vendors
             .into_iter()

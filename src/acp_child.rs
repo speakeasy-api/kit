@@ -437,6 +437,46 @@ impl std::fmt::Display for ChildError {
     }
 }
 
+fn roster_activity(update: &SessionUpdate) -> Option<crate::events::SubagentActivity> {
+    use crate::events::SubagentActivity;
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agentkit_acp::{PlanEntryStatus, ToolCallStatus};
+    let running = |status| matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+    match update {
+        SessionUpdate::ToolCall(call) => Some(SubagentActivity::Tool {
+            id: call.tool_call_id.to_string(),
+            title: Some(call.title.clone()),
+            running: Some(running(call.status)),
+        }),
+        SessionUpdate::ToolCallUpdate(call)
+            if call.fields.title.is_some() || call.fields.status.is_some() =>
+        {
+            Some(SubagentActivity::Tool {
+                id: call.tool_call_id.to_string(),
+                title: call.fields.title.clone(),
+                running: call.fields.status.map(running),
+            })
+        }
+        SessionUpdate::Plan(plan) => Some(SubagentActivity::Plan {
+            entry: plan
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.status == PlanEntryStatus::InProgress && !entry.content.trim().is_empty()
+                })
+                .map(|entry| entry.content.clone()),
+        }),
+        SessionUpdate::SessionInfoUpdate(info) => match &info.title {
+            MaybeUndefined::Value(title) => Some(SubagentActivity::Title {
+                title: Some(title.clone()),
+            }),
+            MaybeUndefined::Null => Some(SubagentActivity::Title { title: None }),
+            MaybeUndefined::Undefined => None,
+        },
+        _ => None,
+    }
+}
+
 struct Prompt {
     // The worker, not the waiting caller, owns serialization until settlement.
     serial: tokio::sync::OwnedMutexGuard<()>,
@@ -968,6 +1008,11 @@ async fn run(
                 let Some(route) = route else {
                     return Ok(());
                 };
+                if let Some(activity) = roster_activity(&notification.update) {
+                    crate::events::emit(&crate::events::RuntimeEvent::SubagentActivity {
+                        id: route.owner.clone(), activity,
+                    });
+                }
                 if let SessionUpdate::UsageUpdate(usage) = &notification.update {
                     crate::events::emit(&crate::events::RuntimeEvent::SubagentUsage {
                         id: route.owner.clone(),
@@ -1493,6 +1538,65 @@ mod tests {
 
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn roster_activity_translates_partial_acp_updates() {
+        use crate::events::SubagentActivity as Activity;
+        let patch = update(
+            json!({"sessionUpdate":"tool_call_update", "toolCallId":"a", "status":"completed"}),
+        );
+        assert_eq!(
+            roster_activity(&patch),
+            Some(Activity::Tool {
+                id: "a".into(),
+                title: None,
+                running: Some(false)
+            })
+        );
+        let title = update(
+            json!({"sessionUpdate":"tool_call_update", "toolCallId":"a", "title":"Reading files"}),
+        );
+        assert_eq!(
+            roster_activity(&title),
+            Some(Activity::Tool {
+                id: "a".into(),
+                title: Some("Reading files".into()),
+                running: None
+            })
+        );
+        let plan = update(json!({"sessionUpdate":"plan", "entries":[
+            {"content":"Finished", "priority":"medium", "status":"completed"},
+            {"content":"Implement parser", "priority":"high", "status":"in_progress"}
+        ]}));
+        assert_eq!(
+            roster_activity(&plan),
+            Some(Activity::Plan {
+                entry: Some("Implement parser".into())
+            })
+        );
+        assert_eq!(
+            roster_activity(&update(json!({"sessionUpdate":"plan", "entries":[]}))),
+            Some(Activity::Plan { entry: None })
+        );
+        assert_eq!(
+            roster_activity(&update(
+                json!({"sessionUpdate":"session_info_update", "title":"Session title"})
+            )),
+            Some(Activity::Title {
+                title: Some("Session title".into())
+            })
+        );
+        assert_eq!(
+            roster_activity(&update(
+                json!({"sessionUpdate":"session_info_update", "title":null})
+            )),
+            Some(Activity::Title { title: None })
+        );
+        assert_eq!(
+            roster_activity(&update(json!({"sessionUpdate":"session_info_update"}))),
+            None
+        );
     }
 
     fn admission_test_session() -> (ChildSession, mpsc::Receiver<Request>) {

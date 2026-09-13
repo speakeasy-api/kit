@@ -171,6 +171,25 @@ fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNoti
     )
 }
 
+/// Compose keeps its tool identity in the initial call and publishes presentation
+/// metadata as a title patch, shared by live events and transcript replay.
+pub(super) fn compose_intent(call: &agentkit_core::ToolCallPart) -> Option<&str> {
+    (call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME)
+        .then(|| call.input.get("intent").and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|intent| !intent.is_empty())
+}
+
+fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<SessionUpdate> {
+    Some(SessionUpdate::ToolCallUpdate(
+        agentkit_acp::ToolCallUpdate::new(
+            agentkit_acp::ToolCallId::new(call.id.to_string()),
+            ToolCallUpdateFields::new().title(compose_intent(call)?.to_owned()),
+        ),
+    ))
+}
+
 fn transcript_replay(
     session_id: &agentkit_acp::SessionId,
     transcript: &[Item],
@@ -192,6 +211,11 @@ fn transcript_replay(
             };
             if let Some(update) = update {
                 replay.push(SessionNotification::new(session_id.clone(), update));
+                if let Part::ToolCall(call) = part
+                    && let Some(update) = compose_title_update(call)
+                {
+                    replay.push(SessionNotification::new(session_id.clone(), update));
+                }
             }
         }
     }
@@ -1066,7 +1090,18 @@ impl LoopObserver for ResponseInterruptionNoticeObserver {
             }
             return;
         }
+        let title = match &event.event {
+            AgentEvent::ToolCallRequested(call) => compose_title_update(call),
+            _ => None,
+        };
         self.inner.handle_event(event);
+        if let Some(update) = title
+            && let Err(error) = self
+                .client
+                .notify_session(SessionNotification::new(self.session_id.clone(), update))
+        {
+            tracing::debug!(%error, "failed to queue ACP v1 compose title");
+        }
     }
 }
 
@@ -4525,6 +4560,40 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             ["compact"]
         );
+    }
+
+    #[test]
+    fn compose_title_replay_preserves_identity_and_trims_intent() {
+        let call = agentkit_core::ToolCallPart::new(
+            "call",
+            "compose",
+            json!({"script": "return 1", "intent": "  Checking files  "}),
+        );
+        let replay = transcript_replay(
+            &agentkit_acp::SessionId::new("session"),
+            &[Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+        );
+        assert_eq!(replay.len(), 2);
+        assert!(
+            matches!(&replay[0].update, SessionUpdate::ToolCall(call) if call.title == "compose")
+        );
+        assert!(
+            matches!(&replay[1].update, SessionUpdate::ToolCallUpdate(update)
+            if update.fields.title.as_deref() == Some("Checking files"))
+        );
+    }
+
+    #[test]
+    fn compose_title_ignores_empty_invalid_and_non_compose_intent() {
+        for (name, input) in [
+            ("compose", json!({})),
+            ("compose", json!({"intent": "  "})),
+            ("compose", json!({"intent": 1})),
+            ("shell", json!({"intent": "Checking files"})),
+        ] {
+            let call = agentkit_core::ToolCallPart::new("call", name, input);
+            assert!(compose_title_update(&call).is_none());
+        }
     }
 
     #[test]

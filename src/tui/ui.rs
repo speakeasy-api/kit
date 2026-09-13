@@ -1847,16 +1847,13 @@ fn agent_duration(millis: u64) -> String {
     duration
 }
 
-/// Task text keeps at least this many cells before the usage readout yields.
-const MIN_AGENT_TASK_WIDTH: usize = 8;
-
 fn agent_lines(
     tree_row: &AgentTreeRow<'_>,
     show_vendor: bool,
     tick: usize,
     now_unix_ms: u64,
     width: usize,
-) -> [Line<'static>; 2] {
+) -> [Line<'static>; 3] {
     let row = tree_row.row;
     let failed = row.outcome == Some(GenerationOutcome::Failed)
         && row
@@ -1923,47 +1920,36 @@ fn agent_lines(
 
     let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
     let mut tail = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
-    let tree_prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
     if let Some(usage) = row.usage {
-        let with_usage = format!(
+        tail = format!(
             "{} {}/{} · {tail}",
             percent(usage.used, usage.size),
             compact(usage.used),
             compact(usage.size)
         );
-        let needed = tree_prefix_width
-            + MIN_AGENT_TASK_WIDTH
-            + 1
-            + UnicodeWidthStr::width(with_usage.as_str());
-        if needed <= width {
-            tail = with_usage;
-        }
     }
-    let tail_full_width = UnicodeWidthStr::width(tail.as_str());
-    let tail_width = tail_full_width.min(width);
-    let displayed_tail = if tail_width < tail_full_width {
-        visible_query_tail(&tail, tail_width).to_string()
-    } else {
-        tail
-    };
-    let prefix_width = width.saturating_sub(tail_width);
-    let second = if prefix_width <= tree_prefix_width {
-        Line::from(vec![
-            Span::raw(" ".repeat(prefix_width)),
-            Span::styled(displayed_tail, theme::faint()),
-        ])
-    } else {
-        let task_width = prefix_width - tree_prefix_width - 1;
-        let task = truncate_to_width(&row.task, task_width);
-        let task_padding = task_width.saturating_sub(UnicodeWidthStr::width(task.as_str()));
-        Line::from(vec![
-            Span::styled(second_prefix, theme::faint()),
-            Span::styled(task, theme::dim()),
-            Span::raw(" ".repeat(task_padding + 1)),
-            Span::styled(displayed_tail, theme::faint()),
-        ])
-    };
-    [first, second]
+    let second_prefix = truncate_to_width(&second_prefix, width);
+    let prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
+    let excerpt = row
+        .excerpt()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let second = Line::from(vec![
+        Span::styled(second_prefix.clone(), theme::faint()),
+        Span::styled(
+            truncate_to_width(&excerpt, width.saturating_sub(prefix_width)),
+            theme::dim(),
+        ),
+    ]);
+    let third = Line::from(vec![
+        Span::styled(second_prefix, theme::faint()),
+        Span::styled(
+            truncate_to_width(&tail, width.saturating_sub(prefix_width)),
+            theme::faint(),
+        ),
+    ]);
+    [first, second, third]
 }
 
 fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -1975,7 +1961,7 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(block, area);
 
     let row_area_height = inner.height.saturating_sub(1);
-    let visible_rows = usize::from(row_area_height / 2);
+    let visible_rows = usize::from(row_area_height / 3);
     app.set_agents_viewport(area, visible_rows);
     let now = crate::events::now_millis();
     let show_vendor = !app.agents_all_kit();
@@ -2508,6 +2494,7 @@ mod tests {
             generation_started_at_unix_ms: 2_000,
             generation_finished_at_unix_ms: None,
             usage: None,
+            activity: Default::default(),
         }
     }
 
@@ -2796,7 +2783,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_rows_render_two_lines_ancestry_duration_and_palette() {
+    fn agent_rows_render_three_lines_ancestry_duration_and_palette() {
         let top = test_agent(
             "Scout",
             SubagentStatus::Working,
@@ -2807,9 +2794,8 @@ mod tests {
         let lines = agent_lines(&tree_row(&top, vec![], false, false), false, 0, 74_000, 48);
         assert_eq!(line_text(&lines[0]), "⠋ Scout");
         let second = line_text(&lines[1]);
-        assert_eq!(second, "  Trace ACP lifecycle                     1m 12s");
-        assert_eq!(&second[42..48], "1m 12s");
-        assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
+        assert_eq!(second, "  Trace ACP lifecycle");
+        assert_eq!(line_text(&lines[2]), "  1m 12s");
         assert_eq!(
             lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Cyan)
@@ -2908,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_rows_show_usage_before_duration_and_drop_it_when_narrow() {
+    fn agent_rows_show_usage_below_excerpt() {
         let mut row = test_agent(
             "Scout",
             SubagentStatus::Working,
@@ -2922,11 +2908,12 @@ mod tests {
         });
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
         let second = line_text(&lines[1]);
-        assert_eq!(second, "  Trace ACP lifecycle    20.6% 41k/200k · 1m 12s");
-        assert_eq!(unicode_width::UnicodeWidthStr::width(second.as_str()), 48);
+        assert_eq!(second, "  Trace ACP lifecycle");
+        assert_eq!(line_text(&lines[2]), "  20.6% 41k/200k · 1m 12s");
 
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 30);
-        assert_eq!(line_text(&lines[1]), "  Trace ACP lifecycle   1m 12s");
+        assert_eq!(line_text(&lines[1]), "  Trace ACP lifecycle");
+        assert_eq!(line_text(&lines[2]), "  20.6% 41k/200k · 1m 12s");
     }
 
     #[test]
@@ -2952,7 +2939,7 @@ mod tests {
     #[test]
     fn agents_panel_marks_vendors_only_for_mixed_rosters() {
         let mut app = panel_app(1);
-        let mut terminal = Terminal::new(TestBackend::new(46, 8)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(46, 9)).expect("terminal");
         terminal
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
@@ -2982,11 +2969,11 @@ mod tests {
             .expect("draw succeeds");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer_cells(buffer, 1, 1..10), "⠋ ◎ Fixer");
-        assert_eq!(buffer_cells(buffer, 3, 1..12), "○ ▙ Scout 0");
+        assert_eq!(buffer_cells(buffer, 4, 1..12), "○ k Scout 0");
     }
 
     #[test]
-    fn agent_rows_truncate_unicode_before_reserved_duration() {
+    fn agent_rows_truncate_unicode_excerpt_independently_of_usage() {
         let row = test_agent(
             "Scout",
             SubagentStatus::Working,
@@ -2995,17 +2982,15 @@ mod tests {
             "🦀🦀 lifecycle work",
         );
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 3_500, 12);
-        assert_eq!(line_text(&lines[1]), "  🦀🦀… 1.5s");
+        assert_eq!(line_text(&lines[1]), "  🦀🦀 life…");
+        assert_eq!(line_text(&lines[2]), "  1.5s");
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
             12
         );
 
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 3_500, 4);
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()),
-            4
-        );
+        assert!(unicode_width::UnicodeWidthStr::width(line_text(&lines[1]).as_str()) <= 4);
     }
 
     #[test]
@@ -3098,7 +3083,7 @@ mod tests {
     #[test]
     fn agents_panel_keeps_footer_fixed_while_overflowing_rows_scroll() {
         let mut app = panel_app(5);
-        let mut terminal = Terminal::new(TestBackend::new(46, 8)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(46, 9)).expect("terminal");
         terminal
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
@@ -3106,8 +3091,8 @@ mod tests {
         assert_eq!(buffer_cells(initial, 0, 1..15), " agent roster ");
         assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
         assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
-        assert_eq!(buffer_cells(initial, 3, 1..10), "○ Scout 1");
-        assert_eq!(buffer_cells(initial, 6, 1..18), "5 agents · 5 idle");
+        assert_eq!(buffer_cells(initial, 4, 1..10), "○ Scout 1");
+        assert_eq!(buffer_cells(initial, 7, 1..18), "5 agents · 5 idle");
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -3121,10 +3106,10 @@ mod tests {
             .expect("draw succeeds");
         let scrolled = terminal.backend().buffer();
         assert_eq!(buffer_cells(scrolled, 1, 1..10), "○ Scout 3");
-        assert_eq!(buffer_cells(scrolled, 3, 1..10), "○ Scout 4");
-        assert_eq!(buffer_cells(scrolled, 6, 1..18), "5 agents · 5 idle");
+        assert_eq!(buffer_cells(scrolled, 4, 1..10), "○ Scout 4");
+        assert_eq!(buffer_cells(scrolled, 7, 1..18), "5 agents · 5 idle");
         assert_eq!(
-            buffer_row(scrolled, 7),
+            buffer_row(scrolled, 8),
             "╰────────────────────────────────────────────╯"
         );
     }

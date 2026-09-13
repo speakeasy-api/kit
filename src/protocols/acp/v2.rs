@@ -457,9 +457,28 @@ where
         if let AgentEvent::ContentDelta(delta) = &event.event {
             self.sink.prepare_content_delta(delta);
         }
+        let title = match &event.event {
+            AgentEvent::ToolCallRequested(call) => compose_title_update(call),
+            _ => None,
+        };
         self.inner.handle_event(event);
+        if let Some(update) = title
+            && let Err(error) = self.sink.update(wire::UpdateSessionNotification::new(
+                self.session_id.clone(),
+                update,
+            ))
+        {
+            tracing::debug!(%error, "failed to queue ACP v2 compose title");
+        }
         self.sink.clear_pending_thought();
     }
+}
+
+fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<wire::SessionUpdate> {
+    Some(wire::SessionUpdate::ToolCallUpdate(
+        wire::ToolCallUpdate::new(wire::ToolCallId::new(call.id.to_string()))
+            .title(super::compose_intent(call)?.to_owned()),
+    ))
 }
 
 struct PromptCommand {
@@ -2049,6 +2068,9 @@ fn transcript_replay(
                                 .status(wire::ToolCallStatus::Pending)
                                 .raw_input(call.input.clone()),
                         ));
+                        if let Some(update) = compose_title_update(call) {
+                            replay.push(update);
+                        }
                     }
                 }
             }
@@ -2414,6 +2436,28 @@ pub(crate) fn component(
     clippy::disallowed_macros
 )]
 mod tests {
+    #[test]
+    fn compose_title_replay_preserves_identity_and_trims_intent() {
+        let call = agentkit_core::ToolCallPart::new(
+            "call",
+            "compose",
+            serde_json::json!({"script": "return 1", "intent": "  Checking files  "}),
+        );
+        let replay = transcript_replay(
+            &wire::SessionId::new("session"),
+            &[Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+        );
+        assert_eq!(replay.len(), 2);
+        assert!(
+            matches!(&replay[0].update, wire::SessionUpdate::ToolCallUpdate(call)
+            if call.title.value().map(String::as_str) == Some("compose"))
+        );
+        assert!(
+            matches!(&replay[1].update, wire::SessionUpdate::ToolCallUpdate(call)
+            if call.title.value().map(String::as_str) == Some("Checking files"))
+        );
+    }
+
     use std::{
         collections::VecDeque,
         sync::{atomic::AtomicUsize, mpsc as std_mpsc},
