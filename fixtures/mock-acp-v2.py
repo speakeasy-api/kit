@@ -294,6 +294,12 @@ def inject(request):
     global next_injection
     params = request["params"]
     text = next((block.get("text", "") for block in params["content"] if block.get("type") == "text"), "")
+    if "MOCK_AUTH_INJECT" in text:
+        send({"jsonrpc": "2.0", "id": request["id"], "error": {
+            "code": -32000, "message": "remote-secret-message",
+            "data": {"methodId": "selected-login", "token": "remote-secret-data"},
+        }})
+        return
     if "MOCK_REJECT_INJECT" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "injection rejected"}})
         return
@@ -349,6 +355,7 @@ for line in sys.stdin:
         respond(request["id"], {
             "protocolVersion": int(option("--protocol-version") or "2"),
             "info": {"name": "mock-acp", "version": "2.0.0"},
+            "authMethods": [{"type": "agent", "methodId": "browser-login", "name": "secret-name", "description": "secret-description"}],
             "capabilities": {"session": {
                 "prompt": {name: {} for name in prompt_capability_names if name},
                 **({"inject": {"modes": ["steer"], "steerInStream": ["finish"]}} if supports_steer else {}),

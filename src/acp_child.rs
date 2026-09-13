@@ -1580,11 +1580,12 @@ async fn run(
                             continue;
                         }
                         let connection = connection.clone();
+                        let auth_methods = auth_methods.clone();
                         tasks.spawn(async move {
                             let result = tokio::time::timeout(CANCEL_SETTLE,
                                 protocol::steer(&connection, steer.session_id, steer.content)).await;
                             let result = match result {
-                                Ok(result) => result.map_err(|error| ChildError::Failed(error.to_string())),
+                                Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
                                 Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
                             };
                             let _ = steer.reply.send(result);
@@ -3792,6 +3793,28 @@ for line in sys.stdin:
         });
         steering_test_support::wait_request(&root, "session/prompt").await;
         assert!(base.steer("MOCK_REJECT_INJECT".into()).await.is_err());
+        let auth_error = base
+            .steer("MOCK_AUTH_INJECT".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            "auth_required",
+            "outside Kit",
+            "selected-login",
+            "browser-login",
+        ] {
+            assert!(auth_error.contains(expected), "{auth_error}");
+        }
+        for secret in [
+            "remote-secret-message",
+            "remote-secret-data",
+            "secret-name",
+            "secret-description",
+        ] {
+            assert!(!auth_error.contains(secret), "{auth_error}");
+        }
+
         let receipt = base.steer("change direction".into()).await.unwrap();
         assert_eq!(receipt["messageId"], "injected-1");
         assert!(
@@ -3833,7 +3856,7 @@ for line in sys.stdin:
             .iter()
             .filter(|r| r["method"] == "session/inject")
             .collect();
-        assert_eq!(injections.len(), 2);
+        assert_eq!(injections.len(), 3);
         assert!(injections.iter().all(|r| r["mode"] == "steer"));
         assert!(!requests.iter().any(|r| r["method"] == "session/cancel"));
         assert_eq!(
