@@ -227,7 +227,7 @@ pub(super) fn fork(
     request: v1::ForkSessionRequest,
 ) -> Result<
     (
-        agent_client_protocol::schema::RequestId,
+        v1::RequestId,
         impl Future<Output = Result<v1::ForkSessionResponse, Error>> + Send + 'static,
     ),
     Error,
@@ -299,8 +299,11 @@ mod tests {
             params["clientCapabilities"]["session"]["compaction"],
             json!({})
         );
-        assert!(params["clientCapabilities"].get("fs").is_none());
-        assert!(params["clientCapabilities"].get("terminal").is_none());
+        let caps: v1::ClientCapabilities =
+            serde_json::from_value(params["clientCapabilities"].clone()).unwrap();
+        assert!(!caps.fs.read_text_file);
+        assert!(!caps.fs.write_text_file);
+        assert!(!caps.terminal);
     }
 
     #[test]

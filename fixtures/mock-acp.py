@@ -349,7 +349,7 @@ for line in sys.stdin:
         value = params["value"]
         option_id = params["configId"]
         advertised = next((item for item in config_options(params["sessionId"])
-                           if item["id"] == option_id), None)
+                           if item.get("configId", item.get("id")) == option_id), None)
         valid = advertised is not None and (
             (advertised["type"] == "boolean" and type(value) is bool) or
             (advertised["type"] == "select" and type(value) is str and
