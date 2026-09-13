@@ -91,7 +91,7 @@ fn task_summary(prompt: &str) -> String {
 }
 
 use crate::{
-    acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession},
+    acp_child::{ChildConfig, ChildError, ChildOutput, ChildSession, prompt::ChildPrompt},
     events::{self, GenerationOutcome, SubagentStatus},
     session,
 };
@@ -211,10 +211,16 @@ impl OutputContract {
     }
 }
 
-fn structured_prompt(prompt: String, contract: Option<&OutputContract>) -> String {
-    match contract {
-        Some(contract) => contract.prompt(prompt),
-        None => prompt,
+fn structured_prompt(prompt: ChildPrompt, contract: Option<&OutputContract>) -> ChildPrompt {
+    match (prompt, contract) {
+        (ChildPrompt::Text(text), Some(contract)) => contract.prompt(text).into(),
+        (ChildPrompt::Blocks(mut blocks), Some(contract)) => {
+            blocks.push(agentkit_acp::ContentBlock::Text(
+                agentkit_acp::TextContent::new(contract.prompt(String::new())),
+            ));
+            ChildPrompt::Blocks(blocks)
+        }
+        (prompt, None) => prompt,
     }
 }
 
@@ -255,7 +261,7 @@ struct ForkOperation {
     source_state: Arc<AsyncMutex<State>>,
     source_child: ChildSession,
     id: String,
-    prompt: String,
+    prompt: ChildPrompt,
     name: Option<String>,
     harness: String,
     vendor: events::HarnessVendor,
@@ -342,7 +348,7 @@ impl Subagents {
 
     async fn create(
         &self,
-        prompt: String,
+        prompt: ChildPrompt,
         options: CreateOptions,
         depth: usize,
         cancellation: TurnCancellation,
@@ -377,7 +383,7 @@ impl Subagents {
             State {
                 name: name.unwrap_or_default(),
                 status: SubagentStatus::Starting,
-                task: task_summary(&prompt),
+                task: task_summary(&prompt.summary()),
                 generation: 1,
                 handle_generation: 1,
                 outcome: None,
@@ -480,7 +486,7 @@ impl Subagents {
     async fn prompt(
         &self,
         prior: SubagentValue,
-        prompt: String,
+        prompt: ChildPrompt,
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
@@ -507,7 +513,7 @@ impl Subagents {
             .checked_add(1)
             .ok_or_else(|| ChildError::Failed("subagent generation overflow".into()))?;
         locked.status = SubagentStatus::Working;
-        locked.task = task_summary(&prompt);
+        locked.task = task_summary(&prompt.summary());
         locked.generation = generation;
         locked.outcome = None;
         locked.generation_started_at_unix_ms = events::now_millis();
@@ -574,7 +580,7 @@ impl Subagents {
     async fn fork(
         &self,
         prior: SubagentValue,
-        prompt: String,
+        prompt: ChildPrompt,
         name: Option<String>,
         depth: usize,
         cancellation: TurnCancellation,
@@ -710,7 +716,7 @@ impl Subagents {
             State {
                 name: name.unwrap_or_default(),
                 status: SubagentStatus::Starting,
-                task: task_summary(&prompt),
+                task: task_summary(&prompt.summary()),
                 generation,
                 handle_generation: generation,
                 outcome: None,
@@ -1506,10 +1512,7 @@ fn continuation_schema() -> serde_json::Value {
             "properties".into(),
             Value::Object(Map::from_iter([
                 ("subagent".into(), value_schema()),
-                (
-                    "prompt".into(),
-                    Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
-                ),
+                ("prompt".into(), crate::acp_child::prompt::schema()),
                 (
                     "output_schema".into(),
                     Value::Object(Map::from_iter([(
@@ -1597,10 +1600,7 @@ impl SubagentTool {
             (
                 "properties".into(),
                 Value::Object(Map::from_iter([
-                    (
-                        "prompt".into(),
-                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
-                    ),
+                    ("prompt".into(), crate::acp_child::prompt::schema()),
                     ("name".into(), display_name_schema()),
                     (
                         "harness".into(),
@@ -1710,13 +1710,7 @@ impl ForkTool {
                         "properties".into(),
                         Value::Object(Map::from_iter([
                             ("subagent".into(), value_schema()),
-                            (
-                                "prompt".into(),
-                                Value::Object(Map::from_iter([(
-                                    "type".into(),
-                                    Value::from("string"),
-                                )])),
-                            ),
+                            ("prompt".into(), crate::acp_child::prompt::schema()),
                             ("name".into(), display_name_schema()),
                             (
                                 "output_schema".into(),
@@ -1784,7 +1778,7 @@ impl CloseTool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
-    prompt: String,
+    prompt: ChildPrompt,
     name: Option<String>,
     harness: Option<String>,
     model: Option<String>,
@@ -1796,7 +1790,7 @@ struct Input {
 #[serde(deny_unknown_fields)]
 struct Continuation {
     subagent: SubagentValue,
-    prompt: String,
+    prompt: ChildPrompt,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
@@ -1804,7 +1798,7 @@ struct Continuation {
 #[serde(deny_unknown_fields)]
 struct ForkInput {
     subagent: SubagentValue,
-    prompt: String,
+    prompt: ChildPrompt,
     name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,

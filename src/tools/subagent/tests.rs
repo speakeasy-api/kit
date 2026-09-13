@@ -1898,3 +1898,103 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
     );
 }
+
+#[tokio::test]
+async fn non_text_prompts_survive_create_continue_and_fork() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec!["--prompt-content".into(), "--echo-prompt-content".into()],
+    );
+    let blocks = json!([
+        {"type": "resource_link", "uri": "file:///context.txt", "name": "context", "_meta": {"contextId": "sample"}},
+        {"type": "text", "text": "Inspect the attached context"},
+        {"type": "resource", "resource": {"uri": "file:///context.txt", "text": "embedded context", "mimeType": "text/plain"}},
+        {"type": "resource", "resource": {"uri": "file:///binary", "blob": "YQ=="}},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+    ]);
+    let make_prompt = || serde_json::from_value::<ChildPrompt>(blocks.clone()).unwrap();
+    let created = manager
+        .create(
+            make_prompt(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(created.output.as_str().unwrap()).unwrap(),
+        blocks
+    );
+    let continued = manager
+        .prompt(created, make_prompt(), TurnCancellation::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(continued.output.as_str().unwrap()).unwrap(),
+        blocks
+    );
+    let contract = Arc::new(OutputContract::new(json!(true)).unwrap());
+    let forked = manager
+        .fork(
+            continued.clone(),
+            make_prompt(),
+            None,
+            0,
+            TurnCancellation::default(),
+            Some(Arc::clone(&contract)),
+        )
+        .await
+        .unwrap();
+    let mut expected = blocks.as_array().unwrap().clone();
+    expected.push(json!({"type": "text", "text": contract.prompt(String::new())}));
+    assert_eq!(forked.output, json!(expected));
+    manager
+        .close(&forked.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    manager
+        .close(&continued.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_prompt_content_preserves_continuation_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager_with_generic_harness(root.path(), Vec::new());
+    let created = manager
+        .create(
+            "initial".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let image =
+        serde_json::from_value(json!([{"type": "image", "data": "YQ==", "mimeType": "image/png"}]))
+            .unwrap();
+    let error = manager
+        .prompt(created.clone(), image, TurnCancellation::default(), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("promptCapabilities.image"));
+    let continued = manager
+        .prompt(
+            created,
+            "still usable".into(),
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.output, json!("still usable"));
+    manager
+        .close(&continued.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}

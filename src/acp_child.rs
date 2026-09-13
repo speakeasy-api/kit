@@ -33,6 +33,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::tools::mcp::CredentialStorage;
 
+pub(crate) mod prompt;
+use prompt::ChildPrompt;
+
 const HANDSHAKE: Duration = Duration::from_secs(30);
 const PRE_HANDSHAKE_EXIT_SETTLE: Duration = Duration::from_millis(250);
 const CANCEL_SETTLE: Duration = Duration::from_secs(5);
@@ -487,7 +490,7 @@ struct Prompt {
     session_id: SessionId,
     /// The subagent id that owns this turn, so usage events name the roster row.
     owner: String,
-    text: String,
+    content: Vec<ContentBlock>,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
 }
@@ -862,9 +865,10 @@ impl ChildSession {
     pub async fn prompt(
         &self,
         owner: String,
-        text: String,
+        prompt: ChildPrompt,
         cancellation: TurnCancellation,
     ) -> Result<ChildOutput, ChildError> {
+        let content = prompt.into_blocks(&self.capabilities.prompt_capabilities)?;
         // A one-shot admission race: an available gate may win concurrent
         // cancellation. The request retains cancellation after admission.
         let serial = match select(
@@ -881,7 +885,7 @@ impl ChildSession {
             serial,
             session_id: self.session_id.clone(),
             owner,
-            text,
+            content,
             cancellation: cancellation.clone(),
             reply,
         });
@@ -1270,7 +1274,7 @@ async fn run(
                                 routes.insert(session_id.clone(), Route { owner: prompt.owner, output: Arc::clone(&output) });
                             }
                             let request = connection.send_request(agentkit_acp::PromptRequest::new(
-                                session_id.clone(), vec![ContentBlock::Text(agentkit_acp::TextContent::new(prompt.text))],
+                                session_id.clone(), prompt.content,
                             )).block_task();
                             tokio::pin!(request);
                             // Response-first matches the original biased race.
@@ -1807,7 +1811,7 @@ mod tests {
                 serial,
                 session_id: child.session_id.clone(),
                 owner: "s-test".into(),
-                text: "queued".into(),
+                content: vec![ContentBlock::Text(agentkit_acp::TextContent::new("queued"))],
                 cancellation: controller.handle().checkpoint(),
                 reply,
             }))

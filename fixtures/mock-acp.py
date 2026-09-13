@@ -59,7 +59,7 @@ def log_request(request):
     if request.get("method") in ("session/new", "session/fork"):
         entry["cwd"] = params["cwd"]
     if request.get("method") == "session/prompt":
-        entry["text"] = params["prompt"][0]["text"]
+        entry["text"] = " ".join(block["text"] for block in params["prompt"] if block["type"] == "text")
     with log_lock:
         with open(request_log, "a", encoding="utf-8") as log:
             log.write(json.dumps(entry, separators=(",", ":")) + "\n")
@@ -95,7 +95,7 @@ def fork(request):
 def prompt(request):
     params = request["params"]
     session_id = params["sessionId"]
-    text = params["prompt"][0]["text"]
+    text = " ".join(block["text"] for block in params["prompt"] if block["type"] == "text")
     should_gate = prompt_release is not None and (
         prompt_release_text is None or prompt_release_text == text
     )
@@ -103,6 +103,8 @@ def prompt(request):
         time.sleep(0.01)
     if prompt_release is None:
         time.sleep(0.40)
+    if "--echo-prompt-content" in sys.argv:
+        text = json.dumps(params["prompt"])
     if "MOCK_CWD" in text:
         text = os.getcwd()
     if "MOCK_SELECTED_MODEL" in text:
@@ -202,6 +204,10 @@ for line in sys.stdin:
         respond(request["id"], {
             "protocolVersion": 1,
             "agentCapabilities": {
+                "promptCapabilities": {
+                    "image": "--prompt-content" in sys.argv,
+                    "embeddedContext": "--prompt-content" in sys.argv,
+                },
                 "sessionCapabilities": (
                     {"fork": {}, "close": {}} if supports_fork else {"close": {}}
                 )
