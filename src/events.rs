@@ -32,7 +32,7 @@ pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 ///
 /// `call` is the compose child call id, shaped `<parent>:compose:<operation>`,
 /// so a client can attribute every child to the ACP tool call it belongs to.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     /// Process-wide progress transport lease/reset, not a source execution.
@@ -88,7 +88,13 @@ pub enum RuntimeEvent {
         generation_finished_at_unix_ms: Option<u64>,
     },
     /// A subagent's ACP session reported its context window occupancy.
-    SubagentUsage { id: String, used: u64, size: u64 },
+    SubagentUsage {
+        id: String,
+        used: u64,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<agent_client_protocol::schema::v2::Cost>,
+    },
     /// A child ACP update relevant to its roster excerpt.
     SubagentActivity {
         id: String,
@@ -455,6 +461,7 @@ mod tests {
             id: "s-child".into(),
             used: 12_345,
             size: 200_000,
+            cost: None,
         };
         let json = serde_json::to_value(&usage).unwrap();
         assert_eq!(json["event"], "subagent_usage");
@@ -463,6 +470,20 @@ mod tests {
         assert_eq!(parsed, usage);
         assert!(parsed.forward_from_child());
         assert_eq!(parsed.parent_call(), None);
+    }
+
+    #[test]
+    fn subagent_cost_events_accept_legacy_and_round_trip_current_reports() {
+        let legacy = json!({"event": "subagent_usage", "id": "child", "used": 1, "size": 2});
+        let old: RuntimeEvent = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old).unwrap(), legacy);
+        let mut current = legacy;
+        current["cost"] = json!({"amount": 1.25, "currency": "USD"});
+        let event: RuntimeEvent = serde_json::from_value(current.clone()).unwrap();
+        assert!(event.forward_from_child());
+        assert_eq!(serde_json::to_value(event).unwrap(), current);
+        current["cost"]["amount"] = json!("invalid");
+        assert!(serde_json::from_value::<RuntimeEvent>(current).is_err());
     }
 
     #[test]
