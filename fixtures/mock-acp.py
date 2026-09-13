@@ -205,6 +205,9 @@ def prompt(request):
         for update in updates:
             send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
         text = ""
+    if "--v2" in sys.argv and text == "MOCK_WHOLE_IMAGE":
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "agent_message", "messageId": "answer", "content": [{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}]}}})
+        text = ""
     if "MOCK_REFUSAL" in text:
         respond(request["id"], {"stopReason": "refusal"})
         return

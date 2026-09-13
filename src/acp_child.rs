@@ -757,6 +757,69 @@ impl ChildOutput {
         self.updates.push(value);
     }
 
+    fn record_message(&mut self, update: agent_client_protocol::schema::v2::SessionUpdate) {
+        use agent_client_protocol::schema::{MaybeUndefined, v2};
+        match &update {
+            v2::SessionUpdate::AgentMessage(message) => {
+                if !matches!(message.content, MaybeUndefined::Undefined) {
+                    self.remove_message_content(&message.message_id.to_string());
+                }
+                if let MaybeUndefined::Value(content) = &message.content {
+                    for block in content {
+                        self.capture_message_block(&message.message_id.to_string(), block);
+                    }
+                }
+            }
+            v2::SessionUpdate::AgentMessageChunk(chunk) => {
+                self.capture_message_block(&chunk.message_id.to_string(), &chunk.content);
+            }
+            _ => {}
+        }
+        self.messages.record(update);
+    }
+
+    fn remove_message_content(&mut self, id: &str) {
+        // Only this message's rich chunks are replaced. Other message and tool
+        // updates retain their order and the shared capture budget. Serialization
+        // failure conservatively keeps the old byte charge rather than overfilling.
+        let mut removed_bytes = 0;
+        self.updates.retain(|update| {
+            if update["sessionUpdate"] == "agent_message_chunk"
+                && update["messageId"].as_str() == Some(id)
+            {
+                if let Ok(encoded) = serde_json::to_vec(update) {
+                    removed_bytes += encoded.len();
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.update_bytes = self.update_bytes.saturating_sub(removed_bytes);
+    }
+
+    fn capture_message_block(
+        &mut self,
+        id: &str,
+        block: &agent_client_protocol::schema::v2::ContentBlock,
+    ) {
+        use agent_client_protocol::schema::v2;
+        if matches!(block, v2::ContentBlock::Text(_)) {
+            return;
+        }
+        if self.updates.len() >= MAX_CAPTURED_UPDATES {
+            self.updates_truncated = true;
+            return;
+        }
+        match serde_json::to_value(v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+            block.clone(),
+            id,
+        ))) {
+            Ok(value) => self.capture_value(value),
+            Err(_) => self.updates_truncated = true,
+        }
+    }
+
     fn record(&mut self, update: SessionUpdate) {
         if let SessionUpdate::AgentMessageChunk(chunk) = &update
             && let ContentBlock::Text(text) = &chunk.content
@@ -789,6 +852,14 @@ impl ChildOutput {
         };
         if matches!(update, SessionUpdate::ToolCallUpdate(_)) {
             deduplicate_tool_output(&mut value);
+        }
+        self.capture_value(value);
+    }
+
+    fn capture_value(&mut self, value: Value) {
+        if self.updates.len() >= MAX_CAPTURED_UPDATES {
+            self.updates_truncated = true;
+            return;
         }
         let Ok(encoded) = serde_json::to_vec(&value) else {
             self.updates_truncated = true;
@@ -1294,9 +1365,8 @@ async fn run(
                     route.idle.send_if_modified(|current| current.advance(state));
                     return Ok(());
                 }
-                if let Some(update) = messages::parse(&params["update"])?
-                    && let Ok(mut output) = route.output.lock()
-                    && output.messages.record(update) {
+                if let Some(update) = messages::parse(&params["update"])? {
+                    if let Ok(mut output) = route.output.lock() { output.record_message(update); }
                     return Ok(());
                 }
                 // Reuse normalized configuration identifiers for captured output.
@@ -3523,6 +3593,54 @@ for line in sys.stdin:
         }
     }
 
+    #[test]
+    fn whole_message_rich_output_replaces_clears_and_obeys_shared_budget() {
+        use serde_json::json;
+        let image = |data: &str| json!({"type":"image", "data":data, "mimeType":"image/png"});
+        let whole = |content: Value| json!({"sessionUpdate":"agent_message", "messageId":"a", "content":content});
+        let mut output = ChildOutput::default();
+        let mut send =
+            |update: Value| output.record_message(messages::parse(&update).unwrap().unwrap());
+        send(whole(json!([image("old")])));
+        send(whole(json!([image("new")])));
+        send(json!({"sessionUpdate":"agent_message", "messageId":"a"}));
+        assert_eq!(output.updates.len(), 1);
+        assert_eq!(output.updates[0]["content"]["data"], "new");
+        assert_eq!(output.updates[0]["messageId"], "a");
+        output.record_message(messages::parse(&whole(Value::Null)).unwrap().unwrap());
+        assert!(output.updates.is_empty());
+        assert_eq!(output.update_bytes, 0);
+        output.record_message(
+            messages::parse(&whole(json!([image("again")])))
+                .unwrap()
+                .unwrap(),
+        );
+        output.record_message(messages::parse(&whole(json!([]))).unwrap().unwrap());
+        assert!(output.updates.is_empty());
+        assert_eq!(output.update_bytes, 0);
+        output.record_message(
+            messages::parse(&whole(json!([image(
+                &"x".repeat(MAX_CAPTURED_UPDATE_BYTES)
+            )])))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(output.updates.is_empty());
+        assert!(output.updates_truncated);
+        for _ in 0..MAX_CAPTURED_UPDATES {
+            output.record(SessionUpdate::AgentMessageChunk(
+                agentkit_acp::ContentChunk::new(serde_json::from_value(image("chunk")).unwrap()),
+            ));
+        }
+        output.record_message(
+            messages::parse(&whole(json!([image("over count")])))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(output.updates.len(), MAX_CAPTURED_UPDATES);
+        assert!(output.update_bytes <= MAX_CAPTURED_UPDATE_BYTES);
+    }
+
     #[tokio::test]
     async fn mock_v2_child_waits_for_idle_and_supports_forks() {
         let root = tempfile::tempdir().unwrap();
@@ -3677,6 +3795,23 @@ for line in sys.stdin:
         .await
         .unwrap();
         assert!(base.supports_native_fork());
+        let image_output = base
+            .prompt(
+                "s-test".into(),
+                "MOCK_WHOLE_IMAGE".into(),
+                TurnCancellation::default(),
+            )
+            .await
+            .unwrap();
+        assert!(image_output.text.is_empty());
+        assert!(
+            image_output
+                .updates
+                .iter()
+                .any(|update| update["content"]["type"] == "image"
+                    && update["messageId"] == "answer")
+        );
+
         for (prompt, expected) in [
             ("MOCK_WHOLE", "whole answer"),
             ("MOCK_REPLACE", "replacement tail"),
