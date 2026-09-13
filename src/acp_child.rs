@@ -862,6 +862,16 @@ impl ChildOutput {
         self.capture_value(value);
     }
 
+    /// Preserve the original rich wire content: v1 decoding skips v2 diffs and
+    /// cannot represent agent-owned terminal notifications. The existing shared
+    /// count/byte budget applies before these values can reach a parent result.
+    fn record_tool_value(&mut self, mut value: Value) {
+        if value["sessionUpdate"] == "tool_call_update" {
+            deduplicate_tool_output(&mut value);
+        }
+        self.capture_value(value);
+    }
+
     fn capture_value(&mut self, value: Value) {
         if self.updates.len() >= MAX_CAPTURED_UPDATES {
             self.updates_truncated = true;
@@ -893,7 +903,9 @@ fn deduplicate_tool_output(update: &mut Value) {
     if rendered_text_only(content).is_some_and(|text| {
         serde_json::from_str::<Value>(text).is_ok_and(|value| value == *raw_output)
     }) {
-        object.remove("content");
+        // Keep the explicit replacement: omission would resurrect earlier rich
+        // content when a parent folds these updates into a final snapshot.
+        object.insert("content".into(), Value::Array(Vec::new()));
     }
 }
 
@@ -1401,6 +1413,19 @@ async fn run(
                     if let Ok(mut output) = route.output.lock() { output.record_message(update); }
                     return Ok(());
                 }
+                // Capture rich tool values without round-tripping through the v1
+                // schema, which silently drops v2 diff entries and terminal events.
+                // Build the owned value before locking; recording has no callbacks,
+                // wakeups, or awaits and shares ChildOutput's existing byte budget.
+                let tool_update = matches!(params["update"]["sessionUpdate"].as_str(),
+                    Some("tool_call" | "tool_call_update" | "tool_call_content_chunk"
+                        | "terminal_update" | "terminal_output_chunk"));
+                if tool_update {
+                    let value = params["update"].clone();
+                    if let Ok(mut output) = route.output.lock() {
+                        output.record_tool_value(value);
+                    }
+                }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
                 if !route.owner.is_empty() && let Some(activity) = roster_activity(&notification.update) {
@@ -1418,7 +1443,7 @@ async fn run(
                         }),
                     });
                 }
-                if let Ok(mut output) = route.output.lock() {
+                if !tool_update && let Ok(mut output) = route.output.lock() {
                     output.record(notification.update);
                 }
                 Ok(())
@@ -2825,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_tool_updates_drop_content_that_duplicates_raw_output() {
+    fn captured_tool_updates_clear_content_that_duplicates_raw_output() {
         let raw = json!({"exit_code": 0, "stdout": "done", "stderr": "", "success": true});
         let mut output = ChildOutput::default();
         output.record(update(json!({
@@ -2840,8 +2865,37 @@ mod tests {
         })));
 
         assert_eq!(output.updates.len(), 1);
-        assert!(output.updates[0].get("content").is_none());
+        assert_eq!(output.updates[0]["content"], json!([]));
         assert_eq!(output.updates[0]["rawOutput"]["stdout"], "done");
+    }
+
+    #[test]
+    fn captured_v2_tool_values_keep_explicit_rich_content_replacement() {
+        let mut output = ChildOutput::default();
+        output.record_tool_value(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "a",
+            "content": [{"type": "diff", "changes": [{"operation": "modify", "path": "/file"}]}]
+        }));
+        let raw = json!({"stdout": "done"});
+        output.record_tool_value(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "a",
+            "content": [{"type": "content", "content": {"type": "text", "text": raw.to_string()}}],
+            "rawOutput": raw
+        }));
+        assert_eq!(
+            output.updates[0]["content"][0]["changes"][0]["path"],
+            "/file"
+        );
+        assert_eq!(output.updates[1]["content"], json!([]));
+        assert_eq!(output.updates[1]["rawOutput"], raw);
+        assert_eq!(
+            output.update_bytes,
+            output
+                .updates
+                .iter()
+                .map(|value| serde_json::to_vec(value).unwrap().len())
+                .sum()
+        );
     }
 
     #[test]

@@ -646,6 +646,59 @@ return { output: child.output, updates: child.updates }"#,
 }
 
 #[tokio::test]
+async fn subagent_preserves_v1_and_v2_diff_and_terminal_wire_content() {
+    for v2 in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let mut args = vec![format!(
+            "{}/fixtures/mock-acp.py",
+            env!("CARGO_MANIFEST_DIR")
+        )];
+        if v2 {
+            args.push("--v2".into());
+        }
+        let harnesses = kit::AcpHarnesses::new(BTreeMap::from([(
+            "rich".into(),
+            kit::AcpHarnessProfile {
+                command: "python3".into(),
+                args,
+                permissions: Default::default(),
+            },
+        )]))
+        .unwrap();
+        let runtime =
+            kit::Runtime::with_acp_harnesses(runtime, harnesses, "acp.rich".into()).unwrap();
+        let outcome = execute_compose(
+            &runtime,
+            r#"return subagent({prompt: "MOCK_TOOL_CONTENT"})"#,
+        )
+        .await;
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("child failed: {outcome:?}");
+        };
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("expected JSON");
+        };
+        assert_eq!(value["output"], "tool content done");
+        assert_eq!(value["updates"]["truncated"], false);
+        let items = value["updates"]["items"].as_array().unwrap();
+        assert_eq!(items[0]["rawOutput"], json!({"stdout": "child output"}));
+        let diff = &items[0]["content"][1];
+        assert_eq!(diff["type"], "diff");
+        if v2 {
+            assert_eq!(diff["changes"][0]["path"], "/tmp/child.txt");
+            assert_eq!(items[1]["terminalId"], "terminal-1");
+            assert_eq!(items[2]["content"][0]["terminalId"], "terminal-1");
+            assert_eq!(items[3]["data"], "Y2hpbGQgb3V0cHV0Cg==");
+            assert_eq!(items[4]["exitStatus"]["exitCode"], 0);
+        } else {
+            assert_eq!(diff["oldText"], "old\n");
+            assert_eq!(diff["newText"], "new\n");
+        }
+    }
+}
+
+#[tokio::test]
 async fn compose_dispatches_bundled_docs_search_through_runlet() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = kit::Runtime::new(directory.path(), "gpt-5.4").unwrap();

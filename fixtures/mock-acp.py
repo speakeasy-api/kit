@@ -211,6 +211,28 @@ def prompt(request):
     if "MOCK_REFUSAL" in text:
         respond(request["id"], {"stopReason": "refusal"})
         return
+    if text == "MOCK_TOOL_CONTENT":
+        diff = ({"type": "diff", "changes": [{"operation": "modify", "path": "/tmp/child.txt"}],
+                 "patch": {"format": "git_patch", "text": "-old\n+new\n"}}
+                if "--v2" in sys.argv else
+                {"type": "diff", "path": "/tmp/child.txt", "oldText": "old\n", "newText": "new\n"})
+        raw = {"stdout": "child output"}
+        updates = [
+            {"sessionUpdate": "tool_call_update", "toolCallId": "call-1",
+             "content": [{"type": "content", "content": {"type": "text", "text": json.dumps(raw)}}, diff],
+             "rawOutput": raw},
+        ]
+        if "--v2" in sys.argv:
+            updates += [
+                {"sessionUpdate": "terminal_update", "terminalId": "terminal-1", "command": "echo child output"},
+                {"sessionUpdate": "tool_call_update", "toolCallId": "call-2",
+                 "content": [{"type": "terminal", "terminalId": "terminal-1"}]},
+                {"sessionUpdate": "terminal_output_chunk", "terminalId": "terminal-1", "data": "Y2hpbGQgb3V0cHV0Cg=="},
+                {"sessionUpdate": "terminal_update", "terminalId": "terminal-1", "exitStatus": {"exitCode": 0}},
+            ]
+        for update in updates:
+            send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": update}})
+        text = "tool content done"
     if "MOCK_RICH_OUTPUT" in text:
         updates = [
             {

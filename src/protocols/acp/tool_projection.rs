@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 )]
 mod tests;
 
+pub(crate) mod child;
 pub(crate) mod terminal;
 
 #[cfg(test)]
