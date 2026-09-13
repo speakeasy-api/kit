@@ -4,6 +4,27 @@ Kit can start parent-owned nested agents through the [Agent Client Protocol (ACP
 
 A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
 
+## Prompt content and file context
+
+The `prompt` argument to `subagent`, `prompt`, and `fork` accepts either a string (the existing text-only form) or an ordered array of ACP content blocks:
+
+```text
+child = subagent({
+  prompt: [
+    { type: "text", text: "Review this interface against the requirements." },
+    { type: "resource_link", uri: "file:///project/src/interface.rs", name: "interface.rs", mimeType: "text/x-rust" },
+    { type: "resource", resource: { uri: "file:///project/requirements.txt", mimeType: "text/plain", text: "Keep existing callers compatible." } }
+  ]
+})
+return child.output
+```
+
+- `text` and `resource_link` require no optional child capability. A resource link refers to a URI the child can access; Kit does not read the URI or copy the file automatically. A local file must be accessible to the child in its own filesystem.
+- Embedded `resource` blocks contain a `resource` object with `uri`, optional `mimeType`, and either `text` or base64 `blob`. They require the child's `promptCapabilities.embeddedContext` capability.
+- `image` blocks contain base64 `data`, `mimeType`, and an optional `uri`. They require the child's `promptCapabilities.image` capability. These are ACP blocks, not Kit managed File references; the parent's session-authorized File references are not transferred to the child.
+
+Kit rejects unsupported content rather than silently converting it to text or dropping it. The array must be nonempty. Block order and metadata are preserved. When `output_schema` is set, Kit appends the JSON-output instructions as a separate text block after the supplied blocks. Roster task summaries use only text blocks, not embedded files or image data.
+
 ## Why use another harness from Kit?
 
 Keep Kit as the orchestrator and route only a bounded task to a specialist. The parent can start independent specialists concurrently, give each child explicit context, require structured output, continue a useful session, or fork an alternative. This makes the specialist's result composable with shell commands, edits, tests, MCP calls, and other agents in the same Runlet program.
