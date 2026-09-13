@@ -704,13 +704,17 @@ pub(crate) struct ChildOutput {
 impl ChildOutput {
     fn config_snapshot(&mut self, options: Vec<SessionConfigOption>) {
         // Reserve the newest complete snapshot within the existing update budget.
-        let value = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
+        let Ok(value) = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(
             ConfigOptionUpdate::new(options),
-        ))
-        .expect("ACP config options serialize");
-        let bytes = serde_json::to_vec(&value)
-            .expect("JSON value serializes")
-            .len();
+        )) else {
+            self.updates_truncated = true;
+            return;
+        };
+        let Ok(encoded) = serde_json::to_vec(&value) else {
+            self.updates_truncated = true;
+            return;
+        };
+        let bytes = encoded.len();
         if bytes > MAX_CAPTURED_UPDATE_BYTES {
             self.updates_truncated = true;
             return;
@@ -718,11 +722,17 @@ impl ChildOutput {
         while self.updates.len() >= MAX_CAPTURED_UPDATES
             || self.update_bytes + bytes > MAX_CAPTURED_UPDATE_BYTES
         {
-            let removed = self.updates.pop().expect("nonempty bounded updates");
-            self.update_bytes -= serde_json::to_vec(&removed)
-                .expect("JSON value serializes")
-                .len();
             self.updates_truncated = true;
+            let Some(removed_bytes) = self
+                .updates
+                .last()
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map(|bytes| bytes.len())
+            else {
+                return;
+            };
+            self.updates.pop();
+            self.update_bytes -= removed_bytes;
         }
         self.update_bytes += bytes;
         self.updates.push(value);

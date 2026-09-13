@@ -185,9 +185,9 @@ values depend on the harness. Model selection continues to use the dedicated
 
 Kit applies an explicit model first, then profile options in key order, using the
 updated option list returned after each selection. Native forks inherit the
-child's current configuration; they do not reset it to profile defaults. An
-explicit fork model still overrides the inherited model. Fallback forks start a
-new child and apply the profile again.
+child's current configuration; they do not reset it to profile defaults. A
+model explicitly selected for the source is reapplied to its forks. Fallback
+forks start a new child and apply the profile again.
 
 Returned `updates.items` includes the latest complete `config_option_update`
 snapshot advertised by the child, including changes received between prompts.

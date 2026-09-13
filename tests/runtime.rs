@@ -255,7 +255,7 @@ fn config_options_runtime(
     directory: &std::path::Path,
     config_options: BTreeMap<String, serde_json::Value>,
     advertise: bool,
-) -> kit::Runtime {
+) -> Arc<kit::Runtime> {
     let mut args = vec![
         format!("{}/fixtures/mock-acp.py", env!("CARGO_MANIFEST_DIR")),
         "--models".into(),
@@ -373,9 +373,9 @@ async fn subagent_retains_config_notifications_across_prompt_and_native_fork() {
     );
     let outcome = execute_compose(
         &runtime,
-        r#"child = subagent({ prompt: "MOCK_CONFIG_UPDATE" })
+        r#"child = subagent({ model: "mock/requested", prompt: "MOCK_CONFIG_UPDATE" })
 continued = prompt({ subagent: child, prompt: "MOCK_CONFIG_OPTIONS" })
-branch = fork({ subagent: continued, model: "mock/requested", prompt: "MOCK_CONFIG_OPTIONS" })
+branch = fork({ subagent: continued, prompt: "MOCK_CONFIG_OPTIONS" })
 return { child, continued, branch }"#,
     )
     .await;
@@ -387,7 +387,7 @@ return { child, continued, branch }"#,
     };
     for key in ["child", "continued", "branch"] {
         let expected = json!({
-            "model": if key == "branch" { "mock/requested" } else { "mock/default" },
+            "model": "mock/requested",
             "reasoning_effort": "low", "mode": "plan", "custom_enabled": false,
         });
         assert_eq!(latest_config_values(&value[key]), expected, "{key}");
@@ -407,9 +407,11 @@ async fn subagent_retains_idle_config_notifications_on_next_prompt() {
         BTreeMap::from([("thought_level".into(), json!("high"))]),
         true,
     );
-    let outcome = execute_compose(
-        &runtime,
+    let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
+    let outcome = execute_compose_source(
+        Arc::clone(&source),
         r#"return subagent({ prompt: "MOCK_IDLE_CONFIG_UPDATE" })"#,
+        None,
     )
     .await;
     let ToolExecutionOutcome::Completed(result) = outcome else {
@@ -428,12 +430,13 @@ async fn subagent_retains_idle_config_notifications_on_next_prompt() {
     })
     .await
     .expect("fixture did not send idle config notification");
-    let outcome = execute_compose(
-        &runtime,
+    let outcome = execute_compose_source(
+        source,
         &format!(
             "return prompt({{ subagent: {}, prompt: \"MOCK_CONFIG_OPTIONS\" }})",
             serde_json::to_string(&child).unwrap()
         ),
+        None,
     )
     .await;
     let ToolExecutionOutcome::Completed(result) = outcome else {
@@ -863,6 +866,14 @@ async fn execute_compose_cancelled(
     script: &str,
     cancellation: Option<TurnCancellation>,
 ) -> ToolExecutionOutcome {
+    execute_compose_source(Arc::new(runtime.compose(0)), script, cancellation).await
+}
+
+async fn execute_compose_source(
+    source: Arc<dyn ToolSource>,
+    script: &str,
+    cancellation: Option<TurnCancellation>,
+) -> ToolExecutionOutcome {
     // HOME/session/call-scoped artifacts must not share a spill directory with
     // another parallel invocation that may remove it during cleanup.
     static NEXT_CALL: AtomicUsize = AtomicUsize::new(0);
@@ -870,7 +881,6 @@ async fn execute_compose_cancelled(
         "compose-test-{}",
         NEXT_CALL.fetch_add(1, Ordering::Relaxed)
     ));
-    let source: Arc<dyn ToolSource> = Arc::new(runtime.compose(0));
     let executor = Arc::new(BasicToolExecutor::new([source]));
     let scope = ToolExecutionScope {
         executor,
