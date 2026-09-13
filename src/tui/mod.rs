@@ -3452,11 +3452,6 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 MaybeUndefined::Null => Some(String::new()),
                 MaybeUndefined::Undefined => None,
             };
-            let intent = match &update.raw_input {
-                MaybeUndefined::Value(input) => Some(intent_of(input)),
-                MaybeUndefined::Null => Some(None),
-                MaybeUndefined::Undefined => None,
-            };
             let backgrounded = update
                 .raw_input
                 .value()
@@ -3489,7 +3484,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 output,
                 images,
                 append_output: false,
-                intent,
+                intent: None,
                 backgrounded,
             }]
         }
@@ -3719,15 +3714,6 @@ fn script_of(input: &Value) -> Option<String> {
     input
         .get("script")
         .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn intent_of(input: &Value) -> Option<String> {
-    input
-        .get("intent")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|intent| !intent.is_empty())
         .map(str::to_string)
 }
 
@@ -4782,23 +4768,72 @@ mod tests {
     }
 
     #[test]
-    fn translates_trimmed_compose_intent() {
+    fn compose_title_patches_preserve_identity_and_fallback() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let patches = [
+            (
+                wire::ToolCallUpdate::new("tool")
+                    .title("compose")
+                    .raw_input(json!({"script": "return 1", "intent": "Ignored"})),
+                "Running tools.",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").title("  Checking files  "),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool")
+                    .raw_input(json!({"script": "return 2", "intent": "Still ignored"})),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").status(wire::ToolCallStatus::Completed),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").title("  "),
+                "Running tools.",
+            ),
+        ];
+        for (patch, expected) in patches {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", SessionUpdate::ToolCallUpdate(patch)),
+                "session",
+            ) {
+                app.apply(update);
+            }
+            let Block::Tool(call) = &app.blocks[0] else {
+                panic!("expected tool");
+            };
+            assert!(call.is_compose());
+            assert_eq!(call.display_title(), expected);
+        }
+    }
+
+    #[test]
+    fn translates_acp_title_without_reading_raw_intent() {
         let update = UpdateSessionNotification::new(
             "session",
             SessionUpdate::ToolCallUpdate(
                 wire::ToolCallUpdate::new("tool-1")
-                    .title("compose")
+                    .title("Checking the project.")
                     .raw_input(json!({
                         "script": "return 1",
-                        "intent": "  Check the project.  "
+                        "intent": "Ignored raw intent"
                     })),
             ),
         );
 
         assert!(matches!(
             translate_for_session(update, "session").as_slice(),
-            [Update::ToolPatched { intent: Some(Some(intent)), script: Some(script), .. }]
-                if intent == "Check the project." && script == "return 1"
+            [Update::ToolPatched { title: Some(title), intent: None, script: Some(script), .. }]
+                if title == "Checking the project." && script == "return 1"
         ));
     }
 

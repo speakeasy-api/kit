@@ -1024,6 +1024,7 @@ fn authoritative_progress_loss_invalidates_all_runtime_lifecycle_state() {
             parent_id: Some("parent-agent".into()),
             parent_name: Some("Parent".into()),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: None,
             created_at_unix_ms: 1,
             generation_started_at_unix_ms: 2,

@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::attachment::{
     MaterializedImage, RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment,
 };
-use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
+use crate::events::{GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
@@ -481,7 +481,7 @@ pub struct ToolCall {
     pub output: Vec<String>,
     /// Typed tool-result images sharing the user-image retention and decode budgets.
     pub images: Vec<UserImage>,
-    /// User-facing summary supplied by a compose caller.
+    /// User-facing summary supplied by an ACP title patch.
     pub intent: Option<String>,
     pub expanded: bool,
     /// The selected view for an expanded completed compose call.
@@ -703,10 +703,74 @@ pub struct AgentRow {
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
     pub harness: String,
+    pub vendor: HarnessVendor,
     pub model: Option<String>,
     pub created_at_unix_ms: u64,
     pub generation_started_at_unix_ms: u64,
     pub generation_finished_at_unix_ms: Option<u64>,
+    pub usage: Option<ContextUsage>,
+    pub activity: AgentActivity,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentActivity {
+    tools: Vec<(String, String, bool)>,
+    plan: Option<String>,
+    title: Option<String>,
+}
+
+impl AgentActivity {
+    fn apply(&mut self, activity: crate::events::SubagentActivity) {
+        use crate::events::SubagentActivity;
+        match activity {
+            SubagentActivity::Tool { id, title, running } => {
+                let index = self
+                    .tools
+                    .iter()
+                    .position(|tool| tool.0 == id)
+                    .unwrap_or_else(|| {
+                        self.tools.push((id, String::new(), true));
+                        self.tools.len() - 1
+                    });
+                let tool = &mut self.tools[index];
+                if let Some(title) = title {
+                    tool.1 = title;
+                }
+                if let Some(running) = running {
+                    tool.2 = running;
+                }
+            }
+            SubagentActivity::Plan { entry } => self.plan = entry,
+            SubagentActivity::Title { title } => self.title = title,
+        }
+    }
+
+    fn clear_transient(&mut self) {
+        self.tools.clear();
+        self.plan = None;
+    }
+}
+
+impl AgentRow {
+    pub fn excerpt(&self) -> &str {
+        self.activity
+            .tools
+            .iter()
+            .rev()
+            .find(|tool| tool.2 && !tool.1.trim().is_empty())
+            .map(|tool| tool.1.as_str())
+            .or(self
+                .activity
+                .plan
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()))
+            .or(self
+                .activity
+                .title
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()))
+            .unwrap_or(&self.task)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1485,6 +1549,13 @@ impl App {
         rows
     }
 
+    /// Harness marks only earn their column when the roster mixes vendors.
+    pub fn agents_all_kit(&self) -> bool {
+        self.agents
+            .values()
+            .all(|row| row.vendor == HarnessVendor::Kit)
+    }
+
     pub fn agent_counts(&self) -> AgentCounts {
         self.agents
             .values()
@@ -2091,7 +2162,15 @@ impl App {
                     {
                         call.expanded = true;
                     }
-                    call.title = title;
+                    // ACP title patches describe the current operation, not a new
+                    // tool identity. Keep compose's identity for its specialized view.
+                    if call.is_compose() {
+                        call.intent = (title != agentkit_tool_compose::COMPOSE_TOOL_NAME)
+                            .then(|| title.trim().to_owned())
+                            .filter(|title| !title.is_empty() && title != "Tool");
+                    } else {
+                        call.title = title;
+                    }
                 }
                 if let Some(kind) = kind {
                     call.kind = kind;
@@ -2288,6 +2367,7 @@ impl App {
                 parent_id,
                 parent_name,
                 harness,
+                vendor,
                 model,
                 created_at_unix_ms,
                 generation_started_at_unix_ms,
@@ -2324,6 +2404,17 @@ impl App {
                 {
                     self.agents.remove(&id);
                 } else {
+                    // Usage arrives on its own event stream; a lifecycle
+                    // transition must not blank a reading already shown.
+                    let usage = self.agents.get(&id).and_then(|row| row.usage);
+                    let previous = self.agents.get(&id);
+                    let mut activity = previous.map(|row| row.activity.clone()).unwrap_or_default();
+                    if previous.is_none_or(|row| row.generation != generation)
+                        || matches!(status, SubagentStatus::Idle | SubagentStatus::Removed)
+                    {
+                        activity.clear_transient();
+                    }
+
                     self.agents.insert(
                         id.clone(),
                         AgentRow {
@@ -2336,14 +2427,35 @@ impl App {
                             parent_id,
                             parent_name,
                             harness,
+                            vendor,
                             model,
                             created_at_unix_ms,
                             generation_started_at_unix_ms,
                             generation_finished_at_unix_ms,
+                            usage,
+                            activity,
                         },
                     );
                 }
                 self.clamp_agents_scroll();
+                return;
+            }
+            RuntimeEvent::SubagentActivity { id, activity } => {
+                if let Some(row) = self.agents.get_mut(&id)
+                    && (matches!(activity, crate::events::SubagentActivity::Title { .. })
+                        || matches!(
+                            row.status,
+                            SubagentStatus::Starting | SubagentStatus::Working
+                        ))
+                {
+                    row.activity.apply(activity);
+                }
+                return;
+            }
+            RuntimeEvent::SubagentUsage { id, used, size } => {
+                if let Some(row) = self.agents.get_mut(&id) {
+                    row.usage = Some(ContextUsage { used, size });
+                }
                 return;
             }
             RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
@@ -2597,6 +2709,7 @@ impl App {
                 SubagentStatus::Starting | SubagentStatus::Working
             ) {
                 row.status = SubagentStatus::Removed;
+                row.activity.clear_transient();
                 row.outcome = Some(GenerationOutcome::Failed);
                 row.generation_finished_at_unix_ms
                     .get_or_insert(now_unix_ms);
@@ -7879,11 +7992,239 @@ mod tests {
             parent_id: parent.map(|(id, _)| id.into()),
             parent_name: parent.map(|(_, name)| name.into()),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: Some("test".into()),
             created_at_unix_ms: created,
             generation_started_at_unix_ms: started,
             generation_finished_at_unix_ms: finished,
         }
+    }
+
+    #[test]
+    fn roster_excerpt_prioritizes_activity_and_resets_each_turn() {
+        use crate::events::{SubagentActivity as Activity, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        let apply = |app: &mut App, activity| {
+            app.apply_runtime_at(
+                RuntimeEvent::SubagentActivity {
+                    id: "scout".into(),
+                    activity,
+                },
+                10,
+            )
+        };
+        assert_eq!(app.agents["scout"].excerpt(), "task for scout");
+        apply(
+            &mut app,
+            Activity::Title {
+                title: Some("Session title".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Plan {
+                entry: Some("Implement parser".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Implement parser");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: Some("Reading files".into()),
+                running: Some(true),
+            },
+        );
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: Some("Running tests".into()),
+                running: Some(true),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Running tests");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: None,
+                running: Some(false),
+            },
+        );
+        // A late content-only or title update must not resurrect a completed tool.
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: Some("Tests passed".into()),
+                running: None,
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Reading files");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: None,
+                running: Some(false),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Implement parser");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 2, Some(10)),
+            ),
+            10,
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Plan {
+                entry: Some("Late plan".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                2,
+                None,
+                (1, 12, None),
+            ),
+            12,
+        );
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: Some("New turn".into()),
+                running: Some(true),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "New turn");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                3,
+                None,
+                (1, 14, None),
+            ),
+            14,
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Title {
+                title: Some("  ".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "task for scout");
+    }
+
+    #[test]
+    fn subagent_usage_tracks_known_rows_and_survives_lifecycle_updates() {
+        use crate::events::{HarnessVendor, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 1,
+                size: 2,
+            },
+            10,
+        );
+        assert!(app.agents.is_empty(), "usage for an unknown row is dropped");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        assert!(app.agents_all_kit());
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 40_000,
+                size: 200_000,
+            },
+            11,
+        );
+        assert_eq!(
+            app.agents["scout"].usage,
+            Some(super::ContextUsage {
+                used: 40_000,
+                size: 200_000
+            })
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(crate::events::GenerationOutcome::Success),
+                1,
+                None,
+                (1, 2, Some(9)),
+            ),
+            12,
+        );
+        assert_eq!(
+            app.agents["scout"].usage.map(|usage| usage.used),
+            Some(40_000),
+            "a lifecycle transition keeps the last reading"
+        );
+
+        let mut claude = agent_event(
+            "designer",
+            "Designer",
+            SubagentStatus::Working,
+            None,
+            1,
+            None,
+            (1, 2, None),
+        );
+        if let RuntimeEvent::SubagentStateChanged {
+            vendor, harness, ..
+        } = &mut claude
+        {
+            *vendor = HarnessVendor::Claude;
+            *harness = "acp.claude".into();
+        }
+        app.apply_runtime_at(claude, 13);
+        assert!(!app.agents_all_kit());
+        assert_eq!(app.agents["designer"].vendor, HarnessVendor::Claude);
     }
 
     #[test]
