@@ -1,7 +1,8 @@
 //! Best-effort projection at the evaluated hidden-tool invocation boundary.
-//! No raw source/input/output retention and no execution waits. The compose call
+//! No execution waits or accumulated source/input/output retention. The compose
 //! budget bounds cards per run; the bus and receiver bound queued/active cards.
-use std::{collections::HashSet, path::Path, sync::OnceLock};
+//! Rich-content patches carry bounded payloads only for the lifetime of delivery.
+use std::{collections::HashMap, path::Path, sync::OnceLock};
 
 use agentkit_tools_core::ToolRequest;
 use serde_json::{Map, Value};
@@ -15,6 +16,8 @@ use tokio::sync::broadcast;
     clippy::disallowed_macros
 )]
 mod tests;
+
+pub(crate) mod terminal;
 
 #[cfg(test)]
 #[allow(
@@ -37,9 +40,46 @@ pub(crate) struct Update {
     ok: bool,
 }
 
+fn subscribers() -> usize {
+    bus().receiver_count() + v2_bus().receiver_count()
+}
+
+// Separate ingress queues: v1 must never lag because of v2-only traffic,
+// including when clients of both protocol versions coexist.
+struct Buses {
+    v1: broadcast::Sender<Update>,
+    v2: broadcast::Sender<Update>,
+}
+
+impl Buses {
+    fn new() -> Self {
+        Self {
+            v1: broadcast::channel(CAPACITY).0,
+            v2: broadcast::channel(CAPACITY).0,
+        }
+    }
+
+    fn publish(&self, update: Update) {
+        if !update.v2_only() {
+            let _ = self.v1.send(update.clone());
+        }
+        let _ = self.v2.send(update);
+    }
+}
+
+fn buses() -> &'static Buses {
+    static BUSES: OnceLock<Buses> = OnceLock::new();
+    BUSES.get_or_init(Buses::new)
+}
+
+fn v2_bus() -> &'static broadcast::Sender<Update> {
+    &buses().v2
+}
 fn bus() -> &'static broadcast::Sender<Update> {
-    static BUS: OnceLock<broadcast::Sender<Update>> = OnceLock::new();
-    BUS.get_or_init(|| broadcast::channel(CAPACITY).0)
+    &buses().v1
+}
+fn publish(update: Update) {
+    buses().publish(update);
 }
 
 /// An invocation owns its terminal update, including cancellation/unwind.
@@ -47,7 +87,7 @@ pub(crate) struct Invocation(Update);
 
 impl Invocation {
     pub(crate) fn start(request: &ToolRequest, root: Option<&Path>) -> Option<Self> {
-        if bus().receiver_count() == 0
+        if subscribers() == 0
             || request.session_id.0.len() > MAX_ID
             || request.call_id.0.len() > MAX_ID
         {
@@ -106,7 +146,7 @@ impl Invocation {
             patch: None,
             ok: false,
         };
-        let _ = bus().send(update.clone());
+        publish(update.clone());
         Some(Self(Update {
             start: None,
             ..update
@@ -120,13 +160,13 @@ impl Invocation {
 
 impl Drop for Invocation {
     fn drop(&mut self) {
-        let _ = bus().send(self.0.clone());
+        publish(self.0.clone());
     }
 }
 
 /// Publish a location established by the tool itself, not a guessed source line.
 pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
-    if bus().receiver_count() == 0
+    if subscribers() == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -136,7 +176,7 @@ pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
     let Some(locations) = location_value(path, Some(line)) else {
         return;
     };
-    let _ = bus().send(Update {
+    publish(Update {
         session: request.session_id.0.clone(),
         call: request.call_id.0.clone(),
         start: None,
@@ -157,7 +197,7 @@ const MAX_DIFF_TEXT: usize = 16 * 1024;
 /// otherwise valid delete. Reads stop at the bound even if the file grows.
 pub(crate) fn deletion_text(path: &Path) -> Option<String> {
     use std::io::Read;
-    if bus().receiver_count() == 0 {
+    if subscribers() == 0 {
         return None;
     }
     let metadata = std::fs::symlink_metadata(path).ok()?;
@@ -177,7 +217,7 @@ pub(crate) fn deletion_text(path: &Path) -> Option<String> {
 /// text. The patch contains both wire shapes; each protocol's typed decoder
 /// retains only its own fields. No renderable v2 git patch is synthesized.
 pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: Option<&str>) {
-    if bus().receiver_count() == 0
+    if subscribers() == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -195,7 +235,7 @@ pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: O
         (Some(_), Some(_)) => "modify",
         (None, None) => return,
     };
-    let _ = bus().send(Update {
+    publish(Update {
         session: request.session_id.0.clone(),
         call: request.call_id.0.clone(),
         start: None,
@@ -250,6 +290,12 @@ impl Update {
             })
     }
 
+    pub(crate) fn v2_only(&self) -> bool {
+        self.patch
+            .as_ref()
+            .is_some_and(|patch| patch.get("sessionUpdate").is_some())
+    }
+
     pub(crate) fn v1(&self) -> Result<agentkit_acp::SessionUpdate, serde_json::Error> {
         if self.start.is_some() {
             serde_json::from_value(self.value()).map(agentkit_acp::SessionUpdate::ToolCall)
@@ -259,8 +305,12 @@ impl Update {
     }
 
     pub(crate) fn v2(&self) -> Result<agentkit_acp::v2::wire::SessionUpdate, serde_json::Error> {
-        serde_json::from_value(self.value())
-            .map(agentkit_acp::v2::wire::SessionUpdate::ToolCallUpdate)
+        if self.v2_only() {
+            serde_json::from_value(self.value())
+        } else {
+            serde_json::from_value(self.value())
+                .map(agentkit_acp::v2::wire::SessionUpdate::ToolCallUpdate)
+        }
     }
 }
 
@@ -275,7 +325,21 @@ type Drain = tokio::sync::oneshot::Sender<Result<(), agentkit_acp::AcpRuntimeErr
 
 impl Subscription {
     pub(super) fn start(session: String, send: impl Fn(Update) -> bool + Send + 'static) -> Self {
-        let receiver = bus().subscribe();
+        Self::with_receiver(bus().subscribe(), session, send)
+    }
+
+    pub(super) fn start_v2(
+        session: String,
+        send: impl Fn(Update) -> bool + Send + 'static,
+    ) -> Self {
+        Self::with_receiver(v2_bus().subscribe(), session, send)
+    }
+
+    fn with_receiver(
+        receiver: broadcast::Receiver<Update>,
+        session: String,
+        send: impl Fn(Update) -> bool + Send + 'static,
+    ) -> Self {
         let (drains, commands) = tokio::sync::mpsc::channel(1);
         Self {
             task: tokio::spawn(forward(receiver, session, send, commands)),
@@ -312,7 +376,8 @@ async fn forward(
     mut drains: tokio::sync::mpsc::Receiver<Drain>,
 ) {
     use futures_util::future::{Either, select};
-    let mut active = HashSet::new();
+    let mut active = HashMap::new();
+    let mut budget = terminal::Budget::default();
     let mut drains_open = true;
     loop {
         let next = if drains_open {
@@ -348,7 +413,14 @@ async fn forward(
                             Err(broadcast::error::RecvError::Closed)
                         }
                     };
-                    result = forward_event(event, &mut receiver, &session, &mut active, &send);
+                    result = forward_event(
+                        event,
+                        &mut receiver,
+                        &session,
+                        &mut active,
+                        &mut budget,
+                        &send,
+                    );
                     if result.is_err() {
                         break;
                     }
@@ -360,7 +432,16 @@ async fn forward(
                 }
             }
             Either::Right(event) => {
-                if forward_event(event, &mut receiver, &session, &mut active, &send).is_err() {
+                if forward_event(
+                    event,
+                    &mut receiver,
+                    &session,
+                    &mut active,
+                    &mut budget,
+                    &send,
+                )
+                .is_err()
+                {
                     return;
                 }
             }
@@ -372,20 +453,28 @@ fn forward_event(
     event: Result<Update, broadcast::error::RecvError>,
     receiver: &mut broadcast::Receiver<Update>,
     session: &str,
-    active: &mut HashSet<String>,
+    active: &mut HashMap<String, terminal::State>,
+    budget: &mut terminal::Budget,
     send: &impl Fn(Update) -> bool,
 ) -> Result<(), agentkit_acp::AcpRuntimeError> {
     match event {
-        Ok(update) if update.session == session => {
+        Ok(mut update) if update.session == session => {
             if update.start.is_some() {
-                if active.len() >= CAPACITY || !active.insert(update.call.clone()) {
+                if active.len() >= CAPACITY || active.contains_key(&update.call) {
                     return Ok(());
                 }
-            } else if update.patch.is_some() {
-                if !active.contains(&update.call) {
+                active.insert(update.call.clone(), terminal::State::default());
+            } else if let Some(patch) = &update.patch {
+                let Some(state) = active.get_mut(&update.call) else {
+                    return Ok(());
+                };
+                if patch.get("sessionUpdate").and_then(Value::as_str) == Some("terminal_update") {
+                    state.running = patch.get("exitStatus").is_none();
+                }
+                if !budget.admit(&mut update, state) {
                     return Ok(());
                 }
-            } else if !active.remove(&update.call) {
+            } else if active.remove(&update.call).is_none() {
                 return Ok(());
             }
             if !send(update) {
@@ -394,7 +483,31 @@ fn forward_event(
         }
         Ok(_) => {}
         Err(error) => {
-            for call in active.drain() {
+            for (call, state) in active.drain() {
+                // Loss invalidates the stream as well as its card. Do not leave
+                // an editor waiting for a terminal exit frame that was dropped.
+                if state.running
+                    && !send(Update {
+                        session: session.into(),
+                        call: call.clone(),
+                        start: None,
+                        patch: Some(Value::Object(Map::from_iter([
+                            ("sessionUpdate".into(), Value::from("terminal_update")),
+                            ("terminalId".into(), Value::from(call.clone())),
+                            ("exitStatus".into(), Value::Object(Map::new())),
+                            (
+                                "_meta".into(),
+                                Value::Object(Map::from_iter([(
+                                    "kit/outputIncomplete".into(),
+                                    Value::from(true),
+                                )])),
+                            ),
+                        ]))),
+                        ok: false,
+                    })
+                {
+                    return Err(delivery_error());
+                }
                 if !send(Update {
                     session: session.into(),
                     call,

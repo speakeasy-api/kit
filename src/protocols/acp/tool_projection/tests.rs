@@ -273,3 +273,314 @@ async fn lag_invalidates_active_cards_and_recovers_for_fresh_calls() {
     task.await.unwrap();
     assert!(messages.try_recv().is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_shell_streams_bytes_before_exit_and_drains_terminal_before_call() {
+    use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext, Tool};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let tool = crate::tools::Observed::new(crate::tools::ShellTool::new(root.path().into()));
+    let context = OwnedToolContext {
+        session_id: SessionId::new("real-terminal"),
+        turn_id: TurnId::new("turn"),
+        metadata: MetadataMap::new(),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+        execution_scope: None,
+        approved_request: None,
+    };
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let subscription = Subscription::start_v2("real-terminal".into(), move |update| {
+        send.send(update).is_ok()
+    });
+    let call = request(
+        "real-terminal",
+        "shell",
+        json!({
+            "command": "printf '\\377A'; while [ ! -f release ]; do sleep 0.01; done; printf 'err' >&2; exit 7",
+            "timeout_seconds": 5,
+        }),
+    );
+    let execution = tokio::spawn(async move { tool.invoke(call, &mut context.borrowed()).await });
+    let mut bytes = Vec::new();
+    let mut updates = Vec::new();
+    // Release the actual process only after receiving a streamed byte, rather
+    // than asserting a fragile wall-clock latency or accepting buffered output.
+    while bytes.is_empty() {
+        let update = tokio::time::timeout(std::time::Duration::from_secs(10), receive.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let value = serde_json::to_value(update.v2().unwrap()).unwrap();
+        if value["sessionUpdate"] == "terminal_output_chunk" {
+            bytes.extend(STANDARD.decode(value["data"].as_str().unwrap()).unwrap());
+        }
+        updates.push(update);
+    }
+    assert!(!execution.is_finished());
+    std::fs::write(root.path().join("release"), "").unwrap();
+    let result = execution.await.unwrap().unwrap();
+    let agentkit_core::ToolOutput::Structured(result) = result.result.output else {
+        panic!()
+    };
+    assert_eq!(result["exit_code"], 7);
+    assert_eq!(result["stderr"], "err");
+    subscription.drain().await.unwrap();
+    while let Ok(update) = receive.try_recv() {
+        let value = serde_json::to_value(update.v2().unwrap()).unwrap();
+        if value["sessionUpdate"] == "terminal_output_chunk" {
+            bytes.extend(STANDARD.decode(value["data"].as_str().unwrap()).unwrap());
+        }
+        updates.push(update);
+    }
+    assert_eq!(bytes, b"\xffAerr");
+    let values: Vec<_> = updates
+        .iter()
+        .map(|u| serde_json::to_value(u.v2().unwrap()).unwrap())
+        .collect();
+    assert_eq!(values[1]["sessionUpdate"], "terminal_update");
+    assert_eq!(values[2]["content"][0]["type"], "terminal");
+    assert_eq!(values[2]["content"][0]["terminalId"], "parent:compose:node");
+    assert_eq!(values[values.len() - 2]["exitStatus"]["exitCode"], 7);
+    assert_eq!(values.last().unwrap()["status"], "completed");
+    // v1 observes only the existing invocation lifecycle, no agent-owned terminal.
+    assert_eq!(updates.iter().filter(|u| !u.v2_only()).count(), 2);
+}
+
+#[test]
+fn terminal_drop_marks_exit_and_bounds_binary_chunks_and_metadata() {
+    let mut receiver = v2_bus().subscribe();
+    let request = request("terminal-bounds", "shell", json!({}));
+    let invocation = Invocation::start(&request, None).unwrap();
+    let terminal = terminal::Terminal::start(
+        &request,
+        &"x".repeat(crate::runlet_progress::MAX_SOURCE + 1),
+        Path::new("/tmp"),
+    );
+    terminal.output().unwrap().chunk(&vec![255; 20_000]);
+    drop(terminal);
+    invocation.finish(false);
+    let updates: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+        .filter(|update| update.session == "terminal-bounds")
+        .collect();
+    let values: Vec<_> = updates
+        .iter()
+        .map(|u| serde_json::to_value(u.v2().unwrap()).unwrap())
+        .collect();
+    assert!(values[1].get("command").is_none());
+    for value in &values {
+        if value["sessionUpdate"] == "terminal_output_chunk" {
+            assert!(value["data"].as_str().unwrap().len() <= 10_924);
+        }
+    }
+    assert!(values[values.len() - 2]["exitStatus"].is_object());
+    assert_eq!(values.last().unwrap()["status"], "failed");
+}
+
+#[tokio::test]
+async fn lag_exits_live_terminal_before_invalidating_its_card() {
+    let (sender, receiver) = broadcast::channel(2);
+    let (_drain, commands) = tokio::sync::mpsc::channel(1);
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(forward(
+        receiver,
+        "terminal-lag".into(),
+        move |u| send.send(u).is_ok(),
+        commands,
+    ));
+    let start = Update {
+        session: "terminal-lag".into(),
+        call: "parent:compose:node".into(),
+        start: Some(json!({"toolCallId": "parent:compose:node", "status": "in_progress"})),
+        patch: None,
+        ok: false,
+    };
+    sender.send(start.clone()).unwrap();
+    receive.recv().await.unwrap();
+    let mut terminal = start.clone();
+    terminal.start = None;
+    terminal.patch = Some(json!({"sessionUpdate": "terminal_update", "terminalId": terminal.call}));
+    sender.send(terminal.clone()).unwrap();
+    receive.recv().await.unwrap();
+    // No await: force the bounded receiver to observe lag deterministically.
+    for _ in 0..3 {
+        sender.send(terminal.clone()).unwrap();
+    }
+    let exit = receive.recv().await.unwrap();
+    let value = serde_json::to_value(exit.v2().unwrap()).unwrap();
+    assert_eq!(value["sessionUpdate"], "terminal_update");
+    assert!(value["exitStatus"].is_object());
+    assert_eq!(value["_meta"]["kit/outputIncomplete"], true);
+    let end = receive.recv().await.unwrap();
+    assert_eq!(end.value()["status"], "failed");
+    drop(sender);
+    task.await.unwrap();
+    assert!(receive.try_recv().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_shell_cancellation_and_timeout_exit_terminal_before_failed_card() {
+    use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext, Tool};
+    use std::sync::Arc;
+    for cancel in [true, false] {
+        let session = if cancel {
+            "terminal-cancel"
+        } else {
+            "terminal-timeout"
+        };
+        let root = tempfile::tempdir().unwrap();
+        let tool = crate::tools::Observed::new(crate::tools::ShellTool::new(root.path().into()));
+        let controller = agentkit_core::CancellationController::new();
+        let context = OwnedToolContext {
+            session_id: SessionId::new(session),
+            turn_id: TurnId::new("turn"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: Some(controller.handle().checkpoint()),
+            execution_scope: None,
+            approved_request: None,
+        };
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let subscription = Subscription::start_v2(session.into(), move |u| send.send(u).is_ok());
+        let call = request(
+            session,
+            "shell",
+            json!({"command": "printf ready; sleep 30", "timeout_seconds": 1}),
+        );
+        let execution =
+            tokio::spawn(async move { tool.invoke(call, &mut context.borrowed()).await });
+        loop {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if update.value()["sessionUpdate"] == "terminal_output_chunk" {
+                break;
+            }
+        }
+        if cancel {
+            controller.interrupt();
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .unwrap()
+            .unwrap();
+        if cancel {
+            assert!(matches!(
+                result,
+                Err(agentkit_tools_core::ToolError::Cancelled)
+            ));
+        } else {
+            assert!(
+                matches!(result, Err(agentkit_tools_core::ToolError::ExecutionFailed(message)) if message.contains("timed out"))
+            );
+        }
+        subscription.drain().await.unwrap();
+        let values: Vec<_> = std::iter::from_fn(|| receive.try_recv().ok())
+            .map(|u| serde_json::to_value(u.v2().unwrap()).unwrap())
+            .collect();
+        assert!(values[values.len() - 2]["exitStatus"].is_object());
+        assert_eq!(values.last().unwrap()["status"], "failed");
+    }
+}
+
+#[tokio::test]
+async fn terminal_bursts_never_enter_the_v1_queue_with_mixed_clients() {
+    let buses = Buses::new();
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    let (drains, commands) = tokio::sync::mpsc::channel(1);
+    let subscription = Subscription {
+        task: tokio::spawn(forward(
+            buses.v1.subscribe(),
+            "v1-isolated".into(),
+            move |u| send.send(u).is_ok(),
+            commands,
+        )),
+        drains,
+    };
+    let mut v2 = buses.v2.subscribe();
+    let start = Update {
+        session: "v1-isolated".into(),
+        call: "parent:compose:node".into(),
+        start: Some(json!({"toolCallId": "parent:compose:node", "status": "in_progress"})),
+        patch: None,
+        ok: false,
+    };
+    buses.publish(start.clone());
+    for _ in 0..CAPACITY + 1 {
+        buses.publish(Update {
+            session: "v2-burst".into(), call: "parent:compose:other".into(),
+            start: None, patch: Some(json!({"sessionUpdate": "terminal_output_chunk", "terminalId": "parent:compose:other", "data": "YQ=="})), ok: false,
+        });
+    }
+    buses.publish(Update {
+        start: None,
+        ok: true,
+        ..start
+    });
+    // The v2 receiver really did lag, while v1 had only lifecycle traffic.
+    assert!(matches!(
+        v2.try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(_))
+    ));
+    subscription.drain().await.unwrap();
+    let start = receive.try_recv().unwrap();
+    let end = receive.try_recv().unwrap();
+    assert!(start.start.is_some());
+    assert_eq!(end.value()["status"], "completed");
+    assert!(receive.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn cumulative_budget_bounds_a_stalled_transport_across_calls() {
+    for size in [1, 8192] {
+        // This external sink deliberately accepts without consumption, like the
+        // SDK's unbounded queue. The budget must hold even without bus lag.
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let subscription =
+            Subscription::start_v2("slow-terminal".into(), move |u| send.send(u).is_ok());
+        for call in 0..4 {
+            let mut request = request("slow-terminal", "shell", json!({}));
+            request.call_id = ToolCallId::new(format!("parent:compose:{call}"));
+            let invocation = Invocation::start(&request, None).unwrap();
+            let terminal = terminal::Terminal::start(&request, "printf lots", Path::new("/tmp"));
+            subscription.drain().await.unwrap();
+            for _ in 0..64 {
+                terminal.output().unwrap().chunk(&vec![255; size]);
+                subscription.drain().await.unwrap();
+            }
+            terminal.finish(Some(0));
+            invocation.finish(true);
+            subscription.drain().await.unwrap();
+        }
+        let values: Vec<_> = std::iter::from_fn(|| receive.try_recv().ok())
+            .map(|u| serde_json::to_value(u.v2().unwrap()).unwrap())
+            .collect();
+        let chunks: Vec<_> = values.iter().filter_map(|v| v["data"].as_str()).collect();
+        assert!(!chunks.is_empty());
+        assert!(chunks.len() <= 128);
+        assert!(chunks.iter().map(|s| s.len()).sum::<usize>() <= 1024 * 1024);
+        assert!(
+            values
+                .iter()
+                .any(|v| v["_meta"]["kit/outputIncomplete"] == true)
+        );
+        assert_eq!(
+            values.iter().filter(|v| v["status"] == "completed").count(),
+            4
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|v| v["exitStatus"]["exitCode"] == 0)
+                .count(),
+            4
+        );
+        assert!(!values.iter().any(|v| v["status"] == "failed"));
+    }
+}
