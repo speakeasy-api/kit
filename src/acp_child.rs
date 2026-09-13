@@ -584,6 +584,7 @@ struct Ready {
     session_id: SessionId,
     capabilities: agentkit_acp::AgentCapabilities,
     descendant_parent: Option<String>,
+    replay: ChildOutput,
 }
 
 /// Where one in-flight prompt's session updates land.
@@ -854,6 +855,22 @@ impl ChildSession {
         depth: usize,
         cancellation: TurnCancellation,
     ) -> Result<Self, ChildError> {
+        Self::start_with_output(config, harness, persisted, model, depth, cancellation)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    /// Reconnect a generic v2 child using a known ACP session id in `persisted`.
+    /// Returns replay separately from the next turn; durable id discovery is owned
+    /// by the caller. Built-in Kit persistence retains its existing launch path.
+    pub async fn start_with_output(
+        config: ChildConfig,
+        harness: String,
+        persisted: Option<(String, bool)>,
+        model: Option<String>,
+        depth: usize,
+        cancellation: TurnCancellation,
+    ) -> Result<(Self, ChildOutput), ChildError> {
         let context = config.harnesses.launch_context(&harness);
         let actor_context = context.clone();
         let (tx, mut rx) = mpsc::channel(1);
@@ -915,14 +932,17 @@ impl ChildSession {
             }
         };
         match result {
-            Ok(ready) => Ok(Self {
-                tx: actor_tx,
-                session_id: ready.session_id,
-                capabilities: ready.capabilities,
-                serial: Arc::new(tokio::sync::Mutex::new(())),
-                closed: closed_rx,
-                descendant_parent: ready.descendant_parent,
-            }),
+            Ok(ready) => Ok((
+                Self {
+                    tx: actor_tx,
+                    session_id: ready.session_id,
+                    capabilities: ready.capabilities,
+                    serial: Arc::new(tokio::sync::Mutex::new(())),
+                    closed: closed_rx,
+                    descendant_parent: ready.descendant_parent,
+                },
+                ready.replay,
+            )),
             Err(error) => {
                 task.abort();
                 let _ = task.await;
@@ -1218,12 +1238,12 @@ async fn run(
                 }
                 // Reuse normalized configuration identifiers for captured output.
                 let Some(notification) = notification else { return Ok(()); };
-                if let Some(activity) = roster_activity(&notification.update) {
+                if !route.owner.is_empty() && let Some(activity) = roster_activity(&notification.update) {
                     crate::events::emit(&crate::events::RuntimeEvent::SubagentActivity {
                         id: route.owner.clone(), activity,
                     });
                 }
-                if let SessionUpdate::UsageUpdate(usage) = &notification.update {
+                if !route.owner.is_empty() && let SessionUpdate::UsageUpdate(usage) = &notification.update {
                     crate::events::emit(&crate::events::RuntimeEvent::SubagentUsage {
                         id: route.owner.clone(),
                         used: usage.used,
@@ -1261,7 +1281,24 @@ async fn run(
         .connect_with(transport, async move |connection| {
             let (version, capabilities) = protocol::initialize(&connection).await?;
             let supports_close = capabilities.session_capabilities.close.is_some();
-            let session = protocol::request(connection.clone(), version, agentkit_acp::NewSessionRequest::new(root.clone())).await?;
+            // Startup privately owns this route. Notifications are its only output
+            // writers; response completion removes the route before publishing replay.
+            // Failure/cancellation drops the entire startup connection and its route.
+            let replay_output = Arc::new(Mutex::new(ChildOutput::default()));
+            let session = if let Some((id, true)) = &persisted
+                && harness != BUILTIN_HARNESS
+            {
+                let id = SessionId::new(id.clone());
+                let (idle, _) = watch::channel(protocol::Foreground::Waiting);
+                routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
+                    .insert(id.clone(), Route { owner: String::new(), output: Arc::clone(&replay_output), idle });
+                let result = protocol::resume(&connection, version, id.clone(), root.clone()).await;
+                routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
+                result?
+            } else {
+                protocol::request(connection.clone(), version, agentkit_acp::NewSessionRequest::new(root.clone())).await?
+            };
+            let replay = replay_output.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.clone();
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
             }
@@ -1308,6 +1345,7 @@ async fn run(
                 session_id: session.session_id,
                 capabilities,
                 descendant_parent,
+                replay,
             }));
             let mut next_branch = 0;
             loop {
@@ -1531,7 +1569,10 @@ async fn run(
                             let request = async {
                                 let response = protocol::prompt(&connection, version, session_id.clone(), prompt.content).await?;
                                 if version == protocol::Version::V2 {
-                                    idle_rx.wait_for(|state| *state == protocol::Foreground::Idle).await.map_err(agent_client_protocol::Error::into_internal_error)?;
+                                    let state = idle_rx.wait_for(|state| matches!(state, protocol::Foreground::Idle(_))).await.map_err(agent_client_protocol::Error::into_internal_error)?.clone();
+                                    if let protocol::Foreground::Idle(reason) = state {
+                                        return protocol::completion(reason);
+                                    }
                                 }
                                 Ok::<_, agent_client_protocol::Error>(response)
                             };
@@ -3243,13 +3284,117 @@ mod tests {
             parent_name: None,
         };
         let base = ChildSession::start(
-            config,
+            config.clone(),
             "acp.mock".into(),
             None,
             Some("mock/requested".into()),
             1,
             TurnCancellation::default(),
         )
+        .await
+        .unwrap();
+        for reason in [
+            "end_turn",
+            "max_tokens",
+            "cancelled",
+            "refusal",
+            "max_turn_requests",
+            "_future",
+        ] {
+            let result = base
+                .prompt(
+                    "s-test".into(),
+                    format!("MOCK_STOP:{reason}").into(),
+                    TurnCancellation::default(),
+                )
+                .await;
+            match reason {
+                "end_turn" | "max_tokens" => assert!(result.is_ok()),
+                "cancelled" => assert!(matches!(result, Err(ChildError::Cancelled))),
+                _ => assert!(matches!(result, Err(ChildError::Failed(_)))),
+            }
+        }
+        let (resumed, replay) = ChildSession::start_with_output(
+            config.clone(),
+            "acp.mock".into(),
+            Some(("saved-session".into(), true)),
+            None,
+            1,
+            TurnCancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.session_id.to_string(), "saved-session");
+        assert_eq!(replay.text, "replayed history");
+        assert_eq!(
+            resumed
+                .prompt("s-test".into(), "fresh".into(), TurnCancellation::default())
+                .await
+                .unwrap()
+                .text,
+            "fresh"
+        );
+        resumed.close().await.unwrap();
+        for id in ["replay-failure", "replay-eof"] {
+            let failed = ChildSession::start_with_output(
+                config.clone(),
+                "acp.mock".into(),
+                Some((id.into(), true)),
+                None,
+                1,
+                TurnCancellation::default(),
+            )
+            .await;
+            assert!(matches!(failed, Err(ChildError::Failed(_))));
+        }
+        let replay_controller = agentkit_core::CancellationController::new();
+        let replay_cancellation = replay_controller.handle().checkpoint();
+        let replay_config = config.clone();
+        let replay_task = tokio::spawn(async move {
+            ChildSession::start_with_output(
+                replay_config,
+                "acp.mock".into(),
+                Some(("replay-stall".into(), true)),
+                None,
+                1,
+                replay_cancellation,
+            )
+            .await
+        });
+        let marker = root.path().join("replay-stalled");
+        let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&marker)
+                    && let Ok(pid) = value.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        replay_controller.interrupt();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), replay_task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ChildError::Cancelled)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap()
+                .success()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .unwrap();
         assert!(base.supports_native_fork());

@@ -165,7 +165,9 @@ Kit's ACP server also advertises a separate reasoning-effort session selector wi
 
 Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the owning parent session. Closing that main session drops its subagent manager, which closes every child actor and terminates the retained child processes. A later Kit process cannot pass an old value to `prompt` or `fork`.
 
-For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Steering, detailed v2 stop-reason interpretation, and reconnect replay are not yet supported.
+For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Its stop reason uses the same success, cancellation, refusal, and request-limit handling as v1. An omitted reason permits normal completion; an unknown reason reports an error rather than success.
+
+The child client can reconnect a known generic v2 session with `session/resume` and `replayFrom: {"type": "start"}`. It collects history until the resume response, separately from the next prompt, so historical idle updates cannot finish a fresh turn. This is a client foundation, not automatic recovery of subagent handles after a Kit restart; durable session-id storage and recovery are tracked in #185.
 
 ## Configure a generic ACP harness
 

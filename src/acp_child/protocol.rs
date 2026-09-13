@@ -275,8 +275,8 @@ pub(super) async fn prompt(
                 ))
                 .block_task()
                 .await?;
-            // The caller still waits for idle before settling the turn. Full v2
-            // stop-reason interpretation and reconnect replay belong to #182.
+            // Acceptance is not completion. The caller replaces this response with
+            // the idle state update after foreground work settles.
             Ok(v1::PromptResponse::new(v1::StopReason::EndTurn))
         }
     }
@@ -351,18 +351,22 @@ mod tests {
     #[test]
     fn foreground_ignores_initial_idle_and_stays_settled() {
         let mut state = Foreground::Waiting;
-        assert!(!state.advance(Foreground::Idle));
+        assert!(!state.advance(Foreground::Idle(None)));
         assert_eq!(state, Foreground::Waiting);
         assert!(state.advance(Foreground::Running));
-        assert!(state.advance(Foreground::Idle));
+        assert!(state.advance(Foreground::Idle(Some(v2::StopReason::Refusal))));
         assert!(!state.advance(Foreground::Running));
-        assert_eq!(state, Foreground::Idle);
+        assert!(!state.advance(Foreground::Idle(Some(v2::StopReason::EndTurn))));
+        assert_eq!(state, Foreground::Idle(Some(v2::StopReason::Refusal)));
     }
 
     #[test]
     fn recognizes_idle_without_treating_running_as_completion() {
         let update = |state| json!({"sessionId": "child", "update": {"sessionUpdate": "state_update", "state": state}});
-        assert_eq!(foreground(&update("idle")).unwrap(), Some(Foreground::Idle));
+        assert_eq!(
+            foreground(&update("idle")).unwrap(),
+            Some(Foreground::Idle(None))
+        );
         assert_eq!(
             foreground(&update("running")).unwrap(),
             Some(Foreground::Running)
@@ -380,20 +384,64 @@ mod tests {
 // Per-route state is private to one serialized turn. Only notifications write
 // Running/Idle; an initial idle is ignored until that turn has started. No lock
 // guard is held across request dispatch, wakeup, output recording, or await.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Foreground {
     Waiting,
     Running,
-    Idle,
+    Idle(Option<v2::StopReason>),
 }
 impl Foreground {
     pub(super) fn advance(&mut self, next: Self) -> bool {
-        if *self == Self::Idle || (*self == Self::Waiting && next == Self::Idle) {
+        if matches!(self, Self::Idle(_))
+            || (*self == Self::Waiting && matches!(next, Self::Idle(_)))
+        {
             return false;
         }
         *self = next;
         true
     }
+}
+
+/// Missing reasons are legal in v2; preserve normal completion in that case.
+/// Unknown reasons must settle the route, but must not be reported as success.
+pub(super) fn completion(reason: Option<v2::StopReason>) -> Result<v1::PromptResponse, Error> {
+    let reason = match reason {
+        None | Some(v2::StopReason::EndTurn) => v1::StopReason::EndTurn,
+        Some(v2::StopReason::MaxTokens) => v1::StopReason::MaxTokens,
+        Some(v2::StopReason::MaxTurnRequests) => v1::StopReason::MaxTurnRequests,
+        Some(v2::StopReason::Refusal) => v1::StopReason::Refusal,
+        Some(v2::StopReason::Cancelled) => v1::StopReason::Cancelled,
+        Some(_) => {
+            return Err(Error::into_internal_error(std::io::Error::other(
+                "nested agent returned an unknown stop reason",
+            )));
+        }
+    };
+    Ok(v1::PromptResponse::new(reason))
+}
+
+/// Replay is complete when resume responds, not when a historical idle arrives.
+pub(super) async fn resume(
+    connection: &ConnectionTo<Agent>,
+    version: Version,
+    session_id: v1::SessionId,
+    root: std::path::PathBuf,
+) -> Result<v1::NewSessionResponse, Error> {
+    if version != Version::V2 {
+        return Err(Error::into_internal_error(std::io::Error::other(
+            "ACP child replay requires protocol v2",
+        )));
+    }
+    let response = connection
+        .send_request(
+            v2::ResumeSessionRequest::new(session_id.to_string(), root)
+                .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::default())),
+        )
+        .block_task()
+        .await?;
+    let mut value = serde_json::to_value(response)?;
+    value["sessionId"] = serde_json::to_value(session_id)?;
+    session_response(value)
 }
 
 pub(super) fn foreground(params: &Value) -> Result<Option<Foreground>, Error> {
@@ -402,7 +450,9 @@ pub(super) fn foreground(params: &Value) -> Result<Option<Foreground>, Error> {
     }
     let notification: v2::UpdateSessionNotification = serde_json::from_value(params.clone())?;
     Ok(match notification.update {
-        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => Some(Foreground::Idle),
+        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
+            Some(Foreground::Idle(idle.stop_reason))
+        }
         v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => Some(Foreground::Running),
         _ => None,
     })
