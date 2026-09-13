@@ -1116,6 +1116,55 @@ fn harness_diagnostic(label: &str, line: &str) -> Option<String> {
     Some(format!("ACP harness {label}: {line}"))
 }
 
+/// Authentication diagnostics omit child messages and arbitrary data, which may
+/// contain secrets. Only bounded, control-free method identifiers are included.
+fn child_auth_required(
+    error: &agent_client_protocol::Error,
+    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+) -> Option<String> {
+    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+        return None;
+    }
+    let mut ids = BTreeSet::new();
+    // Reserve a slot for the method selected by the error before advertisements.
+    for id in error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("methodId"))
+        .and_then(Value::as_str)
+        .into_iter()
+        .chain(methods.iter().map(|method| method.id().0.as_ref()))
+    {
+        if !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic()) {
+            ids.insert(id);
+        }
+        if ids.len() == 16 {
+            break;
+        }
+    }
+    let methods = if ids.is_empty() {
+        "no methodId advertised".to_owned()
+    } else {
+        format!(
+            "methodId: {}",
+            ids.into_iter()
+                .map(|id| format!("{id:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some(format!(
+        "child authentication required (auth_required; {methods}); log in to the configured ACP harness outside Kit, then retry. Kit does not run child authentication commands"
+    ))
+}
+
+fn child_request_error(
+    error: agent_client_protocol::Error,
+    methods: &[agent_client_protocol::schema::v1::AuthMethod],
+) -> String {
+    child_auth_required(&error, methods).unwrap_or_else(|| error.to_string())
+}
+
 async fn run(
     run_config: RunConfig,
     rx: &mut mpsc::Receiver<Request>,
@@ -1246,12 +1295,24 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(transport, async move |connection| {
-            let initialized = connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
+            let initialized = match connection.send_request(agentkit_acp::InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(agentkit_acp::ClientCapabilities::new().session(
                     agentkit_acp::ClientSessionCapabilities::new().compaction(
                         agentkit_acp::CompactionCapabilities::default(),
                     ),
-                ))).block_task().await?;
+                ))).block_task().await {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    if let Some(message) = child_auth_required(&error, &[]) {
+                        // Publish a received auth response before process-exit
+                        // classification can replace it with a generic failure.
+                        let _ = ready.send(Err(format!("ACP harness {harness:?}: {message}")));
+                        return std::future::pending().await;
+                    }
+                    return Err(error);
+                }
+            };
+            let auth_methods = initialized.auth_methods;
             let capabilities = initialized.agent_capabilities;
             let supports_close = capabilities.session_capabilities.close.is_some();
             // Reject before creating any session rather than silently dropping
@@ -1263,7 +1324,16 @@ async fn run(
                 let _ = ready.send(Err(format!("ACP harness {harness:?} does not advertise additional project directory support")));
                 return std::future::pending().await;
             }
-            let session = connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).block_task().await?;
+            let session = match connection.send_request(agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).block_task().await {
+                Ok(session) => session,
+                Err(error) => {
+                    if let Some(message) = child_auth_required(&error, &auth_methods) {
+                        let _ = ready.send(Err(format!("ACP harness {harness:?}: {message}")));
+                        return std::future::pending().await;
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(options) = session.config_options.clone() {
                 config_snapshots.set(session.session_id.clone(), options)?;
             }
@@ -1278,6 +1348,7 @@ async fn run(
                 match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), "model", model.as_str())).block_task().await {
                     Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
                     Err(error) => {
+                        let error = child_request_error(error, &auth_methods);
                         let _ = ready.send(Err(format!("ACP harness {harness:?} rejected model selection {model:?}: {error}")));
                         return std::future::pending().await;
                     }
@@ -1296,7 +1367,8 @@ async fn run(
                     match connection.send_request(SetSessionConfigOptionRequest::new(session.session_id.clone(), id, value)).block_task().await {
                         Ok(response) => config_snapshots.set(session.session_id.clone(), response.config_options)?,
                         Err(error) => {
-                            let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
+                            let error = child_request_error(error, &auth_methods);
+                        let _ = ready.send(Err(format!("ACP harness {harness:?} rejected config option {key:?}: {error}")));
                             return std::future::pending().await;
                         }
                     }
@@ -1321,6 +1393,7 @@ async fn run(
                 };
                 match request {
                     Request::Fork(fork) => {
+                        let auth_methods = auth_methods.clone();
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
                         let root = root.clone();
@@ -1377,7 +1450,7 @@ async fn run(
                                                 Ok(Ok(response)) => config_snapshots.set(session_id.clone(), response.config_options)
                                                     .map(|()| session_id.clone()).map_err(|error| ChildError::Failed(error.to_string())),
                                                 Ok(Err(error)) => Err(ChildError::Failed(format!(
-                                                    "ACP harness rejected model selection {model:?} for forked session: {error}"
+                                                    "ACP harness rejected model selection {model:?} for forked session: {}", child_request_error(error, &auth_methods)
                                                 ))),
                                                 Err(_) => Err(ChildError::Failed(
                                                     "ACP harness did not apply the model selection to the forked session within 30 seconds".into(),
@@ -1402,7 +1475,7 @@ async fn run(
                                             Ok(session_id)
                                         }
                                     }
-                                    Err(error) => Err(ChildError::Failed(error.to_string())),
+                                    Err(error) => Err(ChildError::Failed(child_request_error(error, &auth_methods))),
                                 },
                                 Either::Right((Either::Left(((), _)), _)) => {
                                     // Keep awaiting late success for cleanup, but ask the peer
@@ -1482,6 +1555,7 @@ async fn run(
                         });
                     }
                     Request::Close(close) => {
+                        let auth_methods = auth_methods.clone();
                         let config_snapshots = Arc::clone(&config_snapshots);
                         let connection = connection.clone();
                         let sessions = Arc::clone(&sessions);
@@ -1494,7 +1568,7 @@ async fn run(
                                         .block_task())
                                         .await
                                         .map_err(|_| ChildError::Failed("ACP harness did not answer session/close within 5 seconds".into()))?
-                                        .map_err(|error| ChildError::Failed(error.to_string()))?;
+                                        .map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods)))?;
                                 }
                                 // Commit live-session removal before fallible history cleanup.
                                 if supports_close && let Ok(mut sessions) = sessions.lock() {
@@ -1527,6 +1601,7 @@ async fn run(
                         });
                     }
                     Request::Prompt(prompt) => {
+                        let auth_methods = auth_methods.clone();
                         let connection = connection.clone();
                         let routes = Arc::clone(&routes);
                         let fatal = fatal_tx.clone();
@@ -1548,11 +1623,11 @@ async fn run(
                                 &mut request,
                                 std::pin::pin!(prompt.cancellation.cancelled()),
                             ).await {
-                                Either::Left((result, _)) => (result.map_err(|error| error.to_string()), false),
+                                Either::Left((result, _)) => (result.map_err(|error| child_request_error(error, &auth_methods)), false),
                                 Either::Right(((), _)) => {
                                     let _ = connection.send_notification(CancelNotification::new(session_id.clone()));
                                     match tokio::time::timeout(CANCEL_SETTLE, &mut request).await {
-                                        Ok(result) => (result.map_err(|error| error.to_string()), true),
+                                        Ok(result) => (result.map_err(|error| child_request_error(error, &auth_methods)), true),
                                         Err(_) => {
                                             let _ = prompt.reply.send(Err(ChildError::TerminalCancelled));
                                             let _ = fatal.send(());
@@ -1624,7 +1699,9 @@ async fn run(
     }
     let _ = child.kill().await;
     connected.map_err(|error| {
-        if startup_complete.load(Ordering::Acquire) {
+        if let Some(message) = child_auth_required(&error, &[]) {
+            context.error("authentication required", message)
+        } else if startup_complete.load(Ordering::Acquire) {
             error.to_string()
         } else {
             // ACP error messages and data are child-controlled and may contain
@@ -2648,6 +2725,160 @@ mod tests {
         );
     }
 
+    #[test]
+    fn child_auth_diagnostics_are_bounded_and_redacted() {
+        let error = agent_client_protocol::Error::auth_required().data(serde_json::json!({
+            "methodId": "oauth", "token": "secret-token"
+        }));
+        let message = child_auth_required(&error, &[]).unwrap();
+        assert!(message.contains("methodId: \"oauth\""));
+        assert!(!message.contains("secret-token"));
+        let error = agent_client_protocol::Error::auth_required().data(serde_json::json!({
+            "methodId": "bad\nidentifier"
+        }));
+        assert!(
+            child_auth_required(&error, &[])
+                .unwrap()
+                .contains("no methodId advertised")
+        );
+        let error = agent_client_protocol::Error::auth_required().data(serde_json::json!({
+            "methodId": "x".repeat(129)
+        }));
+        assert!(
+            child_auth_required(&error, &[])
+                .unwrap()
+                .contains("no methodId advertised")
+        );
+        assert!(
+            child_auth_required(&agent_client_protocol::Error::internal_error(), &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn child_auth_error_method_takes_priority_over_advertised_methods() {
+        let methods = (1..=16)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("method-{i:02}"), "name": "Login"
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let error = agent_client_protocol::Error::auth_required().data(serde_json::json!({
+            "methodId": "required-login"
+        }));
+        let message = child_auth_required(&error, &methods).unwrap();
+        assert!(message.contains("required-login"), "{message}");
+        assert!(message.contains("method-15"), "{message}");
+        assert!(!message.contains("method-16"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn child_auth_required_at_initialize_new_session_and_prompt() {
+        for (stage, exit_after_error) in [
+            ("initialize", false),
+            ("initialize", true),
+            ("session/new", false),
+            ("session/prompt", false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let script = r#"
+import json,sys
+stage=sys.argv[1]
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request:
+        continue
+    response={'jsonrpc':'2.0','id':request['id']}
+    if request['method'] == stage:
+        response['error']={'code':-32000,'message':'remote-secret-message','data':{'methodId':'selected-login','token':'remote-secret-data'}}
+    elif request['method'] == 'initialize':
+        response['result']={'protocolVersion':1,'agentCapabilities':{},'authMethods':[{'id':'browser-login','name':'secret-name','description':'secret-description'},{'type':'terminal','id':'terminal-login','name':'terminal-secret','args':['secret-command']}]}
+    elif request['method'] == 'session/new':
+        response['result']={'sessionId':'test-session'}
+    else:
+        response['result']={}
+    print(json.dumps(response),flush=True)
+    if 'error' in response and sys.argv[2] == 'true':
+        sys.exit(42)
+"#;
+            let profiles = BTreeMap::from([(
+                "broken".into(),
+                AcpHarnessProfile {
+                    command: "python3".into(),
+                    args: vec![
+                        "-c".into(),
+                        script.into(),
+                        stage.into(),
+                        exit_after_error.to_string(),
+                    ],
+                    permissions: AcpPermissionPolicy::Deny,
+                },
+            )]);
+            let config = ChildConfig {
+                root: root.path().into(),
+                additional_directories: Vec::new(),
+                model: "unused".into(),
+                provider: Default::default(),
+                reasoning_effort: None,
+                openrouter_api_key: None,
+                configured_mcp_config: None,
+                configured_mcp_config_inherited: false,
+                legacy_mcp_config: false,
+                mcp_config: None,
+                credential_storage: Default::default(),
+                telemetry: Default::default(),
+                harnesses: AcpHarnesses::new(profiles).unwrap(),
+                default_harness: "acp.broken".into(),
+                parent_id: None,
+                parent_name: None,
+            };
+            let result = ChildSession::start(
+                config,
+                "acp.broken".into(),
+                None,
+                None,
+                1,
+                TurnCancellation::default(),
+            )
+            .await;
+            let error = match result {
+                Err(error) => {
+                    assert_ne!(stage, "session/prompt", "{error}");
+                    error.to_string()
+                }
+                Ok(child) => {
+                    assert_eq!(stage, "session/prompt");
+                    child
+                        .prompt(
+                            "test-owner".into(),
+                            "hello".into(),
+                            TurnCancellation::default(),
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                }
+            };
+            assert!(error.contains("auth_required"), "{stage}: {error}");
+            assert!(error.contains("selected-login"), "{stage}: {error}");
+            assert!(error.contains("outside Kit"), "{stage}: {error}");
+            if stage != "initialize" {
+                assert!(error.contains("browser-login"), "{error}");
+                assert!(error.contains("terminal-login"), "{error}");
+            }
+            for secret in [
+                "remote-secret-message",
+                "remote-secret-data",
+                "secret-name",
+                "secret-description",
+                "secret-command",
+            ] {
+                assert!(!error.contains(secret), "{error}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn protocol_handshake_failure_includes_only_safe_launch_context() {
         let root = tempfile::tempdir().unwrap();
@@ -2661,7 +2892,7 @@ mod tests {
                         "import json,sys; ",
                         "request=json.loads(sys.stdin.readline()); ",
                         "response={'jsonrpc':'2.0','id':request['id'],'error':",
-                        "{'code':-32000,'message':'remote-secret-message',",
+                        "{'code':-32603,'message':'remote-secret-message',",
                         "'data':{'token':'remote-secret-data'}}}; ",
                         "print(json.dumps(response), flush=True)"
                     )

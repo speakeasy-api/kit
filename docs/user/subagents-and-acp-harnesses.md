@@ -62,6 +62,8 @@ npx -y @agentclientprotocol/claude-agent-acp@0.69.0 --cli auth login --claudeai 
 # Use --console instead for Anthropic Console API billing.
 ```
 
+When a child reports `auth_required`, Kit reports the advertised authentication `methodId` values (and a `methodId` supplied by the error), so you can identify the login method. Log in to that harness outside Kit, then retry the subagent call. Kit does not execute advertised terminal authentication commands or forward authentication error messages and arbitrary data, which may contain secrets.
+
 Kit does not perform this login. You can start Kit before authenticating the adapter; authentication only needs to finish before the subagent starts.
 
 ## Start, prompt, and fork a reusable subagent
