@@ -6,6 +6,7 @@ use tempfile::{Builder, TempPath};
 
 const MAX_SESSION_FILES: usize = 64;
 const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OPENED_BYTES: usize = super::app::MAX_RETAINED_IMAGE_SOURCE_BYTES;
 const MAX_DECODED_ALLOCATION: u64 = 64 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 8_192;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -121,12 +122,52 @@ pub(super) fn materialize_image(
 pub(super) struct SessionAttachmentCache {
     files: HashMap<[u8; 32], Arc<TemporaryAttachment>>,
     bytes: usize,
+    // Opened overflow files stay alive for external viewers until session cleanup.
+    opened: HashMap<[u8; 32], Arc<TemporaryAttachment>>,
+    opened_bytes: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RetainOpenedError {
+    Exhausted,
+    InvalidPath,
 }
 
 impl SessionAttachmentCache {
+    /// Retains overflow images without invalidating paths handed to external
+    /// viewers. Repeated keys reuse their original file, even when the pool is
+    /// full. The separate pool is bounded by the retained image-source budget.
+    pub(super) fn retain_opened(
+        &mut self,
+        image: MaterializedImage,
+    ) -> Result<String, RetainOpenedError> {
+        if let Some(file) = self
+            .files
+            .get(&image.key)
+            .or_else(|| self.opened.get(&image.key))
+        {
+            return url::Url::from_file_path(file.path())
+                .map(|uri| uri.to_string())
+                .map_err(|()| RetainOpenedError::InvalidPath);
+        }
+        if self.opened.len() >= MAX_SESSION_FILES
+            || image.bytes > MAX_OPENED_BYTES.saturating_sub(self.opened_bytes)
+        {
+            return Err(RetainOpenedError::Exhausted);
+        }
+        let uri = url::Url::from_file_path(image.file.path())
+            .map_err(|()| RetainOpenedError::InvalidPath)?
+            .to_string();
+        self.opened_bytes += image.bytes;
+        self.opened.insert(image.key, image.file);
+        Ok(uri)
+    }
+
     pub(super) fn clear(&mut self) {
         self.files.clear();
         self.bytes = 0;
+        self.opened.clear();
+        self.opened_bytes = 0;
     }
 
     /// Admits a worker-produced file without evicting existing session links.
@@ -153,6 +194,145 @@ impl SessionAttachmentCache {
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
+
+    fn overflow_image(color: u8) -> MaterializedImage {
+        materialize_image(
+            [color; 32],
+            &STANDARD.encode(source(ImageFormat::Png, color)),
+            "image/png",
+            MAX_IMAGE_BYTES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn overflow_pool_retains_a_and_b_until_clear_or_drop() {
+        for clear in [false, true] {
+            let mut cache = SessionAttachmentCache::default();
+            let a = overflow_image(1);
+            let a_path = a.file.path().to_owned();
+            cache.retain_opened(a).unwrap();
+            let b = overflow_image(2);
+            let b_path = b.file.path().to_owned();
+            cache.retain_opened(b).unwrap();
+            assert!(a_path.exists());
+            assert!(b_path.exists());
+            if clear {
+                cache.clear();
+                assert!(!a_path.exists());
+                assert!(!b_path.exists());
+                cache.retain_opened(overflow_image(1)).unwrap();
+            }
+            drop(cache);
+            assert!(!a_path.exists());
+            assert!(!b_path.exists());
+        }
+    }
+
+    #[test]
+    fn overflow_pool_reuses_duplicates_and_refuses_new_files_when_full() {
+        let mut cache = SessionAttachmentCache::default();
+        let mut paths = Vec::new();
+        let mut first_uri = String::new();
+        for color in 0..MAX_SESSION_FILES {
+            let image = overflow_image(color as u8);
+            paths.push(image.file.path().to_owned());
+            let uri = cache.retain_opened(image).unwrap();
+            if color == 0 {
+                first_uri = uri;
+            }
+        }
+        let duplicate = overflow_image(0);
+        let duplicate_path = duplicate.file.path().to_owned();
+        assert_eq!(cache.retain_opened(duplicate).unwrap(), first_uri);
+        assert!(!duplicate_path.exists());
+        let refused = overflow_image(MAX_SESSION_FILES as u8);
+        let refused_path = refused.file.path().to_owned();
+        assert_eq!(
+            cache.retain_opened(refused),
+            Err(RetainOpenedError::Exhausted)
+        );
+        assert!(!refused_path.exists());
+        assert!(paths.iter().all(|path| path.exists()));
+        cache.clear();
+        assert!(paths.iter().all(|path| !path.exists()));
+        cache.retain_opened(overflow_image(0)).unwrap();
+    }
+
+    #[test]
+    fn overflow_pool_refuses_byte_exhaustion_without_evicting() {
+        let mut cache = SessionAttachmentCache::default();
+        let mut paths = Vec::new();
+        // Trailing PNG bytes are preserved by materialization, allowing the
+        // real validation and storage APIs to exercise the byte budget.
+        for color in 0..3 {
+            let mut bytes = source(ImageFormat::Png, color);
+            bytes.resize(MAX_IMAGE_BYTES, 0);
+            let image = materialize_image(
+                [color; 32],
+                &STANDARD.encode(bytes),
+                "image/png",
+                MAX_IMAGE_BYTES,
+            )
+            .unwrap();
+            paths.push(image.file.path().to_owned());
+            cache.retain_opened(image).unwrap();
+        }
+        let mut bytes = source(ImageFormat::Png, 3);
+        bytes.resize(MAX_IMAGE_BYTES, 0);
+        let image = materialize_image(
+            [3; 32],
+            &STANDARD.encode(bytes),
+            "image/png",
+            MAX_IMAGE_BYTES,
+        )
+        .unwrap();
+        let refused_path = image.file.path().to_owned();
+        assert_eq!(
+            cache.retain_opened(image),
+            Err(RetainOpenedError::Exhausted)
+        );
+        assert!(!refused_path.exists());
+        assert!(paths.iter().all(|path| path.exists()));
+        cache.clear();
+        assert!(paths.iter().all(|path| !path.exists()));
+        cache.retain_opened(overflow_image(0)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_on_demand_completion_releases_private_file() {
+        use super::super::app::{Update, UserImage};
+        use super::super::{
+            ActiveSessionRoute, BackgroundCompletion, QueuedUpdate, accept_queued_update,
+            spawn_background_workers,
+        };
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = spawn_background_workers(completed).unwrap();
+        let image = UserImage::new(
+            STANDARD.encode(source(ImageFormat::Png, 1)),
+            "image/png".into(),
+            0,
+        )
+        .unwrap();
+        assert!(
+            workers
+                .try_update(QueuedUpdate::for_session(1, Update::OpenUserImage(image)))
+                .is_ok()
+        );
+        let BackgroundCompletion::Update { queued, images } = completions.recv().await.unwrap()
+        else {
+            panic!("expected update");
+        };
+        let path = images[0].file.path().to_owned();
+        assert!(path.exists());
+        let route = Arc::new(std::sync::Mutex::new(ActiveSessionRoute {
+            id: "new".into(),
+            generation: 2,
+        }));
+        assert!(accept_queued_update(&route, queued).is_none());
+        drop(images);
+        assert!(!path.exists());
+    }
 
     fn source(format: ImageFormat, color: u8) -> Vec<u8> {
         let image = image::RgbImage::from_pixel(1, 1, image::Rgb([color, 40, 60]));

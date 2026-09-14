@@ -625,13 +625,17 @@ fn spawn_background_workers(
                 let images = match &queued.update {
                     Update::UserMessage { images, .. } => images
                         .iter()
-                        .take_while(|_| !update_stopping.load(Ordering::Acquire))
+                        // File-backed placeholders need materialization before they can
+                        // open. Give them priority over URI-less image candidates.
                         .filter(|image| {
                             image
                                 .source_uri
                                 .as_deref()
-                                .is_none_or(|uri| uri.starts_with("file:"))
+                                .is_some_and(|uri| uri.starts_with("file:"))
                         })
+                        .chain(images.iter().filter(|image| image.source_uri.is_none()))
+                        .take_while(|_| !update_stopping.load(Ordering::Acquire))
+                        // Bound attempts, including failed decodes, across both groups.
                         .take(64)
                         .filter_map(|image| {
                             let prepared = attachment::materialize_image(
@@ -647,6 +651,14 @@ fn spawn_background_workers(
                             Some(prepared)
                         })
                         .collect(),
+                    Update::OpenUserImage(image) => attachment::materialize_image(
+                        image.key,
+                        &image.data,
+                        &image.mime_type,
+                        10 * 1024 * 1024,
+                    )
+                    .into_iter()
+                    .collect(),
                     _ => Vec::new(),
                 };
                 if !send_background_completion(
@@ -2471,6 +2483,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     )?;
                                     events = EventStream::new();
                                 }
+                                Action::OpenUserImage(image) => {
+                                    // Snapshot only; release the guard before queueing work.
+                                    // Poison rejects this request rather than selecting another session.
+                                    let generation = transition_session.lock().ok().map(|route| route.generation);
+                                    if let Some(generation) = generation
+                                        && background_workers.try_update(QueuedUpdate::for_session(
+                                            generation, Update::OpenUserImage(image),
+                                        )).is_err()
+                                    {
+                                        app.note("image worker is busy; click again to open");
+                                    }
+                                }
                                 Action::Copy(text) => {
                                     execute!(terminal.backend_mut(), Print(osc52(&text)))
                                         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -3744,7 +3768,9 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                         .map(|(line, uri)| (first_line + line, uri)),
                 );
                 text.push_str(&content);
-                separate_after_image = false;
+                if !content.is_empty() {
+                    separate_after_image = false;
+                }
             }
         }
     }
@@ -5234,6 +5260,87 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn background_image_worker_prioritizes_files_and_bounds_decode_attempts() {
+        use super::app::UserImage;
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = STANDARD.encode(png.into_inner());
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = super::spawn_background_workers(completed).unwrap();
+
+        for invalid_files in [0, 63, 64] {
+            let mut images: Vec<_> = (0..64)
+                .map(|_| UserImage::new("not base64!".into(), "image/png".into(), 0).unwrap())
+                .collect();
+            images.extend((0..invalid_files).map(|_| {
+                UserImage::with_source(
+                    "not base64!".into(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///invalid.png".into()),
+                )
+                .unwrap()
+            }));
+            images.push(
+                UserImage::with_source(
+                    encoded.clone(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///valid.png".into()),
+                )
+                .unwrap(),
+            );
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        1,
+                        Update::UserMessage {
+                            id: "user".into(),
+                            text: "[Image #1](file:///valid.png)".into(),
+                            images,
+                            append: false,
+                        },
+                    ))
+                    .is_ok()
+            );
+            let completion =
+                tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let BackgroundCompletion::Update { queued, images } = completion else {
+                panic!("expected image worker completion");
+            };
+            assert_eq!(images.len(), usize::from(invalid_files < 64));
+            let mut app = App::new(
+                "/tmp/kit".into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.apply_materialized(queued.update, images);
+            let super::app::Block::User(message) = &app.blocks[0] else {
+                panic!("expected user");
+            };
+            if invalid_files < 64 {
+                let (_, uri) = super::markdown::image_label_links(&message.text)
+                    .pop()
+                    .unwrap();
+                let path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    STANDARD.decode(&encoded).unwrap()
+                );
+            } else {
+                assert_eq!(message.text, "[Image #1]");
+            }
+        }
+    }
+
     #[test]
     fn assistant_image_translation_defers_decode_to_worker() {
         let update = agent_content_update(
@@ -6705,6 +6812,118 @@ mod tests {
         assert_eq!(text, format!("before\n[Image #1]({uri})\nafter"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].line, 1);
+    }
+
+    #[test]
+    fn sequential_user_image_chunks_preserve_materialized_links_and_spacing() {
+        use super::{app::Block, attachment};
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let image_block = |value| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([value, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            ContentBlock::Image(wire::ImageContent::new(
+                STANDARD.encode(png.into_inner()),
+                "image/png",
+            ))
+        };
+        for content in [
+            ContentBlock::Text(TextContent::new("before")),
+            image_block(0),
+            ContentBlock::Text(TextContent::new("")),
+            ContentBlock::Text(TextContent::new("after")),
+            image_block(255),
+            ContentBlock::Text(TextContent::new("end")),
+        ] {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::UserMessageChunk(
+                    serde_json::from_value(json!({
+                        "messageId": "user",
+                        "content": content,
+                    }))
+                    .unwrap(),
+                ),
+            );
+            let updates = translate_for_session(notification, "session");
+            assert_eq!(updates.len(), 1);
+            for update in updates {
+                let Update::UserMessage {
+                    id, images, append, ..
+                } = &update
+                else {
+                    panic!("expected a user message chunk");
+                };
+                assert_eq!(id, "user");
+                assert!(*append);
+                let materialized = images
+                    .iter()
+                    .map(|image| {
+                        assert!(image.source_uri.is_none());
+                        attachment::materialize_image(
+                            image.key,
+                            &image.data,
+                            &image.mime_type,
+                            usize::MAX,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                app.apply_materialized(update, materialized);
+            }
+        }
+
+        let [Block::User(message)] = app.blocks.as_slice() else {
+            panic!("expected one user message");
+        };
+        assert_eq!(message.images.len(), 2);
+        assert_ne!(message.images[0].key, message.images[1].key);
+        assert_eq!(message.images[0].line, 1);
+        assert_eq!(message.images[1].line, 3);
+        let lines: Vec<_> = message.text.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "before");
+        assert_eq!(lines[2], "after");
+        assert_eq!(lines[4], "end");
+        let links = super::markdown::image_label_links(&message.text);
+        assert_eq!(links.len(), 2);
+        assert_ne!(links[0].1, links[1].1);
+        for ((line, uri), image) in links.iter().zip(&message.images) {
+            assert_eq!(*line, image.line);
+            assert!(uri.starts_with("file://"));
+            let path = url::Url::parse(uri).unwrap().to_file_path().unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                STANDARD.decode(&image.data).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn user_image_placeholder_separator_survives_empty_text() {
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Image(agent_client_protocol::schema::v2::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+            ContentBlock::Text(TextContent::new("")),
+            ContentBlock::Text(TextContent::new("after")),
+        ]);
+
+        assert_eq!(text, "[Image #1]\nafter");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 0);
     }
 
     #[test]

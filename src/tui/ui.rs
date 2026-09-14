@@ -1323,12 +1323,31 @@ fn user_block_rows(
     width: usize,
 ) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
     let mut rows = Vec::new();
+    let mut line_start = 0;
     for (line_index, text) in message.text.split('\n').enumerate() {
+        let mut line = user_line("", line_index == 0);
+        let mut labels = message
+            .images
+            .iter()
+            .filter_map(|image| {
+                let range = image.open_label.as_ref()?;
+                (range.start >= line_start && range.end <= line_start + text.len()).then(|| {
+                    (
+                        range.start - line_start..range.end - line_start,
+                        image.open_target(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|(range, _)| range.start);
+        line.spans.extend(markdown::inline_spans_with_image_labels(
+            text,
+            theme::bold(theme::text_color()),
+            &labels,
+        ));
+        line_start += text.len() + 1;
         rows.extend(wrap_linked_tagged(
-            &[(
-                user_line(text, line_index == 0),
-                (None, None, Some(line_index)),
-            )],
+            &[(line, (None, None, Some(line_index)))],
             width,
         ));
     }
@@ -5936,7 +5955,35 @@ mod tests {
                     app.start_session("replacement".into());
                     assert!(!path.exists(), "session switch must release the local file");
                 } else {
-                    assert!(links.is_empty(), "invalid data must not create a dead link");
+                    assert_eq!(links.len(), 1);
+                    assert!(
+                        links[0].url.starts_with("kit-image:"),
+                        "invalid data must not create a dead native file link"
+                    );
+                    let Block::User(message) = &app.blocks[0] else {
+                        panic!("expected user");
+                    };
+                    assert!(
+                        workers
+                            .try_update(QueuedUpdate {
+                                generation: None,
+                                update: crate::tui::app::Update::OpenUserImage(
+                                    message.images[0].clone()
+                                ),
+                            })
+                            .is_ok()
+                    );
+                    let BackgroundCompletion::Update { queued, images } =
+                        completions.recv().await.unwrap()
+                    else {
+                        panic!("expected open completion");
+                    };
+                    assert!(
+                        images.is_empty(),
+                        "invalid data must not create a temporary file"
+                    );
+                    app.apply_materialized(queued.update, images);
+                    assert_eq!(app.toast_text(), Some("image could not be opened"));
                 }
                 assert!(!images.pending());
                 assert_eq!(images.cached_entries(), 0);
