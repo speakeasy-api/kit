@@ -26,7 +26,7 @@ WORKDIR /src
 ARG TARGETARCH
 ARG CARGO_ARGS
 
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs install.sh ./
 COPY src ./src
 COPY docs/user ./docs/user
 
@@ -55,7 +55,7 @@ WORKDIR /src
 ARG TARGETARCH
 ARG CARGO_ARGS
 
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs install.sh ./
 COPY src ./src
 COPY docs/user ./docs/user
 

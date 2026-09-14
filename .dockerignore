@@ -3,6 +3,7 @@
 !Cargo.toml
 !Cargo.lock
 !build.rs
+!install.sh
 !LICENSE
 !THIRD_PARTY_NOTICES.md
 !third_party/
