@@ -192,3 +192,87 @@ async fn wait_for_file(path: &std::path::Path) {
     .await
     .unwrap();
 }
+
+#[cfg(unix)]
+async fn cancel_during_startup(signals: &[&str]) {
+    let home = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let n = stream.read(&mut buffer).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+        }
+        assert!(request.starts_with(b"GET /models "));
+        entered_tx.send(()).unwrap();
+        // Keep provider startup pending until AFTER the process exits. There is
+        // no model response, credential backend, or external network request.
+        let _ = release_rx.await;
+        drop(stream);
+    });
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kit"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("OPENROUTER_API_KEY", "local-test-key")
+        .env("OPENROUTER_BASE_URL", url)
+        .args([
+            "prompt",
+            "--provider",
+            "openrouter",
+            "--model",
+            "test/model",
+            "--credential-store",
+            "memory",
+            "--root",
+        ])
+        .arg(home.path())
+        .arg("hello")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    for signal in signals {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        let pid = child.id().unwrap().to_string();
+        // A second signal may race the already-completing process.
+        let _ = tokio::process::Command::new("/bin/kill")
+            .args([*signal, &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+    }
+    let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output()).await;
+    let _ = release_tx.send(());
+    server.await.unwrap();
+    let output = output
+        .expect("signal must exit without waiting for startup metadata")
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_signals_do_not_wait_for_metadata() {
+    // These each launch a full CLI runtime; keep the scenarios sequential rather
+    // than multiplying process startup load in the integration test runner.
+    for signals in [&["-TERM"][..], &["-INT"][..], &["-TERM", "-TERM"][..]] {
+        cancel_during_startup(signals).await;
+    }
+}

@@ -1748,6 +1748,71 @@ mod tests {
     }
 
     #[test]
+    fn dropped_auth_waiter_does_not_make_blocking_backend_quiescent() {
+        // Startup cancellation can drop an async waiter, but must not claim that
+        // credential work has stopped or abandon runtime ownership of it.
+        struct BlockingStore {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl CredentialStore for BlockingStore {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                // No token means refresh returns before any HTTP or signing-key
+                // lookup; this fake never reads or writes actual credentials.
+                Ok(None)
+            }
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                panic!("missing fake credentials cannot be saved");
+            }
+            fn delete(&self) -> Result<bool, AuthError> {
+                panic!("refresh cannot delete fake credentials");
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let waiter = tokio::task::spawn_blocking(move || {
+                    let store = BlockingStore {
+                        entered: entered_tx,
+                        release: Mutex::new(release_rx),
+                    };
+                    assert!(
+                        refresh_current(
+                            &store,
+                            Instant::now() + Duration::from_secs(3),
+                            None,
+                            "http://127.0.0.1:1/unused"
+                        )
+                        .is_err()
+                    );
+                });
+                drop(waiter);
+            });
+            // Match main's ownership: do not use shutdown_timeout to abandon a
+            // blocking refresh that may need to persist a rotated token.
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let exited_while_blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(!exited_while_blocked);
+    }
+
+    #[test]
     fn refresh_guard_rejects_backend_unwind_without_retrying() {
         struct PanickingStore(std::sync::atomic::AtomicUsize);
 

@@ -1308,109 +1308,127 @@ impl Runtime {
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
         let session_id = request.id.clone();
-        if self.plugin_runtime.is_some() {
-            self.mcp.refresh().await.map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "plugin_refresh",
-                    error,
-                )
-            })?;
-        }
-        let initial = if request.resume {
-            vec![Item::text(ItemKind::System, self.system_prompt(0))]
-        } else {
-            self.initial_transcript(0).await.map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "initial_transcript",
-                    error,
-                )
-            })?
-        };
-        let opened = if request.resume {
-            crate::session::open(&self.root, &request.id, true, request.force, initial)
-        } else {
-            crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
-        }
-        .map_err(|error| {
-            record_runtime_failure(
-                &session_id,
-                crate::fatal::Surface::Prompt,
-                "session_open",
-                error,
-            )
-        })?;
-        let pending_creation = (!request.resume).then(|| opened.observer.clone());
-        let skills = self.fresh_skills();
-        let compactor = crate::compaction::automatic(
-            self.adapter.clone(),
-            self.agentkit_telemetry(),
-            Some(opened.observer.clone()),
-            format!("compaction-{}", crate::session::new_id()),
-        )
-        .map_err(|error| {
-            record_runtime_failure(
-                &session_id,
-                crate::fatal::Surface::Prompt,
-                "compactor_build",
-                error,
-            )
-        })?;
-        let subagents = self
-            .subagents
-            .fresh()
-            .with_observer(opened.observer.clone(), opened.children)
-            .map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "subagent_restore",
-                    error,
-                )
-            })?;
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
-        let agent = Agent::builder()
-            .cancellation(controller.handle())
-            .model(self.adapter.clone())
-            .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(0, subagents, background_jobs.clone(), skills))
-            .task_manager(task_manager)
-            .mutator(compactor)
-            .transcript_observer(opened.observer)
-            .transcript(opened.transcript)
-            .input(vec![Item::text(ItemKind::User, prompt)])
-            .build()
+        let startup = async {
+            if self.plugin_runtime.is_some() {
+                self.mcp.refresh().await.map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "plugin_refresh",
+                        error,
+                    )
+                })?;
+            }
+            let initial = if request.resume {
+                vec![Item::text(ItemKind::System, self.system_prompt(0))]
+            } else {
+                self.initial_transcript(0).await.map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "initial_transcript",
+                        error,
+                    )
+                })?
+            };
+            let opened = if request.resume {
+                crate::session::open(&self.root, &request.id, true, request.force, initial)
+            } else {
+                crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
+            }
             .map_err(|error| {
                 record_runtime_failure(
                     &session_id,
                     crate::fatal::Surface::Prompt,
-                    "agent_build",
-                    error.to_string(),
+                    "session_open",
+                    error,
                 )
             })?;
-        let mut driver = match agent
-            .start(SessionConfig::new(session_id.clone()).without_cache())
-            .await
-        {
-            Ok(driver) => {
-                if let Some(observer) = pending_creation {
-                    observer.commit_creation()?;
-                }
-                driver
-            }
-            Err(error) => {
-                return Err(record_loop_failure(
+            let pending_creation = (!request.resume).then(|| opened.observer.clone());
+            let skills = self.fresh_skills();
+            let compactor = crate::compaction::automatic(
+                self.adapter.clone(),
+                self.agentkit_telemetry(),
+                Some(opened.observer.clone()),
+                format!("compaction-{}", crate::session::new_id()),
+            )
+            .map_err(|error| {
+                record_runtime_failure(
                     &session_id,
                     crate::fatal::Surface::Prompt,
-                    &error,
-                ));
+                    "compactor_build",
+                    error,
+                )
+            })?;
+            let subagents = self
+                .subagents
+                .fresh()
+                .with_observer(opened.observer.clone(), opened.children)
+                .map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "subagent_restore",
+                        error,
+                    )
+                })?;
+            let agent = Agent::builder()
+                .cancellation(controller.handle())
+                .model(self.adapter.clone())
+                .telemetry(self.agentkit_telemetry())
+                .add_tool_source(self.compose_with_jobs(
+                    0,
+                    subagents,
+                    background_jobs.clone(),
+                    skills,
+                ))
+                .task_manager(task_manager)
+                .mutator(compactor)
+                .transcript_observer(opened.observer)
+                .transcript(opened.transcript)
+                .input(vec![Item::text(ItemKind::User, prompt)])
+                .build()
+                .map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "agent_build",
+                        error.to_string(),
+                    )
+                })?;
+            let driver = match agent
+                .start(SessionConfig::new(session_id.clone()).without_cache())
+                .await
+            {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return Err(record_loop_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        &error,
+                    ));
+                }
+            };
+            Ok::<_, String>((driver, pending_creation))
+        };
+        // No model tool work is launched until drive_with_tasks below. Dropping
+        // async startup here must never replace the execution cleanup path.
+        // Provider-owned blocking credential workers still retain their existing
+        // deadline and runtime-shutdown ownership; this is not their quiescence.
+        let (mut driver, pending_creation) = {
+            let startup = std::pin::pin!(startup);
+            let cancellation = std::pin::pin!(cancelled.cancelled());
+            match select(cancellation, startup).await {
+                Either::Left(((), _)) => return Err("prompt cancelled during startup".into()),
+                Either::Right((result, _)) => result?,
             }
         };
+        if let Some(observer) = pending_creation {
+            observer.commit_creation()?;
+        }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
             let run = std::pin::pin!(drive_with_tasks(&mut driver, Some(&tasks)));
