@@ -66,7 +66,7 @@ run = "cargo test --locked --no-default-features"
 
 [tasks."test:scripts"]
 description = "Shell tests for the release scripts"
-run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_audio_linkage.sh"]
+run = ["scripts/tests/test_next_release_version.sh", "scripts/tests/test_linux_audio_linkage.sh", "scripts/tests/test_install.sh"]
 
 [tasks.check]
 description = "Everything CI runs on Linux"

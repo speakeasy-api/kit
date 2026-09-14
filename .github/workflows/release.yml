@@ -188,7 +188,7 @@ jobs:
         shell: bash
         run: |
           version=$RELEASE_VERSION
-          mise run build:release -- --target x86_64-unknown-linux-gnu
+          KIT_RELEASE_BINARY=1 mise run build:release -- --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
           mise run test:linux-no-audio -- stage/kit
@@ -274,7 +274,7 @@ jobs:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
           version=${{ needs.verify.outputs.version }}
-          mise run build:release -- --target aarch64-apple-darwin
+          KIT_RELEASE_BINARY=1 mise run build:release -- --target aarch64-apple-darwin
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
           cp LICENSE THIRD_PARTY_NOTICES.md stage/
