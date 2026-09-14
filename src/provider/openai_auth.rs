@@ -6,6 +6,7 @@ use std::{
     sync::{LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio_util::sync::CancellationToken;
 
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
@@ -38,6 +39,7 @@ pub(crate) struct Output {
 
 #[derive(Clone, Copy, Debug)]
 enum ClientErrorKind {
+    Cancelled,
     Invalid,
     Unavailable,
     Timeout,
@@ -97,6 +99,10 @@ pub(crate) struct AuthError {
 }
 
 impl AuthError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self.kind, ClientErrorKind::Cancelled)
+    }
+
     fn invalid(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
@@ -417,7 +423,7 @@ fn login(
                             TOKEN_URL,
                         )
                         .and_then(|record| {
-                            let _lock = process_lock_scoped(deadline, store.lock_scope())?;
+                            let _lock = process_lock_scoped(deadline, store.lock_scope(), None)?;
                             store.save(&record)?;
                             store.require_disk()?;
                             Ok(record)
@@ -467,7 +473,7 @@ fn status(
     deadline: Instant,
 ) -> Result<Output, AuthError> {
     let record = match store.load()? {
-        Some(record) => Some(refresh_if_needed(store, record, deadline)?),
+        Some(record) => Some(refresh_if_needed(store, record, deadline, None)?),
         None => None,
     };
     render_status(record, format, false)
@@ -489,7 +495,7 @@ fn logout_at(
     local_only: bool,
     revoke_url: &str,
 ) -> Result<Output, AuthError> {
-    let _lock = process_lock_scoped(deadline, store.lock_scope())?;
+    let _lock = process_lock_scoped(deadline, store.lock_scope(), None)?;
     if let Some(record) = store.load()?
         && !local_only
     {
@@ -568,17 +574,57 @@ pub(crate) fn access_token(
     storage: &CredentialStorage,
     deadline: Instant,
 ) -> Result<TokenRecord, AuthError> {
-    let store = BackendCredentialStore::new(storage);
-    let mut record = store.load()?.ok_or_else(|| {
+    access_token_from_store(&BackendCredentialStore::new(storage), deadline, None)
+}
+
+pub(crate) fn access_token_cancellable(
+    storage: &CredentialStorage,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<TokenRecord, AuthError> {
+    access_token_from_store(
+        &BackendCredentialStore::new(storage),
+        deadline,
+        Some(cancellation),
+    )
+}
+
+fn check_auth_cancellation(cancellation: Option<&CancellationToken>) -> Result<(), AuthError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(AuthError {
+            code: "openai_auth_cancelled",
+            detail: "OpenAI authentication cancelled before refresh issuance".into(),
+            kind: ClientErrorKind::Cancelled,
+        });
+    }
+    Ok(())
+}
+
+fn load_for_auth(
+    store: &dyn CredentialStore,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<TokenRecord>, AuthError> {
+    check_auth_cancellation(cancellation)?;
+    let record = store.load();
+    check_auth_cancellation(cancellation)?;
+    record
+}
+
+fn access_token_from_store(
+    store: &dyn CredentialStore,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<TokenRecord, AuthError> {
+    let mut record = load_for_auth(store, cancellation)?.ok_or_else(|| {
         AuthError::invalid(
             "openai_auth_required",
             "run `kit auth login openai` before using openai-subscription",
         )
     })?;
     if !valid_generation(&record.generation) {
-        let _thread = refresh_guard(&REFRESH_LOCK, deadline)?;
-        let _process = process_lock_scoped(deadline, store.lock_scope())?;
-        record = store.load()?.ok_or_else(|| {
+        let _thread = refresh_guard(&REFRESH_LOCK, deadline, cancellation)?;
+        let _process = process_lock_scoped(deadline, store.lock_scope(), cancellation)?;
+        record = load_for_auth(store, cancellation)?.ok_or_else(|| {
             AuthError::invalid(
                 "openai_auth_required",
                 "OpenAI subscription credentials are missing",
@@ -586,10 +632,11 @@ pub(crate) fn access_token(
         })?;
         if !valid_generation(&record.generation) {
             record.generation = random_urlsafe::<32>()?;
+            check_auth_cancellation(cancellation)?;
             store.save(&record)?;
         }
     }
-    refresh_if_needed(&store, record, deadline)
+    refresh_if_needed(store, record, deadline, cancellation)
 }
 
 pub(crate) fn refresh_after_unauthorized(
@@ -598,18 +645,25 @@ pub(crate) fn refresh_after_unauthorized(
     deadline: Instant,
 ) -> Result<TokenRecord, AuthError> {
     let store = BackendCredentialStore::new(storage);
-    refresh_locked(&store, deadline, Some(rejected_access_token), TOKEN_URL)
+    refresh_locked(
+        &store,
+        deadline,
+        Some(rejected_access_token),
+        TOKEN_URL,
+        None,
+    )
 }
 
 fn refresh_if_needed(
     store: &dyn CredentialStore,
     record: TokenRecord,
     deadline: Instant,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
     if record.expires_at > unix_seconds() + REFRESH_WINDOW_SECONDS {
         Ok(record)
     } else {
-        refresh_locked(store, deadline, None, TOKEN_URL)
+        refresh_locked(store, deadline, None, TOKEN_URL, cancellation)
     }
 }
 
@@ -618,17 +672,26 @@ fn refresh_locked(
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
-    let _thread = refresh_guard(&REFRESH_LOCK, deadline)?;
-    let _process = process_lock_scoped(deadline, store.lock_scope())?;
-    refresh_current(store, deadline, rejected_access_token, token_url)
+    let _thread = refresh_guard(&REFRESH_LOCK, deadline, cancellation)?;
+    let _process = process_lock_scoped(deadline, store.lock_scope(), cancellation)?;
+    refresh_current(
+        store,
+        deadline,
+        rejected_access_token,
+        token_url,
+        cancellation,
+    )
 }
 
-fn refresh_guard(
-    lock: &Mutex<()>,
+fn refresh_guard<'a>(
+    lock: &'a Mutex<()>,
     deadline: Instant,
-) -> Result<std::sync::MutexGuard<'_, ()>, AuthError> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::sync::MutexGuard<'a, ()>, AuthError> {
     loop {
+        check_auth_cancellation(cancellation)?;
         match lock.try_lock() {
             Ok(guard) => return Ok(guard),
             // This guard also covers backend calls and remote token rotation.
@@ -657,6 +720,7 @@ fn refresh_current(
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
     refresh_with_signing_keys(
         store,
@@ -667,6 +731,7 @@ fn refresh_current(
             cache: &JWKS_CACHE,
             source: &OpenAiSigningKeys,
         },
+        cancellation,
     )
 }
 
@@ -676,8 +741,9 @@ fn refresh_with_signing_keys(
     rejected_access_token: Option<&str>,
     token_url: &str,
     signing_keys: &SigningKeys<'_>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
-    let current = store.load()?.ok_or_else(|| {
+    let current = load_for_auth(store, cancellation)?.ok_or_else(|| {
         AuthError::invalid(
             "openai_auth_required",
             "OpenAI subscription credentials are missing",
@@ -691,6 +757,9 @@ fn refresh_with_signing_keys(
         return Ok(current);
     }
     let client = http_client(deadline)?;
+    // Crossing this check commits to finishing validation/save under the lease.
+    // Cancellation racing after it is an in-flight owned transaction, not abort.
+    check_auth_cancellation(cancellation)?;
     let response = client
         .post(token_url)
         .form(&[
@@ -1416,7 +1485,9 @@ struct ProcessLock {
 fn process_lock_scoped(
     deadline: Instant,
     credential_scope: Option<&std::path::Path>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ProcessLock, AuthError> {
+    check_auth_cancellation(cancellation)?;
     let path = auth_lock_path()?;
     let parent = path.parent().ok_or_else(|| {
         AuthError::unavailable(
@@ -1445,6 +1516,7 @@ fn process_lock_scoped(
         })?;
     }
     loop {
+        check_auth_cancellation(cancellation)?;
         match fs::global().acquire_lease(&path, scope, fs::LeaseMode::ExistingOrNew) {
             Ok(lease) => {
                 let scope = credential_scope
@@ -1715,7 +1787,7 @@ mod tests {
     use super::*;
 
     fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
-        process_lock_scoped(deadline, None)
+        process_lock_scoped(deadline, None, None)
     }
 
     use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
@@ -1748,6 +1820,202 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_blocked_read_prevents_refresh_request_and_save() {
+        struct Store {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl CredentialStore for Store {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                let mut record =
+                    super::test_support::token_record("old", "account-one", "generation-one");
+                record.expires_at = 0;
+                Ok(Some(record))
+            }
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                panic!("cancelled pretransaction saved credentials")
+            }
+            fn delete(&self) -> Result<bool, AuthError> {
+                panic!("unexpected delete")
+            }
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            let store = Store {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            };
+            let keys = SigningKeyFixture::new(vec![]);
+            refresh_with_signing_keys(
+                &store,
+                Instant::now() + Duration::from_millis(500),
+                None,
+                &url,
+                &keys.signing_keys(),
+                Some(&worker_token),
+            )
+            .unwrap_err()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+        let error = worker.join().unwrap();
+        assert_eq!(error.code, "openai_auth_cancelled");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_refresh_lock_retry_before_deadline() {
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let worker_lock = lock.clone();
+        let cancellation = CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            refresh_guard(
+                &worker_lock,
+                Instant::now() + Duration::from_millis(500),
+                Some(&worker_token),
+            )
+            .unwrap_err()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancellation.cancel();
+        let error = worker.join().unwrap();
+        drop(held);
+        assert_eq!(error.code, "openai_auth_cancelled");
+    }
+
+    #[test]
+    fn cancellation_after_refresh_issuance_preserves_validated_save() {
+        let kid = "cancel-refresh";
+        let store = MemoryStore::default();
+        let mut old = super::test_support::token_record("old", "account-one", "generation-one");
+        old.id_token = jwt(CLIENT_ID, None, kid, -3600, None);
+        old.expires_at = 0;
+        store.save(&old).unwrap();
+        let body = json!({"access_token": jwt("https://api.openai.com/v1", None, kid, 3600, None), "refresh_token":"rotated-refresh", "expires_in":3600,"token_type":"Bearer"}).to_string();
+        let cancellation = CancellationToken::new();
+        let server_token = cancellation.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            // Remote issuance already happened: cancellation must not discard
+            // this validated response or the token rotation it represents.
+            server_token.cancel();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let keys = SigningKeyFixture::new(vec![test_jwks(kid)]);
+        let result = refresh_with_signing_keys(
+            &store,
+            Instant::now() + Duration::from_secs(3),
+            None,
+            &url,
+            &keys.signing_keys(),
+            Some(&cancellation),
+        );
+        server.join().unwrap();
+        assert!(cancellation.is_cancelled());
+        let result = result.unwrap();
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.refresh_token, "rotated-refresh");
+        assert_eq!(saved.access_token(), result.access_token());
+    }
+
+    #[test]
+    fn dropped_auth_waiter_does_not_make_blocking_backend_quiescent() {
+        // Startup cancellation can drop an async waiter, but must not claim that
+        // credential work has stopped or abandon runtime ownership of it.
+        struct BlockingStore {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl CredentialStore for BlockingStore {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                // No token means refresh returns before any HTTP or signing-key
+                // lookup; this fake never reads or writes actual credentials.
+                Ok(None)
+            }
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                panic!("missing fake credentials cannot be saved");
+            }
+            fn delete(&self) -> Result<bool, AuthError> {
+                panic!("refresh cannot delete fake credentials");
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let waiter = tokio::task::spawn_blocking(move || {
+                    let store = BlockingStore {
+                        entered: entered_tx,
+                        release: Mutex::new(release_rx),
+                    };
+                    assert!(
+                        refresh_current(
+                            &store,
+                            Instant::now() + Duration::from_secs(3),
+                            None,
+                            "http://127.0.0.1:1/unused",
+                            None
+                        )
+                        .is_err()
+                    );
+                });
+                drop(waiter);
+            });
+            // Match main's ownership: do not use shutdown_timeout to abandon a
+            // blocking refresh that may need to persist a rotated token.
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let exited_while_blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(!exited_while_blocked);
+    }
+
+    #[test]
     fn refresh_guard_rejects_backend_unwind_without_retrying() {
         struct PanickingStore(std::sync::atomic::AtomicUsize);
 
@@ -1771,7 +2039,7 @@ mod tests {
         let store = PanickingStore(std::sync::atomic::AtomicUsize::new(0));
         let deadline = Instant::now() + Duration::from_secs(1);
         let attempt = || {
-            let _guard = refresh_guard(&lock, deadline)?;
+            let _guard = refresh_guard(&lock, deadline, None)?;
             store.load()
         };
         assert!(std::panic::catch_unwind(attempt).is_err());
@@ -2096,6 +2364,7 @@ mod tests {
                     Some("rejected-access-token"),
                     &token_url,
                     &signing_keys.signing_keys(),
+                    None,
                 )
                 .unwrap()
                 .access_token()
@@ -2123,6 +2392,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Some(tokens[0].as_str()),
             "http://127.0.0.1:1/oauth/token",
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "openai_auth_required");

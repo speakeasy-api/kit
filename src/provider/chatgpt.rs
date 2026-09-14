@@ -871,13 +871,21 @@ async fn load_credentials(
     storage: crate::credentials::CredentialStorage,
     timeout: Duration,
 ) -> Result<auth::TokenRecord, LoopError> {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
         let deadline = auth::checked_deadline(timeout)?;
-        auth::access_token(&storage, deadline)
+        auth::access_token_cancellable(&storage, deadline, &cancellation)
     })
     .await
     .map_err(|_| LoopError::Provider("OpenAI authentication worker failed".into()))?
-    .map_err(|error| LoopError::Provider(error.to_string()))
+    .map_err(|error| {
+        if error.is_cancelled() {
+            LoopError::Cancelled
+        } else {
+            LoopError::Provider(error.to_string())
+        }
+    })
 }
 
 fn ensure_credential_binding(
