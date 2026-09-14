@@ -433,6 +433,14 @@ mod tests {
     #[test]
     fn git_roots_do_not_apply_non_git_exclusions() {
         let workspace = workspace();
+        // This source must be visible under Git's rules even when the user's
+        // global excludes contain node_modules/. Keep the production walker
+        // honoring Git ignores; only the non-Git fallback should hide it.
+        fs::write(
+            workspace.path().join(".gitignore"),
+            "ignored/\n!node_modules/\n!node_modules/source.js\n",
+        )
+        .expect("allow fixture source independently of global Git excludes");
         fs::create_dir(workspace.path().join("node_modules")).expect("create directory");
         fs::write(workspace.path().join("node_modules/source.js"), "source").expect("write source");
         let search =
