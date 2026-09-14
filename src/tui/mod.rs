@@ -651,11 +651,13 @@ fn spawn_background_workers(
                             Some(prepared)
                         })
                         .collect(),
+                    // Sources were bounded at ingest; materialization enforces
+                    // its own per-image limit.
                     Update::OpenUserImage(image) => attachment::materialize_image(
                         image.key,
                         &image.data,
                         &image.mime_type,
-                        10 * 1024 * 1024,
+                        usize::MAX,
                     )
                     .into_iter()
                     .collect(),
@@ -2487,12 +2489,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     // Snapshot only; release the guard before queueing work.
                                     // Poison rejects this request rather than selecting another session.
                                     let generation = transition_session.lock().ok().map(|route| route.generation);
-                                    if let Some(generation) = generation
-                                        && background_workers.try_update(QueuedUpdate::for_session(
+                                    if let Some(generation) = generation {
+                                        match background_workers.try_update(QueuedUpdate::for_session(
                                             generation, Update::OpenUserImage(image),
-                                        )).is_err()
-                                    {
-                                        app.note("image worker is busy; click again to open");
+                                        )) {
+                                            Ok(()) => {}
+                                            Err(error) => match *error {
+                                                std::sync::mpsc::TrySendError::Full(_) => app.note("image worker is busy; click again to open"),
+                                                std::sync::mpsc::TrySendError::Disconnected(_) => app.note("image worker is unavailable"),
+                                            },
+                                        }
                                     }
                                 }
                                 Action::Copy(text) => {

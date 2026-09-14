@@ -141,11 +141,7 @@ impl SessionAttachmentCache {
         &mut self,
         image: MaterializedImage,
     ) -> Result<String, RetainOpenedError> {
-        if let Some(file) = self
-            .files
-            .get(&image.key)
-            .or_else(|| self.opened.get(&image.key))
-        {
+        if let Some(file) = self.file(image.key) {
             return url::Url::from_file_path(file.path())
                 .map(|uri| uri.to_string())
                 .map_err(|()| RetainOpenedError::InvalidPath);
@@ -171,8 +167,9 @@ impl SessionAttachmentCache {
     }
 
     /// Admits a worker-produced file without evicting existing session links.
+    /// Keys already retained by an open reuse that file instead.
     pub(super) fn admit(&mut self, image: MaterializedImage) {
-        if self.files.contains_key(&image.key)
+        if self.file(image.key).is_some()
             || self.files.len() >= MAX_SESSION_FILES
             || image.bytes > MAX_SESSION_BYTES.saturating_sub(self.bytes)
         {
@@ -182,8 +179,13 @@ impl SessionAttachmentCache {
         self.files.insert(image.key, image.file);
     }
 
+    fn file(&self, key: [u8; 32]) -> Option<&Arc<TemporaryAttachment>> {
+        self.files.get(&key).or_else(|| self.opened.get(&key))
+    }
+
+    /// Resolves a stable link for keys held by either pool.
     pub(super) fn image_uri(&self, key: [u8; 32]) -> Option<String> {
-        let file = self.files.get(&key)?;
+        let file = self.file(key)?;
         url::Url::from_file_path(file.path())
             .ok()
             .map(|uri| uri.to_string())
@@ -227,6 +229,23 @@ mod tests {
             assert!(!a_path.exists());
             assert!(!b_path.exists());
         }
+    }
+
+    #[test]
+    fn admit_and_lookup_reuse_files_retained_by_open() {
+        let mut cache = SessionAttachmentCache::default();
+        let opened = cache.retain_opened(overflow_image(1)).unwrap();
+        assert_eq!(cache.image_uri([1; 32]), Some(opened.clone()));
+        let duplicate = overflow_image(1);
+        let duplicate_path = duplicate.file.path().to_owned();
+        cache.admit(duplicate);
+        assert!(
+            !duplicate_path.exists(),
+            "opened keys must not be admitted twice"
+        );
+        assert!(cache.files.is_empty());
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(cache.image_uri([1; 32]), Some(opened));
     }
 
     #[test]

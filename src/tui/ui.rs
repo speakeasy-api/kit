@@ -1144,11 +1144,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             }
             continue;
         }
-        let sources = match app.blocks.get(block_index) {
-            Some(Block::User(message)) => &message.images,
-            Some(Block::Tool(call)) => &call.images,
-            _ => continue,
+        // User images render as clickable labels, never as inline viewports.
+        let Some(Block::Tool(call)) = app.blocks.get(block_index) else {
+            continue;
         };
+        let sources = &call.images;
         let Some(source) = sources.get(source_index) else {
             continue;
         };
@@ -1318,10 +1318,7 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     }
 }
 
-fn user_block_rows(
-    message: &UserMessage,
-    width: usize,
-) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptRow> {
     let mut rows = Vec::new();
     let mut line_start = 0;
     for (line_index, text) in message.text.split('\n').enumerate() {
@@ -1351,7 +1348,7 @@ fn user_block_rows(
             width,
         ));
     }
-    (rows, Vec::new())
+    rows
 }
 
 /// Place viewports at complete image boundaries before wrapping following prose.
@@ -1557,7 +1554,7 @@ fn single_transcript_block_rows(
 ) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
-        Block::User(message) => return user_block_rows(message, width),
+        Block::User(message) => return (user_block_rows(message, width), Vec::new()),
         Block::Agent(text) => return agent_block_rows(text, block_index, width, reserve_images),
         Block::AgentParts(parts) => {
             return agent_parts_rows(parts, block_index, width, reserve_images);
@@ -5752,9 +5749,8 @@ mod tests {
             images: vec![image],
         };
 
-        let (rows, placements) = user_block_rows(&message, 40);
+        let rows = user_block_rows(&message, 40);
 
-        assert!(placements.is_empty());
         assert_eq!(
             rows.iter().map(|row| line_text(&row.0)).collect::<Vec<_>>(),
             ["› before", "  Image #1", "  ", "  after", "  "]

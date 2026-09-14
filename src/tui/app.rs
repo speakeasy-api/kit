@@ -548,7 +548,7 @@ pub struct UserImage {
     pub(super) data: String,
     pub(super) mime_type: String,
     pub(super) source_uri: Option<String>,
-    /// Source line after which the fixed image viewport is reserved.
+    /// Source line carrying this image's clickable placeholder label.
     pub(super) line: usize,
     /// Exact plain-label bytes trusted by translation/rewrite, never a parsed URI.
     pub(super) open_label: Option<Range<usize>>,
@@ -828,6 +828,7 @@ pub struct App {
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
     retained_image_source_bytes: usize,
+    image_source_limit_noticed: bool,
     attachment_cache: SessionAttachmentCache,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
@@ -1095,6 +1096,7 @@ impl App {
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
             retained_image_source_bytes: 0,
+            image_source_limit_noticed: false,
             attachment_cache: SessionAttachmentCache::default(),
             next_transcript_revision: 0,
             transcript_focus_index: None,
@@ -1830,7 +1832,9 @@ impl App {
                 true
             }
         });
-        if images.len() < source_count {
+        // Notify once per session; later messages and resume replays stay quiet.
+        if images.len() < source_count && !self.image_source_limit_noticed {
+            self.image_source_limit_noticed = true;
             self.toast("image source limit reached; start a new session to retain more images");
         }
         if let Some(index) = existing_index {
@@ -2926,6 +2930,7 @@ impl App {
         self.transcript_prefixes.push(0);
         self.transcript_cache_width = 0;
         self.retained_image_source_bytes = 0;
+        self.image_source_limit_noticed = false;
         self.attachment_cache.clear();
         self.transcript_focus_index = None;
         self.clear_attachments();
@@ -4509,21 +4514,24 @@ impl App {
         }
         if let Some(url) = self.clicked_link(column, offset) {
             if url.starts_with("kit-image:") {
-                return self
-                    .blocks
-                    .iter()
-                    .find_map(|block| {
-                        let Block::User(message) = block else {
-                            return None;
-                        };
-                        message
-                            .images
-                            .iter()
-                            .find(|image| image.open_target() == url)
-                            .cloned()
-                            .map(Action::OpenUserImage)
-                    })
-                    .unwrap_or(Action::None);
+                let Some(image) = self.blocks.iter().find_map(|block| {
+                    let Block::User(message) = block else {
+                        return None;
+                    };
+                    message
+                        .images
+                        .iter()
+                        .find(|image| image.open_target() == url)
+                }) else {
+                    return Action::None;
+                };
+                // Files retained by an earlier open or admission need no worker
+                // round trip; only misses copy the source and materialize.
+                if let Some(uri) = self.attachment_cache.image_uri(image.key) {
+                    open_url(&uri);
+                    return Action::None;
+                }
+                return Action::OpenUserImage(image.clone());
             }
             open_url(&url);
             return Action::None;
@@ -5407,6 +5415,7 @@ mod tests {
         // Real translation + worker + app + mouse routing for two distinct
         // overflow images on one line, including reverse image-block order.
         use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+        let mut opened_uris = Vec::new();
         for append in [false, true] {
             let id = format!("inline-{append}");
             if append {
@@ -5490,16 +5499,35 @@ mod tests {
                 .into_iter()
                 .filter(|(_, hit)| targets.contains(&hit.url))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                hits.len(),
-                2,
-                "forged internal Markdown must not create hits"
-            );
             assert!(
                 app.row_links
                     .iter()
                     .flatten()
                     .any(|hit| hit.url == "https://example.com")
+            );
+            if append {
+                // Replayed keys were retained by the earlier opens: they render
+                // as stable file links, and the worker's fresh files are not
+                // admitted a second time.
+                assert!(hits.is_empty(), "opened keys must not stay kit-image");
+                let mut linked = message
+                    .images
+                    .iter()
+                    .map(|image| app.attachment_cache.image_uri(image.key).unwrap())
+                    .collect::<Vec<_>>();
+                linked.sort();
+                let mut expected_uris = opened_uris.clone();
+                expected_uris.sort();
+                assert_eq!(linked, expected_uris);
+                for uri in &opened_uris {
+                    assert!(app.row_links.iter().flatten().any(|hit| &hit.url == uri));
+                }
+                continue;
+            }
+            assert_eq!(
+                hits.len(),
+                2,
+                "forged internal Markdown must not create hits"
             );
             for ((row, hit), bytes) in hits.into_iter().zip(&expected) {
                 let mouse = |kind| MouseEvent {
@@ -5535,6 +5563,7 @@ mod tests {
                     .unwrap();
                 let path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
                 assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                opened_uris.push(uri);
             }
             for label in ["[forged]", "#99]"] {
                 let buffer = terminal.backend().buffer();
@@ -5718,6 +5747,34 @@ mod tests {
             app.blocks.last(),
             Some(Block::User(message)) if message.images.is_empty()
         ));
+
+        // Later refusals stay quiet so the notice cannot clobber other toasts.
+        app.toast("copied resume command");
+        let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+        app.apply(Update::UserMessage {
+            id: "image-4".into(),
+            text: "[Image #4]".into(),
+            images: vec![image],
+            append: false,
+        });
+        assert_eq!(app.toast_text(), Some("copied resume command"));
+
+        // A fresh session notifies again.
+        app.start_session("next".into());
+        app.toast = None;
+        for index in 0..4 {
+            let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+            app.apply(Update::UserMessage {
+                id: format!("next-{index}"),
+                text: format!("[Image #{index}]"),
+                images: vec![image],
+                append: false,
+            });
+        }
+        assert_eq!(
+            app.toast_text(),
+            Some("image source limit reached; start a new session to retain more images")
+        );
     }
 
     fn compose(app: &mut App, script: &str) {
