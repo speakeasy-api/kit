@@ -2313,20 +2313,33 @@ fn agent_lines(
     if let Some(model) = row.model.as_deref().filter(|model| !model.is_empty()) {
         identity.push(model.to_owned());
     }
+    let generation = truncate_to_width(&format!("g{}", row.generation), width);
+    let generation_width = UnicodeWidthStr::width(generation.as_str());
+    // Reserve generation and the inter-column gap before budgeting either side.
+    let gap = width.saturating_sub(generation_width).min(2);
+    let mut prefix_room = width.saturating_sub(generation_width + gap);
+    for span in &mut first {
+        span.content = truncate_to_width(&span.content, prefix_room).into();
+        prefix_room = prefix_room.saturating_sub(span.width());
+    }
+    let prefix_width = Line::from(first.clone()).width();
+    let identity_room = width.saturating_sub(prefix_width + 4 + gap + generation_width + 2);
+    let identity = truncate_to_width(&identity.join(" · "), identity_room);
     let mut right = Vec::new();
     if !identity.is_empty() {
-        right.push(Span::styled(identity.join(" · "), theme::faint()));
+        right.push(Span::styled(identity, theme::faint()));
         right.push(Span::raw("  "));
     }
-    right.push(Span::styled(format!("g{}", row.generation), theme::faint()));
-    let name_room = width
-        .saturating_sub(Line::from(first.clone()).width() + Line::from(right.clone()).width() + 2)
-        .max(4);
+    right.push(Span::styled(generation, theme::faint()));
+    let name_room = width.saturating_sub(prefix_width + Line::from(right.clone()).width() + gap);
     first.push(Span::styled(
         truncate_to_width(&format!("{}{ancestry}", row.name), name_room),
         theme::text(),
     ));
-    let first = spread(first, right, width);
+    let used = Line::from(first.clone()).width() + Line::from(right.clone()).width();
+    first.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    first.extend(right);
+    let first = Line::from(first);
 
     let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
     let elapsed = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
@@ -3632,6 +3645,37 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer_cells(buffer, 1, 1..10), "⠋ ◎ Fixer");
         assert_eq!(buffer_cells(buffer, 4, 1..12), "○ k Scout 0");
+    }
+
+    #[test]
+    fn agents_panel_fits_nested_long_identity_and_preserves_generation() {
+        let mut app = panel_app(1);
+        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+            id: "child".into(),
+            name: "Nested agent with a long name".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 123,
+            task: "Patch the parser".into(),
+            parent_id: Some("agent-0".into()),
+            parent_name: Some("Scout 0".into()),
+            harness: "acp.codex".into(),
+            vendor: crate::events::HarnessVendor::Codex,
+            model: Some("very-long-model-模型-identifier-that-exceeds-panel-width".into()),
+            created_at_unix_ms: 3_000,
+            generation_started_at_unix_ms: 3_000,
+            generation_finished_at_unix_ms: None,
+        }));
+        for width in [30, 46, 60] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).expect("terminal");
+            terminal
+                .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+                .expect("draw succeeds");
+            let row = buffer_row(terminal.backend().buffer(), 4);
+            assert!(row.contains("└─ ⠋ ◎ Nes"), "{row}");
+            assert!(row.contains("…"), "{row}");
+            assert!(row.ends_with("g123│"), "{row}");
+        }
     }
 
     #[test]
