@@ -41,7 +41,7 @@ use crate::{
     tools::{
         A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
         Observed, PromptTool, ReadFileTool, ShellTool, SteerTool, SubagentTool, Subagents,
-        SubagentsTool, ToolSearch, observe_shared,
+        SubagentsTool, ToolSchema, ToolSearch, observe_shared,
     },
 };
 
@@ -1239,7 +1239,14 @@ impl Runtime {
                 }
             })))
             .register(Observed::new(A2aTool::new()))
-            .register(Observed::new(ToolSearch::new(mcp.clone())))
+            .register(Observed::new(ToolSearch::new(
+                mcp.clone(),
+                crate::artifacts::base(&self.root),
+            )))
+            .register(Observed::new(ToolSchema::new(
+                mcp.clone(),
+                crate::artifacts::base(&self.root),
+            )))
             .register(Observed::new(AuthTool::new(mcp.clone())))
             .register(Observed::new(McpTool::new(mcp)));
         if let Some(skill_tool) = &self.dynamic_skill_tool {

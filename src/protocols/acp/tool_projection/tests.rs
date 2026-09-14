@@ -23,6 +23,7 @@ fn evaluated_metadata_has_both_wire_shapes_without_retaining_arguments() {
         ("edit", "edit"),
         ("read_file", "read"),
         ("tool_search", "search"),
+        ("tool_schema", "read"),
         ("docs", "fetch"),
         ("prompt", "other"),
     ] {

@@ -111,12 +111,13 @@ An explicit `auth` block is an optional fallback or override. Set `auth.type` to
 
 ## Discover, authenticate, and call MCP tools
 
-MCP tools are model-visible through three meta-tools rather than as an unrestricted static list. The expected workflow is:
+MCP tools are model-visible through four meta-tools rather than as an unrestricted static list. The expected workflow is:
 
 1. Call `tool_search({ query: "issues" })`. The search reloads the configuration, waits for any servers that are still initializing, then ranks every connected server's tools globally with high precision: a tool must match the query in its name or match every query term. At most 5 tools are returned across all servers—often fewer—sorted by score and grouped by server with `available_tool_count`, `matched_tool_count`, `returned_tool_count`, and `truncated`, plus top-level `total_matched`, `total_returned`, and `truncated`. Responses are capped at 32 KiB by dropping lowest-ranked status-only server groups before lowest-ranked tools; the counts show when that happened. A server whose name strongly matches the query but which needs authentication or failed to connect is listed without tools. Use the exact query `tool_search({ query: "mcp" })` (case-insensitive) for a compact configured-server listing—name, bounded description, status, bounded optional error, and `available_tool_count` (`null` unless connected)—without any tool schemas. Compact listings drop tail servers when necessary and report `total_servers`, `returned_servers`, and `truncated`.
 2. If the selected server has status `authentication_required`, call `auth({ name: "projects" })` with its exact server name. Give the returned `url` to the user. While the flow is active, status is `pending`; the loopback browser callback expires after 10 minutes.
 3. When the user completes OAuth, Kit stores the credentials, connects the server, and sends a notification to the originating ACP session. The agent resumes automatically and can search or call the newly available tools; no manual post-authentication search is required.
-4. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema. Calls have a 60-second deadline by default. Set the optional `timeout_seconds` field from 1 through 3600 only when the tool is expected to return after that default; for example, `tool({ name: "returned_tool_name", args: { ... }, timeout_seconds: 300 })`.
+4. If a tool has `schema_incomplete: true`, inspect its full input schema with `tool_schema` using the returned `schema_ref` before constructing arguments (see below).
+5. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema. Calls have a 60-second deadline by default. Set the optional `timeout_seconds` field from 1 through 3600 only when the tool is expected to return after that default; for example, `tool({ name: "returned_tool_name", args: { ... }, timeout_seconds: 300 })`.
 
 A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. A missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
@@ -125,6 +126,24 @@ A connected server reports `authenticated`, including servers that do not need O
 Interactive browser authentication is enabled in the long-lived `kit tui`, `kit serve`, and `kit acp` runtimes. It is disabled in the one-shot `kit prompt` command. A challenged server still appears as `authentication_required` so the cause is preserved, while calling `auth` reports `interactive MCP authentication requires the tui, serve, or acp command`.
 
 `kit prompt` can still use OAuth credentials restored from a persistent store. Authenticate first in a long-lived runtime using the same MCP configuration and credential store, then run the prompt with those settings. The OAuth redirect listener binds a temporary `127.0.0.1` port, so the browser must be able to reach the local callback.
+
+## Inspect large tool schemas
+
+Oversized tool schemas in `tool_search` results expose a `schema_ref` and `schema_incomplete: true` instead of requiring the whole schema to fit in the search response. Treat incomplete schema metadata as a discovery summary, not a complete argument contract.
+
+Call `tool_schema({ schema_ref: "returned_schema_ref" })` to inspect the root. Its optional fields are `pointer` (a JSON Pointer, default `""` for the root), `offset` (default `0`), and `limit` (default `16`, maximum `32`). For example:
+
+```text
+tool_schema({ schema_ref: "returned_schema_ref", pointer: "/properties", offset: 0, limit: 16 })
+```
+
+Each response is a bounded structural view with shallow children and their JSON pointers, incomplete metadata, and `next_offset` when more children remain. Use the returned pointers to descend and `next_offset` to page the same pointer. The top-level `children_incomplete` flag means this page does not contain every direct child; `incomplete` also accounts for shallow or truncated children. Each node summary has its own `incomplete` flag. Do not assume a shallow view contains the complete subtree. Arbitrary object keys are addressable: JSON Pointer escapes `~` as `~0` and `/` as `~1`; array elements use numeric index segments.
+
+Schema `$ref` values are never expanded automatically. Inspect referenced locations explicitly when needed; for a local reference such as `#/$defs/Issue`, use the pointer `/$defs/Issue` with the same `schema_ref`.
+
+Long descriptions are previews marked with `description_truncated`. When a `description_artifact` is provided, its `{ path, total_bytes }` identifies the full text. Read it with `artifact({ path: "returned_artifact_path" })`, then continue from the reader's `next_offset` until `eof`. Do not use a shell command to read it: artifacts can be retained only in memory. Other oversized strings (including enum values and unusually long pointers) use the same `<field>_truncated` and `<field>_artifact` convention. Read a truncated pointer's artifact before using that pointer to descend.
+
+Schema references are validated against the session and current MCP catalog. Do not reuse references from another session or retain them as durable identifiers. If a reference is rejected after a catalog change, search again and use the new reference.
 
 ## ACP child behavior
 

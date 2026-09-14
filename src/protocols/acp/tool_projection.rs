@@ -104,6 +104,7 @@ impl Invocation {
             "edit" => ("Editing file", "edit"),
             "read_file" => ("Reading image", "read"),
             "tool_search" => ("Searching available tools", "search"),
+            "tool_schema" => ("Reading tool schema", "read"),
             "docs" => ("Fetching Kit documentation", "fetch"),
             "subagent" => ("Starting subagent", "other"),
             "prompt" => ("Prompting subagent", "other"),

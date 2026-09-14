@@ -1181,6 +1181,7 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
         ])
     );
     assert!(specs[0].description.contains("`tool_search`"));
+    assert!(specs[0].description.contains("`tool_schema`"));
     assert!(specs[0].description.contains("`auth`"));
     assert!(specs[0].description.contains("`tool`"));
     assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
