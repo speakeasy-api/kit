@@ -357,7 +357,7 @@ fn terminal_drop_marks_exit_and_bounds_binary_chunks_and_metadata() {
     let invocation = Invocation::start(&request, None).unwrap();
     let terminal = terminal::Terminal::start(
         &request,
-        &"x".repeat(crate::runlet_progress::MAX_SOURCE + 1),
+        &"x".repeat(terminal::MAX_COMMAND_BYTES + 1),
         Path::new("/tmp"),
     );
     terminal.output().unwrap().chunk(&vec![255; 20_000]);

@@ -61,11 +61,6 @@ pub(crate) fn with_stalled_stderr(test: &str) -> bool {
 use super::{EVENT_MARKER, RuntimeEvent};
 
 pub(crate) fn write_event(writer: &mut impl std::io::Write, event: &RuntimeEvent) {
-    if let RuntimeEvent::RunletProgress { progress } = event
-        && !progress.bounded()
-    {
-        return;
-    }
     if let Ok(line) = serde_json::to_string(event) {
         let _ = writeln!(writer, "{EVENT_MARKER}{line}");
     }

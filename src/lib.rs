@@ -22,6 +22,7 @@ pub mod config_editor;
 #[doc(hidden)]
 pub mod config_files;
 mod credentials;
+mod diagnostic_transport;
 pub mod docs;
 pub mod events;
 mod fatal;
@@ -34,7 +35,6 @@ pub(crate) mod process_tree;
 pub mod protocols;
 pub mod provider;
 pub mod request_budget;
-mod runlet_progress;
 pub mod runtime;
 /// Shared internal filesystem and process-lifetime recovery controls.
 pub mod resilient_fs {

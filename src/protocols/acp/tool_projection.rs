@@ -28,7 +28,7 @@ pub(crate) mod terminal;
 )]
 mod diff_tests;
 
-const CAPACITY: usize = crate::runlet_progress::MAX_NODES;
+const CAPACITY: usize = 256;
 const MAX_ID: usize = 256;
 const MAX_PATH: usize = 4096;
 

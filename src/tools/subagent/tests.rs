@@ -1110,7 +1110,6 @@ mod lifecycle_events {
                 (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
             ]
         );
-        assert!(emitted.iter().all(|event| event.parent_call().is_none()));
         let generations = emitted
             .iter()
             .filter_map(|event| match event {

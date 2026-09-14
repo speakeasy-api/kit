@@ -15,7 +15,7 @@ mod image;
 #[cfg(all(test, unix))]
 mod keyboard_tests;
 mod markdown;
-mod progress;
+mod source;
 mod theme;
 mod ui;
 mod wrap;
@@ -67,7 +67,7 @@ use wire::{
 };
 
 use crate::{
-    events::{self, EVENTS_ENV, RuntimeEvent},
+    events::{self, EVENTS_ENV},
     protocols::acp::{
         FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID, model_switch,
     },
@@ -2759,11 +2759,6 @@ impl std::error::Error for Failure {}
 /// still drive runtime availability, subagent status, storage, and failure reports.
 fn stderr_update(line: String) -> Option<Update> {
     match events::parse(&line) {
-        Some(
-            RuntimeEvent::ChildStarted { .. }
-            | RuntimeEvent::ChildFinished { .. }
-            | RuntimeEvent::RunletProgress { .. },
-        ) => None,
         Some(event) => Some(Update::Runtime(event)),
         None if line.starts_with("A2A listening on ") => Some(Update::A2aAddress(
             line.trim_start_matches("A2A listening on ").to_string(),
@@ -4038,7 +4033,7 @@ mod tests {
         let heartbeat = || line(RuntimeEvent::RunletTransport { available: true });
         app.apply(stderr_update(heartbeat()).unwrap());
         assert!(!app.runtime_unavailable());
-        app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+        app.runtime_tick_at(std::time::Instant::now() + crate::diagnostic_transport::LEASE);
         assert!(app.runtime_unavailable());
         app.apply(stderr_update(heartbeat()).unwrap());
         assert!(
@@ -4059,31 +4054,6 @@ mod tests {
             assert!(
                 matches!(stderr_update(line(event.clone())), Some(Update::Runtime(actual)) if actual == event)
             );
-        }
-        for event in [
-            RuntimeEvent::ChildStarted {
-                call: "child".into(),
-                tool: "shell".into(),
-                summary: "running".into(),
-                at: 1,
-            },
-            RuntimeEvent::ChildFinished {
-                call: "child".into(),
-                tool: "shell".into(),
-                ok: true,
-                summary: "done".into(),
-                millis: 1,
-            },
-            RuntimeEvent::RunletProgress {
-                progress: crate::runlet_progress::Progress {
-                    owner: "root".into(),
-                    incarnation: 1,
-                    sequence: 1,
-                    change: crate::runlet_progress::Change::Finished { complete: true },
-                },
-            },
-        ] {
-            assert!(stderr_update(line(event)).is_none());
         }
         assert!(
             matches!(stderr_update("ordinary diagnostic".into()), Some(Update::Log(line)) if line == "ordinary diagnostic")

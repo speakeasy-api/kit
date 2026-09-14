@@ -21,7 +21,7 @@ use crate::events::{GenerationOutcome, SubagentStatus};
 use super::{
     app::{
         AgentPart, AgentTreeRow, App, Block, CachedTranscriptBlock, CachedTranscriptImage,
-        CachedTranscriptRow, Child, CodeHit, ComposeView, EffortDialog, FilePickerDialog,
+        CachedTranscriptRow, CodeHit, ComposeView, EffortDialog, FilePickerDialog,
         FilePickerStatus, ModelDialog, Phase, SessionRename, ToolCall, UserMessage,
     },
     command,
@@ -1168,7 +1168,7 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     for block_index in dirty {
         let dynamic = match &app.blocks[block_index] {
             Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running() || call.running_children() > 0,
+            Block::Tool(call) => call.running(),
             _ => false,
         };
         let revision = app.transcript_revisions[block_index];
@@ -1624,27 +1624,11 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
                     && !call.script.is_empty()))
         {
             lines.extend(script_lines(call));
-        } else if let Some(child) = call.children.iter().rev().find(|child| child.running()) {
-            lines.push(Line::from(vec![
-                Span::styled("   ↳ ", theme::faint()),
-                Span::styled(child.summary.clone(), theme::dim()),
-            ]));
         }
         if call.expanded {
             lines.extend(output_lines(call));
         }
         return lines;
-    }
-    if !compose {
-        for child in call.children.iter().take(6) {
-            lines.push(Line::from(child_spans(app, child, "   ")));
-        }
-        if call.children.len() > 6 {
-            lines.push(Line::from(Span::styled(
-                format!("   … {} more calls", call.children.len() - 6),
-                theme::faint(),
-            )));
-        }
     }
     if compose {
         lines.extend(completed_compose_lines(call));
@@ -1654,25 +1638,17 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
     lines
 }
 
-/// Source lines stay neutral. Exact runtime call spans add qualified counts at
-/// their source start line; annotations never assert whole-line/binding state.
+/// Source lines stay neutral; ACP owns tool lifecycle display.
 fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
-    let annotations = call.progress.labels(&call.script);
     let mut lines: Vec<_> = call
         .script
         .lines()
         .take(MAX_OUTPUT_ROWS)
-        .enumerate()
-        .map(|(index, source)| {
-            let mut spans = vec![
+        .map(|source| {
+            let spans = vec![
                 Span::styled("   │ ", theme::faint()),
                 Span::styled(source.to_string(), theme::dim()),
             ];
-            if let Some(labels) = annotations.get(&(index + 1)) {
-                for label in labels {
-                    spans.push(Span::styled(format!("  {label}"), theme::dim()));
-                }
-            }
             Line::from(spans)
         })
         .collect();
@@ -1688,36 +1664,7 @@ fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
 
 fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
     if !call.expanded {
-        let mut counts = std::collections::HashMap::<&str, usize>::new();
-        for child in &call.children {
-            *counts.entry(child.tool.as_str()).or_default() += 1;
-        }
-        let mut counts = counts.into_iter().collect::<Vec<_>>();
-        counts.sort_by(|(left_name, left_count), (right_name, right_count)| {
-            right_count
-                .cmp(left_count)
-                .then_with(|| left_name.cmp(right_name))
-        });
-        if counts.is_empty() {
-            return output_lines(call);
-        }
-        let summary = counts
-            .into_iter()
-            .take(4)
-            .map(|(name, count)| {
-                if count > 1 {
-                    format!("{name} x {count}")
-                } else {
-                    name.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" · ");
-        return vec![Line::from(vec![
-            Span::styled("   ▸ ", theme::dim()),
-            Span::styled(summary, theme::dim()),
-            Span::styled("  click or ^o to open", theme::faint()),
-        ])];
+        return output_lines(call);
     }
 
     let (output_style, script_style, hint) = match call.compose_view {
@@ -1832,18 +1779,6 @@ fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
             spans.push(Span::styled(" · ^k kill", theme::accent()));
         }
     }
-    let running = call.running_children();
-    if running > 0 {
-        spans.push(Span::styled(
-            format!("  · {running} in flight"),
-            Style::default().fg(theme::running_color()),
-        ));
-    } else if (call.expanded || call.running() || !call.is_compose()) && !call.children.is_empty() {
-        spans.push(Span::styled(
-            format!("  · {} calls", call.children.len()),
-            theme::faint(),
-        ));
-    }
     spans
 }
 
@@ -1861,33 +1796,6 @@ fn kind_label(kind: &ToolKind) -> &'static str {
         ToolKind::SwitchMode => "  mode",
         _ => "",
     }
-}
-
-fn child_spans(app: &App, child: &Child, indent: &str) -> Vec<Span<'static>> {
-    let (glyph, style) = if child.running() {
-        (
-            theme::pulse(theme::Pulse::Child, app.tick).to_string(),
-            Style::default().fg(theme::running_color()),
-        )
-    } else if child.ok {
-        ("✓".into(), Style::default().fg(theme::success_color()))
-    } else {
-        ("✗".into(), Style::default().fg(theme::error_color()))
-    };
-    let detail = if child.running() || child.result.is_empty() {
-        child.summary.clone()
-    } else {
-        child.result.clone()
-    };
-    vec![
-        Span::styled(format!("{indent}{glyph} "), style),
-        Span::styled(format!("{:<8}", child.tool), theme::dim()),
-        Span::styled(
-            format!("{:>7}  ", theme::duration(child.elapsed())),
-            theme::faint(),
-        ),
-        Span::styled(detail, theme::dim()),
-    ]
 }
 
 fn working_line(app: &App) -> Line<'static> {
@@ -3538,7 +3446,7 @@ mod tests {
         assert_eq!(right, 79);
     }
 
-    include!("progress_tests.rs");
+    include!("runtime_health_tests.rs");
 
     const SCRIPT: &str = "files = shell({ command: \"ls src\" })\n\
         checked = for file in files.lines {\n\
@@ -3564,25 +3472,6 @@ mod tests {
             script: Some(SCRIPT.into()),
             backgrounded: false,
         });
-        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-            call: "call-1:compose:one".into(),
-            tool: "shell".into(),
-            summary: "ls src".into(),
-            at: 0,
-        }));
-        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-            call: "call-1:compose:one".into(),
-            tool: "shell".into(),
-            ok: true,
-            summary: "main.rs".into(),
-            millis: 120,
-        }));
-        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-            call: "call-1:compose:two".into(),
-            tool: "shell".into(),
-            summary: "cargo check".into(),
-            at: 0,
-        }));
         app
     }
 
@@ -4051,7 +3940,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_script_stays_neutral_with_running_and_successful_calls() {
+    fn compose_source_stays_neutral() {
         let mut app = sample();
 
         let frame = render(&mut app, 120, 40);
@@ -4060,101 +3949,11 @@ mod tests {
             frame.contains("files = shell({ command: \"ls src\" })"),
             "{frame}"
         );
-        assert!(frame.contains("1 in flight"), "{frame}");
         assert!(!frame.contains(" # "), "{frame}");
         assert!(!frame.contains("resolved"), "{frame}");
         assert!(!frame.contains("iteration 1 running"), "{frame}");
         assert!(!frame.contains("shell running"), "{frame}");
         assert!(app.transcript_width > 100, "{}", app.transcript_width);
-    }
-
-    #[test]
-    fn compose_script_does_not_infer_failure_retry_or_waiting_state() {
-        let script = "value = boundary retry 2 {\n\
-            return shell({ command: \"false\" })\n\
-        } catch err {\n\
-            return fail(\"FAILED\", err.message)\n\
-        }\n\
-        later = docs({ query: \"next\" })\n\
-        return value";
-        let mut app = App::new(
-            PathBuf::from("/Users/dev/projects/kit"),
-            "openai-subscription".into(),
-            "gpt-5.4".into(),
-            "127.0.0.1:7331".into(),
-        );
-        app.apply(Update::ToolStarted {
-            id: "call-1".into(),
-            title: "compose".into(),
-            kind: ToolKind::Other,
-            script: Some(script.into()),
-            backgrounded: false,
-        });
-        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-            call: "call-1:compose:failed".into(),
-            tool: "shell".into(),
-            summary: "false".into(),
-            at: 0,
-        }));
-        app.apply(Update::Runtime(RuntimeEvent::ChildFinished {
-            call: "call-1:compose:failed".into(),
-            tool: "shell".into(),
-            ok: false,
-            summary: "exit code 1".into(),
-            millis: 10,
-        }));
-
-        let frame = render(&mut app, 100, 30);
-
-        assert!(frame.contains("value = boundary retry 2 {"), "{frame}");
-        assert!(!frame.contains(" # "), "{frame}");
-        assert!(!frame.contains("value failed"), "{frame}");
-        assert!(!frame.contains("attempt 1"), "{frame}");
-        assert!(!frame.contains("shell failure"), "{frame}");
-        assert!(!frame.contains("later waiting"), "{frame}");
-    }
-
-    #[test]
-    fn compose_script_does_not_attribute_descendants_to_a_dependent_review() {
-        let mut app = App::new(
-            PathBuf::from("/Users/dev/projects/kit"),
-            "openai-subscription".into(),
-            "gpt-5.4".into(),
-            "127.0.0.1:7331".into(),
-        );
-        let script = "a = subagent({name: \"implementation\", prompt: input.task})\n\
-            r = subagent({name: \"review\", prompt: json.encode(a.output)})\n\
-            return r";
-        app.apply(Update::ToolStarted {
-            id: "root".into(),
-            title: "compose".into(),
-            kind: ToolKind::Other,
-            script: Some(script.into()),
-            backgrounded: true,
-        });
-        for call in [
-            "root:compose:implementation",
-            "child:compose:storage",
-            "child:compose:backfill",
-            "child:compose:transport",
-            "child:compose:tests",
-        ] {
-            app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-                call: call.into(),
-                tool: "subagent".into(),
-                summary: "working".into(),
-                at: 0,
-            }));
-        }
-        let frame = render(&mut app, 160, 30);
-        assert!(frame.contains("1 in flight"), "{frame}");
-        let source_rows: Vec<_> = frame
-            .lines()
-            .filter_map(|line| line.split_once("│ ").map(|(_, source)| source.trim_end()))
-            .collect();
-        assert_eq!(source_rows, script.lines().collect::<Vec<_>>());
-        assert!(!frame.contains("subagent: 2 running"), "{frame}");
-        assert!(!frame.contains("subagent: 3 running"), "{frame}");
     }
 
     #[test]
@@ -4179,43 +3978,6 @@ mod tests {
         let intent = render(&mut app, 100, 30);
         assert!(intent.contains("Check every source file."), "{intent}");
         assert!(!intent.contains("Running tools."), "{intent}");
-    }
-
-    #[test]
-    fn collapsed_compose_groups_sorts_and_caps_child_tool_names() {
-        let mut app = sample();
-        let Block::Tool(call) = app.blocks.last_mut().expect("compose call") else {
-            panic!("last block was not a tool");
-        };
-        for (index, tool) in [
-            "shell", "docs", "shell", "alpha", "edit", "docs", "fork", "shell", "alpha",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            call.attach(format!("extra-{index}"), tool.into(), tool.into());
-        }
-        app.apply(Update::ToolPatched {
-            title: None,
-            kind: None,
-            images: None,
-            append_output: false,
-            intent: None,
-            id: "call-1".into(),
-            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
-            script: None,
-            output: Some(vec!["done".into()]),
-            backgrounded: false,
-        });
-
-        let frame = render(&mut app, 120, 35);
-        let shell = frame.find("shell x 5").expect("shell summary");
-        let alpha = frame.find("alpha x 2").expect("alpha summary");
-        let docs = frame.find("docs x 2").expect("docs summary");
-        let edit = frame.find("edit").expect("edit summary");
-        assert!(shell < alpha && alpha < docs && docs < edit, "{frame}");
-        assert!(!frame.contains("edit x 1"), "{frame}");
-        assert!(!frame.contains("fork"), "{frame}");
     }
 
     #[test]
@@ -4273,7 +4035,7 @@ mod tests {
         });
 
         let collapsed = render(&mut app, 100, 30);
-        assert!(collapsed.contains("shell x 2"), "{collapsed}");
+        assert!(collapsed.contains("1 line of output"), "{collapsed}");
         assert!(!collapsed.contains("compose result"), "{collapsed}");
         assert!(!collapsed.contains("files = shell"), "{collapsed}");
 
@@ -4293,7 +4055,10 @@ mod tests {
 
         app.toggle_last_output();
         let collapsed_again = render(&mut app, 100, 30);
-        assert!(collapsed_again.contains("shell x 2"), "{collapsed_again}");
+        assert!(
+            collapsed_again.contains("1 line of output"),
+            "{collapsed_again}"
+        );
         assert!(!collapsed_again.contains("Output"), "{collapsed_again}");
     }
 
@@ -4366,42 +4131,6 @@ mod tests {
             _ => None,
         });
         assert!(previous.is_some_and(|call| !call.expanded));
-    }
-
-    #[test]
-    fn non_compose_child_summary_requires_a_matching_parent() {
-        let mut app = App::new(
-            PathBuf::from("/Users/dev/projects/kit"),
-            "openai-subscription".into(),
-            "gpt-5.4".into(),
-            "127.0.0.1:7331".into(),
-        );
-        app.apply(Update::ToolStarted {
-            id: "call-1".into(),
-            title: "shell".into(),
-            kind: ToolKind::Execute,
-            script: None,
-            backgrounded: false,
-        });
-        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-            call: "call-1:child".into(),
-            tool: "shell".into(),
-            summary: "cargo check".into(),
-            at: 0,
-        }));
-
-        let frame = render(&mut app, 80, 20);
-
-        assert!(!frame.contains("↳ cargo check"), "{frame}");
-
-        app.apply(Update::Runtime(RuntimeEvent::ChildStarted {
-            call: "call-1:compose:child".into(),
-            tool: "shell".into(),
-            summary: "cargo check".into(),
-            at: 0,
-        }));
-        let frame = render(&mut app, 80, 20);
-        assert!(frame.contains("↳ cargo check"), "{frame}");
     }
 
     #[test]

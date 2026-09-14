@@ -1,17 +1,5 @@
-//! Side channel that carries nested tool activity from `kit serve` to the
-//! terminal client, along with the id of each persisted ACP session it opens.
-//!
-//! ACP reports the model-visible `compose` call, but every interesting thing
-//! Kit does happens *inside* that call: the Runlet program dispatches shell,
-//! edit, subagent, and A2A children concurrently. The terminal client renders
-//! that as inline live script state, so it needs the child lifecycle.
-//!
-//! Rather than fork the ACP surface, the events ride on stderr — Kit's
-//! diagnostics channel — as single JSON lines behind a control-character
-//! marker. The terminal client owns the `serve` child process and pipes its
-//! stderr, so marked lines become script-state updates and everything else
-//! becomes log output. Emission is opt-in through `KIT_RUNTIME_EVENTS` so ordinary
-//! ACP hosts never see the extra chatter.
+//! Ephemeral stderr diagnostics for session attachment, runtime health, and
+//! subagent lifecycle. Tool cards are projected through canonical ACP events.
 
 use std::{
     sync::OnceLock,
@@ -19,7 +7,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Prefix that distinguishes an event line from a diagnostic line. The
 /// leading control character cannot appear in ordinary log text.
@@ -29,37 +16,15 @@ pub const EVENT_MARKER: &str = "\u{1}kit-runtime\u{1}";
 pub const EVENTS_ENV: &str = "KIT_RUNTIME_EVENTS";
 
 /// One runtime event sent privately to the terminal client.
-///
-/// `call` is the compose child call id, shaped `<parent>:compose:<operation>`,
-/// so a client can attribute every child to the ACP tool call it belongs to.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RuntimeEvent {
-    /// Process-wide progress transport lease/reset, not a source execution.
+    /// Process-wide diagnostic transport lease/reset.
     RunletTransport { available: bool },
-    /// Authoritative, value-free observations owned by an exact compose call.
-    RunletProgress {
-        progress: crate::runlet_progress::Progress,
-    },
     /// Process-wide durability state, independent of the active ACP session.
     StorageStatus { pending: bool, exhausted: bool },
     /// A persisted ACP session was opened by the child runtime.
     SessionStarted { session_id: String },
-    /// A nested tool call started running.
-    ChildStarted {
-        call: String,
-        tool: String,
-        summary: String,
-        at: u64,
-    },
-    /// A nested tool call finished, successfully or not.
-    ChildFinished {
-        call: String,
-        tool: String,
-        ok: bool,
-        summary: String,
-        millis: u64,
-    },
     /// Automatic transcript compaction started.
     CompactionStarted { reason: String, at: u64 },
     /// Automatic transcript compaction finished.
@@ -191,32 +156,11 @@ impl RuntimeEvent {
     pub(crate) fn forward_from_child(&self) -> bool {
         matches!(
             self,
-            Self::ChildStarted { .. }
-                | Self::ChildFinished { .. }
-                | Self::SubagentStateChanged { .. }
+            Self::SubagentStateChanged { .. }
                 | Self::SubagentUsage { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentDescendantsRemoved { .. }
         )
-    }
-
-    /// The ACP tool call this child belongs to, when the id carries one.
-    #[must_use]
-    pub fn parent_call(&self) -> Option<&str> {
-        let call = match self {
-            Self::RunletProgress { progress } => return Some(&progress.owner),
-            Self::ChildStarted { call, .. } | Self::ChildFinished { call, .. } => call,
-            Self::RunletTransport { .. }
-            | Self::StorageStatus { .. }
-            | Self::SessionStarted { .. }
-            | Self::CompactionStarted { .. }
-            | Self::CompactionFinished { .. }
-            | Self::SubagentStateChanged { .. }
-            | Self::SubagentUsage { .. }
-            | Self::SubagentActivity { .. }
-            | Self::SubagentDescendantsRemoved { .. } => return None,
-        };
-        call.rsplit_once(":compose:").map(|(parent, _)| parent)
     }
 }
 
@@ -228,12 +172,12 @@ pub fn enabled() -> bool {
 }
 
 /// Enqueues one event without waiting for stderr. Loss disables the transport;
-/// its explicit reset (or the client lease on a stalled sink) hides source state.
+/// its explicit reset (or the client lease on a stalled sink) invalidates runtime status.
 pub fn emit(event: &RuntimeEvent) {
     if !enabled() {
         return;
     }
-    if let Some(transport) = crate::runlet_progress::transport::global() {
+    if let Some(transport) = crate::diagnostic_transport::global() {
         transport.publish_event(event);
     }
 }
@@ -245,15 +189,7 @@ pub fn parse(line: &str) -> Option<RuntimeEvent> {
     if body.len() > 64 * 1024 {
         return None;
     }
-    // Existing diagnostic events retain their historical parser shape. The new
-    // bounded payload is checked before it can reach retained UI state.
-    let event: RuntimeEvent = serde_json::from_str(body).ok()?;
-    if let RuntimeEvent::RunletProgress { progress } = &event
-        && (body.len() > 4096 || !progress.bounded())
-    {
-        return None;
-    }
-    Some(event)
+    serde_json::from_str(body).ok()
 }
 
 /// Milliseconds since the Unix epoch, saturating at zero on a broken clock.
@@ -263,61 +199,6 @@ pub fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
-}
-
-/// One short line describing what a nested call was asked to do.
-#[must_use]
-pub fn summarize_input(input: &Value) -> String {
-    subject(
-        input,
-        &[
-            "command", "path", "file", "prompt", "task", "query", "url", "message",
-        ],
-    )
-}
-
-/// One short line describing what a nested call produced.
-#[must_use]
-pub fn summarize_output(output: &Value) -> String {
-    subject(
-        output,
-        &["stdout", "text", "message", "summary", "path", "error"],
-    )
-}
-
-/// One short line describing a tool payload.
-///
-/// Tool inputs and outputs are small JSON objects whose most descriptive field
-/// differs per tool, so the first field that reads like a subject wins, and
-/// anything unexpected falls back to compact JSON.
-fn subject(value: &Value, keys: &[&str]) -> String {
-    let named = value.as_object().and_then(|fields| {
-        keys.iter()
-            .filter_map(|key| fields.get(*key))
-            .find(|field| !matches!(field, Value::String(text) if text.trim().is_empty()))
-            .map(render_value)
-    });
-    truncate(&named.unwrap_or_else(|| render_value(value)), 160)
-}
-
-fn render_value(value: &Value) -> String {
-    let text = match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    };
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(limit).collect();
-    format!("{kept}…")
 }
 
 #[cfg(test)]
@@ -330,13 +211,12 @@ fn truncate(text: &str, limit: usize) -> String {
     clippy::disallowed_macros
 )]
 mod tests {
-    use std::io::{self, Write};
-
     use serde_json::json;
+    use std::io::{self, Write};
 
     use super::{
         EVENT_MARKER, GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus, parse,
-        summarize_input, summarize_output, test_support::write_event,
+        test_support::write_event,
     };
 
     #[test]
@@ -348,21 +228,18 @@ mod tests {
             let wire = String::from_utf8(wire).unwrap();
             let parsed = parse(wire.trim_end()).unwrap();
             assert_eq!(parsed, event);
-            assert_eq!(parsed.parent_call(), None);
         }
     }
 
     #[test]
     fn reads_back_an_emitted_event_line() {
-        let event = RuntimeEvent::ChildStarted {
-            call: "call-1:compose:abcdef".into(),
-            tool: "shell".into(),
-            summary: "ls".into(),
+        let event = RuntimeEvent::CompactionStarted {
+            reason: "test".into(),
             at: 7,
         };
         let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
         let parsed = parse(&line).expect("event round trips");
-        assert_eq!(parsed.parent_call(), Some("call-1"));
+        assert_eq!(parsed, event);
     }
 
     #[test]
@@ -397,7 +274,6 @@ mod tests {
         for event in [changed, removed] {
             let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
             assert_eq!(parse(&line), Some(event.clone()));
-            assert_eq!(event.parent_call(), None);
         }
     }
 
@@ -451,7 +327,6 @@ mod tests {
             let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
             assert_eq!(parse(&line), Some(event.clone()));
             assert!(event.forward_from_child());
-            assert_eq!(event.parent_call(), None);
         }
     }
 
@@ -469,7 +344,6 @@ mod tests {
         let parsed = parse(&line).unwrap();
         assert_eq!(parsed, usage);
         assert!(parsed.forward_from_child());
-        assert_eq!(parsed.parent_call(), None);
     }
 
     #[test]
@@ -595,8 +469,8 @@ mod tests {
         };
         let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
         let parsed = parse(&line).expect("event round trips");
+        assert_eq!(parsed, event);
         assert!(matches!(parsed, RuntimeEvent::CompactionStarted { .. }));
-        assert_eq!(parsed.parent_call(), None);
     }
 
     #[test]
@@ -623,22 +497,6 @@ mod tests {
     #[test]
     fn ignores_ordinary_diagnostics() {
         assert!(parse("listening on 127.0.0.1:7331").is_none());
-    }
-
-    #[test]
-    fn summarizes_by_the_most_descriptive_field() {
-        assert_eq!(
-            summarize_input(&json!({ "timeout_seconds": 30, "command": "cargo test" })),
-            "cargo test"
-        );
-        assert_eq!(
-            summarize_output(&json!({ "success": true, "stdout": "ok\nrest" })),
-            "ok"
-        );
-        assert_eq!(
-            summarize_output(&json!({ "success": true, "stdout": "" })),
-            "{\"success\":true,\"stdout\":\"\"}"
-        );
     }
 }
 

@@ -1,5 +1,7 @@
 //! Agent-owned terminals are v2 only. Frames share the bounded invocation bus.
 use super::{MAX_ID, Update, publish, v2_bus};
+
+pub(super) const MAX_COMMAND_BYTES: usize = 64 * 1024;
 use agentkit_tools_core::ToolRequest;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
@@ -75,7 +77,7 @@ impl Terminal {
             ("terminalId".into(), Value::from(output.call.clone())),
         ]));
         // Omit oversized metadata rather than retaining or truncating commands.
-        if command.len() <= crate::runlet_progress::MAX_SOURCE {
+        if command.len() <= MAX_COMMAND_BYTES {
             patch["command"] = Value::from(command);
         }
         if cwd.is_absolute()
