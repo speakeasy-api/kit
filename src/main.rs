@@ -2357,7 +2357,22 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?
             };
-            let output = runtime.run_persistent(prompt).await?;
+            let cancellation = agentkit_core::CancellationController::new();
+            let run = std::pin::pin!(
+                runtime.run_persistent_interruptible(prompt, Some(cancellation.handle()),)
+            );
+            // Install the existing platform-specific signal listener only for
+            // this CLI operation. Keep polling the owner through its cleanup.
+            let signal = std::pin::pin!(termination_signal());
+            let output = match select(signal, run).await {
+                Either::Left((signal, run)) => {
+                    cancellation.interrupt();
+                    let result = run.await;
+                    signal?;
+                    result?
+                }
+                Either::Right((result, _)) => result?,
+            };
             println!("{output}");
             println!("session_id: {session_id}");
         }

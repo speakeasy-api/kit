@@ -11,16 +11,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn prompt_delivers_background_completion_before_exit() {
-    for background in [
-        Some(serde_json::json!(true)),
-        Some(serde_json::json!(1)),
-        None,
-    ] {
+    let mut cases = vec![
+        (Some(serde_json::json!(true)), "success"),
+        (Some(serde_json::json!(1)), "success"),
+        (None, "success"),
+        (Some(serde_json::json!(true)), "failure"),
+        (Some(serde_json::json!(true)), "race"),
+    ];
+    if cfg!(unix) {
+        cases.extend([
+            (Some(serde_json::json!(true)), "TERM"),
+            (Some(serde_json::json!(true)), "INT"),
+        ]);
+    }
+    for (background, scenario) in cases {
         let detached = background.is_some();
         let home = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/stream", listener.local_addr().unwrap());
+        let root = home.path().to_path_buf();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let mut paused_tx = Some(paused_tx);
             for turn in 0..if detached { 3 } else { 2 } {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -49,6 +61,24 @@ async fn prompt_delivers_background_completion_before_exit() {
                 };
                 let (delta, reason) = if turn == 0 {
                     let mut args = serde_json::json!({"script": "return shell({command: \"sleep 2; echo BACKGROUND_RESULT\", timeout_seconds: 5})"});
+                    match scenario {
+                        "failure" => {
+                            args["script"] = serde_json::json!(
+                                "_ = shell({command: \"sleep 2\"})\nreturn fail(\"BACKGROUND_RESULT\", \"expected local failure\")"
+                            )
+                        }
+                        "race" => {
+                            args["script"] = serde_json::json!(
+                                "return shell({command: \"while [ ! -f release ]; do sleep 0.02; done; echo BACKGROUND_RESULT; touch completed\", timeout_seconds: 5})"
+                            )
+                        }
+                        "TERM" | "INT" => {
+                            args["script"] = serde_json::json!(
+                                "return shell({command: \"echo $$ > owned-pid; sleep 4; touch orphan-canary\", timeout_seconds: 6})"
+                            )
+                        }
+                        _ => {}
+                    }
                     if let Some(background) = &background {
                         args["background"] = background.clone();
                     }
@@ -57,6 +87,13 @@ async fn prompt_delivers_background_completion_before_exit() {
                         "tool_calls",
                     )
                 } else if detached && turn == 1 {
+                    if scenario == "race" {
+                        // Release the task only after the empty final model turn
+                        // has started; keep its response open until completion.
+                        std::fs::write(root.join("release"), "go").unwrap();
+                        wait_for_file(&root.join("completed")).await;
+                    }
+                    let _ = paused_tx.take().unwrap().send(());
                     (serde_json::json!({"role":"assistant","content":""}), "stop")
                 } else {
                     assert!(
@@ -99,12 +136,42 @@ async fn prompt_delivers_background_completion_before_exit() {
             .arg("hello")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        if scenario == "TERM" || scenario == "INT" {
+            tokio::time::timeout(Duration::from_secs(5), paused_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            wait_for_file(&home.path().join("owned-pid")).await;
+            let pid = child.id().unwrap().to_string();
+            assert!(
+                tokio::process::Command::new("/bin/kill")
+                    .args([format!("-{scenario}"), pid])
+                    .status()
+                    .await
+                    .unwrap()
+                    .success()
+            );
+        }
+        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
             .await
             .unwrap()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if scenario == "TERM" || scenario == "INT" {
+            server.abort();
+            // A real descendant canary detects an orphan, not merely CLI exit.
+            tokio::time::sleep(Duration::from_millis(4200)).await;
+            let orphaned = home.path().join("orphan-canary").exists();
+            assert!(!output.status.success(), "signal must not report success");
+            assert!(
+                !orphaned,
+                "{scenario} left the owned shell descendant alive"
+            );
+            continue;
+        }
         if !output.status.success() || !stdout.contains("RESUMED_FINAL_ANSWER") {
             server.abort();
             panic!("detached={detached}: {stdout}\n{stderr}");
@@ -114,4 +181,14 @@ async fn prompt_delivers_background_completion_before_exit() {
             .unwrap()
             .unwrap();
     }
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

@@ -1277,13 +1277,29 @@ impl Runtime {
 
     /// Runs one prompt in the configured durable session.
     pub async fn run_persistent(self: &Arc<Self>, prompt: String) -> Result<String, String> {
+        self.run_persistent_interruptible(prompt, None).await
+    }
+
+    /// Runs a durable prompt with cancellation owned by its caller.
+    pub async fn run_persistent_interruptible(
+        self: &Arc<Self>,
+        prompt: String,
+        cancellation: Option<CancellationHandle>,
+    ) -> Result<String, String> {
         // Keep the operation current through startup and the existing fatal writes.
-        self.run_persistent_inner(prompt)
+        self.run_persistent_inner(prompt, cancellation)
             .instrument(crate::telemetry::error_spans::operation("prompt"))
             .await
     }
 
-    async fn run_persistent_inner(self: &Arc<Self>, prompt: String) -> Result<String, String> {
+    async fn run_persistent_inner(
+        self: &Arc<Self>,
+        prompt: String,
+        cancellation: Option<CancellationHandle>,
+    ) -> Result<String, String> {
+        let controller = CancellationController::new();
+        let cancelled = controller.handle().checkpoint();
+        let _shutdown_bridge = StorageCancellationBridge::new(controller.clone(), cancellation);
         let request = self
             .session
             .lock()
@@ -1359,6 +1375,7 @@ impl Runtime {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let agent = Agent::builder()
+            .cancellation(controller.handle())
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(0, subagents, background_jobs.clone(), skills))
@@ -1394,7 +1411,15 @@ impl Runtime {
                 ));
             }
         };
-        let result = drive_with_tasks(&mut driver, Some(&tasks)).await;
+        let result = {
+            let cancellation = std::pin::pin!(cancelled.cancelled());
+            let run = std::pin::pin!(drive_with_tasks(&mut driver, Some(&tasks)));
+            // Idle prompts must observe cancellation too, not just model turns.
+            match select(cancellation, run).await {
+                Either::Left(((), _)) => Err(LoopError::Cancelled),
+                Either::Right((result, _)) => result,
+            }
+        };
         // Cancel owned compose work cooperatively before aborting task handles.
         background_jobs.cancel_all();
         let _ = tokio::time::timeout(
@@ -2798,8 +2823,8 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
     drive_with_tasks(driver, None).await
 }
 
-async fn drive_with_tasks(
-    driver: &mut LoopDriver<SelectableSession>,
+async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
+    driver: &mut LoopDriver<S>,
     tasks: Option<&TaskManagerHandle>,
 ) -> Result<String, LoopError> {
     let mut output = String::new();
@@ -3057,3 +3082,6 @@ mod additional_directory_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod prompt_tests;
