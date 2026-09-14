@@ -233,22 +233,27 @@ fn cargo_plan(root: &Path, executable: &Path) -> Result<Plan> {
         }
         args.extend(["--path".into(), path.canonicalize()?.into_os_string()]);
     } else if let Some(git) = source.strip_prefix("git+") {
-        let mut url = url::Url::parse(git)?;
-        let queries: Vec<_> = url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        for (key, value) in queries {
-            if !["branch", "tag", "rev"].contains(&key.as_str()) {
+        // Cargo's SourceId writes a literal selector, not a form-encoded query.
+        // Only the final fragment is the resolved commit, not an explicit pin.
+        let source = git.rsplit_once('#').map_or(git, |(source, _)| source);
+        let (repository, selector) = source
+            .split_once('?')
+            .map_or((source, None), |(repository, selector)| {
+                (repository, Some(selector))
+            });
+        let _ = url::Url::parse(repository)?;
+        if let Some(selector) = selector {
+            let (key, value) = selector.split_once('=').ok_or_else(|| {
+                refuse("Invalid Cargo git source selector; use the original cargo install command")
+            })?;
+            if !["branch", "tag", "rev"].contains(&key) || value.is_empty() {
                 return Err(refuse(
                     "Unsupported Cargo git source selector; use the original cargo install command",
                 ));
             }
             args.extend([format!("--{key}").into(), value.into()]);
         }
-        url.set_query(None);
-        url.set_fragment(None); // Cargo's resolved commit is not an explicit revision pin.
-        args.extend(["--git".into(), url.to_string().into(), "kit".into()]);
+        args.extend(["--git".into(), repository.into(), "kit".into()]);
     } else if source == "registry+https://github.com/rust-lang/crates.io-index"
         || source == "registry+sparse+https://index.crates.io/"
     {
@@ -352,7 +357,17 @@ mod tests {
 
     #[test]
     fn cargo_git_preserves_selectors_not_resolved_commit() {
-        for selector in ["", "?branch=release", "?tag=v1", "?rev=abc"] {
+        for selector in [
+            "",
+            "?branch=release",
+            "?tag=v1",
+            "?rev=abc",
+            "?branch=release+fix",
+            "?tag=release%2Fstable",
+            "?rev=release+%2Fstable",
+            "?branch=release&fix=1",
+            "?tag=release#stable",
+        ] {
             let root = cargo_root(&format!("git+https://example.com/kit{selector}#resolved"));
             let plan = args(root.path());
             assert!(plan.contains(&OsString::from("https://example.com/kit")));
