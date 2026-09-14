@@ -607,7 +607,24 @@ pub enum Block {
         millis: Option<u64>,
     },
     Tool(Box<ToolCall>),
-    TurnDuration(u64),
+    /// A turn ended. `background` counts detached programs still running
+    /// then; `since_prompt` is wall time since the user's last new prompt,
+    /// spanning the autonomous turns that follow a background result.
+    TurnDuration {
+        background: usize,
+        since_prompt: u64,
+    },
+    /// A detached program finished after its turn had already ended.
+    BackgroundResult {
+        title: String,
+        millis: u64,
+        failed: bool,
+    },
+    /// Transcript history was compacted into a note.
+    Compacted {
+        reason: String,
+        millis: u64,
+    },
     Notice(String),
     Error(String),
 }
@@ -793,6 +810,8 @@ pub struct App {
     clipboard_route_epoch: u64,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
+    /// When the user last started something new, as opposed to steering.
+    prompt_started: Option<Instant>,
     pub can_steer: bool,
     pub can_replace_steer: bool,
     pub(super) selected_steer: Option<String>,
@@ -830,6 +849,8 @@ pub struct App {
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
+    /// Header cell range of the session id, a click target for the resume command.
+    pub(super) session_area: Rect,
     /// Tool card selected for output toggling or background cancellation.
     pub focused_call_id: Option<String>,
     pub tick: usize,
@@ -1056,6 +1077,7 @@ impl App {
             clipboard_route_epoch: 0,
             phase: Phase::Idle,
             turn_started: None,
+            prompt_started: None,
             can_steer: false,
             can_replace_steer: false,
             selected_steer: None,
@@ -1087,6 +1109,7 @@ impl App {
             agents_scroll: 0,
             agents_viewport: 0,
             agents_area: Rect::default(),
+            session_area: Rect::default(),
             focused_call_id: None,
             tick: 0,
             scroll: 0,
@@ -1171,7 +1194,7 @@ impl App {
     }
 
     fn push_block(&mut self, block: Block) {
-        if !matches!(block, Block::TurnDuration(_)) {
+        if !matches!(block, Block::TurnDuration { .. }) {
             self.collapse_last_tool_output();
         }
         let index = self.blocks.len();
@@ -1923,8 +1946,54 @@ impl App {
             self.note(notice);
         }
         if let Some(millis) = turn_millis {
-            self.push_block(Block::TurnDuration(millis));
+            let background = self.background_calls().len();
+            let since_prompt = self.prompt_started.map_or(millis, |started| {
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+            self.push_block(Block::TurnDuration {
+                background,
+                since_prompt,
+            });
         }
+    }
+
+    /// Top-level calls that detached from their turn and are still running.
+    pub fn background_calls(&self) -> Vec<&ToolCall> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                Block::Tool(call)
+                    if call.parent_id.is_none() && call.backgrounded && call.running() =>
+                {
+                    Some(call.as_ref())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The session's name: its catalog title when known, else its first prompt.
+    pub fn session_title(&self) -> Option<String> {
+        if let Some(id) = &self.session_id
+            && let Some(title) = self
+                .session_choices
+                .iter()
+                .find(|entry| &entry.id == id)
+                .and_then(|entry| entry.title.clone())
+        {
+            return Some(title);
+        }
+        self.blocks.iter().find_map(|block| match block {
+            Block::User(message) => {
+                let text = message
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
     }
 
     pub(super) fn apply_materialized(&mut self, update: Update, images: Vec<MaterializedImage>) {
@@ -2043,7 +2112,12 @@ impl App {
                 images,
                 append,
             } => {
+                let steer = self.pending_steers.iter().any(|pending| pending.id == id);
+                let new_message = !self.message_blocks.contains_key(&id);
                 self.remove_pending_steer(&id);
+                if new_message && !steer {
+                    self.prompt_started = Some(Instant::now());
+                }
                 self.apply_message(id, text, images, append, MessageRole::User);
             }
             Update::AgentImage { id, image, append } => {
@@ -2220,6 +2294,13 @@ impl App {
                 let identity_changed = was_compose != call.is_compose();
                 let completed_background = was_running && !call.running() && call.backgrounded;
                 // Autonomous output after a detached call starts a new agent stream.
+                let landed = (completed_background && call.parent_id.is_none()).then(|| {
+                    (
+                        call.display_title().to_owned(),
+                        call.elapsed(),
+                        call.status == ToolCallStatus::Failed,
+                    )
+                });
                 self.agent_stream_sealed |= completed_background;
                 if let Some(index) = self.call_index(&id) {
                     if identity_changed {
@@ -2227,6 +2308,19 @@ impl App {
                     }
                     self.mark_block_dirty(index);
                     self.reclassify_dynamic(index);
+                    // A result arriving after its turn ended is marked where it
+                    // lands; the card itself stays back in its own turn.
+                    if let Some((title, millis, failed)) = landed
+                        && self.blocks[index + 1..]
+                            .iter()
+                            .any(|block| matches!(block, Block::TurnDuration { .. }))
+                    {
+                        self.push_block(Block::BackgroundResult {
+                            title,
+                            millis,
+                            failed,
+                        });
+                    }
                 }
             }
             Update::Usage { used, size, cost } => {
@@ -2363,11 +2457,16 @@ impl App {
             RuntimeEvent::CompactionStarted { .. } => {
                 self.compacting = true;
             }
-            RuntimeEvent::CompactionFinished { ok, compacted, .. } => {
+            RuntimeEvent::CompactionFinished {
+                reason,
+                ok,
+                compacted,
+                millis,
+            } => {
                 self.compacting = false;
                 if ok && compacted {
                     self.usage = None;
-                    self.note("context compacted");
+                    self.push_block(Block::Compacted { reason, millis });
                 }
             }
             RuntimeEvent::SubagentStateChanged {
@@ -2507,6 +2606,14 @@ impl App {
                 self.clamp_agents_scroll();
             }
         }
+    }
+
+    pub(super) fn tool_call(&self, id: &str) -> Option<&ToolCall> {
+        self.call_index(id)
+            .and_then(|index| match &self.blocks[index] {
+                Block::Tool(call) => Some(call.as_ref()),
+                _ => None,
+            })
     }
 
     fn call_index(&self, id: &str) -> Option<usize> {
@@ -4284,8 +4391,40 @@ impl App {
         )
     }
 
-    /// Copies code, opens links, or folds tool output at the clicked row.
+    /// The command that reopens this session from a shell.
+    pub fn resume_command(&self) -> Option<String> {
+        let id = self.session_id.as_deref()?;
+        let root = self.root.display().to_string();
+        let root = if root.is_empty()
+            || !root
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c))
+        {
+            format!("'{}'", root.replace('\'', "'\\''"))
+        } else {
+            root
+        };
+        Some(format!("kit tui --root {root} --resume {id}"))
+    }
+
+    fn mouse_in(area: Rect, column: usize, row: usize) -> bool {
+        area.width > 0
+            && area.height > 0
+            && column >= usize::from(area.x)
+            && column < usize::from(area.x) + usize::from(area.width)
+            && row >= usize::from(area.y)
+            && row < usize::from(area.y) + usize::from(area.height)
+    }
+
+    /// Copies the resume command, code, opens links, or folds tool output at
+    /// the clicked cell.
     fn click(&mut self, column: usize, row: usize) -> Action {
+        if Self::mouse_in(self.session_area, column, row)
+            && let Some(command) = self.resume_command()
+        {
+            self.toast("copied resume command");
+            return Action::Copy(command);
+        }
         if self.scroll == usize::MAX {
             return Action::None;
         }
@@ -5183,9 +5322,10 @@ mod tests {
         }));
         assert!(!app.compacting);
         assert!(app.usage.is_none());
-        assert!(
-            matches!(app.blocks.last(), Some(Block::Notice(text)) if text == "context compacted")
-        );
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::Compacted { reason, millis: 12 }) if reason == "TokenThreshold"
+        ));
     }
 
     #[test]
@@ -5444,7 +5584,7 @@ mod tests {
         assert_eq!(
             app.blocks
                 .iter()
-                .filter(|block| matches!(block, Block::TurnDuration(_)))
+                .filter(|block| matches!(block, Block::TurnDuration { .. }))
                 .count(),
             1
         );
@@ -5455,6 +5595,7 @@ mod tests {
         let mut app = app();
         app.push_user("hello".into());
         app.turn_started = Some(Instant::now() - Duration::from_secs(65));
+        app.prompt_started = app.turn_started;
 
         app.apply(Update::State(StateUpdate::Idle(
             IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
@@ -5462,7 +5603,7 @@ mod tests {
 
         assert!(matches!(
             app.blocks.last(),
-            Some(Block::TurnDuration(millis)) if *millis >= 65_000
+            Some(Block::TurnDuration { since_prompt, .. }) if *since_prompt >= 65_000
         ));
     }
 
@@ -5485,7 +5626,7 @@ mod tests {
         assert!(!app.working());
         assert!(matches!(
             app.blocks.as_slice(),
-            [.., Block::Notice(text), Block::TurnDuration(_)] if text == "turn interrupted"
+            [.., Block::Notice(text), Block::TurnDuration { .. }] if text == "turn interrupted"
         ));
     }
 
@@ -5522,6 +5663,60 @@ mod tests {
             Some("background-2")
         );
         assert!(!app.working());
+    }
+
+    #[test]
+    fn background_programs_are_tracked_across_turns_until_their_result_lands() {
+        let mut app = app();
+        app.push_user("start".into());
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some("return 1".into()),
+            backgrounded: true,
+        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration { background: 1, .. })
+        ));
+
+        app.push_user("meanwhile".into());
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration { background: 1, since_prompt, .. }) if *since_prompt < 5_000
+        ));
+
+        app.apply(Update::ToolPatched {
+            id: "background".into(),
+            title: None,
+            kind: None,
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: Some(vec!["done".into()]),
+            images: None,
+            append_output: false,
+            intent: None,
+            backgrounded: true,
+        });
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::BackgroundResult { failed: false, .. })
+        ));
+
+        assert!(app.background_calls().is_empty());
     }
 
     #[test]
