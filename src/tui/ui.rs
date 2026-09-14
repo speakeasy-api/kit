@@ -2600,7 +2600,7 @@ fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
             .unwrap_or(total - 1);
         let start = selected.saturating_sub(cap - 1).min(total - cap);
         let end = start + cap;
-        let hidden = total - cap;
+        let hidden = total - cap + usize::from(cap > 1);
         let indicator = Line::from(Span::styled(
             format!("   … {hidden} more in the dock"),
             theme::faint(),
@@ -2966,7 +2966,11 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         &format!("{} ", keys.join("   "))
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
-    } else if app.phase == Phase::Idle && background > 0 {
+    } else if app.phase == Phase::Idle
+        && app
+            .focus_call()
+            .is_some_and(|call| call.backgrounded && call.running())
+    {
         "⏎ send   ^k stop   ^r agents   ^t reasoning   ^l log "
     } else {
         "⏎ send   ⇧⏎ newline   ^r agents   ^t reasoning   ^l log   ^c quit "
@@ -4788,6 +4792,11 @@ mod tests {
             "127.0.0.1:7331".into(),
         );
         for index in 0..6 {
+            if index == 5 {
+                let frame = render(&mut app, 100, 24);
+                assert!(frame.contains("… 2 more in the dock"), "{frame}");
+                assert!(frame.contains("program 4"), "{frame}");
+            }
             app.apply(Update::ToolStarted {
                 id: format!("bg-{index}"),
                 title: format!("program {index}"),
@@ -4814,7 +4823,7 @@ mod tests {
         // Newest background call is focused by default and stays visible.
         let frame = render(&mut app, 100, 24);
         assert!(frame.contains("program 5"), "{frame}");
-        assert!(frame.contains("… 5 more in the dock"), "{frame}");
+        assert!(frame.contains("… 6 more in the dock"), "{frame}");
         assert!(dock(&frame) <= super::MAX_DOCK_ROWS, "{frame}");
 
         app.focused_call_id = Some("bg-0".into());
@@ -4882,6 +4891,40 @@ mod tests {
             .unwrap();
         assert!(first.contains("^k stop"), "{selected:?}");
         assert!(!second.contains("^k stop"), "{selected:?}");
+    }
+
+    #[test]
+    fn idle_stop_hint_requires_a_running_focused_background_call() {
+        let mut app = sample();
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "background program".into(),
+            kind: ToolKind::Other,
+            script: Some("return 1".into()),
+            backgrounded: true,
+        });
+        app.apply(Update::ToolPatched {
+            id: "call-1".into(),
+            title: None,
+            kind: None,
+            status: Some(agent_client_protocol::schema::v2::ToolCallStatus::Completed),
+            script: None,
+            output: None,
+            images: None,
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+        app.phase = Phase::Idle;
+        app.focused_call_id = Some("call-1".into());
+        assert!(!app.focus_call().unwrap().running());
+        assert_eq!(app.background_calls().len(), 1);
+        let frame = render(&mut app, 160, 24);
+        assert!(!frame.contains("^k stop"), "{frame}");
+
+        app.focused_call_id = Some("background".into());
+        let frame = render(&mut app, 160, 24);
+        assert!(frame.lines().last().unwrap().contains("^k stop"), "{frame}");
     }
 
     #[test]
@@ -5445,6 +5488,21 @@ mod tests {
             app.resume_command().as_deref(),
             Some("kit tui --root '/Users/dev/my projects/kit' --resume s-1770000000000-12345-0")
         );
+    }
+
+    #[test]
+    fn resume_command_quotes_shell_metacharacters_without_whitespace() {
+        let mut app = sample();
+        app.session_id = Some("session-1".into());
+        for root in ["/tmp/it's", "/tmp/$HOME", "/tmp/$(pwd)", "/tmp/a;b", ""] {
+            app.root = PathBuf::from(root);
+            let command = app.resume_command().unwrap();
+            assert!(command.starts_with("kit tui --root '"), "{command}");
+            assert_eq!(
+                shlex::split(&command).unwrap(),
+                ["kit", "tui", "--root", root, "--resume", "session-1"]
+            );
+        }
     }
 
     #[test]

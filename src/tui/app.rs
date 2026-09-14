@@ -4395,7 +4395,11 @@ impl App {
     pub fn resume_command(&self) -> Option<String> {
         let id = self.session_id.as_deref()?;
         let root = self.root.display().to_string();
-        let root = if root.chars().any(char::is_whitespace) {
+        let root = if root.is_empty()
+            || !root
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c))
+        {
             format!("'{}'", root.replace('\'', "'\\''"))
         } else {
             root
