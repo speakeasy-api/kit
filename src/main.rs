@@ -2367,6 +2367,11 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let output = match select(signal, run).await {
                 Either::Left((signal, run)) => {
                     cancellation.interrupt();
+                    if signal.is_ok() {
+                        eprintln!(
+                            "Cancellation requested; waiting for owned work and credential/storage cleanup."
+                        );
+                    }
                     let result = run.await;
                     signal?;
                     result?
