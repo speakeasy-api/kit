@@ -51,6 +51,36 @@ curl -fsSL https://raw.githubusercontent.com/speakeasy-api/kit/main/install.sh |
 
 The installation script downloads the release archive. It verifies the archive against `SHA256SUMS` and installs Kit in `~/.local/bin`. Set `KIT_VERSION=v0.1.108` to select a release. Set `KIT_INSTALL_DIR` to change the destination.
 
+### Update Kit
+
+```sh
+kit update --dry-run  # inspect the installation method and proposed action
+kit update
+```
+
+Kit checks the **running executable**, not the first `kit` on `PATH`. Dry runs only
+read local provenance: they do not download, run package managers, or change files.
+Release CLI builds in `~/.local/bin` use the installer embedded in Kit to install
+the latest release, verify its checksum, and atomically replace the executable.
+`KIT_VERSION` is ignored for updates. For a custom installer destination, set
+`KIT_INSTALL_DIR` to that same directory. Symlinks to a recognized installation
+work; moving a binary elsewhere does not establish installer provenance.
+
+Cargo installations use the owning install root's metadata and keep their source:
+local paths rebuild the original checkout (update that checkout first), Git sources
+keep explicit branch/tag/revision selectors, and crates.io installs stay on
+crates.io. Recorded features, profile, and target are preserved when available.
+Missing checkouts, inconsistent provenance, and custom registries are refused
+rather than silently switching to upstream. Use the original `cargo install`
+command when an automatic plan is unavailable.
+
+Unknown/source-built binaries and older release builds without a release marker
+are not overwritten. Rebuild and run `mise run install`, or rerun the release
+installer explicitly. For Homebrew, verify the owning formula with `brew list`
+and use `brew upgrade <owning-formula>`; automatic Homebrew updates are not
+supported. Update desktop apps through the app distribution, and pull a new image
+and recreate containers rather than modifying bundled executables.
+
 <!-- PLACEHOLDER: record docs/media/install.gif — run the curl|sh line in a clean shell, then `kit --version`. The tape is in scripts/readme-media/install.tape; it only works once install.sh is on main. -->
 
 ### mise
@@ -59,6 +89,25 @@ The installation script downloads the release archive. It verifies the archive a
 mise use -g github:speakeasy-api/kit        # latest
 mise use -g github:speakeasy-api/kit@0.1.108
 ```
+
+`kit update` (including `--dry-run`) recognizes mise-managed installations and
+refuses to overwrite their versioned files, even with `KIT_INSTALL_DIR` set.
+Detection checks the canonical executable under mise's actual installs directory:
+`MISE_INSTALLS_DIR`, or `MISE_DATA_DIR/installs`, defaulting to
+`${XDG_DATA_HOME:-~/.local/share}/mise/installs` on macOS and Linux.
+
+Update through mise from the directory whose configuration selects Kit:
+
+```sh
+mise ls github:speakeasy-api/kit       # inspect selected version and config
+mise upgrade github:speakeasy-api/kit # respect the configured version range
+```
+
+An exact version pin remains pinned. To deliberately update that pin, use
+`mise upgrade --bump github:speakeasy-api/kit` in the intended configuration
+scope. Kit does not choose a project/global scope or change mise config for you.
+This is distinct from `mise run install` in a source checkout, which creates a
+Cargo installation and follows the Cargo update rules above.
 
 ### Docker
 

@@ -22,6 +22,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod update;
+
 use clap::ValueEnum;
 use futures_util::future::{Either, select};
 use kit::resilient_fs as fs;
@@ -708,6 +710,16 @@ impl ConfigAction {
 
 impl Command {
     fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand(
+            clap::Command::new("update")
+                .about("Update Kit using its detected installation method")
+                .arg(
+                    clap::Arg::new("dry_run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Show the update plan without downloading or changing files"),
+                ),
+        );
         let command = command.subcommand({
             clap::Command::new("init")
                 .about("Write the recommended configuration to ~/.kit/config.toml")
@@ -1110,6 +1122,9 @@ impl Command {
         let (name, matches) = required_subcommand(matches)?;
         match name {
             "init" => Ok(Self::Init),
+            "update" => Ok(Self::Update {
+                dry_run: required_arg(matches, "dry_run")?,
+            }),
             "config" => Ok(Self::Config {
                 action: ConfigAction::from_matches(matches)?,
             }),
@@ -1597,10 +1612,15 @@ enum SessionsAction {
 }
 
 enum Command {
+    Update {
+        dry_run: bool,
+    },
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
     /// Edit global configuration without loading runtime settings.
-    Config { action: ConfigAction },
+    Config {
+        action: ConfigAction,
+    },
     /// Manage provider authentication without starting a runtime.
     Auth {
         action: AuthAction,
@@ -2036,6 +2056,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .terminal_auth_login()
         .map(|(provider, _)| provider);
     match cli.command {
+        Command::Update { dry_run } => update::run(dry_run)?,
         Command::Init => {
             tokio::task::spawn_blocking(init_default_config).await??;
             if fs::global().status().pending_operations > 0 {

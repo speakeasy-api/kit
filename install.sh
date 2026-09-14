@@ -47,7 +47,8 @@ asset="kit-$VERSION-$target.tar.gz"
 base="https://github.com/$REPO/releases/download/$VERSION"
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t kit-install)
-trap 'rm -rf "$tmp"' EXIT
+stage=""
+trap 'rm -rf "$tmp"; [ -z "$stage" ] || rm -rf "$stage"' EXIT
 
 log "Downloading $asset"
 curl -fsSL -o "$tmp/$asset" "$base/$asset"
@@ -64,7 +65,12 @@ fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$INSTALL_DIR"
-install -m 0755 "$tmp/kit" "$INSTALL_DIR/kit"
+# Stage on the destination filesystem, then rename over the running binary.
+# Writing the executable in place fails with ETXTBSY on Linux.
+[ ! -d "$INSTALL_DIR/kit" ] || die "destination is a directory: $INSTALL_DIR/kit"
+stage=$(mktemp -d "$INSTALL_DIR/.kit-install.XXXXXX")
+install -m 0755 "$tmp/kit" "$stage/kit"
+mv -f "$stage/kit" "$INSTALL_DIR/kit"
 
 log "Installed kit $VERSION to $INSTALL_DIR/kit"
 case ":$PATH:" in
