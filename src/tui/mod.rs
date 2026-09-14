@@ -2622,6 +2622,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             voice.stop();
             voice.notify_state(&connection, &session_id);
             leave(&mut terminal);
+            print_exit_message(&app);
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -3360,6 +3361,25 @@ async fn bounded_graceful_close<T>(
         Either::Left((output, _)) => Some(output),
         Either::Right(_) => None,
     }
+}
+
+/// After the alternate screen is gone, leave the banner and the command that
+/// reopens this session, so nobody has to find the id in the session list.
+fn print_exit_message(app: &App) {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout);
+    for line in ui::banner_lines() {
+        let _ = writeln!(stdout, "{line}");
+    }
+    if let Some(command) = app.resume_command() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "resume this session with:");
+        let _ = writeln!(stdout, "  {command}");
+    }
+    let _ = writeln!(stdout);
+    let _ = stdout.flush();
 }
 
 fn leave(terminal: &mut DefaultTerminal) {

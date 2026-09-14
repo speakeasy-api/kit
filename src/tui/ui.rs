@@ -42,13 +42,11 @@ pub(super) fn native_links_obscured(app: &App) -> bool {
         || app.effort_dialog.is_some()
         || !app.command_completions().is_empty()
 }
-const MAX_PENDING_STEER_ROWS: usize = 3;
 const START_MAX_WIDTH: u16 = 96;
 const START_LOGO_ROWS: u16 = 3;
 const START_LOGO_GAP: u16 = 2;
 const START_PROMPT_CHROME_ROWS: u16 = 4;
 const START_MIN_PROMPT_ROWS: u16 = START_PROMPT_CHROME_ROWS + 1;
-const HEADER_SEPARATOR: &str = "  ·  ";
 /// Rows of raw tool output rendered when a card is opened.
 const MAX_OUTPUT_ROWS: usize = 400;
 
@@ -96,7 +94,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
             .clamp(1, MAX_PROMPT_ROWS) as u16
             + 2;
         let logs_rows = if app.show_logs { 9 } else { 0 };
-        let pending_rows = app.pending_steers.len().min(MAX_PENDING_STEER_ROWS) as u16;
+        let narrow = frame.area().width < SIDE_BY_SIDE_WIDTH;
+        let pending_rows = dock_rows(app, narrow) as u16;
         let minimum_rows = 1 + 3 + logs_rows + pending_rows + prompt_rows + 1;
         let rainbow_fits = frame.area().height >= minimum_rows.saturating_add(1);
         let header_rows = 1 + u16::from(!app.blocks.is_empty() && rainbow_fits);
@@ -110,12 +109,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         ])
         .areas(frame.area());
 
-        draw_header(frame, app, header);
+        app.session_area = draw_header(frame, app, header).unwrap_or_default();
+
         draw_body(frame, app, images, body);
         if app.show_logs {
             draw_logs(frame, app, logs);
         }
-        draw_pending_steers(frame, app, pending);
+        draw_dock(frame, app, pending, narrow);
         let viewport = draw_prompt(frame, app, prompt);
         draw_command_popup(frame, app, prompt);
         draw_status(frame, app, status);
@@ -771,80 +771,178 @@ fn cost_label(amount: f64, currency: &str) -> String {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// Ten-cell context gauge with the automatic compaction threshold marked.
+fn gauge_spans(used: u64, size: u64) -> Vec<Span<'static>> {
+    const CELLS: u64 = 10;
+    const COMPACT_AT: u64 = 8;
+    let filled = if size == 0 {
+        0
+    } else {
+        (used.saturating_mul(CELLS) / size).min(CELLS)
+    };
+    let fill = Style::default().fg(if filled >= COMPACT_AT {
+        theme::warn_color()
+    } else {
+        theme::running_color()
+    });
+    let mut spans = Vec::with_capacity(12);
+    for cell in 0..CELLS {
+        if cell == COMPACT_AT {
+            spans.push(Span::styled("┆", theme::faint()));
+        }
+        if cell < filled {
+            spans.push(Span::styled("▰", fill));
+        } else {
+            spans.push(Span::styled("▱", theme::faint()));
+        }
+    }
+    spans
+}
+
+fn header_field(priority: u8, spans: Vec<Span<'static>>) -> (u8, Vec<Span<'static>>) {
+    (priority, spans)
+}
+
+/// Where, then which model, then how much room. Lowest-priority fields drop
+/// first rather than clipping a value into something misleading.
+fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) -> Option<Rect> {
     let root = app.root.file_name().map_or_else(
         || app.root.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let version = format!("v{} ", env!("CARGO_PKG_VERSION"));
-    let mut spans = vec![
-        Span::styled(" kit ", theme::bold(theme::accent_color())),
-        Span::styled(version.clone(), theme::faint()),
-        Span::styled("▏ ", theme::faint()),
+    let prefix = vec![
+        Span::styled(" kit", theme::bold(theme::accent_color())),
+        Span::styled(" ▏ ", theme::faint()),
     ];
-    // Keep complete high-value fields and drop low-priority fields rather than
-    // clipping a session ID or context-window value into something misleading.
-    let mut fields = vec![
-        (2, root, theme::text()),
-        (3, format!("{} / {}", app.provider, app.model), theme::dim()),
-        (1, format!("effort {}", app.reasoning_effort), theme::dim()),
-    ];
-    if let Some(usage) = app.usage {
-        fields.push((
+    let mut left = vec![header_field(9, vec![Span::styled(root, theme::text())])];
+    if let Some(title) = app.session_title() {
+        left.push(header_field(
             4,
-            format!(
-                "{} {}/{}",
-                percent(usage.used, usage.size),
-                compact(usage.used),
-                compact(usage.size)
-            ),
-            theme::dim(),
+            vec![
+                Span::styled("▸ ", theme::faint()),
+                Span::styled(truncate_to_width(&title, 48), theme::text()),
+            ],
         ));
     }
+    let mut right = vec![header_field(
+        6,
+        vec![
+            Span::styled(app.model.clone(), theme::text()),
+            Span::styled(" · ", theme::faint()),
+            Span::styled(app.reasoning_effort.clone(), theme::dim()),
+        ],
+    )];
+    if let Some(usage) = app.usage {
+        let mut spans = gauge_spans(usage.used, usage.size);
+        spans.push(Span::styled(
+            format!(" {}", percent(usage.used, usage.size)),
+            theme::dim(),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", compact(usage.used)),
+            theme::text(),
+        ));
+        spans.push(Span::styled(
+            format!("/{}", compact(usage.size)),
+            theme::dim(),
+        ));
+        right.push(header_field(8, spans));
+    }
     if let Some(cost) = &app.cost {
-        fields.push((4, cost_label(cost.amount, &cost.currency), theme::dim()));
+        right.push(header_field(
+            5,
+            vec![Span::styled(
+                cost_label(cost.amount, &cost.currency),
+                theme::text(),
+            )],
+        ));
     }
-    fields.push((
-        5,
-        format!(
-            "session {}",
-            app.session_id.as_deref().unwrap_or("starting")
-        ),
-        theme::dim(),
+    let session_field = right.len();
+    if let Some(id) = &app.session_id {
+        right.push(header_field(
+            3,
+            vec![Span::styled(id.clone(), theme::dim())],
+        ));
+    }
+    right.push(header_field(
+        0,
+        vec![Span::styled(format!("a2a {}", app.a2a), theme::faint())],
     ));
-    fields.push((0, format!("a2a {}", app.a2a), theme::dim()));
 
-    let prefix_width = Line::from(spans.clone()).width();
-    let header_width = |fields: &[(u8, String, Style)]| {
-        prefix_width
-            + fields
-                .iter()
-                .map(|(_, text, _)| UnicodeWidthStr::width(text.as_str()))
-                .sum::<usize>()
-            + fields.len().saturating_sub(1) * UnicodeWidthStr::width(HEADER_SEPARATOR)
-    };
-    while header_width(&fields) > area.width as usize {
-        let Some(index) = fields
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (priority, _, _))| *priority)
-            .map(|(index, _)| index)
-        else {
-            break;
-        };
-        fields.remove(index);
-    }
-    for (index, (_, text, style)) in fields.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(HEADER_SEPARATOR, theme::faint()));
+    let join = |fields: &[(u8, Vec<Span<'static>>)], separator: &str| {
+        let mut spans = Vec::new();
+        for (index, (_, field)) in fields.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(separator.to_owned(), theme::faint()));
+            }
+            spans.extend(field.iter().cloned());
         }
-        spans.push(Span::styled(text, style));
+        spans
+    };
+    let width = |left: &[(u8, Vec<Span<'static>>)], right: &[(u8, Vec<Span<'static>>)]| {
+        Line::from(prefix.clone()).width()
+            + Line::from(join(left, " ")).width()
+            + 2
+            + Line::from(join(right, " ▏ ")).width()
+            + 1
+    };
+    while width(&left, &right) > area.width as usize {
+        let lowest = |fields: &[(u8, Vec<Span<'static>>)]| {
+            fields
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (priority, _))| *priority)
+                .map(|(index, (priority, _))| (*priority, index))
+        };
+        match (lowest(&left), lowest(&right)) {
+            (Some((l, li)), Some((r, ri))) => {
+                if l <= r {
+                    left.remove(li);
+                } else {
+                    right.remove(ri);
+                }
+            }
+            (Some((_, li)), None) => {
+                left.remove(li);
+            }
+            (None, Some((_, ri))) => {
+                right.remove(ri);
+            }
+            (None, None) => break,
+        }
     }
+    let mut spans = prefix;
+    spans.extend(join(&left, " "));
+    let right_spans = join(&right, " ▏ ");
+    let gap = (area.width as usize)
+        .saturating_sub(
+            Line::from(spans.clone()).width() + Line::from(right_spans.clone()).width() + 1,
+        )
+        .max(1);
+    spans.push(Span::raw(" ".repeat(gap)));
+    // The session id is a click target: where it starts is where the fields
+    // before it end, if it survived the width fitting.
+    let session_area = right
+        .get(session_field)
+        .filter(|(priority, _)| *priority == 3)
+        .map(|(_, field)| {
+            let before = Line::from(spans.clone()).width()
+                + Line::from(join(&right[..session_field], " ▏ ")).width()
+                + if session_field > 0 { 3 } else { 0 };
+            Rect::new(
+                area.x + u16::try_from(before).unwrap_or(u16::MAX),
+                area.y,
+                u16::try_from(Line::from(field.clone()).width()).unwrap_or(u16::MAX),
+                1,
+            )
+        });
+    spans.extend(right_spans);
     let metadata = Rect { height: 1, ..area };
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme::bar()),
         metadata,
     );
+
     if area.height > 1 {
         let rainbow = Rect {
             y: area.y + 1,
@@ -856,6 +954,7 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             rainbow,
         );
     }
+    session_area
 }
 
 fn draw_start(
@@ -881,15 +980,14 @@ fn draw_start(
     (prompt, viewport)
 }
 
+/// Narrow terminals keep the whole height for the transcript; the dock
+/// summarises agents there instead of stacking the panel.
 fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, Option<Rect>) {
-    if !show_agents || transcript_empty {
+    if !show_agents || transcript_empty || area.width < SIDE_BY_SIDE_WIDTH {
         return (area, None);
     }
-    let [transcript, agents] = if area.width >= SIDE_BY_SIDE_WIDTH {
-        Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area)
-    } else {
-        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
-    };
+    let [transcript, agents] =
+        Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area);
     (transcript, Some(agents))
 }
 
@@ -1126,6 +1224,11 @@ fn rainbow_line(width: usize, symbol: &str) -> Line<'static> {
             })
             .collect::<Vec<_>>(),
     )
+}
+
+/// The block-glyph mark as plain text, for the exit message.
+pub(super) fn banner_lines() -> [&'static str; 3] {
+    ["█   ▀ ▄█▄", "█▄▀ █  █", "█▀▄ █  █▄  by Speakeasy"]
 }
 
 fn welcome_logo() -> Paragraph<'static> {
@@ -1412,24 +1515,26 @@ fn transcript_block_rows(
     if total == 0 {
         return (rows, images);
     }
-    let show = call.expanded && call.compose_view == ComposeView::Output;
-    let label = if show {
-        format!(
-            "   ↳ calls {}–{} of {total} · alt+PgUp/PgDn pages",
-            start + 1,
-            start + children.len()
-        )
-    } else {
-        format!("   ↳ {total} calls · expand to view")
-    };
-    rows.extend(wrap_linked_tagged(
-        &[(
-            LinkedLine::plain(Line::from(Span::styled(label, theme::dim()))),
-            (Some(call.id.clone()), None, None),
-        )],
-        width,
-    ));
+    // Lanes stay visible while the program runs; a finished program folds
+    // them behind its call count until opened.
+    let collapsed_by_user = call.expansion_explicit && !call.expanded;
+    let show = (call.running() && !collapsed_by_user)
+        || (call.expanded && call.compose_view == ComposeView::Output);
     if show {
+        if total > children.len() {
+            let label = format!(
+                "   ┃ calls {}–{} of {total} · alt+PgUp/PgDn",
+                start + 1,
+                start + children.len()
+            );
+            rows.extend(wrap_linked_tagged(
+                &[(
+                    LinkedLine::plain(Line::from(Span::styled(label, theme::faint()))),
+                    (Some(call.id.clone()), None, None),
+                )],
+                width,
+            ));
+        }
         for &child in children {
             let (mut child_rows, child_images) = single_transcript_block_rows(
                 app,
@@ -1482,14 +1587,63 @@ fn single_transcript_block_rows(
                 app,
                 call,
                 app.transcript_call_is_focused(block_index),
+                width,
+                block_index,
             ))),
             Some(call.id.clone()),
         ),
-        Block::TurnDuration(millis) => (
-            uncopyable(plain_lines(vec![Line::from(Span::styled(
-                format!("· took {}", theme::duration(*millis)),
-                theme::faint(),
-            ))])),
+        Block::TurnDuration {
+            background,
+            since_prompt,
+            ..
+        } => (
+            uncopyable(plain_lines(vec![turn_end_line(*background, *since_prompt)])),
+            None,
+        ),
+        Block::BackgroundResult {
+            title,
+            millis,
+            failed,
+        } => (
+            uncopyable(plain_lines(vec![spread(
+                vec![
+                    Span::styled("↩ ", theme::faint()),
+                    Span::styled(
+                        truncate_to_width(title, width.saturating_sub(40).max(8)),
+                        theme::bold(theme::text_color()),
+                    ),
+                ],
+                vec![
+                    Span::styled(
+                        format!("background result · {}", theme::duration(*millis)),
+                        theme::dim(),
+                    ),
+                    Span::styled(
+                        if *failed { " failed" } else { "" },
+                        Style::default().fg(theme::error_color()),
+                    ),
+                ],
+                width,
+            )])),
+            None,
+        ),
+        Block::Compacted { reason, millis } => (
+            uncopyable(plain_lines(vec![Line::from(vec![
+                Span::styled("⇅ ", theme::faint()),
+                Span::styled("compacted context", theme::bold(theme::text_color())),
+                Span::styled(
+                    format!(
+                        "  {} · {}",
+                        theme::duration(*millis),
+                        if reason.contains("Threshold") {
+                            "reached 80% of the window".to_owned()
+                        } else {
+                            reason.to_lowercase()
+                        }
+                    ),
+                    theme::dim(),
+                ),
+            ])])),
             None,
         ),
         Block::Notice(text) => (
@@ -1582,6 +1736,49 @@ fn user_line(text: &str, first: bool) -> LinkedLine {
     LinkedLine::new(spans).with_leading_gutter()
 }
 
+/// Left-aligned content with meta pushed to the right edge; falls back to a
+/// plain run when the row is too narrow to spread.
+fn spread(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    if right.is_empty() {
+        return Line::from(left);
+    }
+    let used = Line::from(left.clone()).width() + Line::from(right.clone()).width();
+    let gap = if used + 2 <= width { width - used } else { 2 };
+    left.push(Span::raw(" ".repeat(gap)));
+    left.extend(right);
+    Line::from(left)
+}
+
+/// A turn's end: wall time since the user's prompt, and whether work is
+/// still running in the background. Turns restart on their own after a
+/// detached result lands, so per-turn figures would say little; the clock
+/// keeps running until nothing is left in the background.
+fn turn_end_line(background: usize, since_prompt: u64) -> Line<'static> {
+    let mut spans = vec![Span::styled("· ", theme::faint())];
+    if background > 0 {
+        spans.push(Span::styled("◔ ", Style::default().fg(theme::warn_color())));
+        spans.push(Span::styled(
+            format!(
+                "{background} in background · {} so far",
+                theme::duration(since_prompt)
+            ),
+            theme::faint(),
+        ));
+    } else {
+        spans.push(Span::styled(theme::duration(since_prompt), theme::faint()));
+    }
+    Line::from(spans)
+}
+
+/// The most recent reasoning heading, as the fold's label.
+fn thought_heading(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(|line| line.trim().trim_matches('*').trim())
+        .find(|line| !line.is_empty())
+        .map(|line| truncate_to_width(line, 72))
+}
+
 fn thought_lines(
     app: &App,
     text: &str,
@@ -1589,19 +1786,30 @@ fn thought_lines(
     millis: Option<u64>,
 ) -> Vec<Line<'static>> {
     let elapsed = millis.unwrap_or(u64::try_from(running_millis).unwrap_or(u64::MAX));
-    if millis.is_some() && !app.show_thoughts {
-        return vec![Line::from(Span::styled(
-            format!("⋮ thought for {} · ^t to read", theme::duration(elapsed)),
-            theme::faint(),
-        ))];
+    if !app.show_thoughts {
+        return vec![if millis.is_some() {
+            Line::from(vec![
+                Span::styled("⋮ ", theme::faint()),
+                Span::styled(
+                    format!("thought {} · ^t", theme::duration(elapsed)),
+                    theme::faint(),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("⋮ ", Style::default().fg(theme::running_color())),
+                Span::styled("thinking", theme::dim()),
+                Span::styled(
+                    thought_heading(text).map_or(String::new(), |heading| format!(" · {heading}")),
+                    theme::text(),
+                ),
+                Span::styled(format!(" · {}", theme::duration(elapsed)), theme::dim()),
+            ])
+        }];
     }
     let style = theme::dim().add_modifier(Modifier::ITALIC);
     let all: Vec<&str> = text.split('\n').collect();
-    let shown = if app.show_thoughts {
-        all.as_slice()
-    } else {
-        &all[all.len().saturating_sub(4)..]
-    };
+    let shown = all.as_slice();
     shown
         .iter()
         .map(|line| {
@@ -1613,8 +1821,14 @@ fn thought_lines(
         .collect()
 }
 
-fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(tool_header(app, call, active))];
+fn tool_lines(
+    app: &App,
+    call: &ToolCall,
+    active: bool,
+    width: usize,
+    block_index: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![tool_header(app, call, active, width, block_index)];
     let compose = call.is_compose();
     if call.running() {
         if compose
@@ -1625,17 +1839,147 @@ fn tool_lines(app: &App, call: &ToolCall, active: bool) -> Vec<Line<'static>> {
         {
             lines.extend(script_lines(call));
         }
-        if call.expanded {
-            lines.extend(output_lines(call));
+        // A running program's own output is a placeholder until it finishes;
+        // its lanes say more, unless the user asked for the output.
+        if call.expanded && (call.expansion_explicit || !app.has_grouped_tools(&call.id)) {
+            lines.extend(expanded_output_lines(call));
         }
         return lines;
     }
     if compose {
         lines.extend(completed_compose_lines(call));
-    } else {
-        lines.extend(output_lines(call));
+    } else if call.expanded {
+        lines.extend(expanded_output_lines(call));
     }
     lines
+}
+
+/// Where a nested call sits on its program's clock.
+struct LaneClock {
+    started: std::time::Instant,
+    total_millis: u64,
+}
+
+fn lane_clock(app: &App, call: &ToolCall) -> Option<LaneClock> {
+    let parent = app.tool_call(call.parent_id.as_deref()?)?;
+    Some(LaneClock {
+        started: parent.started,
+        total_millis: parent.elapsed().max(1),
+    })
+}
+
+/// A bar on the program's clock: where the call started, how long it ran,
+/// and whether it is still going.
+fn lane_bar(call: &ToolCall, clock: &LaneClock, track: usize) -> Vec<Span<'static>> {
+    let offset = u64::try_from(
+        call.started
+            .saturating_duration_since(clock.started)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let end = offset.saturating_add(call.elapsed());
+    let total = clock.total_millis.max(end).max(1);
+    let cell = |millis: u64| ((millis as f64 / total as f64) * track as f64) as usize;
+    let mut start = cell(offset).min(track.saturating_sub(2));
+    let mut stop = if call.running() {
+        track
+    } else {
+        cell(end).max(start + 2).min(track)
+    };
+    if stop - start < 2 {
+        start = stop.saturating_sub(2);
+        stop = start + 2;
+    }
+    let (style, cap) = if call.running() {
+        (Style::default().fg(theme::running_color()), "▶")
+    } else if call.status == ToolCallStatus::Failed {
+        (Style::default().fg(theme::error_color()), "╴")
+    } else {
+        (Style::default().fg(theme::success_color()), "╴")
+    };
+    vec![
+        Span::raw(" ".repeat(start)),
+        Span::styled(format!("╶{}{cap}", "━".repeat(stop - start - 2)), style),
+        Span::raw(" ".repeat(track - stop)),
+    ]
+}
+
+/// The one-word kind of a nested call, from the runtime's canonical title.
+fn lane_kind(call: &ToolCall) -> (&'static str, bool) {
+    let kind = match call.title.as_str() {
+        "Running shell command" => "shell",
+        "Editing file" => "edit",
+        "Reading image" => "read",
+        "Searching available tools" => "tool_search",
+        "Fetching Kit documentation" => "docs",
+        "Starting subagent" => "subagent",
+        "Prompting subagent" => "prompt",
+        "Forking session" => "fork",
+        "Calling tool" => "tool",
+        _ => return ("", false),
+    };
+    (kind, true)
+}
+
+/// A nested call as one lane of its program.
+fn lane_line(
+    app: &App,
+    call: &ToolCall,
+    active: bool,
+    width: usize,
+    clock: Option<LaneClock>,
+) -> Line<'static> {
+    const TRACK: usize = 16;
+    let (glyph, style) = status_glyph(app, call);
+    let (kind, canonical) = lane_kind(call);
+    let mut left = vec![
+        Span::styled("┃ ", theme::faint()),
+        Span::styled(format!("{glyph} "), style),
+    ];
+    let title_style = theme::bold(if active {
+        theme::accent_color()
+    } else {
+        theme::text_color()
+    });
+    if canonical {
+        left.push(Span::styled(format!("{kind:<11}"), title_style));
+    } else {
+        left.push(Span::styled(
+            format!("{:<11}", kind_label(&call.kind).trim()),
+            theme::dim(),
+        ));
+        left.push(Span::styled(call.display_title().to_string(), title_style));
+    }
+    let mut right = Vec::new();
+    if let Some(clock) = clock.filter(|_| width >= 56) {
+        right.extend(lane_bar(call, &clock, TRACK));
+        right.push(Span::raw("  "));
+    }
+    right.push(Span::styled(theme::duration(call.elapsed()), theme::dim()));
+    if !call.running() && call.status == ToolCallStatus::Failed {
+        right.push(Span::styled(
+            " failed",
+            Style::default().fg(theme::error_color()),
+        ));
+    }
+    if !call.output.is_empty() && !call.expanded {
+        right.push(Span::styled(
+            format!(" ▸ {}", call.output.len()),
+            theme::faint(),
+        ));
+    }
+    spread(left, right, width)
+}
+
+fn status_glyph(app: &App, call: &ToolCall) -> (String, Style) {
+    match call.status {
+        _ if call.running() => (
+            theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
+            theme::bold(theme::running_color()),
+        ),
+        ToolCallStatus::Failed => ("✗".into(), theme::bold(theme::error_color())),
+        _ => ("✓".into(), theme::bold(theme::success_color())),
+    }
 }
 
 /// Source lines stay neutral; ACP owns tool lifecycle display.
@@ -1646,7 +1990,7 @@ fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
         .take(MAX_OUTPUT_ROWS)
         .map(|source| {
             let spans = vec![
-                Span::styled("   │ ", theme::faint()),
+                Span::styled("   ┃ ", theme::faint()),
                 Span::styled(source.to_string(), theme::dim()),
             ];
             Line::from(spans)
@@ -1655,85 +1999,86 @@ fn script_lines(call: &ToolCall) -> Vec<Line<'static>> {
     let count = call.script.lines().count();
     if count > MAX_OUTPUT_ROWS {
         lines.push(Line::from(Span::styled(
-            format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
+            format!("   ┃ … {} more lines", count - MAX_OUTPUT_ROWS),
             theme::faint(),
         )));
     }
     lines
 }
 
+/// The output/script view chips for an opened program.
+fn view_chips(view: ComposeView) -> Vec<Span<'static>> {
+    let chip = |label: &'static str, selected: bool| {
+        if selected {
+            Span::styled(format!("[{label}]"), theme::bold(theme::accent_color()))
+        } else {
+            Span::styled(format!(" {label} "), theme::faint())
+        }
+    };
+    vec![
+        chip("output", view == ComposeView::Output),
+        chip("script", view == ComposeView::Script),
+    ]
+}
+
 fn completed_compose_lines(call: &ToolCall) -> Vec<Line<'static>> {
     if !call.expanded {
-        return output_lines(call);
+        return Vec::new();
     }
-
-    let (output_style, script_style, hint) = match call.compose_view {
-        ComposeView::Output => (
-            theme::bold(theme::accent_color()),
-            theme::faint(),
-            "  click or ^o for Script",
-        ),
-        ComposeView::Script => (
-            theme::faint(),
-            theme::bold(theme::accent_color()),
-            "  click or ^o to close",
-        ),
-    };
-    let mut lines = vec![Line::from(vec![
-        Span::styled("   ", theme::faint()),
-        Span::styled("Script", script_style),
-        Span::styled("  ", theme::faint()),
-        Span::styled("Output", output_style),
-        Span::styled(hint, theme::faint()),
-    ])];
+    let count = call.output.len();
+    let mut left = vec![Span::styled("   ┃ ▾ ", theme::dim())];
+    left.push(Span::styled(
+        match call.compose_view {
+            ComposeView::Output => format!("output · {count} {}", plural("line", count)),
+            ComposeView::Script => "script".to_owned(),
+        },
+        theme::dim(),
+    ));
+    left.push(Span::raw("   "));
+    left.extend(view_chips(call.compose_view));
+    let mut lines = vec![Line::from(left)];
     match call.compose_view {
-        ComposeView::Output => lines.extend(expanded_output_lines(call)),
-        ComposeView::Script => {
-            lines.extend(script_lines(call));
-        }
+        ComposeView::Output => lines.extend(output_body(call)),
+        ComposeView::Script => lines.extend(script_lines(call)),
     }
     lines
 }
 
-/// Raw tool output stays folded: it is machine-shaped, often thousands of
-/// lines, and unreadable inline. The fold row says how much there is and opens
-/// on a click or `^o`.
-fn output_lines(call: &ToolCall) -> Vec<Line<'static>> {
-    if call.output.is_empty() {
-        return Vec::new();
-    }
-    let count = call.output.len();
-    if !call.expanded {
-        return vec![Line::from(vec![
-            Span::styled("   ▸ ", theme::dim()),
-            Span::styled(
-                format!("{count} {} of output", plural("line", count)),
-                theme::dim(),
-            ),
-            Span::styled("  click or ^o to open", theme::faint()),
-        ])];
-    }
-    expanded_output_lines(call)
-}
-
+/// Raw tool output stays folded behind the header's line count: it is
+/// machine-shaped, often thousands of lines, and unreadable inline. A click
+/// or `^o` opens it.
 fn expanded_output_lines(call: &ToolCall) -> Vec<Line<'static>> {
     if call.output.is_empty() {
         return Vec::new();
     }
     let count = call.output.len();
     let mut lines = vec![Line::from(vec![
-        Span::styled("   ▾ ", theme::dim()),
-        Span::styled("output", theme::dim()),
+        Span::styled("   ┃ ▾ ", theme::dim()),
+        Span::styled(
+            format!("output · {count} {}", plural("line", count)),
+            theme::dim(),
+        ),
     ])];
-    lines.extend(call.output.iter().take(MAX_OUTPUT_ROWS).map(|line| {
-        Line::from(vec![
-            Span::styled("   │ ", theme::faint()),
-            Span::styled(line.clone(), theme::dim()),
-        ])
-    }));
+    lines.extend(output_body(call));
+    lines
+}
+
+fn output_body(call: &ToolCall) -> Vec<Line<'static>> {
+    let count = call.output.len();
+    let mut lines: Vec<_> = call
+        .output
+        .iter()
+        .take(MAX_OUTPUT_ROWS)
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("   ┃ ", theme::faint()),
+                Span::styled(line.clone(), theme::dim()),
+            ])
+        })
+        .collect();
     if count > MAX_OUTPUT_ROWS {
         lines.push(Line::from(Span::styled(
-            format!("   │ … {} more lines", count - MAX_OUTPUT_ROWS),
+            format!("   ┃ … {} more lines", count - MAX_OUTPUT_ROWS),
             theme::faint(),
         )));
     }
@@ -1748,38 +2093,71 @@ fn plural(word: &str, count: usize) -> String {
     }
 }
 
-fn tool_header(app: &App, call: &ToolCall, active: bool) -> Vec<Span<'static>> {
-    let (glyph, style) = match call.status {
-        _ if call.running() => (
-            theme::pulse(theme::Pulse::Tool, app.tick).to_string(),
-            theme::bold(theme::running_color()),
-        ),
-        ToolCallStatus::Failed => ("✗".into(), theme::bold(theme::error_color())),
-        _ => ("✓".into(), theme::bold(theme::success_color())),
+/// Glyph and title on the left; counts, timing, and the output fold on the
+/// right. Nested calls render as lanes of their program instead.
+fn tool_header(
+    app: &App,
+    call: &ToolCall,
+    active: bool,
+    width: usize,
+    block_index: usize,
+) -> Line<'static> {
+    if call.parent_id.is_some() {
+        return lane_line(app, call, active, width, lane_clock(app, call));
+    }
+    let (glyph, style) = status_glyph(app, call);
+    let mut left = vec![Span::styled(format!("{glyph} "), style)];
+    let kind = if call.is_compose() {
+        ""
+    } else {
+        kind_label(&call.kind)
     };
-    let mut spans = vec![
-        Span::styled(format!("{glyph} "), style),
-        Span::styled(
-            call.display_title().to_string(),
-            theme::bold(if active {
-                theme::accent_color()
-            } else {
-                theme::text_color()
-            }),
-        ),
-        Span::styled(kind_label(&call.kind).to_string(), theme::faint()),
-        Span::styled(
-            format!("  {}", theme::duration(call.elapsed())),
-            theme::dim(),
-        ),
-    ];
-    if call.backgrounded && call.running() {
-        spans.push(Span::styled("  · background", theme::accent()));
-        if active {
-            spans.push(Span::styled(" · ^k kill", theme::accent()));
+    let mut meta = Vec::new();
+    let (_, _, calls) = app.child_window(block_index);
+    if calls > 0 {
+        meta.push(format!("{calls} {}", plural("call", calls)));
+    }
+    meta.push(theme::duration(call.elapsed()));
+    let mut right = Vec::new();
+    if call.backgrounded {
+        if call.running() {
+            right.push(Span::styled("◔ ", Style::default().fg(theme::warn_color())));
+            right.push(Span::styled("background · ", theme::dim()));
+        } else {
+            right.push(Span::styled("↩ ", theme::faint()));
+            right.push(Span::styled("background · ".to_owned(), theme::dim()));
         }
     }
-    spans
+    right.push(Span::styled(meta.join(" · "), theme::dim()));
+    if !call.running() && call.status == ToolCallStatus::Failed {
+        right.push(Span::styled(
+            " failed",
+            Style::default().fg(theme::error_color()),
+        ));
+    }
+    if !call.output.is_empty() && !call.expanded {
+        let count = call.output.len();
+        right.push(Span::styled(
+            format!(" ▸ {count} {}", plural("line", count)),
+            theme::faint(),
+        ));
+    }
+    // The title gives way before the meta wraps onto a second row.
+    let room = width
+        .saturating_sub(2 + UnicodeWidthStr::width(kind) + 2 + Line::from(right.clone()).width())
+        .max(8);
+    left.push(Span::styled(
+        truncate_to_width(call.display_title(), room),
+        theme::bold(if active {
+            theme::accent_color()
+        } else {
+            theme::text_color()
+        }),
+    ));
+    if !kind.is_empty() {
+        left.push(Span::styled(kind.to_string(), theme::faint()));
+    }
+    spread(left, right, width)
 }
 
 /// Tool kinds worth naming; `other` reads as noise next to the tool's title.
@@ -1802,7 +2180,12 @@ fn working_line(app: &App) -> Line<'static> {
     let label = match app.phase {
         Phase::Cancelling => "stopping",
         _ if app.compacting => "compacting context",
-        _ if app.focus_call().is_some_and(ToolCall::running) => "running tools",
+        _ if app
+            .focus_call()
+            .is_some_and(|call| call.running() && !call.backgrounded) =>
+        {
+            "running tools"
+        }
         _ => "thinking",
     };
     Line::from(vec![
@@ -1812,10 +2195,9 @@ fn working_line(app: &App) -> Line<'static> {
         ),
         Span::styled(label.to_string(), theme::accent()),
         Span::styled(
-            format!("  {}", theme::duration(app.elapsed())),
+            format!(" · {}", theme::duration(app.elapsed())),
             theme::dim(),
         ),
-        Span::styled("   esc interrupts", theme::faint()),
     ])
 }
 
@@ -1914,59 +2296,109 @@ fn agent_lines(
         });
     }
     let mut first = vec![
-        Span::styled(first_prefix, theme::faint()),
+        Span::styled(first_prefix.clone(), theme::faint()),
         Span::styled(format!("{glyph} "), glyph_style),
     ];
     if show_vendor {
         let (mark, mark_style) = theme::vendor_mark(row.vendor);
         first.push(Span::styled(format!("{mark} "), mark_style));
     }
-    first.push(Span::styled(row.name.clone(), theme::text()));
-    first.push(Span::styled(ancestry, theme::faint()));
-    let first = Line::from(first);
+    // Identity on the right: which harness and model, and which generation
+    // the model can continue or fork.
+    let mut identity = Vec::new();
+    let harness = row.harness.trim_start_matches("acp.");
+    if !harness.is_empty() && (harness != "kit" || show_vendor) {
+        identity.push(harness.to_owned());
+    }
+    if let Some(model) = row.model.as_deref().filter(|model| !model.is_empty()) {
+        identity.push(model.to_owned());
+    }
+    let mut right = Vec::new();
+    if !identity.is_empty() {
+        right.push(Span::styled(identity.join(" · "), theme::faint()));
+        right.push(Span::raw("  "));
+    }
+    right.push(Span::styled(format!("g{}", row.generation), theme::faint()));
+    let name_room = width
+        .saturating_sub(Line::from(first.clone()).width() + Line::from(right.clone()).width() + 2)
+        .max(4);
+    first.push(Span::styled(
+        truncate_to_width(&format!("{}{ancestry}", row.name), name_room),
+        theme::text(),
+    ));
+    let first = spread(first, right, width);
 
     let finished = row.generation_finished_at_unix_ms.unwrap_or(now_unix_ms);
-    let mut tail = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
-    if let Some(usage) = row.usage {
-        tail = format!(
-            "{} {}/{} · {tail}",
-            percent(usage.used, usage.size),
-            compact(usage.used),
-            compact(usage.size)
-        );
-    }
-    if let Some(cost) = &row.cost {
-        tail = format!("{} · {tail}", cost_label(cost.amount, &cost.currency));
-    }
+    let elapsed = agent_duration(finished.saturating_sub(row.generation_started_at_unix_ms));
     let second_prefix = truncate_to_width(&second_prefix, width);
     let prefix_width = UnicodeWidthStr::width(second_prefix.as_str());
-    let excerpt = row
-        .excerpt()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let idle = matches!(row.status, SubagentStatus::Idle) && !failed;
+    let excerpt = if idle {
+        "idle · resumable".to_owned()
+    } else if failed {
+        "failed".to_owned()
+    } else {
+        row.excerpt()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let second = Line::from(vec![
         Span::styled(second_prefix.clone(), theme::faint()),
         Span::styled(
             truncate_to_width(&excerpt, width.saturating_sub(prefix_width)),
-            theme::dim(),
+            if failed {
+                Style::default().fg(theme::error_color())
+            } else {
+                theme::dim()
+            },
         ),
     ]);
-    let third = Line::from(vec![
-        Span::styled(second_prefix, theme::faint()),
-        Span::styled(
-            truncate_to_width(&tail, width.saturating_sub(prefix_width)),
-            theme::faint(),
-        ),
-    ]);
-    [first, second, third]
+    let mut third = vec![Span::styled(second_prefix, theme::faint())];
+    let mut tail = Vec::new();
+    if let Some(usage) = row.usage {
+        third.extend(agent_gauge(usage.used, usage.size));
+        tail.push(compact(usage.used));
+    }
+    if !idle {
+        tail.push(elapsed);
+    }
+    if let Some(cost) = &row.cost {
+        tail.push(cost_label(cost.amount, &cost.currency));
+    }
+    let used = Line::from(third.clone()).width();
+    third.push(Span::styled(
+        truncate_to_width(&tail.join(" · "), width.saturating_sub(used)),
+        theme::faint(),
+    ));
+    [first, second, Line::from(third)]
+}
+
+/// Six-cell context gauge for an agent row, followed by a space.
+fn agent_gauge(used: u64, size: u64) -> Vec<Span<'static>> {
+    const CELLS: u64 = 6;
+    let filled = if size == 0 {
+        0
+    } else {
+        (used.saturating_mul(CELLS) / size).min(CELLS)
+    };
+    let fill = Style::default().fg(if used.saturating_mul(10) >= size.saturating_mul(8) {
+        theme::warn_color()
+    } else {
+        theme::running_color()
+    });
+    vec![
+        Span::styled("▰".repeat(filled as usize), fill),
+        Span::styled("▱".repeat((CELLS - filled) as usize), theme::faint()),
+        Span::raw(" "),
+    ]
 }
 
 fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::faint())
-        .title(Span::styled(" agent roster ", theme::accent()));
+        .title(Span::styled(" agents ", theme::accent()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1990,15 +2422,11 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     if inner.height > 0 {
         let counts = app.agent_counts();
-        let mut parts = vec![format!("{} agents", counts.total)];
-        let costs = app
-            .subagent_cost_totals()
-            .into_iter()
-            .map(|(currency, amount)| cost_label(amount, &currency))
-            .collect::<Vec<_>>();
-        if !costs.is_empty() {
-            parts.push(costs.join(" + "));
-        }
+        let mut parts = vec![format!(
+            "{} {}",
+            counts.total,
+            plural("agent", counts.total)
+        )];
         if counts.starting > 0 {
             parts.push(format!("{} starting", counts.starting));
         }
@@ -2008,13 +2436,26 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         if counts.idle > 0 {
             parts.push(format!("{} idle", counts.idle));
         }
+        let costs = app
+            .subagent_cost_totals()
+            .into_iter()
+            .map(|(currency, amount)| cost_label(amount, &currency))
+            .collect::<Vec<_>>();
         let footer = Rect {
             y: inner.y + inner.height - 1,
             height: 1,
             ..inner
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(parts.join(" · "), theme::faint())),
+            Paragraph::new(spread(
+                vec![Span::styled(parts.join(" · "), theme::faint())],
+                if costs.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Span::styled(costs.join(" + "), theme::dim())]
+                },
+                inner.width as usize,
+            )),
             footer,
         );
     }
@@ -2049,66 +2490,172 @@ fn draw_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_pending_steers(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// Whether the dock shows an agents summary: the panel is hidden by width.
+fn dock_agents_row(app: &App, narrow: bool) -> bool {
+    narrow && app.show_agents() && app.agent_counts().total > 0
+}
+
+/// Content rows the dock may take before it windows its entries.
+const MAX_DOCK_ROWS: usize = 4;
+
+fn dock_entry_count(app: &App, narrow: bool) -> usize {
+    app.background_calls().len()
+        + usize::from(dock_agents_row(app, narrow))
+        + app.pending_steers.len()
+}
+
+/// Rows for everything alive outside the current turn, plus a hairline.
+fn dock_rows(app: &App, narrow: bool) -> usize {
+    let rows = dock_entry_count(app, narrow).min(MAX_DOCK_ROWS);
+    if rows == 0 { 0 } else { rows + 1 }
+}
+
+/// Background programs, an agents summary when the panel cannot fit, and
+/// steers waiting for injection sit above the composer so nothing that is
+/// still running can scroll away. The dock is capped; when it overflows it
+/// windows around the selected entry and says how many rows are hidden.
+fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
     let visible = area.height as usize;
-    if visible == 0 || app.pending_steers.is_empty() {
+    if visible == 0 {
         return;
     }
+    let width = area.width as usize;
+    let mut entries: Vec<(Line<'static>, bool)> = Vec::new();
+    for call in app.background_calls() {
+        let focused = app.focus_call().is_some_and(|focus| focus.id == call.id);
+        let mut right = vec![Span::styled(theme::duration(call.elapsed()), theme::dim())];
+        if focused {
+            right.push(Span::styled("   ^k stop", theme::faint()));
+        }
+        right.push(Span::raw(" "));
+        let room = width
+            .saturating_sub(15 + Line::from(right.clone()).width() + 2)
+            .max(8);
+        let left = vec![
+            Span::styled(" ◔ ", Style::default().fg(theme::warn_color())),
+            Span::styled("background  ", theme::dim()),
+            Span::styled(
+                truncate_to_width(call.display_title(), room),
+                theme::bold(if focused {
+                    theme::accent_color()
+                } else {
+                    theme::text_color()
+                }),
+            ),
+        ];
+        // While the queue has focus the selected steer is what keys act on.
+        entries.push((spread(left, right, width), focused && !app.queue_focused));
+    }
+    if dock_agents_row(app, narrow) {
+        let counts = app.agent_counts();
+        let active = counts.starting + counts.working;
+        let (glyph, style) = if active > 0 {
+            (
+                theme::pulse(theme::Pulse::Child, app.tick),
+                Style::default().fg(theme::running_color()),
+            )
+        } else {
+            ("○", theme::dim())
+        };
+        let mut parts = vec![format!(
+            "{} {}",
+            counts.total,
+            plural("agent", counts.total)
+        )];
+        if counts.working > 0 {
+            parts.push(format!("{} working", counts.working));
+        }
+        if counts.starting > 0 {
+            parts.push(format!("{} starting", counts.starting));
+        }
+        if counts.idle > 0 {
+            parts.push(format!("{} idle", counts.idle));
+        }
+        entries.push((
+            spread(
+                vec![
+                    Span::styled(format!(" {glyph} "), style),
+                    Span::styled("agents  ", theme::dim()),
+                    Span::styled(parts.join(" · "), theme::text()),
+                ],
+                vec![Span::styled("^r panel ", theme::faint())],
+                width,
+            ),
+            false,
+        ));
+    }
+    entries.extend(pending_steer_lines(app, width));
 
-    let mut lines = Vec::with_capacity(visible);
+    let mut lines = vec![Line::from(Span::styled("╌".repeat(width), theme::faint()))];
+    let cap = visible.saturating_sub(1);
+    let total = entries.len();
+    if total <= cap {
+        lines.extend(entries.into_iter().map(|(line, _)| line));
+    } else if cap > 0 {
+        // Keep the selected entry on screen; otherwise favour the newest,
+        // which is what the keys act on. One row says what is hidden.
+        let selected = entries
+            .iter()
+            .position(|(_, selected)| *selected)
+            .unwrap_or(total - 1);
+        let start = selected.saturating_sub(cap - 1).min(total - cap);
+        let end = start + cap;
+        let hidden = total - cap;
+        let indicator = Line::from(Span::styled(
+            format!("   … {hidden} more in the dock"),
+            theme::faint(),
+        ));
+        let mut window: Vec<Line<'static>> = entries
+            .into_iter()
+            .skip(start)
+            .take(cap)
+            .map(|(line, _)| line)
+            .collect();
+        if cap > 1 {
+            let slot = if selected == end - 1 { 0 } else { cap - 1 };
+            window[slot] = indicator;
+        }
+        lines.extend(window);
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn pending_steer_lines(app: &App, width: usize) -> Vec<(Line<'static>, bool)> {
     let selected = app
         .pending_steers
         .iter()
         .position(|pending| app.selected_steer.as_deref() == Some(pending.id.as_str()));
-    let skip = if let Some(selected) = selected {
-        selected.saturating_sub(visible - 1)
-    } else if app.pending_steers.len() > visible && visible > 1 {
-        let hidden = app.pending_steers.len() - (visible - 1);
-        lines.push(Line::from(Span::styled(
-            format!("  … {hidden} earlier pending"),
-            theme::faint(),
-        )));
-        hidden
-    } else {
-        app.pending_steers.len().saturating_sub(visible)
-    };
-    lines.extend(
-        app.pending_steers
-            .iter()
-            .skip(skip)
-            .take(visible)
-            .map(|pending| {
-                let text = pending
-                    .text
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Line::from(vec![
-                    Span::styled(
-                        if app.selected_steer.as_deref() == Some(pending.id.as_str()) {
-                            "  ▶ "
-                        } else {
-                            "  › "
-                        },
-                        theme::bold(theme::user_color()),
-                    ),
-                    Span::styled(text, theme::bold(theme::text_color())),
-                    Span::styled(
-                        if app.selected_steer.as_deref() == Some(pending.id.as_str()) {
-                            format!(
-                                "  · pending [{}/{}]",
-                                selected.unwrap_or(0) + 1,
-                                app.pending_steers.len()
-                            )
-                        } else {
-                            "  · pending".to_owned()
-                        },
-                        theme::faint(),
-                    ),
-                ])
-            }),
-    );
-    frame.render_widget(Paragraph::new(lines), area);
+    app.pending_steers
+        .iter()
+        .enumerate()
+        .map(|(index, pending)| {
+            let text = pending
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let is_selected = selected == Some(index);
+            let left = vec![
+                Span::styled(
+                    if is_selected { " ▶ " } else { " ⇥ " },
+                    theme::bold(theme::user_color()),
+                ),
+                Span::styled(format!("steer {}  ", index + 1), theme::dim()),
+                Span::styled(text, theme::bold(theme::text_color())),
+            ];
+            let right = vec![Span::styled(
+                if is_selected {
+                    format!("pending [{}/{}] ", index + 1, app.pending_steers.len())
+                } else if app.queue_focused {
+                    "pending ".to_owned()
+                } else {
+                    "pending · f2 ".to_owned()
+                },
+                theme::faint(),
+            )];
+            (spread(left, right, width), is_selected)
+        })
+        .collect()
 }
 
 fn draw_start_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
@@ -2172,12 +2719,20 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, area: Rect) -> PromptViewport {
     } else {
         theme::faint()
     };
+    let title = if app.editing_steer() {
+        Line::from(Span::styled(
+            " editing pending · Enter save · Esc cancel ",
+            theme::dim(),
+        ))
+    } else if app.phase == Phase::Working && app.can_steer {
+        Line::from(Span::styled(" steer ", theme::accent()))
+    } else if app.phase == Phase::Idle {
+        Line::from(Span::styled(" message ", theme::faint()))
+    } else {
+        Line::default()
+    };
     let block = Panel::bordered()
-        .title(if app.editing_steer() {
-            " editing pending · Enter save · Esc cancel "
-        } else {
-            ""
-        })
+        .title(title)
         .border_type(BorderType::Rounded)
         .border_style(border);
     let inner = block.inner(area);
@@ -2352,12 +2907,25 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(" {} ", theme::pulse(theme::Pulse::Status, app.tick)),
                 Style::default().fg(theme::accent_color()),
             ),
-            Span::styled(
-                format!("working {}", theme::duration(app.elapsed())),
-                Style::default().fg(theme::accent_color()),
-            ),
+            Span::styled("working", theme::bold(theme::accent_color())),
+            Span::styled(format!(" {}", theme::duration(app.elapsed())), theme::dim()),
         ],
     };
+    let counts = app.agent_counts();
+    let active_agents = counts.starting + counts.working;
+    if active_agents > 0 {
+        left.push(Span::styled(
+            format!(" · {active_agents} {}", plural("agent", active_agents)),
+            theme::dim(),
+        ));
+    }
+    let background = app.background_calls().len();
+    if background > 0 {
+        left.push(Span::styled(
+            format!(" · {background} background"),
+            theme::dim(),
+        ));
+    }
     if let Some(toast) = app.toast_text() {
         left.push(Span::styled("  ", theme::dim()));
         left.push(Span::styled(
@@ -2379,12 +2947,45 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     } else if app.queue_handoff {
         "queue closed · type / ←→ / esc to continue "
+    } else if app.phase == Phase::Working {
+        let stop = app
+            .focus_call()
+            .is_some_and(|call| call.backgrounded && call.running());
+        let mut keys = Vec::new();
+        if app.can_steer {
+            keys.push("⏎ steer");
+        }
+        if !app.pending_steers.is_empty() {
+            keys.push("F2 queue");
+        }
+        keys.push("esc interrupt");
+        if stop {
+            keys.push("^k stop");
+        }
+        keys.extend(["⌘b background", "^t reasoning", "^r agents"]);
+        &format!("{} ", keys.join("   "))
     } else if !app.pending_steers.is_empty() {
         "F2 queue   ⏎ send   ⇧⏎ newline "
+    } else if app.phase == Phase::Idle && background > 0 {
+        "⏎ send   ^k stop   ^r agents   ^t reasoning   ^l log "
     } else {
-        "⏎ send   ⇧⏎ newline   ^l log   ^c quit "
+        "⏎ send   ⇧⏎ newline   ^r agents   ^t reasoning   ^l log   ^c quit "
     };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
+
+    let hint_width = hints.chars().count();
+    let hints = if used + hint_width + 1 > area.width as usize {
+        // Drop hints from the right until the phase stays readable.
+        let mut trimmed = hints.trim_end().to_owned();
+        while used + trimmed.chars().count() + 2 > area.width as usize
+            && let Some(cut) = trimmed.rfind("   ")
+        {
+            trimmed.truncate(cut);
+        }
+        format!("{trimmed} ")
+    } else {
+        hints.to_owned()
+    };
     let gap = (area.width as usize)
         .saturating_sub(used + hints.chars().count())
         .max(1);
@@ -2811,7 +3412,16 @@ mod tests {
             "Trace ACP lifecycle",
         );
         let lines = agent_lines(&tree_row(&top, vec![], false, false), false, 0, 74_000, 48);
-        assert_eq!(line_text(&lines[0]), "⠋ Scout");
+        assert!(
+            line_text(&lines[0]).starts_with("⠋ Scout"),
+            "{}",
+            line_text(&lines[0])
+        );
+        assert!(
+            line_text(&lines[0]).ends_with("test  g1"),
+            "{}",
+            line_text(&lines[0])
+        );
         let second = line_text(&lines[1]);
         assert_eq!(second, "  Trace ACP lifecycle");
         assert_eq!(line_text(&lines[2]), "  1m 12s");
@@ -2834,7 +3444,11 @@ mod tests {
             74_000,
             48,
         );
-        assert_eq!(line_text(&lines[0]), "│  └─ ⠁ Scout");
+        assert!(
+            line_text(&lines[0]).starts_with("│  └─ ⠁ Scout "),
+            "{}",
+            line_text(&lines[0])
+        );
         assert!(line_text(&lines[1]).starts_with("│     Trace ACP lifecycle"));
 
         let lines = agent_lines(
@@ -2844,11 +3458,19 @@ mod tests {
             74_000,
             48,
         );
-        assert_eq!(line_text(&lines[0]), "   ├─ ⠁ Scout");
+        assert!(
+            line_text(&lines[0]).starts_with("   ├─ ⠁ Scout "),
+            "{}",
+            line_text(&lines[0])
+        );
         assert!(line_text(&lines[1]).starts_with("   │  Trace ACP lifecycle"));
 
         let lines = agent_lines(&tree_row(&nested, vec![], true, true), false, 0, 74_000, 48);
-        assert_eq!(line_text(&lines[0]), "⠁ Scout · via Pip");
+        assert!(
+            line_text(&lines[0]).starts_with("⠁ Scout · via Pip "),
+            "{}",
+            line_text(&lines[0])
+        );
         assert!(line_text(&lines[1]).starts_with("│ Trace ACP lifecycle"));
         assert_eq!(
             lines[0].spans[1].style.fg,
@@ -2857,7 +3479,11 @@ mod tests {
 
         let idle = test_agent("Scout", SubagentStatus::Idle, None, None, "done");
         let idle_lines = agent_lines(&tree_row(&idle, vec![], false, false), false, 0, 74_000, 20);
-        assert_eq!(line_text(&idle_lines[0]), "○ Scout");
+        assert!(
+            line_text(&idle_lines[0]).starts_with("○ Scout "),
+            "{}",
+            line_text(&idle_lines[0])
+        );
         assert!(
             idle_lines[0].spans[1]
                 .style
@@ -2879,12 +3505,16 @@ mod tests {
             74_000,
             20,
         );
-        assert_eq!(line_text(&failed_lines[0]), "✗ Scout");
+        assert!(
+            line_text(&failed_lines[0]).starts_with("✗ Scout "),
+            "{}",
+            line_text(&failed_lines[0])
+        );
         assert_eq!(
             failed_lines[0].spans[1].style.fg,
             Some(ratatui::style::Color::Red)
         );
-        assert_eq!(
+        assert!(
             line_text(
                 &agent_lines(
                     &tree_row(&failed, vec![], false, false),
@@ -2893,8 +3523,8 @@ mod tests {
                     77_000,
                     20,
                 )[0]
-            ),
-            "○ Scout"
+            )
+            .starts_with("○ Scout ")
         );
     }
 
@@ -2928,11 +3558,11 @@ mod tests {
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
         let second = line_text(&lines[1]);
         assert_eq!(second, "  Trace ACP lifecycle");
-        assert_eq!(line_text(&lines[2]), "  20.6% 41k/200k · 1m 12s");
+        assert_eq!(line_text(&lines[2]), "  ▰▱▱▱▱▱ 41k · 1m 12s");
 
         let lines = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 30);
         assert_eq!(line_text(&lines[1]), "  Trace ACP lifecycle");
-        assert_eq!(line_text(&lines[2]), "  20.6% 41k/200k · 1m 12s");
+        assert_eq!(line_text(&lines[2]), "  ▰▱▱▱▱▱ 41k · 1m 12s");
     }
 
     #[test]
@@ -2946,9 +3576,18 @@ mod tests {
         );
         row.vendor = crate::events::HarnessVendor::Claude;
         let plain = agent_lines(&tree_row(&row, vec![], false, false), false, 0, 74_000, 48);
-        assert_eq!(line_text(&plain[0]), "○ Designer");
+        assert!(
+            line_text(&plain[0]).starts_with("○ Designer "),
+            "{}",
+            line_text(&plain[0])
+        );
+        assert_eq!(line_text(&plain[1]), "  idle · resumable");
         let marked = agent_lines(&tree_row(&row, vec![], false, false), true, 0, 74_000, 48);
-        assert_eq!(line_text(&marked[0]), "○ ✱ Designer");
+        assert!(
+            line_text(&marked[0]).starts_with("○ ✱ Designer "),
+            "{}",
+            line_text(&marked[0])
+        );
         assert_eq!(
             marked[0].spans[2].style,
             super::theme::vendor_mark(crate::events::HarnessVendor::Claude).1
@@ -3017,13 +3656,7 @@ mod tests {
         let area_107 = ratatui::layout::Rect::new(2, 3, 107, 20);
         assert_eq!(body_layout(area_107, false, false), (area_107, None));
         assert_eq!(body_layout(area_107, true, true), (area_107, None));
-        assert_eq!(
-            body_layout(area_107, true, false),
-            (
-                ratatui::layout::Rect::new(2, 3, 107, 11),
-                Some(ratatui::layout::Rect::new(2, 14, 107, 9)),
-            )
-        );
+        assert_eq!(body_layout(area_107, true, false), (area_107, None));
 
         let area_108 = ratatui::layout::Rect::new(2, 3, 108, 20);
         assert_eq!(
@@ -3132,9 +3765,10 @@ mod tests {
             .draw(|frame| draw_agents(frame, &mut app, frame.area()))
             .expect("draw succeeds");
         let initial = terminal.backend().buffer();
-        assert_eq!(buffer_cells(initial, 0, 1..15), " agent roster ");
+        assert_eq!(buffer_cells(initial, 0, 1..9), " agents ");
         assert_eq!(buffer_cells(initial, 1, 1..10), "○ Scout 0");
-        assert_eq!(buffer_cells(initial, 2, 3..9), "Task 0");
+        assert_eq!(buffer_cells(initial, 2, 3..19), "idle · resumable");
+
         assert_eq!(buffer_cells(initial, 4, 1..10), "○ Scout 1");
         assert_eq!(buffer_cells(initial, 7, 1..18), "5 agents · 5 idle");
 
@@ -3773,7 +4407,7 @@ mod tests {
         let second = frame.find("second pending").expect("second steer");
         let input = frame.find("steer kit…").expect("steering input");
         assert!(first < second && second < input, "{frame}");
-        assert_eq!(frame.matches("· pending").count(), 2, "{frame}");
+        assert_eq!(frame.matches("⇥ steer").count(), 2, "{frame}");
         assert!(
             !app.blocks
                 .iter()
@@ -3787,7 +4421,7 @@ mod tests {
             append: false,
         });
         let frame = render(&mut app, 80, 18);
-        assert_eq!(frame.matches("· pending").count(), 1, "{frame}");
+        assert_eq!(frame.matches("⇥ steer").count(), 1, "{frame}");
         assert_eq!(app.pending_steers.len(), 1);
         assert!(
             matches!(app.blocks.last(), Some(Block::User(message)) if message.text == "first pending")
@@ -3814,14 +4448,14 @@ mod tests {
         assert!(render(&mut app, 100, 18).contains("F2 queue"));
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         let first = render(&mut app, 100, 18);
-        assert!(first.contains("▶ queued text 0"), "{first}");
+        assert!(first.contains("▶ steer 1  queued text 0"), "{first}");
         assert!(first.contains("⏎ edit"), "{first}");
         assert!(first.contains("del remove"), "{first}");
         for _ in 0..7 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let last = render(&mut app, 100, 18);
-        assert!(last.contains("▶ queued text 7"), "{last}");
+        assert!(last.contains("▶ steer 8  queued text 7"), "{last}");
         assert!(last.contains("[8/8]"), "{last}");
         app.pending_steers[7].editable = false;
         assert!(render(&mut app, 100, 18).contains("edit unavailable"));
@@ -3890,11 +4524,25 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         );
-        app.blocks.push(Block::TurnDuration(788_645_000));
+        app.blocks.push(Block::TurnDuration {
+            background: 0,
+            since_prompt: 788_645_000,
+        });
 
         let frame = render(&mut app, 80, 12);
 
-        assert!(frame.contains("· took 1w2d 3h04m05s"), "{frame}");
+        assert!(frame.contains("· 1w2d 3h04m05s"), "{frame}");
+        assert!(!frame.contains("so far"), "{frame}");
+
+        app.blocks.push(Block::TurnDuration {
+            background: 2,
+            since_prompt: 788_646_000,
+        });
+        let frame = render(&mut app, 80, 12);
+        assert!(
+            frame.contains("· ◔ 2 in background · 1w2d 3h04m06s so far"),
+            "{frame}"
+        );
     }
 
     #[test]
@@ -4035,31 +4683,28 @@ mod tests {
         });
 
         let collapsed = render(&mut app, 100, 30);
-        assert!(collapsed.contains("1 line of output"), "{collapsed}");
+        assert!(collapsed.contains("▸ 1 line"), "{collapsed}");
         assert!(!collapsed.contains("compose result"), "{collapsed}");
         assert!(!collapsed.contains("files = shell"), "{collapsed}");
 
         app.toggle_last_output();
         let output = render(&mut app, 100, 30);
-        assert!(output.contains("Output"), "{output}");
-        assert!(output.contains("Script"), "{output}");
+        assert!(output.contains("[output]"), "{output}");
+        assert!(output.contains(" script "), "{output}");
         assert!(output.contains("compose result"), "{output}");
         assert!(!output.contains("files = shell"), "{output}");
 
         app.toggle_last_output();
         let script = render(&mut app, 100, 30);
-        assert!(script.contains("Output"), "{script}");
-        assert!(script.contains("Script"), "{script}");
+        assert!(script.contains(" output "), "{script}");
+        assert!(script.contains("[script]"), "{script}");
         assert!(script.contains("files = shell"), "{script}");
         assert!(!script.contains("compose result"), "{script}");
 
         app.toggle_last_output();
         let collapsed_again = render(&mut app, 100, 30);
-        assert!(
-            collapsed_again.contains("1 line of output"),
-            "{collapsed_again}"
-        );
-        assert!(!collapsed_again.contains("Output"), "{collapsed_again}");
+        assert!(collapsed_again.contains("▸ 1 line"), "{collapsed_again}");
+        assert!(!collapsed_again.contains("[output]"), "{collapsed_again}");
     }
 
     #[test]
@@ -4134,6 +4779,61 @@ mod tests {
     }
 
     #[test]
+    fn dock_is_capped_and_keeps_the_selected_entry_visible() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openai-subscription".into(),
+            "gpt-5.4".into(),
+            "127.0.0.1:7331".into(),
+        );
+        for index in 0..6 {
+            app.apply(Update::ToolStarted {
+                id: format!("bg-{index}"),
+                title: format!("program {index}"),
+                kind: ToolKind::Other,
+                script: Some("return 1".into()),
+                backgrounded: true,
+            });
+        }
+        app.can_replace_steer = true;
+        for index in 0..3 {
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: format!("steer-{index}"),
+                text: format!("queued {index}"),
+            });
+        }
+        let dock = |frame: &str| {
+            frame
+                .lines()
+                .filter(|line| line.contains("background  ") || line.contains("steer "))
+                .count()
+        };
+
+        // Newest background call is focused by default and stays visible.
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.contains("program 5"), "{frame}");
+        assert!(frame.contains("… 5 more in the dock"), "{frame}");
+        assert!(dock(&frame) <= super::MAX_DOCK_ROWS, "{frame}");
+
+        app.focused_call_id = Some("bg-0".into());
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.contains("program 0"), "{frame}");
+        assert!(frame.contains("^k stop"), "{frame}");
+        assert!(!frame.contains("background  program 5"), "{frame}");
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        for _ in 0..2 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.contains("▶ steer 3  queued 2"), "{frame}");
+        assert!(frame.contains("[3/3]"), "{frame}");
+        assert!(dock(&frame) <= super::MAX_DOCK_ROWS, "{frame}");
+    }
+
+    #[test]
     fn only_the_focused_call_shows_the_kill_hint() {
         let mut app = App::new(
             PathBuf::from("/tmp"),
@@ -4150,34 +4850,38 @@ mod tests {
                 backgrounded: true,
             });
         }
-        fn headers(app: &App) -> Vec<String> {
-            app.blocks
-                .iter()
-                .filter_map(|block| match block {
-                    Block::Tool(call) => Some(
-                        super::tool_header(
-                            app,
-                            call,
-                            app.focus_call()
-                                .is_some_and(|focused| focused.id == call.id),
-                        )
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>(),
-                    ),
-                    _ => None,
-                })
+        fn dock(app: &mut App) -> Vec<String> {
+            render(app, 100, 20)
+                .lines()
+                .filter(|line| line.trim_start().starts_with("◔ background  "))
+                .map(str::to_owned)
                 .collect()
         }
 
-        let initial = headers(&app);
-        assert!(!initial[0].contains("^k kill"));
-        assert!(initial[1].contains("^k kill"));
+        let initial = dock(&mut app);
+        let first = initial
+            .iter()
+            .find(|line| line.contains("compose first"))
+            .unwrap();
+        let second = initial
+            .iter()
+            .find(|line| line.contains("compose second"))
+            .unwrap();
+        assert!(!first.contains("^k stop"), "{initial:?}");
+        assert!(second.contains("^k stop"), "{initial:?}");
 
         app.focused_call_id = Some("first".into());
-        let selected = headers(&app);
-        assert!(selected[0].contains("^k kill"));
-        assert!(!selected[1].contains("^k kill"));
+        let selected = dock(&mut app);
+        let first = selected
+            .iter()
+            .find(|line| line.contains("compose first"))
+            .unwrap();
+        let second = selected
+            .iter()
+            .find(|line| line.contains("compose second"))
+            .unwrap();
+        assert!(first.contains("^k stop"), "{selected:?}");
+        assert!(!second.contains("^k stop"), "{selected:?}");
     }
 
     #[test]
@@ -4287,7 +4991,7 @@ mod tests {
         let rows = frame.lines().collect::<Vec<_>>();
         let status = rows
             .iter()
-            .position(|row| row.contains("send"))
+            .position(|row| row.contains("working"))
             .expect("status row");
         let bottom = status - 1;
         let top = rows[..bottom]
@@ -4362,12 +5066,12 @@ mod tests {
         });
         let frame = render(&mut app, 100, 24);
         println!("{frame}");
-        assert!(frame.contains("40 lines of output"));
+        assert!(frame.contains("▸ 40 lines"));
         assert!(!frame.contains("output line 39"));
 
         let row = frame
             .lines()
-            .position(|line| line.contains("lines of output"))
+            .position(|line| line.contains("▸ 40 lines"))
             .expect("fold row is on screen");
         for kind in [
             MouseEventKind::Down(MouseButton::Left),
@@ -4695,12 +5399,52 @@ mod tests {
 
         let frame = render(&mut app, 120, 24);
 
-        assert!(frame.contains(concat!("kit v", env!("CARGO_PKG_VERSION"))));
-        assert!(frame.contains("openai-subscription / gpt-5.4"));
-        assert!(frame.contains("0.5% 1k/272k"));
-        assert!(frame.contains("session s-1770000000000-12345-0"));
+        assert!(frame.contains(" kit ▏ kit"), "{frame}");
+        assert!(frame.contains("gpt-5.4 · default"), "{frame}");
+        assert!(frame.contains("▱▱▱▱▱▱▱▱┆▱▱ 0.5% 1k/272k"), "{frame}");
+        assert!(frame.contains("s-1770000000000-12345-0"), "{frame}");
         assert!(frame.lines().any(|line| line == "━".repeat(120)));
         assert!(!frame.contains("ctx "));
+    }
+
+    #[test]
+    fn clicking_the_session_id_copies_the_resume_command() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut app = sample();
+        app.session_id = Some("s-1770000000000-12345-0".into());
+        let frame = render(&mut app, 120, 24);
+        let header = frame.lines().next().expect("header row");
+        let column = header
+            .find("s-1770000000000-12345-0")
+            .expect("session id in header");
+        let column = u16::try_from(header[..column].chars().count()).unwrap();
+
+        let mut action = crate::tui::app::Action::None;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            action = app.handle_mouse(MouseEvent {
+                kind,
+                column: column + 3,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let crate::tui::app::Action::Copy(command) = action else {
+            panic!("clicking the session id should copy");
+        };
+        assert_eq!(
+            command,
+            "kit tui --root /Users/dev/projects/kit --resume s-1770000000000-12345-0"
+        );
+        assert_eq!(app.toast_text(), Some("copied resume command"));
+
+        app.root = PathBuf::from("/Users/dev/my projects/kit");
+        assert_eq!(
+            app.resume_command().as_deref(),
+            Some("kit tui --root '/Users/dev/my projects/kit' --resume s-1770000000000-12345-0")
+        );
     }
 
     #[test]
@@ -4713,8 +5457,8 @@ mod tests {
         let frame = render(&mut app, 35, 24);
         let header = frame.lines().next().expect("header row");
 
-        assert!(header.contains("session s"));
-        assert!(!header.contains("p / 模型"));
+        assert!(header.contains("模"), "{header}");
+        assert!(!header.contains("a2a"), "{header}");
     }
 
     #[test]
@@ -5124,7 +5868,9 @@ mod tests {
         ));
         assert!(frame.lines().any(|line| line.trim() == "▔".repeat(86)));
         assert!(frame.contains(" ready"));
-        assert!(frame.contains("⏎ send   ⇧⏎ newline   ^l log   ^c quit"));
+        assert!(
+            frame.contains("⏎ send   ⇧⏎ newline   ^r agents   ^t reasoning   ^l log   ^c quit")
+        );
         assert!(frame.contains("message kit"));
     }
 
