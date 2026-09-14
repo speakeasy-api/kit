@@ -13,7 +13,7 @@ pub use a2a::A2aTool;
 pub use artifact::ArtifactTool;
 pub use docs::DocsTool;
 pub use edit::EditTool;
-pub use mcp::{AuthTool, McpTool, ToolSearch};
+pub use mcp::{AuthTool, McpTool, ToolSchema, ToolSearch};
 pub use observed::Observed;
 pub(crate) use observed::shared as observe_shared;
 pub use read_file::ReadFileTool;

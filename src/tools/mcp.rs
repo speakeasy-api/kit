@@ -1,5 +1,7 @@
 mod auth;
 mod credentials;
+mod schema;
+pub use schema::ToolSchema;
 
 pub use crate::credentials::CredentialStorage;
 
@@ -2313,10 +2315,39 @@ impl McpRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn search(&self, query: &str) -> Result<Value, ToolError> {
+        self.search_scoped(query, schema::DiscoveryScope::testing())
+            .await
+    }
+
+    async fn search_scoped(
+        &self,
+        query: &str,
+        scope: schema::DiscoveryScope,
+    ) -> Result<Value, ToolError> {
         let prepared = PreparedQuery::new(query).ok_or_else(|| {
             ToolError::InvalidInput("query must contain a letter or number".into())
         })?;
+        let (records, available) = self.discovery_catalog().await?;
+        tokio::task::spawn_blocking(move || {
+            render_search_scoped(&prepared, &records, &available, &scope)
+        })
+        .await
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+    }
+
+    // Read-only snapshot: preserve existing lock order (servers released before manager),
+    // and never retain guards across rendering, artifact I/O, or an await.
+    async fn discovery_catalog(
+        &self,
+    ) -> Result<
+        (
+            BTreeMap<String, ServerRecord>,
+            BTreeMap<String, Vec<ToolSpec>>,
+        ),
+        ToolError,
+    > {
         self.reload_config().await.map_err(ToolError::Unavailable)?;
         self.initialize_uninitialized()
             .await
@@ -2330,9 +2361,9 @@ impl McpRuntime {
                     .connected_server(&McpServerId::new(name))
                     .map(|handle| (name.clone(), handle.tool_registry().specs()))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect();
         drop(manager);
-        render_search(&prepared, &records, &available)
+        Ok((records, available))
     }
 
     async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
@@ -2879,16 +2910,18 @@ impl McpRuntime {
 #[derive(Clone)]
 pub struct ToolSearch {
     runtime: McpRuntime,
+    artifact_root: PathBuf,
     spec: ToolSpec,
 }
 
 impl ToolSearch {
-    pub fn new(runtime: McpRuntime) -> Self {
+    pub fn new(runtime: McpRuntime, artifact_root: PathBuf) -> Self {
         Self {
             runtime,
+            artifact_root,
             spec: ToolSpec::new(
                 ToolName::new("tool_search"),
-                "Reload the MCP config, finish connecting any servers still initializing, then rank every connected server's tools globally and return at most 5 precise matches with input schemas, grouped by server with match counts. Strongly matching servers that need authentication or failed to connect are listed without tools. The exact query `mcp` instead returns a compact status list, with omission counts if the response cap excludes tail entries.",
+                "Reload the MCP config, finish connecting any servers still initializing, then rank every connected server's tools globally and return at most 5 precise matches, grouped by server with match counts. Oversized definitions return schema_incomplete and a session-scoped schema_ref; use tool_schema to walk their canonical input schema. Long descriptions have bounded previews and description_artifact references readable with artifact. Strongly matching servers that need authentication or failed to connect are listed without tools. The exact query `mcp` instead returns a compact status list, with omission counts if the response cap excludes tail entries.",
                 Value::Object(Map::from_iter([
                     ("type".into(), Value::from("object")),
                     (
@@ -3063,9 +3096,10 @@ impl Tool for ToolSearch {
         request: ToolRequest,
         _: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let scope = schema::DiscoveryScope::new(&self.artifact_root, &request);
         let input: SearchInput = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-        let matches = self.runtime.search(&input.query).await?;
+        let matches = self.runtime.search_scoped(&input.query, scope).await?;
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(matches),
@@ -3834,10 +3868,25 @@ fn bounded_server_text(value: &str) -> &str {
 /// connected tools globally and returns at most `SEARCH_RESULT_LIMIT` of
 /// them. Both modes drop tail results until the serialized response fits
 /// `SEARCH_RESULT_BYTE_CAP`.
+#[cfg(test)]
 fn render_search(
     query: &PreparedQuery,
     records: &BTreeMap<String, ServerRecord>,
     available: &BTreeMap<String, Vec<ToolSpec>>,
+) -> Result<Value, ToolError> {
+    render_search_scoped(
+        query,
+        records,
+        available,
+        &schema::DiscoveryScope::testing(),
+    )
+}
+
+fn render_search_scoped(
+    query: &PreparedQuery,
+    records: &BTreeMap<String, ServerRecord>,
+    available: &BTreeMap<String, Vec<ToolSpec>>,
+    scope: &schema::DiscoveryScope,
 ) -> Result<Value, ToolError> {
     if query.0.normalized == "mcp" {
         let total_servers = records.len();
@@ -3988,12 +4037,25 @@ fn render_search(
         .collect::<Vec<_>>();
     let total_strong_servers = strong_servers.len();
     let mut returned_strong_servers = total_strong_servers;
+    // Build each projection once: retries of the byte-budget grouping must not
+    // duplicate large prose artifacts.
+    let entries = returned
+        .iter()
+        .map(|(server, spec, _)| {
+            schema::search_entry(
+                scope,
+                server,
+                &records[server.as_str()].fingerprint,
+                &spec.spec,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     loop {
         // Group the currently returned tools by server, ordered by each
         // server's best globally ranked returned candidate.
         let mut server_order = Vec::<&str>::new();
         let mut returned_by_server = BTreeMap::<&str, Vec<Value>>::new();
-        for (server, spec, _) in &returned {
+        for ((server, _, _), entry) in returned.iter().zip(&entries) {
             let tools = match returned_by_server.entry(server.as_str()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     server_order.push(server.as_str());
@@ -4001,14 +4063,7 @@ fn render_search(
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             };
-            tools.push(Value::Object(Map::from_iter([
-                ("name".into(), Value::from(spec.spec.name.0.clone())),
-                (
-                    "description".into(),
-                    Value::from(spec.spec.description.clone()),
-                ),
-                ("input_schema".into(), spec.spec.input_schema.clone()),
-            ])));
+            tools.push(entry.clone());
         }
         let groups = server_order
             .iter()
@@ -4118,7 +4173,7 @@ mod tests {
         AuthOperation, AuthRequest, AuthResolution, McpAuthResponder, McpTransportBinding,
     };
     use agentkit_plugins::{PluginMcpServer, PluginMcpTransport};
-    use agentkit_tools_core::{ToolName, ToolSpec};
+    use agentkit_tools_core::{ToolName, ToolSource, ToolSpec};
     use rmcp::transport::auth::{
         AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
         OAuthTokenResponse, StoredCredentials,
@@ -6402,7 +6457,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_results_drop_the_lowest_ranked_tools() {
+    fn oversized_results_retain_lower_ranked_tools_as_schema_stubs() {
         let records = BTreeMap::from_iter([(
             "files".to_string(),
             search_record("File tools", ServerStatus::Connected),
@@ -6425,12 +6480,14 @@ mod tests {
             "the serialized response respects the byte cap"
         );
         assert_eq!(response["total_matched"], 2);
-        assert_eq!(response["total_returned"], 1);
-        assert_eq!(response["truncated"], true);
+        assert_eq!(response["total_returned"], 2);
+        assert_eq!(response["truncated"], false);
         let group = &response["servers"][0];
-        assert_eq!(group["returned_tool_count"], 1);
-        assert_eq!(group["truncated"], true);
+        assert_eq!(group["returned_tool_count"], 2);
+        assert_eq!(group["truncated"], false);
         assert_eq!(group["tools"][0]["name"], "mcp_files_read");
+        assert_eq!(group["tools"][1]["schema_incomplete"], true);
+        assert!(group["tools"][1]["schema_ref"].is_string());
     }
 
     #[test]
@@ -6930,6 +6987,302 @@ mod tests {
         }
         assert!(base.inner.servers.read().await.is_empty());
         base.with_session_servers(vec![session_server("valid")], directory.path())
+            .await
+            .unwrap();
+    }
+
+    // Real MCP discovery transport; application calls are deliberately rejected.
+    #[cfg(unix)]
+    async fn schema_api_fixture(
+        directory: &Path,
+        schema: &Value,
+        description: &str,
+    ) -> (super::McpRuntime, Value) {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        with open(sys.argv[1]) as catalog:
+            result = {'tools': json.load(catalog)}
+    else:
+        raise RuntimeError('Unexpected application call: ' + method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        std::fs::write(
+            directory.join("catalog.json"),
+            json!([
+                {"name":"inspect", "description":description, "inputSchema":schema}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let config = json!({"mcpServers":{"local":{"command":"/usr/bin/env",
+            "args":["python3","-u","-c",script,directory.join("catalog.json")]}}});
+        let path = directory.join("mcp.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+        let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        (runtime, config)
+    }
+
+    #[cfg(unix)]
+    async fn schema_api_invoke(
+        tool: &dyn agentkit_tools_core::Tool,
+        session: &str,
+        input: Value,
+    ) -> Result<Value, agentkit_tools_core::ToolError> {
+        use agentkit_core::{SessionId, ToolOutput, TurnId};
+        use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext, ToolRequest};
+        let context = OwnedToolContext {
+            session_id: SessionId::new(session),
+            turn_id: TurnId::new("turn"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+            execution_scope: None,
+            approved_request: None,
+        };
+        let result = tool
+            .invoke(
+                ToolRequest::new(
+                    "discovery",
+                    tool.spec().name.clone(),
+                    input,
+                    session,
+                    "turn",
+                ),
+                &mut context.borrowed(),
+            )
+            .await?;
+        assert!(!result.result.is_error);
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("expected structured discovery output");
+        };
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 32 * 1024);
+        Ok(value)
+    }
+
+    #[cfg(unix)]
+    async fn schema_api_read_text(
+        tool: &crate::tools::artifact::ArtifactTool,
+        path: &Value,
+    ) -> String {
+        let mut offset = 0;
+        let mut text = String::new();
+        loop {
+            let page = schema_api_invoke(
+                tool,
+                "owner",
+                json!({"path":path,"offset":offset,"limit":1023}),
+            )
+            .await
+            .unwrap();
+            text.push_str(page["content"].as_str().unwrap());
+            let next = page["next_offset"].as_u64().unwrap();
+            assert!(next > offset);
+            assert_eq!(next as usize, text.len());
+            if page["eof"] == true {
+                assert_eq!(page["total_bytes"].as_u64().unwrap(), next);
+                break;
+            }
+            offset = next;
+        }
+        text
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_api_oversized_utf8_descriptions_are_lossless_and_session_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = "🦀é東京\"\\\n".repeat(5000);
+        let schema = json!({"type":"object","properties":{"nested":{"type":"object",
+            "properties":{"leaf":{"type":"string","description":text}}}}});
+        assert!(schema.to_string().len() > 32 * 1024);
+        let (runtime, _) = schema_api_fixture(directory.path(), &schema, &text).await;
+        let search = super::ToolSearch::new(runtime.clone(), directory.path().into());
+        let walker = super::ToolSchema::new(runtime.clone(), directory.path().into());
+        let reader = crate::tools::artifact::ArtifactTool::new(directory.path().into());
+        let found = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        assert_eq!(found["total_returned"], 1);
+        let entry = &found["servers"][0]["tools"][0];
+        assert_eq!(entry["schema_incomplete"], true);
+        assert!(entry.get("input_schema").is_none());
+        let reference = entry["schema_ref"].as_str().unwrap();
+        assert_eq!(entry["description_truncated"], true);
+        assert!(text.starts_with(entry["description"].as_str().unwrap()));
+        let leaf = schema_api_invoke(
+            &walker,
+            "owner",
+            json!({"schema_ref":reference,"pointer":"/properties/nested/properties/leaf"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(leaf["node"]["description_truncated"], true);
+        for artifact in [
+            &entry["description_artifact"],
+            &leaf["node"]["description_artifact"],
+        ] {
+            assert_eq!(artifact["total_bytes"], text.len());
+            assert_eq!(schema_api_read_text(&reader, &artifact["path"]).await, text);
+            assert!(
+                schema_api_invoke(&reader, "foreign", json!({"path":artifact["path"]}))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            schema_api_invoke(&walker, "foreign", json!({"schema_ref":reference}))
+                .await
+                .is_err()
+        );
+        let foreign = schema_api_invoke(&search, "foreign", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let foreign_ref = &foreign["servers"][0]["tools"][0]["schema_ref"];
+        assert_ne!(foreign_ref, reference);
+        schema_api_invoke(&walker, "foreign", json!({"schema_ref":foreign_ref}))
+            .await
+            .unwrap();
+        assert!(
+            schema_api_invoke(&walker, "owner", json!({"schema_ref":foreign_ref}))
+                .await
+                .is_err()
+        );
+        let canonical = runtime
+            .catalog()
+            .get(&ToolName::new("mcp_local_inspect"))
+            .unwrap();
+        assert_eq!(canonical.spec().input_schema, schema);
+        assert_eq!(canonical.spec().description, text);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_api_walks_canonical_keywords_and_pages_wide_nodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let properties: serde_json::Map<String, Value> = (0..97)
+            .map(|index| {
+                (
+                    format!("field-{index:03}"),
+                    json!({"description":"é🦀".repeat(400),"type":"string"}),
+                )
+            })
+            .collect();
+        let schema = json!({"type":"object","properties":properties,
+            "$defs":{"a/b~c":{"anyOf":[{"type":"string"},{"type":"null"}]}},
+            "allOf":[{"$ref":"#/$defs/a~1b~0c"}],
+            "oneOf":[{"const":true},{"const":false}],
+            "enum":["é",7,null,false],"x-unknown":{"a/b~c":{"$dynamicRef":"#node"}}});
+        let (runtime, mut config) =
+            schema_api_fixture(directory.path(), &schema, "Inspect schema").await;
+        let search = super::ToolSearch::new(runtime.clone(), directory.path().into());
+        let walker = super::ToolSchema::new(runtime.clone(), directory.path().into());
+        let found = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let reference = &found["servers"][0]["tools"][0]["schema_ref"];
+        for (pointer, expected) in [
+            ("/allOf/0/$ref", json!("#/$defs/a~1b~0c")),
+            ("/$defs/a~1b~0c/anyOf/1/type", json!("null")),
+            ("/oneOf/0/const", json!(true)),
+            ("/enum/0", json!("é")),
+            ("/enum/1", json!(7)),
+            ("/enum/2", Value::Null),
+            ("/enum/3", json!(false)),
+            ("/x-unknown/a~1b~0c/$dynamicRef", json!("#node")),
+        ] {
+            let node = schema_api_invoke(
+                &walker,
+                "owner",
+                json!({"schema_ref":reference,"pointer":pointer}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(node["node"]["value"], expected, "{pointer}");
+            assert_eq!(node["children"], json!([]));
+            assert_eq!(node["incomplete"], false);
+        }
+        let root = schema_api_invoke(&walker, "owner", json!({"schema_ref":reference}))
+            .await
+            .unwrap();
+        assert!(
+            root["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|child| child["pointer"] == "/x-unknown")
+        );
+        let mut offset = 0;
+        let mut pointers = Vec::new();
+        loop {
+            let page = schema_api_invoke(
+                &walker,
+                "owner",
+                json!({"schema_ref":reference,"pointer":"/properties","offset":offset,"limit":32}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page["total_children"], 97);
+            let children = page["children"].as_array().unwrap();
+            assert!(!children.is_empty());
+            assert!(children.len() <= 32);
+            pointers.extend(
+                children
+                    .iter()
+                    .map(|child| child["pointer"].as_str().unwrap().to_owned()),
+            );
+            if let Some(next) = page["next_offset"].as_u64() {
+                assert_eq!(page["children_incomplete"], true);
+                assert_eq!(next, offset + children.len() as u64);
+                offset = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            pointers,
+            (0..97)
+                .map(|index| format!("/properties/field-{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runtime
+                .catalog()
+                .get(&ToolName::new("mcp_local_inspect"))
+                .unwrap()
+                .spec()
+                .input_schema,
+            schema
+        );
+        // Reload a changed real catalog and configured server identity.
+        config["mcpServers"]["local"]["args"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("revision-two"));
+        std::fs::write(directory.path().join("catalog.json"), json!([{"name":"inspect","description":"Changed schema","inputSchema":{"type":"object","description":"changed".repeat(6000)}}]).to_string()).unwrap();
+        std::fs::write(directory.path().join("mcp.json"), config.to_string()).unwrap();
+        let refreshed = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let new_ref = &refreshed["servers"][0]["tools"][0]["schema_ref"];
+        assert!(new_ref.is_string());
+        assert_ne!(reference, new_ref);
+        assert!(
+            schema_api_invoke(&walker, "owner", json!({"schema_ref":reference}))
+                .await
+                .is_err()
+        );
+        schema_api_invoke(&walker, "owner", json!({"schema_ref":new_ref}))
             .await
             .unwrap();
     }
