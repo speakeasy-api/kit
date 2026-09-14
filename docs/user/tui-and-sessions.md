@@ -10,7 +10,18 @@ Start an interactive session at a project root with the installed binary:
 kit tui --root /path/to/project
 ```
 
-List sessions for the workspace, then resume the ID shown in the header or catalog:
+Open the session picker at startup, or resume a known ID directly:
+
+```sh
+kit tui --root /path/to/project --resume
+kit tui --root /path/to/project --resume <session-id>
+```
+
+Without an ID, `--resume` opens the same workspace-scoped, newest-first picker as `/sessions`, with the same session names, selection, and inline rename interactions. It resolves `--root` and configured root defaults just like normal startup. No new persisted session is created to display the picker; a session is resumed only after selection. Plain `kit tui` still starts normally.
+
+At the top-level picker, `Esc` or `Ctrl+C` cancels startup and exits successfully without creating or resuming a session; `Esc` during inline rename only cancels the rename. An empty catalog reports that the workspace has no resumable sessions and exits successfully. Catalog read failures report an actionable error and exit unsuccessfully. If the selected session disappears, becomes invalid, or is locked before resume, Kit reports the resume error rather than starting a new session.
+
+You can also list and rename sessions from the command line, then resume the ID shown in the header or catalog:
 
 ```sh
 kit sessions --root /path/to/project
@@ -188,7 +199,7 @@ ACP v1 clients restore a closed durable session with `session/load` and discover
 
 Session discovery and restoration are isolated to the server's canonical workspace root. The primary `cwd` must match that root. ACP `session/new`, `session/load`, `session/resume`, and supported `session/fork` requests can also supply `additionalDirectories`: absolute paths to existing project directories. Kit canonicalizes and deduplicates these paths, loads their ancestor `AGENTS.md` instructions as session context, and reports the roots in `SessionInfo`. Additional roots are not a filesystem allowlist and do not change the default tool cwd, configuration, or durable session namespace. Each attachment supplies its complete additional-root set; an empty list clears prior extra roots. These roots are persisted as extensible transcript metadata, so old sessions without that metadata report an empty list. Legacy transcripts under a project-local `.kit/sessions` directory follow the same migration and root checks as CLI resume; they do not make a same-named session visible from another workspace. Old global transcripts without workspace metadata are excluded from discovery in every workspace, but an explicit resume by ID remains supported and binds the transcript to that workspace. An individually malformed or concurrently incomplete transcript is omitted from catalog results without preventing valid sessions from being listed; explicit resume remains strict and reports its error.
 
-An arbitrary ACP load or resume never applies the server process's configured `--force` setting. The one exception is the initial resume requested by `kit tui --resume <id> --force`: only that matching configured session may use the explicit stale-lock override. If another live Kit instance owns the session lock, restoration fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can restore it again.
+An arbitrary ACP load or resume never applies the server process's configured `--force` setting. The one exception is the initial resume requested by `kit tui --resume [<id>] --force`: only the explicitly named or picker-selected session may use the stale-lock override. If another live Kit instance owns the session lock, restoration fails instead of taking over the session. A missing or invalid ID also fails normally. After the session closes and releases its lock, an ACP client can restore it again.
 
 Before the restoration response, Kit replays the canonical transcript as ordered ACP updates for representable user text and attachments, assistant text and thoughts, and tool calls and results. Internal instructions, ambient context, notifications, and provider-specific content are not replayed to the client, but remain in the model transcript. Because compaction replaces the canonical transcript, restoring a compacted session replays its canonical summary history rather than the superseded pre-compaction items.
 
@@ -206,7 +217,7 @@ first confirm that no Kit process is still using the session. Then retry the res
 kit tui --root /path/to/project --resume <session-id> --force
 ```
 
-`--force` is only for a stale lock left by an exited or crashed process, and the CLI accepts it only with `--resume`. It does not steal a lock held by a live process: the OS-level lock check instead reports `session is actively locked by another Kit instance (...)`. Do not manually remove a lock belonging to a running Kit process.
+`--force` is only for a stale lock left by an exited or crashed process, and the CLI accepts it only with `--resume`. With `kit tui --resume --force`, the override applies only to the session selected in the startup picker. It does not steal a lock held by a live process: the OS-level lock check instead reports `session is actively locked by another Kit instance (...)`. Do not manually remove a lock belonging to a running Kit process.
 
 A new session ID that already exists reports `session ... already exists; use --resume`; a missing resume target reports `session ... does not exist`. Use the correct ID and mode rather than `--force` for either error.
 

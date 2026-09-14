@@ -1092,7 +1092,8 @@ impl Command {
                     .value_name("RESUME")
                     .value_parser(clap::value_parser!(String))
                     .action(clap::ArgAction::Set)
-                    .help("Resume this persisted session id"),
+                    .num_args(0..=1)
+                    .help("Resume a persisted session by ID, or open the session picker without an ID"),
             );
             command.arg(
                 clap::Arg::new("force")
@@ -1175,7 +1176,10 @@ impl Command {
                 reasoning_effort: optional_arg(matches, "reasoning_effort")?,
                 a2a: optional_arg(matches, "a2a")?,
                 mcp: McpArgs::from_matches(matches)?,
-                resume: optional_arg(matches, "resume")?,
+                resume: matches
+                    .contains_id("resume")
+                    .then(|| optional_arg(matches, "resume"))
+                    .transpose()?,
                 force: required_arg(matches, "force")?,
             }),
             _ => Err(clap::Error::raw(
@@ -1709,8 +1713,8 @@ enum Command {
         a2a: Option<String>,
 
         mcp: McpArgs,
-        /// Resume this persisted session id.
-        resume: Option<String>,
+        /// Resume by ID, or open the workspace session picker without an ID.
+        resume: Option<Option<String>>,
         /// Override the resumed session's stale lock.
         force: bool,
     },
@@ -2377,22 +2381,40 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the selected reference before starting that subprocess.
             let _ = config.harnesses()?;
             let root = config.root(root);
+            let mut stop = kit::tui::Stop::new()?;
+            let resume = match resume {
+                Some(None) => match kit::tui::pick_session(&root, &mut stop).await? {
+                    Some(id) => Some(id),
+                    None => return Ok(()),
+                },
+                Some(Some(id)) => Some(id),
+                None => None,
+            };
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
-            let _ = config.plugin_runtime(&root).await?;
             let voice_enabled = config.experimental.voice;
-            let config_path = config.config_path.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Some(path) = config_path {
-                    fs::global().require_disk(path)?;
-                }
-                Ok::<_, io::Error>(())
-            })
-            .await??;
+            let prepared = stop
+                .until(async {
+                    let _ = config.plugin_runtime(&root).await?;
+                    let config_path = config.config_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(path) = config_path {
+                            fs::global().require_disk(path)?;
+                        }
+                        Ok::<_, io::Error>(())
+                    })
+                    .await??;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })
+                .await;
+            let Some(prepared) = prepared else {
+                return Ok(());
+            };
+            prepared?;
             kit::tui::run_with_reasoning_effort_and_openrouter_key(
                 &root,
                 &model,
@@ -2406,6 +2428,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 resume.as_deref(),
                 force,
                 voice_enabled,
+                &mut stop,
             )
             .await?
         }
@@ -2438,6 +2461,41 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_resume_forms_preserve_direct_and_normal_startup() {
+        for (args, expected, expected_force) in [
+            (vec!["kit", "tui"], None, false),
+            (vec!["kit", "tui", "--resume"], Some(None), false),
+            (vec!["kit", "tui", "--resume", "--force"], Some(None), true),
+            (
+                vec!["kit", "tui", "--resume", "s-example"],
+                Some(Some("s-example".to_string())),
+                false,
+            ),
+            (
+                vec!["kit", "tui", "--resume", "s-example", "--force"],
+                Some(Some("s-example".to_string())),
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Tui { resume, force, .. } = cli.command else {
+                panic!("expected TUI")
+            };
+            assert_eq!(resume, expected);
+            assert_eq!(force, expected_force);
+        }
+        assert!(Cli::try_parse_from(["kit", "tui", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "prompt", "hello", "--resume"]).is_err());
+        let help = Cli::try_parse_from(["kit", "tui", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("--resume [<RESUME>]"));
+        assert!(help.contains("session picker without an ID"));
+    }
 
     #[cfg(feature = "tui")]
     #[test]

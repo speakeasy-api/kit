@@ -122,13 +122,18 @@ Start the ACP-backed terminal client at a project root:
 kit tui --root /path/to/project
 ```
 
-Resume a persisted conversation by its displayed session ID:
+Choose a persisted conversation in the startup picker, or resume directly by ID:
 
 ```sh
+kit tui --root /path/to/project --resume
 kit tui --root /path/to/project --resume <session-id>
 ```
 
-If a dead process left a stale session lock, `--force` can accompany `--resume`. It is not a general overwrite option and Clap rejects it without a resume argument.
+Without an ID, `--resume` opens the same workspace-scoped, newest-first picker as `/sessions`, including session names and inline rename. Workspace selection honors `--root` and configured root defaults as in normal startup. No new persisted session is created just to show the picker. Plain `kit tui` is unchanged.
+
+`Esc` at the top level or `Ctrl+C` cancels startup successfully without creating or resuming a session; `Esc` while renaming only cancels the rename. An empty catalog reports no resumable sessions and exits successfully. Catalog read failures exit unsuccessfully with an actionable error; a selected session that cannot be resumed reports its resume error instead of starting a new session.
+
+If a dead process left a stale session lock, `--force` can accompany either form of `--resume`. With the picker, it applies only to the selected session and never takes over a lock held by a live process. It is not a general overwrite option and Clap rejects it without `--resume`. See [session locks and recovery](tui-and-sessions.md#session-locks---resume-and---force).
 
 ### One-shot automation with `kit prompt`
 
