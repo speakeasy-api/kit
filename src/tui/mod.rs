@@ -67,7 +67,7 @@ use wire::{
 };
 
 use crate::{
-    events::{self, EVENTS_ENV},
+    events::{self, EVENTS_ENV, RuntimeEvent},
     protocols::acp::{
         FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID, model_switch,
     },
@@ -1434,20 +1434,16 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let update = match events::parse(&line) {
-                    Some(event) => Update::Runtime(event),
-                    None if line.starts_with("A2A listening on ") => {
-                        Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
-                    }
-                    None => {
-                        if let Ok(mut recent) = recorder.lock() {
-                            recent.push(line.clone());
-                            let extra = recent.len().saturating_sub(FAILURE_LINES);
-                            recent.drain(..extra);
-                        }
-                        Update::Log(line)
-                    }
+                let Some(update) = stderr_update(line) else {
+                    continue;
                 };
+                if let Update::Log(line) = &update
+                    && let Ok(mut recent) = recorder.lock()
+                {
+                    recent.push(line.clone());
+                    let extra = recent.len().saturating_sub(FAILURE_LINES);
+                    recent.drain(..extra);
+                }
                 if diagnostics.send(QueuedUpdate::global(update)).is_err() {
                     return;
                 }
@@ -2759,6 +2755,23 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+/// ACP owns tool cards, but the stderr transport lease and general diagnostics
+/// still drive runtime availability, subagent status, storage, and failure reports.
+fn stderr_update(line: String) -> Option<Update> {
+    match events::parse(&line) {
+        Some(
+            RuntimeEvent::ChildStarted { .. }
+            | RuntimeEvent::ChildFinished { .. }
+            | RuntimeEvent::RunletProgress { .. },
+        ) => None,
+        Some(event) => Some(Update::Runtime(event)),
+        None if line.starts_with("A2A listening on ") => Some(Update::A2aAddress(
+            line.trim_start_matches("A2A listening on ").to_string(),
+        )),
+        None => Some(Update::Log(line)),
+    }
+}
+
 /// Explains an agent exit, quoting the last thing it said.
 async fn died(
     status: Option<std::process::ExitStatus>,
@@ -3431,6 +3444,21 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             MessageKind::Thought,
         ),
         SessionUpdate::ToolCallUpdate(update) => {
+            let parent = match &update.meta {
+                MaybeUndefined::Value(meta) => meta.get("kit/parentToolCallId").and_then(|value| {
+                    if value.is_null() {
+                        Some(None)
+                    } else {
+                        value.as_str().map(|id| Some(id.to_owned()))
+                    }
+                }),
+                MaybeUndefined::Null => Some(None),
+                MaybeUndefined::Undefined => None,
+            };
+            let parent_update = parent.map(|parent| Update::ToolParent {
+                id: update.tool_call_id.to_string(),
+                parent,
+            });
             let images = match &update.content {
                 MaybeUndefined::Value(content) => Some(tool_images_of(content)),
                 MaybeUndefined::Null => Some(Vec::new()),
@@ -3439,7 +3467,26 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 MaybeUndefined::Undefined => None,
             };
             let output = match &update.content {
-                MaybeUndefined::Value(content) => Some(output_of(Some(content))),
+                MaybeUndefined::Value(content) => {
+                    let text = output_of(Some(content));
+                    // The TUI does not replay terminal streams yet. A parallel raw
+                    // result still provides useful output for terminal-only content.
+                    Some(
+                        if text.is_empty()
+                            && content
+                                .iter()
+                                .any(|item| matches!(item, ToolCallContent::Terminal(_)))
+                        {
+                            update
+                                .raw_output
+                                .value()
+                                .map(raw_output_lines)
+                                .unwrap_or_default()
+                        } else {
+                            text
+                        },
+                    )
+                }
                 MaybeUndefined::Null => Some(Vec::new()),
                 MaybeUndefined::Undefined => match &update.raw_output {
                     MaybeUndefined::Value(output) => Some(raw_output_lines(output)),
@@ -3463,7 +3510,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                         .iter()
                         .any(|line| line.contains("is now running in the background"))
                 });
-            vec![Update::ToolPatched {
+            let mut updates = vec![Update::ToolPatched {
                 id: update.tool_call_id.to_string(),
                 title: match update.title {
                     MaybeUndefined::Value(title) => Some(title),
@@ -3486,7 +3533,9 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 append_output: false,
                 intent: None,
                 backgrounded,
-            }]
+            }];
+            updates.extend(parent_update);
+            updates
         }
         SessionUpdate::ToolCallContentChunk(chunk) => {
             let images = tool_images_of(std::slice::from_ref(&chunk.content));
@@ -3966,6 +4015,86 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn stderr_filter_preserves_transport_recovery_and_general_diagnostics() {
+        use super::stderr_update;
+        use crate::events::{self, RuntimeEvent};
+
+        let line = |event: RuntimeEvent| {
+            format!(
+                "{}{}",
+                events::EVENT_MARKER,
+                serde_json::to_string(&event).unwrap()
+            )
+        };
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let heartbeat = || line(RuntimeEvent::RunletTransport { available: true });
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(!app.runtime_unavailable());
+        app.progress_tick_at(std::time::Instant::now() + crate::runlet_progress::transport::LEASE);
+        assert!(app.runtime_unavailable());
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(
+            !app.runtime_unavailable(),
+            "stderr heartbeats must recover the status lease"
+        );
+        app.apply(stderr_update(line(RuntimeEvent::RunletTransport { available: false })).unwrap());
+        assert!(app.runtime_unavailable());
+        for event in [
+            RuntimeEvent::SessionStarted {
+                session_id: "session".into(),
+            },
+            RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: false,
+            },
+        ] {
+            assert!(
+                matches!(stderr_update(line(event.clone())), Some(Update::Runtime(actual)) if actual == event)
+            );
+        }
+        for event in [
+            RuntimeEvent::ChildStarted {
+                call: "child".into(),
+                tool: "shell".into(),
+                summary: "running".into(),
+                at: 1,
+            },
+            RuntimeEvent::ChildFinished {
+                call: "child".into(),
+                tool: "shell".into(),
+                ok: true,
+                summary: "done".into(),
+                millis: 1,
+            },
+            RuntimeEvent::RunletProgress {
+                progress: crate::runlet_progress::Progress {
+                    owner: "root".into(),
+                    incarnation: 1,
+                    sequence: 1,
+                    change: crate::runlet_progress::Change::Finished { complete: true },
+                },
+            },
+        ] {
+            assert!(stderr_update(line(event)).is_none());
+        }
+        assert!(
+            matches!(stderr_update("ordinary diagnostic".into()), Some(Update::Log(line)) if line == "ordinary diagnostic")
+        );
+        assert!(
+            matches!(stderr_update("A2A listening on localhost:1234".into()), Some(Update::A2aAddress(address)) if address == "localhost:1234")
+        );
+        let malformed = format!("{}not json", events::EVENT_MARKER);
+        assert!(
+            matches!(stderr_update(malformed.clone()), Some(Update::Log(line)) if line == malformed)
+        );
     }
 
     #[test]

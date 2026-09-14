@@ -123,6 +123,8 @@ pub enum Update {
         intent: Option<Option<String>>,
         backgrounded: bool,
     },
+    /// ACP parent identity; absence of this update preserves the relationship.
+    ToolParent { id: String, parent: Option<String> },
     /// Agent-advertised slash commands for one session.
     AvailableCommands {
         session_id: String,
@@ -478,6 +480,9 @@ pub enum ComposeView {
 
 /// A model-visible tool call and, for compose, the program running inside it.
 pub struct ToolCall {
+    /// Opaque ACP identity, independent of the tool name and Runlet source.
+    pub parent_id: Option<String>,
+    pub child_page: usize,
     pub id: String,
     pub title: String,
     pub kind: ToolKind,
@@ -676,6 +681,7 @@ pub enum Block {
 }
 
 pub(super) struct CachedTranscriptImage {
+    pub block: Option<usize>,
     pub source: usize,
     pub row: usize,
     pub destination: Option<String>,
@@ -831,6 +837,11 @@ pub struct App {
     /// Session currently associated with the ordered runtime side channel.
     runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
+    tool_indices: HashMap<String, usize>,
+    /// Reverse ACP edges also retain children waiting for an unseen parent.
+    tool_dependents: HashMap<String, BTreeSet<usize>>,
+    pub(super) tool_owners: HashMap<usize, usize>,
+    pub(super) grouped_tools: HashMap<usize, Vec<usize>>,
     pub(super) transcript_cache: Vec<Option<CachedTranscriptBlock>>,
     pub(super) transcript_revisions: Vec<u64>,
     pub(super) transcript_dirty: BTreeSet<usize>,
@@ -1090,6 +1101,10 @@ impl App {
             session_id: None,
             runtime_session_id: None,
             blocks: Vec::new(),
+            tool_indices: HashMap::new(),
+            tool_dependents: HashMap::new(),
+            tool_owners: HashMap::new(),
+            grouped_tools: HashMap::new(),
             transcript_cache: Vec::new(),
             transcript_revisions: Vec::new(),
             transcript_dirty: BTreeSet::new(),
@@ -1248,6 +1263,10 @@ impl App {
         if dynamic {
             self.transcript_dynamic.insert(index);
         }
+        if let Some(id) = &tool_id {
+            self.tool_indices.insert(id.clone(), index);
+            self.refresh_tool_groups(index);
+        }
         if tool_id.as_deref() == self.focused_call_id.as_deref()
             || tool_id.is_some() && self.focused_call_id.is_none()
         {
@@ -1272,6 +1291,9 @@ impl App {
     }
 
     fn mark_block_dirty(&mut self, index: usize) {
+        if let Some(&owner) = self.tool_owners.get(&index) {
+            self.mark_block_dirty(owner);
+        }
         if let Some(revision) = self.transcript_revisions.get_mut(index) {
             self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
             *revision = self.next_transcript_revision;
@@ -1301,6 +1323,9 @@ impl App {
             }
             if Self::block_is_dynamic(&self.blocks[index]) {
                 self.transcript_dynamic.insert(index);
+            }
+            if let Block::Tool(call) = &self.blocks[index] {
+                self.tool_indices.insert(call.id.clone(), index);
             }
             if matches!(self.blocks[index], Block::Tool(_))
                 && (self.focused_call_id.is_none()
@@ -1347,10 +1372,7 @@ impl App {
     }
 
     fn focus_call_by_id(&mut self, id: String) {
-        let index = self
-            .blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id));
+        let index = self.call_index(&id);
         self.focused_call_id = Some(id);
         self.set_focus_index(index);
     }
@@ -1940,11 +1962,17 @@ impl App {
         let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
         self.compacting = false;
+        let inherited_background: HashSet<_> = self
+            .tool_indices
+            .values()
+            .filter_map(|&child| self.has_background_ancestor(child).then_some(child))
+            .collect();
         let mut finished = Vec::new();
         for (index, block) in self.blocks.iter_mut().enumerate() {
             if let Block::Tool(call) = block
                 && call.running()
                 && !call.backgrounded
+                && !inherited_background.contains(&index)
             {
                 call.status = if successful {
                     ToolCallStatus::Completed
@@ -2098,6 +2126,30 @@ impl App {
             Update::AgentThought { id, text, append } => {
                 self.apply_message(id, text, Vec::new(), append, MessageRole::Thought);
             }
+            Update::ToolParent { id, parent } => {
+                if let Some(index) = self.call_index(&id)
+                    && let Block::Tool(call) = &mut self.blocks[index]
+                    && call.parent_id != parent
+                {
+                    let old = std::mem::replace(&mut call.parent_id, parent.clone());
+                    if let Some(old) = old
+                        && let Some(children) = self.tool_dependents.get_mut(&old)
+                    {
+                        children.remove(&index);
+                        if children.is_empty() {
+                            self.tool_dependents.remove(&old);
+                        }
+                    }
+                    if let Some(parent) = parent {
+                        self.tool_dependents
+                            .entry(parent)
+                            .or_default()
+                            .insert(index);
+                    }
+                    self.mark_block_dirty(index);
+                    self.refresh_tool_groups(index);
+                }
+            }
             Update::ToolStarted {
                 id,
                 title,
@@ -2106,10 +2158,19 @@ impl App {
                 backgrounded,
             } => {
                 self.close_thought();
-                self.prepare_focused_call(id.clone());
+                // A late parent attaches an already visible child; do not steal
+                // that child's selection just because its owner arrived later.
+                if self
+                    .focus_call()
+                    .is_none_or(|call| call.parent_id.as_deref() != Some(id.as_str()))
+                {
+                    self.prepare_focused_call(id.clone());
+                }
                 let expanded = title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
                 self.push_block(Block::Tool(Box::new(ToolCall {
                     id,
+                    parent_id: None,
+                    child_page: 0,
                     title,
                     kind,
                     status: ToolCallStatus::Pending,
@@ -2181,6 +2242,7 @@ impl App {
                 let Some(call) = self.call_mut(&id) else {
                     return;
                 };
+                let was_compose = call.is_compose();
                 let was_running = call.running();
                 if let Some(title) = title {
                     if title == agentkit_tool_compose::COMPOSE_TOOL_NAME
@@ -2228,10 +2290,14 @@ impl App {
                         call.finalize_terminal_state();
                     }
                 }
+                let identity_changed = was_compose != call.is_compose();
                 let completed_background = was_running && !call.running() && call.backgrounded;
                 // Autonomous output after a detached call starts a new agent stream.
                 self.agent_stream_sealed |= completed_background;
                 if let Some(index) = self.call_index(&id) {
+                    if identity_changed {
+                        self.refresh_tool_groups(index);
+                    }
                     self.mark_block_dirty(index);
                     self.reclassify_dynamic(index);
                 }
@@ -2610,32 +2676,197 @@ impl App {
     }
 
     fn call_index(&self, id: &str) -> Option<usize> {
-        self.blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id))
+        self.tool_indices.get(id).copied()
     }
 
     fn call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
-        self.find_call_mut(|call| call.id == id)
+        let index = self.call_index(id)?;
+        self.mark_block_dirty(index);
+        match &mut self.blocks[index] {
+            Block::Tool(call) => Some(call),
+            _ => None,
+        }
     }
 
-    fn find_call_mut(&mut self, matches: impl Fn(&ToolCall) -> bool) -> Option<&mut ToolCall> {
-        let (index, call) =
-            self.blocks
-                .iter_mut()
-                .enumerate()
-                .rev()
-                .find_map(|(index, block)| match block {
-                    Block::Tool(call) if matches(call) => Some((index, call)),
-                    _ => None,
-                })?;
-        // Retain the matched variant while updating only cache metadata.
-        if let Some(revision) = self.transcript_revisions.get_mut(index) {
-            self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
-            *revision = self.next_transcript_revision;
-            self.transcript_dirty.insert(index);
+    /// Resolve explicit ACP edges, memoizing paths only for this affected update.
+    /// Missing ancestors and cycles leave calls visible without a displayed owner.
+    fn compose_root(
+        &self,
+        index: usize,
+        resolved: &mut HashMap<usize, Option<usize>>,
+    ) -> Option<usize> {
+        let mut path = HashSet::new();
+        let mut cursor = index;
+        let root = loop {
+            if let Some(root) = resolved.get(&cursor) {
+                break *root;
+            }
+            if !path.insert(cursor) {
+                break None;
+            }
+            let Block::Tool(call) = &self.blocks[cursor] else {
+                break None;
+            };
+            let Some(parent) = &call.parent_id else {
+                break call.is_compose().then_some(cursor);
+            };
+            let Some(&parent) = self.tool_indices.get(parent) else {
+                break None;
+            };
+            cursor = parent;
+        };
+        for index in path {
+            resolved.insert(index, root);
         }
-        Some(call)
+        root
+    }
+
+    /// Only descendants of an arriving/reparented/renamed call can change owner.
+    /// Reverse edges include unresolved parents, so arrivals attach existing orphans.
+    fn refresh_tool_groups(&mut self, index: usize) {
+        let mut affected = BTreeSet::new();
+        let mut pending = vec![index];
+        while let Some(index) = pending.pop() {
+            if !affected.insert(index) {
+                continue;
+            }
+            if let Block::Tool(call) = &self.blocks[index]
+                && let Some(children) = self.tool_dependents.get(&call.id)
+            {
+                pending.extend(children.iter().copied());
+            }
+        }
+        let mut resolved = HashMap::new();
+        let mut changed = BTreeSet::new();
+        for index in affected {
+            let owner = self
+                .compose_root(index, &mut resolved)
+                .filter(|&root| root != index);
+            let previous = self.tool_owners.get(&index).copied();
+            if owner == previous {
+                continue;
+            }
+            changed.insert(index);
+            if let Some(previous) = previous {
+                self.tool_owners.remove(&index);
+                if let Some(children) = self.grouped_tools.get_mut(&previous) {
+                    if let Ok(position) = children.binary_search(&index) {
+                        children.remove(position);
+                    }
+                    if children.is_empty() {
+                        self.grouped_tools.remove(&previous);
+                    }
+                }
+                changed.insert(previous);
+            }
+            if let Some(owner) = owner {
+                // Child creation can precede its ACP parent patch and implicitly
+                // fold the previous card. Restore the running group's default
+                // expansion, but never override an explicit user choice.
+                if let Block::Tool(call) = &mut self.blocks[owner]
+                    && call.running()
+                    && !call.expansion_explicit
+                {
+                    call.expanded = true;
+                }
+                self.tool_owners.insert(index, owner);
+                let children = self.grouped_tools.entry(owner).or_default();
+                if let Err(position) = children.binary_search(&index) {
+                    children.insert(position, index);
+                }
+                changed.insert(owner);
+            }
+        }
+        if let Some(focus) = self.transcript_focus_index
+            && let Some(&owner) = self.tool_owners.get(&focus)
+            && changed.contains(&focus)
+            && let Ok(position) = self.grouped_tools[&owner].binary_search(&focus)
+            && let Block::Tool(call) = &mut self.blocks[owner]
+        {
+            call.child_page = position / 32;
+            // A collapsed group (or its script view) cannot display the focused
+            // child. Keep keyboard actions on the visible owner instead.
+            if !call.expanded || call.compose_view != ComposeView::Output {
+                let id = call.id.clone();
+                self.focus_call_by_id(id);
+            }
+        }
+        if !changed.is_empty() {
+            self.clear_transcript_interaction();
+        }
+        for index in changed {
+            self.mark_block_dirty(index);
+        }
+    }
+
+    fn has_background_ancestor(&self, index: usize) -> bool {
+        let mut cursor = index;
+        let mut visited = HashSet::new();
+        while visited.insert(cursor) {
+            let Block::Tool(call) = &self.blocks[cursor] else {
+                break;
+            };
+            if call.backgrounded {
+                return true;
+            }
+            let Some(parent) = call
+                .parent_id
+                .as_ref()
+                .and_then(|id| self.tool_indices.get(id))
+            else {
+                break;
+            };
+            cursor = *parent;
+        }
+        false
+    }
+
+    pub(super) fn has_grouped_tools(&self, id: &str) -> bool {
+        self.call_index(id)
+            .is_some_and(|index| self.grouped_tools.contains_key(&index))
+    }
+
+    pub(super) fn child_window(&self, owner: usize) -> (&[usize], usize, usize) {
+        const PAGE: usize = 32;
+        let Some(children) = self.grouped_tools.get(&owner) else {
+            return (&[], 0, 0);
+        };
+        let Block::Tool(call) = &self.blocks[owner] else {
+            return (&[], 0, 0);
+        };
+        let start = call.child_page.min((children.len() - 1) / PAGE) * PAGE;
+        (
+            &children[start..(start + PAGE).min(children.len())],
+            start,
+            children.len(),
+        )
+    }
+
+    fn page_children(&mut self, forward: bool) -> bool {
+        let Some(focus) = self.transcript_focus_index else {
+            return false;
+        };
+        let owner = self.tool_owners.get(&focus).copied().unwrap_or(focus);
+        let Some(children) = self.grouped_tools.get(&owner) else {
+            return false;
+        };
+        let last = (children.len() - 1) / 32;
+        let Block::Tool(call) = &mut self.blocks[owner] else {
+            return false;
+        };
+        call.child_page = if forward {
+            (call.child_page + 1).min(last)
+        } else {
+            call.child_page.saturating_sub(1)
+        };
+        call.expanded = true;
+        call.compose_view = ComposeView::Output;
+        call.expansion_explicit = true;
+        let id = call.id.clone();
+        self.focus_call_by_id(id);
+        self.mark_block_dirty(owner);
+        self.clear_transcript_interaction();
+        true
     }
 
     fn close_thought(&mut self) {
@@ -2671,6 +2902,10 @@ impl App {
         self.command_completion_query = None;
         self.command_completion_dismissed = None;
         self.blocks.clear();
+        self.tool_indices.clear();
+        self.tool_dependents.clear();
+        self.tool_owners.clear();
+        self.grouped_tools.clear();
         self.transcript_cache.clear();
         self.transcript_revisions.clear();
         self.transcript_dirty.clear();
@@ -3657,6 +3892,12 @@ impl App {
             self.file_picker = None;
             return Action::Quit;
         }
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            && self.page_children(key.code == KeyCode::PageDown)
+        {
+            return Action::None;
+        }
         // Queue focus owns composer keys, not global task, view, or copy actions.
         // Ctrl+K is global only when it cancels background work; otherwise it
         // must not fall through and delete text from the parked composer.
@@ -4305,7 +4546,8 @@ impl App {
         let selection = self.selection?;
         let (start, end) = selection.ordered();
         let mut lines: Vec<String> = Vec::new();
-        let mut pending: Option<(Option<(usize, usize)>, String)> = None;
+        type LogicalLine<'a> = (usize, Option<&'a str>, usize);
+        let mut pending: Option<(Option<LogicalLine<'_>>, String)> = None;
         for line in start.0..=end.0 {
             let Some((block, row)) = self.transcript_row(line) else {
                 if let Some((_, text)) = pending.take() {
@@ -4328,7 +4570,9 @@ impl App {
                 fragment = column_slice(fragment, 2 - from, usize::MAX);
             }
             let fragment = fragment.trim_end().to_string();
-            let logical = row.1.2.map(|index| (block, index));
+            // Grouped rows share the displayed cache block, not their source.
+            // Keep each canonical call's logical lines distinct when copying.
+            let logical = row.1.2.map(|index| (block, row.1.0.as_deref(), index));
             match &mut pending {
                 Some((Some(previous), joined)) if logical == Some(*previous) => {
                     let fragment = fragment.trim_start();
@@ -9267,5 +9511,243 @@ mod tests {
         assert_eq!(app.agents_scroll(), 0);
         app.handle_mouse(wheel(MouseEventKind::ScrollDown, 30, 8));
         assert_eq!(app.agents_scroll(), 0);
+    }
+
+    mod canonical_group_tests {
+        use super::super::*;
+
+        fn app() -> App {
+            App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            )
+        }
+        fn start(app: &mut App, id: &str, compose: bool, backgrounded: bool) {
+            app.apply(Update::ToolStarted {
+                id: id.into(),
+                title: if compose { "compose" } else { "shell" }.into(),
+                kind: ToolKind::default(),
+                script: None,
+                backgrounded,
+            });
+        }
+        fn parent(app: &mut App, id: &str, owner: &str) {
+            app.apply(Update::ToolParent {
+                id: id.into(),
+                parent: Some(owner.into()),
+            });
+        }
+        fn patch(app: &mut App, id: &str, status: Option<ToolCallStatus>, text: &str) {
+            app.apply(Update::ToolPatched {
+                id: id.into(),
+                title: None,
+                kind: None,
+                status,
+                script: None,
+                output: Some(vec![text.into()]),
+                images: None,
+                append_output: true,
+                intent: None,
+                backgrounded: false,
+            });
+        }
+        fn call<'a>(app: &'a App, id: &str) -> &'a ToolCall {
+            let Block::Tool(call) = &app.blocks[app.call_index(id).unwrap()] else {
+                panic!("tool")
+            };
+            call
+        }
+
+        #[test]
+        fn canonical_interleaving_orphans_cycles_and_sessions() {
+            let mut app = app();
+            start(&mut app, "arbitrary child", false, false);
+            parent(&mut app, "arbitrary child", "root-b");
+            assert!(app.tool_owners.is_empty());
+            start(&mut app, "root-a", true, false);
+            start(&mut app, "root-b", false, false);
+            assert!(app.tool_owners.is_empty());
+            app.apply(Update::ToolPatched {
+                id: "root-b".into(),
+                title: Some("compose".into()),
+                kind: None,
+                status: None,
+                script: None,
+                output: None,
+                images: None,
+                append_output: false,
+                intent: None,
+                backgrounded: false,
+            });
+            assert_eq!(app.tool_owners.get(&0), Some(&2));
+            start(&mut app, "root-b/looks-related", false, false);
+            parent(&mut app, "root-b/looks-related", "root-a");
+            assert_eq!(app.grouped_tools[&1], vec![3]);
+            assert_eq!(app.grouped_tools[&2], vec![0]);
+            parent(&mut app, "root-b", "arbitrary child");
+            assert!(!app.tool_owners.contains_key(&0));
+            assert!(!app.tool_owners.contains_key(&2));
+            parent(&mut app, "root-a", "root-a");
+            assert!(app.tool_owners.is_empty());
+            app.start_session("new".into());
+            assert!(app.tool_indices.is_empty());
+            assert!(app.grouped_tools.is_empty());
+            start(&mut app, "arbitrary child", false, false);
+            assert!(call(&app, "arbitrary child").parent_id.is_none());
+        }
+
+        #[test]
+        fn canonical_terminal_parent_does_not_finish_child_and_patches_keep_identity() {
+            let mut app = app();
+            app.phase = Phase::Working;
+            start(&mut app, "root", true, true);
+            start(&mut app, "child", false, false);
+            parent(&mut app, "child", "root");
+            patch(
+                &mut app,
+                "root",
+                Some(ToolCallStatus::Completed),
+                "detached",
+            );
+            assert!(call(&app, "child").running());
+            app.finish_turn_with_outcome(false, None);
+            assert!(call(&app, "child").running());
+            patch(&mut app, "child", Some(ToolCallStatus::Failed), "cancelled");
+            patch(&mut app, "child", None, "late output");
+            let child = call(&app, "child");
+            assert_eq!(child.parent_id.as_deref(), Some("root"));
+            assert_eq!(child.status, ToolCallStatus::Failed);
+            assert_eq!(child.output, ["cancelled", "late output"]);
+            assert!(!child.backgrounded);
+            assert!(app.transcript_dirty.contains(&0));
+        }
+
+        #[test]
+        fn canonical_reparenting_updates_only_the_related_tree() {
+            let mut app = app();
+            start(&mut app, "leaf", false, false);
+            parent(&mut app, "leaf", "middle");
+            start(&mut app, "a", true, false);
+            start(&mut app, "b", true, false);
+            start(&mut app, "middle", false, false);
+            parent(&mut app, "middle", "a");
+            assert_eq!(app.grouped_tools[&1], vec![0, 3]);
+            parent(&mut app, "middle", "b");
+            assert!(!app.grouped_tools.contains_key(&1));
+            assert_eq!(app.grouped_tools[&2], vec![0, 3]);
+            parent(&mut app, "a", "b");
+            parent(&mut app, "b", "a");
+            assert!(app.tool_owners.is_empty());
+            app.apply(Update::ToolParent {
+                id: "a".into(),
+                parent: None,
+            });
+            assert_eq!(app.grouped_tools[&1], vec![0, 2, 3]);
+            parent(&mut app, "leaf", "missing");
+            assert!(!app.tool_owners.contains_key(&0));
+            assert_eq!(app.grouped_tools[&1], vec![2, 3]);
+            start(&mut app, "missing", true, false);
+            assert_eq!(app.grouped_tools[&4], vec![0]);
+            assert_eq!(app.grouped_tools[&1], vec![2, 3]);
+        }
+
+        /// Opt-in benchmark at the real App update boundary. No timing assertions
+        /// or production instrumentation: compare scaling across transcript sizes.
+        #[test]
+        #[ignore = "manual canonical ingestion benchmark; run with --ignored --nocapture"]
+        fn canonical_ingestion_benchmark() {
+            for count in [1_000, 2_000, 4_000, 8_000, 16_000] {
+                let mut app = app();
+                start(&mut app, "root", true, false);
+                let started = Instant::now();
+                for i in 0..count {
+                    let id = format!("child-{i}");
+                    app.apply(Update::ToolPatched {
+                        id: id.clone(),
+                        title: Some("shell".into()),
+                        kind: None,
+                        status: None,
+                        script: None,
+                        output: None,
+                        images: None,
+                        append_output: false,
+                        intent: None,
+                        backgrounded: false,
+                    });
+                    parent(&mut app, &id, "root");
+                }
+                let elapsed = started.elapsed();
+                std::hint::black_box(&app);
+                eprintln!(
+                    "canonical ingestion: {count} calls, {elapsed:?}, {} ns/call",
+                    elapsed.as_nanos() / count
+                );
+            }
+        }
+
+        #[test]
+        fn canonical_automatic_focus_preserves_word_movement_and_separate_paging() {
+            let mut app = app();
+            app.paste("first second");
+            start(&mut app, "root", true, false);
+            for i in 0..70 {
+                let id = format!("child {i}");
+                start(&mut app, &id, false, false);
+                parent(&mut app, &id, "root");
+            }
+            assert_eq!(app.focus_call().unwrap().id, "child 69");
+            let page = call(&app, "root").child_page;
+            assert!(page > 0);
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 6);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page - 1);
+            assert_eq!(app.editor.cursor(), 12);
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page);
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(app.editor.text(), "first second");
+        }
+
+        #[test]
+        fn canonical_nested_background_and_bounded_navigation() {
+            let mut app = app();
+            app.phase = Phase::Working;
+            start(&mut app, "root", true, false);
+            start(&mut app, "nested", true, true);
+            parent(&mut app, "nested", "root");
+            for i in 0..70 {
+                let id = format!("child {i}");
+                start(&mut app, &id, false, false);
+                parent(&mut app, &id, "nested");
+            }
+            assert!(app.child_window(0).0.len() <= 32);
+            app.finish_turn_with_outcome(false, None);
+            assert!(call(&app, "child 69").running());
+            app.focus_call_by_id("root".into());
+            for _ in 0..3 {
+                assert!(app.page_children(false));
+            }
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                seen.extend_from_slice(app.child_window(0).0);
+                assert!(app.page_children(true));
+            }
+            assert_eq!(seen, app.grouped_tools[&0]);
+            app.toggle_output("child 0");
+            assert!(call(&app, "child 0").expanded);
+            app.apply(Update::ToolParent {
+                id: "child 0".into(),
+                parent: None,
+            });
+            assert!(!app.tool_owners.contains_key(&2));
+            assert!(call(&app, "child 0").expanded);
+        }
     }
 }
