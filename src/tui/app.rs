@@ -327,9 +327,6 @@ fn replace_image_uri_on_line(
     source_uri: Option<&str>,
     local_uri: Option<&str>,
 ) {
-    let Some(source_uri) = source_uri else {
-        return;
-    };
     let start = if line == 0 {
         0
     } else if let Some((index, _)) = text.match_indices('\n').nth(line - 1) {
@@ -340,6 +337,21 @@ fn replace_image_uri_on_line(
     let end = text[start..]
         .find('\n')
         .map_or(text.len(), |offset| start + offset);
+    let Some(source_uri) = source_uri else {
+        // URI-less image blocks get their own generated placeholder line during
+        // translation. Link only that label, never arbitrary neighboring text.
+        let label = &text[start..end];
+        if let Some(local_uri) = local_uri
+            && let Some(number) = label
+                .strip_prefix("[Image #")
+                .and_then(|label| label.strip_suffix(']'))
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            text.insert_str(end, &format!("({local_uri})"));
+        }
+        return;
+    };
     let destination = markdown::image_label_link_destinations(&text[start..end])
         .into_iter()
         .find_map(|(range, uri)| (uri == source_uri).then_some(range));
@@ -1749,7 +1761,7 @@ impl App {
             if image
                 .source_uri
                 .as_deref()
-                .is_some_and(|uri| uri.starts_with("file:"))
+                .is_none_or(|uri| uri.starts_with("file:"))
             {
                 let uri = self.attachment_cache.image_uri(image.key);
                 replace_image_uri_on_line(
@@ -5180,6 +5192,28 @@ mod tests {
                  [Image #3](file:///tmp/second.png)"
             )
         );
+    }
+
+    #[test]
+    fn uri_less_user_image_rewrite_only_links_generated_placeholder_lines() {
+        for label in [
+            "[Image #1]",
+            "[Image #12]",
+            "prose [Image #1]",
+            "`[Image #1]`",
+            "[Image #]",
+            "[Image #x]",
+            "[Image #1](https://example.com/image.png)",
+        ] {
+            let mut text = format!("before\n{label}\nafter");
+            replace_image_uri_on_line(&mut text, 1, None, Some("file:///tmp/local.png"));
+            let expected = if matches!(label, "[Image #1]" | "[Image #12]") {
+                format!("before\n{label}(file:///tmp/local.png)\nafter")
+            } else {
+                format!("before\n{label}\nafter")
+            };
+            assert_eq!(text, expected);
+        }
     }
 
     #[test]

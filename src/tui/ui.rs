@@ -5863,6 +5863,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn uri_less_user_images_translate_to_local_placeholder_links_without_preview_gaps() {
+        use crate::tui::{
+            BackgroundCompletion, QueuedUpdate, spawn_background_workers, user_message_of,
+        };
+        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = spawn_background_workers(completed).unwrap();
+
+        // Full replay messages and replay chunks share this translation path.
+        for append in [false, true] {
+            for payload in [encoded.as_str(), "invalid base64"] {
+                let (text, sources) = user_message_of(vec![
+                    ContentBlock::Text(TextContent::new("before")),
+                    ContentBlock::Image(ImageContent::new(payload, "image/png")),
+                    ContentBlock::Text(TextContent::new("after")),
+                ]);
+                assert_eq!(text, "before\n[Image #1]\nafter");
+                assert!(
+                    workers
+                        .try_update(QueuedUpdate {
+                            generation: None,
+                            update: crate::tui::app::Update::UserMessage {
+                                id: "replayed".into(),
+                                text,
+                                images: sources,
+                                append,
+                            },
+                        })
+                        .is_ok()
+                );
+                let BackgroundCompletion::Update {
+                    queued,
+                    images: prepared,
+                } = completions.recv().await.unwrap()
+                else {
+                    panic!("expected update")
+                };
+                let mut app = App::new(
+                    PathBuf::from("/tmp/kit"),
+                    "openai-subscription".into(),
+                    "gpt-5.4".into(),
+                    "0:0".into(),
+                );
+                app.apply_materialized(queued.update, prepared);
+                let mut images = crate::tui::image::ImageRuntime::with_picker(Picker::halfblocks());
+                for width in [12, 40] {
+                    refresh_transcript_cache_with_images(&mut app, &mut images, width);
+                    let cached = app.transcript_cache[0].as_ref().unwrap();
+                    assert!(cached.images.is_empty());
+                    assert_eq!(cached.rows.len(), 3);
+                    assert_eq!(app.transcript_prefixes.last().copied(), Some(3));
+                }
+                let cached = app.transcript_cache[0].as_ref().unwrap();
+                let links = &cached.rows[1].2;
+                if payload == encoded {
+                    assert_eq!(line_text(&cached.rows[1].0), "  Image #1");
+                    assert_eq!(links.len(), 1);
+                    let path = url::Url::parse(&links[0].url)
+                        .unwrap()
+                        .to_file_path()
+                        .unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                    app.start_session("replacement".into());
+                    assert!(!path.exists(), "session switch must release the local file");
+                } else {
+                    assert!(links.is_empty(), "invalid data must not create a dead link");
+                }
+                assert!(!images.pending());
+                assert_eq!(images.cached_entries(), 0);
+            }
+        }
+    }
+
     #[test]
     fn transcript_width_change_rebuilds_cached_rows() {
         let mut app = App::new(

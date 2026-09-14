@@ -630,7 +630,7 @@ fn spawn_background_workers(
                             image
                                 .source_uri
                                 .as_deref()
-                                .is_some_and(|uri| uri.starts_with("file:"))
+                                .is_none_or(|uri| uri.starts_with("file:"))
                         })
                         .take(64)
                         .filter_map(|image| {
