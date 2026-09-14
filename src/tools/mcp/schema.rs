@@ -210,7 +210,7 @@ impl ToolSchema {
             runtime,
             artifact_root,
             spec: ToolSpec::new(ToolName::new("tool_schema"),
-                "Walk a canonical MCP input schema using a session-scoped schema_ref from tool_search. JSON Pointer defaults to root (empty string). Returns shallow children with pointers; offset/limit page wide nodes. Follow child pointers to descend. References ($ref, $dynamicRef, etc.) remain literal, never recursively expanded. Incomplete projections are NOT executable schemas. Long descriptions and other strings have previews and artifact references; use artifact to read the full original text. Stale or out-of-scope references require a new tool_search.",
+                "Inspect a tool’s input schema using the schema_ref returned by tool_search. Omit pointer to list the root’s children. To explore a nested object or array, pass a child’s returned JSON Pointer as pointer (for example, /properties/command). Use next_offset as offset with the same pointer to list more children; limit defaults to 16, maximum 32. Views are shallow: follow child pointers to inspect types, required fields, constraints, and alternatives before constructing tool arguments. Schema references such as $ref are not expanded; inspect local targets with the same schema_ref (for example, #/$defs/Query becomes /$defs/Query). Truncated text includes an artifact path for reading the full content with artifact; do not use truncated pointer previews as addresses. If schema_ref is rejected, run tool_search again.",
                 input_schema).with_output_schema(output_schema),
         }
     }
