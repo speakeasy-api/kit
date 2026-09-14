@@ -1355,16 +1355,14 @@ impl Runtime {
                     error,
                 )
             })?;
+        let task_manager = background_task_manager();
+        let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
-                0,
-                subagents,
-                BackgroundJobs::default(),
-                skills,
-            ))
-            .task_manager(background_task_manager())
+            .add_tool_source(self.compose_with_jobs(0, subagents, background_jobs.clone(), skills))
+            .task_manager(task_manager)
             .mutator(compactor)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
@@ -1396,7 +1394,18 @@ impl Runtime {
                 ));
             }
         };
-        match drive(&mut driver).await {
+        let result = drive_with_tasks(&mut driver, Some(&tasks)).await;
+        // Cancel owned compose work cooperatively before aborting task handles.
+        background_jobs.cancel_all();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            background_jobs.wait_for_quiescence(),
+        )
+        .await;
+        for task in tasks.list_running().await {
+            let _ = tasks.cancel(task.id).await;
+        }
+        match result {
             Ok(output) => Ok(output),
             Err(error) => Err(record_loop_failure(
                 &session_id,
@@ -2786,13 +2795,28 @@ fn record_loop_failure(
 }
 
 async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
+    drive_with_tasks(driver, None).await
+}
+
+async fn drive_with_tasks(
+    driver: &mut LoopDriver<SelectableSession>,
+    tasks: Option<&TaskManagerHandle>,
+) -> Result<String, LoopError> {
+    let mut output = String::new();
     loop {
+        // Read running state BEFORE probing the loop: completion publishes its
+        // loop update atomically with clearing running. The probe therefore
+        // cannot miss the last completion and mistake it for quiescence.
+        let running = match tasks {
+            Some(tasks) => !tasks.list_running().await.is_empty(),
+            None => false,
+        };
         match driver.next().await? {
             LoopStep::Finished(result) => {
                 if result.finish_reason == FinishReason::Cancelled {
                     return Err(LoopError::Cancelled);
                 }
-                return Ok(result
+                output = result
                     .items
                     .iter()
                     .flat_map(|item| &item.parts)
@@ -2801,7 +2825,22 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
                         _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join(""));
+                    .join("");
+                if tasks.is_none() {
+                    return Ok(output);
+                }
+            }
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) if tasks.is_some() => {
+                if !running {
+                    return Ok(output);
+                }
+                if let Some(tasks) = tasks {
+                    // Events are queued during model turns, including failure
+                    // and cancellation; no check-to-wait notification is lost.
+                    if tasks.next_event().await.is_none() {
+                        return Err(LoopError::InvalidState("task event stream closed".into()));
+                    }
+                }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(_) => {
