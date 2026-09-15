@@ -82,6 +82,8 @@ pub enum Update {
         images: Vec<UserImage>,
         append: bool,
     },
+    /// A bounded worker request from an internal image-placeholder click.
+    OpenUserImage(UserImage),
     /// Agent prose, either appended as a chunk or replaced by an upsert.
     AgentMessage {
         id: String,
@@ -326,32 +328,50 @@ fn replace_image_uri_on_line(
     line: usize,
     source_uri: Option<&str>,
     local_uri: Option<&str>,
-) {
-    let Some(source_uri) = source_uri else {
-        return;
-    };
+) -> Option<Range<usize>> {
     let start = if line == 0 {
         0
     } else if let Some((index, _)) = text.match_indices('\n').nth(line - 1) {
         index + 1
     } else {
-        return;
+        return None;
     };
     let end = text[start..]
         .find('\n')
         .map_or(text.len(), |offset| start + offset);
+    let Some(source_uri) = source_uri else {
+        // URI-less image blocks get their own generated placeholder line during
+        // translation. Link only that label, never arbitrary neighboring text.
+        let label = &text[start..end];
+        if let Some(number) = label
+            .strip_prefix("[Image #")
+            .and_then(|label| label.strip_suffix(']'))
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if let Some(local_uri) = local_uri {
+                text.insert_str(end, &format!("({local_uri})"));
+            }
+            return Some(start..end);
+        }
+        return None;
+    };
     let destination = markdown::image_label_link_destinations(&text[start..end])
         .into_iter()
         .find_map(|(range, uri)| (uri == source_uri).then_some(range));
     if let Some(destination) = destination {
         let destination = start + destination.start..start + destination.end;
+        let label_end = destination.start - 1;
+        let label_start = text[start..label_end].rfind('[')? + start;
         if let Some(local_uri) = local_uri {
             text.replace_range(destination, local_uri);
         } else {
             // Remove the complete `](destination)` suffix, leaving the label as plain text.
             text.replace_range(destination.start - 2..destination.end + 1, "]");
         }
+        return Some(label_start..label_end);
     }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -403,6 +423,7 @@ pub(super) enum ClipboardMode {
 }
 
 pub enum Action {
+    OpenUserImage(UserImage),
     Voice(String),
     None,
     Redraw,
@@ -527,11 +548,18 @@ pub struct UserImage {
     pub(super) data: String,
     pub(super) mime_type: String,
     pub(super) source_uri: Option<String>,
-    /// Source line after which the fixed image viewport is reserved.
+    /// Source line carrying this image's clickable placeholder label.
     pub(super) line: usize,
+    /// Exact plain-label bytes trusted by translation/rewrite, never a parsed URI.
+    pub(super) open_label: Option<Range<usize>>,
 }
 
 impl UserImage {
+    /// Internal hit target only: never sent to an OS URI handler or OSC 8.
+    pub(super) fn open_target(&self) -> String {
+        format!("kit-image:{}", blake3::Hash::from(self.key).to_hex())
+    }
+
     pub(super) fn new(data: String, mime_type: String, line: usize) -> Option<Self> {
         Self::with_source(data, mime_type, line, None)
     }
@@ -572,6 +600,7 @@ impl UserImage {
             mime_type,
             source_uri,
             line,
+            open_label: None,
         })
     }
 }
@@ -799,6 +828,7 @@ pub struct App {
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
     retained_image_source_bytes: usize,
+    image_source_limit_noticed: bool,
     attachment_cache: SessionAttachmentCache,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
@@ -1066,6 +1096,7 @@ impl App {
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
             retained_image_source_bytes: 0,
+            image_source_limit_noticed: false,
             attachment_cache: SessionAttachmentCache::default(),
             next_transcript_revision: 0,
             transcript_focus_index: None,
@@ -1745,19 +1776,34 @@ impl App {
             self.next_attachment = self.next_attachment.max(self.submitted_attachment);
         }
         let mut images = images;
-        for image in &images {
+        for index in 0..images.len() {
+            let image = &images[index];
             if image
                 .source_uri
                 .as_deref()
-                .is_some_and(|uri| uri.starts_with("file:"))
+                .is_none_or(|uri| uri.starts_with("file:"))
             {
                 let uri = self.attachment_cache.image_uri(image.key);
-                replace_image_uri_on_line(
+                let old_len = text.len();
+                let label = replace_image_uri_on_line(
                     &mut text,
                     image.line,
                     image.source_uri.as_deref(),
                     uri.as_deref(),
                 );
+                if let Some(label) = label {
+                    // Later rewrites may precede already associated labels (ACP
+                    // image order need not match text order).
+                    for previous in &mut images[..index] {
+                        if let Some(range) = &mut previous.open_label
+                            && range.start >= label.end
+                        {
+                            range.start = range.start + text.len() - old_len;
+                            range.end = range.end + text.len() - old_len;
+                        }
+                    }
+                    images[index].open_label = uri.is_none().then_some(label);
+                }
             }
         }
         let existing_index = self.message_blocks.get(&id).copied();
@@ -1774,6 +1820,7 @@ impl App {
             self.retained_image_source_bytes =
                 self.retained_image_source_bytes.saturating_sub(replaced);
         }
+        let source_count = images.len();
         images.retain(|image| {
             let retained = self
                 .retained_image_source_bytes
@@ -1785,6 +1832,11 @@ impl App {
                 true
             }
         });
+        // Notify once per session; later messages and resume replays stay quiet.
+        if images.len() < source_count && !self.image_source_limit_noticed {
+            self.image_source_limit_noticed = true;
+            self.toast("image source limit reached; start a new session to retain more images");
+        }
         if let Some(index) = existing_index {
             let mut changed = false;
             match (&mut self.blocks[index], role) {
@@ -1804,8 +1856,13 @@ impl App {
                         }
                         let line_offset =
                             existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        let byte_offset = existing.text.len();
                         existing.text.push_str(&text);
                         for image in &mut images {
+                            if let Some(range) = &mut image.open_label {
+                                range.start += byte_offset;
+                                range.end += byte_offset;
+                            }
                             image.line += line_offset;
                         }
                         existing.images.extend(std::mem::take(&mut images));
@@ -1997,6 +2054,22 @@ impl App {
     }
 
     pub(super) fn apply_materialized(&mut self, update: Update, images: Vec<MaterializedImage>) {
+        if matches!(update, Update::OpenUserImage(_)) {
+            use super::attachment::RetainOpenedError;
+            let result = images
+                .into_iter()
+                .next()
+                .ok_or(RetainOpenedError::InvalidPath)
+                .and_then(|image| self.attachment_cache.retain_opened(image));
+            match result {
+                Ok(uri) => open_url(&uri),
+                Err(RetainOpenedError::Exhausted) => {
+                    self.toast("image open limit reached; start a new session to open more images")
+                }
+                Err(RetainOpenedError::InvalidPath) => self.toast("image could not be opened"),
+            }
+            return;
+        }
         for image in images {
             self.attachment_cache.admit(image);
         }
@@ -2005,6 +2078,7 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         match update {
+            Update::OpenUserImage(_) => {}
             Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
             Update::SessionCatalog(result) => {
@@ -2856,6 +2930,7 @@ impl App {
         self.transcript_prefixes.push(0);
         self.transcript_cache_width = 0;
         self.retained_image_source_bytes = 0;
+        self.image_source_limit_noticed = false;
         self.attachment_cache.clear();
         self.transcript_focus_index = None;
         self.clear_attachments();
@@ -4438,6 +4513,26 @@ impl App {
             return Action::None;
         }
         if let Some(url) = self.clicked_link(column, offset) {
+            if url.starts_with("kit-image:") {
+                let Some(image) = self.blocks.iter().find_map(|block| {
+                    let Block::User(message) = block else {
+                        return None;
+                    };
+                    message
+                        .images
+                        .iter()
+                        .find(|image| image.open_target() == url)
+                }) else {
+                    return Action::None;
+                };
+                // Files retained by an earlier open or admission need no worker
+                // round trip; only misses copy the source and materialize.
+                if let Some(uri) = self.attachment_cache.image_uri(image.key) {
+                    open_url(&uri);
+                    return Action::None;
+                }
+                return Action::OpenUserImage(image.clone());
+            }
             open_url(&url);
             return Action::None;
         }
@@ -5183,6 +5278,366 @@ mod tests {
     }
 
     #[test]
+    fn uri_less_user_image_rewrite_only_links_generated_placeholder_lines() {
+        for label in [
+            "[Image #1]",
+            "[Image #12]",
+            "prose [Image #1]",
+            "`[Image #1]`",
+            "[Image #]",
+            "[Image #x]",
+            "[Image #1](https://example.com/image.png)",
+        ] {
+            let mut text = format!("before\n{label}\nafter");
+            replace_image_uri_on_line(&mut text, 1, None, Some("file:///tmp/local.png"));
+            let expected = if matches!(label, "[Image #1]" | "[Image #12]") {
+                format!("before\n{label}(file:///tmp/local.png)\nafter")
+            } else {
+                format!("before\n{label}\nafter")
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_image_cache_keeps_placeholders_openable_on_demand() {
+        use super::super::{BackgroundCompletion, QueuedUpdate, spawn_background_workers};
+        use base64::Engine as _;
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = spawn_background_workers(completed).unwrap();
+        let mut app = app();
+        let mut first_uri = None;
+        for color in 0..65u8 {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([color, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let image = UserImage::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                "image/png".into(),
+                0,
+            )
+            .unwrap();
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        0,
+                        Update::UserMessage {
+                            id: color.to_string(),
+                            text: "[Image #1]".into(),
+                            images: vec![image],
+                            append: false,
+                        }
+                    ))
+                    .is_ok()
+            );
+            let BackgroundCompletion::Update { queued, images } = completions.recv().await.unwrap()
+            else {
+                panic!("expected update");
+            };
+            app.apply_materialized(queued.update, images);
+            if color == 0 {
+                let Block::User(message) = &app.blocks[0] else {
+                    panic!("user");
+                };
+                first_uri = app.attachment_cache.image_uri(message.images[0].key);
+            }
+        }
+        let Block::User(last) = app.blocks.last().unwrap() else {
+            panic!("user");
+        };
+        assert_eq!(last.text, "[Image #1]");
+        let key = last.images[0].key;
+        assert!(app.attachment_cache.image_uri(key).is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        let mut runtime = super::super::image::ImageRuntime::with_picker(
+            ratatui_image::picker::Picker::halfblocks(),
+        );
+        terminal
+            .draw(|frame| super::super::ui::draw(frame, &mut app, &mut runtime))
+            .unwrap();
+        let (row, hit) = app
+            .row_links
+            .iter()
+            .enumerate()
+            .find_map(|(row, hits)| {
+                hits.iter()
+                    .find(|hit| hit.url.starts_with("kit-image:"))
+                    .map(|hit| (row, hit.clone()))
+            })
+            .unwrap();
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: (app.transcript_left + hit.start) as u16,
+            row: (app.transcript_top + row) as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = mouse(MouseEventKind::Down(MouseButton::Left));
+        let up = mouse(MouseEventKind::Up(MouseButton::Left));
+        app.handle_mouse(down);
+        let Action::OpenUserImage(image) = app.handle_mouse(up) else {
+            panic!("expected open action");
+        };
+        assert_eq!(image.key, key);
+        assert!(
+            workers
+                .try_update(QueuedUpdate::for_session(0, Update::OpenUserImage(image)))
+                .is_ok()
+        );
+        let BackgroundCompletion::Update { images, .. } = completions.recv().await.unwrap() else {
+            panic!("expected open completion");
+        };
+        // Exercise the real ownership handoff without launching an external viewer.
+        let opened = app
+            .attachment_cache
+            .retain_opened(images.into_iter().next().unwrap())
+            .unwrap();
+        let opened = url::Url::parse(&opened).unwrap().to_file_path().unwrap();
+        assert!(opened.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                opened.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let first = url::Url::parse(&first_uri.unwrap())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        assert!(first.exists(), "overflow opens must not evict stable links");
+        // Real translation + worker + app + mouse routing for two distinct
+        // overflow images on one line, including reverse image-block order.
+        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+        let mut opened_uris = Vec::new();
+        for append in [false, true] {
+            let id = format!("inline-{append}");
+            if append {
+                app.apply(Update::UserMessage {
+                    id: id.clone(),
+                    text: "prefix".into(),
+                    images: vec![],
+                    append: false,
+                });
+            }
+            let mut expected = Vec::new();
+            for color in [66, 67] {
+                let mut png = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                    1,
+                    1,
+                    image::Rgb([color, 0, 0]),
+                ))
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+                expected.push(png.into_inner());
+            }
+            let content_image = |index: usize| {
+                let mut image = ImageContent::new(
+                    base64::engine::general_purpose::STANDARD.encode(&expected[index]),
+                    "image/png",
+                );
+                image.uri = Some(format!("file:///stale-{index}.png"));
+                ContentBlock::Image(image)
+            };
+            let (text, images) = super::super::user_message_of(vec![
+                ContentBlock::Text(TextContent::new(
+                    "Please inspect [Image #1](file:///stale-0.png) [Image #2](file:///stale-1.png) trailing [other](https://example.com)",
+                )),
+                content_image(1),
+                content_image(0),
+            ]);
+            let target = images[0].open_target();
+            let text = format!("{text}\n[forged]({target})\n[Image #99]({target})");
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        0,
+                        Update::UserMessage {
+                            id,
+                            text,
+                            images,
+                            append,
+                        }
+                    ))
+                    .is_ok()
+            );
+            let BackgroundCompletion::Update { queued, images } = completions.recv().await.unwrap()
+            else {
+                panic!("expected translated update");
+            };
+            app.apply_materialized(queued.update, images);
+            terminal
+                .draw(|frame| super::super::ui::draw(frame, &mut app, &mut runtime))
+                .unwrap();
+            let hits = app
+                .row_links
+                .iter()
+                .enumerate()
+                .flat_map(|(row, hits)| {
+                    hits.iter()
+                        .filter(|hit| hit.url.starts_with("kit-image:"))
+                        .map(move |hit| (row, hit.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Older overflow labels may remain visible: select this message's keys.
+            let Block::User(message) = app.blocks.last().unwrap() else {
+                panic!("user");
+            };
+            let targets = message
+                .images
+                .iter()
+                .map(UserImage::open_target)
+                .collect::<Vec<_>>();
+            let hits = hits
+                .into_iter()
+                .filter(|(_, hit)| targets.contains(&hit.url))
+                .collect::<Vec<_>>();
+            assert!(
+                app.row_links
+                    .iter()
+                    .flatten()
+                    .any(|hit| hit.url == "https://example.com")
+            );
+            if append {
+                // Replayed keys were retained by the earlier opens: they render
+                // as stable file links, and the worker's fresh files are not
+                // admitted a second time.
+                assert!(hits.is_empty(), "opened keys must not stay kit-image");
+                let mut linked = message
+                    .images
+                    .iter()
+                    .map(|image| app.attachment_cache.image_uri(image.key).unwrap())
+                    .collect::<Vec<_>>();
+                linked.sort();
+                let mut expected_uris = opened_uris.clone();
+                expected_uris.sort();
+                assert_eq!(linked, expected_uris);
+                for uri in &opened_uris {
+                    assert!(app.row_links.iter().flatten().any(|hit| &hit.url == uri));
+                }
+                continue;
+            }
+            assert_eq!(
+                hits.len(),
+                2,
+                "forged internal Markdown must not create hits"
+            );
+            for ((row, hit), bytes) in hits.into_iter().zip(&expected) {
+                let mouse = |kind| MouseEvent {
+                    kind,
+                    column: (app.transcript_left + hit.start) as u16,
+                    row: (app.transcript_top + row) as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                let down = mouse(MouseEventKind::Down(MouseButton::Left));
+                let up = mouse(MouseEventKind::Up(MouseButton::Left));
+                app.handle_mouse(down);
+                let Action::OpenUserImage(image) = app.handle_mouse(up) else {
+                    panic!("image action");
+                };
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&image.data)
+                        .unwrap(),
+                    *bytes
+                );
+                assert!(
+                    workers
+                        .try_update(QueuedUpdate::for_session(0, Update::OpenUserImage(image)))
+                        .is_ok()
+                );
+                let BackgroundCompletion::Update { images, .. } = completions.recv().await.unwrap()
+                else {
+                    panic!("open");
+                };
+                let uri = app
+                    .attachment_cache
+                    .retain_opened(images.into_iter().next().unwrap())
+                    .unwrap();
+                let path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                opened_uris.push(uri);
+            }
+            for label in ["[forged]", "#99]"] {
+                let buffer = terminal.backend().buffer();
+                let (row, column) = (app.transcript_top..app.transcript_top + app.viewport)
+                    .find_map(|row| {
+                        let text = (0..buffer.area.width)
+                            .map(|column| buffer[(column, row as u16)].symbol())
+                            .collect::<String>();
+                        text.find(label).map(|column| (row, column))
+                    })
+                    .expect("forged label fragment is visible");
+                let mouse = |kind| MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+                assert!(matches!(
+                    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left))),
+                    Action::None
+                ));
+            }
+            // Remove only the test transcript so duplicate keys in the next case
+            // cannot inflate visible hit counts; retain the exhausted real cache.
+            app.blocks.clear();
+            app.message_blocks.clear();
+        }
+        app.start_session("next".into());
+        assert!(!opened.exists());
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn exhausted_open_pool_reports_actionable_notice_without_launching() {
+        use base64::Engine as _;
+        let mut app = app();
+        for color in 0..=64 {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([color, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let image = UserImage::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                "image/png".into(),
+                0,
+            )
+            .unwrap();
+            let materialized = super::super::attachment::materialize_image(
+                image.key,
+                &image.data,
+                &image.mime_type,
+                usize::MAX,
+            )
+            .unwrap();
+            if color < 64 {
+                app.attachment_cache.retain_opened(materialized).unwrap();
+            } else {
+                // Admission failure takes the real completion path, which must
+                // report the refusal rather than launch an unowned path.
+                app.apply_materialized(Update::OpenUserImage(image), vec![materialized]);
+                assert_eq!(
+                    app.toast_text(),
+                    Some("image open limit reached; start a new session to open more images",)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replayed_native_image_links_are_reused_and_live_for_the_session() {
         use base64::Engine as _;
         let mut png = std::io::Cursor::new(Vec::new());
@@ -5282,12 +5737,44 @@ mod tests {
             });
         }
 
+        assert_eq!(
+            app.toast_text(),
+            Some("image source limit reached; start a new session to retain more images")
+        );
         assert_eq!(app.retained_image_source_bytes, source_bytes * 3);
         assert!(app.retained_image_source_bytes <= MAX_RETAINED_IMAGE_SOURCE_BYTES);
         assert!(matches!(
             app.blocks.last(),
             Some(Block::User(message)) if message.images.is_empty()
         ));
+
+        // Later refusals stay quiet so the notice cannot clobber other toasts.
+        app.toast("copied resume command");
+        let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+        app.apply(Update::UserMessage {
+            id: "image-4".into(),
+            text: "[Image #4]".into(),
+            images: vec![image],
+            append: false,
+        });
+        assert_eq!(app.toast_text(), Some("copied resume command"));
+
+        // A fresh session notifies again.
+        app.start_session("next".into());
+        app.toast = None;
+        for index in 0..4 {
+            let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+            app.apply(Update::UserMessage {
+                id: format!("next-{index}"),
+                text: format!("[Image #{index}]"),
+                images: vec![image],
+                append: false,
+            });
+        }
+        assert_eq!(
+            app.toast_text(),
+            Some("image source limit reached; start a new session to retain more images")
+        );
     }
 
     fn compose(app: &mut App, script: &str) {

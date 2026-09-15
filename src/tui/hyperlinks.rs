@@ -73,6 +73,11 @@ impl HyperlinkRenderer {
                     continue;
                 };
                 for hit in hits {
+                    // Internal on-demand targets require a normal TUI click;
+                    // terminal modifier-click must not dispatch them to the OS.
+                    if hit.url.starts_with("kit-image:") {
+                        continue;
+                    }
                     let Some(start) = transcript_left
                         .checked_add(hit.start)
                         .and_then(|value| u16::try_from(value).ok())
@@ -266,6 +271,22 @@ mod tests {
             area: buffer.area,
             count: 0,
         }
+    }
+
+    #[test]
+    fn internal_image_targets_are_not_emitted_as_native_hyperlinks() {
+        let buffer = Buffer::with_lines([Line::from("[Image #1]")]);
+        let rows = vec![vec![LinkHit {
+            start: 0,
+            end: 10,
+            url: "kit-image:internal".into(),
+        }]];
+        let mut renderer = HyperlinkRenderer::default();
+        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
+        let capture = Capture::default();
+        let mut backend = CrosstermBackend::new(capture.clone());
+        renderer.draw(&mut backend, prepared).unwrap();
+        assert!(!has_nonempty_open(&capture.bytes()));
     }
 
     #[test]

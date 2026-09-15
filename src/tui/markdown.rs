@@ -733,6 +733,7 @@ pub(super) fn image_label_link_destinations(source: &str) -> Vec<(Range<usize>, 
         false,
         0,
         Some(&mut destinations),
+        &[],
     );
     destinations
 }
@@ -802,6 +803,17 @@ pub(super) fn inline_spans(source: &str, base: Style) -> Vec<LinkedSpan> {
     inline_with_link_destinations(source, base, false)
 }
 
+/// Render internal image hits only at caller-associated source ranges. The
+/// ordinary Markdown parser still rejects internal URI schemes, including when
+/// an attacker copies a real image target into another link.
+pub(super) fn inline_spans_with_image_labels(
+    source: &str,
+    base: Style,
+    labels: &[(Range<usize>, String)],
+) -> Vec<LinkedSpan> {
+    inline_with_link_destinations_and_ranges(source, base, false, 0, None, labels)
+}
+
 /// Splits inline links, emphasis, and code spans out of one line of Markdown.
 fn inline(source: &str, base: Style) -> Vec<LinkedSpan> {
     inline_with_link_destinations(source, base, true)
@@ -812,7 +824,7 @@ fn inline_with_link_destinations(
     base: Style,
     show_link_destinations: bool,
 ) -> Vec<LinkedSpan> {
-    inline_with_link_destinations_and_ranges(source, base, show_link_destinations, 0, None)
+    inline_with_link_destinations_and_ranges(source, base, show_link_destinations, 0, None, &[])
 }
 
 fn inline_with_link_destinations_and_ranges(
@@ -821,6 +833,7 @@ fn inline_with_link_destinations_and_ranges(
     show_link_destinations: bool,
     offset: usize,
     mut destinations: Option<&mut Vec<(Range<usize>, String)>>,
+    labels: &[(Range<usize>, String)],
 ) -> Vec<LinkedSpan> {
     let mut spans = Vec::new();
     let mut plain = String::new();
@@ -831,6 +844,30 @@ fn inline_with_link_destinations_and_ranges(
             .map(|index| (index, &rest[index..]));
         let image = image_references(rest).into_iter().next();
         let link = next_link(rest);
+        let consumed = offset + source.len() - rest.len();
+        let label = labels
+            .iter()
+            .find(|(range, _)| range.start >= consumed && range.end <= consumed + rest.len());
+        if let Some((range, target)) = label {
+            let start = range.start - consumed;
+            let end = range.end - consumed;
+            if marker.as_ref().is_none_or(|(index, _)| start < *index)
+                && image.as_ref().is_none_or(|(range, _)| start <= range.start)
+                && link.as_ref().is_none_or(|link| start <= link.start)
+            {
+                plain.push_str(&rest[..start]);
+                if !plain.is_empty() {
+                    spans.push(plain_span(std::mem::take(&mut plain), base));
+                }
+                spans.push(link_span(
+                    rest[start..end].to_owned(),
+                    base.add_modifier(Modifier::UNDERLINED),
+                    target,
+                ));
+                rest = &rest[end..];
+                continue;
+            }
+        }
         if let Some((range, _)) = image
             && marker
                 .as_ref()
@@ -943,6 +980,7 @@ fn inline_with_link_destinations_and_ranges(
                 show_link_destinations,
                 offset + source.len() - body.len(),
                 destinations.as_deref_mut(),
+                labels,
             ));
         }
         rest = &body[close + delimiter.len()..];
@@ -997,6 +1035,38 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn trusted_image_labels_preserve_surrounding_emphasis_and_reject_forged_uris() {
+        let text =
+            "**Please [Image #1] inspect** [other](https://example.com) [forged](kit-image:one)";
+        let start = text.find("[Image #1]").unwrap();
+        let spans = super::inline_spans_with_image_labels(
+            text,
+            ratatui::style::Style::default(),
+            &[(start..start + "[Image #1]".len(), "kit-image:one".into())],
+        );
+        let links = spans
+            .iter()
+            .filter(|span| span.url.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].span.content, "[Image #1]");
+        assert!(
+            links[0]
+                .span
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(links[1].url.as_deref(), Some("https://example.com"));
+        let visible = spans
+            .iter()
+            .map(|span| span.span.content.as_ref())
+            .collect::<String>();
+        assert!(!visible.contains("**"));
+        assert!(visible.contains("[forged](kit-image:one)"));
     }
 
     #[test]

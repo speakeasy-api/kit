@@ -1144,11 +1144,11 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
             }
             continue;
         }
-        let sources = match app.blocks.get(block_index) {
-            Some(Block::User(message)) => &message.images,
-            Some(Block::Tool(call)) => &call.images,
-            _ => continue,
+        // User images render as clickable labels, never as inline viewports.
+        let Some(Block::Tool(call)) = app.blocks.get(block_index) else {
+            continue;
         };
+        let sources = &call.images;
         let Some(source) = sources.get(source_index) else {
             continue;
         };
@@ -1318,47 +1318,37 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     }
 }
 
-fn user_block_rows(
-    message: &UserMessage,
-    width: usize,
-    reserve_images: bool,
-) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
+fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptRow> {
     let mut rows = Vec::new();
-    let mut placements = Vec::new();
+    let mut line_start = 0;
     for (line_index, text) in message.text.split('\n').enumerate() {
+        let mut line = user_line("", line_index == 0);
+        let mut labels = message
+            .images
+            .iter()
+            .filter_map(|image| {
+                let range = image.open_label.as_ref()?;
+                (range.start >= line_start && range.end <= line_start + text.len()).then(|| {
+                    (
+                        range.start - line_start..range.end - line_start,
+                        image.open_target(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|(range, _)| range.start);
+        line.spans.extend(markdown::inline_spans_with_image_labels(
+            text,
+            theme::bold(theme::text_color()),
+            &labels,
+        ));
+        line_start += text.len() + 1;
         rows.extend(wrap_linked_tagged(
-            &[(
-                user_line(text, line_index == 0),
-                (None, None, Some(line_index)),
-            )],
+            &[(line, (None, None, Some(line_index)))],
             width,
         ));
-        if reserve_images {
-            for (source, _) in message
-                .images
-                .iter()
-                .enumerate()
-                .filter(|(_, image)| image.line == line_index)
-            {
-                let row = rows.len();
-                rows.extend((0..RESERVED_ROWS).map(|_| {
-                    (
-                        Line::default(),
-                        (None, None, None),
-                        Vec::new(),
-                        String::new(),
-                    )
-                }));
-                placements.push(CachedTranscriptImage {
-                    block: None,
-                    source,
-                    row,
-                    destination: None,
-                });
-            }
-        }
     }
-    (rows, placements)
+    rows
 }
 
 /// Place viewports at complete image boundaries before wrapping following prose.
@@ -1564,7 +1554,7 @@ fn single_transcript_block_rows(
 ) -> (Vec<CachedTranscriptRow>, Vec<CachedTranscriptImage>) {
     let block = &app.blocks[block_index];
     let (block_lines, call) = match block {
-        Block::User(message) => return user_block_rows(message, width, reserve_images),
+        Block::User(message) => return (user_block_rows(message, width), Vec::new()),
         Block::Agent(text) => return agent_block_rows(text, block_index, width, reserve_images),
         Block::AgentParts(parts) => {
             return agent_parts_rows(parts, block_index, width, reserve_images);
@@ -5752,23 +5742,21 @@ mod tests {
     }
 
     #[test]
-    fn image_rows_preserve_text_image_text_display_order() {
+    fn user_image_placeholders_preserve_explicit_text_newlines() {
         let image = UserImage::new("AQID".into(), "image/png".into(), 1).unwrap();
         let message = UserMessage {
-            text: "before\n[Image #1]\nafter".into(),
+            text: "before\n[Image #1](file:///tmp/image.png)\n\nafter\n".into(),
             images: vec![image],
         };
 
-        let (rows, placements) = user_block_rows(&message, 40, true);
+        let rows = user_block_rows(&message, 40);
 
-        assert_eq!(placements.len(), 1);
-        let after = &rows[placements[0].row + usize::from(super::RESERVED_ROWS)].0;
-        assert!(
-            after
-                .spans
-                .iter()
-                .any(|span| span.content.contains("after"))
+        assert_eq!(
+            rows.iter().map(|row| line_text(&row.0)).collect::<Vec<_>>(),
+            ["› before", "  Image #1", "  ", "  after", "  "]
         );
+        assert_eq!(rows[1].2.len(), 1);
+        assert_eq!(rows[1].2[0].url, "file:///tmp/image.png");
     }
 
     #[test]
@@ -5839,7 +5827,7 @@ mod tests {
     }
 
     #[test]
-    fn image_rows_are_fixed_and_decoding_is_lazy() {
+    fn user_images_remain_clickable_placeholders_with_image_runtime() {
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(400, 200)
             .write_to(&mut png, image::ImageFormat::Png)
@@ -5862,62 +5850,141 @@ mod tests {
         }));
         let mut images = crate::tui::image::ImageRuntime::with_picker(Picker::halfblocks());
 
-        refresh_transcript_cache_with_images(&mut app, &mut images, 12);
-        assert_eq!(images.cached_entries(), 0, "layout must not decode images");
-        let narrow = app.transcript_cache[0].as_ref().unwrap();
-        assert_eq!(narrow.images.len(), 1);
-        assert!(narrow.rows.len() > 1);
-        let narrow_rows = narrow.rows.len();
-        assert_eq!(app.transcript_prefixes.last().copied(), Some(narrow_rows));
-
-        refresh_transcript_cache_with_images(&mut app, &mut images, 40);
-        assert_eq!(images.cached_entries(), 0, "width changes stay lazy");
-        let wide = app.transcript_cache[0].as_ref().unwrap();
-        assert_eq!(wide.images.len(), 1);
-        assert_eq!(wide.rows.len(), narrow_rows);
+        for width in [12, 40] {
+            refresh_transcript_cache_with_images(&mut app, &mut images, width);
+            let cached = app.transcript_cache[0].as_ref().unwrap();
+            assert!(cached.images.is_empty());
+            assert_eq!(cached.rows.len(), 1);
+            assert_eq!(line_text(&cached.rows[0].0), "› Image #1");
+            assert_eq!(cached.rows[0].2.len(), 1);
+            assert_eq!(cached.rows[0].2[0].url, "file:///tmp/image.png");
+            assert_eq!(app.transcript_prefixes.last().copied(), Some(1));
+        }
 
         let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
         terminal
             .draw(|frame| draw(frame, &mut app, &mut images))
             .unwrap();
-        assert_eq!(images.cached_entries(), 0, "visible image decode is queued");
-        wait_for_image_decode(&mut images);
-        terminal
-            .draw(|frame| draw(frame, &mut app, &mut images))
-            .unwrap();
-        assert_eq!(images.cached_entries(), 1, "visible image is rendered");
-        assert!(buffer_contains_black_image_cell(
+        assert!(!images.pending(), "user images must not queue decoding");
+        assert_eq!(images.cached_entries(), 0);
+        assert!(!buffer_contains_black_image_cell(
             terminal.backend().buffer()
         ));
-        let reserved_rows = app.transcript_cache[0].as_ref().unwrap().rows.len();
+        assert!(
+            app.row_links
+                .iter()
+                .flatten()
+                .any(|hit| hit.url == "file:///tmp/image.png")
+        );
+    }
 
-        images.clear();
-        assert_eq!(
-            images.cached_entries(),
-            0,
-            "decoded image cache was evicted"
-        );
-        terminal
-            .draw(|frame| draw(frame, &mut app, &mut images))
+    #[tokio::test]
+    async fn uri_less_user_images_translate_to_local_placeholder_links_without_preview_gaps() {
+        use crate::tui::{
+            BackgroundCompletion, QueuedUpdate, spawn_background_workers, user_message_of,
+        };
+        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
-        assert_eq!(images.cached_entries(), 0, "evicted image decode is queued");
-        wait_for_image_decode(&mut images);
-        terminal
-            .draw(|frame| draw(frame, &mut app, &mut images))
-            .unwrap();
-        assert_eq!(
-            images.cached_entries(),
-            1,
-            "an evicted visible image is rendered again after decoding"
-        );
-        assert!(buffer_contains_black_image_cell(
-            terminal.backend().buffer()
-        ));
-        assert_eq!(
-            app.transcript_cache[0].as_ref().unwrap().rows.len(),
-            reserved_rows,
-            "cache eviction cannot remove reserved transcript rows"
-        );
+        let bytes = png.into_inner();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = spawn_background_workers(completed).unwrap();
+
+        // Full replay messages and replay chunks share this translation path.
+        for append in [false, true] {
+            for payload in [encoded.as_str(), "invalid base64"] {
+                let (text, sources) = user_message_of(vec![
+                    ContentBlock::Text(TextContent::new("before")),
+                    ContentBlock::Image(ImageContent::new(payload, "image/png")),
+                    ContentBlock::Text(TextContent::new("after")),
+                ]);
+                assert_eq!(text, "before\n[Image #1]\nafter");
+                assert!(
+                    workers
+                        .try_update(QueuedUpdate {
+                            generation: None,
+                            update: crate::tui::app::Update::UserMessage {
+                                id: "replayed".into(),
+                                text,
+                                images: sources,
+                                append,
+                            },
+                        })
+                        .is_ok()
+                );
+                let BackgroundCompletion::Update {
+                    queued,
+                    images: prepared,
+                } = completions.recv().await.unwrap()
+                else {
+                    panic!("expected update")
+                };
+                let mut app = App::new(
+                    PathBuf::from("/tmp/kit"),
+                    "openai-subscription".into(),
+                    "gpt-5.4".into(),
+                    "0:0".into(),
+                );
+                app.apply_materialized(queued.update, prepared);
+                let mut images = crate::tui::image::ImageRuntime::with_picker(Picker::halfblocks());
+                for width in [12, 40] {
+                    refresh_transcript_cache_with_images(&mut app, &mut images, width);
+                    let cached = app.transcript_cache[0].as_ref().unwrap();
+                    assert!(cached.images.is_empty());
+                    assert_eq!(cached.rows.len(), 3);
+                    assert_eq!(app.transcript_prefixes.last().copied(), Some(3));
+                }
+                let cached = app.transcript_cache[0].as_ref().unwrap();
+                let links = &cached.rows[1].2;
+                if payload == encoded {
+                    assert_eq!(line_text(&cached.rows[1].0), "  Image #1");
+                    assert_eq!(links.len(), 1);
+                    let path = url::Url::parse(&links[0].url)
+                        .unwrap()
+                        .to_file_path()
+                        .unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                    app.start_session("replacement".into());
+                    assert!(!path.exists(), "session switch must release the local file");
+                } else {
+                    assert_eq!(links.len(), 1);
+                    assert!(
+                        links[0].url.starts_with("kit-image:"),
+                        "invalid data must not create a dead native file link"
+                    );
+                    let Block::User(message) = &app.blocks[0] else {
+                        panic!("expected user");
+                    };
+                    assert!(
+                        workers
+                            .try_update(QueuedUpdate {
+                                generation: None,
+                                update: crate::tui::app::Update::OpenUserImage(
+                                    message.images[0].clone()
+                                ),
+                            })
+                            .is_ok()
+                    );
+                    let BackgroundCompletion::Update { queued, images } =
+                        completions.recv().await.unwrap()
+                    else {
+                        panic!("expected open completion");
+                    };
+                    assert!(
+                        images.is_empty(),
+                        "invalid data must not create a temporary file"
+                    );
+                    app.apply_materialized(queued.update, images);
+                    assert_eq!(app.toast_text(), Some("image could not be opened"));
+                }
+                assert!(!images.pending());
+                assert_eq!(images.cached_entries(), 0);
+            }
+        }
     }
 
     #[test]
