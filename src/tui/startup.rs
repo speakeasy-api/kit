@@ -25,12 +25,8 @@ pub async fn pick_session(
     root: &Path,
     stop: &mut Stop,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let root = root
-        .canonicalize()
-        .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
-    let filesystem =
-        crate::resilient_fs::Fs::new(std::sync::Arc::new(crate::resilient_fs::DiskBackend));
-    let Some(entries) = scan_catalog(root.clone(), filesystem, stop).await? else {
+    let backend = std::sync::Arc::new(crate::resilient_fs::DiskBackend);
+    let Some((root, entries)) = scan_catalog(root.to_path_buf(), backend, stop).await? else {
         return Ok(None);
     };
     if entries.is_empty() {
@@ -153,16 +149,27 @@ pub async fn pick_session(
 // unlike spawn_blocking, it does not delay Tokio runtime teardown.
 async fn scan_catalog(
     root: std::path::PathBuf,
-    filesystem: crate::resilient_fs::Fs,
+    backend: std::sync::Arc<dyn crate::resilient_fs::Backend>,
     stop: &mut Stop,
-) -> Result<Option<Vec<crate::session::CatalogEntry>>, Box<dyn std::error::Error>> {
+) -> Result<
+    Option<(std::path::PathBuf, Vec<crate::session::CatalogEntry>)>,
+    Box<dyn std::error::Error>,
+> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let worker = std::thread::Builder::new()
         .name("session-catalog".into())
         .spawn(move || {
-            let result = crate::session::catalog_with(&filesystem, &root).map_err(|error| {
-                format!("could not list sessions for {}: {error}", root.display())
-            });
+            let result = (|| {
+                let root = backend
+                    .canonicalize(&root)
+                    .map_err(|error| format!("{}: {error}", root.display()))?;
+                let filesystem = crate::resilient_fs::Fs::new(backend);
+                let entries =
+                    crate::session::catalog_with(&filesystem, &root).map_err(|error| {
+                        format!("could not list sessions for {}: {error}", root.display())
+                    })?;
+                Ok::<_, String>((root, entries))
+            })();
             let _ = tx.send(result);
         })?;
     let Some(result) = stop.until(rx).await else {

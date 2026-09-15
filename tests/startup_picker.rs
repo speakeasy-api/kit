@@ -73,7 +73,7 @@ impl Picker {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    &raw mut size,
                 )
             },
             0
