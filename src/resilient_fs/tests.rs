@@ -188,6 +188,8 @@ impl Backend for Injected {
         }))
     }
     fn metadata(&self, p: &Path, follow: bool) -> io::Result<native::Metadata> {
+        self.faults.panic_at(Point::Metadata);
+        self.faults.pause_at(Point::Metadata);
         self.disk.metadata(p, follow)
     }
     fn read_dir(&self, p: &Path) -> io::Result<Vec<DiskEntry>> {
@@ -2398,5 +2400,286 @@ fn best_effort_post_publication_payload_cannot_bypass_retained_budget() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn prepared_replace_is_effect_free_until_commit_and_preserves_legacy_parents() {
+    let t = Fixture::new();
+    let path = t.path("legacy/metadata/session.json");
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    assert!(!t.path("legacy").exists());
+    drop(prepared);
+    assert!(!t.path("legacy").exists());
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    prepared.commit().unwrap();
+    assert_eq!(native::read(&path).unwrap(), b"new");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            native::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Compare with ordinary create_dir_all under the same process umask.
+        native::create_dir_all(t.path("ordinary/child")).unwrap();
+        assert_eq!(
+            native::metadata(t.path("legacy"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            native::metadata(t.path("ordinary"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        );
+    }
+}
+
+#[test]
+fn prepared_replace_reads_share_ticket_and_aba_access_invalidates_it() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"old").unwrap();
+    let namespace = t.fs.prepare_namespace().unwrap();
+    assert_eq!(namespace.filesystem().read(&path).unwrap(), b"old");
+    // Open and drop leaves no live object, but must still invalidate the ticket.
+    drop(t.fs.open(&path).unwrap());
+    let prepared = namespace
+        .prepare_private_replace_with_parents(&path, b"new")
+        .unwrap();
+    t.faults.arm_panic(Point::Metadata);
+    assert_eq!(
+        prepared.commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(native::read(&path).unwrap(), b"old");
+    t.faults.2.store(0, Ordering::SeqCst);
+    t.fs.prepare_private_replace_with_parents(&path, b"retry")
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(native::read(&path).unwrap(), b"retry");
+}
+
+#[test]
+fn prepared_replace_blocked_preflight_does_not_hold_original_state() {
+    let t = Fixture::new();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    *t.faults.3.lock().unwrap() = Some((Point::Metadata, entered.clone(), resume.clone()));
+    let fs = t.fs.clone();
+    let path = t.path("value");
+    let worker = std::thread::spawn(move || fs.prepare_private_replace_with_parents(path, b"new"));
+    entered.wait();
+    // A synchronous acquisition completes while isolated backend I/O is paused.
+    assert_eq!(t.fs.status().pending_operations, 0);
+    resume.wait();
+    assert_eq!(
+        worker.join().unwrap().unwrap().commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(!t.path("value").exists());
+}
+
+#[test]
+fn prepared_replace_preflight_panic_is_isolated_but_commit_panic_poisons() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    t.faults.arm_panic(Point::Metadata);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = t.fs.prepare_private_replace_with_parents(&path, b"new");
+        }))
+        .is_err()
+    );
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    t.faults.arm_panic(Point::AfterRename);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepared.commit())).is_err());
+    assert_eq!(native::read(&path).unwrap(), b"new");
+    let err = t.fs.prepare_namespace().err().unwrap();
+    assert!(err.get_ref().is_some_and(|e| e.is::<PoisonedState>()));
+}
+
+#[test]
+fn prepared_replace_rejects_live_handles_and_never_rebinds_old_handle() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"old").unwrap();
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    let mut handle = t.fs.open(&path).unwrap();
+    assert_eq!(
+        t.fs.prepare_namespace().err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        prepared.commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let mut contents = String::new();
+    handle.read_to_string(&mut contents).unwrap();
+    assert_eq!(contents, "old");
+}
+
+#[test]
+#[cfg(unix)]
+fn prepared_replace_queues_parent_first_and_rejects_existing_overlay() {
+    let t = Fixture::new();
+    let path = t.path("legacy/metadata/value");
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    t.faults.arm(Point::Mkdir, libc::ENOSPC);
+    prepared.commit().unwrap();
+    assert!(!t.path("legacy").exists());
+    assert_eq!(t.fs.read(&path).unwrap(), b"new");
+    t.faults.clear();
+    // No preparation-side recovery may flush accepted obligations.
+    assert_eq!(
+        t.fs.prepare_namespace().err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(!path.exists());
+    t.settle();
+    assert_eq!(native::read(&path).unwrap(), b"new");
+}
+
+#[test]
+#[cfg(unix)]
+fn prepared_replace_partial_plan_rejection_keeps_accepted_directory() {
+    let t = Fixture::new();
+    let path = t.path("legacy/value");
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    t.faults.arm(Point::Open, libc::EACCES);
+    assert_eq!(
+        prepared.commit().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(t.path("legacy").is_dir());
+    assert!(!path.exists());
+    t.faults.clear();
+    t.fs.prepare_private_replace_with_parents(&path, b"retry")
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(native::read(&path).unwrap(), b"retry");
+}
+
+#[test]
+fn prepared_replace_fences_dropped_scopes_and_invalidates_sibling_tickets() {
+    let t = Fixture::new();
+    let fs = t.fs.best_effort(1024, 16);
+    let first = fs
+        .prepare_private_replace_with_parents(t.path("first"), b"one")
+        .unwrap();
+    let second = fs
+        .prepare_private_replace_with_parents(t.path("second"), b"two")
+        .unwrap();
+    assert_eq!(
+        first.commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    // Even a rejected commit invalidates competing preparations.
+    assert_eq!(
+        second.commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let prepared = fs
+        .prepare_private_replace_with_parents(t.path("value"), b"new")
+        .unwrap();
+    fs.abandon_best_effort().unwrap();
+    assert!(prepared.commit().is_err());
+    let err = fs.prepare_namespace().err().unwrap();
+    assert!(err.get_ref().is_some_and(|e| e.is::<DroppedScope>()));
+    assert!(!t.path("value").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn prepared_replace_rejects_exhausted_and_leased_services_without_preflight() {
+    let t = Fixture::budget(0, 0);
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(t.path("value"), b"new")
+            .unwrap();
+    t.faults.arm(Point::Open, libc::ENOSPC);
+    assert_eq!(
+        prepared.commit().unwrap_err().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    t.faults.clear();
+    t.faults.arm_panic(Point::Metadata);
+    assert_eq!(
+        t.fs.prepare_namespace().err().unwrap().kind(),
+        io::ErrorKind::OutOfMemory
+    );
+    assert!(!t.path("value").exists());
+
+    let t = Fixture::new();
+    let lease =
+        t.fs.acquire_lease(t.path("lock"), &t.root, LeaseMode::CreateNew)
+            .unwrap();
+    let guarded = t.fs.guarded(&lease).unwrap();
+    t.faults.arm_panic(Point::LeaseCheck);
+    assert_eq!(
+        guarded.prepare_namespace().err().unwrap().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        t.fs.prepare_namespace().err().unwrap().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    t.faults.2.store(0, Ordering::SeqCst);
+}
+
+#[test]
+#[cfg(unix)]
+fn prepared_replace_preserves_preflight_file_validation() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"old").unwrap();
+    native::set_permissions(&path, Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    native::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+    native::hard_link(&path, t.path("other")).unwrap();
+    assert_eq!(
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(native::read(&path).unwrap(), b"old");
+}
+
+#[test]
+fn prepared_replacements_can_repeat_without_recovery() {
+    let t = Fixture::new();
+    let path = t.path("legacy/value");
+    for value in [b"first".as_slice(), b"second", b"third"] {
+        t.fs.prepare_private_replace_with_parents(&path, value)
+            .unwrap()
+            .commit()
+            .unwrap();
+        // Native inspection does not prune or access the original service.
+        assert_eq!(native::read(&path).unwrap(), value);
     }
 }

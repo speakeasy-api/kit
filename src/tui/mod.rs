@@ -16,6 +16,9 @@ mod image;
 mod keyboard_tests;
 mod markdown;
 mod source;
+mod startup;
+
+pub use startup::pick_session;
 mod theme;
 mod ui;
 mod wrap;
@@ -1096,23 +1099,6 @@ async fn bounded_agent_request<T>(
     }
 }
 
-async fn bounded_startup_request<T>(
-    request: impl std::future::Future<Output = T>,
-    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
-    timeout: Duration,
-) -> Result<T, RequestFailure> {
-    // One-shot ties prefer request, exit, then timeout (all formerly allowed).
-    let request = pin!(request);
-    let timeout = pin!(tokio::time::sleep(timeout));
-    match select(request, select(&mut *exit, timeout)).await {
-        Either::Left((output, _)) => Ok(output),
-        Either::Right((Either::Left((status, _)), _)) => Err(RequestFailure::AgentExited(
-            status.ok().and_then(Result::ok),
-        )),
-        Either::Right((Either::Right(_), _)) => Err(RequestFailure::TimedOut),
-    }
-}
-
 async fn bounded_cancellable_request<T>(
     request: impl std::future::Future<Output = T>,
     exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
@@ -1352,6 +1338,7 @@ pub async fn run_with_reasoning_effort(
         resume,
         force,
         false,
+        &mut Stop::new()?,
     )
     .await
 }
@@ -1371,6 +1358,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     resume: Option<&str>,
     force: bool,
     voice_enabled: bool,
+    stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
@@ -1414,17 +1402,25 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             force,
         )?;
         let child_mcp_config = mcp_config.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-                crate::resilient_fs::global()
-                    .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
-            }
-            if let Some(path) = child_mcp_config {
-                crate::resilient_fs::global().require_disk(path)?;
-            }
-            Ok::<_, std::io::Error>(())
-        })
-        .await??;
+        let prepared = stop
+            .until(async {
+                tokio::task::spawn_blocking(move || {
+                    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                        crate::resilient_fs::global()
+                            .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
+                    }
+                    if let Some(path) = child_mcp_config {
+                        crate::resilient_fs::global().require_disk(path)?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
+                .await
+            })
+            .await;
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        prepared??;
         let auth_invocation = AgentInvocation::from_command(command.as_std());
         detach_from_controlling_terminal(&mut command);
         let mut child = command
@@ -1556,8 +1552,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 )
                 .block_task();
             let initialized =
-                match bounded_startup_request(initialize, &mut exit_rx, HANDSHAKE).await {
-                    Ok(initialized) => initialized?,
+                match bounded_cancellable_request(initialize, &mut exit_rx, stop.requested(), HANDSHAKE).await {
+                    Ok(Some(initialized)) => initialized?,
+                    Ok(None) => return Ok(()),
                     Err(failure) => {
                         return Err(request_failure(
                             failure,
@@ -1587,18 +1584,20 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         })
                 });
 
-            let initial = match bounded_startup_request(
+            let initial = match bounded_cancellable_request(
                 request_initial_session(
                     &connection,
                     resume_session_id.as_deref(),
                     &root,
                 ),
                 &mut exit_rx,
+                stop.requested(),
                 HANDSHAKE,
             )
             .await
             {
-                Ok(session) => session,
+                Ok(Some(session)) => session,
+                Ok(None) => return Ok(()),
                 Err(failure) => {
                     return Err(request_failure(
                         failure,
@@ -1623,10 +1622,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 result => result,
             };
 
-            // Install every fallible signal handler before changing terminal modes so
-            // an installation failure cannot leave the caller's terminal altered.
-            let mut stop =
-                Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let (mut terminal, mut images) =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut native_hyperlinks = hyperlinks::HyperlinkRenderer::default();
@@ -1726,7 +1721,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         &auth_invocation,
                                         &root,
                                         &method,
-                                        &mut stop,
+                                        stop,
                                     );
                                     leave(&mut terminal);
                                     println!("Starting {}…", method.name);
@@ -2404,7 +2399,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         &auth_invocation,
                                         &root,
                                         &method,
-                                        &mut stop,
+                                        stop,
                                     );
                                     leave(&mut terminal);
                                     println!("Starting {}…", method.name);
@@ -3338,7 +3333,7 @@ fn restore_modes() {
 /// the shell in raw mode with mouse reporting on — every later mouse move
 /// arrives at the prompt as garbage. Holding the signal streams for the whole
 /// session and returning through the normal exit keeps that from happening.
-struct Stop {
+pub struct Stop {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -3348,8 +3343,18 @@ struct Stop {
 }
 
 impl Stop {
+    /// Cancel preparation before launching any detached child tasks.
+    pub async fn until<T>(&mut self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        let stopped = pin!(self.requested());
+        let work = pin!(work);
+        match select(stopped, work).await {
+            Either::Left(_) => None,
+            Either::Right((result, _)) => Some(result),
+        }
+    }
+
     #[cfg(unix)]
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
@@ -3359,7 +3364,7 @@ impl Stop {
     }
 
     #[cfg(not(unix))]
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         Ok(Self {})
     }
 
@@ -7454,14 +7459,20 @@ mod signal_tests {
     async fn startup_requests_preserve_success_timeout_and_agent_exit() {
         let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
         assert!(matches!(
-            super::bounded_startup_request(future::ready(7), &mut exit_rx, Duration::from_secs(30))
-                .await,
-            Ok(7)
+            super::bounded_cancellable_request(
+                future::ready(7),
+                &mut exit_rx,
+                future::pending(),
+                Duration::from_secs(30)
+            )
+            .await,
+            Ok(Some(7))
         ));
         assert!(matches!(
-            super::bounded_startup_request(
+            super::bounded_cancellable_request(
                 future::pending::<()>(),
                 &mut exit_rx,
+                future::pending(),
                 Duration::from_secs(30)
             )
             .await,
@@ -7469,9 +7480,10 @@ mod signal_tests {
         ));
         drop(exit_tx);
         assert!(matches!(
-            super::bounded_startup_request(
+            super::bounded_cancellable_request(
                 future::pending::<()>(),
                 &mut exit_rx,
+                future::pending(),
                 Duration::from_secs(30)
             )
             .await,
@@ -7603,6 +7615,33 @@ mod signal_tests {
         )
         .await;
         assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_stop_survives_handoff_and_cancels_requests() {
+        for signal in ["-INT", "-TERM", "-HUP"] {
+            let mut stop = Stop::new().unwrap();
+            // A successful preparation leaves the same streams alive, including
+            // signals received before the next startup future begins polling.
+            assert_eq!(stop.until(future::ready(7)).await, Some(7));
+            std::process::Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::bounded_cancellable_request(
+                    future::pending::<()>(),
+                    &mut exit_rx,
+                    stop.requested(),
+                    Duration::from_secs(30),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, Ok(None)));
+        }
     }
 
     /// A client killed from outside must still reach its restore path, or it
