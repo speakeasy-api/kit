@@ -1300,14 +1300,89 @@ fn set_display_name_in(
     session_id: &str,
     display_name: Option<&str>,
 ) -> Result<Option<String>, String> {
+    display_name_data_in(
+        fs::best_effort_global(),
+        root,
+        global_directory,
+        session_id,
+        display_name,
+    )?
+    .commit()
+}
+
+struct DisplayNameData {
+    directory: PathBuf,
+    path: PathBuf,
+    output: Vec<u8>,
+    effective_title: Option<String>,
+}
+
+/// A prepared metadata replacement owns no accepted writes. Only the picker
+/// can consume it at admission; dropping it (including a late reply) is inert.
+#[cfg(feature = "tui")]
+pub(crate) struct PreparedDisplayName {
+    replacement: fs::PreparedPrivateReplace,
+    effective_title: Option<String>,
+}
+
+#[cfg(feature = "tui")]
+impl PreparedDisplayName {
+    pub(crate) fn commit(self) -> Result<Option<String>, String> {
+        self.replacement
+            .commit()
+            .map_err(|error| format!("could not commit session rename: {error}"))?;
+        Ok(self.effective_title)
+    }
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn prepare_display_name(
+    filesystem: &Fs,
+    root: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<PreparedDisplayName, String> {
+    // Capture the original namespace revision before any workspace/authority
+    // reads. Preparation uses only the independent read view, never global Fs.
+    let namespace = filesystem
+        .prepare_namespace()
+        .map_err(|error| format!("could not prepare session rename: {error}"))?;
+    let data = display_name_data_in(
+        namespace.filesystem(),
+        root,
+        &default_directory()?,
+        session_id,
+        display_name,
+    )?;
+    let replacement = namespace
+        .prepare_private_replace_with_parents(&data.path, &data.output)
+        .map_err(|error| {
+            format!(
+                "could not prepare session metadata {}: {error}",
+                data.path.display()
+            )
+        })?;
+    Ok(PreparedDisplayName {
+        replacement,
+        effective_title: data.effective_title,
+    })
+}
+
+fn display_name_data_in(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<DisplayNameData, String> {
     validate_id(session_id)?;
-    let root = fs::canonicalize(root).map_err(|error| {
+    let root = filesystem.canonicalize(root).map_err(|error| {
         format!(
             "could not resolve workspace root {}: {error}",
             root.display()
         )
     })?;
-    if !fs::best_effort_global()
+    if !filesystem
         .metadata(&root)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
@@ -1318,8 +1393,9 @@ fn set_display_name_in(
         ));
     }
 
-    let authority = select_authority_for_rename(global_directory, &root, session_id)?
-        .ok_or_else(|| format!("session {session_id} was not found in {}", root.display()))?;
+    let authority =
+        select_authority_with(filesystem, global_directory, &root, session_id, false, true)?
+            .ok_or_else(|| format!("session {session_id} was not found in {}", root.display()))?;
     if catalog_is_subagent(&authority.historical_items, &authority.items) {
         return Err(format!(
             "session {session_id} was not found in {}",
@@ -1336,39 +1412,35 @@ fn set_display_name_in(
     output.push(b'\n');
 
     let directory = workspace_storage_directory(global_directory, &root);
-    fs::best_effort_global()
-        .create_dir_all(&directory)
-        .map_err(|error| {
-            format!(
-                "could not create session directory {}: {error}",
-                directory.display()
-            )
-        })?;
     let path = metadata_path(&directory, session_id);
-    fs::best_effort_global()
-        .replace_private(&path, &output)
-        .map_err(|error| {
-            format!(
-                "could not replace session metadata {}: {error}",
-                path.display()
-            )
-        })?;
-    Ok(effective_title)
+    Ok(DisplayNameData {
+        directory,
+        path,
+        output,
+        effective_title,
+    })
 }
 
-fn select_authority_for_rename(
-    directory: &Path,
-    root: &Path,
-    session_id: &str,
-) -> Result<Option<Authority>, String> {
-    select_authority_with(
-        fs::best_effort_global(),
-        directory,
-        root,
-        session_id,
-        false,
-        true,
-    )
+impl DisplayNameData {
+    fn commit(self) -> Result<Option<String>, String> {
+        fs::best_effort_global()
+            .create_dir_all(&self.directory)
+            .map_err(|error| {
+                format!(
+                    "could not create session directory {}: {error}",
+                    self.directory.display()
+                )
+            })?;
+        fs::best_effort_global()
+            .replace_private(&self.path, &self.output)
+            .map_err(|error| {
+                format!(
+                    "could not replace session metadata {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        Ok(self.effective_title)
+    }
 }
 
 pub(crate) fn is_safe_display_name_character(character: char) -> bool {

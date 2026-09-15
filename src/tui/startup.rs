@@ -16,11 +16,18 @@ use super::{
 enum PickerUpdate {
     Tick,
     Session(Update),
+    RenamePrepared {
+        session_id: String,
+        display_name: Option<String>,
+        result: Result<crate::session::PreparedDisplayName, String>,
+    },
     Clipboard(ClipboardRoute, ClipboardResult),
 }
 
 /// Pick an existing workspace session without creating or resuming a session.
 /// Cancellation and an empty catalog return `None`.
+/// The caller must await this future to completion and signal cancellation via
+/// `Stop`: dropping it cannot asynchronously drain admitted storage commits.
 pub async fn pick_session(
     root: &Path,
     stop: &mut Stop,
@@ -39,6 +46,7 @@ pub async fn pick_session(
     // The caller retains signal handlers across selection and startup. Restore the
     // terminal on both successful cancellation and fallible reads/draws.
     let (mut terminal, mut images) = enter()?;
+    let mut renames = RenameCommits::default();
     let result = async {
         let mut events = EventStream::new();
         let mut clipboard_pending = false;
@@ -78,6 +86,30 @@ pub async fn pick_session(
                             app.apply(update);
                             Action::None
                         }
+                        Some(PickerUpdate::RenamePrepared {
+                            session_id,
+                            display_name,
+                            result,
+                        }) => {
+                            match result {
+                                Ok(prepared) => {
+                                    // This branch is the write-admission boundary. Only the
+                                    // picker owns prepared values; a stopped picker drops them.
+                                    renames.admit(
+                                        prepared,
+                                        session_id,
+                                        display_name,
+                                        updates_tx.clone(),
+                                    );
+                                }
+                                Err(error) => app.apply(Update::SessionRenamed {
+                                    session_id,
+                                    display_name,
+                                    result: Err(error),
+                                }),
+                            }
+                            Action::None
+                        }
                         Some(PickerUpdate::Clipboard(route, result)) => {
                             clipboard_pending = false;
                             // A cancelled or submitted rename must not receive an
@@ -104,23 +136,13 @@ pub async fn pick_session(
                     session_id,
                     display_name,
                 } => {
-                    let root = root.clone();
-                    let updates = updates_tx.clone();
-                    tokio::spawn(async move {
-                        let id = session_id.clone();
-                        let name = display_name.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            crate::session::set_display_name_and_title(&root, &id, name.as_deref())
-                        })
-                        .await
-                        .map_err(|error| format!("session rename worker failed: {error}"))
-                        .and_then(|result| result);
-                        let _ = updates.send(PickerUpdate::Session(Update::SessionRenamed {
-                            session_id,
-                            display_name: display_name.map(|name| name.trim().to_string()),
-                            result,
-                        }));
-                    });
+                    start_rename_preparation(
+                        root.clone(),
+                        session_id,
+                        display_name,
+                        crate::resilient_fs::best_effort_global().clone(),
+                        updates_tx.clone(),
+                    )?;
                 }
                 Action::ReadClipboard(route, mode) => {
                     if clipboard_pending {
@@ -140,7 +162,89 @@ pub async fn pick_session(
     }
     .await;
     leave(&mut terminal);
+    // No preparation can submit writes after the receiver is dropped above.
+    // Accepted commits remain owned: drain them before the caller can recover
+    // global storage. An indefinitely stalled accepted write is not cancellable.
+    renames.drain().await?;
     result
+}
+
+/// Admission is owned by the picker, not the preparation thread. This owner is
+/// drained after terminal restoration on every ordinary picker exit/error path.
+#[derive(Default)]
+struct RenameCommits {
+    workers: Vec<tokio::task::JoinHandle<Result<Option<String>, String>>>,
+}
+impl RenameCommits {
+    fn admit(
+        &mut self,
+        prepared: crate::session::PreparedDisplayName,
+        session_id: String,
+        display_name: Option<String>,
+        updates: tokio::sync::mpsc::UnboundedSender<PickerUpdate>,
+    ) {
+        self.workers.push(tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || prepared.commit())
+                .await
+                .map_err(|error| format!("session rename worker failed: {error}"))
+                .and_then(|result| result);
+            let _ = updates.send(PickerUpdate::Session(Update::SessionRenamed {
+                session_id,
+                display_name,
+                result: result.clone(),
+            }));
+            result
+        }));
+    }
+
+    async fn drain(self) -> Result<(), String> {
+        let mut failure = None;
+        for worker in self.workers {
+            match worker.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    // A closed stderr must not unwind past still-owned commits.
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "{error}");
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| format!("session rename worker failed: {error}"));
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+fn start_rename_preparation(
+    root: std::path::PathBuf,
+    session_id: String,
+    display_name: Option<String>,
+    filesystem: crate::resilient_fs::Fs,
+    updates: tokio::sync::mpsc::UnboundedSender<PickerUpdate>,
+) -> std::io::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let id = session_id.clone();
+    let name = display_name.clone();
+    std::thread::Builder::new()
+        .name("session-rename-prepare".into())
+        .spawn(move || {
+            let result =
+                crate::session::prepare_display_name(&filesystem, &root, &id, name.as_deref());
+            let _ = tx.send(result);
+        })?;
+    tokio::spawn(async move {
+        let result = rx
+            .await
+            .map_err(|error| format!("session rename preparation worker failed: {error}"))
+            .and_then(|result| result);
+        let _ = updates.send(PickerUpdate::RenamePrepared {
+            session_id,
+            display_name: display_name.map(|name| name.trim().to_string()),
+            result,
+        });
+    });
+    Ok(())
 }
 
 // This worker only reads disk, with its own empty filesystem namespace: it
