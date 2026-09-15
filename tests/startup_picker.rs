@@ -58,10 +58,13 @@ impl Picker {
         Self::with_args(home, root, &[])
     }
     fn with_args(home: &Path, root: &Path, args: &[&str]) -> Self {
+        Self::with_width(home, root, args, 120)
+    }
+    fn with_width(home: &Path, root: &Path, args: &[&str], width: u16) -> Self {
         let (mut master, mut slave) = (-1, -1);
         let mut size = libc::winsize {
             ws_row: 40,
-            ws_col: 120,
+            ws_col: width,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -425,7 +428,8 @@ fn rename_error_is_erased_without_another_input_event() {
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let path = session(home.path(), root.path(), "s-toast", "Toast fixture");
-    let mut picker = Picker::start(home.path(), root.path());
+    // Keep the footer narrow enough that the toast displaces its help text.
+    let mut picker = Picker::with_width(home.path(), root.path(), &[], 60);
     picker.keys(b"r");
     picker.until("rename: ");
     picker.keys(b"\x1b[200~ChangedName\x1b[201~");
@@ -446,9 +450,9 @@ fn rename_error_is_erased_without_another_input_event() {
         picker.pump();
     }
     picker.output.clear();
-    // Ratatui's diff clears the status text with spaces when the toast expires.
+    // Observe restored help, not the renderer's choice of clearing spaces.
     // No key, resize, or clipboard event is sent to provoke this redraw.
-    picker.until("                        ");
+    picker.until("⏎ send");
     picker.keys(b"\x1b[27u");
     picker.until(BROWSING);
     picker.keys(b"\x1b[27u");
