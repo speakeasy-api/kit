@@ -4272,7 +4272,7 @@ mod tests {
         )
         .unwrap();
         let mut images = ImageRuntime::disabled();
-        let open = b"\x1b]8;;https://example.com/target\x1b\\";
+        let destination = "https://example.com/target\x1b\\";
         for obscured in [false, true, true, false] {
             if obscured && !native_links_obscured(&app) {
                 app.paste("/");
@@ -4291,10 +4291,13 @@ mod tests {
                 }
             })
             .unwrap();
-            assert_eq!(
-                capture.bytes().windows(open.len()).any(|part| part == open),
-                !obscured
-            );
+            let output = String::from_utf8(capture.bytes()).unwrap();
+            let opened = output.split("\x1b]8;").skip(1).any(|part| {
+                part.split_once(';').is_some_and(|(params, rest)| {
+                    params.starts_with("id=kit-") && rest.starts_with(destination)
+                })
+            });
+            assert_eq!(opened, !obscured);
             capture.clear();
         }
     }

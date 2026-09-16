@@ -21,8 +21,14 @@ use ratatui::{
     layout::{Position, Size},
 };
 
-type Links = BTreeMap<(u16, u16), Rc<str>>;
-const OSC8_OPEN: &[u8] = b"\x1b]8;;";
+#[derive(PartialEq, Eq)]
+struct Link {
+    id: String,
+    url: String,
+}
+
+type Links = BTreeMap<(u16, u16), Rc<Link>>;
+const OSC8_OPEN: &[u8] = b"\x1b]8;";
 const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
 
 #[derive(Default)]
@@ -147,11 +153,21 @@ fn prepare(
             // terminal modifier-click must not dispatch them to the OS.
             .filter(|hit| !hit.url.starts_with("kit-image:"))
             .map(|hit| {
-                (
-                    left.saturating_add(hit.start),
-                    left.saturating_add(hit.end),
-                    Rc::<str>::from(escape_url(&hit.url)),
-                )
+                let start = left.saturating_add(hit.start);
+                let end = left.saturating_add(hit.end);
+                let url = escape_url(&hit.url);
+                // Anonymous OSC-8 opens allocate a fresh xterm marker whenever
+                // linked cells change. Keep identity stable across partial diffs,
+                // but distinguish separate spans and changed destinations.
+                // Hashing keeps long/untrusted URLs out of OSC parameters.
+                let id = format!(
+                    "kit-{}-{}-{}-{}",
+                    y,
+                    start.max(usize::from(buffer.area.left())),
+                    end.min(usize::from(buffer.area.right())),
+                    blake3::hash(url.as_bytes()).to_hex(),
+                );
+                (start, end, Rc::new(Link { id, url }))
             })
             .collect();
         let mut covered_until = buffer.area.left();
@@ -165,10 +181,10 @@ fn prepare(
                 continue;
             }
             // Match any overlap, including a hit beginning in a wide grapheme.
-            if let Some((_, _, url)) = hits.iter().rev().find(|(start, end, _)| {
+            if let Some((_, _, link)) = hits.iter().rev().find(|(start, end, _)| {
                 start < end && usize::from(x) < *end && usize::from(covered_until) > *start
             }) {
-                links.insert((x, y), Rc::clone(url));
+                links.insert((x, y), Rc::clone(link));
             }
         }
     }
@@ -242,9 +258,10 @@ impl<W: Write> Backend for HyperlinkBackend<W> {
             .peekable();
         while let Some(&(x, y, _)) = content.peek() {
             let target = links.get(&(x, y));
-            if let Some(url) = target {
+            if let Some(link) = target {
                 self.inner.write_all(OSC8_OPEN)?;
-                self.inner.write_all(url.as_bytes())?;
+                write!(self.inner, "id={};", link.id)?;
+                self.inner.write_all(link.url.as_bytes())?;
                 self.inner.write_all(b"\x1b\\")?;
             }
             let run = std::iter::from_fn(|| {
@@ -382,6 +399,18 @@ mod tests {
     fn output(capture: &Capture) -> String {
         String::from_utf8(std::mem::take(&mut *capture.0.borrow_mut())).unwrap()
     }
+    fn opens(output: &str) -> Vec<(&str, &str)> {
+        output
+            .split("\x1b]8;")
+            .skip(1)
+            .filter_map(|part| {
+                let (command, _) = part.split_once("\x1b\\").unwrap();
+                let (params, url) = command.split_once(';').unwrap();
+                (!url.is_empty()).then_some((params, url))
+            })
+            .collect()
+    }
+
     #[test]
     fn internal_image_targets_are_not_emitted_as_native_hyperlinks() {
         let (mut terminal, capture) = terminal();
@@ -389,10 +418,7 @@ mod tests {
         let internal = output(&capture);
         assert!(internal.contains("LINK"));
         assert!(!internal.contains("kit-image:"));
-        assert_eq!(
-            internal.matches("\x1b]8;;").count(),
-            internal.matches("\x1b]8;;\x1b\\").count()
-        );
+        assert!(opens(&internal).is_empty());
 
         // Replacing a native target with an internal target also clears the
         // old hyperlink, even when its displayed text is unchanged.
@@ -411,7 +437,10 @@ mod tests {
         render(&mut terminal, "LINK", Some("https://one"), true);
         let first = output(&capture);
         assert_eq!(first.matches("LINK").count(), 1);
-        assert!(first.contains("\x1b]8;;https://one\x1b\\"));
+        let opened = opens(&first);
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].0.starts_with("id=kit-0-0-4-"));
+        assert_eq!(opened[0].1, "https://one");
         render(&mut terminal, "LINK", Some("https://one"), true);
         let unchanged = output(&capture);
         assert!(!unchanged.contains("LINK"));
@@ -428,6 +457,175 @@ mod tests {
         render(&mut terminal, "LINK", None, true);
         assert!(!output(&capture).contains("LINK"));
     }
+    #[test]
+    fn partial_text_and_style_diffs_reuse_the_complete_link_identity() {
+        let (mut terminal, capture) = terminal();
+        render(&mut terminal, "ABCD", Some("https://example.com"), true);
+        let first = output(&capture);
+        let initial = opens(&first);
+        for text in ["ABCX", "AYCZ", "ABCD"] {
+            render(&mut terminal, text, Some("https://example.com"), true);
+            let repainted = output(&capture);
+            assert_eq!(opens(&repainted), initial);
+        }
+        draw(&mut terminal, |frame| {
+            frame.render_widget(Line::from("ABCD"), Rect::new(0, 0, 12, 1));
+            frame.buffer_mut()[(1, 0)].set_fg(ratatui::style::Color::Red);
+            FrameLinks {
+                rows: vec![vec![LinkHit {
+                    start: 0,
+                    end: 4,
+                    url: "https://example.com".into(),
+                }]],
+                left: 0,
+                top: 0,
+                obscured: false,
+            }
+        })
+        .unwrap();
+        let styled = output(&capture);
+        assert_eq!(opens(&styled), initial);
+        assert!(styled.contains('B'));
+        assert!(!styled.contains("ABCD"));
+
+        render(&mut terminal, "ABCD", Some("file:///tmp/new.png"), true);
+        let replaced = output(&capture);
+        let changed = opens(&replaced);
+        assert_ne!(changed[0].0, initial[0].0);
+        assert_eq!(changed[0].1, "file:///tmp/new.png");
+    }
+
+    #[test]
+    fn identities_distinguish_spans_and_survive_overlay_restoration() {
+        let (mut terminal, capture) = terminal();
+        let mut initial = String::new();
+        for obscured in [false, true, false] {
+            draw(&mut terminal, |frame| {
+                frame.render_widget(Line::from("LINKLINK"), Rect::new(0, 0, 12, 1));
+                FrameLinks {
+                    rows: vec![vec![
+                        LinkHit {
+                            start: 0,
+                            end: 4,
+                            url: "https://same".into(),
+                        },
+                        LinkHit {
+                            start: 4,
+                            end: 8,
+                            url: "https://same".into(),
+                        },
+                    ]],
+                    left: 0,
+                    top: 0,
+                    obscured,
+                }
+            })
+            .unwrap();
+            let rendered = output(&capture);
+            let links = opens(&rendered);
+            assert_eq!(rendered.matches("LINK").count(), 2);
+            if obscured {
+                assert!(links.is_empty());
+            } else {
+                assert_eq!(links.len(), 2);
+                assert_ne!(links[0].0, links[1].0);
+                assert_eq!(links[0].1, links[1].1);
+                if initial.is_empty() {
+                    initial = rendered;
+                } else {
+                    assert_eq!(links, opens(&initial));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_spans_and_untrusted_urls_have_stable_bounded_safe_ids() {
+        let capture = Capture::default();
+        let mut terminal = Terminal::with_options(
+            HyperlinkBackend::new(capture.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(5, 2, 12, 2)),
+            },
+        )
+        .unwrap();
+        let url = format!("https://example.com/{}\x1b\\\x07\u{85}", "x".repeat(4096));
+        let mut initial = String::new();
+        // Different raw extents clip to the same span at a nonzero origin.
+        for (start, end, text) in [(0, 17, "ABCD"), (5, 100, "ABCE")] {
+            draw(&mut terminal, |frame| {
+                frame.render_widget(Line::from(text), Rect::new(5, 2, 12, 1));
+                FrameLinks {
+                    rows: vec![vec![LinkHit {
+                        start,
+                        end,
+                        url: url.clone(),
+                    }]],
+                    left: 0,
+                    top: 2,
+                    obscured: false,
+                }
+            })
+            .unwrap();
+            let rendered = output(&capture);
+            let links = opens(&rendered);
+            assert_eq!(links.len(), 1);
+            let id = links[0].0.strip_prefix("id=").unwrap();
+            assert!(id.starts_with("kit-2-5-17-"));
+            assert!(id.len() < 128);
+            assert!(
+                id.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            );
+            assert_eq!(links[0].1, escape_url(&url));
+            if initial.is_empty() {
+                initial = rendered;
+            } else {
+                assert_eq!(links, opens(&initial));
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_cells_do_not_emit_links_and_restore_their_identity_when_repainted() {
+        let (mut terminal, capture) = terminal();
+        let mut initial = String::new();
+        for skip in [false, true, false] {
+            draw(&mut terminal, |frame| {
+                frame.render_widget(Line::from("LINK"), Rect::new(0, 0, 12, 1));
+                if skip {
+                    for x in 0..4 {
+                        frame.buffer_mut()[(x, 0)].set_diff_option(CellDiffOption::Skip);
+                    }
+                }
+                FrameLinks {
+                    rows: vec![vec![LinkHit {
+                        start: 0,
+                        end: 4,
+                        url: "https://example.com".into(),
+                    }]],
+                    left: 0,
+                    top: 0,
+                    obscured: false,
+                }
+            })
+            .unwrap();
+            let rendered = output(&capture);
+            if skip {
+                assert!(opens(&rendered).is_empty());
+                assert!(!rendered.contains("LINK"));
+            } else {
+                assert_eq!(opens(&rendered).len(), 1);
+                assert!(rendered.contains("LINK"));
+                if initial.is_empty() {
+                    initial = rendered;
+                } else {
+                    assert_eq!(opens(&rendered), opens(&initial));
+                }
+            }
+        }
+    }
+
     #[test]
     fn ordinary_frames_hide_before_print_and_show_after_positioning() {
         let (mut terminal, capture) = terminal();
@@ -500,6 +698,26 @@ mod tests {
             let text = output(&capture);
             assert_eq!(text.matches("LINK").count(), 2);
             assert_eq!(text.matches("https://moving").count(), 1);
+        }
+    }
+
+    #[test]
+    fn linked_narrow_to_wide_transitions_keep_the_span_identity() {
+        let (mut terminal, capture) = terminal();
+        render(&mut terminal, "ABCD", Some("https://example.com"), true);
+        let first = output(&capture);
+        let initial = opens(&first);
+        for text in ["❤️CD", "ABCD"] {
+            render(&mut terminal, text, Some("https://example.com"), true);
+            let changed = output(&capture);
+            let links = opens(&changed);
+            assert!(!links.is_empty());
+            assert!(links.iter().all(|link| *link == initial[0]));
+            if text.starts_with('❤') {
+                assert_eq!(changed.matches("❤️").count(), 1);
+            } else {
+                assert!(changed.contains("AB"));
+            }
         }
     }
 
