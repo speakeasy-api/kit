@@ -1,12 +1,10 @@
 Output "out/headless.gif"
-Set Shell zsh
-Set FontSize 15
-Set Width 1200
-Set Height 560
-Set Theme "Catppuccin Mocha"
-Set Padding 12
-Set TypingSpeed 40ms
+Source theme.tape
+Set Height 800
 Hide
+Type `PROMPT_EOL_MARK='' PROMPT='%F{blue}> %f' asciinema rec -q --overwrite -i 3 -c 'zsh -f' out/headless.cast`
+Enter
+Sleep 1s
 Type "cd $KIT_DEMO_ROOT && export GIT_PAGER=cat PAGER=cat && clear"
 Enter
 Show
@@ -22,3 +20,7 @@ Sleep 45s
 Type "git --no-pager diff --stat"
 Enter
 Sleep 4s
+Hide
+Type "exit"
+Enter
+Sleep 1s

@@ -7,3 +7,5 @@
 /macos/Config/Version.xcconfig
 /.env
 .DS_Store
+
+scripts/readme-media/out/

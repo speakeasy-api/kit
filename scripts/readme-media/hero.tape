@@ -1,13 +1,8 @@
 Output "out/hero.gif"
-Set Shell zsh
-Set FontSize 15
-Set Width 1200
-Set Height 720
-Set Theme "Catppuccin Mocha"
-Set Padding 12
-Set TypingSpeed 40ms
+Source theme.tape
+Set Height 1100
 Hide
-Type "kit tui --root $KIT_DEMO_ROOT"
+Type `asciinema rec -q --overwrite -i 3 -c "kit tui --root $KIT_DEMO_ROOT" out/hero.cast`
 Enter
 Sleep 3s
 Show
@@ -15,7 +10,7 @@ Sleep 1s
 Type "The unit tests fail. Find the bug, fix it, and run the tests again."
 Sleep 500ms
 Enter
-Sleep 90s
+Sleep 40s
 Hide
 Ctrl+C
 Sleep 1s
