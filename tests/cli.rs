@@ -34,6 +34,66 @@ fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
     directory.join(format!("{id}.metadata.json"))
 }
 
+#[cfg(feature = "tui")]
+#[test]
+fn tui_resume_picker_empty_workspace_exits_without_starting_a_session() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
+    command
+        .env("HOME", home.path())
+        .args(["tui", "--resume", "--root"])
+        .arg(root.path())
+        .args(["--credential-store", "memory"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no resumable sessions for workspace"),
+        "{output:?}"
+    );
+    assert!(!home.path().join(".kit/sessions").exists());
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn tui_resume_picker_uses_configured_root_and_reports_catalog_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".kit");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("root = {:?}\n", root.path()),
+    )
+    .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .args(["tui", "--resume", "--credential-store", "memory"])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(root.path().canonicalize().unwrap().to_str().unwrap()),
+        "{output:?}"
+    );
+    assert!(!config_dir.join("sessions").exists());
+    fs::write(config_dir.join("sessions"), "not a directory").unwrap();
+    let output = run();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not list sessions for"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir.join("sessions")).unwrap(),
+        "not a directory"
+    );
+}
+
 #[test]
 fn terminal_auth_arguments_run_login_from_acp_server_invocations() {
     let home = tempfile::tempdir().unwrap();

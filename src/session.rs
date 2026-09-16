@@ -1300,14 +1300,106 @@ fn set_display_name_in(
     session_id: &str,
     display_name: Option<&str>,
 ) -> Result<Option<String>, String> {
+    display_name_data_in(
+        fs::best_effort_global(),
+        root,
+        global_directory,
+        session_id,
+        display_name,
+    )?
+    .commit()
+}
+
+struct DisplayNameData {
+    directory: PathBuf,
+    path: PathBuf,
+    output: Vec<u8>,
+    effective_title: Option<String>,
+}
+
+/// A prepared metadata replacement owns no accepted writes. Only the picker
+/// can consume it at admission; dropping it (including a late reply) is inert.
+#[cfg(feature = "tui")]
+pub(crate) struct PreparedDisplayName {
+    replacement: fs::PreparedPrivateReplace,
+    effective_title: Option<String>,
+}
+
+#[cfg(feature = "tui")]
+impl PreparedDisplayName {
+    pub(crate) fn commit(self) -> Result<Option<String>, String> {
+        self.replacement
+            .commit()
+            .map_err(|error| format!("could not commit session rename: {error}"))?;
+        Ok(self.effective_title)
+    }
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn prepare_display_name(
+    filesystem: &Fs,
+    root: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<PreparedDisplayName, String> {
+    prepare_display_name_in(
+        filesystem,
+        root,
+        &default_directory()?,
+        session_id,
+        display_name,
+    )
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn prepare_display_name_in(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<PreparedDisplayName, String> {
+    // Capture the original namespace revision before any workspace/authority
+    // reads. Preparation uses only the independent read view, never global Fs.
+    let namespace = filesystem
+        .prepare_namespace()
+        .map_err(|error| format!("could not prepare session rename: {error}"))?;
+    let data = display_name_data_in(
+        namespace.filesystem(),
+        root,
+        global_directory,
+        session_id,
+        display_name,
+    )?;
+    let replacement = namespace
+        .prepare_private_replace_with_parents(&data.path, &data.output)
+        .map_err(|error| {
+            format!(
+                "could not prepare session metadata {}: {error}",
+                data.path.display()
+            )
+        })?;
+    Ok(PreparedDisplayName {
+        replacement,
+        effective_title: data.effective_title,
+    })
+}
+
+fn display_name_data_in(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<DisplayNameData, String> {
     validate_id(session_id)?;
-    let root = fs::canonicalize(root).map_err(|error| {
+    let root = filesystem.canonicalize(root).map_err(|error| {
         format!(
             "could not resolve workspace root {}: {error}",
             root.display()
         )
     })?;
-    if !fs::best_effort_global()
+    if !filesystem
         .metadata(&root)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
@@ -1318,8 +1410,9 @@ fn set_display_name_in(
         ));
     }
 
-    let authority = select_authority_for_rename(global_directory, &root, session_id)?
-        .ok_or_else(|| format!("session {session_id} was not found in {}", root.display()))?;
+    let authority =
+        select_authority_with(filesystem, global_directory, &root, session_id, false, true)?
+            .ok_or_else(|| format!("session {session_id} was not found in {}", root.display()))?;
     if catalog_is_subagent(&authority.historical_items, &authority.items) {
         return Err(format!(
             "session {session_id} was not found in {}",
@@ -1336,39 +1429,35 @@ fn set_display_name_in(
     output.push(b'\n');
 
     let directory = workspace_storage_directory(global_directory, &root);
-    fs::best_effort_global()
-        .create_dir_all(&directory)
-        .map_err(|error| {
-            format!(
-                "could not create session directory {}: {error}",
-                directory.display()
-            )
-        })?;
     let path = metadata_path(&directory, session_id);
-    fs::best_effort_global()
-        .replace_private(&path, &output)
-        .map_err(|error| {
-            format!(
-                "could not replace session metadata {}: {error}",
-                path.display()
-            )
-        })?;
-    Ok(effective_title)
+    Ok(DisplayNameData {
+        directory,
+        path,
+        output,
+        effective_title,
+    })
 }
 
-fn select_authority_for_rename(
-    directory: &Path,
-    root: &Path,
-    session_id: &str,
-) -> Result<Option<Authority>, String> {
-    select_authority_with(
-        fs::best_effort_global(),
-        directory,
-        root,
-        session_id,
-        false,
-        true,
-    )
+impl DisplayNameData {
+    fn commit(self) -> Result<Option<String>, String> {
+        fs::best_effort_global()
+            .create_dir_all(&self.directory)
+            .map_err(|error| {
+                format!(
+                    "could not create session directory {}: {error}",
+                    self.directory.display()
+                )
+            })?;
+        fs::best_effort_global()
+            .replace_private(&self.path, &self.output)
+            .map_err(|error| {
+                format!(
+                    "could not replace session metadata {}: {error}",
+                    self.path.display()
+                )
+            })?;
+        Ok(self.effective_title)
+    }
 }
 
 pub(crate) fn is_safe_display_name_character(character: char) -> bool {
@@ -1398,10 +1487,8 @@ fn validate_display_name(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-fn read_display_name(directory: &Path, session_id: &str) -> Option<String> {
-    let input = fs::best_effort_global()
-        .read(metadata_path(directory, session_id))
-        .ok()?;
+fn read_display_name_with(filesystem: &Fs, directory: &Path, session_id: &str) -> Option<String> {
+    let input = filesystem.read(metadata_path(directory, session_id)).ok()?;
     let metadata: SessionMetadata = serde_json::from_slice(&input).ok()?;
     metadata
         .display_name
@@ -1415,13 +1502,28 @@ fn catalog_for_workspace(
     root: &Path,
     global_directory: &Path,
 ) -> Result<Vec<CatalogEntry>, String> {
-    let root = fs::canonicalize(root).map_err(|error| {
+    catalog_for_workspace_with(fs::best_effort_global(), root, global_directory)
+}
+
+/// Read a disk catalog using an isolated filesystem with no pending writes.
+/// Startup may abandon this read without sharing locks with storage recovery.
+#[cfg(feature = "tui")]
+pub(crate) fn catalog_with(filesystem: &Fs, root: &Path) -> Result<Vec<CatalogEntry>, String> {
+    catalog_for_workspace_with(filesystem, root, &default_directory()?)
+}
+
+fn catalog_for_workspace_with(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+) -> Result<Vec<CatalogEntry>, String> {
+    let root = filesystem.canonicalize(root).map_err(|error| {
         format!(
             "could not resolve workspace root {}: {error}",
             root.display()
         )
     })?;
-    if !fs::best_effort_global()
+    if !filesystem
         .metadata(&root)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
@@ -1431,19 +1533,14 @@ fn catalog_for_workspace(
             root.display()
         ));
     }
-    let ids = list_ids_for_workspace(&root, global_directory)?;
+    let ids = list_ids_for_workspace_with(filesystem, &root, global_directory)?;
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
         // Discovery is best-effort per transcript: a damaged file or one caught
         // mid-append must not hide every other session in the workspace.
-        let Ok(Some(authority)) = select_authority_with(
-            fs::best_effort_global(),
-            global_directory,
-            &root,
-            &id,
-            false,
-            false,
-        ) else {
+        let Ok(Some(authority)) =
+            select_authority_with(filesystem, global_directory, &root, &id, false, false)
+        else {
             continue;
         };
         if catalog_is_subagent(&authority.historical_items, &authority.items) {
@@ -1461,7 +1558,7 @@ fn catalog_for_workspace(
             })
             .max()
             .unwrap_or(0);
-        let file_updated = fs::best_effort_global()
+        let file_updated = filesystem
             .metadata(&authority.path)
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -1469,7 +1566,7 @@ fn catalog_for_workspace(
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let directory = workspace_storage_directory(global_directory, &root);
-        let title = read_display_name(&directory, &id).or(title);
+        let title = read_display_name_with(filesystem, &directory, &id).or(title);
         entries.push(CatalogEntry {
             id,
             title,
@@ -1658,23 +1755,27 @@ fn civil_date(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn list_ids_for_workspace(root: &Path, global_directory: &Path) -> Result<Vec<String>, String> {
-    let root = canonical_workspace(root);
-    let scoped_directory = workspace_storage_directory(global_directory, &root);
-    let legacy_directory = workspace_directory(&root);
+fn list_ids_for_workspace_with(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+) -> Result<Vec<String>, String> {
+    let scoped_directory = workspace_storage_directory(global_directory, root);
+    let legacy_directory = workspace_directory(root);
     let mut ids = Vec::new();
-    ids.extend(list_ids_in(&scoped_directory)?);
-    for id in list_ids_in(global_directory)? {
+    ids.extend(list_ids_in_with(filesystem, &scoped_directory)?);
+    for id in list_ids_in_with(filesystem, global_directory)? {
         let path = transcript_path(global_directory, &id);
-        if matches!(
-            transcript_workspace(&path, &id),
-            Ok(Some(stored)) if stored == root
-        ) {
+        let workspace = filesystem
+            .read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| transcript_workspace_bytes(&path, &id, &bytes));
+        if matches!(workspace, Ok(Some(stored)) if stored == root) {
             ids.push(id);
         }
     }
     // Its location scopes this pre-global-layout directory to the workspace.
-    ids.extend(list_ids_in(&legacy_directory)?);
+    ids.extend(list_ids_in_with(filesystem, &legacy_directory)?);
     ids.sort();
     ids.dedup();
     Ok(ids)
@@ -1694,8 +1795,8 @@ fn belongs_to_workspace_in(
     Ok(select_authority(global_directory, &root, session_id)?.is_some())
 }
 
-pub(crate) fn list_ids_in(directory: &Path) -> Result<Vec<String>, String> {
-    let entries = match fs::best_effort_global().read_dir(directory) {
+fn list_ids_in_with(filesystem: &Fs, directory: &Path) -> Result<Vec<String>, String> {
+    let entries = match filesystem.read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -1900,8 +2001,12 @@ fn select_authority_with(
                 }
             }
             StoredTranscript::Redirect(target) => {
-                let target = normalized_absolute(&target)?;
-                let scoped_target = normalized_absolute(&scoped)?;
+                let target = filesystem.canonicalize(&target).map_err(|error| {
+                    format!("could not normalize {}: {error}", target.display())
+                })?;
+                let scoped_target = filesystem.canonicalize(&scoped).map_err(|error| {
+                    format!("could not normalize {}: {error}", scoped.display())
+                })?;
                 if target != scoped_target {
                     return Err(format!("invalid session redirect in {}", path.display()));
                 }
@@ -4165,11 +4270,14 @@ mod tests {
         fs::write(directory.path().join("bad id.jsonl"), "invalid").unwrap();
         fs::create_dir(directory.path().join("nested.jsonl")).unwrap();
 
-        assert_eq!(list_ids_in(directory.path()).unwrap(), ["alpha", "zeta"]);
+        assert_eq!(
+            list_ids_in_with(fs::best_effort_global(), directory.path()).unwrap(),
+            ["alpha", "zeta"]
+        );
         let not_directory = directory.path().join("plain-file");
         fs::write(&not_directory, "not a directory").unwrap();
         assert!(
-            list_ids_in(&not_directory)
+            list_ids_in_with(fs::best_effort_global(), &not_directory)
                 .unwrap_err()
                 .contains("could not list session directory")
         );
@@ -5093,11 +5201,21 @@ mod tests {
         assert_eq!(item_text(&first_resumed.transcript[1]), "first-only");
         assert_eq!(item_text(&second_resumed.transcript[1]), "second-only");
         assert_eq!(
-            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&first),
+                storage.path()
+            )
+            .unwrap(),
             ["shared"]
         );
         assert_eq!(
-            list_ids_for_workspace(&second, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&second),
+                storage.path()
+            )
+            .unwrap(),
             ["shared"]
         );
     }
@@ -5135,13 +5253,22 @@ mod tests {
         );
         assert!(load_in(&second, storage.path(), "legacy-id").is_err());
         assert_eq!(
-            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&first),
+                storage.path()
+            )
+            .unwrap(),
             ["legacy-id"]
         );
         assert!(
-            list_ids_for_workspace(&second, storage.path())
-                .unwrap()
-                .is_empty()
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&second),
+                storage.path()
+            )
+            .unwrap()
+            .is_empty()
         );
         let migrated =
             open_in(&first, storage.path(), "legacy-id", true, false, Vec::new()).unwrap();
@@ -5164,11 +5291,21 @@ mod tests {
         .unwrap();
         assert_eq!(item_text(&second_open.transcript[0]), "second");
         assert_eq!(
-            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&first),
+                storage.path()
+            )
+            .unwrap(),
             ["legacy-id"]
         );
         assert_eq!(
-            list_ids_for_workspace(&second, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&second),
+                storage.path()
+            )
+            .unwrap(),
             ["legacy-id"]
         );
     }
@@ -5191,13 +5328,22 @@ mod tests {
         fs::write(legacy.join("legacy.jsonl"), format!("{record}\n")).unwrap();
 
         assert_eq!(
-            list_ids_for_workspace(&first, storage.path()).unwrap(),
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&first),
+                storage.path()
+            )
+            .unwrap(),
             ["legacy"]
         );
         assert!(
-            list_ids_for_workspace(&second, storage.path())
-                .unwrap()
-                .is_empty()
+            list_ids_for_workspace_with(
+                fs::best_effort_global(),
+                &canonical_workspace(&second),
+                storage.path()
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(belongs_to_workspace_in(&first, storage.path(), "legacy").unwrap());
 

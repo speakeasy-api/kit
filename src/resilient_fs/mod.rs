@@ -317,11 +317,184 @@ struct Entry {
     path: PathBuf,
     object: Option<Obj>,
 }
+impl PreparationNamespace {
+    /// Trusted crate callers must use this namespace only for read operations.
+    /// Writes here would bypass the original service's ordering and admission.
+    #[cfg(any(feature = "tui", test))]
+    pub(crate) fn filesystem(&self) -> &Fs {
+        &self.isolated
+    }
+
+    pub fn prepare_private_replace_with_parents<P: AsRef<Path>>(
+        self,
+        path: P,
+        contents: &[u8],
+    ) -> io::Result<PreparedPrivateReplace> {
+        let fs = &self.isolated;
+        let path = fs.norm(path.as_ref())?;
+        let mut state = fs.state()?;
+        let mut parents = Vec::new();
+        let mut current = PathBuf::new();
+        for component in path
+            .parent()
+            .ok_or_else(|| error(io::ErrorKind::InvalidInput, "no parent"))?
+            .components()
+        {
+            current.push(component.as_os_str());
+            match fs.lookup(&state, &current) {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(_) => {
+                    return Err(error(
+                        io::ErrorKind::NotADirectory,
+                        "ancestor is not a directory",
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            fs.secure_path(&state, &current, false)?;
+            fs.parent(&state, &current)?;
+            Fs::prepare(&mut state, 1)?;
+            parents.try_reserve(1).map_err(|_| allocation_oom())?;
+            let meta = Metadata {
+                identity: next_identity(),
+                disk_identity: None,
+                disk: None,
+                kind: FileType {
+                    file: false,
+                    dir: true,
+                    symlink: false,
+                },
+                len: 0,
+                permissions: fs.new_permissions(&state, &current, false, true)?,
+                modified: SystemTime::now(),
+            };
+            let object = Arc::new(Mutex::new(Object::memory(
+                Arc::new(Zeroizing::new(Vec::new())),
+                meta,
+            )));
+            // lookup exposes entries only while an action owns their overlay.
+            // This isolated queue is a virtual plan, never submitted/recovered;
+            // after taking this guard we use only direct read-only helpers.
+            state.pending.push_back(Pending {
+                action: Action::Mkdir {
+                    path: current.clone(),
+                    private: false,
+                    stage: 0,
+                },
+                lease: None,
+            });
+            Fs::entry(&mut state, current.clone(), Some(object.clone()))?;
+            parents.push((current.clone(), object));
+        }
+        // Existing preflight opens an existing file without create/truncate to
+        // validate write permission; it never writes bytes or creates a probe.
+        fs.preflight(&state, &path)?;
+        let permissions = fs.new_permissions(&state, &path, true, false)?;
+        let data = Arc::new(bytes(contents)?);
+        let image = Image::memory(data.clone());
+        let object = Arc::new(Mutex::new(Object::memory(
+            data,
+            Metadata {
+                identity: next_identity(),
+                disk_identity: None,
+                disk: None,
+                kind: FileType {
+                    file: true,
+                    dir: false,
+                    symlink: false,
+                },
+                len: image.len,
+                permissions: permissions.clone(),
+                modified: SystemTime::now(),
+            },
+        )));
+        drop(state);
+        Ok(PreparedPrivateReplace {
+            original: self.original,
+            revision: self.revision,
+            parents,
+            path,
+            object,
+            image,
+            permissions,
+        })
+    }
+}
+
+impl PreparedPrivateReplace {
+    /// Validate without I/O, then submit parent-first under the same state guard.
+    /// No recovery or global preflight precedes submission. A stale plan is
+    /// rejected with WouldBlock and must be prepared again, never replayed.
+    pub fn commit(self) -> io::Result<()> {
+        let fs = &self.original;
+        let (mut state, previous) = fs.service.acquire()?;
+        if !self.revision.ptr_eq(&Arc::downgrade(&previous)) {
+            return Err(error(
+                io::ErrorKind::WouldBlock,
+                "stale preparation; retry the operation",
+            ));
+        }
+        fs.preparation_quiescent(&state)?;
+        Fs::prepare(&mut state, self.parents.len() + 1)?;
+        let result = (|| {
+            for (path, object) in self.parents {
+                fs.submit(
+                    &mut state,
+                    Action::Mkdir {
+                        path: path.clone(),
+                        private: false,
+                        stage: 0,
+                    },
+                )?;
+                Fs::entry(&mut state, path, Some(object))?;
+            }
+            let action = Fs::put_action(&mut state, &self.path, self.image, self.permissions);
+            fs.submit(&mut state, action)?;
+            // Quiescence excludes old live handles; acquisitions creating one
+            // invalidate the ticket. Therefore replacement cannot rebind a handle.
+            Fs::entry(&mut state, self.path, Some(self.object))?;
+            fs.rebase(&mut state)?;
+            Ok(())
+        })();
+        // Remove completed plan bookkeeping on success AND ordinary rejection.
+        // This is still owned commit work; preparation must not drop arbitrary
+        // backend descriptors under the original state lock just to prune.
+        // Pending overlays remain intact for process-owned recovery. An unwind
+        // instead poisons the service, as in ordinary mutation paths.
+        Fs::prune(&mut state);
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct Fs {
     service: Arc<Service>,
     lease: Option<Arc<LeaseCaller>>,
 }
+/// Isolated namespace protected by an original-service revision ticket.
+/// No backend reads hold the original service mutex. Concurrent original-service
+/// access conservatively invalidates this preparation, except observational
+/// status queries and recovery passes that do no work.
+pub struct PreparationNamespace {
+    original: Fs,
+    isolated: Fs,
+    revision: std::sync::Weak<()>,
+}
+
+/// A validated private replacement. Dropping it has no filesystem effects.
+/// Commit uses the original service; mkdir plus replace is not atomic: accepted
+/// directories can remain if a later action is rejected.
+pub struct PreparedPrivateReplace {
+    original: Fs,
+    revision: std::sync::Weak<()>,
+    parents: Vec<(PathBuf, Obj)>,
+    path: PathBuf,
+    object: Obj,
+    image: Image,
+    permissions: Permissions,
+}
+
 // Lock order: service state -> cursor (when present) -> object -> native file.
 // Lease fencing is acquired under service state, or independently by observers;
 // it never acquires service state. No guard crosses an await. File and namespace
@@ -334,10 +507,22 @@ struct Service {
     max_operations: usize,
     best_effort: bool,
 }
+impl Service {
+    // Ordinary acquisitions invalidate preparation, including reads and rejected
+    // operations. Only status queries and provably idle recovery bypass this.
+    // Weak tickets cannot keep an obsolete generation alive, and
+    // allocation identity cannot wrap or be reused while its Weak survives.
+    fn acquire(&self) -> io::Result<(std::sync::MutexGuard<'_, State>, Arc<()>)> {
+        let mut state = lock(&self.state)?;
+        let previous = std::mem::replace(&mut state.revision, Arc::new(()));
+        Ok((state, previous))
+    }
+}
 // Fs and File transitions coordinate namespace entries/redirects, live object
 // images, budget accounting, replay stages, and retained lease authority here.
 // Disk effects cannot be rolled back generically after an unwind.
 struct State {
+    revision: Arc<()>,
     entries: Vec<Entry>,
     redirects: Vec<(PathBuf, PathBuf)>,
     objects: Vec<std::sync::Weak<Mutex<Object>>>,
@@ -575,6 +760,7 @@ impl Fs {
             service: Arc::new(Service {
                 backend,
                 state: Mutex::new(State {
+                    revision: Arc::new(()),
                     entries: Vec::new(),
                     redirects: Vec::new(),
                     objects: Vec::new(),
@@ -591,10 +777,72 @@ impl Fs {
             lease: None,
         }
     }
+    fn preparation_quiescent(&self, state: &State) -> io::Result<()> {
+        if state.dropped {
+            return Err(io::Error::other(DroppedScope));
+        }
+        if state.exhausted || ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(oom());
+        }
+        // Native lease validation is I/O, so leased namespaces cannot use this
+        // optimistic path. Ordinary guarded operations retain their semantics.
+        if self.lease.is_some()
+            || state
+                .leases
+                .iter()
+                .any(|(_, lease, _)| lease.strong_count() > 0)
+        {
+            return Err(error(
+                io::ErrorKind::PermissionDenied,
+                "leased preparation unsupported",
+            ));
+        }
+        if !state.pending.is_empty()
+            || !state.entries.is_empty()
+            || !state.redirects.is_empty()
+            || state.objects.iter().any(|object| object.strong_count() > 0)
+        {
+            return Err(error(
+                io::ErrorKind::WouldBlock,
+                "storage is busy; retry the operation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Capture a quiescent revision BEFORE any normalization or backend reads.
+    /// The returned namespace shares only the backend, never the original queue,
+    /// locks, objects, or lease authority. Retry preparation on WouldBlock.
+    pub fn prepare_namespace(&self) -> io::Result<PreparationNamespace> {
+        let state = self.state()?;
+        self.preparation_quiescent(&state)?;
+        let revision = Arc::downgrade(&state.revision);
+        drop(state);
+        Ok(PreparationNamespace {
+            original: self.clone(),
+            isolated: Self::with_policy(
+                self.service.backend.clone(),
+                self.service.max_bytes,
+                self.service.max_operations,
+                self.service.best_effort,
+            ),
+            revision,
+        })
+    }
+
+    pub fn prepare_private_replace_with_parents<P: AsRef<Path>>(
+        &self,
+        path: P,
+        contents: &[u8],
+    ) -> io::Result<PreparedPrivateReplace> {
+        self.prepare_namespace()?
+            .prepare_private_replace_with_parents(path, contents)
+    }
+
     // Fence IO entry points, not just queue submission: reads
     // must not mistake an abandoned image for a complete transcript either.
     fn state(&self) -> io::Result<std::sync::MutexGuard<'_, State>> {
-        let s = lock(&self.service.state)?;
+        let s = self.service.acquire().map(|(state, _)| state)?;
         if s.dropped {
             return Err(io::Error::other(DroppedScope));
         }
@@ -653,7 +901,7 @@ impl Fs {
                 "not a best-effort service",
             ));
         }
-        let mut s = lock(&self.service.state)?;
+        let mut s = self.service.acquire().map(|(state, _)| state)?;
         s.dropped = true;
         let pending = std::mem::take(&mut s.pending);
         let entries = std::mem::take(&mut s.entries);
@@ -1419,7 +1667,7 @@ impl Fs {
         }
     }
     pub fn recover(&self) -> RecoveryReport {
-        let mut s = match self.state() {
+        let mut s = match lock(&self.service.state) {
             Ok(s) => s,
             Err(e) => {
                 return RecoveryReport {
@@ -1430,6 +1678,38 @@ impl Fs {
                 };
             }
         };
+        // An empty queue alone is insufficient: rebase can change live objects
+        // and prune can remove overlays/registrations. Classify under the same
+        // guard, and bypass all recovery work only for a demonstrably idle pass.
+        if !s.dropped
+            && s.pending.is_empty()
+            && s.entries.is_empty()
+            && s.redirects.is_empty()
+            && s.objects.is_empty()
+            && self.lease.is_none()
+            && !s
+                .leases
+                .iter()
+                .any(|(_, lease, _)| lease.strong_count() > 0)
+        {
+            return RecoveryReport {
+                completed_operations: 0,
+                remaining_operations: 0,
+                blocked: None,
+                lease_blocked: false,
+            };
+        }
+        // Fence before any attempted work, including failed replay/rebase and
+        // rejected recovery on an abandoned scope. Never restore a generation.
+        s.revision = Arc::new(());
+        if s.dropped {
+            return RecoveryReport {
+                completed_operations: 0,
+                remaining_operations: usize::MAX,
+                blocked: Some(io::Error::other(DroppedScope)),
+                lease_blocked: false,
+            };
+        }
         let mut report = self.recover_locked(&mut s);
         if let Err(e) = self.rebase(&mut s) {
             report.blocked = Some(e);
