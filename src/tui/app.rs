@@ -6376,6 +6376,22 @@ mod tests {
     }
 
     #[test]
+    fn line_start_deletion_keys_continue_through_newlines() {
+        for key in [
+            modified_press(KeyCode::Backspace, KeyModifiers::SUPER),
+            modified_press(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = app();
+            app.paste("first\nsecond");
+            for expected in ["first\n", "first", "", ""] {
+                app.handle_key(key);
+                assert_eq!(app.editor.text(), expected);
+                assert_eq!(app.editor.cursor(), expected.len());
+            }
+        }
+    }
+
+    #[test]
     fn attachment_placeholder_includes_a_separator_before_following_text() {
         let mut app = app();
         app.attach(
