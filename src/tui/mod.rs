@@ -3311,6 +3311,8 @@ fn restore_modes() {
     }
     // A panic can interrupt a frame before its ordinary I/O cleanup runs.
     let _ = std::io::Write::write_all(&mut stdout, b"\x1b]8;;\x1b\\");
+    // Bypass the backend: an interrupted frame still defers cursor visibility.
+    let _ = execute!(stdout, crossterm::cursor::Show);
     let _ = execute!(stdout, crossterm::terminal::EndSynchronizedUpdate);
     let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
 }
