@@ -81,7 +81,7 @@ and use `brew upgrade <owning-formula>`; automatic Homebrew updates are not
 supported. Update desktop apps through the app distribution, and pull a new image
 and recreate containers rather than modifying bundled executables.
 
-<!-- PLACEHOLDER: record docs/media/install.gif — run the curl|sh line in a clean shell, then `kit --version`. The tape is in scripts/readme-media/install.tape; it only works once install.sh is on main. -->
+<p align="center"><img src="docs/media/install.gif" alt="Installing kit with the release script, then checking the version" width="900"></p>
 
 ### mise
 
