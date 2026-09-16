@@ -28,8 +28,8 @@ For voice, install `libpulse0` for PulseAudio (including PipeWire's PulseAudio
 compatibility service), or `libasound2` on Debian 12 / `libasound2t64` on Ubuntu
 24.04 for ALSA. A working audio service/device and microphone and speaker access
 are also required. If audio libraries or usable devices are missing, `/voice on`
-fails locally before creating a paid subscription call. Build dependencies are
-listed in [native voice build requirements](native-voice.md#build-authenticate-and-launch).
+fails locally before creating a subscription call. See [Native voice](native-voice.md)
+for setup and controls; using the packaged binary does not require build tools.
 
 The container images are headless builds without the `tui` Cargo feature: they
 omit the terminal client, voice, and the audio libraries. Debian flavors include
