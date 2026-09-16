@@ -2,7 +2,9 @@
 
 Talk to Kit in the terminal using your ChatGPT subscription. Native voice is
 **experimental and off by default**. It is included in the packaged desktop
-release binaries—you do not need to build Kit from source.
+release binaries—you do not need to build Kit from source. You must still enable
+`experimental.voice` with `kit config set experimental.voice true` and restart
+the TUI before using `/voice on`.
 
 ## What you need
 
