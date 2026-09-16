@@ -5,7 +5,7 @@ Hide
 Type `PROMPT_EOL_MARK='' PROMPT='%F{blue}> %f' asciinema rec -q --overwrite -i 3 -c 'zsh -f' out/install.cast`
 Enter
 Sleep 1s
-Type "export KIT_INSTALL_DIR=$(mktemp -d) && export PATH=$KIT_INSTALL_DIR:$PATH && alias docker=podman && clear"
+Type "export KIT_INSTALL_DIR=$(mktemp -d) && export PATH=$KIT_INSTALL_DIR:$PATH && { command -v docker >/dev/null || alias docker=podman; } && clear"
 Enter
 Sleep 500ms
 Show
