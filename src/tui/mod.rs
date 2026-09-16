@@ -55,7 +55,7 @@ use futures_util::{
     StreamExt,
     future::{Either, select},
 };
-use ratatui::DefaultTerminal;
+type DefaultTerminal = ratatui::Terminal<hyperlinks::HyperlinkBackend<std::io::Stdout>>;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -1624,7 +1624,6 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
 
             let (mut terminal, mut images) =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
-            let mut native_hyperlinks = hyperlinks::HyperlinkRenderer::default();
             let mut app = App::new(
                 root.clone(),
                 provider.as_str().to_string(),
@@ -1655,24 +1654,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     }
                     let mut next_priority = 0;
                     loop {
-                    let native_links = match terminal
-                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
-                    {
-                        Ok(frame) => native_hyperlinks.prepare(
-                            &frame,
-                            &app.row_links,
-                            app.transcript_left,
-                            app.transcript_top,
-                            ui::native_links_obscured(&app),
-                        ),
-                        Err(error) => {
-                            leave(&mut terminal);
-                            return Err(agent_client_protocol::Error::into_internal_error(error));
-                        }
-                    };
-                    if let Err(error) =
-                        native_hyperlinks.draw(terminal.backend_mut(), native_links)
-                    {
+                    if let Err(error) = draw_frame(&mut terminal, &mut app, &mut images) {
                         leave(&mut terminal);
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
@@ -1894,20 +1876,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             },
                         }
                     }
-                    let native_links = terminal
-                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
-                        .map(|frame| {
-                            native_hyperlinks.prepare(
-                                &frame,
-                                &app.row_links,
-                                app.transcript_left,
-                                app.transcript_top,
-                                ui::native_links_obscured(&app),
-                            )
-                        })
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
-                    native_hyperlinks
-                        .draw(terminal.backend_mut(), native_links)
+                    draw_frame(&mut terminal, &mut app, &mut images)
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                     let event = if std::mem::take(&mut submit_after_paste) {
                         SessionEvent::Terminal(Some(Ok(Event::Key(KeyEvent::new(
@@ -3248,23 +3217,39 @@ fn enable_tui_modes() {
     }
 }
 
+fn draw_frame(
+    terminal: &mut DefaultTerminal,
+    app: &mut app::App,
+    images: &mut image::ImageRuntime,
+) -> std::io::Result<()> {
+    hyperlinks::draw(terminal, |frame| {
+        ui::draw(frame, app, images);
+        hyperlinks::FrameLinks {
+            rows: app.row_links.clone(),
+            left: app.transcript_left,
+            top: app.transcript_top,
+            obscured: ui::native_links_obscured(app),
+        }
+    })
+}
+
 fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
-    let terminal = ratatui::try_init()?;
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_modes();
+        ratatui::restore();
+        previous(info);
+    }));
+    crossterm::terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    let terminal = ratatui::Terminal::new(hyperlinks::HyperlinkBackend::new(std::io::stdout()))?;
     // Query after entering the alternate screen but before the event stream owns
     // terminal input, as required by ratatui-image. The query has a short bound.
     let images = image::ImageRuntime::detect();
     // Bracketed paste keeps pasted newlines out of the key stream. Keyboard
     // enhancement distinguishes command keys, shifted returns, and releases.
     enable_tui_modes();
-    // Ratatui's own hook restores raw mode and the alternate screen, but not
-    // the modes turned on above: a panic would otherwise leave the shell
-    // reporting every mouse move as text.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_modes();
-        previous(info);
-    }));
     Ok((terminal, images))
 }
 
@@ -3324,6 +3309,11 @@ fn restore_modes() {
     if ENHANCED.swap(false, Ordering::Relaxed) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
+    // A panic can interrupt a frame before its ordinary I/O cleanup runs.
+    let _ = std::io::Write::write_all(&mut stdout, b"\x1b]8;;\x1b\\");
+    // Bypass the backend: an interrupted frame still defers cursor visibility.
+    let _ = execute!(stdout, crossterm::cursor::Show);
+    let _ = execute!(stdout, crossterm::terminal::EndSynchronizedUpdate);
     let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
 }
 

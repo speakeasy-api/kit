@@ -1,190 +1,203 @@
-use std::io::{self, Write};
-
-use crossterm::{
-    cursor::{RestorePosition, SavePosition},
-    queue,
-};
-use ratatui::{
-    CompletedFrame,
-    backend::{Backend, CrosstermBackend},
-    buffer::{Cell, CellDiffOption, CellWidth},
-    layout::Rect,
+//! OSC-8 metadata travels beside Ratatui's buffer, not inside display symbols.
+//! Metadata-only changes join the diff; the backend decorates the resulting draw
+//! stream in runs, so every changed grapheme is printed once.
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    io::{self, Write},
+    rc::Rc,
 };
 
 use super::wrap::LinkHit;
+use crossterm::{
+    cursor::{Hide, RestorePosition, SavePosition, Show},
+    queue,
+    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::{Buffer, Cell, CellDiffOption, CellWidth},
+    layout::{Position, Size},
+};
 
+type Links = BTreeMap<(u16, u16), Rc<str>>;
 const OSC8_OPEN: &[u8] = b"\x1b]8;;";
 const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
 
 #[derive(Default)]
-pub struct HyperlinkRenderer {
-    linked: Vec<Footprint>,
+struct Metadata {
+    links: Links,
+    forced: Vec<(u16, u16, Cell)>,
 }
 
-#[derive(Clone, Copy)]
-struct Footprint {
-    y: u16,
-    start: u16,
-    end: u16,
+pub struct HyperlinkBackend<W: Write> {
+    inner: CrosstermBackend<W>,
+    metadata: Rc<RefCell<Metadata>>,
+    cursor_visible: bool,
+    in_frame: bool,
+    saved_position: bool,
 }
 
-pub struct PreparedFrame {
-    stale: Vec<DrawCell>,
-    links: Vec<PreparedLink>,
-    footprints: Vec<Footprint>,
-}
-
-struct PreparedLink {
-    url: String,
-    cells: Vec<DrawCell>,
-}
-
-struct DrawCell {
-    x: u16,
-    y: u16,
-    cell: Cell,
-}
-
-impl HyperlinkRenderer {
-    /// Copies the bounded link rows out of Ratatui's completed frame so the
-    /// terminal backend can be borrowed again for the native-link pass.
-    pub fn prepare(
-        &self,
-        frame: &CompletedFrame<'_>,
-        row_links: &[Vec<LinkHit>],
-        transcript_left: usize,
-        transcript_top: usize,
-        obscured: bool,
-    ) -> PreparedFrame {
-        let stale = self
-            .linked
-            .iter()
-            .flat_map(|footprint| cells(frame, *footprint))
-            .collect();
-        let mut links = Vec::new();
-        let mut footprints = Vec::new();
-
-        if !obscured {
-            for (row, hits) in row_links.iter().enumerate() {
-                let Some(y) = transcript_top
-                    .checked_add(row)
-                    .and_then(|value| u16::try_from(value).ok())
-                else {
-                    continue;
-                };
-                for hit in hits {
-                    // Internal on-demand targets require a normal TUI click;
-                    // terminal modifier-click must not dispatch them to the OS.
-                    if hit.url.starts_with("kit-image:") {
-                        continue;
-                    }
-                    let Some(start) = transcript_left
-                        .checked_add(hit.start)
-                        .and_then(|value| u16::try_from(value).ok())
-                    else {
-                        continue;
-                    };
-                    let Some(end) = transcript_left
-                        .checked_add(hit.end)
-                        .and_then(|value| u16::try_from(value).ok())
-                    else {
-                        continue;
-                    };
-                    let Some(footprint) = clipped(frame.area, Footprint { y, start, end }) else {
-                        continue;
-                    };
-                    let link_cells = cells(frame, footprint);
-                    if link_cells.is_empty() {
-                        continue;
-                    }
-                    links.push(PreparedLink {
-                        url: escape_url(&hit.url),
-                        cells: link_cells,
-                    });
-                    footprints.push(footprint);
-                }
-            }
-        }
-
-        PreparedFrame {
-            stale,
-            links,
-            footprints,
+impl<W: Write> HyperlinkBackend<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: CrosstermBackend::new(writer),
+            metadata: Rc::default(),
+            cursor_visible: true,
+            in_frame: false,
+            saved_position: false,
         }
     }
 
-    /// Repaints old footprints without a link, then repaints current footprints
-    /// between OSC-8 open/close commands. Save/restore leaves Ratatui's cursor
-    /// exactly where its normal draw pass placed it.
-    pub fn draw<W: Write>(
-        &mut self,
-        backend: &mut CrosstermBackend<W>,
-        prepared: PreparedFrame,
-    ) -> io::Result<()> {
-        if prepared.stale.is_empty() && prepared.links.is_empty() {
-            self.linked = prepared.footprints;
-            return Ok(());
-        }
+    fn begin_frame(&mut self) -> io::Result<()> {
+        self.in_frame = true;
+        self.saved_position = false;
+        queue!(self.inner, BeginSynchronizedUpdate, SavePosition)?;
+        self.saved_position = true;
+        queue!(self.inner, Hide)
+    }
 
-        queue!(backend, SavePosition)?;
-        let result: io::Result<()> = (|| {
-            backend.draw(prepared.stale.iter().map(draw_tuple))?;
-            for link in &prepared.links {
-                backend.write_all(OSC8_OPEN)?;
-                backend.write_all(link.url.as_bytes())?;
-                backend.write_all(b"\x1b\\")?;
-                backend.draw(link.cells.iter().map(draw_tuple))?;
-                backend.write_all(OSC8_CLOSE)?;
-            }
+    // Attempt every cleanup independently: a failing OSC close must not prevent
+    // ending synchronized updates or restoring the cursor after an I/O failure.
+    fn end_frame(&mut self, failed: bool, was_visible: bool) -> io::Result<()> {
+        let close = self.inner.write_all(OSC8_CLOSE);
+        let restore = if failed && self.saved_position {
+            queue!(self.inner, RestorePosition)
+        } else {
             Ok(())
-        })();
-
-        // Do not let a partial write strand either a hyperlink or the cursor.
-        let cleanup: io::Result<()> = (|| {
-            backend.write_all(OSC8_CLOSE)?;
-            queue!(backend, RestorePosition)?;
-            Backend::flush(backend)
-        })();
-        result?;
-        cleanup?;
-        self.linked = prepared.footprints;
-        Ok(())
+        };
+        if failed {
+            self.cursor_visible = was_visible;
+        }
+        let cursor = if self.cursor_visible {
+            queue!(self.inner, Show)
+        } else {
+            queue!(self.inner, Hide)
+        };
+        let end = queue!(self.inner, EndSynchronizedUpdate);
+        let flush = Backend::flush(&mut self.inner);
+        self.in_frame = false;
+        close.and(restore).and(cursor).and(end).and(flush)
     }
 }
 
-fn draw_tuple(cell: &DrawCell) -> (u16, u16, &Cell) {
-    (cell.x, cell.y, &cell.cell)
+pub struct FrameLinks {
+    pub rows: Vec<Vec<LinkHit>>,
+    pub left: usize,
+    pub top: usize,
+    pub obscured: bool,
 }
 
-fn cells(frame: &CompletedFrame<'_>, footprint: Footprint) -> Vec<DrawCell> {
-    let Some(footprint) = clipped(frame.area, footprint) else {
-        return Vec::new();
-    };
-    let mut cells = Vec::new();
-    let mut covered_until = frame.area.left();
-    for x in frame.area.left()..frame.area.right() {
-        if x < covered_until {
-            continue;
-        }
-        let Some(cell) = frame.buffer.cell((x, footprint.y)) else {
+/// Enclose *all* terminal output, including autoresize and cursor updates.
+/// Cursor visibility requests are deferred until after Ratatui positions it.
+pub fn draw<W: Write>(
+    terminal: &mut Terminal<HyperlinkBackend<W>>,
+    render: impl FnOnce(&mut Frame<'_>) -> FrameLinks,
+) -> io::Result<()> {
+    let metadata = Rc::clone(&terminal.backend().metadata);
+    let was_visible = terminal.backend().cursor_visible;
+    let result = terminal.backend_mut().begin_frame().and_then(|()| {
+        terminal
+            .draw(|frame| {
+                let rendered = render(frame);
+                let next = prepare(
+                    frame.buffer_mut(),
+                    &rendered.rows,
+                    rendered.left,
+                    rendered.top,
+                    rendered.obscured,
+                );
+                let mut previous = metadata.borrow_mut();
+                previous.forced = invalidate(frame.buffer_mut(), &previous.links, &next);
+                previous.links = next;
+            })
+            .map(|_| ())
+    });
+    let cleanup = terminal
+        .backend_mut()
+        .end_frame(result.is_err(), was_visible);
+    result.and(cleanup)
+}
+
+fn prepare(
+    buffer: &Buffer,
+    rows: &[Vec<LinkHit>],
+    left: usize,
+    top: usize,
+    obscured: bool,
+) -> Links {
+    let mut links = Links::new();
+    if obscured {
+        return links;
+    }
+    for (row, hits) in rows.iter().enumerate() {
+        let Some(y) = top.checked_add(row).and_then(|y| u16::try_from(y).ok()) else {
             continue;
         };
-        let grapheme_end = x
-            .saturating_add(cell.cell_width().max(1))
-            .min(frame.area.right());
-        covered_until = grapheme_end;
-        if cell_is_skipped(cell) {
+        if y < buffer.area.top() || y >= buffer.area.bottom() {
             continue;
         }
-        if x < footprint.end && grapheme_end > footprint.start {
-            cells.push(DrawCell {
-                x,
-                y: footprint.y,
-                cell: cell.clone(),
-            });
+        if hits.is_empty() {
+            continue;
+        }
+        let hits: Vec<_> = hits
+            .iter()
+            // Internal on-demand targets require a normal TUI click;
+            // terminal modifier-click must not dispatch them to the OS.
+            .filter(|hit| !hit.url.starts_with("kit-image:"))
+            .map(|hit| {
+                (
+                    left.saturating_add(hit.start),
+                    left.saturating_add(hit.end),
+                    Rc::<str>::from(escape_url(&hit.url)),
+                )
+            })
+            .collect();
+        let mut covered_until = buffer.area.left();
+        for x in buffer.area.left()..buffer.area.right() {
+            if x < covered_until {
+                continue;
+            }
+            let cell = &buffer[(x, y)];
+            covered_until = x.saturating_add(cell.cell_width().max(1));
+            if cell_is_skipped(cell) {
+                continue;
+            }
+            // Match any overlap, including a hit beginning in a wide grapheme.
+            if let Some((_, _, url)) = hits.iter().rev().find(|(start, end, _)| {
+                start < end && usize::from(x) < *end && usize::from(covered_until) > *start
+            }) {
+                links.insert((x, y), Rc::clone(url));
+            }
         }
     }
-    cells
+    links
+}
+
+fn invalidate(buffer: &Buffer, old: &Links, new: &Links) -> Vec<(u16, u16, Cell)> {
+    let mut forced = Vec::new();
+    if old == new {
+        return forced;
+    }
+    // Walk grapheme starts, never the continuation cell or an image's Skip cell.
+    // A former link may now lie inside a *different* wide grapheme.
+    for y in buffer.area.top()..buffer.area.bottom() {
+        let mut x = buffer.area.left();
+        while x < buffer.area.right() {
+            let cell = &buffer[(x, y)];
+            let end = x
+                .saturating_add(cell.cell_width().max(1))
+                .min(buffer.area.right());
+            if !cell_is_skipped(cell)
+                && (x..end).any(|column| old.get(&(column, y)) != new.get(&(column, y)))
+            {
+                forced.push((x, y, cell.clone()));
+            }
+            x = end;
+        }
+    }
+    forced
 }
 
 #[allow(deprecated)]
@@ -192,17 +205,107 @@ fn cell_is_skipped(cell: &Cell) -> bool {
     matches!(cell.diff_option, CellDiffOption::Skip) || cell.skip
 }
 
-fn clipped(area: Rect, footprint: Footprint) -> Option<Footprint> {
-    if footprint.y < area.top() || footprint.y >= area.bottom() {
-        return None;
+impl<W: Write> Write for HyperlinkBackend<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
     }
-    let start = footprint.start.max(area.left());
-    let end = footprint.end.min(area.right());
-    (start < end).then_some(Footprint {
-        y: footprint.y,
-        start,
-        end,
-    })
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.inner)
+    }
+}
+
+impl<W: Write> Backend for HyperlinkBackend<W> {
+    type Error = io::Error;
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut metadata = self.metadata.borrow_mut();
+        let forced = std::mem::take(&mut metadata.forced);
+        let links = &metadata.links;
+        // Merge metadata-only updates with the real diff before printing. Using
+        // AlwaysUpdate on the frame would persist in Ratatui's previous buffer
+        // and cause a redundant repaint when that marker disappears next frame.
+        let mut extra: BTreeMap<_, _> =
+            forced.iter().map(|(x, y, cell)| ((*y, *x), cell)).collect();
+        let updates: Vec<_> = content
+            .inspect(|(x, y, _)| {
+                extra.remove(&(*y, *x));
+            })
+            .collect();
+        // Preserve Ratatui's order: VS16 wide-grapheme updates can clear
+        // continuation cells *before* printing their leading grapheme.
+        let mut content = extra
+            .into_iter()
+            .map(|((y, x), cell)| (x, y, cell))
+            .chain(updates)
+            .peekable();
+        while let Some(&(x, y, _)) = content.peek() {
+            let target = links.get(&(x, y));
+            if let Some(url) = target {
+                self.inner.write_all(OSC8_OPEN)?;
+                self.inner.write_all(url.as_bytes())?;
+                self.inner.write_all(b"\x1b\\")?;
+            }
+            let run = std::iter::from_fn(|| {
+                let &(x, y, _) = content.peek()?;
+                if links.get(&(x, y)) == target {
+                    content.next()
+                } else {
+                    None
+                }
+            });
+            let result = self.inner.draw(run);
+            let close = if target.is_some() {
+                self.inner.write_all(OSC8_CLOSE)
+            } else {
+                Ok(())
+            };
+            result.and(close)?;
+        }
+        Ok(())
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = false;
+        if self.in_frame {
+            Ok(())
+        } else {
+            self.inner.hide_cursor()
+        }
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = true;
+        if self.in_frame {
+            Ok(())
+        } else {
+            self.inner.show_cursor()
+        }
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, p: P) -> io::Result<()> {
+        self.inner.set_cursor_position(p)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.metadata.borrow_mut().links.clear();
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, kind: ClearType) -> io::Result<()> {
+        self.inner.clear_region(kind)
+    }
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Backend::flush(&mut self.inner)
+    }
 }
 
 fn escape_url(url: &str) -> String {
@@ -223,305 +326,297 @@ fn escape_url(url: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
-    use std::{cell::RefCell, io::Write, rc::Rc};
-
-    use ratatui::{
-        CompletedFrame, Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Rect,
-        text::Line,
-    };
-
     use super::*;
+    use ratatui::{TerminalOptions, Viewport, layout::Rect, text::Line};
 
     #[derive(Clone, Default)]
     struct Capture(Rc<RefCell<Vec<u8>>>);
-
     impl Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.borrow_mut().extend_from_slice(bytes);
             Ok(bytes.len())
         }
-
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-
-    impl Capture {
-        fn bytes(&self) -> Vec<u8> {
-            self.0.borrow().clone()
-        }
-
-        fn clear(&self) {
-            self.0.borrow_mut().clear();
-        }
+    fn terminal() -> (Terminal<HyperlinkBackend<Capture>>, Capture) {
+        let capture = Capture::default();
+        let terminal = Terminal::with_options(
+            HyperlinkBackend::new(capture.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 12, 2)),
+            },
+        )
+        .unwrap();
+        (terminal, capture)
     }
-
-    fn has_nonempty_open(output: &[u8]) -> bool {
-        output
-            .windows(OSC8_OPEN.len())
-            .enumerate()
-            .any(|(index, prefix)| {
-                prefix == OSC8_OPEN && !output[index + OSC8_OPEN.len()..].starts_with(b"\x1b\\")
-            })
+    fn render(
+        terminal: &mut Terminal<HyperlinkBackend<Capture>>,
+        text: &str,
+        url: Option<&str>,
+        cursor: bool,
+    ) {
+        draw(terminal, |frame| {
+            frame.render_widget(Line::from(text), Rect::new(0, 0, 12, 1));
+            if cursor {
+                frame.set_cursor_position((10, 1));
+            }
+            FrameLinks {
+                rows: vec![
+                    url.map(|url| LinkHit {
+                        start: 0,
+                        end: 4,
+                        url: url.into(),
+                    })
+                    .into_iter()
+                    .collect(),
+                ],
+                left: 0,
+                top: 0,
+                obscured: false,
+            }
+        })
+        .unwrap();
     }
-
-    fn frame(buffer: &Buffer) -> CompletedFrame<'_> {
-        CompletedFrame {
-            buffer,
-            area: buffer.area,
-            count: 0,
-        }
+    fn output(capture: &Capture) -> String {
+        String::from_utf8(std::mem::take(&mut *capture.0.borrow_mut())).unwrap()
     }
-
     #[test]
     fn internal_image_targets_are_not_emitted_as_native_hyperlinks() {
-        let buffer = Buffer::with_lines([Line::from("[Image #1]")]);
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 10,
-            url: "kit-image:internal".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-        renderer.draw(&mut backend, prepared).unwrap();
-        assert!(!has_nonempty_open(&capture.bytes()));
-    }
-
-    #[test]
-    fn emits_native_open_and_close_around_linked_cells_and_preserves_cursor() {
-        let buffer = Buffer::with_lines([Line::from("sent Image #1")]);
-        let rows = vec![vec![LinkHit {
-            start: 5,
-            end: 13,
-            url: "file:///tmp/image.png".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-
-        renderer.draw(&mut backend, prepared).unwrap();
-
-        let output = capture.bytes();
-        let open = b"\x1b]8;;file:///tmp/image.png\x1b\\";
-        let open_at = output
-            .windows(open.len())
-            .position(|part| part == open)
-            .unwrap();
-        let text_at = output
-            .windows(8)
-            .position(|part| part == b"Image #1")
-            .unwrap();
-        let close_at = output
-            .windows(OSC8_CLOSE.len())
-            .position(|part| part == OSC8_CLOSE)
-            .unwrap();
-        assert!(open_at < text_at && text_at < close_at);
-        assert!(output.starts_with(b"\x1b7"));
-        assert!(output.ends_with(b"\x1b8"));
-    }
-
-    #[test]
-    fn redraws_stale_footprints_without_reopening_a_link() {
-        let buffer = Buffer::with_lines([Line::from("Image #1")]);
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 8,
-            url: "file:///tmp/image.png".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-        let linked = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        renderer.draw(&mut backend, linked).unwrap();
-        capture.clear();
-
-        let cleared = renderer.prepare(&frame(&buffer), &[], 0, 0, false);
-        renderer.draw(&mut backend, cleared).unwrap();
-
-        let output = capture.bytes();
-        assert!(output.windows(8).any(|part| part == b"Image #1"));
-        assert!(!has_nonempty_open(&output));
-        assert!(output.starts_with(b"\x1b7"));
-        assert!(output.ends_with(b"\x1b8"));
-    }
-
-    #[test]
-    fn obscured_frames_clear_existing_native_links() {
-        let buffer = Buffer::with_lines([Line::from("Image #1")]);
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 8,
-            url: "file:///tmp/image.png".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-        let linked = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        renderer.draw(&mut backend, linked).unwrap();
-        capture.clear();
-
-        let obscured = renderer.prepare(&frame(&buffer), &rows, 0, 0, true);
-        renderer.draw(&mut backend, obscured).unwrap();
-
-        assert!(!has_nonempty_open(&capture.bytes()));
-    }
-
-    #[test]
-    fn control_characters_cannot_terminate_the_osc_sequence() {
+        let (mut terminal, capture) = terminal();
+        render(&mut terminal, "LINK", Some("kit-image:internal"), true);
+        let internal = output(&capture);
+        assert!(internal.contains("LINK"));
+        assert!(!internal.contains("kit-image:"));
         assert_eq!(
-            escape_url("file:///tmp/a\x1b]8;;evil\x07\u{85}"),
-            "file:///tmp/a%1B]8;;evil%07%C2%85"
+            internal.matches("\x1b]8;;").count(),
+            internal.matches("\x1b]8;;\x1b\\").count()
         );
+
+        // Replacing a native target with an internal target also clears the
+        // old hyperlink, even when its displayed text is unchanged.
+        render(&mut terminal, "LINK", Some("https://example.com"), true);
+        assert!(output(&capture).contains("https://example.com"));
+        render(&mut terminal, "LINK", Some("kit-image:internal"), true);
+        let cleared = output(&capture);
+        assert!(cleared.contains("LINK"));
+        assert!(!cleared.contains("kit-image:"));
+        assert!(!cleared.contains("https://example.com"));
     }
 
     #[test]
-    fn emits_each_wide_grapheme_once() {
-        let buffer = Buffer::with_lines([Line::from("A界🙂B")]);
-        let rows = vec![vec![LinkHit {
-            start: 1,
-            end: 5,
-            url: "https://example.com/wide".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-
-        renderer.draw(&mut backend, prepared).unwrap();
-
-        let output = capture.bytes();
-        assert_eq!(
-            output
-                .windows("界".len())
-                .filter(|part| *part == "界".as_bytes())
-                .count(),
-            1
-        );
-        assert_eq!(
-            output
-                .windows("🙂".len())
-                .filter(|part| *part == "🙂".as_bytes())
-                .count(),
-            1
-        );
-        assert!(
-            !output
-                .windows("界 ".len())
-                .any(|part| part == "界 ".as_bytes())
-        );
-        assert!(
-            !output
-                .windows("🙂 ".len())
-                .any(|part| part == "🙂 ".as_bytes())
-        );
+    fn one_pass_and_metadata_only_changes() {
+        let (mut terminal, capture) = terminal();
+        render(&mut terminal, "LINK", Some("https://one"), true);
+        let first = output(&capture);
+        assert_eq!(first.matches("LINK").count(), 1);
+        assert!(first.contains("\x1b]8;;https://one\x1b\\"));
+        render(&mut terminal, "LINK", Some("https://one"), true);
+        let unchanged = output(&capture);
+        assert!(!unchanged.contains("LINK"));
+        assert!(!unchanged.contains("https://one"));
+        render(&mut terminal, "LINK", Some("https://two"), true);
+        let changed = output(&capture);
+        assert_eq!(changed.matches("LINK").count(), 1);
+        assert!(changed.contains("https://two"));
+        assert!(!changed.contains("https://one"));
+        render(&mut terminal, "LINK", None, true);
+        let stale = output(&capture);
+        assert_eq!(stale.matches("LINK").count(), 1);
+        assert!(!stale.contains("https://"));
+        render(&mut terminal, "LINK", None, true);
+        assert!(!output(&capture).contains("LINK"));
     }
-
     #[test]
-    fn stale_range_inside_a_wide_cell_repaints_the_whole_grapheme() {
-        let buffer = Buffer::with_lines([Line::from("A界B")]);
-        let rows = vec![vec![LinkHit {
-            start: 2,
-            end: 3,
-            url: "https://example.com/wide".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-        let linked = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        renderer.draw(&mut backend, linked).unwrap();
-        capture.clear();
-
-        let cleared = renderer.prepare(&frame(&buffer), &[], 0, 0, false);
-        renderer.draw(&mut backend, cleared).unwrap();
-
-        let output = capture.bytes();
-        assert!(
-            output
-                .windows("界".len())
-                .any(|part| part == "界".as_bytes())
-        );
-        assert!(!has_nonempty_open(&output));
+    fn ordinary_frames_hide_before_print_and_show_after_positioning() {
+        let (mut terminal, capture) = terminal();
+        render(&mut terminal, "TEXT", None, true);
+        let visible = output(&capture);
+        assert!(visible.starts_with("\x1b[?2026h\x1b7\x1b[?25l"));
+        assert!(visible.find("\x1b[?25l").unwrap() < visible.find("TEXT").unwrap());
+        assert!(visible.find("\x1b[2;11H").unwrap() < visible.find("\x1b[?25h").unwrap());
+        assert!(visible.ends_with("\x1b[?25h\x1b[?2026l"));
+        render(&mut terminal, "TEXT", None, false);
+        let hidden = output(&capture);
+        assert!(!hidden.contains("\x1b[?25h"));
+        assert!(hidden.ends_with("\x1b[?25l\x1b[?2026l"));
     }
-
     #[test]
-    fn omits_cells_marked_to_skip() {
-        let mut buffer = Buffer::with_lines([Line::from("AB")]);
-        buffer
-            .cell_mut((0, 0))
-            .unwrap()
-            .set_diff_option(CellDiffOption::Skip);
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 2,
-            url: "https://example.com/skip".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        let capture = Capture::default();
-        let mut backend = CrosstermBackend::new(capture.clone());
-
-        renderer.draw(&mut backend, prepared).unwrap();
-
-        let output = capture.bytes();
-        assert!(!output.contains(&b'A'));
-        assert!(output.contains(&b'B'));
-    }
-
-    #[test]
-    fn renders_from_a_real_completed_terminal_frame() {
-        let capture = Capture::default();
-        let backend = CrosstermBackend::new(capture.clone());
-        let mut terminal = Terminal::new(backend).unwrap();
-        let completed = terminal
-            .draw(|frame| {
-                frame.render_widget(Line::from("Image #1"), Rect::new(0, 0, 8, 1));
+    fn wide_graphemes_skipped_cells_and_obscured_links() {
+        let (mut terminal, capture) = terminal();
+        let mut obscured = false;
+        for _ in 0..2 {
+            draw(&mut terminal, |frame| {
+                frame.render_widget(Line::from("A界🙂Z"), Rect::new(0, 0, 12, 1));
+                frame.buffer_mut()[(5, 0)].set_diff_option(CellDiffOption::Skip);
+                FrameLinks {
+                    rows: vec![vec![LinkHit {
+                        start: 2,
+                        end: 6,
+                        url: "https://wide".into(),
+                    }]],
+                    left: 0,
+                    top: 0,
+                    obscured,
+                }
             })
             .unwrap();
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 8,
-            url: "file:///tmp/image.png".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&completed, &rows, 0, 0, false);
-        capture.clear();
-
-        renderer.draw(terminal.backend_mut(), prepared).unwrap();
-
-        let output = capture.bytes();
-        assert!(has_nonempty_open(&output));
-        assert!(output.windows(8).any(|part| part == b"Image #1"));
+            let text = output(&capture);
+            assert_eq!(text.matches('界').count(), 1);
+            assert_eq!(text.matches('🙂').count(), 1);
+            assert!(!text.contains('Z'));
+            assert_eq!(text.contains("https://wide"), !obscured);
+            obscured = true;
+        }
+    }
+    #[test]
+    fn escapes_control_characters() {
+        assert_eq!(
+            escape_url("https://a/\x1b\\\n\u{9c}"),
+            "https://a/%1B\\%0A%C2%9C"
+        );
+    }
+    #[test]
+    fn scrolling_same_text_moves_link_metadata_without_double_printing() {
+        let (mut terminal, capture) = terminal();
+        for top in [0, 1] {
+            draw(&mut terminal, |frame| {
+                for y in 0..2 {
+                    frame.render_widget(Line::from("LINK"), Rect::new(0, y, 12, 1));
+                }
+                FrameLinks {
+                    rows: vec![vec![LinkHit {
+                        start: 0,
+                        end: 4,
+                        url: "https://moving".into(),
+                    }]],
+                    left: 0,
+                    top,
+                    obscured: false,
+                }
+            })
+            .unwrap();
+            let text = output(&capture);
+            assert_eq!(text.matches("LINK").count(), 2);
+            assert_eq!(text.matches("https://moving").count(), 1);
+        }
     }
 
-    struct RejectWrites;
+    #[test]
+    fn preserves_ratatui_wide_cell_clear_order() {
+        let old = Buffer::with_lines(["ABCD"]);
+        let next = Buffer::with_lines(["❤️CD"]);
+        let capture = Capture::default();
+        let plain = Capture::default();
+        let mut backend = HyperlinkBackend::new(capture.clone());
+        backend.draw(old.diff_iter(&next)).unwrap();
+        CrosstermBackend::new(plain.clone())
+            .draw(old.diff_iter(&next))
+            .unwrap();
+        assert_eq!(output(&capture), output(&plain));
+    }
 
-    impl Write for RejectWrites {
-        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("rejected write"))
+    // External I/O boundary: fail a particular output command once, then allow
+    // cleanup through. No production instrumentation is needed.
+    struct FailCommand {
+        capture: Capture,
+        command: &'static [u8],
+        failed: bool,
+    }
+    impl Write for FailCommand {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.failed && bytes == self.command {
+                self.failed = true;
+                return Err(io::Error::other("injected write failure"));
+            }
+            self.capture.write(bytes)
         }
-
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn propagates_backend_write_errors() {
-        let buffer = Buffer::with_lines([Line::from("Image #1")]);
-        let rows = vec![vec![LinkHit {
-            start: 0,
-            end: 8,
-            url: "file:///tmp/image.png".into(),
-        }]];
-        let mut renderer = HyperlinkRenderer::default();
-        let prepared = renderer.prepare(&frame(&buffer), &rows, 0, 0, false);
-        let mut backend = CrosstermBackend::new(RejectWrites);
+    fn failures_close_links_end_sync_and_restore_cursor_visibility() {
+        for visible in [false, true] {
+            let capture = Capture::default();
+            let writer = FailCommand {
+                capture: capture.clone(),
+                command: b"L",
+                failed: false,
+            };
+            let mut terminal = Terminal::with_options(
+                HyperlinkBackend::new(writer),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 12, 2)),
+                },
+            )
+            .unwrap();
+            if !visible {
+                terminal.hide_cursor().unwrap();
+            }
+            output(&capture);
+            let result = draw(&mut terminal, |frame| {
+                frame.render_widget(Line::from("LINK"), Rect::new(0, 0, 12, 1));
+                FrameLinks {
+                    rows: vec![vec![LinkHit {
+                        start: 0,
+                        end: 4,
+                        url: "https://fail".into(),
+                    }]],
+                    left: 0,
+                    top: 0,
+                    obscured: false,
+                }
+            });
+            assert!(result.is_err());
+            let text = output(&capture);
+            assert!(text.contains("\x1b]8;;\x1b\\"));
+            assert!(text.contains("\x1b8"));
+            let tail = if visible {
+                "\x1b[?25h\x1b[?2026l"
+            } else {
+                "\x1b[?25l\x1b[?2026l"
+            };
+            assert!(text.ends_with(tail), "{text:?}");
+        }
+    }
 
-        let error = renderer.draw(&mut backend, prepared).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+    #[test]
+    fn cleanup_failure_does_not_skip_cursor_or_end_sync() {
+        let capture = Capture::default();
+        let mut backend = HyperlinkBackend::new(FailCommand {
+            capture: capture.clone(),
+            command: OSC8_CLOSE,
+            failed: false,
+        });
+        backend.begin_frame().unwrap();
+        assert!(backend.end_frame(true, true).is_err());
+        let text = output(&capture);
+        assert!(text.ends_with("\x1b8\x1b[?25h\x1b[?2026l"));
+    }
+    #[test]
+    fn failed_begin_does_not_restore_an_unsaved_cursor_position() {
+        let capture = Capture::default();
+        let writer = FailCommand {
+            capture: capture.clone(),
+            command: b"\x1b[?2026h",
+            failed: false,
+        };
+        let mut terminal = Terminal::with_options(
+            HyperlinkBackend::new(writer),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 12, 2)),
+            },
+        )
+        .unwrap();
+        let result = draw(&mut terminal, |_| {
+            panic!("must not render after failed begin")
+        });
+        assert!(result.is_err());
+        let text = output(&capture);
+        assert!(!text.contains("\x1b8"));
+        assert!(text.ends_with("\x1b[?25h\x1b[?2026l"));
     }
 }
