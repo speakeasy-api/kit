@@ -3043,10 +3043,7 @@ mod tests {
     use agent_client_protocol::schema::v2::ToolKind;
     use base64::Engine as _;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-    use ratatui::{
-        Terminal,
-        backend::{CrosstermBackend, TestBackend},
-    };
+    use ratatui::{Terminal, backend::TestBackend};
     use ratatui_image::picker::Picker;
     use unicode_width::UnicodeWidthStr;
 
@@ -3064,7 +3061,7 @@ mod tests {
                 FilePickerDialog, FilePickerStatus, ModelDialog, Phase, SessionDialog,
                 SessionRename, Update, UserImage, UserMessage,
             },
-            hyperlinks::HyperlinkRenderer,
+            hyperlinks::{self, FrameLinks, HyperlinkBackend},
         },
     };
 
@@ -4266,74 +4263,40 @@ mod tests {
             "[visible link](https://example.com/target)".into(),
         ));
         app.phase = Phase::Working;
-        let mut terminal = Terminal::new(TestBackend::new(50, 10)).expect("terminal");
-        let mut images = ImageRuntime::disabled();
-        let mut renderer = HyperlinkRenderer::default();
         let capture = Capture::default();
-        let mut native_backend = CrosstermBackend::new(capture.clone());
-
-        let linked = terminal
-            .draw(|frame| draw(frame, &mut app, &mut images))
-            .expect("draw linked frame");
-        assert!(!native_links_obscured(&app));
-        let (row, hit) = app
-            .row_links
-            .iter()
-            .enumerate()
-            .find_map(|(row, hits)| hits.first().map(|hit| (row, hit)))
-            .expect("visible transcript link");
-        let link_x = u16::try_from(app.transcript_left + hit.start).unwrap();
-        let link_y = u16::try_from(app.transcript_top + row).unwrap();
-        let linked_symbol = linked.buffer[(link_x, link_y)].symbol().to_string();
-        let prepared = renderer.prepare(
-            &linked,
-            &app.row_links,
-            app.transcript_left,
-            app.transcript_top,
-            false,
-        );
-        renderer.draw(&mut native_backend, prepared).unwrap();
+        let mut terminal = Terminal::with_options(
+            HyperlinkBackend::new(capture.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 50, 10)),
+            },
+        )
+        .unwrap();
+        let mut images = ImageRuntime::disabled();
         let open = b"\x1b]8;;https://example.com/target\x1b\\";
-        assert!(capture.bytes().windows(open.len()).any(|part| part == open));
-        capture.clear();
-
-        app.paste("/");
-        let popup = terminal
-            .draw(|frame| draw(frame, &mut app, &mut images))
-            .expect("draw popup frame");
-        assert!(native_links_obscured(&app));
-        assert!(app.row_links.iter().flatten().next().is_some());
-        assert_ne!(
-            popup.buffer[(link_x, link_y)].symbol(),
-            linked_symbol,
-            "command popup should cover the transcript link"
-        );
-        let prepared = renderer.prepare(
-            &popup,
-            &app.row_links,
-            app.transcript_left,
-            app.transcript_top,
-            native_links_obscured(&app),
-        );
-        renderer.draw(&mut native_backend, prepared).unwrap();
-
-        let cleared = capture.bytes();
-        assert!(cleared.starts_with(b"\x1b7"));
-        assert!(cleared.ends_with(b"\x1b8"));
-        // Clearing a stale footprint still emits OSC-8 close; it must not
-        // reopen the hidden transcript destination over the popup cells.
-        assert!(!cleared.windows(open.len()).any(|part| part == open));
-        capture.clear();
-
-        let prepared = renderer.prepare(
-            &popup,
-            &app.row_links,
-            app.transcript_left,
-            app.transcript_top,
-            true,
-        );
-        renderer.draw(&mut native_backend, prepared).unwrap();
-        assert!(capture.bytes().is_empty());
+        for obscured in [false, true, true, false] {
+            if obscured && !native_links_obscured(&app) {
+                app.paste("/");
+            } else if !obscured {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            hyperlinks::draw(&mut terminal, |frame| {
+                draw(frame, &mut app, &mut images);
+                assert_eq!(native_links_obscured(&app), obscured);
+                assert!(app.row_links.iter().flatten().next().is_some());
+                FrameLinks {
+                    rows: app.row_links.clone(),
+                    left: app.transcript_left,
+                    top: app.transcript_top,
+                    obscured,
+                }
+            })
+            .unwrap();
+            assert_eq!(
+                capture.bytes().windows(open.len()).any(|part| part == open),
+                !obscured
+            );
+            capture.clear();
+        }
     }
 
     #[test]
