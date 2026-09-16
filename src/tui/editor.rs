@@ -236,9 +236,14 @@ impl Editor {
         self.text.replace_range(self.cursor..target, "");
     }
 
-    /// `ctrl+u` / `cmd+backspace`: erase from the cursor to the line start.
+    /// `ctrl+u` / `cmd+backspace`: erase from the cursor to the line start,
+    /// or erase the preceding newline when already at the line start.
     pub fn delete_to_line_start(&mut self) {
         let (start, _) = self.line_bounds(self.cursor);
+        if start == self.cursor {
+            self.backspace();
+            return;
+        }
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -445,6 +450,28 @@ mod tests {
         let mut editor = editor("first\nsecond");
         editor.delete_to_line_start();
         assert_eq!(editor.text(), "first\n");
+    }
+
+    #[test]
+    fn deleting_to_line_start_can_continue_through_previous_lines() {
+        let mut editor = editor("café\n\nsecond");
+        for expected in ["café\n\n", "café\n", "café", "", ""] {
+            editor.delete_to_line_start();
+            assert_eq!(editor.text(), expected);
+            assert_eq!(editor.cursor(), expected.len());
+        }
+    }
+
+    #[test]
+    fn deleting_at_line_start_preserves_text_after_the_cursor() {
+        let mut editor = editor("café\nsecond");
+        editor.move_line_start();
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "cafésecond");
+        assert_eq!(editor.cursor(), "café".len());
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "second");
+        assert_eq!(editor.cursor(), 0);
     }
 
     #[test]
