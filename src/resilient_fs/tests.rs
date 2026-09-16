@@ -2418,6 +2418,13 @@ fn prepared_replace_is_effect_free_until_commit_and_preserves_legacy_parents() {
             .unwrap();
     prepared.commit().unwrap();
     assert_eq!(native::read(&path).unwrap(), b"new");
+    // Native inspection above does not prune or access the original service.
+    // A second commit must work without an intervening service read or recovery.
+    t.fs.prepare_private_replace_with_parents(&path, b"second")
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(native::read(&path).unwrap(), b"second");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2481,8 +2488,75 @@ fn prepared_replace_blocked_preflight_does_not_hold_original_state() {
     // A synchronous acquisition completes while isolated backend I/O is paused.
     assert_eq!(t.fs.status().pending_operations, 0);
     resume.wait();
+    worker.join().unwrap().unwrap().commit().unwrap();
+    assert_eq!(native::read(t.path("value")).unwrap(), b"new");
+}
+
+#[test]
+fn prepared_replace_survives_observational_status_and_idle_recovery() {
+    for best_effort in [false, true] {
+        let t = Fixture::new();
+        let fs = if best_effort {
+            t.fs.best_effort(1024, 16)
+        } else {
+            t.fs.clone()
+        };
+        let prepared = fs
+            .prepare_private_replace_with_parents(t.path("value"), b"new")
+            .unwrap();
+        assert_eq!(fs.status().pending_operations, 0);
+        assert_eq!(
+            fs.best_effort_status(),
+            best_effort.then_some(BestEffortStatus::Ready)
+        );
+        let report = fs.recover();
+        assert_eq!(report.completed_operations, 0);
+        assert_eq!(report.remaining_operations, 0);
+        assert!(report.blocked.is_none());
+        prepared.commit().unwrap();
+        assert_eq!(native::read(t.path("value")).unwrap(), b"new");
+    }
+}
+
+#[test]
+fn prepared_replace_empty_queue_recovery_still_fences_object_cleanup() {
+    let t = Fixture::new();
+    let path = t.path("value");
+    native::write(&path, b"old").unwrap();
+    drop(t.fs.open(&path).unwrap());
+    // Acquire the ticket AFTER handle access, so only recovery can stale it.
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    assert_eq!(t.fs.status().pending_operations, 0);
+    assert!(t.fs.recover().blocked.is_none());
     assert_eq!(
-        worker.join().unwrap().unwrap().commit().unwrap_err().kind(),
+        prepared.commit().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(native::read(&path).unwrap(), b"old");
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(&path, b"new")
+            .unwrap();
+    assert!(t.fs.recover().blocked.is_none());
+    prepared.commit().unwrap();
+    assert_eq!(native::read(&path).unwrap(), b"new");
+}
+
+#[test]
+fn prepared_replace_failed_mutation_stays_stale_after_idle_recovery() {
+    let t = Fixture::new();
+    let prepared =
+        t.fs.prepare_private_replace_with_parents(t.path("value"), b"new")
+            .unwrap();
+    assert_eq!(
+        t.fs.remove_file(t.path("missing")).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(t.fs.recover().blocked.is_none());
+    assert_eq!(t.fs.status().pending_operations, 0);
+    assert_eq!(
+        prepared.commit().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
     assert!(!t.path("value").exists());
@@ -2668,18 +2742,4 @@ fn prepared_replace_preserves_preflight_file_validation() {
         io::ErrorKind::Unsupported
     );
     assert_eq!(native::read(&path).unwrap(), b"old");
-}
-
-#[test]
-fn prepared_replacements_can_repeat_without_recovery() {
-    let t = Fixture::new();
-    let path = t.path("legacy/value");
-    for value in [b"first".as_slice(), b"second", b"third"] {
-        t.fs.prepare_private_replace_with_parents(&path, value)
-            .unwrap()
-            .commit()
-            .unwrap();
-        // Native inspection does not prune or access the original service.
-        assert_eq!(native::read(&path).unwrap(), value);
-    }
 }

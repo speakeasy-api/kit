@@ -223,6 +223,13 @@ fn escape_and_control_c_cancel_without_mutating_session() {
         let path = session(home.path(), root.path(), "s-cancel", "Cancel fixture");
         let original = fs::read(&path).unwrap();
         let mut picker = Picker::start(home.path(), root.path());
+        if key == b"\x1b[27u" {
+            picker.keys(b"rdraft");
+            picker.until("rename: ");
+            picker.keys(key);
+            picker.until(BROWSING);
+            assert!(!path.with_extension("metadata.json").exists());
+        }
         picker.keys(key);
         assert!(picker.finish().success(), "{}", picker.output);
         assert_eq!(fs::read(&path).unwrap(), original);
@@ -233,25 +240,6 @@ fn escape_and_control_c_cancel_without_mutating_session() {
             picker.output
         );
     }
-}
-#[test]
-fn escape_cancels_rename_before_closing_picker() {
-    let home = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let path = session(
-        home.path(),
-        root.path(),
-        "s-rename-cancel",
-        "Original title",
-    );
-    let mut picker = Picker::start(home.path(), root.path());
-    picker.keys(b"rdraft");
-    picker.until("rename: ");
-    picker.keys(b"\x1b[27u");
-    picker.until(BROWSING);
-    assert!(!path.with_extension("metadata.json").exists());
-    picker.keys(b"\x1b[27u");
-    assert!(picker.finish().success(), "{}", picker.output);
 }
 #[test]
 fn renamed_session_is_persisted_then_selected_through_real_lock_error() {

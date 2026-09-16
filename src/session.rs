@@ -1342,6 +1342,23 @@ pub(crate) fn prepare_display_name(
     session_id: &str,
     display_name: Option<&str>,
 ) -> Result<PreparedDisplayName, String> {
+    prepare_display_name_in(
+        filesystem,
+        root,
+        &default_directory()?,
+        session_id,
+        display_name,
+    )
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn prepare_display_name_in(
+    filesystem: &Fs,
+    root: &Path,
+    global_directory: &Path,
+    session_id: &str,
+    display_name: Option<&str>,
+) -> Result<PreparedDisplayName, String> {
     // Capture the original namespace revision before any workspace/authority
     // reads. Preparation uses only the independent read view, never global Fs.
     let namespace = filesystem
@@ -1350,7 +1367,7 @@ pub(crate) fn prepare_display_name(
     let data = display_name_data_in(
         namespace.filesystem(),
         root,
-        &default_directory()?,
+        global_directory,
         session_id,
         display_name,
     )?;

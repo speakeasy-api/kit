@@ -474,7 +474,8 @@ pub struct Fs {
 }
 /// Isolated namespace protected by an original-service revision ticket.
 /// No backend reads hold the original service mutex. Concurrent original-service
-/// access conservatively invalidates this preparation, even if it only reads.
+/// access conservatively invalidates this preparation, except observational
+/// status queries and recovery passes that do no work.
 pub struct PreparationNamespace {
     original: Fs,
     isolated: Fs,
@@ -507,8 +508,9 @@ struct Service {
     best_effort: bool,
 }
 impl Service {
-    // Every acquisition invalidates preparation, including reads and rejected
-    // operations. Weak tickets cannot keep an obsolete generation alive, and
+    // Ordinary acquisitions invalidate preparation, including reads and rejected
+    // operations. Only status queries and provably idle recovery bypass this.
+    // Weak tickets cannot keep an obsolete generation alive, and
     // allocation identity cannot wrap or be reused while its Weak survives.
     fn acquire(&self) -> io::Result<(std::sync::MutexGuard<'_, State>, Arc<()>)> {
         let mut state = lock(&self.state)?;
@@ -878,7 +880,7 @@ impl Fs {
         if !self.service.best_effort {
             return None;
         }
-        Some(match self.service.acquire().map(|(state, _)| state) {
+        Some(match lock(&self.service.state) {
             Err(_) => BestEffortStatus::Poisoned,
             Ok(s) if s.dropped => BestEffortStatus::Dropped,
             Ok(s) if !s.pending.is_empty() => BestEffortStatus::Buffered,
@@ -1126,7 +1128,7 @@ impl Fs {
     /// Use `recover().blocked` for the typed poison error.
     pub fn status(&self) -> Status {
         let snapshot = || -> io::Result<Status> {
-            let s = self.service.acquire().map(|(state, _)| state)?;
+            let s = lock(&self.service.state)?;
             Ok(Status {
                 pending_operations: s.pending.len(),
                 retained_bytes: Self::retained(&s)?,
@@ -1665,7 +1667,7 @@ impl Fs {
         }
     }
     pub fn recover(&self) -> RecoveryReport {
-        let mut s = match self.state() {
+        let mut s = match lock(&self.service.state) {
             Ok(s) => s,
             Err(e) => {
                 return RecoveryReport {
@@ -1676,6 +1678,38 @@ impl Fs {
                 };
             }
         };
+        // An empty queue alone is insufficient: rebase can change live objects
+        // and prune can remove overlays/registrations. Classify under the same
+        // guard, and bypass all recovery work only for a demonstrably idle pass.
+        if !s.dropped
+            && s.pending.is_empty()
+            && s.entries.is_empty()
+            && s.redirects.is_empty()
+            && s.objects.is_empty()
+            && self.lease.is_none()
+            && !s
+                .leases
+                .iter()
+                .any(|(_, lease, _)| lease.strong_count() > 0)
+        {
+            return RecoveryReport {
+                completed_operations: 0,
+                remaining_operations: 0,
+                blocked: None,
+                lease_blocked: false,
+            };
+        }
+        // Fence before any attempted work, including failed replay/rebase and
+        // rejected recovery on an abandoned scope. Never restore a generation.
+        s.revision = Arc::new(());
+        if s.dropped {
+            return RecoveryReport {
+                completed_operations: 0,
+                remaining_operations: usize::MAX,
+                blocked: Some(io::Error::other(DroppedScope)),
+                lease_blocked: false,
+            };
+        }
         let mut report = self.recover_locked(&mut s);
         if let Err(e) = self.rebase(&mut s) {
             report.blocked = Some(e);

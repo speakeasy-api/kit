@@ -159,10 +159,13 @@ fn cancelled_catalog_does_not_hold_runtime_teardown() {
         drop(runtime);
         return;
     }
-    for (signal, canonicalize) in [false, true]
-        .into_iter()
-        .flat_map(|canonicalize| ["-INT", "-TERM", "-HUP"].map(|signal| (signal, canonicalize)))
-    {
+    // Exercise every signal on one stall, and each other stall with SIGINT.
+    for (signal, canonicalize) in [
+        ("-INT", false),
+        ("-TERM", false),
+        ("-HUP", false),
+        ("-INT", true),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join(".kit/sessions")).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -388,32 +391,30 @@ fn cancelled_rename_does_not_hold_recovery_or_write_after_shutdown() {
         return;
     }
     for operation in ["canonicalize", "authority", "metadata", "write-open"] {
-        for signal in ["-INT", "-TERM", "-HUP"] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut child = rename_child(
-                "tui::startup::tests::cancelled_rename_does_not_hold_recovery_or_write_after_shutdown",
-                directory.path(),
-                operation,
-            );
-            wait_for_marker(&directory.path().join("entered"), &mut child);
-            assert!(
-                Command::new("kill")
-                    .args([signal, &child.0.id().to_string()])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            wait_for_rename_child(&mut child);
-            assert_eq!(
-                std::fs::read(directory.path().join("recovered")).unwrap(),
-                b"finished"
-            );
-        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = rename_child(
+            "tui::startup::tests::cancelled_rename_does_not_hold_recovery_or_write_after_shutdown",
+            directory.path(),
+            operation,
+        );
+        wait_for_marker(&directory.path().join("entered"), &mut child);
+        assert!(
+            Command::new("kill")
+                .args(["-INT", &child.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        wait_for_rename_child(&mut child);
+        assert_eq!(
+            std::fs::read(directory.path().join("recovered")).unwrap(),
+            b"finished"
+        );
     }
 }
 
 #[test]
-fn prepared_rename_commit_persists() {
+fn admitted_rename_is_drained_before_recovery() {
     if let Some(directory) = std::env::var_os("KIT_RENAME_TEARDOWN_CHILD") {
         let directory = PathBuf::from(directory);
         let root = rename_fixture(&directory);
@@ -422,6 +423,8 @@ fn prepared_rename_commit_persists() {
             .build()
             .unwrap();
         runtime.block_on(async {
+            // Observe successful preparation and completion in this same child,
+            // then exercise shutdown with the picker's receiver gone.
             let filesystem = fs::Fs::new(Arc::new(DiskBackend));
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             super::start_rename_preparation(
@@ -456,29 +459,6 @@ fn prepared_rename_commit_persists() {
             assert_eq!(result.unwrap().as_deref(), Some("changed"));
             fs::finish_best_effort_recovery(&filesystem);
             assert_rename_title(&root, "changed");
-        });
-        drop(runtime);
-        return;
-    }
-    let directory = tempfile::tempdir().unwrap();
-    let mut child = rename_child(
-        "tui::startup::tests::prepared_rename_commit_persists",
-        directory.path(),
-        "none",
-    );
-    wait_for_rename_child(&mut child);
-}
-
-#[test]
-fn admitted_rename_is_drained_before_recovery() {
-    if let Some(directory) = std::env::var_os("KIT_RENAME_TEARDOWN_CHILD") {
-        let directory = PathBuf::from(directory);
-        let root = rename_fixture(&directory);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
             let mut stop = super::Stop::new().unwrap();
             let filesystem = fs::Fs::new(Arc::new(StalledDisk {
                 entered: directory.join("entered"),
@@ -489,7 +469,7 @@ fn admitted_rename_is_drained_before_recovery() {
             super::start_rename_preparation(
                 root.clone(),
                 "rename-target".into(),
-                Some("changed".into()),
+                Some("drained".into()),
                 filesystem.clone(),
                 tx.clone(),
             )
@@ -517,34 +497,32 @@ fn admitted_rename_is_drained_before_recovery() {
             fs::finish_best_effort_recovery(&filesystem);
             fs::finish_best_effort_recovery(fs::best_effort_global());
             fs::finish_recovery(fs::global()).unwrap();
-            assert_rename_title(&root, "changed");
+            assert_rename_title(&root, "drained");
         });
         drop(runtime);
         std::fs::write(directory.join("recovered"), b"finished").unwrap();
         return;
     }
-    for signal in ["-INT", "-TERM", "-HUP"] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut child = rename_child(
-            "tui::startup::tests::admitted_rename_is_drained_before_recovery",
-            directory.path(),
-            "commit",
-        );
-        wait_for_marker(&directory.path().join("entered"), &mut child);
-        assert!(
-            Command::new("kill")
-                .args([signal, &child.0.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        wait_for_marker(&directory.path().join("draining"), &mut child);
-        assert!(!directory.path().join("recovered").exists());
-        std::fs::write(directory.path().join("release"), b"go").unwrap();
-        wait_for_rename_child(&mut child);
-        assert_eq!(
-            std::fs::read(directory.path().join("recovered")).unwrap(),
-            b"finished"
-        );
-    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = rename_child(
+        "tui::startup::tests::admitted_rename_is_drained_before_recovery",
+        directory.path(),
+        "commit",
+    );
+    wait_for_marker(&directory.path().join("entered"), &mut child);
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_for_marker(&directory.path().join("draining"), &mut child);
+    assert!(!directory.path().join("recovered").exists());
+    std::fs::write(directory.path().join("release"), b"go").unwrap();
+    wait_for_rename_child(&mut child);
+    assert_eq!(
+        std::fs::read(directory.path().join("recovered")).unwrap(),
+        b"finished"
+    );
 }

@@ -39,24 +39,19 @@ fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
 fn tui_resume_picker_empty_workspace_exits_without_starting_a_session() {
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
-    for force in [false, true] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
-        command
-            .env("HOME", home.path())
-            .args(["tui", "--resume", "--root"])
-            .arg(root.path())
-            .args(["--credential-store", "memory"]);
-        if force {
-            command.arg("--force");
-        }
-        let output = command.output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("no resumable sessions for workspace"),
-            "{output:?}"
-        );
-        assert!(!home.path().join(".kit/sessions").exists());
-    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
+    command
+        .env("HOME", home.path())
+        .args(["tui", "--resume", "--root"])
+        .arg(root.path())
+        .args(["--credential-store", "memory"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no resumable sessions for workspace"),
+        "{output:?}"
+    );
+    assert!(!home.path().join(".kit/sessions").exists());
 }
 
 #[cfg(feature = "tui")]

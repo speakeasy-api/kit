@@ -242,6 +242,58 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tui")]
+    fn idle_recovery_pass_preserves_prepared_session_rename() {
+        use crate::resilient_fs::{BestEffortStatus, DiskBackend, Fs};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(".kit/sessions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let id = crate::session::new_id();
+        let transcript = serde_json::json!({
+            "schema_version": 1,
+            "session_id": id,
+            "generation": 1,
+            "item": agentkit_core::Item::text(agentkit_core::ItemKind::User, "Original title"),
+        })
+        .to_string();
+        std::fs::write(directory.join(format!("{id}.jsonl")), &transcript).unwrap();
+        // Match the worker's distinct strict and best-effort services without
+        // touching process-global queues or relying on a timer/thread race.
+        let strict = Fs::new(std::sync::Arc::new(DiskBackend));
+        let optional = strict.best_effort(1024 * 1024, 1024);
+        let storage = tempfile::tempdir().unwrap();
+        let prepared = crate::session::prepare_display_name_in(
+            &optional,
+            root.path(),
+            storage.path(),
+            &id,
+            Some("Renamed"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::recover_best_effort(&optional),
+            Some(BestEffortStatus::Ready)
+        );
+        assert_eq!(strict.status().pending_operations, 0);
+        assert_eq!(prepared.commit().unwrap().as_deref(), Some("Renamed"));
+        let metadata_directory = std::fs::read_dir(storage.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read_to_string(metadata_directory.join(format!("{id}.metadata.json")))
+                .unwrap(),
+            "{\"display_name\":\"Renamed\"}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(format!("{id}.jsonl"))).unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
     fn optional_recovery_does_not_operate_on_a_strict_service() {
         let strict =
             crate::resilient_fs::Fs::new(std::sync::Arc::new(crate::resilient_fs::DiskBackend));
