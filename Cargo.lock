@@ -160,9 +160,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.8"
+version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279d6cd22661dc59e7745cb0a065e84d9221faba0195ce24914d5982c6fe645b"
+checksum = "7f99b81132ad4c4a62575ce4f39f133245607769923072df88de4865e7efa782"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -230,9 +230,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-http"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b818e27ef0aa35e4f11af6a7fb453b0a020b0e7f46025a870647c4823cf71e2"
+checksum = "697f08884433720327a7a5b4345fceff1a3ef46e67751d546ebb39a816f4b824"
 dependencies = [
  "async-trait",
  "bytes",
@@ -267,9 +267,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c13599c05c4b036902b83fa22f05d0415d85b8e9ba52be6b5a50256241c8492"
+checksum = "c3e6dc29da7d0d393a1234c874ffe5035f0f38bc81a8a95176a3c3c6267a98f6"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -4439,11 +4439,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-channel",
  "futures-core",

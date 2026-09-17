@@ -36,13 +36,13 @@ agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork
 agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices", "unstable_session_compaction", "unstable_tool_call_name"] }
 agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server"] }
 agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
-agentkit-adapter-completions = "=0.10.8"
+agentkit-adapter-completions = "=0.10.9"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
 agentkit-loop = { version = "=0.10.11", features = ["otel"] }
-agentkit-mcp = "=0.10.6"
-agentkit-http = "=0.10.6"
+agentkit-mcp = "=0.10.7"
+agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.8"
 agentkit-provider-openrouter = "=0.10.8"
@@ -75,7 +75,7 @@ opentelemetry-otlp = { version = "=0.32.0", default-features = false, features =
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
 ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"], optional = true }
-reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
