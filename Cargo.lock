@@ -144,7 +144,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=8e4ee26434a3f847e3613da5bb073ae63a262243#8e4ee26434a3f847e3613da5bb073ae63a262243"
+source = "git+https://github.com/danielkov/agentkit.git?rev=bec9dcc45ee0f436d538286bc220b16dc19fd5f3#bec9dcc45ee0f436d538286bc220b16dc19fd5f3"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -250,19 +250,19 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=8e4ee26434a3f847e3613da5bb073ae63a262243#8e4ee26434a3f847e3613da5bb073ae63a262243"
+version = "0.10.12"
+source = "git+https://github.com/danielkov/agentkit.git?rev=bec9dcc45ee0f436d538286bc220b16dc19fd5f3#bec9dcc45ee0f436d538286bc220b16dc19fd5f3"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
  "agentkit-tools-core",
  "async-trait",
- "opentelemetry 0.31.0",
+ "opentelemetry",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "tracing-opentelemetry 0.32.1",
+ "tracing-opentelemetry",
 ]
 
 [[package]]
@@ -303,9 +303,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.8"
+version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c677bf5485f3521227a14b7c92610cb85861f34464a3e3a9f02485ae1c0c1acd"
+checksum = "2f6c76aa382a8d913eed413242db270701c30a9bb2626d10021b47966b50384b"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -3064,7 +3064,7 @@ dependencies = [
  "keyring",
  "libc",
  "neo_frizbee",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "opus-pure",
@@ -3088,7 +3088,7 @@ dependencies = [
  "toml_edit",
  "tower",
  "tracing",
- "tracing-opentelemetry 0.33.0",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
@@ -3640,19 +3640,6 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opentelemetry"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "pin-project-lite",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "opentelemetry"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
@@ -3673,7 +3660,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "http",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "reqwest",
 ]
 
@@ -3684,7 +3671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
  "http",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
@@ -3705,7 +3692,7 @@ checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "base64 0.22.1",
  "const-hex",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "opentelemetry_sdk",
  "prost",
  "serde",
@@ -3722,7 +3709,7 @@ dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
@@ -5727,26 +5714,12 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.32.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
-dependencies = [
- "js-sys",
- "opentelemetry 0.31.0",
- "tracing",
- "tracing-core",
- "tracing-subscriber",
- "web-time",
-]
-
-[[package]]
-name = "tracing-opentelemetry"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
 dependencies = [
  "js-sys",
- "opentelemetry 0.32.0",
+ "opentelemetry",
  "tracing",
  "tracing-core",
  "tracing-subscriber",
