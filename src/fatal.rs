@@ -286,6 +286,17 @@ fn classify(
 )> {
     match error {
         LoopError::Cancelled => None,
+        LoopError::ProviderFailure(failure)
+            if failure.reason == agentkit_loop::ProviderFailureReason::Cancelled =>
+        {
+            None
+        }
+        LoopError::ProviderFailure(_) => Some((
+            "provider",
+            "provider_error",
+            "provider request failed".into(),
+            None,
+        )),
         LoopError::Provider(message) => {
             let (message, diagnostics) = split_diagnostics(message);
             if message.starts_with("openai-subscription ") {
@@ -297,9 +308,7 @@ fn classify(
                     diagnostics,
                 ))
             } else {
-                // TODO(agentkit): AgentKit 0.10 flattens OpenAI Responses status, transport,
-                // and protocol failures into LoopError::Provider(String). Keep this generic until
-                // the terminal API exposes a stable typed classification; do not parse its display.
+                // Legacy string errors have no stable classification; do not parse their display.
                 Some((
                     "provider",
                     "provider_error",
@@ -877,6 +886,38 @@ mod tests {
         assert_eq!(code, "provider_error");
         assert_eq!(message, "provider request failed");
         assert!(diagnostics.is_none());
+    }
+
+    #[test]
+    fn typed_provider_failures_preserve_fatal_and_cancellation_behavior() {
+        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+
+        for reason in [
+            ProviderFailureReason::RetryExhausted,
+            ProviderFailureReason::Authentication,
+            ProviderFailureReason::Cancelled,
+        ] {
+            let error = LoopError::ProviderFailure(Box::new(ProviderFailure {
+                route: ProviderRoute::OpenAiResponses,
+                reason,
+                last_attempt_reason: None,
+                upstream: Default::default(),
+                accounting: Default::default(),
+            }));
+            if reason == ProviderFailureReason::Cancelled {
+                assert!(
+                    record_loop_error("session-1", Surface::Acp, &error)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let (kind, code, message, diagnostics) = classify(&error).unwrap();
+                assert_eq!(kind, "provider");
+                assert_eq!(code, "provider_error");
+                assert_eq!(message, "provider request failed");
+                assert!(diagnostics.is_none());
+            }
+        }
     }
 
     #[test]
