@@ -6555,9 +6555,9 @@ mod tests {
             assert_eq!(
                 app.editor.text(),
                 if move_before {
-                    "ébefore [Image #1] after"
+                    "ébefore [Image #1]after"
                 } else {
-                    "before [Image #1] afteré"
+                    "before [Image #1]afteré"
                 }
             );
             assert_eq!(

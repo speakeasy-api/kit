@@ -3088,10 +3088,12 @@ impl App {
             self.editor.insert_char(' ');
         }
         self.editor.insert_str(&placeholder);
-        if after.is_none_or(|character| !character.is_whitespace()) {
-            self.editor.insert_char(' ');
-        } else {
-            self.editor.move_right();
+        if attachment.temporary.is_none() {
+            if after.is_none_or(|character| !character.is_whitespace()) {
+                self.editor.insert_char(' ');
+            } else {
+                self.editor.move_right();
+            }
         }
         attachment.placeholder = placeholder;
         self.attachments.push(attachment);
@@ -6523,6 +6525,30 @@ mod tests {
 
         assert_eq!(app.editor.text(), "[Image #1] ");
         assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn clipboard_image_preserves_spacing_and_leaves_cursor_at_placeholder_end() {
+        for (text, cursor, expected, expected_cursor) in [
+            ("", 0, "[Image #1]", 10),
+            ("leftright", 4, "left [Image #1]right", 15),
+            ("left", 4, "left [Image #1]", 15),
+            ("left right", 4, "left [Image #1] right", 15),
+            ("left  right", 5, "left [Image #1] right", 15),
+            ("left\n\nright", 5, "left\n[Image #1]\nright", 15),
+        ] {
+            let mut app = app();
+            app.editor.insert_str(text);
+            app.editor.set_cursor(cursor);
+            let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            app.attach_attachment(Attachment::clipboard_image(
+                crate::tui::attachment::own_temp_path(path),
+                0,
+            ));
+
+            assert_eq!(app.editor.text(), expected);
+            assert_eq!(app.editor.cursor(), expected_cursor);
+        }
     }
 
     #[test]
