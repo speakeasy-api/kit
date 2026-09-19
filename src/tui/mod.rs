@@ -342,41 +342,52 @@ impl Drop for NativeVoice {
 #[derive(Default)]
 struct ClipboardPastes {
     pending: Option<PendingClipboardPastes>,
+    next_placeholder: u64,
 }
 
 struct PendingClipboardPastes {
     generation: u64,
     route: ClipboardRoute,
     remaining: usize,
+    placeholders: std::collections::VecDeque<String>,
     submit: bool,
 }
 
 impl ClipboardPastes {
-    fn retain_current(&mut self, generation: Option<u64>, route: &ClipboardRoute) {
+    fn retain_current(&mut self, app: &mut App, generation: Option<u64>, route: &ClipboardRoute) {
         if self.pending.as_ref().is_some_and(|pending| {
             Some(pending.generation) != generation || &pending.route != route
         }) {
             self.pending = None;
+            app.cancel_clipboard_placeholders();
         }
     }
 
-    fn queued(&mut self, generation: u64, route: ClipboardRoute) {
+    fn queued(&mut self, app: &mut App, generation: u64, route: ClipboardRoute) {
         if !matches!(route, ClipboardRoute::Composer(_)) {
             return;
         }
+        self.next_placeholder += 1;
+        let placeholder = format!("[Pasting… #{}]", self.next_placeholder);
         if let Some(pending) = &mut self.pending
             && pending.generation == generation
             && pending.route == route
         {
             pending.remaining += 1;
+            pending.placeholders.push_back(placeholder.clone());
         } else {
+            app.cancel_clipboard_placeholders();
             self.pending = Some(PendingClipboardPastes {
                 generation,
                 route,
                 remaining: 1,
+                placeholders: [placeholder.clone()].into(),
                 submit: false,
             });
         }
+        app.move_out_of_pending_clipboard();
+        app.editor.insert_str(&placeholder);
+        app.pending_clipboard.push(placeholder);
     }
 
     fn finish(&mut self, generation: u64, route: &ClipboardRoute, accepted: bool) -> bool {
@@ -1861,9 +1872,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     // Reconcile after every prior event, including failures in
                     // result/observe, before accepting any next user input.
                     voice.notify_state(&connection, &session_id);
+                    let clipboard_route = app.clipboard_route();
                     clipboard_pastes.retain_current(
+                        &mut app,
                         transition_session.lock().map(|active| active.generation).ok(),
-                        &app.clipboard_route(),
+                        &clipboard_route,
                     );
                     if let Some(queued) = pending_update.take() {
                         match background_workers.try_update(queued) {
@@ -2531,7 +2544,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         .map(|route| route.generation)
                                         .unwrap_or_default();
                                     match background_workers.try_clipboard(generation, route.clone(), mode) {
-                                        Ok(()) => clipboard_pastes.queued(generation, route),
+                                        Ok(()) => clipboard_pastes.queued(&mut app, generation, route),
                                         Err(std::sync::mpsc::TrySendError::Full(_)) => app.note("clipboard is busy; try again"),
                                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => app.note("clipboard worker is unavailable"),
                                     }
@@ -2843,15 +2856,18 @@ fn handle_with_clipboard(app: &mut App, pastes: &mut ClipboardPastes, event: Eve
     if let Some(pending) = &mut pastes.pending {
         if pending.route != app.clipboard_route() {
             pastes.pending = None;
-        } else if matches!(
-            event,
-            Event::Key(KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                ..
-            })
-        ) {
+            app.cancel_clipboard_placeholders();
+        } else if !app.pending_clipboard.is_empty()
+            && matches!(
+                event,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                    ..
+                })
+            )
+        {
             pending.submit = true;
             app.toast("waiting for clipboard paste before submitting");
             return Action::None;
@@ -2863,7 +2879,31 @@ fn handle_with_clipboard(app: &mut App, pastes: &mut ClipboardPastes, event: Eve
             pending.submit = false;
         }
     }
-    handle(app, event)
+    // Treat a pending marker as one composer object: insertions made after
+    // navigating inside it go after it, rather than corrupting its identity.
+    if matches!(&event, Event::Paste(_))
+        || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release
+            && matches!(key.code, KeyCode::Char(_) | KeyCode::Tab | KeyCode::Enter))
+    {
+        app.move_out_of_pending_clipboard();
+    }
+    if matches!(&event, Event::Key(key) if key.code == KeyCode::Esc
+        && key.kind != KeyEventKind::Release)
+    {
+        app.cancel_clipboard_placeholders();
+    }
+    let action = handle(app, event);
+    if pastes
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.route != app.clipboard_route())
+    {
+        pastes.pending = None;
+        app.cancel_clipboard_placeholders();
+    }
+    app.pending_clipboard
+        .retain(|placeholder| app.editor.text().contains(placeholder));
+    action
 }
 
 fn finish_clipboard_paste(
@@ -2874,7 +2914,43 @@ fn finish_clipboard_paste(
     route: ClipboardRoute,
     result: ClipboardResult,
 ) -> bool {
-    let accepted = apply_clipboard_completion(app, active, generation, route.clone(), result);
+    // The worker is FIFO. Each result replaces its own marker, not the live
+    // cursor, so edits and subsequent pastes retain their original ordering.
+    let placeholder = pastes
+        .pending
+        .as_mut()
+        .filter(|pending| pending.generation == generation && pending.route == route)
+        .and_then(|pending| pending.placeholders.pop_front());
+    let accepted = if let Some(placeholder) = placeholder {
+        app.pending_clipboard
+            .retain(|pending| pending != &placeholder);
+        if let Some(start) = app.editor.text().find(&placeholder) {
+            let cursor = app.editor.cursor();
+            let old_len = app.editor.text().len();
+            app.editor
+                .replace_range(start..start + placeholder.len(), "");
+            let accepted =
+                apply_clipboard_completion(app, active, generation, route.clone(), result);
+            let inserted = app.editor.text().len() + placeholder.len() - old_len;
+            let cursor = if cursor <= start {
+                cursor
+            } else if cursor < start + placeholder.len() {
+                start + inserted
+            } else {
+                cursor - placeholder.len() + inserted
+            };
+            app.editor.set_cursor(cursor);
+            accepted
+        } else {
+            // Already cancelled by editing; this late result is a no-op.
+            // It must not cancel a newer Enter waiting for another live paste.
+            true
+        }
+    } else if matches!(route, ClipboardRoute::Composer(_)) {
+        false
+    } else {
+        apply_clipboard_completion(app, active, generation, route.clone(), result)
+    };
     let submit = pastes.finish(generation, &route, accepted);
     if submit {
         // The deferred Enter is an explicit submission, not a pasted newline.
@@ -6145,13 +6221,13 @@ mod tests {
             else {
                 panic!("empty bracketed paste must request an image-only read");
             };
-            pastes.queued(1, route.clone());
+            pastes.queued(&mut app, 1, route.clone());
             let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             assert!(matches!(
                 super::handle_with_clipboard(&mut app, &mut pastes, enter.clone()),
                 Action::None
             ));
-            assert_eq!(app.editor.text(), "describe screenshot");
+            assert_eq!(app.editor.text(), "describe screenshot[Pasting… #1]");
             let result = if has_image {
                 ClipboardResult::Attachment(
                     clipboard_image_attachment(arboard::ImageData {
@@ -6270,7 +6346,7 @@ mod tests {
         else {
             panic!("expected clipboard request");
         };
-        pastes.queued(1, route.clone());
+        pastes.queued(app, 1, route.clone());
         route
     }
 
@@ -6295,7 +6371,7 @@ mod tests {
             super::handle_with_clipboard(&mut app, &mut pastes, enter.clone()),
             Action::None
         ));
-        assert_eq!(app.editor.text(), "describe");
+        assert_eq!(app.editor.text(), "describe[Pasting… #1][Pasting… #2]");
         let mut release = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         release.kind = crossterm::event::KeyEventKind::Release;
         super::handle_with_clipboard(&mut app, &mut pastes, Event::Key(release));
@@ -6307,7 +6383,7 @@ mod tests {
             first,
             ClipboardResult::Text(" this".into())
         ));
-        assert_eq!(app.editor.text(), "describe this");
+        assert_eq!(app.editor.text(), "describe this[Pasting… #2]");
         let attachment = clipboard_image_attachment(arboard::ImageData {
             width: 1,
             height: 1,
@@ -6370,7 +6446,7 @@ mod tests {
                 &mut pastes,
                 Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             );
-            let before = app.editor.text().to_owned();
+            let before = app.editor.text().replace("[Pasting… #1]", "");
             let result = if full {
                 ClipboardResult::Attachment(attachment)
             } else {
@@ -6412,7 +6488,8 @@ mod tests {
             );
             if switch {
                 active.lock().unwrap().generation = 2;
-                pastes.retain_current(Some(2), &app.clipboard_route());
+                let route = app.clipboard_route();
+                pastes.retain_current(&mut app, Some(2), &route);
             } else {
                 super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste(" edited".into()));
             }
@@ -6429,10 +6506,243 @@ mod tests {
                 if switch {
                     "draft"
                 } else {
-                    "draft edited pasted"
+                    "draft pasted edited"
                 }
             );
         }
+    }
+
+    #[test]
+    fn pending_clipboard_resolves_at_original_position_without_moving_live_cursor() {
+        for move_before in [false, true] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("before after");
+            app.editor.set_cursor("before ".len());
+            let route = queue_composer_paste(&mut app, &mut pastes);
+            assert_eq!(app.editor.text(), "before [Pasting… #1]after");
+            assert!(app.attachments.is_empty());
+            if move_before {
+                app.editor.move_line_start();
+            } else {
+                app.editor.move_line_end();
+            }
+            super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste("é".into()));
+            let attachment = clipboard_image_attachment(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+            })
+            .unwrap();
+            assert!(!super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                route,
+                ClipboardResult::Attachment(attachment)
+            ));
+            assert_eq!(app.attachments.len(), 1);
+            assert_eq!(
+                app.editor.text(),
+                if move_before {
+                    "ébefore [Image #1] after"
+                } else {
+                    "before [Image #1] afteré"
+                }
+            );
+            assert_eq!(
+                app.editor.cursor(),
+                if move_before {
+                    "é".len()
+                } else {
+                    app.editor.text().len()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_or_cancelling_pending_clipboard_does_not_revive_it() {
+        for key in [KeyCode::Backspace, KeyCode::Delete, KeyCode::Esc] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("draft");
+            let first = queue_composer_paste(&mut app, &mut pastes);
+            if key == KeyCode::Delete {
+                app.editor.set_cursor("draft".len());
+            }
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+            assert_eq!(app.editor.text(), "draft");
+            let second = queue_composer_paste(&mut app, &mut pastes);
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            );
+            assert!(!super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                first,
+                ClipboardResult::Text("discarded".into())
+            ));
+            assert_eq!(app.editor.text(), "draft[Pasting… #2]");
+            assert!(super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                second,
+                ClipboardResult::Text(" kept".into())
+            ));
+            assert_eq!(app.editor.text(), "draft kept");
+            assert!(app.pending_clipboard.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_clipboard_allows_submission_before_worker_returns() {
+        for key in [KeyCode::Backspace, KeyCode::Esc] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("draft");
+            let route = queue_composer_paste(&mut app, &mut pastes);
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            );
+            app.last_key = None;
+            let Action::Submit { prompt, .. } = super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ) else {
+                panic!("cancelled paste must not block submission");
+            };
+            assert_eq!(prompt.text, "draft");
+            assert!(!super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                route,
+                ClipboardResult::Text("discarded".into())
+            ));
+            assert!(app.editor.is_empty());
+        }
+    }
+
+    #[test]
+    fn shift_insert_inside_pending_clipboard_preserves_both_pastes() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let mut pastes = super::ClipboardPastes::default();
+        let active = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let first = queue_composer_paste(&mut app, &mut pastes);
+        app.editor.move_left();
+        let Action::ReadClipboard(second, _) = super::handle_with_clipboard(
+            &mut app,
+            &mut pastes,
+            Event::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT)),
+        ) else {
+            panic!("expected clipboard paste");
+        };
+        pastes.queued(&mut app, 1, second.clone());
+        assert_eq!(app.editor.text(), "[Pasting… #1][Pasting… #2]");
+        assert!(!super::finish_clipboard_paste(
+            &mut app,
+            &active,
+            &mut pastes,
+            1,
+            first,
+            ClipboardResult::Text("one".into())
+        ));
+        assert!(!super::finish_clipboard_paste(
+            &mut app,
+            &active,
+            &mut pastes,
+            1,
+            second,
+            ClipboardResult::Text("two".into())
+        ));
+        assert_eq!(app.editor.text(), "onetwo");
+    }
+
+    #[test]
+    fn typing_inside_pending_clipboard_keeps_marker_resolvable() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let mut pastes = super::ClipboardPastes::default();
+        let active = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let route = queue_composer_paste(&mut app, &mut pastes);
+        super::handle_with_clipboard(
+            &mut app,
+            &mut pastes,
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        );
+        super::handle_with_clipboard(
+            &mut app,
+            &mut pastes,
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        );
+        assert_eq!(app.editor.text(), "[Pasting… #1]x");
+        assert!(!super::finish_clipboard_paste(
+            &mut app,
+            &active,
+            &mut pastes,
+            1,
+            route,
+            ClipboardResult::Text("paste".into())
+        ));
+        assert_eq!(app.editor.text(), "pastex");
     }
 
     #[test]

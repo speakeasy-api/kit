@@ -125,7 +125,7 @@ tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
 agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
+agentkit-acp = { git = "https://github.com/daviddanialy/agentkit.git", rev = "6d519ed1e93e28e54ba1cc18889534e2e8337181" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 
@@ -146,3 +146,9 @@ todo = "deny"
 unimplemented = "deny"
 disallowed_methods = "deny"
 disallowed_macros = "deny"
+
+# Keep the media-budget fork limited to ACP; share the existing loop and registry types.
+[patch."https://github.com/daviddanialy/agentkit.git"]
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
+agentkit-core = "=0.10.5"
+agentkit-tools-core = "=0.10.5"

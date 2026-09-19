@@ -27,6 +27,13 @@ impl Editor {
         self.cursor
     }
 
+    /// Moves the cursor to a valid byte boundary without changing the draft.
+    pub fn set_cursor(&mut self, cursor: usize) {
+        if cursor <= self.text.len() && self.text.is_char_boundary(cursor) {
+            self.cursor = cursor;
+        }
+    }
+
     /// Replaces the initial slash-command token and leaves following text intact.
     pub fn replace_command_token(&mut self, replacement: &str) -> bool {
         if !self.text.starts_with('/') {
