@@ -838,6 +838,7 @@ pub struct App {
     next_attachment: usize,
     submitted_attachment: usize,
     clipboard_route_epoch: u64,
+    pub(super) pending_clipboard: Vec<String>,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
     /// When the user last started something new, as opposed to steering.
@@ -1106,6 +1107,7 @@ impl App {
             next_attachment: 0,
             submitted_attachment: 0,
             clipboard_route_epoch: 0,
+            pending_clipboard: Vec::new(),
             phase: Phase::Idle,
             turn_started: None,
             prompt_started: None,
@@ -3086,10 +3088,12 @@ impl App {
             self.editor.insert_char(' ');
         }
         self.editor.insert_str(&placeholder);
-        if after.is_none_or(|character| !character.is_whitespace()) {
-            self.editor.insert_char(' ');
-        } else {
-            self.editor.move_right();
+        if attachment.temporary.is_none() {
+            if after.is_none_or(|character| !character.is_whitespace()) {
+                self.editor.insert_char(' ');
+            } else {
+                self.editor.move_right();
+            }
         }
         attachment.placeholder = placeholder;
         self.attachments.push(attachment);
@@ -3141,7 +3145,7 @@ impl App {
     }
 
     fn delete_with_attachments(&mut self, backwards: bool, delete: fn(&mut Editor)) {
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.pending_clipboard.is_empty() {
             delete(&mut self.editor);
             return;
         }
@@ -3158,8 +3162,13 @@ impl App {
             old_cursor..old_cursor + removed
         };
         let mut expanded = deleted.clone();
-        for attachment in &self.attachments {
-            for (start, placeholder) in old_text.match_indices(&attachment.placeholder) {
+        for placeholder in self
+            .attachments
+            .iter()
+            .map(|a| &a.placeholder)
+            .chain(&self.pending_clipboard)
+        {
+            for (start, placeholder) in old_text.match_indices(placeholder) {
                 let end = start + placeholder.len();
                 let deleted_separator = backwards
                     && end == deleted.start
@@ -3198,6 +3207,39 @@ impl App {
         self.session_dialog
             .as_ref()
             .is_some_and(|dialog| dialog.rename.is_some())
+    }
+
+    pub(super) fn move_out_of_pending_clipboard(&mut self) {
+        let cursor = self.editor.cursor();
+        for placeholder in &self.pending_clipboard {
+            if let Some(start) = self.editor.text().find(placeholder)
+                && start < cursor
+                && cursor < start + placeholder.len()
+            {
+                self.editor.set_cursor(start + placeholder.len());
+                break;
+            }
+        }
+    }
+
+    pub(super) fn cancel_clipboard_placeholders(&mut self) {
+        for placeholder in self.pending_clipboard.drain(..) {
+            // A route change may have saved the composer while editing a steer.
+            for editor in std::iter::once(&mut self.editor)
+                .chain(self.steer_edit.as_mut().map(|edit| &mut edit.draft))
+            {
+                while let Some(start) = editor.text().find(&placeholder) {
+                    let end = start + placeholder.len();
+                    let cursor = editor.cursor();
+                    editor.replace_range(start..end, "");
+                    editor.set_cursor(if cursor >= end {
+                        cursor - placeholder.len()
+                    } else {
+                        cursor.min(start)
+                    });
+                }
+            }
+        }
     }
 
     pub(super) fn clipboard_route(&self) -> ClipboardRoute {
@@ -4095,6 +4137,10 @@ impl App {
                 self.toast = None;
             }
             KeyCode::Enter if key.modifiers.is_empty() && !pasted => {
+                if !self.pending_clipboard.is_empty() {
+                    self.toast("waiting for clipboard paste before submitting");
+                    return Action::None;
+                }
                 if self.editor.is_empty() {
                     return Action::None;
                 }
@@ -6479,6 +6525,30 @@ mod tests {
 
         assert_eq!(app.editor.text(), "[Image #1] ");
         assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn clipboard_image_preserves_spacing_and_leaves_cursor_at_placeholder_end() {
+        for (text, cursor, expected, expected_cursor) in [
+            ("", 0, "[Image #1]", 10),
+            ("leftright", 4, "left [Image #1]right", 15),
+            ("left", 4, "left [Image #1]", 15),
+            ("left right", 4, "left [Image #1] right", 15),
+            ("left  right", 5, "left [Image #1] right", 15),
+            ("left\n\nright", 5, "left\n[Image #1]\nright", 15),
+        ] {
+            let mut app = app();
+            app.editor.insert_str(text);
+            app.editor.set_cursor(cursor);
+            let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            app.attach_attachment(Attachment::clipboard_image(
+                crate::tui::attachment::own_temp_path(path),
+                0,
+            ));
+
+            assert_eq!(app.editor.text(), expected);
+            assert_eq!(app.editor.cursor(), expected_cursor);
+        }
     }
 
     #[test]
