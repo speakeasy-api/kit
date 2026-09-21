@@ -1140,6 +1140,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRunti
     }
 
     let width = inner.width.max(1) as usize;
+    app.viewport = inner.height as usize;
     refresh_transcript_cache_with_images(app, images, width);
     let working_rows = if app.working() {
         wrap_linked_tagged(
@@ -1368,6 +1369,19 @@ fn welcome_logo() -> Paragraph<'static> {
 /// Renders the transcript, tagging each line with the tool call it belongs to
 /// so a click on a card can be traced back to it.
 fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime, width: usize) {
+    // Resolve content/width changes before choosing the animated viewport.
+    // Otherwise a large append or replacement can move follow-bottom to cards
+    // outside the old viewport and leave them stale for a frame.
+    let refreshed = refresh_transcript_cache_pass(app, images, width, None);
+    refresh_transcript_cache_pass(app, images, width, Some(&refreshed));
+}
+
+fn refresh_transcript_cache_pass(
+    app: &mut App,
+    images: &mut ImageRuntime,
+    width: usize,
+    refreshed_content: Option<&[usize]>,
+) -> Vec<usize> {
     let structure_changed = app.transcript_revisions.len() != app.blocks.len()
         || app.transcript_cache.len() != app.blocks.len()
         || app.transcript_prefixes.len() != app.blocks.len() + 1;
@@ -1380,16 +1394,37 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         app.transcript_cache_width = width;
         app.transcript_dirty.extend(0..app.blocks.len());
     }
-    app.transcript_dirty
-        .extend(app.transcript_dynamic.iter().copied());
-    let animated_owners: std::collections::BTreeSet<_> = app
-        .transcript_dynamic
-        .iter()
-        .filter_map(|index| app.tool_owners.get(index).copied())
-        .collect();
+    // Content changes are always refreshed, but animation alone must not
+    // rebuild every running card in a long, scrolled-away transcript. Include
+    // a viewport of slack for working rows and small timer-wrap changes.
+    let total = app.transcript_prefixes.last().copied().unwrap_or(0);
+    let viewport = app.viewport.max(1);
+    let top = if app.follow {
+        total.saturating_sub(viewport)
+    } else {
+        app.scroll
+    };
+    let animated_owners: std::collections::BTreeSet<_> = if let Some(refreshed) = refreshed_content
+    {
+        app.transcript_dynamic
+            .iter()
+            .map(|index| app.tool_owners.get(index).copied().unwrap_or(*index))
+            .filter(|&index| {
+                refreshed.binary_search(&index).is_err()
+                    && app.transcript_prefixes[index + 1] > top.saturating_sub(viewport)
+                    && app.transcript_prefixes[index] < top.saturating_add(viewport * 2)
+            })
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     app.transcript_dirty.extend(animated_owners.iter().copied());
     let dirty = std::mem::take(&mut app.transcript_dirty);
     let mut first_changed_count = app.blocks.len();
+    let mut last_changed_count = 0;
+    // Dirty indices are ordered, so this remains sorted for cheap membership
+    // checks in the animation pass without allocating another tree.
+    let mut refreshed = Vec::new();
     for block_index in dirty {
         let dynamic = match &app.blocks[block_index] {
             Block::Thought { closed, .. } => !closed,
@@ -1410,17 +1445,47 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         let old_count = app.transcript_cache[block_index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
-        let (rows, cached_images) =
-            transcript_block_rows(app, block_index, width, images.enabled());
-        if missing || rows.len() != old_count {
+        let text = match &app.blocks[block_index] {
+            Block::Agent(text) => Some(text.as_str()),
+            Block::AgentParts(parts) => match parts.as_slice() {
+                [AgentPart::Text(text)] => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let cached = if let Some(text) = text {
+            let previous = app.transcript_cache[block_index]
+                .take()
+                .filter(|_| !width_changed);
+            incremental_agent_rows(
+                text,
+                block_index,
+                width,
+                images.enabled(),
+                revision,
+                previous,
+            )
+        } else {
+            let (rows, cached_images) =
+                transcript_block_rows(app, block_index, width, images.enabled());
+            CachedTranscriptBlock {
+                revision,
+                rows,
+                images: cached_images,
+                stable_prefix: String::new(),
+                prefix_rows: 0,
+                prefix_lines: 0,
+            }
+        };
+        if missing || cached.rows.len() != old_count {
             first_changed_count = first_changed_count.min(block_index);
+            last_changed_count = block_index;
             layout_changed |= !missing;
         }
-        app.transcript_cache[block_index] = Some(CachedTranscriptBlock {
-            revision,
-            rows,
-            images: cached_images,
-        });
+        app.transcript_cache[block_index] = Some(cached);
+        if refreshed_content.is_none() {
+            refreshed.push(block_index);
+        }
         if dynamic {
             app.transcript_dynamic.insert(block_index);
         } else {
@@ -1431,13 +1496,79 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
         let rows = app.transcript_cache[index]
             .as_ref()
             .map_or(0, |cached| cached.rows.len());
-        app.transcript_prefixes[index + 1] = app.transcript_prefixes[index]
+        let next = app.transcript_prefixes[index]
             + rows
             + usize::from(rows > 0 && app.transcript_prefixes[index] > 0);
+        let unchanged = next == app.transcript_prefixes[index + 1];
+        app.transcript_prefixes[index + 1] = next;
+        if index >= last_changed_count && unchanged {
+            break;
+        }
     }
     if layout_changed {
         app.clear_transcript_interaction();
     }
+    refreshed
+}
+
+/// Cache only complete, line-local source lines. The first potentially structural
+/// line and everything after it remain one renderer input: table lookahead,
+/// unfinished fences (including copy ranges), links and images retain the full
+/// renderer's semantics. Replacements and width changes safely start over.
+fn incremental_agent_rows(
+    text: &str,
+    block: usize,
+    width: usize,
+    reserve_images: bool,
+    revision: u64,
+    previous: Option<CachedTranscriptBlock>,
+) -> CachedTranscriptBlock {
+    let mut cached = previous
+        .filter(|cached| text.starts_with(&cached.stable_prefix))
+        .unwrap_or_else(|| CachedTranscriptBlock {
+            revision,
+            rows: Vec::new(),
+            images: Vec::new(),
+            stable_prefix: String::new(),
+            prefix_rows: 0,
+            prefix_lines: 0,
+        });
+    let offset = cached.stable_prefix.len();
+    let suffix = &text[offset..];
+    let mut stable_bytes = 0;
+    let mut stable_lines = 0;
+    for line in suffix.split_inclusive('\n') {
+        if !line.ends_with('\n') || line.contains(['`', '~', '|', '[']) {
+            break;
+        }
+        stable_bytes += line.len();
+        stable_lines += 1;
+    }
+    cached.rows.truncate(cached.prefix_rows);
+    let (mut rows, mut images) = agent_block_rows(suffix, block, width, reserve_images);
+    let new_prefix_rows = rows
+        .iter()
+        .take_while(|row| row.1.2.is_some_and(|line| line < stable_lines))
+        .count();
+    for row in &mut rows {
+        if let Some(hit) = &mut row.1.1 {
+            hit.range.start += offset;
+            hit.range.end += offset;
+        }
+        if let Some(line) = &mut row.1.2 {
+            *line += cached.prefix_lines;
+        }
+    }
+    for image in &mut images {
+        image.row += cached.rows.len();
+    }
+    cached.rows.extend(rows);
+    cached.images = images;
+    cached.stable_prefix.push_str(&suffix[..stable_bytes]);
+    cached.prefix_rows += new_prefix_rows;
+    cached.prefix_lines += stable_lines;
+    cached.revision = revision;
+    cached
 }
 
 fn user_block_rows(message: &UserMessage, width: usize) -> Vec<CachedTranscriptRow> {
@@ -3289,6 +3420,304 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn assert_transcript_rows_equal(
+        actual: &[super::CachedTranscriptRow],
+        expected: &[super::CachedTranscriptRow],
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.0, expected.0);
+            assert_eq!(actual.1.0, expected.1.0);
+            assert_eq!(
+                actual.1.1.as_ref().map(|hit| (hit.block, &hit.range)),
+                expected.1.1.as_ref().map(|hit| (hit.block, &hit.range))
+            );
+            assert_eq!(actual.1.2, expected.1.2);
+            assert_eq!(actual.2, expected.2);
+            assert_eq!(actual.3, expected.3);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual transcript history and streamed append performance probe"]
+    fn transcript_history_streaming_perf_probe() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "test".into(),
+            "test".into(),
+            "0:0".into(),
+        );
+        let mut images = ImageRuntime::disabled();
+        for index in 0..10_000 {
+            app.apply(Update::AgentMessage {
+                id: index.to_string(),
+                text: "Historical response.\nSecond line.".into(),
+                append: false,
+            });
+        }
+        let start = std::time::Instant::now();
+        refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+        eprintln!("history layout: {:?}", start.elapsed());
+        for size in [100, 1_000] {
+            for (name, chunk) in [
+                ("plain", "Another complete streamed line.\n"),
+                ("markdown-first", "# Heading\n- **formatted text**\n"),
+                ("unfinished-long-line", "another word "),
+                ("fenced-first-fallback", "```rust\nlet value = 1;\n"),
+            ] {
+                let mut times = Vec::new();
+                for full in [false, true] {
+                    let id = format!("probe-{name}-{size}-{full}");
+                    app.apply(Update::AgentMessage {
+                        id: id.clone(),
+                        text: chunk.repeat(size),
+                        append: false,
+                    });
+                    refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+                    let index = app.blocks.len() - 1;
+                    let start = std::time::Instant::now();
+                    for _ in 0..100 {
+                        app.apply(Update::AgentMessage {
+                            id: id.clone(),
+                            text: chunk.into(),
+                            append: true,
+                        });
+                        if full {
+                            // Use the production full renderer on the same warmed source.
+                            std::hint::black_box(super::transcript_block_rows(
+                                &app, index, 80, false,
+                            ));
+                        } else {
+                            refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+                        }
+                    }
+                    times.push(start.elapsed());
+                }
+                eprintln!(
+                    "warm append {name} initial_chunks={size}: cached={:?}, full={:?}",
+                    times[0], times[1]
+                );
+            }
+        }
+        let start = std::time::Instant::now();
+        refresh_transcript_cache_with_images(&mut app, &mut images, 40);
+        eprintln!("history resize: {:?}", start.elapsed());
+        for index in 0..100 {
+            app.apply(Update::ToolStarted {
+                id: format!("animated-{index}"),
+                title: "compose".into(),
+                kind: ToolKind::Other,
+                script: Some("value = 1\n".repeat(30)),
+                backgrounded: true,
+            });
+        }
+        app.viewport = 24;
+        refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+        for dirty in [false, true] {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                if dirty {
+                    app.apply(Update::ToolPatched {
+                        id: "animated-99".into(),
+                        title: None,
+                        kind: None,
+                        status: None,
+                        script: None,
+                        output: Some(vec!["more output".into()]),
+                        images: None,
+                        append_output: true,
+                        intent: None,
+                        backgrounded: false,
+                    });
+                }
+                refresh_transcript_cache_with_images(&mut app, &mut images, 80);
+            }
+            eprintln!(
+                "100 running cards, 100 draws, visible_content_dirty={dirty}: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_cards_refresh_on_first_draw_scroll_and_follow_after_replacement() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "test".into(),
+            "test".into(),
+            "0:0".into(),
+        );
+        for (id, title) in [("owner", "compose"), ("child", "shell")] {
+            app.apply(Update::ToolStarted {
+                id: id.into(),
+                title: title.into(),
+                kind: ToolKind::Other,
+                script: Some("return 1".into()),
+                backgrounded: false,
+            });
+        }
+        app.apply(Update::ToolParent {
+            id: "child".into(),
+            parent: Some("owner".into()),
+        });
+        for block in &mut app.blocks {
+            if let Block::Tool(call) = block {
+                call.started = std::time::Instant::now() - Duration::from_secs(100);
+            }
+        }
+        app.apply(Update::AgentMessage {
+            id: "long".into(),
+            text: "history\n".repeat(100),
+            append: false,
+        });
+        let _ = render(&mut app, 40, 16);
+        assert!(app.transcript_cache[1].as_ref().unwrap().rows.is_empty());
+        app.apply(Update::ToolPatched {
+            id: "child".into(),
+            title: None,
+            kind: None,
+            status: None,
+            script: None,
+            output: Some(vec!["updated while offscreen".into()]),
+            images: None,
+            append_output: true,
+            intent: None,
+            backgrounded: false,
+        });
+        let _ = render(&mut app, 40, 16);
+        // Scroll to the owner through the same draw path used by the terminal.
+        app.follow = false;
+        app.scroll = 0;
+        let screen = render(&mut app, 40, 16);
+        assert!(screen.contains("Running tools"), "{screen}");
+        app.apply(Update::ToolPatched {
+            id: "owner".into(),
+            title: Some("Updated owner".into()),
+            kind: None,
+            status: None,
+            script: None,
+            output: None,
+            images: None,
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+        let screen = render(&mut app, 40, 16);
+        assert!(screen.contains("Updated owner"), "{screen}");
+        assert_transcript_rows_equal(
+            &app.transcript_cache[0].as_ref().unwrap().rows,
+            &super::transcript_block_rows(&app, 0, app.transcript_cache_width, false).0,
+        );
+        app.follow = true;
+        app.apply(Update::AgentMessage {
+            id: "long".into(),
+            text: "short".into(),
+            append: false,
+        });
+        let screen = render(&mut app, 40, 16);
+        assert!(screen.contains("short"), "{screen}");
+        assert_transcript_rows_equal(
+            &app.transcript_cache[0].as_ref().unwrap().rows,
+            &super::transcript_block_rows(&app, 0, app.transcript_cache_width, false).0,
+        );
+        assert!(app.transcript_cache[1].as_ref().unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn running_thought_width_and_elapsed_reflow_matches_full_layout() {
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "test".into(),
+            "test".into(),
+            "0:0".into(),
+        );
+        app.apply(Update::AgentThought {
+            id: "thought".into(),
+            text: "reasoning text".into(),
+            append: true,
+        });
+        for width in [40, 18, 40] {
+            if let Block::Thought { started, .. } = &mut app.blocks[0] {
+                *started = std::time::Instant::now() - Duration::from_secs(100);
+            }
+            let _ = render(&mut app, width, 16);
+            assert_transcript_rows_equal(
+                &app.transcript_cache[0].as_ref().unwrap().rows,
+                &super::transcript_block_rows(&app, 0, app.transcript_cache_width, false).0,
+            );
+            assert_eq!(
+                app.transcript_prefixes.last().copied(),
+                Some(app.transcript_cache[0].as_ref().unwrap().rows.len())
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_layout_matches_full_renderer_across_structural_suffixes() {
+        for reserve_images in [false, true] {
+            for suffix in [
+                "more plain text\nlast line",
+                "# Heading\n- **bold item**\n1. Ordered item\n> quoted text\nend",
+                "| column | value |\n| --- | --- |\n| a | longer value |",
+                "```rust\nlet x = 1;\n```\nafter",
+                "~~~\nunfinished code\nmore",
+                "[linked words](https://example.com) ![plot](plot.png) end",
+                "![multiline\nalt](plot.png) after\nmore",
+                "[multiline\nlink](https://example.com) after",
+                "**bold** and `inline`\nnext",
+            ] {
+                let mut app = App::new(
+                    PathBuf::from("/tmp/kit"),
+                    "test".into(),
+                    "test".into(),
+                    "0:0".into(),
+                );
+                let mut images = if reserve_images {
+                    ImageRuntime::with_picker(Picker::halfblocks())
+                } else {
+                    ImageRuntime::disabled()
+                };
+                let source = format!("Stable prose with unicode café.\nAnother line.\n{suffix}");
+                for ch in source.chars() {
+                    app.apply(Update::AgentMessage {
+                        id: "stream".into(),
+                        text: ch.to_string(),
+                        append: true,
+                    });
+                    refresh_transcript_cache_with_images(&mut app, &mut images, 19);
+                    let (expected, placements) =
+                        super::transcript_block_rows(&app, 0, 19, reserve_images);
+                    let cached = app.transcript_cache[0].as_ref().unwrap();
+                    assert_transcript_rows_equal(&cached.rows, &expected);
+                    assert_eq!(
+                        cached
+                            .images
+                            .iter()
+                            .map(|p| (p.row, &p.destination))
+                            .collect::<Vec<_>>(),
+                        placements
+                            .iter()
+                            .map(|p| (p.row, &p.destination))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                // Both resizing and replacement must discard incompatible prefixes.
+                for (text, width) in [(source.as_str(), 9), ("Replacement\n```\ncode", 9)] {
+                    app.apply(Update::AgentMessage {
+                        id: "stream".into(),
+                        text: text.into(),
+                        append: false,
+                    });
+                    refresh_transcript_cache_with_images(&mut app, &mut images, width);
+                    assert_transcript_rows_equal(
+                        &app.transcript_cache[0].as_ref().unwrap().rows,
+                        &super::transcript_block_rows(&app, 0, width, reserve_images).0,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5416,6 +5845,56 @@ mod tests {
     }
 
     #[test]
+    fn replacing_code_before_next_frame_invalidates_old_copy_targets() {
+        use crossterm::event::MouseButton;
+        let mut app = App::new(
+            PathBuf::from("/tmp/kit"),
+            "test".into(),
+            "test".into(),
+            "0:0".into(),
+        );
+        app.apply(Update::AgentMessage {
+            id: "code".into(),
+            text: "```\nold code\n```".into(),
+            append: false,
+        });
+        let _ = render(&mut app, 80, 24);
+        let row = app.row_code.iter().position(Option::is_some).unwrap();
+        app.apply(Update::AgentMessage {
+            id: "code".into(),
+            text: "```\nnew code\n```".into(),
+            append: false,
+        });
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let action = app.handle_mouse(MouseEvent {
+                kind,
+                column: app.transcript_left as u16,
+                row: (app.transcript_top + row) as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(!matches!(action, Action::Copy(_)));
+        }
+        let _ = render(&mut app, 80, 24);
+        let row = app.row_code.iter().position(Option::is_some).unwrap();
+        let mut action = Action::None;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            action = app.handle_mouse(MouseEvent {
+                kind,
+                column: app.transcript_left as u16,
+                row: (app.transcript_top + row) as u16,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert!(matches!(action, Action::Copy(text) if text == "new code"));
+    }
+
+    #[test]
     fn clicking_a_code_block_copies_exact_content() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -6028,7 +6507,7 @@ mod tests {
         refresh_transcript_cache(&mut app, 12);
         let history_rows = app.transcript_cache[0].as_ref().unwrap().rows.as_ptr();
         let history_revision = app.transcript_cache[0].as_ref().unwrap().revision;
-        let tail_rows = app.transcript_cache[99].as_ref().unwrap().rows.as_ptr();
+        let tail_revision = app.transcript_cache[99].as_ref().unwrap().revision;
 
         app.apply(Update::test_text(" changed".into()));
         refresh_transcript_cache(&mut app, 12);
@@ -6037,8 +6516,8 @@ mod tests {
         assert_eq!(history.rows.as_ptr(), history_rows);
         assert_eq!(history.revision, history_revision);
         assert_ne!(
-            app.transcript_cache[99].as_ref().unwrap().rows.as_ptr(),
-            tail_rows
+            app.transcript_cache[99].as_ref().unwrap().revision,
+            tail_revision
         );
         let tail = app.transcript_cache[99].as_ref().unwrap();
         let text = tail

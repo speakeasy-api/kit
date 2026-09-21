@@ -15,6 +15,7 @@ mod image;
 #[cfg(all(test, unix))]
 mod keyboard_tests;
 mod markdown;
+mod scheduler;
 mod source;
 mod startup;
 
@@ -1851,6 +1852,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     Background(Option<BackgroundCompletion>),
                     Update(Option<QueuedUpdate>),
                     Tick,
+                    Frame,
                     Stop,
                 }
                 let mut next_priority = 0;
@@ -1859,6 +1861,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
                 let mut child_read: Option<ChildTranscriptRead> = None;
+                let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
                     let target = app.child_read_target().map(|target| (session_id.to_string(), target));
                     if child_read.as_ref().is_some_and(|read| Some(&read.target) != target.as_ref()) {
@@ -1892,18 +1895,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         &app.clipboard_route(),
                     );
                     if let Some(queued) = pending_update.take() {
-                        match background_workers.try_update(queued) {
-                            Ok(()) => {}
-                            Err(error) => match *error {
-                                std::sync::mpsc::TrySendError::Full(queued) => {
-                                    pending_update = Some(queued);
-                                }
-                                std::sync::mpsc::TrySendError::Disconnected(_) => return Ok(()),
-                            },
-                        }
+                        pending_update = match scheduler::forward_updates(
+                            &background_workers, &mut updates_rx, queued,
+                        ) {
+                            Ok(pending) => pending,
+                            Err(()) => return Ok(()),
+                        };
                     }
-                    draw_frame(&mut terminal, &mut app, &mut images)
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    if frames.ready(tokio::time::Instant::now()) {
+                        draw_frame(&mut terminal, &mut app, &mut images)
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        frames.drawn(tokio::time::Instant::now());
+                    }
                     let event = if std::mem::take(&mut submit_after_paste) {
                         SessionEvent::Terminal(Some(Ok(Event::Key(KeyEvent::new(
                             KeyCode::Enter,
@@ -1911,6 +1914,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         )))))
                     } else {
                         let redraw = app.needs_redraw_tick() || images.pending();
+                        let frame_deadline = frames.deadline();
+                        let mut frame = pin!(tokio::time::sleep_until(
+                            frame_deadline.unwrap_or_else(tokio::time::Instant::now),
+                        ));
                         let mut stopped = pin!(stop.requested());
                         let mut shutdown = pin!(storage_shutdown.cancelled());
                         // A local round-robin race keeps hot input/update queues
@@ -1921,7 +1928,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         // until this wait ends. This scope drops all losers and
                         // releases input borrows before handlers drain/reset them.
                         poll_fn(|cx| {
-                            let sources = 9;
+                            let sources = 10;
                             for offset in 0..sources {
                                 let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
@@ -1946,6 +1953,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     8 => child_read.as_mut().map_or(Poll::Pending, |read| {
                                         read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
                                     }),
+                                    9 if frame_deadline.is_some() => frame.as_mut().poll(cx).map(|()| SessionEvent::Frame),
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
@@ -1956,6 +1964,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             Poll::Pending
                         }).await
                     };
+                    // Invalidate before handlers: early `continue`s can also mutate
+                    // visible state. Worker forwarding alone never requests a frame.
+                    if matches!(&event, SessionEvent::Terminal(_) | SessionEvent::Voice(_)
+                        | SessionEvent::ModelSwitch(_) | SessionEvent::Tick) {
+                        frames.invalidate();
+                    }
                     match event {
 
                         SessionEvent::ChildTranscript(result) => {
@@ -2026,12 +2040,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             // instead of one frame per character.
                             let mut next = terminal_event;
                             let mut action = Action::None;
-                            for _ in 0..MAX_BURST {
+                            for index in 0..MAX_BURST {
                                 match next {
                                     Some(Ok(event)) => action = handle_with_clipboard(&mut app, &mut clipboard_pastes, event),
                                     Some(Err(_)) | None => return Ok(()),
                                 }
-                                if !matches!(action, Action::None) {
+                                if !matches!(action, Action::None) || index + 1 == MAX_BURST {
                                     break;
                                 }
                                 // `EventStream::next().now_or_never()` polls with a noop
@@ -2602,25 +2616,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         SessionEvent::Background(completion) => match completion {
-                            Some(BackgroundCompletion::Update { queued, images }) => {
-                                if let Some(update) = accept_queued_update(&transition_session, queued) {
-                                    if let Update::ConfigOptions(options) = &update {
-                                        refresh_config_state(&mut app, Some(options));
-                                    }
-
-                                    voice.observe(&update, &mut app);
-                                    app.apply_materialized(update, images);
-                                }
-                            }
-                            Some(BackgroundCompletion::Clipboard { generation, route, result }) => {
-                                submit_after_paste = finish_clipboard_paste(
-                                    &mut app,
-                                    &transition_session,
-                                    &mut clipboard_pastes,
-                                    generation,
-                                    route,
-                                    result,
+                            Some(completion) => {
+                                let applied = scheduler::apply_completions(
+                                    &mut app, &transition_session, &mut voice,
+                                    &mut clipboard_pastes, &mut background_rx, completion,
                                 );
+                                if applied.dirty {
+                                    frames.invalidate();
+                                }
+                                submit_after_paste = applied.submit_after_paste;
                             }
                             None => return Ok(()),
                         },
@@ -2656,17 +2660,17 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                         },
                         SessionEvent::Update(update) => match update {
-                            Some(update) => match background_workers.try_update(update) {
-                                Ok(()) => {}
-                                Err(error) => match *error {
-                                    std::sync::mpsc::TrySendError::Full(update) => {
-                                        pending_update = Some(update);
-                                    }
-                                    std::sync::mpsc::TrySendError::Disconnected(_) => return Ok(()),
-                                },
-                            },
+                            Some(update) => {
+                                pending_update = match scheduler::forward_updates(
+                                    &background_workers, &mut updates_rx, update,
+                                ) {
+                                    Ok(pending) => pending,
+                                    Err(()) => return Ok(()),
+                                };
+                            }
                             None => return Ok(()),
                         },
+                        SessionEvent::Frame => {},
                         SessionEvent::Tick => app.tick(),
                         SessionEvent::Stop => return Ok(()),
                     }

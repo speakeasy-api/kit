@@ -699,6 +699,9 @@ pub(super) struct CachedTranscriptBlock {
     pub revision: u64,
     pub rows: Vec<CachedTranscriptRow>,
     pub images: Vec<CachedTranscriptImage>,
+    pub stable_prefix: String,
+    pub prefix_rows: usize,
+    pub prefix_lines: usize,
 }
 
 /// What the client is doing right now.
@@ -1325,6 +1328,13 @@ impl App {
     }
 
     fn mark_block_dirty(&mut self, index: usize) {
+        // Hit ranges describe the last presented frame, not the newly mutated
+        // source. Only inspect the bounded viewport; preserve selection state.
+        for hit in &mut self.row_code {
+            if hit.as_ref().is_some_and(|hit| hit.block == index) {
+                *hit = None;
+            }
+        }
         if let Some(&owner) = self.tool_owners.get(&index) {
             self.mark_block_dirty(owner);
         }
@@ -1714,13 +1724,17 @@ impl App {
                 _ => Vec::new(),
             })
             .unwrap_or_default();
-        let previous_text = previous
-            .iter()
-            .filter_map(|part| match part {
-                AgentPart::Text(text) => Some(text.as_str()),
-                AgentPart::Image(_) => None,
-            })
-            .collect::<String>();
+        let previous_text = if append {
+            String::new()
+        } else {
+            previous
+                .iter()
+                .filter_map(|part| match part {
+                    AgentPart::Text(text) => Some(text.as_str()),
+                    AgentPart::Image(_) => None,
+                })
+                .collect::<String>()
+        };
         if !append {
             let released = previous
                 .iter()
@@ -1891,7 +1905,12 @@ impl App {
             match (&mut self.blocks[index], role) {
                 (Block::User(existing), MessageRole::User) => {
                     if append {
-                        let last_line = existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        let last_line = if existing.images.is_empty() && images.is_empty() {
+                            0
+                        } else {
+                            existing.text.bytes().filter(|&byte| byte == b'\n').count()
+                        };
+                        let mut line_offset = last_line;
                         let follows_image =
                             existing.images.iter().any(|image| image.line == last_line);
                         let starts_image = !images.is_empty();
@@ -1902,9 +1921,8 @@ impl App {
                             && (follows_image || starts_image)
                         {
                             existing.text.push('\n');
+                            line_offset += 1;
                         }
-                        let line_offset =
-                            existing.text.bytes().filter(|&byte| byte == b'\n').count();
                         let byte_offset = existing.text.len();
                         existing.text.push_str(&text);
                         for image in &mut images {
@@ -2025,17 +2043,17 @@ impl App {
         let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
         self.compacting = false;
-        let inherited_background: HashSet<_> = self
-            .tool_indices
-            .values()
-            .filter_map(|&child| self.has_background_ancestor(child).then_some(child))
-            .collect();
+        // Only running calls can need terminalization. Historical calls cannot
+        // change here, and need not walk their ancestor chains again.
+        let candidates: Vec<_> = self.transcript_dynamic.iter().copied().collect();
         let mut finished = Vec::new();
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            if let Block::Tool(call) = block
+        for index in candidates {
+            if self.has_background_ancestor(index) {
+                continue;
+            }
+            if let Block::Tool(call) = &mut self.blocks[index]
                 && call.running()
                 && !call.backgrounded
-                && !inherited_background.contains(&index)
             {
                 call.status = if successful {
                     ToolCallStatus::Completed
@@ -2067,9 +2085,11 @@ impl App {
 
     /// Top-level calls that detached from their turn and are still running.
     pub fn background_calls(&self) -> Vec<&ToolCall> {
-        self.blocks
+        // The ordered dynamic index includes every running call, including
+        // detached calls; preserve transcript order without scanning history.
+        self.transcript_dynamic
             .iter()
-            .filter_map(|block| match block {
+            .filter_map(|&index| match &self.blocks[index] {
                 Block::Tool(call)
                     if call.parent_id.is_none() && call.backgrounded && call.running() =>
                 {
@@ -8411,6 +8431,83 @@ mod tests {
     }
 
     #[test]
+    fn user_appends_preserve_image_lines_and_label_byte_ranges() {
+        let mut app = app();
+        for (text, image_line) in [
+            ("α\nbeta", None),
+            (" plus", None),
+            ("[Image #1]", Some(0)),
+            ("after", None),
+            ("\n[Image #2]", Some(1)),
+        ] {
+            app.apply(Update::UserMessage {
+                id: "user-stream".into(),
+                text: text.into(),
+                append: true,
+                images: image_line
+                    .map(|line| UserImage::new("AQID".into(), "image/png".into(), line).unwrap())
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        let Block::User(message) = &app.blocks[0] else {
+            panic!("user");
+        };
+        assert_eq!(message.text, "α\nbeta plus\n[Image #1]\nafter\n[Image #2]");
+        assert_eq!(
+            message
+                .images
+                .iter()
+                .map(|image| image.line)
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        for (image, label) in message.images.iter().zip(["[Image #1]", "[Image #2]"]) {
+            assert_eq!(&message.text[image.open_label.clone().unwrap()], label);
+        }
+    }
+
+    #[test]
+    fn multipart_append_then_replacement_preserves_source_and_releases_images() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        app.apply(Update::AgentParts {
+            id: "parts".into(),
+            parts: vec![
+                AgentPart::Text("before".into()),
+                AgentPart::Image(image),
+                AgentPart::Text("after".into()),
+            ],
+        });
+        app.apply(Update::AgentMessage {
+            id: "parts".into(),
+            text: " appended".into(),
+            append: true,
+        });
+        assert_eq!(
+            app.latest_agent_text().as_deref(),
+            Some("beforeafter appended")
+        );
+        assert_eq!(app.retained_image_source_bytes, 4);
+        let Block::AgentParts(parts) = &app.blocks[0] else {
+            panic!("parts");
+        };
+        assert!(matches!(parts.last(), Some(AgentPart::Text(text)) if text == "after appended"));
+        app.apply(Update::AgentParts {
+            id: "parts".into(),
+            parts: vec![AgentPart::Text("replacement".into())],
+        });
+        assert_eq!(app.latest_agent_text().as_deref(), Some("replacement"));
+        assert_eq!(app.retained_image_source_bytes, 0);
+        app.apply(Update::AgentMessage {
+            id: "parts".into(),
+            text: " tail".into(),
+            append: true,
+        });
+        assert_eq!(app.latest_agent_text().as_deref(), Some("replacement tail"));
+    }
+
+    #[test]
     fn assistant_images_complete_upsert_replaces_stream_and_shrinks_in_place() {
         let mut app = app();
         let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
@@ -10419,6 +10516,60 @@ mod tests {
             assert_eq!(child.output, ["cancelled", "late output"]);
             assert!(!child.backgrounded);
             assert!(app.transcript_dirty.contains(&0));
+        }
+
+        #[test]
+        fn finish_turn_only_terminalizes_active_foreground_calls() {
+            for successful in [false, true] {
+                let mut app = app();
+                app.phase = Phase::Working;
+                start(&mut app, "historical", false, false);
+                patch(&mut app, "historical", Some(ToolCallStatus::Failed), "old");
+                start(&mut app, "foreground", true, false);
+                start(&mut app, "foreground-child", false, false);
+                parent(&mut app, "foreground-child", "foreground");
+                start(&mut app, "detached-completed", true, true);
+                start(&mut app, "middle", true, false);
+                parent(&mut app, "middle", "detached-completed");
+                start(&mut app, "leaf", false, false);
+                parent(&mut app, "leaf", "middle");
+                patch(
+                    &mut app,
+                    "detached-completed",
+                    Some(ToolCallStatus::Completed),
+                    "done",
+                );
+                start(&mut app, "background-a", true, true);
+                start(&mut app, "background-b", false, true);
+                app.finish_turn_with_outcome(successful, None);
+                let expected = if successful {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                for id in ["foreground", "foreground-child"] {
+                    assert_eq!(call(&app, id).status, expected);
+                    assert!(call(&app, id).finished.is_some());
+                }
+                assert_eq!(call(&app, "historical").status, ToolCallStatus::Failed);
+                assert_eq!(
+                    call(&app, "detached-completed").status,
+                    ToolCallStatus::Completed
+                );
+                for id in ["middle", "leaf", "background-a", "background-b"] {
+                    assert!(call(&app, id).running(), "{id}");
+                }
+                assert_eq!(
+                    app.background_calls()
+                        .iter()
+                        .map(|call| call.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["background-a", "background-b"]
+                );
+                // Repeated idle terminal events cannot change inherited work.
+                app.finish_turn_with_outcome(!successful, None);
+                assert!(call(&app, "leaf").running());
+            }
         }
 
         #[test]
