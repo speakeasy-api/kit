@@ -504,6 +504,7 @@ impl std::fmt::Display for LogoutAuthenticationError {
 }
 
 pub struct Runtime {
+    eval: Option<crate::tools::EvalTool>,
     root: PathBuf,
     adapter: SelectableAdapter,
     provider: ProviderKind,
@@ -622,6 +623,7 @@ impl Runtime {
             max_subagent_depth,
         );
         Ok(Arc::new(Self {
+            eval: None,
             root,
             adapter,
             provider,
@@ -746,6 +748,20 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
+        Ok(Arc::new(runtime))
+    }
+
+    /// Enables evaluation only after explicit user opt-in and credential resolution.
+    pub fn with_eval(runtime: Arc<Self>, enabled: bool) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure evaluation after runtime was shared".to_string())?;
+        runtime.eval = if crate::tools::EvalTool::available(enabled, &runtime.credential_storage) {
+            Some(crate::tools::EvalTool::new(
+                runtime.credential_storage.clone(),
+            ))
+        } else {
+            None
+        };
         Ok(Arc::new(runtime))
     }
 
@@ -1219,6 +1235,9 @@ impl Runtime {
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())).with_root(self.root.clone()));
+        if let Some(eval) = &self.eval {
+            children.register(Observed::new(eval.clone()));
+        }
         if depth < self.max_subagent_depth {
             children
                 .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))

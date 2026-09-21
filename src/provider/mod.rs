@@ -3,6 +3,10 @@ pub mod chatgpt;
 pub(crate) mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
+pub(crate) mod typesafe_auth;
+
+#[doc(hidden)]
+pub use typesafe_auth::{TypeSafeAuthCommand, execute_typesafe_auth};
 
 pub(crate) use adapter::authentication_method_id;
 pub use adapter::{

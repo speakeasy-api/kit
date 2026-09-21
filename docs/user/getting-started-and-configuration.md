@@ -87,6 +87,36 @@ kit prompt --provider openrouter \
 
 Kit uses the CLI or TOML `model`; `OPENROUTER_MODEL` does not override that selection. The adapter also accepts `OPENROUTER_BASE_URL`, `OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`, `OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT`. Its model-catalog lookup for the selected model's context length is best-effort, so a catalog failure does not by itself prevent normal provider usage.
 
+### TypeSafe API key
+
+TypeSafe authentication is BYOK (bring your own key). Create a key at
+<https://console.typesafe.ai/keys>, then enter it at the hidden terminal prompt:
+
+```sh
+kit auth login typesafe --credential-store keychain
+kit auth status typesafe --credential-store keychain
+kit auth logout typesafe --credential-store keychain
+```
+
+Use the same storage option for all three commands. You can instead
+use `--credential-store file --credential-dir /path/to/private-directory`.
+Login requires `keychain` or `file` to save your key. Enter the key only at the
+hidden prompt, not in command-line arguments or `config.toml`.
+
+Status gives a nonempty `TYPESAFE_API_KEY` environment variable precedence over a
+stored key; an empty variable does not override stored credentials. Login still
+prompts and saves a key when the variable is set, and warns about this precedence.
+Login checks the key with TypeSafe before saving it, without running inference
+or incurring inference charges. If authentication fails, your previously saved
+key is unchanged. Successful login confirms authentication. Status reports
+whether a key is configured; it does not check whether that key is still valid.
+
+Logout removes only the stored key and warns if `TYPESAFE_API_KEY` remains active.
+Revoke the key separately at <https://console.typesafe.ai/keys>; `--local-only`
+suppresses that reminder. These commands manage credentials only: TypeSafe is not
+a model provider, and this does not enable Jev inference, compaction, filtering,
+or behavior configuration.
+
 ### Speakeasy AI Control Plane
 
 Sign in through the Speakeasy dashboard, then use the same persistent credential
@@ -369,3 +399,10 @@ or task deadline.
 The setting is resolved once per Kit process. Native Kit ACP children and the
 TUI's Kit server receive the exact resolved value as a CLI argument, for both
 new and resumed sessions; their local TOML cannot override it.
+
+### Experimental evaluations
+
+`experimental.eval` defaults to `false`. Enable it in your user configuration to
+ask named classification, scoring, and yes/no questions with TypeSafe. A TypeSafe
+key is also required. Each call shares its supplied content with TypeSafe and
+uses your quota. See [Evaluations](evaluations.md) for setup, examples, and limits.
