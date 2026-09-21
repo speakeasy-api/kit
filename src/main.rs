@@ -458,7 +458,7 @@ impl AuthAction {
     fn augment_command(command: clap::Command) -> clap::Command {
         let command = command.subcommand({
             let command = clap::Command::new("login")
-                .about("Authenticate a model provider in the configured credential store");
+                .about("Authenticate a service in the configured credential store");
             let command = command.group(
                 clap::ArgGroup::new("Login")
                     .multiple(true)
@@ -473,8 +473,7 @@ impl AuthAction {
             )
         });
         let command = command.subcommand({
-            let command =
-                clap::Command::new("status").about("Show model-provider authentication status");
+            let command = clap::Command::new("status").about("Show service authentication status");
             let command = command.group(
                 clap::ArgGroup::new("Status")
                     .multiple(true)
@@ -490,7 +489,7 @@ impl AuthAction {
         });
         command.subcommand({
             let command = clap::Command::new("logout")
-                .about("Remove model-provider credentials, revoking them when supported");
+                .about("Remove service credentials, revoking them when supported");
             let command = command.group(
                 clap::ArgGroup::new("Logout")
                     .multiple(true)
@@ -1246,13 +1245,19 @@ impl ValueEnum for AcpProtocolVersion {
 
 impl ValueEnum for AuthProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Openai, Self::Openrouter, Self::Speakeasy]
+        &[
+            Self::Openai,
+            Self::Openrouter,
+            Self::Speakeasy,
+            Self::Typesafe,
+        ]
     }
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         Some(clap::builder::PossibleValue::new(match self {
             Self::Openai => "openai",
             Self::Openrouter => "openrouter",
             Self::Speakeasy => "speakeasy",
+            Self::Typesafe => "typesafe",
         }))
     }
 }
@@ -1314,7 +1319,6 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
-    #[cfg(feature = "tui")]
     #[serde(default, deserialize_with = "deserialize_experimental_config")]
     experimental: ExperimentalConfig,
     request_budget_seconds: Option<kit::request_budget::RequestBudget>,
@@ -1344,7 +1348,6 @@ struct Config {
     config_path: Option<PathBuf>,
 }
 
-#[cfg(feature = "tui")]
 fn deserialize_experimental_config<'de, D>(deserializer: D) -> Result<ExperimentalConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1353,9 +1356,11 @@ where
     table.try_into().map_err(serde::de::Error::custom)
 }
 
-#[cfg(feature = "tui")]
 #[derive(Debug, Default, Deserialize)]
 struct ExperimentalConfig {
+    #[serde(default)]
+    eval: bool,
+    #[cfg(feature = "tui")]
     #[serde(default)]
     voice: bool,
 }
@@ -1578,24 +1583,15 @@ enum AuthProvider {
     Openai,
     Openrouter,
     Speakeasy,
-}
-
-impl AuthProvider {
-    const fn provider_kind(self) -> kit::ProviderKind {
-        match self {
-            Self::Openai => kit::ProviderKind::OpenAiSubscription,
-            Self::Openrouter => kit::ProviderKind::OpenRouter,
-            Self::Speakeasy => kit::ProviderKind::Speakeasy,
-        }
-    }
+    Typesafe,
 }
 
 enum AuthAction {
-    /// Authenticate a model provider in the configured credential store.
+    /// Authenticate a service in the configured credential store.
     Login { provider: AuthProvider },
-    /// Show model-provider authentication status.
+    /// Show service authentication status.
     Status { provider: AuthProvider },
-    /// Remove model-provider credentials, revoking them when supported.
+    /// Remove service credentials, revoking them when supported.
     Logout {
         provider: AuthProvider,
         /// Remove local credentials without attempting remote revocation.
@@ -1831,6 +1827,7 @@ async fn execute_auth(
         OpenAi(kit::provider::OpenAiAuthCommand),
         OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
+        TypeSafe(kit::provider::TypeSafeAuthCommand),
         Logout(kit::ProviderKind, bool),
     }
     let command = match action {
@@ -1842,6 +1839,9 @@ async fn execute_auth(
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Login)
             }
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Login)
+            }
         },
         AuthAction::Status { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
@@ -1851,11 +1851,27 @@ async fn execute_auth(
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Status)
             }
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Status)
+            }
         },
         AuthAction::Logout {
             provider,
             local_only,
-        } => Execution::Logout(provider.provider_kind(), *local_only),
+        } => match provider {
+            AuthProvider::Openai => {
+                Execution::Logout(kit::ProviderKind::OpenAiSubscription, *local_only)
+            }
+            AuthProvider::Openrouter => {
+                Execution::Logout(kit::ProviderKind::OpenRouter, *local_only)
+            }
+            AuthProvider::Speakeasy => Execution::Logout(kit::ProviderKind::Speakeasy, *local_only),
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Logout {
+                    local_only: *local_only,
+                })
+            }
+        },
     };
     let output = tokio::task::spawn_blocking(move || match command {
         Execution::OpenAi(command) => kit::provider::execute_openai_auth(command, &storage),
@@ -1867,6 +1883,7 @@ async fn execute_auth(
                 .map(|(key, source)| (key, *source)),
         ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
+        Execution::TypeSafe(command) => kit::provider::execute_typesafe_auth(command, &storage),
         Execution::Logout(provider, local_only) => kit::provider::execute_provider_logout(
             provider,
             &storage,
@@ -2194,6 +2211,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -2291,6 +2309,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
@@ -2358,6 +2377,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?;
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -2536,6 +2556,31 @@ mod tests {
             .to_string();
         assert!(help.contains("--resume [<RESUME>]"));
         assert!(help.contains("session picker without an ID"));
+    }
+
+    #[test]
+    fn config_experimental_eval_defaults_strict_and_writer() {
+        assert!(!Config::default().experimental.eval);
+        for (text, expected) in [
+            ("", false),
+            ("[experimental]", false),
+            ("[experimental]\neval = true", true),
+            ("[experimental]\neval = false", false),
+            ("[experimental]\nfuture = true", false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(Config::load(&path).unwrap().experimental.eval, expected);
+            kit::config_editor::set(&path, "experimental.eval", "true").unwrap();
+            assert!(Config::load(&path).unwrap().experimental.eval);
+            kit::config_editor::unset(&path, "experimental.eval").unwrap();
+            assert!(!Config::load(&path).unwrap().experimental.eval);
+        }
+        for value in ["'true'", "1", "[]", "{}"] {
+            let text = format!("[experimental]\neval = {value}");
+            assert!(toml::from_str::<Config>(&text).is_err());
+        }
     }
 
     #[cfg(feature = "tui")]
@@ -3847,6 +3892,15 @@ future_option = true
 
     #[test]
     fn auth_commands_parse_without_runtime_arguments() {
+        for action in ["login", "status", "logout"] {
+            assert!(Cli::try_parse_from(["kit", "auth", action, "typesafe"]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "typesafe", "--local-only"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kit", "auth", "login", "typesafe", "--api-key", "secret"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["kit", "prompt", "--provider", "typesafe", "hello"]).is_err());
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openai"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -3891,6 +3945,7 @@ future_option = true
             AuthProvider::Openai,
             AuthProvider::Openrouter,
             AuthProvider::Speakeasy,
+            AuthProvider::Typesafe,
         ] {
             let login = AuthAction::Login { provider };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
