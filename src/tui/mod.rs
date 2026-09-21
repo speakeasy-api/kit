@@ -3327,16 +3327,21 @@ fn draw_frame<W: std::io::Write>(
 ) -> std::io::Result<()> {
     hyperlinks::draw(terminal, |frame| {
         ui::draw(frame, app, images);
-        let app = app
+        // Child views render no overlays, including command completions for
+        // literal slash drafts. Only the root view uses those controls.
+        let (app, obscured) = app
             .child_focus
             .as_ref()
             .and_then(|id| app.child_views.get(id))
-            .map_or(&*app, |child| &*child.app);
+            .map_or_else(
+                || (&*app, ui::native_links_obscured(app)),
+                |child| (&*child.app, false),
+            );
         hyperlinks::FrameLinks {
             rows: app.row_links.clone(),
             left: app.transcript_left,
             top: app.transcript_top,
-            obscured: ui::native_links_obscured(app),
+            obscured,
         }
     })
 }

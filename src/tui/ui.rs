@@ -3944,6 +3944,11 @@ mod tests {
         app.paste("/");
         assert!(native_links_obscured(&app));
         app.focus_child("agent-0".into());
+        // A retained slash draft has root-style completions, but the child
+        // renders no completion popup, even when the draft is read-only.
+        let child = &mut app.child_views.get_mut("agent-0").unwrap().app;
+        child.editor.insert_str("/model");
+        assert!(native_links_obscured(child));
         app.child_views
             .get_mut("agent-0")
             .unwrap()
