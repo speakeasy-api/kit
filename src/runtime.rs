@@ -468,6 +468,7 @@ impl Drop for SessionClaim {
 }
 
 pub(crate) struct AcpDriver {
+    pub subagents: Subagents,
     pub driver: LoopDriver<SelectableSession>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
@@ -1713,7 +1714,7 @@ impl Runtime {
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
-                subagents,
+                subagents.clone(),
                 background_jobs.clone(),
                 skills,
                 mcp,
@@ -1730,6 +1731,7 @@ impl Runtime {
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {
+            subagents,
             driver,
             skills: skill_catalog,
             tasks,

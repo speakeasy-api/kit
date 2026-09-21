@@ -1845,6 +1845,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
 
                     Voice(crate::voice::VoiceEvent),
                     StorageShutdown,
+                    ChildTranscript(Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>),
                     Terminal(Option<std::io::Result<Event>>),
                     ModelSwitch(ModelSwitchCompletion),
                     Background(Option<BackgroundCompletion>),
@@ -1857,7 +1858,32 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut pending_update = None;
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
+                let mut child_read: Option<ChildTranscriptRead> = None;
                 loop {
+                    let target = app.child_read_target().map(|target| (session_id.to_string(), target));
+                    if child_read.as_ref().is_some_and(|read| Some(&read.target) != target.as_ref()) {
+                        // Dropping the future cancels the local request and frees its page.
+                        child_read = None;
+                    }
+                    if child_read.is_none() && let Some(target) = target {
+                        let backoff = app.child_views[&target.1.0].read_backoff;
+                        let request = crate::protocols::acp::ReadSubagentTranscriptRequest {
+                            session_id: target.0.clone().into(),
+                            id: target.1.0.clone(), generation: target.1.1, cursor: target.1.3,
+                        };
+                        let connection = connection.clone();
+                        child_read = Some(ChildTranscriptRead {
+                            target,
+                            future: Box::pin(async move {
+                                if backoff { tokio::time::sleep(Duration::from_millis(150)).await; }
+                                match tokio::time::timeout(HANDSHAKE, connection.send_request(request).block_task()).await {
+                                    Ok(result) => result.map_err(|error| error.message.to_string()),
+                                    Err(_) => Err("child transcript read timed out".into()),
+                                }
+                            }),
+                        });
+                    }
+
                     // Reconcile after every prior event, including failures in
                     // result/observe, before accepting any next user input.
                     voice.notify_state(&connection, &session_id);
@@ -1895,7 +1921,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         // until this wait ends. This scope drops all losers and
                         // releases input borrows before handlers drain/reset them.
                         poll_fn(|cx| {
-                            let sources = 8;
+                            let sources = 9;
                             for offset in 0..sources {
                                 let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
@@ -1917,6 +1943,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     6 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
 
                                     7 => voice.poll(cx).map(SessionEvent::Voice),
+                                    8 => child_read.as_mut().map_or(Poll::Pending, |read| {
+                                        read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
+                                    }),
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
@@ -1929,6 +1958,12 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     };
                     match event {
 
+                        SessionEvent::ChildTranscript(result) => {
+                            if let Some(read) = child_read.take()
+                                && read.target.0 == session_id.to_string() {
+                                app.child_read_finished(&read.target.1, result);
+                            }
+                        }
                         SessionEvent::Voice(event) => match event {
                             crate::voice::VoiceEvent::Ready => voice.mark_ready(&mut app),
                             crate::voice::VoiceEvent::Transcript { speaker, text } => {
@@ -1937,7 +1972,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 app.note(format!("voice {}: {}", voice_display_text(&speaker), voice_display_text(&text)));
                             }
                             crate::voice::VoiceEvent::Delegation { id, text } => {
-                                if app.working() || app.model_switch.is_some() || voice.handoff.is_some() {
+                                if app.child_focus.is_some() {
+                                    voice.result(id, "Task was NOT submitted: return to the root session before delegating voice work.".into(), &mut app);
+                                } else if app.working() || app.model_switch.is_some() || voice.handoff.is_some() {
                                     voice.result(id, "Kit is busy. Task was NOT submitted; ask the user to try again when idle.".into(), &mut app);
                                 } else if text.trim().is_empty() || text.len() > 32_768 || id.len() > 1024 {
                                     voice.result(id, "Task was NOT submitted: empty or oversized delegation.".into(), &mut app);
@@ -2063,6 +2100,31 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             app.note(format!("message was not accepted: {}", error.message));
                                         }
                                     }
+                                }
+                                Action::SteerChild { id, generation, text } => {
+                                    // transition_route is the only route writer. Snapshot its
+                                    // generation synchronously with the root ACP identity, and
+                                    // drop the guard before starting any asynchronous work.
+                                    let route_generation = match transition_session.lock() {
+                                        Ok(route) => route.generation,
+                                        Err(_) => {
+                                            app.apply(Update::ChildSteerFinished {
+                                                id, generation,
+                                                result: Err("active session route unavailable; child steering was not submitted".into()),
+                                            });
+                                            continue;
+                                        }
+                                    };
+                                    let request = crate::protocols::acp::SteerSubagentRequest {
+                                        session_id: session_id.to_string().into(),
+                                        id: id.clone(),
+                                        generation,
+                                        prompt: text,
+                                    };
+                                    let connection = connection.clone();
+                                    spawn_child_steer(route_generation, id, generation, updates_tx.clone(), async move {
+                                        connection.send_request(request).block_task().await.map(|_| ())
+                                    });
                                 }
                                 Action::ReplaceSteer { id, text } => {
                                     let Ok(route) = transition_session.lock() else {
@@ -2793,6 +2855,43 @@ async fn died(
 /// Encodes exact source text for the terminal clipboard.
 fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
+}
+
+/// One cancellable page request, scoped to the root session and focus epoch.
+struct ChildTranscriptRead {
+    target: (String, (String, u64, u64, u64)),
+    future: std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
+                > + Send,
+        >,
+    >,
+}
+
+/// Child steering never enters the root prompt path. Its completion is scoped
+/// independently to the captured root route and the selected child generation.
+fn spawn_child_steer(
+    route_generation: u64,
+    id: String,
+    generation: u64,
+    updates: mpsc::UnboundedSender<QueuedUpdate>,
+    request: impl Future<Output = Result<(), agent_client_protocol::Error>> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(HANDSHAKE, request).await {
+            Ok(result) => result.map_err(|error| error.message.to_string()),
+            Err(_) => Err("child steering timed out; delivery is unknown".into()),
+        };
+        let _ = updates.send(QueuedUpdate::for_session(
+            route_generation,
+            Update::ChildSteerFinished {
+                id,
+                generation,
+                result,
+            },
+        ));
+    })
 }
 
 /// Await delivery-sensitive ACP mutations off the terminal event loop. Both
@@ -5702,6 +5801,60 @@ mod tests {
             matches!(&completion.update, Update::SteerMutationFinished { token: 7, result: Err(error), .. } if error.unavailable)
         );
         assert!(accept_queued_update(&route, completion).is_none());
+    }
+
+    #[tokio::test]
+    async fn child_steer_completion_preserves_child_and_root_generations() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::spawn_child_steer(3, "child".into(), 9, updates, async { Ok(()) })
+            .await
+            .unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert_eq!(completion.generation, Some(3));
+        assert!(matches!(
+            &completion.update,
+            Update::ChildSteerFinished { id, generation: 9, result: Ok(()) }
+                if id == "child"
+        ));
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "root".into(),
+            generation: 3,
+        }));
+        super::transition_route(&route, "other-root".into());
+        assert!(accept_queued_update(&route, completion).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_steer_request_is_bounded() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = super::spawn_child_steer(3, "child".into(), 9, updates, std::future::pending());
+        let completion = receiver.recv().await.unwrap();
+        task.await.unwrap();
+        assert!(matches!(
+            completion.update,
+            Update::ChildSteerFinished { result: Err(message), .. }
+                if message.contains("timed out") && message.contains("delivery is unknown")
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_steer_failure_is_reported_without_root_fallback() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::spawn_child_steer(3, "child".into(), 9, updates, async {
+            Err(agent_client_protocol::Error::invalid_params())
+        })
+        .await
+        .unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert!(matches!(
+            completion.update,
+            Update::ChildSteerFinished {
+                generation: 9,
+                result: Err(_),
+                ..
+            }
+        ));
+        assert!(receiver.recv().await.is_none());
     }
 
     #[test]

@@ -42,9 +42,17 @@ use super::{
     wrap::LinkHit,
 };
 
+mod focus;
+pub use focus::ChildView;
+
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    ChildSteerFinished {
+        id: String,
+        generation: u64,
+        result: Result<(), String>,
+    },
     /// Ordered ACP prompt receipt, before the accepted turn's user message.
     VoicePromptAccepted {
         id: String,
@@ -423,6 +431,11 @@ pub(super) enum ClipboardMode {
 }
 
 pub enum Action {
+    SteerChild {
+        id: String,
+        generation: u64,
+        text: String,
+    },
     OpenUserImage(UserImage),
     Voice(String),
     None,
@@ -689,6 +702,7 @@ enum MessageRole {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRow {
+    pub focus_can_steer: bool,
     pub id: String,
     pub name: String,
     pub status: SubagentStatus,
@@ -787,6 +801,12 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    pub child_focus: Option<String>,
+    child_ui: HashMap<String, focus::ChildUiState>,
+    pub child_views: HashMap<String, ChildView>,
+    pub agents_selected: Option<String>,
+    pub agents_keyboard_focus: bool,
+    pub child_back_area: Rect,
     runtime_last_frame: Option<Instant>,
     runtime_status_unavailable: bool,
     pub root: PathBuf,
@@ -1058,6 +1078,12 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
+            child_focus: None,
+            child_ui: HashMap::new(),
+            child_views: HashMap::new(),
+            agents_selected: None,
+            agents_keyboard_focus: false,
+            child_back_area: Rect::default(),
             runtime_last_frame: None,
             runtime_status_unavailable: false,
             root,
@@ -2078,6 +2104,11 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         match update {
+            Update::ChildSteerFinished {
+                id,
+                generation,
+                result,
+            } => self.child_steer_finished(&id, generation, result),
             Update::OpenUserImage(_) => {}
             Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
@@ -2455,6 +2486,12 @@ impl App {
             return;
         }
         self.runtime_status_unavailable = true;
+        for view in self.child_views.values_mut() {
+            view.disable("Child connection unavailable; retained transcript is read-only");
+        }
+        for row in self.agents.values_mut() {
+            row.focus_can_steer = false;
+        }
         // All these fields depend on the same lossy side channel. Absence is
         // unknown, not idle/success/healthy; the UI exposes unavailability.
         self.agent_versions.clear();
@@ -2543,6 +2580,11 @@ impl App {
                     self.push_block(Block::Compacted { reason, millis });
                 }
             }
+            RuntimeEvent::SubagentCapabilities {
+                id,
+                generation,
+                can_steer,
+            } => self.child_capabilities(&id, generation, can_steer),
             RuntimeEvent::SubagentStateChanged {
                 id,
                 name,
@@ -2605,9 +2647,13 @@ impl App {
                         activity.clear_transient();
                     }
 
+                    let focus_can_steer = previous
+                        .is_some_and(|row| row.generation == generation && row.focus_can_steer)
+                        && status == SubagentStatus::Working;
                     self.agents.insert(
                         id.clone(),
                         AgentRow {
+                            focus_can_steer,
                             id: id.clone(),
                             name,
                             status,
@@ -2628,6 +2674,7 @@ impl App {
                         },
                     );
                 }
+                self.child_lifecycle(&id, generation, status);
                 self.clamp_agents_scroll();
             }
             RuntimeEvent::SubagentActivity { id, activity } => {
@@ -2672,6 +2719,11 @@ impl App {
                     }
                     if removed.len() == before {
                         break;
+                    }
+                }
+                for id in &removed {
+                    if let Some(view) = self.child_views.get_mut(id) {
+                        view.disable("Child removed; retained transcript is read-only");
                     }
                 }
                 self.agents.retain(|id, _| !removed.contains(id));
@@ -2945,6 +2997,12 @@ impl App {
         self.scroll = usize::MAX;
         self.follow = true;
         self.focused_call_id = None;
+        self.child_focus = None;
+        self.child_views.clear();
+        self.child_ui.clear();
+        self.agents_selected = None;
+        self.agents_keyboard_focus = false;
+        self.child_back_area = Rect::default();
         self.agents_auto_opened = false;
         self.cost = None;
         self.agent_costs.clear();
@@ -3201,7 +3259,8 @@ impl App {
     }
 
     pub(super) fn clipboard_route(&self) -> ClipboardRoute {
-        if self.model_switch.is_some()
+        if self.child_focus.is_some()
+            || self.model_switch.is_some()
             || self.model_dialog.is_some()
             || self.effort_dialog.is_some()
             || (self.session_dialog.is_some() && !self.session_rename_active())
@@ -3227,6 +3286,10 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.child_focus.is_some() {
+            self.paste_child(text);
+            return;
+        }
         if self.model_switch.is_some() {
             return;
         }
@@ -3834,6 +3897,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        if let Some(action) = self.handle_focus_key(key) {
+            return action;
+        }
         if let Some(pending) = self.model_switch.as_mut() {
             use crate::protocols::acp::model_switch::Decision;
             let cancel = key.code == KeyCode::Esc
@@ -4372,6 +4438,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if let Some(action) = self.handle_focus_mouse(mouse) {
+            return action;
+        }
         if self.model_switch.is_some() {
             return Action::None;
         }

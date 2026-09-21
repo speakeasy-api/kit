@@ -16,6 +16,7 @@ use agent_client_protocol::{ByteStreams, UntypedMessage};
 
 mod messages;
 mod protocol;
+pub(crate) mod transcript;
 use agentkit_acp::{
     CloseSessionRequest, ConfigOptionUpdate, ContentBlock, DeleteSessionRequest,
     ForkSessionRequest, PermissionOption, PermissionOptionKind, PromptResponse,
@@ -36,6 +37,7 @@ use tokio::{
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::tools::mcp::CredentialStorage;
+use transcript::Transcript;
 
 pub(crate) mod prompt;
 use prompt::ChildPrompt;
@@ -508,6 +510,8 @@ struct Prompt {
     session_id: SessionId,
     /// The subagent id that owns this turn, so usage events name the roster row.
     owner: String,
+    generation: u64,
+    transcript: Option<Transcript>,
     content: Vec<ContentBlock>,
     cancellation: TurnCancellation,
     reply: oneshot::Sender<Result<ChildOutput, ChildError>>,
@@ -526,6 +530,7 @@ struct Close {
     reply: oneshot::Sender<Result<Option<ChildError>, ChildError>>,
 }
 struct Steer {
+    generation: Option<u64>,
     session_id: SessionId,
     content: Vec<ContentBlock>,
     reply: oneshot::Sender<Result<Value, ChildError>>,
@@ -595,12 +600,96 @@ struct Ready {
     replay: ChildOutput,
 }
 
+/// Normalize the message-ID fields shared by v1 chunks and v2 inspection.
+/// Never infer user-message identity from content: an identical message can be
+/// a later accepted steer, and a prompt echo can be fragmented arbitrarily.
+fn inspection_event(owner: &str, generation: u64, mut update: Value) -> Option<Value> {
+    if owner.is_empty() || !update.is_object() {
+        return None;
+    }
+    let kind = update["sessionUpdate"].as_str()?.to_owned();
+    if matches!(
+        kind.as_str(),
+        "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk"
+    ) && update.get("messageId").is_none()
+    {
+        update["messageId"] = Value::String(format!("kit-inspect-{generation}-{kind}"));
+    }
+    Some(update)
+}
+
+/// One route owns this bounded segment cursor. Only the notification callback
+/// writes it; initialization occurs before publication, and cleanup drops the Arc.
+/// No callbacks, I/O, or awaits occur under its lock. Poison invalidates only
+/// inspection, never execution, rather than recovering uncertain ordering. Native v2 IDs are never rewritten.
+#[derive(Default)]
+struct InspectionSegments {
+    kind: Option<&'static str>,
+    sequence: u64,
+}
+impl InspectionSegments {
+    fn normalize(
+        &mut self,
+        generation: u64,
+        update: &mut Value,
+    ) -> agent_client_protocol::Result<()> {
+        if update["sessionUpdate"] == "tool_call" {
+            // v2 unifies announcement and subsequent patches in ToolCallUpdate.
+            update["sessionUpdate"] = Value::String("tool_call_update".into());
+        }
+        let kind = match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => Some("agent_message_chunk"),
+            Some("agent_thought_chunk") => Some("agent_thought_chunk"),
+            Some("user_message_chunk") => Some("user_message_chunk"),
+            _ => None,
+        };
+        if update.get("messageId").is_some() || kind.is_none() {
+            self.kind = None;
+            return Ok(());
+        }
+        if self.kind != kind {
+            self.sequence = self
+                .sequence
+                .checked_add(1)
+                .ok_or_else(agent_client_protocol::Error::internal_error)?;
+            self.kind = kind;
+        }
+        update["messageId"] = Value::String(format!(
+            "kit-inspect-{generation}-segment-{}",
+            self.sequence
+        ));
+        Ok(())
+    }
+}
+
 /// Where one in-flight prompt's session updates land.
 #[derive(Clone)]
 struct Route {
+    transcript: Option<Transcript>,
+    inspection_segments: Arc<Mutex<InspectionSegments>>,
     owner: String,
+    generation: u64,
     output: Arc<Mutex<ChildOutput>>,
     idle: watch::Sender<protocol::Foreground>,
+}
+impl Route {
+    fn record_inspection(&self, mut update: Value) {
+        let Some(transcript) = &self.transcript else {
+            return;
+        };
+        let normalized = self
+            .inspection_segments
+            .lock()
+            .ok()
+            .is_some_and(|mut segments| segments.normalize(self.generation, &mut update).is_ok());
+        if !normalized {
+            transcript.fail();
+            return;
+        }
+        if let Some(update) = inspection_event(&self.owner, self.generation, update) {
+            transcript.record(&update);
+        }
+    }
 }
 
 /// Complete child-advertised snapshots, including notifications between prompts.
@@ -1169,11 +1258,16 @@ impl ChildSession {
 
     /// Steer the current turn without acquiring its prompt/fork serialization gate.
     /// Dropping the caller does not cancel the foreground turn or revoke acceptance.
-    pub async fn steer(&self, prompt: ChildPrompt) -> Result<Value, ChildError> {
+    pub async fn steer_generation(
+        &self,
+        prompt: ChildPrompt,
+        generation: Option<u64>,
+    ) -> Result<Value, ChildError> {
         let content = prompt.into_blocks(&self.capabilities.prompt_capabilities)?;
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Request::Steer(Steer {
+                generation,
                 session_id: self.session_id.clone(),
                 content,
                 reply,
@@ -1189,11 +1283,13 @@ impl ChildSession {
         })?
     }
 
-    pub async fn prompt(
+    pub async fn prompt_generation(
         &self,
         owner: String,
+        generation: u64,
         prompt: ChildPrompt,
         cancellation: TurnCancellation,
+        transcript: Option<Transcript>,
     ) -> Result<ChildOutput, ChildError> {
         let content = prompt.into_blocks(&self.capabilities.prompt_capabilities)?;
         // A one-shot admission race: an available gate may win concurrent
@@ -1212,6 +1308,8 @@ impl ChildSession {
             serial,
             session_id: self.session_id.clone(),
             owner,
+            generation,
+            transcript,
             content,
             cancellation: cancellation.clone(),
             reply,
@@ -1404,6 +1502,7 @@ async fn run(
                     route.idle.send_if_modified(|current| current.advance(state));
                     return Ok(());
                 }
+                route.record_inspection(params["update"].clone());
                 if let Some(update) = messages::parse(&params["update"])? {
                     if let Ok(mut output) = route.output.lock() { output.record_message(update); }
                     return Ok(());
@@ -1504,7 +1603,7 @@ async fn run(
                 let id = SessionId::new(id.clone());
                 let (idle, _) = watch::channel(protocol::Foreground::Waiting);
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?
-                    .insert(id.clone(), Route { owner: String::new(), output: Arc::clone(&replay_output), idle });
+                    .insert(id.clone(), Route { transcript: None, inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: String::new(), generation: 0, output: Arc::clone(&replay_output), idle });
                 let result = protocol::resume(&connection, version, id.clone(), root.clone(), additional_directories.clone()).await;
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
                 result
@@ -1591,30 +1690,39 @@ async fn run(
                         // Routes are installed/removed only by prompt tasks. Read under
                         // their lock, then release it before any protocol I/O. Injection
                         // never owns or changes the foreground output, gate, or idle state.
-                        let active = match routes.lock() {
-                            Ok(routes) => routes.contains_key(&steer.session_id),
-                            Err(_) => {
-                                let _ = steer.reply.send(Err(ChildError::Failed("subagent route lock was poisoned".into())));
+                        let request = {
+                            let routes = match routes.lock() {
+                                Ok(routes) => routes,
+                                Err(_) => {
+                                    let _ = steer.reply.send(Err(ChildError::Failed("subagent route lock was poisoned".into())));
+                                    continue;
+                                }
+                            };
+                            let route = routes.get(&steer.session_id);
+                            let rejection = if !supports_steer {
+                                Some("ACP harness does not advertise v2 steer injection")
+                            } else if route.is_none() {
+                                Some("subagent has no active prompt to steer")
+                            } else if route.is_some_and(|route| steer.generation.is_some_and(|generation| generation != route.generation)) {
+                                Some("stale subagent generation")
+                            } else { None };
+                            if let Some(message) = rejection {
+                                let _ = steer.reply.send(Err(ChildError::Failed(message.into())));
                                 continue;
                             }
+                            // The SDK enqueue is synchronous and does not invoke route callbacks.
+                            // Route removal/replacement cannot interleave admission and enqueue.
+                            // Only receipt waiting is spawned, with no route guard alive.
+                            protocol::steer(&connection, steer.session_id, steer.content)
                         };
-                        let rejection = if !supports_steer {
-                            Some("ACP harness does not advertise v2 steer injection")
-                        } else if !active {
-                            Some("subagent has no active prompt to steer")
-                        } else { None };
-                        if let Some(message) = rejection {
-                            let _ = steer.reply.send(Err(ChildError::Failed(message.into())));
-                            continue;
-                        }
-                        let connection = connection.clone();
                         let auth_methods = auth_methods.clone();
                         tasks.spawn(async move {
-                            let result = tokio::time::timeout(CANCEL_SETTLE,
-                                protocol::steer(&connection, steer.session_id, steer.content)).await;
-                            let result = match result {
-                                Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
-                                Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
+                            let result = match request {
+                                Ok(request) => match tokio::time::timeout(CANCEL_SETTLE, request).await {
+                                    Ok(result) => result.map_err(|error| ChildError::Failed(child_request_error(error, &auth_methods))),
+                                    Err(_) => Err(ChildError::Failed("steer acknowledgement timed out; delivery is unknown".into())),
+                                },
+                                Err(error) => Err(ChildError::Failed(child_request_error(error, &auth_methods))),
                             };
                             let _ = steer.reply.send(result);
                         });
@@ -1832,7 +1940,15 @@ async fn run(
                             let output = Arc::new(Mutex::new(ChildOutput::default()));
                             let (idle_tx, mut idle_rx) = watch::channel(protocol::Foreground::Waiting);
                             if let Ok(mut routes) = routes.lock() {
-                                routes.insert(session_id.clone(), Route { owner: prompt.owner, output: Arc::clone(&output), idle: idle_tx });
+                                routes.insert(session_id.clone(), Route { transcript: prompt.transcript.clone(), inspection_segments: Arc::new(Mutex::new(InspectionSegments::default())), owner: prompt.owner.clone(), generation: prompt.generation, output: Arc::clone(&output), idle: idle_tx });
+                            }
+                            if !prompt.owner.is_empty() {
+                                crate::events::emit(&crate::events::RuntimeEvent::SubagentCapabilities {
+                                    id: prompt.owner.clone(), generation: prompt.generation, can_steer: supports_steer,
+                                });
+                                if let Some(transcript) = &prompt.transcript {
+                                    transcript.record_submitted_prompt(&prompt.owner, prompt.generation, &prompt.content);
+                                }
                             }
                             let request = async {
                                 let response = protocol::prompt(&connection, version, session_id.clone(), prompt.content).await?;
@@ -2143,6 +2259,22 @@ mod tests {
 
     use super::*;
 
+    impl ChildSession {
+        pub async fn steer(&self, prompt: ChildPrompt) -> Result<Value, ChildError> {
+            self.steer_generation(prompt, None).await
+        }
+
+        pub async fn prompt(
+            &self,
+            owner: String,
+            prompt: ChildPrompt,
+            cancellation: TurnCancellation,
+        ) -> Result<ChildOutput, ChildError> {
+            self.prompt_generation(owner, 0, prompt, cancellation, None)
+                .await
+        }
+    }
+
     fn update(value: Value) -> SessionUpdate {
         serde_json::from_value(value).unwrap()
     }
@@ -2393,6 +2525,8 @@ mod tests {
                 serial,
                 session_id: child.session_id.clone(),
                 owner: "s-test".into(),
+                generation: 0,
+                transcript: None,
                 content: vec![ContentBlock::Text(agentkit_acp::TextContent::new("queued"))],
                 cancellation: controller.handle().checkpoint(),
                 reply,
@@ -3827,6 +3961,70 @@ for line in sys.stdin:
         }
     }
 
+    #[test]
+    fn inspection_v1_segments_preserve_text_tool_text_order() {
+        let text = |text: &str| {
+            SessionUpdate::AgentMessageChunk(agentkit_acp::ContentChunk::new(ContentBlock::Text(
+                agentkit_acp::TextContent::new(text),
+            )))
+        };
+        let tool: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"tool_call", "toolCallId":"tool-1", "title":"Read file", "status":"in_progress"
+        })).unwrap();
+        let sequence = [text("A"), text(" continuation"), tool, text("B")];
+        let mut segments = InspectionSegments::default();
+        let mut updates = Vec::new();
+        for update in sequence {
+            let mut update = serde_json::to_value(update).unwrap();
+            segments.normalize(9, &mut update).unwrap();
+            let event = inspection_event("child", 9, update).unwrap();
+            let update = event;
+            assert!(
+                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                    update.clone()
+                )
+                .is_ok()
+            );
+            updates.push(update);
+        }
+        assert_eq!(updates[0]["messageId"], updates[1]["messageId"]);
+        assert_ne!(updates[0]["messageId"], updates[3]["messageId"]);
+        assert_eq!(updates[2]["sessionUpdate"], "tool_call_update");
+        assert_eq!(updates[3]["content"]["text"], "B");
+        let mut native = serde_json::json!({"sessionUpdate":"agent_message_chunk", "messageId":"native-v2", "content":{"type":"text","text":"native"}});
+        let original = native.clone();
+        segments.normalize(9, &mut native).unwrap();
+        assert_eq!(native, original);
+    }
+
+    #[test]
+    fn inspection_normalizes_chunks_and_preserves_large_updates() {
+        for kind in [
+            "user_message_chunk",
+            "agent_message_chunk",
+            "agent_thought_chunk",
+        ] {
+            let update =
+                serde_json::json!({"sessionUpdate":kind, "content":{"type":"text","text":"hello"}});
+            let event = inspection_event("child", 3, update.clone()).unwrap();
+            let normalized = event;
+            assert!(
+                serde_json::from_value::<agent_client_protocol::schema::v2::SessionUpdate>(
+                    normalized
+                )
+                .is_ok()
+            );
+        }
+        let event = inspection_event(
+            "child",
+            3,
+            serde_json::json!({"sessionUpdate":"tool_call", "rawOutput":"x".repeat(65536)}),
+        )
+        .unwrap();
+        let update = event;
+        assert_eq!(update["rawOutput"].as_str().unwrap().len(), 65536);
+    }
+
     #[tokio::test]
     async fn steering_preserves_in_flight_prompt_and_rejection_is_nonterminal() {
         let root = tempfile::tempdir().unwrap();
@@ -3835,14 +4033,26 @@ for line in sys.stdin:
         let child = base.clone();
         let turn = tokio::spawn(async move {
             child
-                .prompt(
+                .prompt_generation(
                     "s-test".into(),
+                    7,
                     "original turn".into(),
                     TurnCancellation::default(),
+                    None,
                 )
                 .await
         });
         steering_test_support::wait_request(&root, "session/prompt").await;
+        assert!(
+            base.steer_generation("stale instruction".into(), Some(6))
+                .await
+                .is_err()
+        );
+        assert!(
+            base.steer_generation("future instruction".into(), Some(8))
+                .await
+                .is_err()
+        );
         assert!(base.steer("MOCK_REJECT_INJECT".into()).await.is_err());
         let auth_error = base
             .steer("MOCK_AUTH_INJECT".into())
@@ -3866,7 +4076,10 @@ for line in sys.stdin:
             assert!(!auth_error.contains(secret), "{auth_error}");
         }
 
-        let receipt = base.steer("change direction".into()).await.unwrap();
+        let receipt = base
+            .steer_generation("change direction".into(), Some(7))
+            .await
+            .unwrap();
         assert_eq!(receipt["messageId"], "injected-1");
         assert!(
             !turn.is_finished(),
