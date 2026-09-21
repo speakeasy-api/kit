@@ -289,6 +289,10 @@ impl Editor {
         self.cursor = self.line_bounds(self.cursor).1;
     }
 
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
+    }
+
     /// Recalls the previous prompt, parking any unsent draft.
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {

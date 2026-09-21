@@ -4364,7 +4364,10 @@ impl App {
             KeyCode::Up if shift => self.scroll_by(-1),
             KeyCode::Down if shift => self.scroll_by(1),
             KeyCode::Up => {
-                if !self.editor.move_row_up(self.prompt_width) {
+                if !self.editor.move_row_up(self.prompt_width) && self.editor.has_history() {
+                    // Cancel before history parks the draft: pending markers
+                    // must never be restored without their paste tracking.
+                    self.cancel_clipboard_placeholders();
                     self.editor.history_prev();
                 }
             }

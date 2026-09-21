@@ -6667,6 +6667,71 @@ mod tests {
     }
 
     #[test]
+    fn history_navigation_cancels_pending_clipboard_before_stashing() {
+        for complete_before_down in [true, false] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.editor.insert_str("previous prompt");
+            app.editor.submit();
+            app.paste("draft");
+            let route = queue_composer_paste(&mut app, &mut pastes);
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            );
+            assert_eq!(app.editor.text(), "previous prompt");
+            assert!(app.pending_clipboard.is_empty());
+            if complete_before_down {
+                assert!(!super::finish_clipboard_paste(
+                    &mut app,
+                    &active,
+                    &mut pastes,
+                    1,
+                    route.clone(),
+                    ClipboardResult::Text("discarded".into()),
+                ));
+                assert_eq!(app.editor.text(), "previous prompt");
+            }
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            );
+            assert_eq!(app.editor.text(), "draft");
+            app.last_key = None;
+            let Action::Submit { prompt, .. } = super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ) else {
+                panic!("history-cancelled paste must not block submission");
+            };
+            assert_eq!(prompt.text, "draft");
+            if !complete_before_down {
+                assert!(!super::finish_clipboard_paste(
+                    &mut app,
+                    &active,
+                    &mut pastes,
+                    1,
+                    route,
+                    ClipboardResult::Text("discarded".into()),
+                ));
+                assert!(app.editor.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn shift_insert_inside_pending_clipboard_preserves_both_pastes() {
         let mut app = App::new(
             PathBuf::from("."),
