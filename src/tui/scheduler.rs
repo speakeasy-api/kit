@@ -8,11 +8,39 @@ use std::sync::{Arc, Mutex};
 use tokio::{sync::mpsc, time::Instant};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-// Yield to the round-robin event selector even when producers keep queues hot.
+// Yield to input and safety checks even when producers keep queues hot.
 const UPDATE_BURST: usize = 64;
+const UPDATE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Checked between records, before consuming the next queue entry. A single
+/// synchronous record can exceed this budget; it is not a latency guarantee.
+struct BatchBudget {
+    started: Instant,
+    records: usize,
+}
+
+impl BatchBudget {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            records: 0,
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        if self.records >= UPDATE_BURST
+            || (self.records > 0 && now.duration_since(self.started) >= UPDATE_BUDGET)
+        {
+            return false;
+        }
+        self.records += 1;
+        true
+    }
+}
 
 pub(super) struct Frames {
     dirty: bool,
+    urgent: bool,
     next: Instant,
 }
 
@@ -20,6 +48,7 @@ impl Frames {
     pub(super) fn new(now: Instant) -> Self {
         Self {
             dirty: true,
+            urgent: false,
             next: now,
         }
     }
@@ -28,19 +57,67 @@ impl Frames {
         self.dirty = true;
     }
 
+    pub(super) fn invalidate_input(&mut self) {
+        self.dirty = true;
+        self.urgent = true;
+    }
+
+    pub(super) fn urgent(&self) -> bool {
+        self.urgent
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.dirty.then_some(self.next)
     }
 
     pub(super) fn ready(&self, now: Instant) -> bool {
-        self.dirty && now >= self.next
+        self.dirty && (self.urgent || now >= self.next)
     }
 
     pub(super) fn drawn(&mut self, now: Instant) {
         self.dirty = false;
-        // Do not catch up missed frames after slow draws or blocking actions.
+        self.urgent = false;
+        // Pace from the start of the draw, without catching up missed frames.
         self.next = now + FRAME_INTERVAL;
     }
+}
+
+/// The priority tier polls real event sources with the caller's task waker.
+/// A pending result permits the caller to poll the background round-robin tier.
+pub(super) enum PriorityEvent {
+    Shutdown,
+    Stop,
+    Frame,
+    Terminal(Option<std::io::Result<crossterm::event::Event>>),
+}
+
+pub(super) fn poll_priority(
+    cx: &mut std::task::Context<'_>,
+    mut shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    mut stopped: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    events: &mut (impl futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin),
+    frames: &Frames,
+    submit_after_paste: &mut bool,
+) -> std::task::Poll<PriorityEvent> {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use futures_util::StreamExt;
+    use std::task::Poll;
+
+    if shutdown.as_mut().poll(cx).is_ready() {
+        return Poll::Ready(PriorityEvent::Shutdown);
+    }
+    if stopped.as_mut().poll(cx).is_ready() {
+        return Poll::Ready(PriorityEvent::Stop);
+    }
+    if frames.urgent() {
+        return Poll::Ready(PriorityEvent::Frame);
+    }
+    if std::mem::take(submit_after_paste) {
+        return Poll::Ready(PriorityEvent::Terminal(Some(Ok(Event::Key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )))));
+    }
+    events.poll_next_unpin(cx).map(PriorityEvent::Terminal)
 }
 
 /// Keep a full worker queue's head ahead of all later updates. No update bypasses
@@ -50,10 +127,12 @@ pub(super) fn forward_updates(
     updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
     first: QueuedUpdate,
 ) -> Result<Option<QueuedUpdate>, ()> {
-    for queued in std::iter::once(first)
-        .chain(std::iter::from_fn(|| updates.try_recv().ok()))
-        .take(UPDATE_BURST)
-    {
+    let mut budget = BatchBudget::new(Instant::now());
+    let mut first = Some(first);
+    while budget.take(Instant::now()) {
+        let Some(queued) = first.take().or_else(|| updates.try_recv().ok()) else {
+            break;
+        };
         match workers.try_update(queued) {
             Ok(()) => {}
             Err(error) => match *error {
@@ -67,6 +146,7 @@ pub(super) fn forward_updates(
 
 pub(super) struct Applied {
     pub(super) dirty: bool,
+    pub(super) urgent: bool,
     pub(super) submit_after_paste: bool,
 }
 
@@ -82,12 +162,15 @@ pub(super) fn apply_completions(
 ) -> Applied {
     let mut applied = Applied {
         dirty: false,
+        urgent: false,
         submit_after_paste: false,
     };
-    for completion in std::iter::once(first)
-        .chain(std::iter::from_fn(|| completed.try_recv().ok()))
-        .take(UPDATE_BURST)
-    {
+    let mut budget = BatchBudget::new(Instant::now());
+    let mut first = Some(first);
+    while budget.take(Instant::now()) {
+        let Some(completion) = first.take().or_else(|| completed.try_recv().ok()) else {
+            break;
+        };
         match completion {
             BackgroundCompletion::Update { queued, images } => {
                 if let Some(update) = accept_queued_update(route, queued) {
@@ -104,12 +187,15 @@ pub(super) fn apply_completions(
                 route: clipboard_route,
                 result,
             } => {
-                applied.submit_after_paste =
+                let outcome =
                     finish_clipboard_paste(app, route, pastes, generation, clipboard_route, result);
-                applied.dirty = true;
-                // The synthetic Enter must precede the next completion, just as
-                // it did when the active loop consumed one completion per turn.
-                if applied.submit_after_paste {
+                if outcome.accepted {
+                    applied.submit_after_paste = outcome.submit;
+                    applied.dirty = true;
+                    applied.urgent = true;
+                    // Present paste feedback before consuming more streaming work,
+                    // even without deferred Enter. A synthetic submit still precedes
+                    // the next completion after this urgent frame.
                     break;
                 }
             }
@@ -146,12 +232,172 @@ mod tests {
         assert_eq!(frames.deadline(), Some(deadline));
         assert!(!frames.ready(now));
         assert!(frames.ready(deadline));
-        // A late frame schedules from its completion, not from the old deadline.
+        // A late frame schedules from its start, not from the old deadline.
         let late = deadline + FRAME_INTERVAL;
         frames.drawn(late);
         frames.invalidate();
         assert!(!frames.ready(late));
         assert!(frames.ready(late + FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn input_frame_bypasses_pacing_and_consumes_pending_stream_invalidation() {
+        let now = Instant::now();
+        let mut frames = Frames::new(now);
+        frames.drawn(now);
+        frames.invalidate();
+        let input_at = now + std::time::Duration::from_millis(1);
+        assert!(!frames.ready(input_at));
+        frames.invalidate_input();
+        assert!(frames.urgent());
+        assert!(frames.ready(input_at));
+        frames.drawn(input_at);
+        assert!(!frames.urgent());
+        assert_eq!(frames.deadline(), None);
+        assert!(!frames.ready(now + FRAME_INTERVAL));
+        frames.invalidate();
+        assert_eq!(frames.deadline(), Some(input_at + FRAME_INTERVAL));
+        assert!(!frames.ready(input_at));
+    }
+
+    #[test]
+    fn batch_budget_checks_elapsed_time_and_count_between_records() {
+        let now = Instant::now();
+        let mut budget = BatchBudget::new(now);
+        assert!(budget.take(now));
+        assert!(budget.take(now + UPDATE_BUDGET / 2));
+        assert!(!budget.take(now + UPDATE_BUDGET));
+        assert!(!budget.take(now + UPDATE_BUDGET * 2));
+        let mut budget = BatchBudget::new(now);
+        // The cap is an explicit policy, not an observed production work count.
+        for _ in 0..UPDATE_BURST {
+            assert!(budget.take(now));
+        }
+        assert!(!budget.take(now));
+    }
+
+    #[tokio::test]
+    async fn priority_tier_preserves_safety_input_and_synthetic_submit_order() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::{
+            future::{pending, poll_fn, ready},
+            pin::pin,
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        sender.send(Ok(key.clone())).unwrap();
+        let mut events = futures_util::stream::poll_fn(|cx| receiver.poll_recv(cx));
+        let mut frames = Frames::new(Instant::now());
+        frames.invalidate_input();
+        let mut submit = true;
+        let mut shutdown = pin!(ready(()));
+        let mut stopped = pin!(ready(()));
+        assert!(matches!(
+            poll_fn(|cx| poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit
+            ))
+            .await,
+            PriorityEvent::Shutdown
+        ));
+        let mut shutdown = pin!(pending());
+        assert!(matches!(
+            poll_fn(|cx| poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit
+            ))
+            .await,
+            PriorityEvent::Stop
+        ));
+        let mut stopped = pin!(pending());
+        assert!(matches!(
+            poll_fn(|cx| poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit
+            ))
+            .await,
+            PriorityEvent::Frame
+        ));
+        assert!(submit);
+        frames.drawn(Instant::now() - FRAME_INTERVAL);
+        frames.invalidate(); // Even a due stream frame must wait for input.
+        assert!(frames.ready(Instant::now()));
+        assert!(matches!(
+            poll_fn(|cx| poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit
+            ))
+            .await,
+            PriorityEvent::Terminal(Some(Ok(Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }))))
+        ));
+        assert!(!submit);
+        let event = poll_fn(|cx| {
+            poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit,
+            )
+        })
+        .await;
+        assert!(matches!(event, PriorityEvent::Terminal(Some(Ok(event))) if event == key));
+        // With no input, the production selector may now service background work.
+        poll_fn(|cx| {
+            assert!(
+                poll_priority(
+                    cx,
+                    shutdown.as_mut(),
+                    stopped.as_mut(),
+                    &mut events,
+                    &frames,
+                    &mut submit
+                )
+                .is_pending()
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // The same source must also wake a pending selector, not just win when
+        // already queued. No synthetic waker or polling-count assertion.
+        let receive = poll_fn(|cx| {
+            poll_priority(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit,
+            )
+        });
+        let send = async {
+            tokio::task::yield_now().await;
+            sender.send(Ok(Event::Paste("new paste".into()))).unwrap();
+        };
+        let (event, ()) = tokio::join!(receive, send);
+        assert!(
+            matches!(event, PriorityEvent::Terminal(Some(Ok(Event::Paste(text)))) if text == "new paste")
+        );
     }
 
     #[test]
@@ -179,7 +425,9 @@ mod tests {
                 panic!("expected log")
             };
             received.push(text);
-            let Some(first) = pending else { break };
+            let Some(first) = pending.or_else(|| updates.try_recv().ok()) else {
+                break;
+            };
             pending = forward_updates(&workers, &mut updates, first).unwrap();
         }
         assert_eq!(received, ["one", "two", "three"]);
@@ -220,11 +468,15 @@ mod tests {
         let next = updates
             .try_recv()
             .expect("a bounded turn leaves queued work");
-        assert!(
-            forward_updates(&workers, &mut updates, next)
-                .unwrap()
-                .is_none()
-        );
+        let mut next = Some(next);
+        while let Some(first) = next {
+            assert!(
+                forward_updates(&workers, &mut updates, first)
+                    .unwrap()
+                    .is_none()
+            );
+            next = updates.try_recv().ok();
+        }
         let received: Vec<_> = worker
             .try_iter()
             .map(|queued| {
@@ -250,14 +502,6 @@ mod tests {
         let mut pastes = ClipboardPastes::default();
         pastes.queued(7, clipboard_route.clone());
         let (sender, mut completed) = mpsc::channel(2);
-        sender
-            .try_send(BackgroundCompletion::Clipboard {
-                generation: 7,
-                route: clipboard_route.clone(),
-                result: ClipboardResult::Text("current".into()),
-            })
-            .ok()
-            .unwrap();
         let applied = apply_completions(
             &mut app,
             &route(),
@@ -266,11 +510,34 @@ mod tests {
             &mut completed,
             BackgroundCompletion::Clipboard {
                 generation: 6,
-                route: clipboard_route,
+                route: clipboard_route.clone(),
                 result: ClipboardResult::Text("stale".into()),
             },
         );
-        assert!(applied.dirty);
+        assert!(!applied.dirty);
+        assert!(!applied.submit_after_paste);
+        assert!(!applied.urgent);
+        assert_eq!(app.editor.text(), "");
+        assert!(pastes.pending.is_some());
+        // Stale results cannot finish the current paste or request a frame.
+        sender
+            .try_send(BackgroundCompletion::Clipboard {
+                generation: 7,
+                route: clipboard_route.clone(),
+                result: ClipboardResult::Text("current".into()),
+            })
+            .ok()
+            .unwrap();
+        let first = completed.try_recv().unwrap();
+        let applied = apply_completions(
+            &mut app,
+            &route(),
+            &mut NativeVoice::default(),
+            &mut pastes,
+            &mut completed,
+            first,
+        );
+        assert!(applied.urgent);
         assert!(!applied.submit_after_paste);
         assert_eq!(app.editor.text(), "current");
         assert!(pastes.pending.is_none());
@@ -353,18 +620,23 @@ mod tests {
             ))
             .ok()
             .unwrap();
-        let first = completed.try_recv().unwrap();
-        let applied = apply_completions(
-            &mut app,
-            &route(),
-            &mut voice,
-            &mut ClipboardPastes::default(),
-            &mut completed,
-            first,
-        );
-        assert!(applied.dirty);
-        assert!(!applied.submit_after_paste);
-        assert!(completed.try_recv().is_err());
+        let route = route();
+        let mut pastes = ClipboardPastes::default();
+        let mut dirty = false;
+        while let Ok(first) = completed.try_recv() {
+            let applied = apply_completions(
+                &mut app,
+                &route,
+                &mut voice,
+                &mut pastes,
+                &mut completed,
+                first,
+            );
+            dirty |= applied.dirty;
+            assert!(!applied.urgent);
+            assert!(!applied.submit_after_paste);
+        }
+        assert!(dirty);
         let handoff = voice.handoff.as_ref().unwrap();
         assert!(handoff.accepted);
         assert_eq!(handoff.user_message_id.as_deref(), Some("user"));
@@ -386,6 +658,72 @@ mod tests {
         );
         assert!(!applied.dirty);
         assert!(app.blocks.is_empty());
+    }
+
+    #[test]
+    fn clipboard_without_submit_requests_urgent_frame_and_leaves_stream_queued() {
+        let mut app = app();
+        let clipboard_route = app.clipboard_route();
+        let mut pastes = ClipboardPastes::default();
+        pastes.queued(7, clipboard_route.clone());
+        let (sender, mut completed) = mpsc::channel(2);
+        sender
+            .try_send(completion(7, Update::Log("after paste".into())))
+            .ok()
+            .unwrap();
+        let applied = apply_completions(
+            &mut app,
+            &route(),
+            &mut NativeVoice::default(),
+            &mut pastes,
+            &mut completed,
+            BackgroundCompletion::Clipboard {
+                generation: 7,
+                route: clipboard_route,
+                result: ClipboardResult::Text("pasted".into()),
+            },
+        );
+        assert!(applied.dirty);
+        assert!(applied.urgent);
+        assert!(!applied.submit_after_paste);
+        assert_eq!(app.editor.text(), "pasted");
+        assert!(pastes.pending.is_none());
+        assert!(app.logs.is_empty());
+        let BackgroundCompletion::Update { queued, .. } = completed.try_recv().unwrap() else {
+            panic!("expected queued streaming update");
+        };
+        assert!(matches!(queued.update, Update::Log(text) if text == "after paste"));
+    }
+
+    #[test]
+    fn current_clipboard_error_is_urgent_but_cannot_submit() {
+        let mut app = app();
+        let clipboard_route = app.clipboard_route();
+        let mut pastes = ClipboardPastes::default();
+        pastes.queued(7, clipboard_route.clone());
+        pastes.pending.as_mut().unwrap().submit = true;
+        let (sender, mut completed) = mpsc::channel(2);
+        sender
+            .try_send(completion(7, Update::Log("after paste".into())))
+            .ok()
+            .unwrap();
+        let applied = apply_completions(
+            &mut app,
+            &route(),
+            &mut NativeVoice::default(),
+            &mut pastes,
+            &mut completed,
+            BackgroundCompletion::Clipboard {
+                generation: 7,
+                route: clipboard_route,
+                result: ClipboardResult::Error("clipboard unavailable".into()),
+            },
+        );
+        assert!(applied.urgent);
+        assert!(applied.dirty);
+        assert!(!applied.submit_after_paste);
+        assert!(pastes.pending.is_none());
+        assert!(completed.try_recv().is_ok());
     }
 
     #[test]
@@ -414,6 +752,7 @@ mod tests {
         );
         assert!(applied.dirty);
         assert!(applied.submit_after_paste);
+        assert!(applied.urgent);
         assert_eq!(app.editor.text(), "pasted");
         assert!(completed.try_recv().is_ok());
         assert!(app.blocks.is_empty());

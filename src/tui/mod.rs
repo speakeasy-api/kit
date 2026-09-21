@@ -1853,8 +1853,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     Update(Option<QueuedUpdate>),
                     Tick,
                     Frame,
+                    Forward,
                     Stop,
                 }
+                let mut forward_retry = tokio::time::interval(Duration::from_millis(2));
+                forward_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut next_priority = 0;
                 let mut switches_closed = false;
                 let mut pending_update = None;
@@ -1894,25 +1897,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         transition_session.lock().map(|active| active.generation).ok(),
                         &app.clipboard_route(),
                     );
-                    if let Some(queued) = pending_update.take() {
-                        pending_update = match scheduler::forward_updates(
-                            &background_workers, &mut updates_rx, queued,
-                        ) {
-                            Ok(pending) => pending,
-                            Err(()) => return Ok(()),
-                        };
-                    }
-                    if frames.ready(tokio::time::Instant::now()) {
-                        draw_frame(&mut terminal, &mut app, &mut images)
-                            .map_err(agent_client_protocol::Error::into_internal_error)?;
-                        frames.drawn(tokio::time::Instant::now());
-                    }
-                    let event = if std::mem::take(&mut submit_after_paste) {
-                        SessionEvent::Terminal(Some(Ok(Event::Key(KeyEvent::new(
-                            KeyCode::Enter,
-                            KeyModifiers::NONE,
-                        )))))
-                    } else {
+                    let event = {
                         let redraw = app.needs_redraw_tick() || images.pending();
                         let frame_deadline = frames.deadline();
                         let mut frame = pin!(tokio::time::sleep_until(
@@ -1920,21 +1905,31 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         ));
                         let mut stopped = pin!(stop.requested());
                         let mut shutdown = pin!(storage_shutdown.cancelled());
-                        // A local round-robin race keeps hot input/update queues
-                        // from starving stop, storage, model switching or ticks.
-                        // Return on the first Ready so no losing source consumes
-                        // an event. Pending registers every eligible source with
-                        // the real task waker; cancellation futures stay pinned
-                        // until this wait ends. This scope drops all losers and
-                        // releases input borrows before handlers drain/reset them.
+                        // Safety first, then present the previous input before
+                        // accepting more work. Synthetic submit remains ahead of
+                        // real terminal events and all background completions.
+                        // Poll crossterm with the real task waker, never a noop
+                        // probe; return on first Ready without consuming losers.
                         poll_fn(|cx| {
-                            let sources = 10;
+                            if let Poll::Ready(event) = scheduler::poll_priority(
+                                cx, shutdown.as_mut(), stopped.as_mut(), &mut events,
+                                &frames, &mut submit_after_paste,
+                            ) {
+                                return Poll::Ready(match event {
+                                    scheduler::PriorityEvent::Shutdown => SessionEvent::StorageShutdown,
+                                    scheduler::PriorityEvent::Stop => SessionEvent::Stop,
+                                    scheduler::PriorityEvent::Frame => SessionEvent::Frame,
+                                    scheduler::PriorityEvent::Terminal(event) => SessionEvent::Terminal(event),
+                                });
+                            }
+                            // Only background sources rotate. A ready paced frame
+                            // is rendered by its branch, after the input check.
+                            let sources = 8;
                             for offset in 0..sources {
                                 let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
-                                    0 => shutdown.as_mut().poll(cx).map(|()| SessionEvent::StorageShutdown),
-                                    1 => events.poll_next_unpin(cx).map(SessionEvent::Terminal),
-                                    2 if !switches_closed => match switch_rx.poll_recv(cx) {
+                                    0 if pending_update.is_some() => forward_retry.poll_tick(cx).map(|_| SessionEvent::Forward),
+                                    1 if !switches_closed => match switch_rx.poll_recv(cx) {
                                         Poll::Ready(Some(completion)) => Poll::Ready(SessionEvent::ModelSwitch(completion)),
                                         Poll::Ready(None) => {
                                             // Like the former Some pattern, EOF
@@ -1944,16 +1939,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                         }
                                         Poll::Pending => Poll::Pending,
                                     },
-                                    3 => background_rx.poll_recv(cx).map(SessionEvent::Background),
-                                    4 if pending_update.is_none() => updates_rx.poll_recv(cx).map(SessionEvent::Update),
-                                    5 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
-                                    6 => stopped.as_mut().poll(cx).map(|()| SessionEvent::Stop),
+                                    2 => background_rx.poll_recv(cx).map(SessionEvent::Background),
+                                    3 if pending_update.is_none() => updates_rx.poll_recv(cx).map(SessionEvent::Update),
+                                    4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
 
-                                    7 => voice.poll(cx).map(SessionEvent::Voice),
-                                    8 => child_read.as_mut().map_or(Poll::Pending, |read| {
+                                    5 => voice.poll(cx).map(SessionEvent::Voice),
+                                    7 => child_read.as_mut().map_or(Poll::Pending, |read| {
                                         read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
                                     }),
-                                    9 if frame_deadline.is_some() => frame.as_mut().poll(cx).map(|()| SessionEvent::Frame),
+                                    6 if frame_deadline.is_some() => frame.as_mut().poll(cx).map(|()| SessionEvent::Frame),
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
@@ -1966,7 +1960,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     };
                     // Invalidate before handlers: early `continue`s can also mutate
                     // visible state. Worker forwarding alone never requests a frame.
-                    if matches!(&event, SessionEvent::Terminal(_) | SessionEvent::Voice(_)
+                    if matches!(&event, SessionEvent::Terminal(_)) {
+                        frames.invalidate_input();
+                    } else if matches!(&event, SessionEvent::Voice(_)
                         | SessionEvent::ModelSwitch(_) | SessionEvent::Tick) {
                         frames.invalidate();
                     }
@@ -2621,7 +2617,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     &mut app, &transition_session, &mut voice,
                                     &mut clipboard_pastes, &mut background_rx, completion,
                                 );
-                                if applied.dirty {
+                                if applied.urgent {
+                                    frames.invalidate_input();
+                                } else if applied.dirty {
                                     frames.invalidate();
                                 }
                                 submit_after_paste = applied.submit_after_paste;
@@ -2670,7 +2668,24 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                             None => return Ok(()),
                         },
-                        SessionEvent::Frame => {},
+                        SessionEvent::Forward => {
+                            if let Some(queued) = pending_update.take() {
+                                pending_update = match scheduler::forward_updates(
+                                    &background_workers, &mut updates_rx, queued,
+                                ) {
+                                    Ok(pending) => pending,
+                                    Err(()) => return Ok(()),
+                                };
+                            }
+                        },
+                        SessionEvent::Frame => {
+                            let started = tokio::time::Instant::now();
+                            if frames.ready(started) {
+                                draw_frame(&mut terminal, &mut app, &mut images)
+                                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                                frames.drawn(started);
+                            }
+                        },
                         SessionEvent::Tick => app.tick(),
                         SessionEvent::Stop => return Ok(()),
                     }
@@ -2969,6 +2984,12 @@ fn handle_with_clipboard(app: &mut App, pastes: &mut ClipboardPastes, event: Eve
     handle(app, event)
 }
 
+struct ClipboardPasteOutcome {
+    // Includes current-route errors/toasts, but never stale results.
+    accepted: bool,
+    submit: bool,
+}
+
 fn finish_clipboard_paste(
     app: &mut App,
     active: &Arc<Mutex<ActiveSessionRoute>>,
@@ -2976,14 +2997,17 @@ fn finish_clipboard_paste(
     generation: u64,
     route: ClipboardRoute,
     result: ClipboardResult,
-) -> bool {
-    let accepted = apply_clipboard_completion(app, active, generation, route.clone(), result);
-    let submit = pastes.finish(generation, &route, accepted);
+) -> ClipboardPasteOutcome {
+    let applied = apply_clipboard_completion(app, active, generation, route.clone(), result);
+    let submit = pastes.finish(generation, &route, applied == Some(true));
     if submit {
         // The deferred Enter is an explicit submission, not a pasted newline.
         app.last_key = None;
     }
-    submit
+    ClipboardPasteOutcome {
+        accepted: applied.is_some(),
+        submit,
+    }
 }
 
 /// Applies one terminal event, returning the work it asks for.
@@ -3079,21 +3103,23 @@ fn read_clipboard(route: &ClipboardRoute, mode: ClipboardMode) -> ClipboardResul
     }
 }
 
+// None rejects a stale/blocked route. Some(false) reports a current-route
+// failure that still needs immediate visual feedback, but must not submit.
 fn apply_clipboard_completion(
     app: &mut App,
     active: &Arc<Mutex<ActiveSessionRoute>>,
     generation: u64,
     route: ClipboardRoute,
     result: ClipboardResult,
-) -> bool {
+) -> Option<bool> {
     let current_generation = active.lock().map(|route| route.generation).ok();
     if current_generation != Some(generation)
         || app.clipboard_route() != route
         || paste_blocked(app)
     {
-        return false;
+        return None;
     }
-    match result {
+    Some(match result {
         ClipboardResult::NoImage => true,
         ClipboardResult::Text(text) => handle_paste(app, &text),
         ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
@@ -3101,7 +3127,7 @@ fn apply_clipboard_completion(
             app.note(error);
             false
         }
-    }
+    })
 }
 
 fn handle_paste(app: &mut App, text: &str) -> bool {
@@ -6335,14 +6361,10 @@ mod tests {
             } else {
                 ClipboardResult::NoImage
             };
-            assert!(super::finish_clipboard_paste(
-                &mut app,
-                &active,
-                &mut pastes,
-                1,
-                route,
-                result
-            ));
+            assert!(
+                super::finish_clipboard_paste(&mut app, &active, &mut pastes, 1, route, result)
+                    .submit
+            );
             let Action::Submit { prompt, .. } =
                 super::handle_with_clipboard(&mut app, &mut pastes, enter)
             else {
@@ -6470,14 +6492,17 @@ mod tests {
         let mut release = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         release.kind = crossterm::event::KeyEventKind::Release;
         super::handle_with_clipboard(&mut app, &mut pastes, Event::Key(release));
-        assert!(!super::finish_clipboard_paste(
-            &mut app,
-            &active,
-            &mut pastes,
-            1,
-            first,
-            ClipboardResult::Text(" this".into())
-        ));
+        assert!(
+            !super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                first,
+                ClipboardResult::Text(" this".into())
+            )
+            .submit
+        );
         assert_eq!(app.editor.text(), "describe this");
         let attachment = clipboard_image_attachment(arboard::ImageData {
             width: 1,
@@ -6485,14 +6510,17 @@ mod tests {
             bytes: Cow::Borrowed(&[20, 40, 60, 255]),
         })
         .unwrap();
-        assert!(super::finish_clipboard_paste(
-            &mut app,
-            &active,
-            &mut pastes,
-            1,
-            second,
-            ClipboardResult::Attachment(attachment)
-        ));
+        assert!(
+            super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                second,
+                ClipboardResult::Attachment(attachment)
+            )
+            .submit
+        );
         let Action::Submit { prompt, .. } =
             super::handle_with_clipboard(&mut app, &mut pastes, enter)
         else {
@@ -6547,14 +6575,10 @@ mod tests {
             } else {
                 ClipboardResult::Error("clipboard unavailable".into())
             };
-            assert!(!super::finish_clipboard_paste(
-                &mut app,
-                &active,
-                &mut pastes,
-                1,
-                route,
-                result
-            ));
+            assert!(
+                !super::finish_clipboard_paste(&mut app, &active, &mut pastes, 1, route, result)
+                    .submit
+            );
             assert_eq!(app.editor.text(), before);
             assert!(pastes.pending.is_none());
         }
@@ -6587,14 +6611,17 @@ mod tests {
             } else {
                 super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste(" edited".into()));
             }
-            assert!(!super::finish_clipboard_paste(
-                &mut app,
-                &active,
-                &mut pastes,
-                1,
-                route,
-                ClipboardResult::Text(" pasted".into())
-            ));
+            assert!(
+                !super::finish_clipboard_paste(
+                    &mut app,
+                    &active,
+                    &mut pastes,
+                    1,
+                    route,
+                    ClipboardResult::Text(" pasted".into())
+                )
+                .submit
+            );
             assert_eq!(
                 app.editor.text(),
                 if switch {
