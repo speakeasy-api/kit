@@ -252,19 +252,19 @@ where
 }
 
 /// Injection is acknowledged independently of the foreground prompt's settlement.
-pub(super) async fn steer(
+pub(super) fn steer(
     connection: &ConnectionTo<Agent>,
     session_id: v1::SessionId,
     content: Vec<v1::ContentBlock>,
-) -> Result<Value, Error> {
+) -> Result<impl Future<Output = Result<Value, Error>> + Send + 'static, Error> {
     let request = v2::InjectSessionRequest::new(
         session_id.to_string(),
         v2::SessionInjectMode::Steer,
         serde_json::from_value(serde_json::to_value(content)?)?,
     );
-    Ok(serde_json::to_value(
-        connection.send_request(request).block_task().await?,
-    )?)
+    // send_request enqueues synchronously; callers can guard generation admission.
+    let sent = connection.send_request(request);
+    Ok(async move { Ok(serde_json::to_value(sent.block_task().await?)?) })
 }
 
 pub(super) fn fork(

@@ -55,6 +55,14 @@ type TaggedTranscriptLine = (LinkedLine, TranscriptTag);
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
     images.poll();
+    app.child_back_area = Rect::default();
+    if let Some(id) = app.child_focus.clone()
+        && let Some(mut child) = app.child_views.remove(&id)
+    {
+        draw_child(frame, app, &id, &mut child, images);
+        app.child_views.insert(id, child);
+        return;
+    }
     // Two border columns plus the `›` gutter; the prompt grows as the wrapped
     // text needs more rows, up to the cap.
     let start_width = frame
@@ -75,6 +83,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
         .min(available_start_prompt_rows);
     let show_start = frame.area().width >= 20
         && available_start_prompt_rows >= START_MIN_PROMPT_ROWS
+        && !app.agents_keyboard_focus
         && app.blocks.is_empty()
         && app.pending_steers.is_empty()
         && !app.editing_steer()
@@ -158,6 +167,114 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime) {
                 area.width,
                 u16::from(area.height > 0),
             ),
+        );
+    }
+}
+
+/// Keep the root roster interactive even when the inspected transcript is empty.
+fn child_body_layout(area: Rect) -> (Rect, Rect) {
+    if area.width >= SIDE_BY_SIDE_WIDTH {
+        let [transcript, agents] =
+            Layout::horizontal([Constraint::Min(40), Constraint::Length(AGENTS_WIDTH)]).areas(area);
+        (transcript, agents)
+    } else {
+        // One complete, selectable three-line row plus borders and footer.
+        let [transcript, agents] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(area);
+        (transcript, agents)
+    }
+}
+
+fn draw_child(
+    frame: &mut Frame<'_>,
+    root: &mut App,
+    id: &str,
+    child: &mut super::app::ChildView,
+    images: &mut ImageRuntime,
+) {
+    let name = root
+        .agent_tree_rows()
+        .into_iter()
+        .find(|row| row.row.id == id)
+        .map(|row| row.row.name.clone())
+        .unwrap_or_else(|| "Subagent".into());
+    let app = &mut child.app;
+    app.prompt_width = frame.area().width.saturating_sub(4).max(1) as usize;
+    let prompt_rows = app
+        .editor
+        .display_rows(app.prompt_width)
+        .clamp(1, MAX_PROMPT_ROWS) as u16
+        + 2;
+    let [back, title, notice, body, prompt] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(prompt_rows),
+    ])
+    .areas(frame.area());
+    root.child_back_area = Rect {
+        width: back.width.min(23),
+        ..back
+    };
+    frame.render_widget(
+        Paragraph::new("← Back to main (Esc)").style(theme::accent()),
+        back,
+    );
+    frame.render_widget(
+        Paragraph::new(format!("{name} · {id} · g{}", child.generation)).style(theme::accent()),
+        title,
+    );
+    frame.render_widget(
+        Paragraph::new(child.notice.as_str())
+            .style(theme::dim())
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        notice,
+    );
+    let (transcript, agents) = child_body_layout(body);
+    draw_transcript(frame, app, images, transcript);
+    draw_agents(frame, root, agents);
+
+    // This is deliberately not the root prompt: no commands, attachments,
+    // queue actions, session controls, or idle-message submission affordance.
+    let can_steer = app.phase == Phase::Working && child.can_steer;
+    let block = Panel::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(if can_steer {
+            theme::accent()
+        } else {
+            theme::faint()
+        })
+        .title(if can_steer {
+            " text steer · Enter send "
+        } else {
+            " text steer unavailable "
+        });
+    let inner = block.inner(prompt);
+    frame.render_widget(block, prompt);
+    if can_steer {
+        let [gutter, field] =
+            Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
+        frame.render_widget(Paragraph::new("›").style(theme::accent()), gutter);
+        let (rows, (cursor_row, cursor_column)) = app.editor.wrapped(field.width.max(1) as usize);
+        let first = cursor_row.saturating_sub(usize::from(field.height.saturating_sub(1)));
+        let lines: Vec<Line<'_>> = rows
+            .into_iter()
+            .skip(first)
+            .take(field.height as usize)
+            .map(Line::from)
+            .collect();
+        frame.render_widget(Paragraph::new(lines), field);
+        if !root.agents_keyboard_focus && field.width > 0 && field.height > 0 {
+            frame.set_cursor_position(Position::new(
+                field.x + (cursor_column as u16).min(field.width - 1),
+                field.y + (cursor_row - first) as u16,
+            ));
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new("Read-only · Esc returns to main").style(theme::faint()),
+            inner,
         );
     }
 }
@@ -992,7 +1109,12 @@ fn body_layout(area: Rect, show_agents: bool, transcript_empty: bool) -> (Rect, 
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &mut App, images: &mut ImageRuntime, area: Rect) {
-    let (transcript, agents) = body_layout(area, app.show_agents(), app.blocks.is_empty());
+    let (transcript, agents) = if app.agents_keyboard_focus {
+        let (transcript, agents) = child_body_layout(area);
+        (transcript, Some(agents))
+    } else {
+        body_layout(area, app.show_agents(), app.blocks.is_empty())
+    };
     draw_transcript(frame, app, images, transcript);
     if let Some(agents) = agents {
         draw_agents(frame, app, agents);
@@ -1270,8 +1392,8 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     let mut first_changed_count = app.blocks.len();
     for block_index in dirty {
         let dynamic = match &app.blocks[block_index] {
-            Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running(),
+            Block::Thought { closed, .. } => !closed,
+            Block::Tool(call) => call.running() && !call.timing_closed,
             _ => false,
         };
         let revision = app.transcript_revisions[block_index];
@@ -1563,12 +1685,14 @@ fn single_transcript_block_rows(
             text,
             started,
             millis,
+            closed,
         } => (
             uncopyable(plain_lines(thought_lines(
                 app,
                 text,
-                started.elapsed().as_millis(),
+                super::app::observed_duration(*started, Some(std::time::Instant::now())),
                 *millis,
+                *closed,
             ))),
             None,
         ),
@@ -1605,7 +1729,7 @@ fn single_transcript_block_rows(
                 ],
                 vec![
                     Span::styled(
-                        format!("background result · {}", theme::duration(*millis)),
+                        format!("background result · {}", timing_label(*millis)),
                         theme::dim(),
                     ),
                     Span::styled(
@@ -1743,19 +1867,25 @@ fn spread(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize)
 /// still running in the background. Turns restart on their own after a
 /// detached result lands, so per-turn figures would say little; the clock
 /// keeps running until nothing is left in the background.
-fn turn_end_line(background: usize, since_prompt: u64) -> Line<'static> {
+fn timing_label(millis: Option<u64>) -> String {
+    millis
+        .map(theme::duration)
+        .unwrap_or_else(|| "timing unknown".into())
+}
+
+fn turn_end_line(background: usize, since_prompt: Option<u64>) -> Line<'static> {
     let mut spans = vec![Span::styled("· ", theme::faint())];
     if background > 0 {
         spans.push(Span::styled("◔ ", Style::default().fg(theme::warn_color())));
         spans.push(Span::styled(
             format!(
                 "{background} in background · {} so far",
-                theme::duration(since_prompt)
+                timing_label(since_prompt)
             ),
             theme::faint(),
         ));
     } else {
-        spans.push(Span::styled(theme::duration(since_prompt), theme::faint()));
+        spans.push(Span::styled(timing_label(since_prompt), theme::faint()));
     }
     Line::from(spans)
 }
@@ -1772,16 +1902,17 @@ fn thought_heading(text: &str) -> Option<String> {
 fn thought_lines(
     app: &App,
     text: &str,
-    running_millis: u128,
+    running_millis: Option<u64>,
     millis: Option<u64>,
+    closed: bool,
 ) -> Vec<Line<'static>> {
-    let elapsed = millis.unwrap_or(u64::try_from(running_millis).unwrap_or(u64::MAX));
+    let elapsed = if closed { millis } else { running_millis };
     if !app.show_thoughts {
-        return vec![if millis.is_some() {
+        return vec![if closed {
             Line::from(vec![
                 Span::styled("⋮ ", theme::faint()),
                 Span::styled(
-                    format!("thought {} · ^t", theme::duration(elapsed)),
+                    format!("thought {} · ^t", timing_label(elapsed)),
                     theme::faint(),
                 ),
             ])
@@ -1793,7 +1924,7 @@ fn thought_lines(
                     thought_heading(text).map_or(String::new(), |heading| format!(" · {heading}")),
                     theme::text(),
                 ),
-                Span::styled(format!(" · {}", theme::duration(elapsed)), theme::dim()),
+                Span::styled(format!(" · {}", timing_label(elapsed)), theme::dim()),
             ])
         }];
     }
@@ -1851,23 +1982,25 @@ struct LaneClock {
 }
 
 fn lane_clock(app: &App, call: &ToolCall) -> Option<LaneClock> {
+    call.started?;
+    call.elapsed()?;
     let parent = app.tool_call(call.parent_id.as_deref()?)?;
+    call.started?.checked_duration_since(parent.started?)?;
     Some(LaneClock {
-        started: parent.started,
-        total_millis: parent.elapsed().max(1),
+        started: parent.started?,
+        total_millis: parent.elapsed()?.max(1),
     })
 }
 
 /// A bar on the program's clock: where the call started, how long it ran,
 /// and whether it is still going.
 fn lane_bar(call: &ToolCall, clock: &LaneClock, track: usize) -> Vec<Span<'static>> {
-    let offset = u64::try_from(
-        call.started
-            .saturating_duration_since(clock.started)
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
-    let end = offset.saturating_add(call.elapsed());
+    let (Some(started), Some(elapsed)) = (call.started, call.elapsed()) else {
+        return Vec::new();
+    };
+    let offset = u64::try_from(started.saturating_duration_since(clock.started).as_millis())
+        .unwrap_or(u64::MAX);
+    let end = offset.saturating_add(elapsed);
     let total = clock.total_millis.max(end).max(1);
     let cell = |millis: u64| ((millis as f64 / total as f64) * track as f64) as usize;
     let mut start = cell(offset).min(track.saturating_sub(2));
@@ -1945,7 +2078,7 @@ fn lane_line(
         right.extend(lane_bar(call, &clock, TRACK));
         right.push(Span::raw("  "));
     }
-    right.push(Span::styled(theme::duration(call.elapsed()), theme::dim()));
+    right.push(Span::styled(timing_label(call.elapsed()), theme::dim()));
     if !call.running() && call.status == ToolCallStatus::Failed {
         right.push(Span::styled(
             " failed",
@@ -2107,7 +2240,7 @@ fn tool_header(
     if calls > 0 {
         meta.push(format!("{calls} {}", plural("call", calls)));
     }
-    meta.push(theme::duration(call.elapsed()));
+    meta.push(timing_label(call.elapsed()));
     let mut right = Vec::new();
     if call.backgrounded {
         if call.running() {
@@ -2184,10 +2317,7 @@ fn working_line(app: &App) -> Line<'static> {
             theme::bold(theme::accent_color()),
         ),
         Span::styled(label.to_string(), theme::accent()),
-        Span::styled(
-            format!(" · {}", theme::duration(app.elapsed())),
-            theme::dim(),
-        ),
+        Span::styled(format!(" · {}", timing_label(app.elapsed())), theme::dim()),
     ])
 }
 
@@ -2401,7 +2531,14 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let block = Panel::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::faint())
-        .title(Span::styled(" agents ", theme::accent()));
+        .title(Span::styled(
+            if app.agents_keyboard_focus {
+                " agents · ↑↓ Enter · Ctrl+G "
+            } else {
+                " agents "
+            },
+            theme::accent(),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2415,7 +2552,16 @@ fn draw_agents(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .into_iter()
         .skip(app.agents_scroll())
         .take(visible_rows)
-        .flat_map(|row| agent_lines(&row, show_vendor, app.tick, now, inner.width as usize))
+        .flat_map(|row| {
+            let mut lines = agent_lines(&row, show_vendor, app.tick, now, inner.width as usize);
+            if app.agents_selected.as_deref() == Some(row.row.id.as_str()) {
+                for line in &mut lines {
+                    *line = std::mem::take(line)
+                        .style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
+            lines
+        })
         .collect::<Vec<_>>();
     let rows_area = Rect {
         height: row_area_height,
@@ -2526,7 +2672,7 @@ fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
     let mut entries: Vec<(Line<'static>, bool)> = Vec::new();
     for call in app.background_calls() {
         let focused = app.focus_call().is_some_and(|focus| focus.id == call.id);
-        let mut right = vec![Span::styled(theme::duration(call.elapsed()), theme::dim())];
+        let mut right = vec![Span::styled(timing_label(call.elapsed()), theme::dim())];
         if focused {
             right.push(Span::styled("   ^k stop", theme::faint()));
         }
@@ -2814,7 +2960,7 @@ fn draw_prompt_editor(
         .collect()
     };
     frame.render_widget(Paragraph::new(lines), field);
-    if !app.queue_focused {
+    if !app.queue_focused && !app.agents_keyboard_focus {
         frame.set_cursor_position(Position::new(
             field.x
                 + u16::try_from(cursor_column)
@@ -2911,7 +3057,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(theme::accent_color()),
             ),
             Span::styled("working", theme::bold(theme::accent_color())),
-            Span::styled(format!(" {}", theme::duration(app.elapsed())), theme::dim()),
+            Span::styled(format!(" {}", timing_label(app.elapsed())), theme::dim()),
         ],
     };
     let counts = app.agent_counts();
@@ -3119,6 +3265,7 @@ mod tests {
             usage: None,
             cost: None,
             activity: Default::default(),
+            focus_can_steer: false,
         }
     }
 
@@ -3731,6 +3878,91 @@ mod tests {
         app
     }
 
+    #[test]
+    fn focused_child_media_paste_stays_text_without_changing_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let text = path.to_str().unwrap();
+        for can_steer in [true, false] {
+            let mut app = panel_app(1);
+            app.paste("root draft");
+            app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+                id: "agent-0".into(),
+                name: "Scout 0".into(),
+                status: SubagentStatus::Working,
+                outcome: None,
+                generation: 2,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 1,
+                generation_started_at_unix_ms: 1,
+                generation_finished_at_unix_ms: None,
+            }));
+            app.apply(Update::Runtime(RuntimeEvent::SubagentCapabilities {
+                id: "agent-0".into(),
+                generation: 2,
+                can_steer,
+            }));
+            app.focus_child("agent-0".into());
+
+            super::super::handle(&mut app, crossterm::event::Event::Paste(text.into()));
+
+            assert_eq!(app.editor.text(), "root draft");
+            assert!(app.attachments.is_empty());
+            let child = &app.child_views["agent-0"].app;
+            assert_eq!(child.editor.text(), if can_steer { text } else { "" });
+            assert!(child.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn focused_child_frame_emits_visible_link_destinations() {
+        let mut app = panel_app(1);
+        app.blocks
+            .push(Block::Agent("[root link](https://example.com/root)".into()));
+        app.phase = Phase::Working;
+        let capture = Capture::default();
+        let mut terminal = Terminal::with_options(
+            HyperlinkBackend::new(capture.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut images = ImageRuntime::disabled();
+        super::super::draw_frame(&mut terminal, &mut app, &mut images).unwrap();
+        let output = String::from_utf8(capture.bytes()).unwrap();
+        assert!(output.contains("https://example.com/root\x1b\\"));
+        capture.clear();
+
+        // Hidden root controls must not suppress the child's native links.
+        app.paste("/");
+        assert!(native_links_obscured(&app));
+        app.focus_child("agent-0".into());
+        // A retained slash draft has root-style completions, but the child
+        // renders no completion popup, even when the draft is read-only.
+        let child = &mut app.child_views.get_mut("agent-0").unwrap().app;
+        child.editor.insert_str("/model");
+        assert!(native_links_obscured(child));
+        app.child_views
+            .get_mut("agent-0")
+            .unwrap()
+            .app
+            .blocks
+            .push(Block::Agent(
+                "[child link](https://example.com/child)".into(),
+            ));
+        super::super::draw_frame(&mut terminal, &mut app, &mut images).unwrap();
+        let output = String::from_utf8(capture.bytes()).unwrap();
+        assert!(output.contains("https://example.com/child\x1b\\"));
+        assert!(!output.contains("https://example.com/root\x1b\\"));
+    }
+
     fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .map(|column| buffer[(column, row)].symbol())
@@ -3765,6 +3997,83 @@ mod tests {
                     && cell.bg == ratatui::style::Color::Rgb(0, 0, 0)
             })
         })
+    }
+
+    #[test]
+    fn focused_child_draw_uses_child_composer_and_root_roster() {
+        for width in [60, 120] {
+            let mut app = panel_app(2);
+            app.editor.insert_str("ROOT DRAFT MUST STAY HIDDEN");
+            app.focus_child("agent-0".into());
+            let child = app.child_views.get_mut("agent-0").expect("child view");
+            child.app.phase = Phase::Working;
+            child.can_steer = true;
+            child.app.editor.insert_str("child steering draft");
+            child.notice = "Child capability notice".into();
+            let mut terminal = Terminal::new(TestBackend::new(width, 25)).expect("terminal");
+            let mut images = ImageRuntime::disabled();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &mut images))
+                .expect("draw succeeds");
+            let buffer = terminal.backend().buffer();
+            let text = (0..25)
+                .map(|row| buffer_row(buffer, row))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Back to main (Esc)"));
+            assert!(text.contains("Child capability notice"));
+            assert!(text.contains("child steering draft"));
+            assert!(text.contains("text steer · Enter send"));
+            assert!(text.contains("Scout 0"));
+            assert!(text.contains("2 agents"));
+            assert!(!text.contains("ROOT DRAFT"));
+            assert!(app.child_back_area.height > 0);
+            assert!(app.child_views.contains_key("agent-0"));
+        }
+    }
+
+    #[test]
+    fn focused_child_layout_keeps_selectable_root_roster() {
+        for width in [40, 107, 108, 160] {
+            let area = ratatui::layout::Rect::new(0, 4, width, 20);
+            let (transcript, roster) = super::child_body_layout(area);
+            assert!(transcript.height > 0);
+            assert!(
+                roster.height >= 6,
+                "one three-line row, borders, and footer"
+            );
+            assert!(roster.width > 2);
+            assert!(!transcript.intersects(roster));
+            assert_eq!(roster.bottom(), area.bottom());
+            if width >= 108 {
+                assert_eq!(roster.width, 46);
+            } else {
+                assert_eq!(roster.width, width);
+            }
+        }
+    }
+
+    #[test]
+    fn agents_panel_highlights_selected_three_line_row() {
+        let mut app = panel_app(2);
+        app.agents_selected = Some("agent-1".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 9)).expect("terminal");
+        terminal
+            .draw(|frame| draw_agents(frame, &mut app, frame.area()))
+            .expect("draw succeeds");
+        let buffer = terminal.backend().buffer();
+        for row in 4..7 {
+            assert!(
+                buffer[(1, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            );
+        }
+        assert!(
+            !buffer[(1, 1)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
     }
 
     #[test]
@@ -4521,6 +4830,49 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_timing_is_explicit_and_has_no_lane_clock() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        for (id, title) in [("parent", "compose"), ("child", "shell")] {
+            app.apply_at(
+                crate::tui::app::Update::ToolStarted {
+                    id: id.into(),
+                    title: title.into(),
+                    kind: Default::default(),
+                    script: None,
+                    backgrounded: false,
+                },
+                None,
+            );
+        }
+        app.apply_at(
+            crate::tui::app::Update::ToolParent {
+                id: "child".into(),
+                parent: Some("parent".into()),
+            },
+            None,
+        );
+        let child = app.tool_call("child").unwrap();
+        assert!(super::lane_clock(&app, child).is_none());
+        let header = super::tool_header(&app, child, false, 100, 1);
+        let text = header
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("timing unknown"), "{text}");
+        assert!(!text.contains("0ms"), "{text}");
+        assert_eq!(
+            super::timing_label(Some(7_000)),
+            super::theme::duration(7_000)
+        );
+    }
+
+    #[test]
     fn completed_turn_duration_is_rendered() {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
@@ -4530,7 +4882,7 @@ mod tests {
         );
         app.blocks.push(Block::TurnDuration {
             background: 0,
-            since_prompt: 788_645_000,
+            since_prompt: Some(788_645_000),
         });
 
         let frame = render(&mut app, 80, 12);
@@ -4540,7 +4892,7 @@ mod tests {
 
         app.blocks.push(Block::TurnDuration {
             background: 2,
-            since_prompt: 788_646_000,
+            since_prompt: Some(788_646_000),
         });
         let frame = render(&mut app, 80, 12);
         assert!(
@@ -4576,19 +4928,30 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_does_not_toggle_a_runtime_graph_layout() {
-        let mut app = App::new(
-            PathBuf::from("/Users/dev/projects/kit"),
-            "openai-subscription".into(),
-            "gpt-5.4".into(),
-            "127.0.0.1:7331".into(),
-        );
-        app.push_user("keep the transcript full width".into());
+    fn ctrl_g_focuses_roster_without_hiding_root_transcript() {
+        for width in [60, 120] {
+            let mut app = panel_app(2);
+            app.push_user("keep the root transcript visible".into());
+            app.editor.insert_str("retained root draft");
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
-        render(&mut app, 120, 20);
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+            let frame = render(&mut app, width, 24);
 
-        assert!(app.transcript_width > 100, "{}", app.transcript_width);
+            assert!(app.agents_keyboard_focus);
+            assert!(app.child_focus.is_none());
+            assert!(
+                frame.contains("keep the root transcript visible"),
+                "{frame}"
+            );
+            assert!(frame.contains("Scout 0"), "{frame}");
+            assert!(frame.contains("↑↓ Enter"), "{frame}");
+            assert!(frame.contains("retained root draft"), "{frame}");
+            assert!(app.transcript_width > 0);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+            assert!(!app.agents_keyboard_focus);
+            assert_eq!(app.editor.text(), "retained root draft");
+        }
     }
 
     #[test]

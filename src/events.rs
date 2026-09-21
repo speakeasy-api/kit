@@ -60,6 +60,12 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost: Option<agent_client_protocol::schema::v2::Cost>,
     },
+    /// Steering support advertised by the child's negotiated ACP connection.
+    SubagentCapabilities {
+        id: String,
+        generation: u64,
+        can_steer: bool,
+    },
     /// A child ACP update relevant to its roster excerpt.
     SubagentActivity {
         id: String,
@@ -159,6 +165,7 @@ impl RuntimeEvent {
             Self::SubagentStateChanged { .. }
                 | Self::SubagentUsage { .. }
                 | Self::SubagentActivity { .. }
+                | Self::SubagentCapabilities { .. }
                 | Self::SubagentDescendantsRemoved { .. }
         )
     }
@@ -304,6 +311,26 @@ mod tests {
             let parsed = parse(&line).expect("nested roster event parses");
             assert_eq!(parsed, event);
             assert!(parsed.forward_from_child());
+        }
+    }
+
+    #[test]
+    fn subagent_inspection_round_trips_and_forwards_from_children() {
+        for event in [
+            RuntimeEvent::SubagentCapabilities {
+                id: "nested-child".into(),
+                generation: 7,
+                can_steer: false,
+            },
+            RuntimeEvent::SubagentCapabilities {
+                id: "nested-child".into(),
+                generation: 7,
+                can_steer: true,
+            },
+        ] {
+            let line = format!("{EVENT_MARKER}{}", serde_json::to_string(&event).unwrap());
+            assert_eq!(parse(&line), Some(event.clone()));
+            assert!(event.forward_from_child());
         }
     }
 
