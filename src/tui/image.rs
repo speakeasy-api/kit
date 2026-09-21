@@ -14,13 +14,14 @@ use ratatui::{
 };
 use ratatui_image::{
     Resize,
-    picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions},
+    picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
 use super::app::UserImage;
 
-const TERMINAL_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+#[path = "image_query.rs"]
+mod image_query;
 const MAX_DECODED_ALLOCATION: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_BACKING_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 16;
@@ -49,12 +50,7 @@ pub(super) struct ImageRuntime {
 
 impl ImageRuntime {
     pub fn detect() -> Self {
-        let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
-            timeout: TERMINAL_QUERY_TIMEOUT,
-            ..QueryStdioOptions::default()
-        })
-        .ok()
-        .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+        let picker = image_query::detect();
         Self {
             picker,
             cache: HashMap::new(),

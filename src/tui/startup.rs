@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{
     StreamExt,
     future::{Either, select},
@@ -47,8 +47,10 @@ pub async fn pick_session(
     // terminal on both successful cancellation and fallible reads/draws.
     let (mut terminal, mut images) = enter()?;
     let mut renames = RenameCommits::default();
+    // The awaited scope owns input but borrows the terminal guard: on normal
+    // return, error, or cancellation it joins input before terminal restoration.
     let result = async {
-        let mut events = EventStream::new();
+        let mut events = super::input::Events::new()?;
         let mut clipboard_pending = false;
         let mut ticker = tokio::time::interval(super::TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

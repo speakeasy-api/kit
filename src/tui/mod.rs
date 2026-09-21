@@ -12,6 +12,7 @@ mod command;
 mod editor;
 mod hyperlinks;
 mod image;
+mod input;
 #[cfg(all(test, unix))]
 mod keyboard_tests;
 mod markdown;
@@ -45,8 +46,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -1637,7 +1638,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
             );
             app.auth_methods = auth_methods;
-            let mut events = EventStream::new();
+            // TerminalSession restores modes if spawning the reader fails.
+            let mut events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut ticker = tokio::time::interval(TICK);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1656,6 +1658,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     let mut next_priority = 0;
                     loop {
                     if let Err(error) = draw_frame(&mut terminal, &mut app, &mut images) {
+                        drop(events);
                         leave(&mut terminal);
                         return Err(agent_client_protocol::Error::into_internal_error(error));
                     }
@@ -1688,13 +1691,20 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         Err(LoginEvent::Terminal(event)) => {
                             let action = match event {
                                 Some(Ok(event)) => handle(&mut app, event),
-                                Some(Err(_)) | None => {
+                                Some(Err(error)) => {
+                                    drop(events);
+                                    leave(&mut terminal);
+                                    return Err(agent_client_protocol::Error::into_internal_error(error));
+                                }
+                                None => {
+                                    drop(events);
                                     leave(&mut terminal);
                                     return Ok(());
                                 }
                             };
                             match action {
                                 Action::Quit => {
+                                    drop(events);
                                     leave(&mut terminal);
                                     return Ok(());
                                 }
@@ -1769,7 +1779,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                                     images = resume_terminal(&mut terminal).map_err(
                                                         agent_client_protocol::Error::into_internal_error,
                                                     )?;
-                                                    events = EventStream::new();
+                                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
                                                     break session;
                                                 }
                                                 Err(error) if authentication_required(
@@ -1794,7 +1804,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     images = resume_terminal(&mut terminal).map_err(
                                         agent_client_protocol::Error::into_internal_error,
                                     )?;
-                                    events = EventStream::new();
+                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
                                 }
                                 Action::None | Action::Redraw => {}
                                 Action::ReadClipboard(_, _) => {
@@ -1806,12 +1816,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         Ok(update) => match update {
                             Some(update) => app.apply(update.update),
                             None => {
+                                drop(events);
                                 leave(&mut terminal);
                                 return Ok(());
                             }
                         },
                         Err(LoginEvent::Tick) => app.tick(),
                         Err(LoginEvent::Stop) => {
+                            drop(events);
                             leave(&mut terminal);
                             return Ok(());
                         }
@@ -1822,6 +1834,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             let active_session_id = match durable_session_id(&session_id) {
                 Ok(session_id) => session_id,
                 Err(error) => {
+                    drop(events);
                     leave(&mut terminal);
                     return Err(agent_client_protocol::Error::into_internal_error(
                         std::io::Error::other(error),
@@ -1841,6 +1854,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             app.start_session(active_session_id.clone());
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let mut voice = NativeVoice::default();
+            // This scope owns events (authentication moves/drops it) but only
+            // borrows terminal. Cancelling it joins input before the outer
+            // TerminalSession guard restores modes, just like ordinary return.
             let result: Result<(), agent_client_protocol::Error> = async {
                 enum SessionEvent {
 
@@ -2039,18 +2055,14 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             for index in 0..MAX_BURST {
                                 match next {
                                     Some(Ok(event)) => action = handle_with_clipboard(&mut app, &mut clipboard_pastes, event),
-                                    Some(Err(_)) | None => return Ok(()),
+                                    Some(Err(error)) => return Err(agent_client_protocol::Error::into_internal_error(error)),
+                                    None => return Ok(()),
                                 }
                                 if !matches!(action, Action::None) || index + 1 == MAX_BURST {
                                     break;
                                 }
-                                // `EventStream::next().now_or_never()` polls with a noop
-                                // waker. If no event is ready, crossterm's background reader
-                                // retains that waker and cannot wake this select loop when the
-                                // next key arrives. Check synchronously before polling the
-                                // stream so an empty burst cannot make the TUI unresponsive.
-                                if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-                                    next = events.next().await;
+                                if let Some(event) = events.try_next() {
+                                    next = Some(event);
                                 } else {
                                     break;
                                 }
@@ -2519,7 +2531,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     images = resume_terminal(&mut terminal).map_err(
                                         agent_client_protocol::Error::into_internal_error,
                                     )?;
-                                    events = EventStream::new();
+                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
                                 }
                                 Action::OpenUserImage(image) => {
                                     // Snapshot only; release the guard before queueing work.
@@ -2692,6 +2704,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 }
             }
             .await;
+            // The completed async block owned and dropped the input reader.
             // Best effort, nonblocking even on quit or an early error. Audio
             // stops first; connection teardown is the final cleanup boundary.
             voice.stop();
@@ -3376,39 +3389,85 @@ fn draw_frame<W: std::io::Write>(
     })
 }
 
-fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
-    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_modes();
-        ratatui::restore();
-        previous(info);
-    }));
-    crossterm::terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
-    let terminal = ratatui::Terminal::new(hyperlinks::HyperlinkBackend::new(std::io::stdout()))?;
-    // Query after entering the alternate screen but before the event stream owns
-    // terminal input, as required by ratatui-image. The query has a short bound.
-    let images = image::ImageRuntime::detect();
-    // Bracketed paste keeps pasted newlines out of the key stream. Keyboard
-    // enhancement distinguishes command keys, shifted returns, and releases.
-    enable_tui_modes();
+/// Owns terminal modes across fallible setup, dropped futures, and unwind.
+/// Declare input after this guard so its reader joins before mode restoration.
+struct TerminalSession {
+    terminal: DefaultTerminal,
+    active: bool,
+}
+
+impl std::ops::Deref for TerminalSession {
+    type Target = DefaultTerminal;
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
+impl std::ops::DerefMut for TerminalSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if self.active {
+            leave(self);
+        }
+    }
+}
+
+fn enter() -> std::io::Result<(TerminalSession, image::ImageRuntime)> {
+    // Unwinding restores through TerminalSession, after Events has joined.
+    // A process-global unwind hook would restore too early, including for an
+    // unrelated worker panic whose terminal owner remains alive.
+    #[cfg(panic = "abort")]
+    {
+        // Abort cannot run either destructor. Preserve best-effort emergency
+        // restoration and diagnostic visibility, without claiming joined input.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_modes();
+            ratatui::restore();
+            previous(info);
+        }));
+    }
+    // Construct before changing modes so a construction failure needs no cleanup.
+    let mut terminal = TerminalSession {
+        terminal: ratatui::Terminal::new(hyperlinks::HyperlinkBackend::new(std::io::stdout()))?,
+        active: false,
+    };
+    let images = prepare_terminal(&mut terminal)?;
     Ok((terminal, images))
 }
 
-fn resume_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<image::ImageRuntime> {
+fn resume_terminal(terminal: &mut TerminalSession) -> std::io::Result<image::ImageRuntime> {
+    let images = prepare_terminal(terminal)?;
+    if let Err(error) = terminal.clear() {
+        leave(terminal);
+        return Err(error);
+    }
+    Ok(images)
+}
+
+fn prepare_terminal(terminal: &mut TerminalSession) -> std::io::Result<image::ImageRuntime> {
+    terminal.active = true;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
     let resumed = (|| {
         crossterm::terminal::enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen)?;
+        // Image and synchronous keyboard-enhancement capability queries are
+        // setup-only readers. Both must finish before Events acquires input;
+        // steady-state UI code consumes only its queue, never crossterm locks.
         let images = image::ImageRuntime::detect();
         enable_tui_modes();
-        terminal.clear()?;
+        // Initial entry has fresh Ratatui buffers and a fresh alternate screen.
+        // Only resume needs clear(): it also queries the cursor position, which
+        // ordinary startup must not require the terminal to report.
         Ok(images)
     })();
     if resumed.is_err() {
-        restore_modes();
-        ratatui::restore();
+        leave(terminal);
     }
     resumed
 }
@@ -3550,7 +3609,8 @@ fn print_exit_message(app: &App) {
     let _ = stdout.flush();
 }
 
-fn leave(terminal: &mut DefaultTerminal) {
+fn leave(terminal: &mut TerminalSession) {
+    terminal.active = false;
     restore_modes();
     let _ = terminal.show_cursor();
     ratatui::restore();
