@@ -3101,6 +3101,10 @@ fn apply_clipboard_completion(
 }
 
 fn handle_paste(app: &mut App, text: &str) -> bool {
+    if app.child_focus.is_some() {
+        app.paste(text);
+        return true;
+    }
     if paste_blocked(app) {
         return false;
     }
@@ -3316,13 +3320,18 @@ fn enable_tui_modes() {
     }
 }
 
-fn draw_frame(
-    terminal: &mut DefaultTerminal,
+fn draw_frame<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<hyperlinks::HyperlinkBackend<W>>,
     app: &mut app::App,
     images: &mut image::ImageRuntime,
 ) -> std::io::Result<()> {
     hyperlinks::draw(terminal, |frame| {
         ui::draw(frame, app, images);
+        let app = app
+            .child_focus
+            .as_ref()
+            .and_then(|id| app.child_views.get(id))
+            .map_or(&*app, |child| &*child.app);
         hyperlinks::FrameLinks {
             rows: app.row_links.clone(),
             left: app.transcript_left,

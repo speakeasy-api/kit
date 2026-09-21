@@ -285,7 +285,8 @@ impl Transcript {
             return;
         };
         if *finished {
-            self.fail();
+            // Removed seals history before child cleanup completes. In-flight
+            // updates are no longer admitted, but do not invalidate the snapshot.
             return;
         }
         let size = bytes.len();
@@ -755,9 +756,12 @@ mod tests {
         let cancelled = tokio::spawn(async move { reader.read(0).await });
         cancelled.abort();
         let _ = cancelled.await;
-        assert_eq!(drain(&transcript, 0).await.updates.len(), 10);
+        let retained = drain(&transcript, 0).await;
+        assert_eq!(retained.updates.len(), 10);
         transcript.record(&update(11));
-        assert!(transcript.read(0).await.is_err());
+        let after = drain(&transcript, 0).await;
+        assert_eq!(after.updates, retained.updates);
+        assert_eq!(after.next_cursor, retained.next_cursor);
     }
 
     #[tokio::test]

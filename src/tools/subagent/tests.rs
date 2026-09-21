@@ -877,6 +877,7 @@ struct ScenarioOptions {
     fail_delete: bool,
     gate_new: bool,
     gate_fork: bool,
+    gate_close: bool,
     gate_prompt: Option<&'static str>,
     fail_close_session: Option<&'static str>,
 }
@@ -888,6 +889,7 @@ struct MockAcpScenario {
     new_release: std::path::PathBuf,
     fork_release: std::path::PathBuf,
     prompt_release: std::path::PathBuf,
+    close_release: std::path::PathBuf,
 }
 
 impl MockAcpScenario {
@@ -897,6 +899,7 @@ impl MockAcpScenario {
         let new_release = root.path().join("release-new");
         let fork_release = root.path().join("release-fork");
         let prompt_release = root.path().join("release-prompt");
+        let close_release = root.path().join("release-close");
         let mut args = vec![fixture_path_arg("--request-log", &requests)];
         if options.fail_delete {
             args.extend(["--delete".into(), "--fail-delete".into()]);
@@ -906,6 +909,9 @@ impl MockAcpScenario {
         }
         if options.gate_fork {
             args.push(fixture_path_arg("--fork-release", &fork_release));
+        }
+        if options.gate_close {
+            args.push(fixture_path_arg("--close-release", &close_release));
         }
         if let Some(text) = options.gate_prompt {
             args.push(fixture_path_arg("--prompt-release", &prompt_release));
@@ -922,6 +928,7 @@ impl MockAcpScenario {
             new_release,
             fork_release,
             prompt_release,
+            close_release,
         }
     }
 
@@ -1631,6 +1638,75 @@ async fn successful_fork_handoff_cleans_up_if_receipt_is_not_acknowledged() {
             .is_empty()
     );
     wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+}
+
+#[tokio::test]
+async fn close_streaming_child_retains_sealed_transcript() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_prompt: Some("late reply"),
+        gate_close: true,
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let manager = scenario.manager.clone();
+    let prior = source.clone();
+    let prompt = tokio::spawn(async move {
+        manager
+            .prompt(
+                prior,
+                "late reply".into(),
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+    });
+    scenario
+        .wait_for(
+            |request| matches!(request, LoggedRequest::Prompt { text, .. } if text == "late reply"),
+        )
+        .await;
+    let manager = scenario.manager.clone();
+    let id = source.id.clone();
+    let close = tokio::spawn(async move { manager.close(&id, &TurnCancellation::default()).await });
+    // The manager has emitted Removed and sealed history before sending close.
+    scenario
+        .wait_for(|request| matches!(request, LoggedRequest::Close { .. }))
+        .await;
+    let generation = source.generation + 1;
+    let retained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = scenario
+                .manager
+                .read_transcript(&source.id, generation, 0)
+                .await
+                .unwrap();
+            if page.caught_up {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!retained.updates.is_empty());
+
+    // Keep the child route live while its final streamed update arrives after seal.
+    MockAcpScenario::release(&scenario.prompt_release);
+    // Retirement is checked after the child consumes its successful response.
+    assert!(matches!(
+        prompt.await.unwrap(),
+        Err(ChildError::Failed(message)) if message == "subagent session is retired"
+    ));
+    MockAcpScenario::release(&scenario.close_release);
+    close.await.unwrap().unwrap();
+    let after = scenario
+        .manager
+        .read_transcript(&source.id, generation, 0)
+        .await
+        .unwrap();
+    assert!(after.caught_up);
+    assert_eq!(after.updates, retained.updates);
+    assert_eq!(after.next_cursor, retained.next_cursor);
 }
 
 #[tokio::test]

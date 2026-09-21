@@ -3878,6 +3878,86 @@ mod tests {
         app
     }
 
+    #[test]
+    fn focused_child_media_paste_stays_text_without_changing_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let text = path.to_str().unwrap();
+        for can_steer in [true, false] {
+            let mut app = panel_app(1);
+            app.paste("root draft");
+            app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+                id: "agent-0".into(),
+                name: "Scout 0".into(),
+                status: SubagentStatus::Working,
+                outcome: None,
+                generation: 2,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 1,
+                generation_started_at_unix_ms: 1,
+                generation_finished_at_unix_ms: None,
+            }));
+            app.apply(Update::Runtime(RuntimeEvent::SubagentCapabilities {
+                id: "agent-0".into(),
+                generation: 2,
+                can_steer,
+            }));
+            app.focus_child("agent-0".into());
+
+            super::super::handle(&mut app, crossterm::event::Event::Paste(text.into()));
+
+            assert_eq!(app.editor.text(), "root draft");
+            assert!(app.attachments.is_empty());
+            let child = &app.child_views["agent-0"].app;
+            assert_eq!(child.editor.text(), if can_steer { text } else { "" });
+            assert!(child.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn focused_child_frame_emits_visible_link_destinations() {
+        let mut app = panel_app(1);
+        app.blocks
+            .push(Block::Agent("[root link](https://example.com/root)".into()));
+        app.phase = Phase::Working;
+        let capture = Capture::default();
+        let mut terminal = Terminal::with_options(
+            HyperlinkBackend::new(capture.clone()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        let mut images = ImageRuntime::disabled();
+        super::super::draw_frame(&mut terminal, &mut app, &mut images).unwrap();
+        let output = String::from_utf8(capture.bytes()).unwrap();
+        assert!(output.contains("https://example.com/root\x1b\\"));
+        capture.clear();
+
+        // Hidden root controls must not suppress the child's native links.
+        app.paste("/");
+        assert!(native_links_obscured(&app));
+        app.focus_child("agent-0".into());
+        app.child_views
+            .get_mut("agent-0")
+            .unwrap()
+            .app
+            .blocks
+            .push(Block::Agent(
+                "[child link](https://example.com/child)".into(),
+            ));
+        super::super::draw_frame(&mut terminal, &mut app, &mut images).unwrap();
+        let output = String::from_utf8(capture.bytes()).unwrap();
+        assert!(output.contains("https://example.com/child\x1b\\"));
+        assert!(!output.contains("https://example.com/root\x1b\\"));
+    }
+
     fn buffer_row(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
         (0..buffer.area.width)
             .map(|column| buffer[(column, row)].symbol())
