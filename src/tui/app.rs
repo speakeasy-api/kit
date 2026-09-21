@@ -489,6 +489,11 @@ pub enum ComposeView {
     Script,
 }
 
+pub(super) fn observed_duration(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    let duration = end?.checked_duration_since(start?)?;
+    Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// A model-visible tool call and, for compose, the program running inside it.
 pub struct ToolCall {
     /// Opaque ACP identity, independent of the tool name and Runlet source.
@@ -498,8 +503,10 @@ pub struct ToolCall {
     pub title: String,
     pub kind: ToolKind,
     pub status: ToolCallStatus,
-    pub started: Instant,
+    pub started: Option<Instant>,
     pub finished: Option<Instant>,
+    /// The clock stopped, possibly without an observed terminal outcome.
+    pub timing_closed: bool,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
     /// Raw tool output, kept whole but folded away until asked for.
@@ -540,17 +547,26 @@ impl ToolCall {
         )
     }
 
-    pub fn elapsed(&self) -> u64 {
-        let end = self.finished.unwrap_or_else(Instant::now);
-        u64::try_from(end.duration_since(self.started).as_millis()).unwrap_or(u64::MAX)
+    pub fn elapsed(&self) -> Option<u64> {
+        self.elapsed_at(Instant::now())
     }
 
-    fn finalize_terminal_state(&mut self) {
+    fn elapsed_at(&self, now: Instant) -> Option<u64> {
+        let end = if self.running() && !self.timing_closed {
+            Some(now)
+        } else {
+            self.finished
+        };
+        observed_duration(self.started, end)
+    }
+
+    fn finalize_terminal_state(&mut self, at: Option<Instant>) {
         if self.is_compose() && !self.expansion_explicit {
             self.expanded = false;
             self.compose_view = ComposeView::Output;
         }
-        self.finished = Some(Instant::now());
+        self.finished = at;
+        self.timing_closed = true;
     }
 }
 
@@ -645,8 +661,9 @@ pub enum Block {
     AgentParts(Vec<AgentPart>),
     Thought {
         text: String,
-        started: Instant,
+        started: Option<Instant>,
         millis: Option<u64>,
+        closed: bool,
     },
     Tool(Box<ToolCall>),
     /// A turn ended. `background` counts detached programs still running
@@ -654,12 +671,12 @@ pub enum Block {
     /// spanning the autonomous turns that follow a background result.
     TurnDuration {
         background: usize,
-        since_prompt: u64,
+        since_prompt: Option<u64>,
     },
     /// A detached program finished after its turn had already ended.
     BackgroundResult {
         title: String,
-        millis: u64,
+        millis: Option<u64>,
         failed: bool,
     },
     /// Transcript history was compacted into a note.
@@ -862,6 +879,9 @@ pub struct App {
     pub turn_started: Option<Instant>,
     /// When the user last started something new, as opposed to steering.
     prompt_started: Option<Instant>,
+    prompt_seen: bool,
+    /// Scoped event clock: outer None is live, inner None is unknown replay timing.
+    observation_time: Option<Option<Instant>>,
     pub can_steer: bool,
     pub can_replace_steer: bool,
     pub(super) selected_steer: Option<String>,
@@ -1135,6 +1155,8 @@ impl App {
             phase: Phase::Idle,
             turn_started: None,
             prompt_started: None,
+            prompt_seen: false,
+            observation_time: None,
             can_steer: false,
             can_replace_steer: false,
             selected_steer: None,
@@ -1288,8 +1310,8 @@ impl App {
 
     fn block_is_dynamic(block: &Block) -> bool {
         match block {
-            Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running(),
+            Block::Thought { closed, .. } => !closed,
+            Block::Tool(call) => call.running() && !call.timing_closed,
             _ => false,
         }
     }
@@ -1654,16 +1676,17 @@ impl App {
         self.agents_scroll = self.agents_scroll.saturating_add_signed(rows).min(top);
     }
 
-    pub fn elapsed(&self) -> u64 {
-        self.turn_started.map_or(0, |started| {
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
+    pub fn elapsed(&self) -> Option<u64> {
+        observed_duration(self.turn_started, Some(Instant::now()))
+    }
+
+    fn observed_at(&self) -> Option<Instant> {
+        self.observation_time
+            .unwrap_or_else(|| Some(Instant::now()))
     }
 
     fn stop_turn_timer(&mut self) -> Option<u64> {
-        self.turn_started
-            .take()
-            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        observed_duration(self.turn_started.take(), self.observed_at())
     }
 
     pub fn toast_text(&self) -> Option<&str> {
@@ -1957,8 +1980,9 @@ impl App {
             }
             MessageRole::Thought => self.push_block(Block::Thought {
                 text,
-                started: Instant::now(),
+                started: self.observed_at(),
                 millis: None,
+                closed: false,
             }),
         }
         self.message_blocks.insert(id, self.blocks.len() - 1);
@@ -1997,6 +2021,7 @@ impl App {
         }
         self.close_thought();
         self.agent_stream_sealed = true;
+        let at = self.observed_at();
         let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
         self.compacting = false;
@@ -2017,7 +2042,7 @@ impl App {
                 } else {
                     ToolCallStatus::Failed
                 };
-                call.finalize_terminal_state();
+                call.finalize_terminal_state(at);
                 finished.push(index);
             }
         }
@@ -2028,16 +2053,16 @@ impl App {
         if let Some(notice) = notice {
             self.note(notice);
         }
-        if let Some(millis) = turn_millis {
-            let background = self.background_calls().len();
-            let since_prompt = self.prompt_started.map_or(millis, |started| {
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-            });
-            self.push_block(Block::TurnDuration {
-                background,
-                since_prompt,
-            });
-        }
+        let background = self.background_calls().len();
+        let since_prompt = if self.prompt_seen {
+            observed_duration(self.prompt_started, at)
+        } else {
+            turn_millis
+        };
+        self.push_block(Block::TurnDuration {
+            background,
+            since_prompt,
+        });
     }
 
     /// Top-level calls that detached from their turn and are still running.
@@ -2103,6 +2128,55 @@ impl App {
     }
 
     pub fn apply(&mut self, update: Update) {
+        self.apply_at(update, self.observed_at());
+    }
+
+    /// Apply a transcript event at its original observation time. Missing timing
+    /// remains unknown; it must never be substituted with the replay clock.
+    pub fn apply_at(&mut self, update: Update, at: Option<Instant>) {
+        let previous = self.observation_time.replace(at);
+        self.apply_observed(update);
+        self.observation_time = previous;
+    }
+
+    /// Stop clocks after a caught-up, inactive replay that lacks terminal events.
+    /// This records neither a successful outcome nor a fabricated finish time.
+    /// A later real terminal update can still supply the missing boundary.
+    pub fn finish_replay_incomplete(&mut self) {
+        let mut changed = Vec::new();
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            match block {
+                Block::Thought { millis, closed, .. } if !*closed => {
+                    *millis = None;
+                    *closed = true;
+                    changed.push(index);
+                }
+                Block::Tool(call) if call.running() && !call.timing_closed => {
+                    call.finished = None;
+                    call.timing_closed = true;
+                    changed.push(index);
+                }
+                _ => {}
+            }
+        }
+        for index in changed {
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
+        }
+        if self.phase != Phase::Idle {
+            self.push_block(Block::TurnDuration {
+                background: self.background_calls().len(),
+                since_prompt: None,
+            });
+        }
+        self.turn_started = None;
+        self.phase = Phase::Idle;
+        self.compacting = false;
+        self.agent_stream_sealed = true;
+    }
+
+    fn apply_observed(&mut self, update: Update) {
+        let at = self.observed_at();
         match update {
             Update::ChildSteerFinished {
                 id,
@@ -2221,7 +2295,8 @@ impl App {
                 let new_message = !self.message_blocks.contains_key(&id);
                 self.remove_pending_steer(&id);
                 if new_message && !steer {
-                    self.prompt_started = Some(Instant::now());
+                    self.prompt_seen = true;
+                    self.prompt_started = at;
                 }
                 self.apply_message(id, text, images, append, MessageRole::User);
             }
@@ -2285,8 +2360,9 @@ impl App {
                     title,
                     kind,
                     status: ToolCallStatus::Pending,
-                    started: Instant::now(),
+                    started: at,
                     finished: None,
+                    timing_closed: false,
                     script: super::source::bounded_source(script.unwrap_or_default()),
                     output: Vec::new(),
                     images: Vec::new(),
@@ -2317,6 +2393,17 @@ impl App {
                         script: script.clone(),
                         backgrounded,
                     });
+                    // A terminal-only observation proves the end, not the start.
+                    // Keep the event clock for other boundaries (such as closing
+                    // reasoning), but do not manufacture a zero-length tool run.
+                    if matches!(
+                        status,
+                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    ) && let Some(index) = self.call_index(&id)
+                        && let Block::Tool(call) = &mut self.blocks[index]
+                    {
+                        call.started = None;
+                    }
                 }
                 if let Some(images) = images
                     && let Some(index) = self.call_index(&id)
@@ -2392,8 +2479,8 @@ impl App {
                 call.backgrounded |= backgrounded;
                 if let Some(status) = status {
                     call.status = status;
-                    if !call.running() {
-                        call.finalize_terminal_state();
+                    if was_running && !call.running() {
+                        call.finalize_terminal_state(at);
                     }
                 }
                 let identity_changed = was_compose != call.is_compose();
@@ -2446,7 +2533,7 @@ impl App {
                 StateUpdate::Running(_) | StateUpdate::RequiresAction(_) => {
                     if self.phase == Phase::Idle {
                         self.agent_stream_sealed = true;
-                        self.turn_started = Some(Instant::now());
+                        self.turn_started = at;
                     }
                     if self.phase != Phase::Cancelling {
                         self.phase = if matches!(state, StateUpdate::Running(_)) {
@@ -2937,13 +3024,17 @@ impl App {
     }
 
     fn close_thought(&mut self) {
+        let at = self.observed_at();
         if let Some(Block::Thought {
             started,
-            millis: millis @ None,
+            millis,
+            closed,
             ..
         }) = self.blocks.last_mut()
+            && !*closed
         {
-            *millis = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            *millis = observed_duration(*started, at);
+            *closed = true;
             let index = self.blocks.len() - 1;
             self.mark_block_dirty(index);
             self.reclassify_dynamic(index);
@@ -2989,6 +3080,8 @@ impl App {
         self.latest_agent_source.clear();
         self.phase = Phase::Idle;
         self.turn_started = None;
+        self.prompt_started = None;
+        self.prompt_seen = false;
         self.message_blocks.clear();
         self.pending_steers.clear();
         self.compacting = false;
@@ -6147,6 +6240,234 @@ mod tests {
     }
 
     #[test]
+    fn replay_terminal_only_tool_keeps_start_and_duration_unknown() {
+        let base = Instant::now();
+        for status in [ToolCallStatus::Completed, ToolCallStatus::Failed] {
+            let mut app = app();
+            app.apply_at(
+                Update::AgentThought {
+                    id: "thought".into(),
+                    text: "reasoning".into(),
+                    append: false,
+                },
+                Some(base),
+            );
+            app.apply_at(
+                Update::ToolPatched {
+                    id: "tool".into(),
+                    title: Some("shell".into()),
+                    kind: None,
+                    status: Some(status.clone()),
+                    script: None,
+                    output: None,
+                    images: None,
+                    append_output: false,
+                    intent: None,
+                    backgrounded: false,
+                },
+                Some(base + Duration::from_secs(7)),
+            );
+            let call = app.tool_call("tool").unwrap();
+            assert_eq!(call.status, status);
+            assert_eq!(call.started, None);
+            assert_eq!(call.finished, Some(base + Duration::from_secs(7)));
+            assert_eq!(call.elapsed_at(base + Duration::from_secs(40)), None);
+            assert!(app.blocks.iter().any(|block| matches!(
+                block,
+                Block::Thought {
+                    millis: Some(7_000),
+                    closed: true,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn replay_incomplete_stops_clocks_without_fabricating_outcomes() {
+        let base = Instant::now();
+        let mut app = app();
+        app.apply_at(
+            Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+            Some(base),
+        );
+        app.apply_at(
+            Update::ToolStarted {
+                id: "tool".into(),
+                title: "shell".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: false,
+            },
+            Some(base),
+        );
+        app.apply_at(
+            Update::AgentThought {
+                id: "thought".into(),
+                text: "reasoning".into(),
+                append: false,
+            },
+            Some(base),
+        );
+        let call = app.tool_call("tool").unwrap();
+        assert_eq!(call.elapsed_at(base + Duration::from_secs(4)), Some(4_000));
+        assert_eq!(call.elapsed_at(base - Duration::from_secs(1)), None);
+        assert_eq!(
+            super::observed_duration(Some(base), Some(base - Duration::from_secs(1))),
+            None
+        );
+
+        app.finish_replay_incomplete();
+        let call = app.tool_call("tool").unwrap();
+        assert_eq!(call.status, ToolCallStatus::Pending);
+        assert_eq!(call.started, Some(base));
+        assert_eq!(call.finished, None);
+        assert_eq!(call.elapsed_at(base + Duration::from_secs(40)), None);
+        assert!(call.timing_closed);
+        assert!(!app.working());
+        assert_eq!(app.elapsed(), None);
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Thought {
+                millis: None,
+                closed: true,
+                ..
+            }
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration {
+                since_prompt: None,
+                ..
+            })
+        ));
+        assert!(app.transcript_dynamic.is_empty());
+        let count = app.blocks.len();
+        app.finish_replay_incomplete();
+        assert_eq!(app.blocks.len(), count);
+
+        // Real terminal evidence may arrive later without losing the known start.
+        app.apply_at(
+            Update::ToolPatched {
+                id: "tool".into(),
+                title: None,
+                kind: None,
+                status: Some(ToolCallStatus::Completed),
+                script: None,
+                output: None,
+                images: None,
+                append_output: false,
+                intent: None,
+                backgrounded: false,
+            },
+            Some(base + Duration::from_secs(7)),
+        );
+        assert_eq!(app.tool_call("tool").unwrap().elapsed(), Some(7_000));
+    }
+
+    #[test]
+    fn replay_timing_uses_original_boundaries_and_preserves_unknowns() {
+        let base = Instant::now() - Duration::from_secs(600);
+        for (start, end, expected) in [
+            (Some(base), Some(base + Duration::from_secs(7)), Some(7_000)),
+            (None, Some(base + Duration::from_secs(7)), None),
+            (Some(base), None, None),
+            (None, None, None),
+            (Some(base), Some(base - Duration::from_secs(1)), None),
+        ] {
+            let mut app = app();
+            app.apply_at(
+                Update::UserMessage {
+                    id: "prompt".into(),
+                    text: "hello".into(),
+                    images: vec![],
+                    append: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+                start,
+            );
+            app.apply_at(
+                Update::AgentThought {
+                    id: "thought".into(),
+                    text: "reasoning".into(),
+                    append: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::ToolStarted {
+                    id: "tool".into(),
+                    title: "shell".into(),
+                    kind: ToolKind::Other,
+                    script: None,
+                    backgrounded: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::State(StateUpdate::Idle(IdleStateUpdate::new())),
+                end,
+            );
+            assert_eq!(app.tool_call("tool").unwrap().elapsed(), expected);
+            assert!(
+                matches!(app.blocks.last(), Some(Block::TurnDuration { since_prompt, .. }) if *since_prompt == expected)
+            );
+            // Reasoning closes when the tool starts, at the original observation time.
+            assert!(app.blocks.iter().any(|block| matches!(block,
+                Block::Thought { millis, closed: true, .. } if *millis == start.map(|_| 0))));
+        }
+    }
+
+    #[test]
+    fn replay_reasoning_and_prompt_have_independent_original_boundaries() {
+        let base = Instant::now() - Duration::from_secs(600);
+        let mut app = app();
+        app.apply_at(
+            Update::UserMessage {
+                id: "prompt".into(),
+                text: "hello".into(),
+                images: vec![],
+                append: false,
+            },
+            Some(base),
+        );
+        app.apply_at(
+            Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+            Some(base + Duration::from_secs(2)),
+        );
+        app.apply_at(
+            Update::AgentThought {
+                id: "thought".into(),
+                text: "reasoning".into(),
+                append: false,
+            },
+            Some(base + Duration::from_secs(3)),
+        );
+        app.apply_at(
+            Update::State(StateUpdate::Idle(IdleStateUpdate::new())),
+            Some(base + Duration::from_secs(9)),
+        );
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Thought {
+                millis: Some(6_000),
+                closed: true,
+                ..
+            }
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration {
+                since_prompt: Some(9_000),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn completed_turn_duration_is_recorded_at_the_end() {
         let mut app = app();
         app.push_user("hello".into());
@@ -6159,7 +6480,7 @@ mod tests {
 
         assert!(matches!(
             app.blocks.last(),
-            Some(Block::TurnDuration { since_prompt, .. }) if *since_prompt >= 65_000
+            Some(Block::TurnDuration { since_prompt, .. }) if since_prompt.is_some_and(|ms| ms >= 65_000)
         ));
     }
 
@@ -6252,7 +6573,7 @@ mod tests {
         )));
         assert!(matches!(
             app.blocks.last(),
-            Some(Block::TurnDuration { background: 1, since_prompt, .. }) if *since_prompt < 5_000
+            Some(Block::TurnDuration { background: 1, since_prompt, .. }) if since_prompt.is_some_and(|ms| ms < 5_000)
         ));
 
         app.apply(Update::ToolPatched {

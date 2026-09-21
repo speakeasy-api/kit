@@ -3,6 +3,7 @@
 //! sole writer. Poison isolates inspection, not execution. One blocking writer
 //! owns each child session, with bounded nonblocking admission. Readers open their
 //! own descriptors, never lock the writer, and only see committed JSON lines.
+use serde::{Serialize, Serializer, ser::SerializeMap};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -202,31 +203,34 @@ impl Transcript {
     /// an exact wire transcript: text is aggregated and rich updates are bounded.
     /// Keep that limitation visible instead of silently discarding available data.
     pub(crate) fn replay(&self, owner: &str, generation: u64, output: &super::ChildOutput) {
-        self.record(&Value::Object(serde_json::Map::from_iter([
+        self.record_at(&Value::Object(serde_json::Map::from_iter([
             ("sessionUpdate".into(), Value::String("kit_transcript_partial".into())),
             ("reason".into(), Value::String("Historical ACP replay is partial: assistant text is aggregated, rich updates are bounded, and original user/thought ordering is unavailable".into())),
-        ])));
+        ])), None);
         let mut text = output.text.as_str();
         while !text.is_empty() {
             let end = text.floor_char_boundary((32 * 1024).min(text.len()));
             let (chunk, rest) = text.split_at(end);
-            self.record(&Value::Object(serde_json::Map::from_iter([
-                (
-                    "sessionUpdate".into(),
-                    Value::String("agent_message_chunk".into()),
-                ),
-                (
-                    "messageId".into(),
-                    Value::String(format!("kit-replay-{generation}")),
-                ),
-                (
-                    "content".into(),
-                    Value::Object(serde_json::Map::from_iter([
-                        ("type".into(), Value::String("text".into())),
-                        ("text".into(), Value::String(chunk.into())),
-                    ])),
-                ),
-            ])));
+            self.record_at(
+                &Value::Object(serde_json::Map::from_iter([
+                    (
+                        "sessionUpdate".into(),
+                        Value::String("agent_message_chunk".into()),
+                    ),
+                    (
+                        "messageId".into(),
+                        Value::String(format!("kit-replay-{generation}")),
+                    ),
+                    (
+                        "content".into(),
+                        Value::Object(serde_json::Map::from_iter([
+                            ("type".into(), Value::String("text".into())),
+                            ("text".into(), Value::String(chunk.into())),
+                        ])),
+                    ),
+                ])),
+                None,
+            );
             text = rest;
         }
         let mut segments = super::InspectionSegments::default();
@@ -237,7 +241,7 @@ impl Transcript {
                 return;
             }
             if let Some(update) = super::inspection_event(owner, generation, update) {
-                self.record(&update);
+                self.record_at(&update, None);
             }
         }
     }
@@ -246,14 +250,33 @@ impl Transcript {
         self.shared.failed.store(true, Ordering::Release);
     }
     pub(crate) fn record(&self, update: &Value) {
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+        self.record_at(update, observed_at);
+    }
+
+    fn record_at(&self, update: &Value, observed_at: Option<u64>) {
         if self.shared.failed.load(Ordering::Acquire) {
             return;
         }
         // Serialization itself is bounded; an enormous tool/image update does
         // not allocate an equally enormous second copy or invalidate the log.
         let mut buffer = BoundedRecord(Vec::new());
-        if serde_json::to_writer(&mut buffer, update).is_err() {
-            buffer.0 = br#"{"sessionUpdate":"kit_transcript_truncated","reason":"One inspection update exceeded 1 MiB and was omitted; later updates remain available"}"#.to_vec();
+        let record = TimedRecord::new(update, observed_at);
+        if serde_json::to_writer(&mut buffer, &record).is_err() {
+            let notice = Value::Object(serde_json::Map::from_iter([
+                ("sessionUpdate".into(), Value::String("kit_transcript_truncated".into())),
+                ("reason".into(), Value::String("One inspection update exceeded 1 MiB and was omitted; later updates remain available".into())),
+            ]));
+            buffer.0.clear();
+            if serde_json::to_writer(&mut buffer, &TimedRecord::new(&notice, record.observed_at))
+                .is_err()
+            {
+                self.fail();
+                return;
+            }
         }
         buffer.0.push(b'\n');
         let bytes = buffer.0;
@@ -285,6 +308,47 @@ impl Transcript {
             .map_err(|error| format!("transcript reader failed: {error}"))?
     }
 }
+/// Additive ephemeral record metadata. Every writer emits an unsigned Unix
+/// millisecond timestamp or explicit null. Files are never reopened across runs,
+/// so there is no persistent migration. Missing legacy metadata means unknown.
+/// ACP message updates have no native event timestamp; preserve supplied Kit
+/// timing when available rather than replacing it with a replay observation.
+/// A supplied value uses the source's wall clock; otherwise this is Kit's local
+/// receipt time. Neither is an exact remote execution start. Clock skew or clock
+/// adjustments can therefore make a boundary pair unusable, which the UI treats
+/// as unknown rather than synthesizing a duration.
+struct TimedRecord<'a> {
+    update: &'a Value,
+    observed_at: Option<u64>,
+}
+impl<'a> TimedRecord<'a> {
+    fn new(update: &'a Value, observed_at: Option<u64>) -> Self {
+        Self {
+            update,
+            observed_at: match update.get("kitObservedAtUnixMs") {
+                Some(value) => value.as_u64(),
+                None => observed_at,
+            },
+        }
+    }
+}
+impl Serialize for TimedRecord<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let object = self
+            .update
+            .as_object()
+            .ok_or_else(|| serde::ser::Error::custom("inspection update must be an object"))?;
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in object {
+            if key != "kitObservedAtUnixMs" {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.serialize_entry("kitObservedAtUnixMs", &self.observed_at)?;
+        map.end()
+    }
+}
+
 /// A production serialization boundary: memory cannot grow with arbitrary
 /// incoming content. Larger records become an explicit, nonfatal notice.
 struct BoundedRecord(Vec<u8>);
@@ -379,7 +443,7 @@ mod tests {
     use serde_json::json;
 
     fn update(n: usize) -> Value {
-        json!({"n": n})
+        json!({"n": n, "kitObservedAtUnixMs": 123})
     }
     async fn drain(transcript: &Transcript, mut cursor: u64) -> Page {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -404,6 +468,83 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn timing_schema_preserves_source_and_normalizes_unknown() {
+        let legacy = json!({"sessionUpdate": "agent_message_chunk"});
+        assert_eq!(
+            serde_json::to_value(TimedRecord::new(&legacy, None)).unwrap(),
+            json!({"sessionUpdate": "agent_message_chunk", "kitObservedAtUnixMs": null})
+        );
+        assert_eq!(
+            serde_json::to_value(TimedRecord::new(&legacy, Some(1_700_000_000_123))).unwrap()["kitObservedAtUnixMs"],
+            1_700_000_000_123_u64
+        );
+        for source in [json!(123), json!(null), json!("bad"), json!(-1), json!(1.5)] {
+            let current = json!({"kitObservedAtUnixMs": source});
+            let encoded = serde_json::to_value(TimedRecord::new(&current, Some(999))).unwrap();
+            assert_eq!(
+                encoded["kitObservedAtUnixMs"],
+                source.as_u64().map(Value::from).unwrap_or(Value::Null)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn original_observation_survives_disk_pages_and_truncation() {
+        let transcript = Transcript::start();
+        transcript.record_at(
+            &json!({"sessionUpdate":"agent_message_chunk"}),
+            Some(1_700_000_000_123),
+        );
+        transcript.record_at(
+            &json!({"text":"x".repeat(FRAME_BYTES + 1)}),
+            Some(1_700_000_000_456),
+        );
+        let first = drain(&transcript, 0).await;
+        assert_eq!(
+            first.updates[0]["kitObservedAtUnixMs"],
+            1_700_000_000_123_u64
+        );
+        assert_eq!(
+            first.updates[1]["kitObservedAtUnixMs"],
+            1_700_000_000_456_u64
+        );
+        assert_eq!(
+            first.updates[1]["sessionUpdate"],
+            "kit_transcript_truncated"
+        );
+        transcript.record_at(
+            &json!({"sessionUpdate":"agent_message_chunk"}),
+            Some(1_700_000_000_789),
+        );
+        let tail = drain(&transcript, first.next_cursor).await;
+        assert_eq!(
+            tail.updates[0]["kitObservedAtUnixMs"],
+            1_700_000_000_789_u64
+        );
+        let repeated = drain(&transcript, 0).await;
+        assert_eq!(repeated.updates[..2], first.updates);
+    }
+
+    #[tokio::test]
+    async fn historical_import_preserves_source_time_and_marks_missing_unknown() {
+        let transcript = Transcript::start();
+        transcript.replay("child", 1, &super::super::ChildOutput {
+            text: "historical text".into(),
+            updates: vec![
+                json!({"sessionUpdate":"agent_thought_chunk", "content":{"type":"text","text":"unknown"}}),
+                json!({"sessionUpdate":"agent_thought_chunk", "content":{"type":"text","text":"known"}, "kitObservedAtUnixMs":123}),
+            ],
+            ..Default::default()
+        });
+        let history = drain(&transcript, 0).await;
+        assert_eq!(history.updates.len(), 4);
+        for update in &history.updates[..3] {
+            assert_eq!(update.get("kitObservedAtUnixMs"), Some(&Value::Null));
+        }
+        assert_eq!(history.updates[3]["kitObservedAtUnixMs"], 123);
+    }
+
     #[tokio::test]
     async fn disk_replay_then_live_handoff_is_ordered_without_duplicates() {
         let transcript = Transcript::start();
@@ -411,10 +552,7 @@ mod tests {
             transcript.record(&update(n));
         }
         let snapshot = drain(&transcript, 0).await;
-        assert_eq!(
-            snapshot.updates,
-            (0..150).map(|n| json!({"n":n})).collect::<Vec<_>>()
-        );
+        assert_eq!(snapshot.updates, (0..150).map(update).collect::<Vec<_>>());
         assert!(
             transcript
                 .read(snapshot.next_cursor)
@@ -427,10 +565,7 @@ mod tests {
             transcript.record(&update(n));
         }
         let live = drain(&transcript, snapshot.next_cursor).await;
-        assert_eq!(
-            live.updates,
-            (150..200).map(|n| json!({"n":n})).collect::<Vec<_>>()
-        );
+        assert_eq!(live.updates, (150..200).map(update).collect::<Vec<_>>());
         assert_eq!(drain(&transcript, 0).await.updates.len(), 200);
         // A real file backs replay, not an in-memory transcript vector.
         let path = transcript.shared.path.get().unwrap();
@@ -459,12 +594,9 @@ mod tests {
         first.start("child", 1); // delayed lifecycle event cannot restore generation 1
         assert!(first.get("child", 1).is_err());
         let current = first.get("child", 2).unwrap();
-        assert_eq!(drain(&current, 0).await.updates, vec![json!({"n":1})]);
+        assert_eq!(drain(&current, 0).await.updates, vec![update(1)]);
         current.record(&update(2));
-        assert_eq!(
-            drain(&current, 0).await.updates,
-            vec![json!({"n":1}), json!({"n":2})]
-        );
+        assert_eq!(drain(&current, 0).await.updates, vec![update(1), update(2)]);
         current.fail();
         assert!(current.read(0).await.is_err());
         current.record(&update(3));
@@ -474,8 +606,8 @@ mod tests {
     #[tokio::test]
     async fn large_updates_replay_and_oversized_notice_does_not_freeze_history() {
         let transcript = Transcript::start();
-        let medium = json!({"text": "m".repeat(16 * 1024)});
-        let large = json!({"text": "l".repeat(512 * 1024)});
+        let medium = json!({"text": "m".repeat(16 * 1024), "kitObservedAtUnixMs": 123});
+        let large = json!({"text": "l".repeat(512 * 1024), "kitObservedAtUnixMs": 123});
         transcript.record(&medium);
         transcript.record(&large);
         transcript.record(&json!({"text": "x".repeat(FRAME_BYTES + 1)}));

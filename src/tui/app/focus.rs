@@ -15,7 +15,39 @@ pub(super) struct ChildUiState {
     follow: bool,
 }
 
+/// One wall/monotonic anchor per view keeps replay pages and live updates on
+/// the same clock. These are observation times, not exact remote start times.
+struct ReplayClock {
+    unix_ms: u64,
+    instant: Instant,
+}
+
+impl ReplayClock {
+    fn now() -> Self {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        Self {
+            unix_ms: u64::try_from(unix_ms).unwrap_or(u64::MAX),
+            instant: Instant::now(),
+        }
+    }
+
+    fn observed_at(&self, value: &serde_json::Value) -> Option<Instant> {
+        let unix_ms = value["kitObservedAtUnixMs"].as_u64()?;
+        if unix_ms <= self.unix_ms {
+            self.instant
+                .checked_sub(Duration::from_millis(self.unix_ms - unix_ms))
+        } else {
+            self.instant
+                .checked_add(Duration::from_millis(unix_ms - self.unix_ms))
+        }
+    }
+}
+
 pub struct ChildView {
+    clock: ReplayClock,
     pub app: Box<App>,
     pub notice: String,
     pub generation: u64,
@@ -41,7 +73,7 @@ impl ChildView {
         self.read_enabled = false;
         self.pending_text = None;
         self.steer_notice = None;
-        self.app.phase = Phase::Idle;
+        self.app.finish_replay_incomplete();
         self.notice = notice.into();
     }
 
@@ -94,6 +126,8 @@ impl App {
             );
         }
         self.child_focus = None;
+        self.agents_keyboard_focus = false;
+        self.agents_selected = None;
         self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
         self.child_back_area = Rect::default();
     }
@@ -129,6 +163,7 @@ impl App {
             app.follow = ui.follow;
         }
         let mut view = ChildView {
+            clock: ReplayClock::now(),
             app: Box::new(app),
             generation,
             can_steer,
@@ -258,6 +293,7 @@ impl App {
                 }
                 continue;
             }
+            let observed_at = view.clock.observed_at(&value);
             let Ok(update) = serde_json::from_value(value) else {
                 view.partial = true;
                 continue;
@@ -284,12 +320,15 @@ impl App {
                 view.partial = true;
             }
             for update in updates {
-                view.app.apply(update);
+                view.app.apply_at(update, observed_at);
             }
         }
         view.cursor = response.next_cursor;
         if response.caught_up {
             view.loading = false;
+            if !view.active {
+                view.app.finish_replay_incomplete();
+            }
             if let Some((scroll, follow)) = view.restore_scroll.take() {
                 view.app.scroll = scroll;
                 view.app.follow = follow;
@@ -325,17 +364,20 @@ impl App {
             return;
         };
         if view.active != (status == SubagentStatus::Working) {
+            // Reject an in-flight read sampled before this lifecycle boundary.
+            // A fresh read must drain the terminal tail before closing clocks.
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
             view.steer_notice = None;
         }
         view.active = status == SubagentStatus::Working;
-        if !view.active {
-            view.can_steer = false;
-        }
-        view.app.phase = if view.active {
-            Phase::Working
+        if view.active {
+            view.app.phase = Phase::Working;
         } else {
-            Phase::Idle
-        };
+            view.can_steer = false;
+            // Lifecycle can precede the final spool page. Keep timing boundaries
+            // open until a subsequent caught-up read consumes that tail.
+            view.read_backoff = false;
+        }
         view.refresh_notice();
     }
 
@@ -618,6 +660,170 @@ mod tests {
     }
 
     #[test]
+    fn replay_clock_preserves_offsets_and_unknown_observations() {
+        let instant = Instant::now();
+        let clock = ReplayClock {
+            unix_ms: 10_000,
+            instant,
+        };
+        let value = |ms| serde_json::json!({"kitObservedAtUnixMs": ms});
+        assert_eq!(
+            clock.observed_at(&value(8_000)),
+            instant.checked_sub(Duration::from_secs(2))
+        );
+        assert_eq!(
+            clock.observed_at(&value(12_000)),
+            instant.checked_add(Duration::from_secs(2))
+        );
+        assert_eq!(clock.observed_at(&serde_json::json!({})), None);
+        assert_eq!(
+            clock.observed_at(&serde_json::json!({"kitObservedAtUnixMs": null})),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_tool_duration_is_stable_across_late_load_and_reopen() {
+        let mut app = app();
+        lifecycle(&mut app, "child", 1, SubagentStatus::Working);
+        let instant = Instant::now();
+        for opened_at in [10_000, 30_000] {
+            app.focus_child("child".into());
+            app.child_views.get_mut("child").unwrap().clock = ReplayClock {
+                unix_ms: opened_at,
+                instant,
+            };
+            for (cursor, update) in [
+                serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "title": "shell", "status": "in_progress", "kitObservedAtUnixMs": 2_000}),
+                serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "status": "completed", "kitObservedAtUnixMs": 5_000}),
+            ].into_iter().enumerate() {
+                let target = app.child_read_target().unwrap();
+                app.child_read_finished(&target, Ok(ReadSubagentTranscriptResponse {
+                    generation: 1, next_cursor: cursor as u64 + 1, caught_up: true, updates: vec![update],
+                }));
+                if cursor == 0 {
+                    let call = app.child_views["child"].app.tool_call("tool").unwrap();
+                    assert!(call.running());
+                    assert_eq!(call.started, instant.checked_sub(Duration::from_millis(opened_at - 2_000)));
+                }
+            }
+            assert_eq!(
+                app.child_views["child"]
+                    .app
+                    .tool_call("tool")
+                    .unwrap()
+                    .elapsed(),
+                Some(3_000)
+            );
+            app.leave_child();
+        }
+    }
+
+    #[test]
+    fn terminal_lifecycle_waits_for_tail_before_closing_reasoning() {
+        let mut app = app();
+        lifecycle(&mut app, "child", 1, SubagentStatus::Working);
+        app.focus_child("child".into());
+        app.child_views.get_mut("child").unwrap().clock = ReplayClock {
+            unix_ms: 10_000,
+            instant: Instant::now(),
+        };
+        let thought = serde_json::json!({"sessionUpdate": "agent_thought_chunk", "messageId": "thought", "content": {"type": "text", "text": "thinking"}, "kitObservedAtUnixMs": 2_000});
+        let target = app.child_read_target().unwrap();
+        app.child_read_finished(
+            &target,
+            Ok(ReadSubagentTranscriptResponse {
+                generation: 1,
+                next_cursor: 1,
+                caught_up: true,
+                updates: vec![thought],
+            }),
+        );
+        let stale_target = app.child_read_target().unwrap();
+        lifecycle(&mut app, "child", 1, SubagentStatus::Idle);
+        assert_ne!(app.child_read_target().unwrap(), stale_target);
+        app.child_read_finished(
+            &stale_target,
+            Ok(ReadSubagentTranscriptResponse {
+                generation: 1,
+                next_cursor: 1,
+                caught_up: true,
+                updates: vec![],
+            }),
+        );
+        let target = app.child_read_target().unwrap();
+        app.child_read_finished(&target, Ok(ReadSubagentTranscriptResponse { generation: 1, next_cursor: 2, caught_up: true, updates: vec![serde_json::json!({"sessionUpdate": "agent_message_chunk", "messageId": "answer", "content": {"type": "text", "text": "done"}, "kitObservedAtUnixMs": 5_000})] }));
+        assert!(
+            app.child_views["child"]
+                .app
+                .blocks
+                .iter()
+                .any(|block| matches!(
+                    block,
+                    Block::Thought {
+                        closed: true,
+                        millis: Some(3_000),
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn inactive_child_without_terminal_records_does_not_keep_aging() {
+        for initially_active in [false, true] {
+            let mut app = app();
+            lifecycle(
+                &mut app,
+                "child",
+                1,
+                if initially_active {
+                    SubagentStatus::Working
+                } else {
+                    SubagentStatus::Idle
+                },
+            );
+            app.focus_child("child".into());
+            app.child_views.get_mut("child").unwrap().clock = ReplayClock {
+                unix_ms: 10_000,
+                instant: Instant::now(),
+            };
+            let target = app.child_read_target().unwrap();
+            app.child_read_finished(&target, Ok(ReadSubagentTranscriptResponse {
+                generation: 1, next_cursor: 2, caught_up: true, updates: vec![
+                    serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "tool", "title": "shell", "status": "in_progress", "kitObservedAtUnixMs": 2_000}),
+                    serde_json::json!({"sessionUpdate": "agent_thought_chunk", "messageId": "thought", "content": {"type": "text", "text": "thinking"}, "kitObservedAtUnixMs": 3_000}),
+                ],
+            }));
+            if initially_active {
+                lifecycle(&mut app, "child", 1, SubagentStatus::Idle);
+                let target = app.child_read_target().unwrap();
+                app.child_read_finished(
+                    &target,
+                    Ok(ReadSubagentTranscriptResponse {
+                        generation: 1,
+                        next_cursor: 2,
+                        caught_up: true,
+                        updates: vec![],
+                    }),
+                );
+            }
+            let child = &app.child_views["child"].app;
+            let call = child.tool_call("tool").unwrap();
+            assert!(call.running(), "missing outcome must not become success");
+            assert_eq!(call.elapsed(), None);
+            assert!(child.blocks.iter().any(|block| matches!(
+                block,
+                Block::Thought {
+                    closed: true,
+                    millis: None,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
     fn focus_navigation_preserves_root_roster_draft_and_scroll() {
         let mut app = app();
         lifecycle(&mut app, "alpha", 1, SubagentStatus::Working);
@@ -779,8 +985,12 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         assert!(app.child_focus.is_none());
         assert!(app.child_views.is_empty());
+        assert!(!app.agents_keyboard_focus);
+        assert!(app.agents_selected.is_none());
         app.focus_child("child".into());
         read(&mut app, "snapshot", true);
+        // Back must release roster focus even while keyboard navigation owns it.
+        app.agents_keyboard_focus = true;
         app.child_back_area = Rect::new(0, 0, 20, 1);
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -790,6 +1000,14 @@ mod tests {
         });
         assert!(app.child_focus.is_none());
         assert!(app.child_views.is_empty());
+        assert!(!app.agents_keyboard_focus);
+        assert!(app.agents_selected.is_none());
+
+        app.focus_child("child".into());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.child_focus.is_none());
+        assert!(!app.agents_keyboard_focus);
+        assert!(app.agents_selected.is_none());
     }
 
     #[test]

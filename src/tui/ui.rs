@@ -1392,8 +1392,8 @@ fn refresh_transcript_cache_with_images(app: &mut App, images: &mut ImageRuntime
     let mut first_changed_count = app.blocks.len();
     for block_index in dirty {
         let dynamic = match &app.blocks[block_index] {
-            Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running(),
+            Block::Thought { closed, .. } => !closed,
+            Block::Tool(call) => call.running() && !call.timing_closed,
             _ => false,
         };
         let revision = app.transcript_revisions[block_index];
@@ -1685,12 +1685,14 @@ fn single_transcript_block_rows(
             text,
             started,
             millis,
+            closed,
         } => (
             uncopyable(plain_lines(thought_lines(
                 app,
                 text,
-                started.elapsed().as_millis(),
+                super::app::observed_duration(*started, Some(std::time::Instant::now())),
                 *millis,
+                *closed,
             ))),
             None,
         ),
@@ -1727,7 +1729,7 @@ fn single_transcript_block_rows(
                 ],
                 vec![
                     Span::styled(
-                        format!("background result · {}", theme::duration(*millis)),
+                        format!("background result · {}", timing_label(*millis)),
                         theme::dim(),
                     ),
                     Span::styled(
@@ -1865,19 +1867,25 @@ fn spread(mut left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize)
 /// still running in the background. Turns restart on their own after a
 /// detached result lands, so per-turn figures would say little; the clock
 /// keeps running until nothing is left in the background.
-fn turn_end_line(background: usize, since_prompt: u64) -> Line<'static> {
+fn timing_label(millis: Option<u64>) -> String {
+    millis
+        .map(theme::duration)
+        .unwrap_or_else(|| "timing unknown".into())
+}
+
+fn turn_end_line(background: usize, since_prompt: Option<u64>) -> Line<'static> {
     let mut spans = vec![Span::styled("· ", theme::faint())];
     if background > 0 {
         spans.push(Span::styled("◔ ", Style::default().fg(theme::warn_color())));
         spans.push(Span::styled(
             format!(
                 "{background} in background · {} so far",
-                theme::duration(since_prompt)
+                timing_label(since_prompt)
             ),
             theme::faint(),
         ));
     } else {
-        spans.push(Span::styled(theme::duration(since_prompt), theme::faint()));
+        spans.push(Span::styled(timing_label(since_prompt), theme::faint()));
     }
     Line::from(spans)
 }
@@ -1894,16 +1902,17 @@ fn thought_heading(text: &str) -> Option<String> {
 fn thought_lines(
     app: &App,
     text: &str,
-    running_millis: u128,
+    running_millis: Option<u64>,
     millis: Option<u64>,
+    closed: bool,
 ) -> Vec<Line<'static>> {
-    let elapsed = millis.unwrap_or(u64::try_from(running_millis).unwrap_or(u64::MAX));
+    let elapsed = if closed { millis } else { running_millis };
     if !app.show_thoughts {
-        return vec![if millis.is_some() {
+        return vec![if closed {
             Line::from(vec![
                 Span::styled("⋮ ", theme::faint()),
                 Span::styled(
-                    format!("thought {} · ^t", theme::duration(elapsed)),
+                    format!("thought {} · ^t", timing_label(elapsed)),
                     theme::faint(),
                 ),
             ])
@@ -1915,7 +1924,7 @@ fn thought_lines(
                     thought_heading(text).map_or(String::new(), |heading| format!(" · {heading}")),
                     theme::text(),
                 ),
-                Span::styled(format!(" · {}", theme::duration(elapsed)), theme::dim()),
+                Span::styled(format!(" · {}", timing_label(elapsed)), theme::dim()),
             ])
         }];
     }
@@ -1973,23 +1982,25 @@ struct LaneClock {
 }
 
 fn lane_clock(app: &App, call: &ToolCall) -> Option<LaneClock> {
+    call.started?;
+    call.elapsed()?;
     let parent = app.tool_call(call.parent_id.as_deref()?)?;
+    call.started?.checked_duration_since(parent.started?)?;
     Some(LaneClock {
-        started: parent.started,
-        total_millis: parent.elapsed().max(1),
+        started: parent.started?,
+        total_millis: parent.elapsed()?.max(1),
     })
 }
 
 /// A bar on the program's clock: where the call started, how long it ran,
 /// and whether it is still going.
 fn lane_bar(call: &ToolCall, clock: &LaneClock, track: usize) -> Vec<Span<'static>> {
-    let offset = u64::try_from(
-        call.started
-            .saturating_duration_since(clock.started)
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
-    let end = offset.saturating_add(call.elapsed());
+    let (Some(started), Some(elapsed)) = (call.started, call.elapsed()) else {
+        return Vec::new();
+    };
+    let offset = u64::try_from(started.saturating_duration_since(clock.started).as_millis())
+        .unwrap_or(u64::MAX);
+    let end = offset.saturating_add(elapsed);
     let total = clock.total_millis.max(end).max(1);
     let cell = |millis: u64| ((millis as f64 / total as f64) * track as f64) as usize;
     let mut start = cell(offset).min(track.saturating_sub(2));
@@ -2067,7 +2078,7 @@ fn lane_line(
         right.extend(lane_bar(call, &clock, TRACK));
         right.push(Span::raw("  "));
     }
-    right.push(Span::styled(theme::duration(call.elapsed()), theme::dim()));
+    right.push(Span::styled(timing_label(call.elapsed()), theme::dim()));
     if !call.running() && call.status == ToolCallStatus::Failed {
         right.push(Span::styled(
             " failed",
@@ -2229,7 +2240,7 @@ fn tool_header(
     if calls > 0 {
         meta.push(format!("{calls} {}", plural("call", calls)));
     }
-    meta.push(theme::duration(call.elapsed()));
+    meta.push(timing_label(call.elapsed()));
     let mut right = Vec::new();
     if call.backgrounded {
         if call.running() {
@@ -2306,10 +2317,7 @@ fn working_line(app: &App) -> Line<'static> {
             theme::bold(theme::accent_color()),
         ),
         Span::styled(label.to_string(), theme::accent()),
-        Span::styled(
-            format!(" · {}", theme::duration(app.elapsed())),
-            theme::dim(),
-        ),
+        Span::styled(format!(" · {}", timing_label(app.elapsed())), theme::dim()),
     ])
 }
 
@@ -2664,7 +2672,7 @@ fn draw_dock(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
     let mut entries: Vec<(Line<'static>, bool)> = Vec::new();
     for call in app.background_calls() {
         let focused = app.focus_call().is_some_and(|focus| focus.id == call.id);
-        let mut right = vec![Span::styled(theme::duration(call.elapsed()), theme::dim())];
+        let mut right = vec![Span::styled(timing_label(call.elapsed()), theme::dim())];
         if focused {
             right.push(Span::styled("   ^k stop", theme::faint()));
         }
@@ -3049,7 +3057,7 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(theme::accent_color()),
             ),
             Span::styled("working", theme::bold(theme::accent_color())),
-            Span::styled(format!(" {}", theme::duration(app.elapsed())), theme::dim()),
+            Span::styled(format!(" {}", timing_label(app.elapsed())), theme::dim()),
         ],
     };
     let counts = app.agent_counts();
@@ -4737,6 +4745,49 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_timing_is_explicit_and_has_no_lane_clock() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        for (id, title) in [("parent", "compose"), ("child", "shell")] {
+            app.apply_at(
+                crate::tui::app::Update::ToolStarted {
+                    id: id.into(),
+                    title: title.into(),
+                    kind: Default::default(),
+                    script: None,
+                    backgrounded: false,
+                },
+                None,
+            );
+        }
+        app.apply_at(
+            crate::tui::app::Update::ToolParent {
+                id: "child".into(),
+                parent: Some("parent".into()),
+            },
+            None,
+        );
+        let child = app.tool_call("child").unwrap();
+        assert!(super::lane_clock(&app, child).is_none());
+        let header = super::tool_header(&app, child, false, 100, 1);
+        let text = header
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("timing unknown"), "{text}");
+        assert!(!text.contains("0ms"), "{text}");
+        assert_eq!(
+            super::timing_label(Some(7_000)),
+            super::theme::duration(7_000)
+        );
+    }
+
+    #[test]
     fn completed_turn_duration_is_rendered() {
         let mut app = App::new(
             PathBuf::from("/Users/dev/projects/kit"),
@@ -4746,7 +4797,7 @@ mod tests {
         );
         app.blocks.push(Block::TurnDuration {
             background: 0,
-            since_prompt: 788_645_000,
+            since_prompt: Some(788_645_000),
         });
 
         let frame = render(&mut app, 80, 12);
@@ -4756,7 +4807,7 @@ mod tests {
 
         app.blocks.push(Block::TurnDuration {
             background: 2,
-            since_prompt: 788_646_000,
+            since_prompt: Some(788_646_000),
         });
         let frame = render(&mut app, 80, 12);
         assert!(
