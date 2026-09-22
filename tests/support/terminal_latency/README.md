@@ -41,7 +41,9 @@ environment allowlist. It asserts raw/no-echo terminal mode to reject accidental
 kernel-echo measurements. The ACP fixture contains only generated text. Idle
 samples alternate Q/Z insertion and backspace. The fixture never emits these
 uppercase glyphs. Hot samples begin 100 ms after submit, during a deterministic burst of `--history` distinct markdown messages, then
-one markdown chunk every 5 ms. Both paths use a 120×40 PTY. Each insertion waits
+one markdown chunk every 5 ms until the runner finishes all hot samples. The runner
+also signals the fixture to stop on measurement failure; there is no fixed stream
+duration or chunk limit that can turn a long hot run into idle samples. Both paths use a 120×40 PTY. Each insertion waits
 for its corresponding printable output bytes and the following synchronized-output
 end marker (`CSI ? 2026 l`); terminal escape sequences are
 removed before matching. A 30 ms drain follows each deletion. This is deliberately

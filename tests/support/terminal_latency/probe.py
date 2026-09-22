@@ -45,11 +45,14 @@ def agent():
             send({"jsonrpc": "2.0", "id": request["id"], "result": {}})
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": session, "update": {"sessionUpdate": "state_update", "state": "running"}}})
-            # Finite deterministic transcript prefix, then paced streaming for 30 seconds.
+            # The runner stops streaming after hot measurement, including on failure.
+            stop_stream = Path(os.environ["PROBE_STOP_STREAM"])
             for index in range(int(os.environ.get("PROBE_HISTORY", "1000"))):
                 update(session, index, f"replay {index}: **bold** `code` and a small paragraph.\n\n")
-            for index in range(6000):
+            index = 0
+            while not stop_stream.exists():
                 update(session, 100000, f"stream {index}: some text with **markdown**.\n")
+                index += 1
                 time.sleep(0.005)
             send({"jsonrpc": "2.0", "method": "session/update", "params": {
                 "sessionId": session, "update": {"sessionUpdate": "state_update", "state": "idle",
@@ -81,10 +84,12 @@ def run(args):
         home = Path(directory)
         root = home / "workspace"
         root.mkdir()
+        stop_stream = home / "stop-stream"
         pid, master = pty.fork()
         if pid == 0:
             env = {"PATH": os.environ["PATH"], "HOME": str(home), "TERM": "xterm-256color",
                    "LANG": "en_US.UTF-8", "PROBE_ROOT": str(root), "PROBE_SCRIPT": str(Path(__file__).resolve()),
+                   "PROBE_STOP_STREAM": str(stop_stream),
                    "PROBE_REQUEST_LOG": str(output / "agent-requests.jsonl"), "PROBE_PYTHON": sys.executable, "PROBE_HISTORY": str(args.history)}
             os.chdir(root)
             os.execve(str(Path(args.binary).resolve()), [args.binary], env)
@@ -164,6 +169,7 @@ def run(args):
             os.write(master, b"\r")
             drain(0.1)
             hot = samples("hot")
+            stop_stream.touch()
             raw.flush()
             if b"stream" not in (output / "terminal.bin").read_bytes():
                 raise RuntimeError("no replay stream was rendered during hot measurements")
@@ -173,6 +179,7 @@ def run(args):
             (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(result))
         finally:
+            stop_stream.touch()
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
