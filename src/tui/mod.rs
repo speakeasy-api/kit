@@ -8364,7 +8364,7 @@ mod native_voice_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod scheduler_event_tests {
     use super::*;
 
