@@ -1656,8 +1656,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         Stop,
                     }
                     let mut next_priority = 0;
+                    let mut redraw_frame = true;
                     loop {
-                    if let Err(error) = draw_frame(&mut terminal, &mut app, &mut images) {
+                    if redraw_frame && let Err(error) = draw_frame(&mut terminal, &mut app, &mut images) {
                         drop(events);
                         leave(&mut terminal);
                         return Err(agent_client_protocol::Error::into_internal_error(error));
@@ -1687,6 +1688,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             Poll::Pending
                         }).await
                     };
+                    redraw_frame = true;
                     match event {
                         Err(LoginEvent::Terminal(event)) => {
                             let action = match event {
@@ -1821,7 +1823,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 return Ok(());
                             }
                         },
-                        Err(LoginEvent::Tick) => app.tick(),
+                        Err(LoginEvent::Tick) => redraw_frame = tick_frame(&mut app, &mut images),
                         Err(LoginEvent::Stop) => {
                             drop(events);
                             leave(&mut terminal);
@@ -1979,7 +1981,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     if matches!(&event, SessionEvent::Terminal(_)) {
                         frames.invalidate_input();
                     } else if matches!(&event, SessionEvent::Voice(_)
-                        | SessionEvent::ModelSwitch(_) | SessionEvent::Tick) {
+                        | SessionEvent::ModelSwitch(_)) {
                         frames.invalidate();
                     }
                     match event {
@@ -2698,7 +2700,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 frames.drawn(started);
                             }
                         },
-                        SessionEvent::Tick => app.tick(),
+                        SessionEvent::Tick => {
+                            if tick_frame(&mut app, &mut images) {
+                                frames.invalidate();
+                            }
+                        },
                         SessionEvent::Stop => return Ok(()),
                     }
                 }
@@ -3361,6 +3367,12 @@ fn enable_tui_modes() {
         );
         ENHANCED.store(true, Ordering::Relaxed);
     }
+}
+
+// Poll maintenance and image completions even when neither needs a frame.
+fn tick_frame(app: &mut App, images: &mut image::ImageRuntime) -> bool {
+    let changed = app.tick();
+    images.poll() || changed
 }
 
 fn draw_frame<W: std::io::Write>(

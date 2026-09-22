@@ -55,8 +55,12 @@ pub async fn pick_session(
         let mut ticker = tokio::time::interval(super::TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut redraw_frame = true;
         loop {
-            terminal.draw(|frame| ui::draw(frame, &mut app, &mut images))?;
+            if redraw_frame {
+                terminal.draw(|frame| ui::draw(frame, &mut app, &mut images))?;
+            }
+            redraw_frame = true;
             let action = {
                 let event = std::pin::pin!(events.next());
                 let redraw = app.needs_redraw_tick() || images.pending();
@@ -81,7 +85,7 @@ pub async fn pick_session(
                     },
                     Either::Right((Either::Right((update, _)), _)) => match update {
                         Some(PickerUpdate::Tick) => {
-                            app.tick();
+                            redraw_frame = super::tick_frame(&mut app, &mut images);
                             Action::None
                         }
                         Some(PickerUpdate::Session(update)) => {

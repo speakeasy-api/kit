@@ -1433,12 +1433,17 @@ impl App {
         }
     }
 
-    /// Whether periodic polling must advance animations or expire a runtime lease.
+    /// Whether periodic polling must run maintenance or advance animations.
+    /// This does not mean that every poll needs a terminal frame.
     pub fn needs_redraw_tick(&self) -> bool {
         (!self.runtime_status_unavailable && self.runtime_last_frame.is_some())
-            || self.working()
-            || !self.transcript_dynamic.is_empty()
             || self.toast.is_some()
+            || self.has_tick_animation()
+    }
+
+    fn has_tick_animation(&self) -> bool {
+        self.working()
+            || !self.transcript_dynamic.is_empty()
             || self.agents.values().any(|row| match row.status {
                 SubagentStatus::Starting | SubagentStatus::Working => true,
                 SubagentStatus::Removed => row.outcome == Some(GenerationOutcome::Failed),
@@ -1451,10 +1456,18 @@ impl App {
             })
     }
 
-    /// Advances animations and removes expired transient state.
-    pub fn tick(&mut self) {
+    /// Runs periodic maintenance and reports whether a new frame is needed.
+    pub fn tick(&mut self) -> bool {
+        let animated = self.has_tick_animation();
+        let unavailable = self.runtime_status_unavailable;
+        let toast = self.toast.is_some();
+        let agents = self.agents.len();
         self.runtime_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
+        animated
+            || unavailable != self.runtime_status_unavailable
+            || toast != self.toast.is_some()
+            || agents != self.agents.len()
     }
 
     fn tick_at(&mut self, now_unix_ms: u64) {
@@ -9051,7 +9064,7 @@ mod tests {
         assert!(!app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 1);
         assert!(app.needs_redraw_tick());
-        app.tick();
+        assert!(!app.tick(), "a healthy lease needs polling, not a frame");
         assert!(!app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 1);
 
@@ -9060,7 +9073,7 @@ mod tests {
         app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
         assert!(app.needs_redraw_tick());
         if app.needs_redraw_tick() {
-            app.tick();
+            assert!(app.tick(), "lease expiration must become visible");
         }
         assert!(app.runtime_unavailable());
         assert_eq!(app.agent_counts().total, 0);
@@ -9100,6 +9113,27 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_ticks_redraw_only_for_visible_changes() {
+        let mut app = app();
+        assert!(!app.tick());
+        app.toast = Some(("done".into(), Instant::now()));
+        assert!(app.needs_redraw_tick());
+        assert!(
+            !app.tick(),
+            "a static toast should not redraw until it expires"
+        );
+        app.toast.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(5);
+        assert!(app.tick());
+        assert!(app.toast.is_none());
+        assert!(!app.tick());
+
+        app.phase = Phase::Working;
+        assert!(app.tick(), "working animations still advance");
+        app.phase = Phase::Idle;
+        assert!(!app.tick());
+    }
+
+    #[test]
     fn redraw_ticks_only_while_time_dependent_ui_is_visible() {
         let mut app = app();
         assert!(!app.needs_redraw_tick());
@@ -9117,6 +9151,7 @@ mod tests {
         });
         app.phase = Phase::Idle;
         assert!(app.needs_redraw_tick());
+        assert!(app.tick(), "background tool animations still advance");
 
         app.apply(Update::ToolPatched {
             id: "background".into(),
