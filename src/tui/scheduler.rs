@@ -91,33 +91,58 @@ pub(super) enum PriorityEvent {
     Terminal(Option<std::io::Result<crossterm::event::Event>>),
 }
 
-pub(super) fn poll_priority(
-    cx: &mut std::task::Context<'_>,
-    mut shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
-    mut stopped: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
-    events: &mut (impl futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin),
-    frames: &Frames,
-    submit_after_paste: &mut bool,
-) -> std::task::Poll<PriorityEvent> {
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use futures_util::StreamExt;
-    use std::task::Poll;
+/// One bounded terminal burst (and its urgent frame) earns a background turn.
+/// Safety and deferred submission never yield; an empty background scan permits
+/// input again in the same poll, preserving terminal wake registration.
+#[derive(Default)]
+pub(super) struct Priority {
+    background_due: bool,
+}
 
-    if shutdown.as_mut().poll(cx).is_ready() {
-        return Poll::Ready(PriorityEvent::Shutdown);
+impl Priority {
+    pub(super) fn background_polled(&mut self) -> bool {
+        std::mem::take(&mut self.background_due)
     }
-    if stopped.as_mut().poll(cx).is_ready() {
-        return Poll::Ready(PriorityEvent::Stop);
+
+    pub(super) fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        mut shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        mut stopped: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        events: &mut (
+                 impl futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin
+             ),
+        frames: &Frames,
+        submit_after_paste: &mut bool,
+    ) -> std::task::Poll<PriorityEvent> {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use futures_util::StreamExt;
+        use std::task::Poll;
+
+        if shutdown.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(PriorityEvent::Shutdown);
+        }
+        if stopped.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(PriorityEvent::Stop);
+        }
+        if frames.urgent() {
+            self.background_due = true;
+            return Poll::Ready(PriorityEvent::Frame);
+        }
+        if std::mem::take(submit_after_paste) {
+            return Poll::Ready(PriorityEvent::Terminal(Some(Ok(Event::Key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )))));
+        }
+        if self.background_due {
+            return Poll::Pending;
+        }
+        let event = events.poll_next_unpin(cx).map(PriorityEvent::Terminal);
+        if event.is_ready() {
+            self.background_due = true;
+        }
+        event
     }
-    if frames.urgent() {
-        return Poll::Ready(PriorityEvent::Frame);
-    }
-    if std::mem::take(submit_after_paste) {
-        return Poll::Ready(PriorityEvent::Terminal(Some(Ok(Event::Key(
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )))));
-    }
-    events.poll_next_unpin(cx).map(PriorityEvent::Terminal)
 }
 
 /// Keep a full worker queue's head ahead of all later updates. No update bypasses
@@ -290,10 +315,11 @@ mod tests {
         let mut frames = Frames::new(Instant::now());
         frames.invalidate_input();
         let mut submit = true;
+        let mut priority = Priority::default();
         let mut shutdown = pin!(ready(()));
         let mut stopped = pin!(ready(()));
         assert!(matches!(
-            poll_fn(|cx| poll_priority(
+            poll_fn(|cx| priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -306,7 +332,7 @@ mod tests {
         ));
         let mut shutdown = pin!(pending());
         assert!(matches!(
-            poll_fn(|cx| poll_priority(
+            poll_fn(|cx| priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -319,7 +345,7 @@ mod tests {
         ));
         let mut stopped = pin!(pending());
         assert!(matches!(
-            poll_fn(|cx| poll_priority(
+            poll_fn(|cx| priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -335,7 +361,7 @@ mod tests {
         frames.invalidate(); // Even a due stream frame must wait for input.
         assert!(frames.ready(Instant::now()));
         assert!(matches!(
-            poll_fn(|cx| poll_priority(
+            poll_fn(|cx| priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -350,8 +376,25 @@ mod tests {
             }))))
         ));
         assert!(!submit);
+        poll_fn(|cx| {
+            assert!(
+                priority
+                    .poll(
+                        cx,
+                        shutdown.as_mut(),
+                        stopped.as_mut(),
+                        &mut events,
+                        &frames,
+                        &mut submit,
+                    )
+                    .is_pending()
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(priority.background_polled());
         let event = poll_fn(|cx| {
-            poll_priority(
+            priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -365,23 +408,25 @@ mod tests {
         // With no input, the production selector may now service background work.
         poll_fn(|cx| {
             assert!(
-                poll_priority(
-                    cx,
-                    shutdown.as_mut(),
-                    stopped.as_mut(),
-                    &mut events,
-                    &frames,
-                    &mut submit
-                )
-                .is_pending()
+                priority
+                    .poll(
+                        cx,
+                        shutdown.as_mut(),
+                        stopped.as_mut(),
+                        &mut events,
+                        &frames,
+                        &mut submit
+                    )
+                    .is_pending()
             );
             std::task::Poll::Ready(())
         })
         .await;
+        assert!(priority.background_polled());
         // The same source must also wake a pending selector, not just win when
         // already queued. No synthetic waker or polling-count assertion.
         let receive = poll_fn(|cx| {
-            poll_priority(
+            priority.poll(
                 cx,
                 shutdown.as_mut(),
                 stopped.as_mut(),
@@ -398,6 +443,110 @@ mod tests {
         assert!(
             matches!(event, PriorityEvent::Terminal(Some(Ok(Event::Paste(text)))) if text == "new paste")
         );
+    }
+
+    #[tokio::test]
+    async fn queued_input_and_urgent_frames_yield_to_background() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use std::{
+            future::{pending, poll_fn},
+            pin::pin,
+            task::Poll,
+        };
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (background_tx, mut background_rx) = mpsc::unbounded_channel();
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        sender.send(Ok(key.clone())).unwrap();
+        let mut events = futures_util::stream::poll_fn(|cx| receiver.poll_recv(cx));
+        let mut priority = Priority::default();
+        let mut frames = Frames::new(Instant::now());
+        frames.drawn(Instant::now());
+        let mut submit = false;
+        let mut shutdown = pin!(pending());
+        let mut stopped = pin!(pending());
+        // Each round leaves input queued while a real completion becomes ready.
+        for value in 0..8 {
+            let event = poll_fn(|cx| {
+                priority.poll(
+                    cx,
+                    shutdown.as_mut(),
+                    stopped.as_mut(),
+                    &mut events,
+                    &frames,
+                    &mut submit,
+                )
+            })
+            .await;
+            assert!(matches!(
+                event,
+                PriorityEvent::Terminal(Some(Ok(Event::Key(_))))
+            ));
+            sender.send(Ok(key.clone())).unwrap();
+            frames.invalidate_input();
+            background_tx.send(value).unwrap();
+            let event = poll_fn(|cx| {
+                priority.poll(
+                    cx,
+                    shutdown.as_mut(),
+                    stopped.as_mut(),
+                    &mut events,
+                    &frames,
+                    &mut submit,
+                )
+            })
+            .await;
+            assert!(matches!(event, PriorityEvent::Frame));
+            frames.drawn(Instant::now());
+            let completed = poll_fn(|cx| {
+                assert!(
+                    priority
+                        .poll(
+                            cx,
+                            shutdown.as_mut(),
+                            stopped.as_mut(),
+                            &mut events,
+                            &frames,
+                            &mut submit,
+                        )
+                        .is_pending()
+                );
+                background_rx.poll_recv(cx)
+            })
+            .await;
+            assert_eq!(completed, Some(value));
+            assert!(priority.background_polled());
+        }
+        // An empty scan must allow terminal polling again without a new wake.
+        frames.invalidate_input();
+        poll_fn(|cx| {
+            assert!(matches!(
+                priority.poll(
+                    cx,
+                    shutdown.as_mut(),
+                    stopped.as_mut(),
+                    &mut events,
+                    &frames,
+                    &mut submit,
+                ),
+                Poll::Ready(PriorityEvent::Frame)
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        frames.drawn(Instant::now());
+        assert!(priority.background_polled());
+        assert!(matches!(
+            poll_fn(|cx| priority.poll(
+                cx,
+                shutdown.as_mut(),
+                stopped.as_mut(),
+                &mut events,
+                &frames,
+                &mut submit,
+            ))
+            .await,
+            PriorityEvent::Terminal(_)
+        ));
     }
 
     #[test]

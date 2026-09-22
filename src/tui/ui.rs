@@ -3564,7 +3564,7 @@ mod tests {
         });
         for block in &mut app.blocks {
             if let Block::Tool(call) = block {
-                call.started = std::time::Instant::now() - Duration::from_secs(100);
+                call.started = Some(std::time::Instant::now() - Duration::from_secs(100));
             }
         }
         app.apply(Update::AgentMessage {
@@ -3640,7 +3640,7 @@ mod tests {
         });
         for width in [40, 18, 40] {
             if let Block::Thought { started, .. } = &mut app.blocks[0] {
-                *started = std::time::Instant::now() - Duration::from_secs(100);
+                *started = Some(std::time::Instant::now() - Duration::from_secs(100));
             }
             let _ = render(&mut app, width, 16);
             assert_transcript_rows_equal(

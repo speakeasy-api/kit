@@ -1882,6 +1882,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
                 let mut child_read: Option<ChildTranscriptRead> = None;
+                let mut priority = scheduler::Priority::default();
                 let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
                     let target = app.child_read_target().map(|target| (session_id.to_string(), target));
@@ -1928,8 +1929,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         // real terminal events and all background completions.
                         // Poll crossterm with the real task waker, never a noop
                         // probe; return on first Ready without consuming losers.
-                        poll_fn(|cx| {
-                            if let Poll::Ready(event) = scheduler::poll_priority(
+                        poll_fn(|cx| loop {
+                            if let Poll::Ready(event) = priority.poll(
                                 cx, shutdown.as_mut(), stopped.as_mut(), &mut events,
                                 &frames, &mut submit_after_paste,
                             ) {
@@ -1969,18 +1970,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     _ => Poll::Pending,
                                 };
                                 if ready.is_ready() {
+                                    priority.background_polled();
                                     next_priority = (branch + 1) % sources;
                                     return ready;
                                 }
                             }
-                            Poll::Pending
+                            if !priority.background_polled() {
+                                return Poll::Pending;
+                            }
                         }).await
                     };
                     // Invalidate before handlers: early `continue`s can also mutate
                     // visible state. Worker forwarding alone never requests a frame.
-                    if matches!(&event, SessionEvent::Terminal(_)) {
-                        frames.invalidate_input();
-                    } else if matches!(&event, SessionEvent::Voice(_)
+                    if matches!(&event, SessionEvent::Voice(_)
                         | SessionEvent::ModelSwitch(_)) {
                         frames.invalidate();
                     }
@@ -1989,7 +1991,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                         SessionEvent::ChildTranscript(result) => {
                             if let Some(read) = child_read.take()
                                 && read.target.0 == session_id.to_string() {
-                                app.child_read_finished(&read.target.1, result);
+                                finish_child_transcript(&mut app, &mut frames, &read.target.1, result);
                             }
                         }
                         SessionEvent::Voice(event) => match event {
@@ -2056,7 +2058,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             let mut action = Action::None;
                             for index in 0..MAX_BURST {
                                 match next {
-                                    Some(Ok(event)) => action = handle_with_clipboard(&mut app, &mut clipboard_pastes, event),
+                                    Some(Ok(event)) => action = handle_terminal(
+                                        &mut app, &mut clipboard_pastes, &mut frames, event,
+                                    ),
                                     Some(Err(error)) => return Err(agent_client_protocol::Error::into_internal_error(error)),
                                     None => return Ok(()),
                                 }
@@ -2907,6 +2911,19 @@ struct ChildTranscriptRead {
     >,
 }
 
+/// Apply only the current focus epoch and schedule its visible page or notice.
+fn finish_child_transcript(
+    app: &mut App,
+    frames: &mut scheduler::Frames,
+    target: &(String, u64, u64, u64),
+    result: Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
+) {
+    if app.child_read_target().as_ref() == Some(target) {
+        app.child_read_finished(target, result);
+        frames.invalidate();
+    }
+}
+
 /// Child steering never enters the root prompt path. Its completion is scoped
 /// independently to the captured root route and the selected child generation.
 fn spawn_child_steer(
@@ -3027,6 +3044,22 @@ fn finish_clipboard_paste(
         accepted: applied.is_some(),
         submit,
     }
+}
+
+/// Mouse handlers request redraw explicitly; ignored motion and releases must
+/// not turn a pending stream frame into an urgent input frame.
+fn handle_terminal(
+    app: &mut App,
+    pastes: &mut ClipboardPastes,
+    frames: &mut scheduler::Frames,
+    event: Event,
+) -> Action {
+    let mouse = matches!(&event, Event::Mouse(_));
+    let action = handle_with_clipboard(app, pastes, event);
+    if !mouse || !matches!(&action, Action::None) {
+        frames.invalidate_input();
+    }
+    action
 }
 
 /// Applies one terminal event, returning the work it asks for.
@@ -8327,5 +8360,109 @@ mod native_voice_tests {
         assert!(handoff.text.chars().all(|character| character == '声'));
         handoff.record("two", "extra", true);
         assert!(handoff.text.len() <= 16_384);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod scheduler_event_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new("/tmp".into(), "test".into(), "test".into(), String::new())
+    }
+
+    #[test]
+    fn ignored_mouse_keeps_stream_frames_paced() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = app();
+        let mut pastes = ClipboardPastes::default();
+        let now = tokio::time::Instant::now();
+        let mut frames = scheduler::Frames::new(now);
+        frames.drawn(now);
+        frames.invalidate();
+        let deadline = frames.deadline();
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(matches!(
+            handle_terminal(
+                &mut app,
+                &mut pastes,
+                &mut frames,
+                mouse(MouseEventKind::Moved),
+            ),
+            Action::None
+        ));
+        assert!(!frames.urgent());
+        assert_eq!(frames.deadline(), deadline);
+        assert!(!frames.ready(now));
+        assert!(matches!(
+            handle_terminal(
+                &mut app,
+                &mut pastes,
+                &mut frames,
+                mouse(MouseEventKind::ScrollUp),
+            ),
+            Action::Redraw
+        ));
+        assert!(frames.urgent());
+        assert!(frames.ready(now));
+    }
+
+    #[test]
+    fn current_child_pages_and_errors_invalidate_but_stale_reads_do_not() {
+        use crate::events::{HarnessVendor, RuntimeEvent, SubagentStatus};
+        use crate::protocols::acp::ReadSubagentTranscriptResponse;
+        let mut app = app();
+        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+            id: "child".into(),
+            name: "child".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "task".into(),
+            parent_id: None,
+            parent_name: None,
+            harness: "acp.kit".into(),
+            vendor: HarnessVendor::Kit,
+            model: None,
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: None,
+        }));
+        app.focus_child("child".into());
+        let target = app.child_read_target().unwrap();
+        let now = tokio::time::Instant::now();
+        let mut frames = scheduler::Frames::new(now);
+        frames.drawn(now);
+        finish_child_transcript(
+            &mut app,
+            &mut frames,
+            &target,
+            Ok(ReadSubagentTranscriptResponse {
+                generation: 1,
+                next_cursor: 1,
+                caught_up: true,
+                updates: vec![
+                    serde_json::json!({"sessionUpdate": "agent_message_chunk", "messageId": "message", "content": {"type": "text", "text": "child output"}}),
+                ],
+            }),
+        );
+        assert!(frames.deadline().is_some());
+        assert!(!frames.urgent());
+        assert_eq!(app.child_read_target().unwrap().3, 1);
+        frames.drawn(now);
+        finish_child_transcript(&mut app, &mut frames, &target, Err("stale".into()));
+        assert_eq!(frames.deadline(), None);
+        let target = app.child_read_target().unwrap();
+        finish_child_transcript(&mut app, &mut frames, &target, Err("read failed".into()));
+        assert!(frames.deadline().is_some());
+        assert!(app.child_views["child"].notice.contains("read failed"));
     }
 }
