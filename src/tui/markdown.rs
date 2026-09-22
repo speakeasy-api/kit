@@ -513,15 +513,129 @@ struct Link<'a> {
     url_range: Range<usize>,
 }
 
+// Balanced-delimiter metadata is shared by every suffix searched during one
+// inline parse. Incomplete streaming syntax is as important to cache as a
+// successful match: a missing entry must not trigger another suffix scan.
+struct DelimiterMatches {
+    source_len: usize,
+    image_labels: std::collections::HashMap<usize, usize>,
+    raw_label_ends: std::collections::HashMap<usize, usize>,
+    image_parentheses: std::collections::HashMap<usize, usize>,
+    link_destinations: std::collections::HashMap<usize, usize>,
+}
+
+impl DelimiterMatches {
+    fn new(source: &str) -> Self {
+        let mut matches = Self {
+            source_len: source.len(),
+            image_labels: std::collections::HashMap::new(),
+            raw_label_ends: std::collections::HashMap::new(),
+            image_parentheses: std::collections::HashMap::new(),
+            link_destinations: std::collections::HashMap::new(),
+        };
+        let mut raw_brackets = Vec::new();
+        let mut image_parentheses = Vec::new();
+        let mut brackets = Vec::new();
+        let mut parentheses = Vec::new();
+        let mut escaped = false;
+        for (index, byte) in source.bytes().enumerate() {
+            match byte {
+                b'[' => raw_brackets.push(index),
+                b']' => {
+                    for open in raw_brackets.drain(..) {
+                        matches.raw_label_ends.insert(open, index);
+                    }
+                }
+                _ => {}
+            }
+            // Markdown link destinations historically count even escaped
+            // parentheses, whereas image alt text honors punctuation escapes.
+            match byte {
+                b'(' => parentheses.push(index),
+                b')' => {
+                    if let Some(open) = parentheses.pop() {
+                        matches.link_destinations.insert(open, index);
+                    }
+                }
+                _ => {}
+            }
+            if escaped {
+                escaped = false;
+                if byte.is_ascii_punctuation() {
+                    continue;
+                }
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'\r' | b'\n' => image_parentheses.clear(),
+                b'(' => image_parentheses.push(index),
+                b')' => {
+                    if let Some(open) = image_parentheses.pop() {
+                        matches.image_parentheses.insert(open, index);
+                    }
+                }
+                b'[' => brackets.push(index),
+                b']' => {
+                    if let Some(open) = brackets.pop() {
+                        matches.image_labels.insert(open, index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        matches
+    }
+
+    // Callers pass suffixes ending at the same source boundary. Document image
+    // scanning creates fresh metadata for each fence-delimited prose segment.
+    fn closing(&self, source: &str, opening: usize, image: bool) -> Option<usize> {
+        let base = self.source_len - source.len();
+        let matches = if image {
+            &self.image_labels
+        } else {
+            &self.link_destinations
+        };
+        matches.get(&(base + opening)).map(|end| *end - base)
+    }
+}
+
 /// Returns byte ranges for complete inline images and their destinations, in source order.
 /// Reference-style images are left literal. Destinations may contain local-path spaces;
 /// Markdown punctuation escapes are decoded, but URI validation belongs to the caller.
 pub(super) fn image_references(source: &str) -> Vec<(Range<usize>, String)> {
+    image_references_before(source, source.len(), false, 0, None)
+}
+
+// Only search starts before the next competing token. Keep the complete source
+// available because an image destination may itself contain Markdown markers.
+fn image_references_before(
+    source: &str,
+    before: usize,
+    first_only: bool,
+    first_newline: usize,
+    matches: Option<&DelimiterMatches>,
+) -> Vec<(Range<usize>, String)> {
+    // Fence segmentation takes priority even over image syntax that starts on
+    // an earlier line. Retain the document scanner for multiline helper input.
+    if first_only && first_newline < source.len() {
+        return image_references(source)
+            .into_iter()
+            .take(1)
+            .filter(|(range, _)| range.start < before)
+            .collect();
+    }
     let mut images = Vec::new();
     let mut fence = None;
     let mut prose_start = 0;
     let mut offset = 0;
-    for line in source.split_inclusive('\n') {
+    // A line without a fence needs no line-end scan before finding its first
+    // image. This common path also avoids repeatedly splitting a long line.
+    if first_only && before <= first_newline && fence_line(source).and_then(opening_fence).is_none()
+    {
+        collect_inline_images(source, 0, before, true, &mut images, matches);
+        return images;
+    }
+    for line in source[..before].split_inclusive('\n') {
         let raw = line.trim_end_matches(['\r', '\n']);
         let marker_line = fence_line(raw);
         if let Some((marker, minimum)) = fence {
@@ -530,21 +644,53 @@ pub(super) fn image_references(source: &str) -> Vec<(Range<usize>, String)> {
                 prose_start = offset + line.len();
             }
         } else if let Some((marker, length, _)) = marker_line.and_then(opening_fence) {
-            collect_inline_images(&source[prose_start..offset], prose_start, &mut images);
+            collect_inline_images(
+                &source[prose_start..offset],
+                prose_start,
+                offset - prose_start,
+                first_only,
+                &mut images,
+                None,
+            );
+            if first_only && !images.is_empty() {
+                return images;
+            }
             fence = Some((marker, length));
         }
         offset += line.len();
     }
     if fence.is_none() {
-        collect_inline_images(&source[prose_start..], prose_start, &mut images);
+        collect_inline_images(
+            &source[prose_start..],
+            prose_start,
+            before.saturating_sub(prose_start),
+            first_only,
+            &mut images,
+            None,
+        );
     }
     images
 }
 
-fn collect_inline_images(source: &str, base: usize, images: &mut Vec<(Range<usize>, String)>) {
+fn collect_inline_images(
+    source: &str,
+    base: usize,
+    before: usize,
+    first_only: bool,
+    images: &mut Vec<(Range<usize>, String)>,
+    matches: Option<&DelimiterMatches>,
+) {
+    let owned;
+    let matches = match matches {
+        Some(matches) => matches,
+        None => {
+            owned = DelimiterMatches::new(source);
+            &owned
+        }
+    };
     let bytes = source.as_bytes();
     let mut offset = 0;
-    while offset < bytes.len() {
+    while offset < before {
         match bytes[offset] {
             b'\\' if bytes.get(offset + 1).is_some_and(u8::is_ascii_punctuation) => {
                 offset += 2;
@@ -569,8 +715,11 @@ fn collect_inline_images(source: &str, base: usize, images: &mut Vec<(Range<usiz
                 offset = closing.unwrap_or(offset + length);
             }
             b'!' if bytes.get(offset + 1) == Some(&b'[') => {
-                if let Some((end, destination)) = image_at(source, offset) {
+                if let Some((end, destination)) = image_at(source, offset, matches) {
                     images.push((base + offset..base + end, destination));
+                    if first_only {
+                        return;
+                    }
                     offset = end;
                 } else {
                     offset += 2;
@@ -581,27 +730,9 @@ fn collect_inline_images(source: &str, base: usize, images: &mut Vec<(Range<usiz
     }
 }
 
-fn image_at(source: &str, start: usize) -> Option<(usize, String)> {
+fn image_at(source: &str, start: usize, matches: &DelimiterMatches) -> Option<(usize, String)> {
     let bytes = source.as_bytes();
-    let mut cursor = start + 2;
-    let mut depth = 1;
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'\\' if bytes.get(cursor + 1).is_some_and(u8::is_ascii_punctuation) => {
-                cursor += 2;
-                continue;
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => {}
-        }
-        cursor += 1;
-    }
+    let mut cursor = matches.closing(source, start + 1, true)?;
     if bytes.get(cursor..cursor + 2)? != b"](" {
         return None;
     }
@@ -612,7 +743,6 @@ fn image_at(source: &str, start: usize) -> Option<(usize, String)> {
     let angle = bytes.get(cursor) == Some(&b'<');
     cursor += usize::from(angle);
     let destination_start = cursor;
-    depth = 0;
     while cursor < bytes.len() {
         match bytes[cursor] {
             b'\r' | b'\n' => return None,
@@ -623,16 +753,21 @@ fn image_at(source: &str, start: usize) -> Option<(usize, String)> {
             b'>' if angle => break,
             b'"' | b'\''
                 if !angle
-                    && depth == 0
                     && cursor > destination_start
                     && bytes[cursor - 1].is_ascii_whitespace() =>
             {
                 break;
             }
             b'<' if angle => return None,
-            b'(' if !angle => depth += 1,
-            b')' if !angle && depth == 0 => break,
-            b')' if !angle => depth -= 1,
+            b'(' if !angle => {
+                // Inside nested parentheses quotes are destination text, not
+                // titles. Skip the balanced region, or fail immediately when
+                // it cannot close before a newline/end. Do not use this map
+                // for the outer delimiter: titles can contain unbalanced parens.
+                let base = matches.source_len - source.len();
+                cursor = *matches.image_parentheses.get(&(base + cursor))? - base;
+            }
+            b')' if !angle => break,
             _ => {}
         }
         cursor += 1;
@@ -679,35 +814,30 @@ fn image_at(source: &str, start: usize) -> Option<(usize, String)> {
     Some((cursor + 1, decoded))
 }
 
-fn next_markdown_link(source: &str) -> Option<Link<'_>> {
+fn next_markdown_link<'a>(
+    source: &'a str,
+    before: usize,
+    matches: &DelimiterMatches,
+) -> Option<Link<'a>> {
     let mut offset = 0;
-    while let Some(relative_start) = source[offset..].find('[') {
+    while offset < before {
+        let Some(relative_start) = source[offset..before].find('[') else {
+            break;
+        };
         let start = offset + relative_start;
         // Images have their own rendering path; do not consume their alt text as a link.
         if start > 0 && source.as_bytes()[start - 1] == b'!' {
-            offset = image_at(source, start - 1).map_or(start + 1, |(end, _)| end);
+            offset = image_at(source, start - 1, matches).map_or(start + 1, |(end, _)| end);
             continue;
         }
-        let label_end = source[start + 1..].find(']').map(|end| start + 1 + end)?;
+        let base = matches.source_len - source.len();
+        let label_end = *matches.raw_label_ends.get(&(base + start))? - base;
         if !source[label_end..].starts_with("](") {
             offset = label_end + 1;
             continue;
         }
         let url_start = label_end + 2;
-        let mut depth = 0;
-        let mut url_end = None;
-        for (relative, character) in source[url_start..].char_indices() {
-            match character {
-                '(' => depth += 1,
-                ')' if depth == 0 => {
-                    url_end = Some(url_start + relative);
-                    break;
-                }
-                ')' => depth -= 1,
-                _ => {}
-            }
-        }
-        let url_end = url_end?;
+        let url_end = matches.closing(source, url_start - 1, false)?;
         let url = &source[url_start..url_end];
         if super::safe_media_uri(url) {
             return Some(Link {
@@ -745,46 +875,47 @@ fn is_image_label(label: &str) -> bool {
         })
 }
 
-fn next_link(source: &str) -> Option<Link<'_>> {
-    let bare = ["https://", "http://"]
-        .into_iter()
-        .filter_map(|scheme| source.find(scheme))
-        .min()
-        .map(|start| {
-            let mut end = source[start..]
-                .find(char::is_whitespace)
-                .map_or(source.len(), |length| start + length);
-            loop {
-                let Some(character) = source[..end].chars().next_back() else {
-                    break;
-                };
-                let unmatched_close = character == ')'
-                    && source[start..end].chars().filter(|&c| c == ')').count()
-                        > source[start..end].chars().filter(|&c| c == '(').count();
-                if matches!(
-                    character,
-                    '.' | ',' | ';' | ':' | '!' | '?' | ']' | '}' | '\'' | '"'
-                ) || unmatched_close
-                {
-                    end -= character.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            Link {
-                start,
-                end,
-                label: None,
-                url: &source[start..end],
-                url_range: start..end,
-            }
-        });
-    let markdown = next_markdown_link(source);
-    match (bare, markdown) {
-        (Some(bare), Some(markdown)) if markdown.start < bare.start => Some(markdown),
-        (Some(bare), _) => Some(bare),
-        (None, markdown) => markdown,
+fn next_link<'a>(
+    source: &'a str,
+    before: usize,
+    bare_start: Option<usize>,
+    matches: &DelimiterMatches,
+) -> Option<Link<'a>> {
+    let bare_start = bare_start.filter(|start| *start < before);
+    if let Some(markdown) = next_markdown_link(source, bare_start.unwrap_or(before), matches) {
+        return Some(markdown);
     }
+    bare_start.map(|start| {
+        let mut end = source[start..]
+            .find(char::is_whitespace)
+            .map_or(source.len(), |length| start + length);
+        let mut balance = source[start..end].bytes().fold(0isize, |balance, byte| {
+            balance + isize::from(byte == b')') - isize::from(byte == b'(')
+        });
+        loop {
+            let Some(character) = source[..end].chars().next_back() else {
+                break;
+            };
+            let unmatched_close = character == ')' && balance > 0;
+            if matches!(
+                character,
+                '.' | ',' | ';' | ':' | '!' | '?' | ']' | '}' | '\'' | '"'
+            ) || unmatched_close
+            {
+                end -= character.len_utf8();
+                balance -= isize::from(character == ')');
+            } else {
+                break;
+            }
+        }
+        Link {
+            start,
+            end,
+            label: None,
+            url: &source[start..end],
+            url_range: start..end,
+        }
+    })
 }
 
 pub(super) fn image_label_links(source: &str) -> Vec<(usize, String)> {
@@ -838,12 +969,83 @@ fn inline_with_link_destinations_and_ranges(
     let mut spans = Vec::new();
     let mut plain = String::new();
     let mut rest = source;
+    let matches = DelimiterMatches::new(source);
+    let mut markers = source.match_indices(['`', '*', '_']).peekable();
+    let mut schemes = source
+        .match_indices("http")
+        .filter_map(|(index, _)| {
+            (source[index..].starts_with("https://") || source[index..].starts_with("http://"))
+                .then_some(index)
+        })
+        .peekable();
+    let mut image_starts = source
+        .match_indices("![")
+        .map(|(index, _)| index)
+        .peekable();
+    let mut newlines = source
+        .match_indices('\n')
+        .map(|(index, _)| index)
+        .peekable();
+    // A failed underscore closer search must not rescan the remaining line for
+    // every opener. These are precisely the old parser's eligible closers.
+    let underscore_closers: Vec<_> = source
+        .match_indices('_')
+        .filter_map(|(index, _)| {
+            (!source[..index].ends_with(char::is_whitespace)
+                && source[index + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric()))
+            .then_some(index)
+        })
+        .collect();
     while !rest.is_empty() {
-        let marker = rest
-            .find(['`', '*', '_'])
-            .map(|index| (index, &rest[index..]));
-        let image = image_references(rest).into_iter().next();
-        let link = next_link(rest);
+        let relative = source.len() - rest.len();
+        while markers.peek().is_some_and(|(index, _)| *index < relative) {
+            markers.next();
+        }
+        let marker = markers.peek().map(|(index, _)| {
+            let index = *index - relative;
+            (index, &rest[index..])
+        });
+        let before = marker.as_ref().map_or(rest.len(), |(index, _)| *index);
+        while schemes.peek().is_some_and(|index| *index < relative) {
+            schemes.next();
+        }
+        while newlines.peek().is_some_and(|index| *index < relative) {
+            newlines.next();
+        }
+        while image_starts.peek().is_some_and(|index| *index < relative) {
+            image_starts.next();
+        }
+        let image_start = image_starts
+            .peek()
+            .map_or(before, |index| (*index - relative).min(before));
+        let bare_start = schemes.peek().map(|index| *index - relative);
+        let mut link = next_link(rest, image_start, bare_start, &matches);
+        let image = if link.is_none() && image_start < before {
+            image_references_before(
+                rest,
+                before,
+                true,
+                newlines
+                    .peek()
+                    .map_or(rest.len(), |index| *index - relative),
+                Some(&matches),
+            )
+            .into_iter()
+            .next()
+        } else {
+            None
+        };
+        if link.is_none() && image_start < before {
+            link = next_link(
+                rest,
+                image.as_ref().map_or(before, |(range, _)| range.start),
+                bare_start,
+                &matches,
+            );
+        }
         let consumed = offset + source.len() - rest.len();
         let label = labels
             .iter()
@@ -946,14 +1148,10 @@ fn inline_with_link_destinations_and_ranges(
         // Emphasis needs the markers hugging the text, so arithmetic like
         // `2 * 3 * 4` stays arithmetic instead of turning italic.
         let paired = if delimiter == "_" {
-            body.match_indices('_').map(|(index, _)| index).find(|end| {
-                *end > 0
-                    && !body[..*end].ends_with(char::is_whitespace)
-                    && body[*end + 1..]
-                        .chars()
-                        .next()
-                        .is_none_or(|character| !character.is_alphanumeric())
-            })
+            let body_start = source.len() - body.len();
+            underscore_closers
+                .get(underscore_closers.partition_point(|index| *index <= body_start))
+                .map(|index| *index - body_start)
         } else {
             body.find(delimiter).filter(|end| {
                 *end > 0
@@ -1035,6 +1233,257 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn incomplete_streaming_delimiters_preserve_later_complete_tokens() {
+        for count in [32, 1000] {
+            let prefix = "![".repeat(count);
+            let source = format!("{prefix}![inner](local.png)");
+            let images = image_references(&source);
+            assert_eq!(images, [(prefix.len()..source.len(), "local.png".into())]);
+            let spans = inline_spans(&source, Style::default());
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.span.content.as_ref())
+                    .collect::<String>(),
+                source
+            );
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.image_end)
+                    .map(|span| span.span.content.as_ref())
+                    .collect::<Vec<_>>(),
+                ["![inner](local.png)"]
+            );
+
+            let prefix = "[label](https://example.com/( ".repeat(count);
+            let source = format!("{prefix}[Image #7](file:///good)");
+            let spans = inline_spans(&source, Style::default());
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.span.content.as_ref())
+                    .collect::<String>(),
+                format!("{prefix}Image #7")
+            );
+            let urls = spans
+                .iter()
+                .filter_map(|span| span.url.as_deref())
+                .collect::<Vec<_>>();
+            assert_eq!(urls.len(), count + 1);
+            assert!(
+                urls[..count]
+                    .iter()
+                    .all(|url| *url == "https://example.com/(")
+            );
+            assert_eq!(urls[count], "file:///good");
+            let destinations = image_label_link_destinations(&source);
+            let start = source.rfind("file:///good").unwrap();
+            assert_eq!(
+                destinations,
+                [(start..start + "file:///good".len(), "file:///good".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_rich_inline_tokens_preserve_styles_links_images_and_ranges() {
+        let unit =
+            "**bold _inner_** [Image #1](file:///tmp/a_(b).png) ![alt](a_b.png) `literal *code*` ";
+        let source = unit.repeat(1000);
+        let spans = inline_spans(&source, Style::default());
+        let visible = spans
+            .iter()
+            .map(|span| span.span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            visible,
+            "bold inner Image #1 ![alt](a_b.png) `literal *code*` ".repeat(1000)
+        );
+        assert_eq!(spans.iter().filter(|span| span.image_end).count(), 1000);
+        let inner = spans
+            .iter()
+            .filter(|span| span.span.content == "inner")
+            .collect::<Vec<_>>();
+        assert_eq!(inner.len(), 1000);
+        assert!(inner.iter().all(|span| {
+            span.span
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC)
+        }));
+        let destinations = image_label_link_destinations(&source);
+        assert_eq!(destinations.len(), 1000);
+        for (index, (range, url)) in destinations.iter().enumerate() {
+            assert_eq!(&source[range.clone()], "file:///tmp/a_(b).png");
+            assert_eq!(url, "file:///tmp/a_(b).png");
+            assert_eq!(
+                range.start,
+                index * unit.len() + unit.find("file:///").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_searches_preserve_malformed_syntax_and_url_trimming() {
+        for source in [
+            "_open ".repeat(1000),
+            "![".repeat(1000),
+            "[unfinished".repeat(1000),
+        ] {
+            let spans = inline_spans(&source, Style::default());
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.span.content.as_ref())
+                    .collect::<String>(),
+                source
+            );
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.url.is_none() && !span.image_end)
+            );
+        }
+        let suffix = ")".repeat(5000) + "...!?";
+        let source = format!("https://example.com/a_(b){suffix}");
+        let spans = inline_spans(&source, Style::default());
+        assert_eq!(spans[0].url.as_deref(), Some("https://example.com/a_(b)"));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.span.content.as_ref())
+                .collect::<String>(),
+            source
+        );
+        let source = r"\![escaped](local) **[Image #1](file:///a)** `![code](b)` ![real](c)";
+        let spans = inline_spans(source, Style::default());
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.image_end)
+                .map(|span| span.span.content.as_ref())
+                .collect::<Vec<_>>(),
+            ["![real](c)"]
+        );
+        let ranges = image_label_link_destinations(source);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].0.clone()], "file:///a");
+    }
+
+    #[test]
+    fn multiline_fences_still_bound_images_before_inline_markers() {
+        let source = "]![![`~~~\\[Image #1](file:///a)[Image #1](file:///a)file:///a\n~~~](~~~***)";
+        let spans = inline_spans(source, Style::default());
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.image_end)
+                .map(|span| span.span.content.as_ref())
+                .collect::<Vec<_>>(),
+            ["![`~~~\\[Image #1](file:///a)"]
+        );
+        let ranges = image_label_link_destinations(source);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].0.clone()], "file:///a");
+    }
+
+    #[test]
+    fn incomplete_image_destinations_and_raw_labels_keep_later_tokens() {
+        for count in [1, 64, 1024] {
+            let prefix = "![x](".repeat(count);
+            assert!(image_references(&prefix).is_empty());
+            let source = format!("{prefix}![雪](ok.png) [docs](https://example.com)");
+            assert_eq!(
+                image_references(&source),
+                vec![(
+                    prefix.len()..prefix.len() + "![雪](ok.png)".len(),
+                    "ok.png".into()
+                )]
+            );
+            let spans = inline_spans(&source, Style::default());
+            assert!(spans.iter().any(|span| span.image_end));
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.url.as_deref() == Some("https://example.com"))
+            );
+
+            let prefix = "[* ".repeat(count);
+            assert!(
+                next_markdown_link(&prefix, prefix.len(), &DelimiterMatches::new(&prefix))
+                    .is_none()
+            );
+            let source = format!("{prefix}雪](https://example.com)");
+            let link =
+                next_markdown_link(&source, source.len(), &DelimiterMatches::new(&source)).unwrap();
+            assert_eq!(link.label, Some(&source[1..source.find(']').unwrap()]));
+            assert_eq!(link.url, "https://example.com");
+        }
+        // Link labels intentionally stop at the first raw ], even when escaped.
+        let source = r"[雪\](https://example.com)";
+        let link =
+            next_markdown_link(source, source.len(), &DelimiterMatches::new(source)).unwrap();
+        assert_eq!(link.label, Some(r"雪\"));
+    }
+
+    #[test]
+    fn image_destination_summary_preserves_escape_title_and_angle_rules() {
+        for (source, destination) in [
+            (r#"![雪](a(b(c)).png "unbalanced ( title")"#, "a(b(c)).png"),
+            (
+                r#"![雪](a(b "literal (c)").png 'title )')"#,
+                "a(b \"literal (c)\").png",
+            ),
+            (r#"![雪](a\(b\).png "escaped \" ) title")"#, "a(b).png"),
+            (r#"![雪](a(b\)c).png 'escaped \' ( title')"#, "a(b)c).png"),
+            (r#"![雪](<雪(a> "title ( )")"#, "雪(a"),
+        ] {
+            let images = image_references(source);
+            assert_eq!(
+                images,
+                vec![(0..source.len(), destination.into())],
+                "{source}"
+            );
+        }
+        for source in ["![x](a(b\nc))", "![x](a(b\rc))", r"![x](a(b\))"] {
+            assert!(image_references(source).is_empty(), "{source}");
+        }
+        let source = "![x](a(b\n![雪](ok.png)\n```\n![hidden](no)\n```";
+        let images = image_references(source);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].1, "ok.png");
+    }
+
+    /// Run manually with `mise run test -- --release --lib inline_scaling_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual timing probe; reports measurements without timing assertions"]
+    fn inline_scaling_probe() {
+        use std::{hint::black_box, time::Instant};
+        for (name, unit) in [
+            ("emphasis", "*bold* plain "),
+            ("nested", "**bold _inner_** plain "),
+            ("links", "[label](https://example.com/a_(b)) "),
+            ("images", "![alt](https://example.com/a_(b).png) "),
+            ("bare", "https://example.com/a_(b))))... "),
+            ("underscore", "_open "),
+            ("unclosed_images", "!["),
+            ("image_destinations", "![x]("),
+            ("raw_labels", "[* "),
+            ("unclosed_links", "[label](https://example.com/( "),
+        ] {
+            for count in [1000, 5000, 10000] {
+                let source = unit.repeat(count);
+                let start = Instant::now();
+                let spans = inline_spans(black_box(&source), Style::default());
+                let elapsed = start.elapsed();
+                eprintln!("{name:18} {count:6} {:9} bytes {elapsed:?}", source.len());
+                black_box(spans);
+            }
+        }
     }
 
     #[test]
@@ -1431,9 +1880,17 @@ mod tests {
 
     #[test]
     fn markdown_link_parser_does_not_consume_images() {
-        assert!(next_markdown_link("![alt](https://example.com/image.png)").is_none());
+        assert!(
+            next_markdown_link(
+                "![alt](https://example.com/image.png)",
+                "![alt](https://example.com/image.png)".len(),
+                &DelimiterMatches::new("![alt](https://example.com/image.png)")
+            )
+            .is_none()
+        );
         let source = "![alt](https://example.com/image.png) [docs](https://example.com/docs)";
-        let link = next_markdown_link(source).unwrap();
+        let link =
+            next_markdown_link(source, source.len(), &DelimiterMatches::new(source)).unwrap();
         assert_eq!(link.label, Some("docs"));
         assert_eq!(
             &source[link.start..link.end],

@@ -14,13 +14,14 @@ use ratatui::{
 };
 use ratatui_image::{
     Resize,
-    picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions},
+    picker::Picker,
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 
 use super::app::UserImage;
 
-const TERMINAL_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+#[path = "image_query.rs"]
+mod image_query;
 const MAX_DECODED_ALLOCATION: u64 = 64 * 1024 * 1024;
 const MAX_DECODED_BACKING_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 16;
@@ -49,12 +50,7 @@ pub(super) struct ImageRuntime {
 
 impl ImageRuntime {
     pub fn detect() -> Self {
-        let picker = Picker::from_query_stdio_with_options(QueryStdioOptions {
-            timeout: TERMINAL_QUERY_TIMEOUT,
-            ..QueryStdioOptions::default()
-        })
-        .ok()
-        .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+        let picker = image_query::detect();
         Self {
             picker,
             cache: HashMap::new(),
@@ -183,11 +179,13 @@ impl ImageRuntime {
         None
     }
 
-    pub fn poll(&mut self) {
+    /// Reports completions, not merely pending work, to the frame scheduler.
+    pub fn poll(&mut self) -> bool {
         let Some(loader) = &mut self.loader else {
-            return;
+            return false;
         };
         let completed: Vec<_> = loader.results.try_iter().collect();
+        let changed = !completed.is_empty();
         for (loaded_key, decoded) in completed {
             if let Some(loader) = &mut self.loader {
                 loader.pending.remove(&loaded_key);
@@ -207,6 +205,7 @@ impl ImageRuntime {
                 },
             );
         }
+        changed
     }
 
     pub fn render(&mut self, frame: &mut Frame<'_>, image: PreparedImage, area: Rect, y: i16) {
@@ -557,6 +556,41 @@ mod tests {
             .unwrap();
         assert_eq!(key, source.key);
         assert_eq!(decoded.unwrap().width(), 4);
+    }
+
+    #[test]
+    fn polling_requests_frames_only_for_completed_images() {
+        let mut runtime = ImageRuntime::with_picker(Picker::halfblocks());
+        assert!(!runtime.poll());
+        // The decoder's channel is the external completion boundary. Keep its
+        // producer controlled so pending and completed states are deterministic.
+        let (requests, _worker) = mpsc::sync_channel(1);
+        let (completed, results) = mpsc::channel();
+        let key = [7; 32];
+        runtime.loader = Some(Loader {
+            requests,
+            results,
+            seen: HashSet::from([key]),
+            pending: HashSet::from([key]),
+        });
+        assert!(runtime.pending());
+        assert!(!runtime.poll());
+        completed
+            .send((key, Some(image::DynamicImage::new_rgb8(4, 4))))
+            .unwrap();
+        assert!(runtime.poll());
+        assert!(!runtime.pending());
+        assert!(runtime.cache[&key].decoded.is_some());
+        assert!(!runtime.poll());
+
+        // Failed completions also clear pending work and update the fallback.
+        let failed = [8; 32];
+        runtime.loader.as_mut().unwrap().pending.insert(failed);
+        completed.send((failed, None)).unwrap();
+        assert!(runtime.poll());
+        assert!(!runtime.pending());
+        assert!(runtime.cache[&failed].decoded.is_none());
+        assert!(!runtime.poll());
     }
 
     #[test]
