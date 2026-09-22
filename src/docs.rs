@@ -416,6 +416,7 @@ mod tests {
             vec![
                 "docs/user/agent-plugins.md",
                 "docs/user/compose-and-local-tools.md",
+                "docs/user/evaluations.md",
                 "docs/user/getting-started-and-configuration.md",
                 "docs/user/mcp.md",
                 "docs/user/migrating-from-claude-code-and-codex.md",

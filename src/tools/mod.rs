@@ -24,3 +24,6 @@ pub use subagent::{
 
 mod image_gen;
 pub use image_gen::ImageGenTool;
+
+mod eval;
+pub(crate) use eval::EvalTool;

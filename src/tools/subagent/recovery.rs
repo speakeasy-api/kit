@@ -178,7 +178,7 @@ impl Subagents {
         let cancellation = cancellation.clone();
         let id = id.to_owned();
         // The task owns completion/rollback even if the caller drops its future.
-        // Replay stays private; it never replaces the public last-turn output.
+        // Replay feeds inspection only; it never replaces public last-turn output.
         tokio::spawn(async move {
             let result = ChildSession::start_with_output(
                 config,
@@ -191,7 +191,7 @@ impl Subagents {
             .await;
             let mut locked = state.lock().await;
             match result {
-                Ok((child, _replay)) => {
+                Ok((child, replay)) => {
                     if let Err(error) = manager.check_active(&locked) {
                         drop(locked);
                         return Err(manager
@@ -201,7 +201,12 @@ impl Subagents {
                     locked.child = Some(child.clone());
                     locked.permit = Some(permit);
                     locked.status = SubagentStatus::Idle;
+                    let generation = locked.generation;
                     drop(locked);
+                    manager.transcripts.start(&id, generation);
+                    if let Ok(transcript) = manager.transcripts.get(&id, generation) {
+                        transcript.replay(&id, generation, &replay);
+                    }
                     manager.monitor_child_exit(id, &state, &child);
                     Ok(())
                 }

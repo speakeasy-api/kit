@@ -423,6 +423,40 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Bounded polling of runtime-owned disk history. Cursor zero starts replay;
+/// next_cursor is an opaque byte offset. Reuse it to transition into live reads.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/subagent/transcript/read", response = ReadSubagentTranscriptResponse)]
+pub(crate) struct ReadSubagentTranscriptRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub id: String,
+    pub generation: u64,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct ReadSubagentTranscriptResponse {
+    pub updates: Vec<serde_json::Value>,
+    pub next_cursor: u64,
+    pub generation: u64,
+    pub caught_up: bool,
+}
+
+/// Generation-checked steering of one live direct subagent.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/subagent/steer", response = SteerSubagentResponse)]
+pub(crate) struct SteerSubagentRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub id: String,
+    pub generation: u64,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct SteerSubagentResponse {
+    pub receipt: serde_json::Value,
+}
+
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
@@ -527,6 +561,7 @@ enum Command {
 }
 
 struct SessionHandle {
+    subagents: Option<crate::tools::Subagents>,
     voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
     commands: mpsc::Sender<Command>,
@@ -1643,6 +1678,7 @@ impl Server {
             &mut admission,
             registered,
             SessionHandle {
+                subagents: Some(driver.subagents),
                 voice_state,
                 token,
                 commands: tx,
@@ -1778,6 +1814,47 @@ impl Server {
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
+    }
+
+    async fn read_subagent_transcript(
+        &self,
+        request: ReadSubagentTranscriptRequest,
+    ) -> Result<ReadSubagentTranscriptResponse, AcpRuntimeError> {
+        let subagents = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .get(&request.session_id.to_string().into())
+            .and_then(|session| session.subagents.clone())
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let page = subagents
+            .read_transcript(&request.id, request.generation, request.cursor)
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        Ok(ReadSubagentTranscriptResponse {
+            updates: page.updates,
+            next_cursor: page.next_cursor,
+            generation: request.generation,
+            caught_up: page.caught_up,
+        })
+    }
+
+    async fn steer_subagent(
+        &self,
+        request: SteerSubagentRequest,
+    ) -> Result<SteerSubagentResponse, AcpRuntimeError> {
+        let subagents = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .get(&request.session_id.to_string().into())
+            .and_then(|session| session.subagents.clone())
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let receipt = subagents
+            .steer_generation(&request.id, Some(request.generation), request.prompt.into())
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        Ok(SteerSubagentResponse { receipt })
     }
 
     async fn detach_compose(
@@ -2775,6 +2852,39 @@ fn component(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
+                async move |request: ReadSubagentTranscriptRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state
+                                .read_subagent_transcript(request)
+                                .await
+                                .map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: SteerSubagentRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.steer_subagent(request).await.map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
                 async move |request: CancelBackgroundRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
@@ -2926,8 +3036,100 @@ async fn drain_client_messages(
     clippy::disallowed_methods,
     clippy::disallowed_macros
 )]
-mod test_support {
+pub(crate) mod test_support {
     use super::*;
+    use agentkit_task_manager::TaskManager as _;
+
+    /// Exercises the real request type and handler over ACP, with an actual
+    /// child's runtime-owned manager supplied by the subprocess regression test.
+    pub(crate) async fn assert_transcript_route(
+        root: &std::path::Path,
+        manager: crate::tools::Subagents,
+        child: String,
+        generation: u64,
+    ) {
+        let server = Arc::new(Server::new(
+            Runtime::new(root, "test-model").unwrap(),
+            AcpIntegration::builder()
+                .name("transcript-route-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        ));
+        for (id, subagents) in [("owner", manager.clone()), ("other", manager.fresh())] {
+            server.sessions.lock().unwrap().insert(
+                agentkit_acp::SessionId::new(id),
+                SessionHandle {
+                    subagents: Some(subagents),
+                    voice_state: Default::default(),
+                    token: 1,
+                    commands: mpsc::channel(1).0,
+                    background_jobs: BackgroundJobs::default(),
+                    structured_completion: false,
+                    tasks: agentkit_task_manager::AsyncTaskManager::new().handle(),
+                },
+            );
+        }
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let service = agent_client_protocol::Agent.builder().on_receive_request(
+            {
+                let server = server.clone();
+                async move |request: ReadSubagentTranscriptRequest, responder, _cx| {
+                    responder.respond_with_result(
+                        server
+                            .read_subagent_transcript(request)
+                            .await
+                            .map_err(sdk_error),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let actor = tokio::spawn(service.connect_to(agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .connect_with(client_transport, async move |connection| {
+                let request = ReadSubagentTranscriptRequest {
+                    session_id: agentkit_acp::SessionId::new("owner"),
+                    id: child,
+                    generation,
+                    cursor: 0,
+                };
+                let page = connection
+                    .send_request(request.clone())
+                    .block_task()
+                    .await?;
+                assert_eq!(page.generation, generation);
+                assert!(!page.updates.is_empty());
+                assert!(page.next_cursor > 0);
+                for invalid in [
+                    ReadSubagentTranscriptRequest {
+                        session_id: agentkit_acp::SessionId::new("other"),
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        session_id: agentkit_acp::SessionId::new("missing"),
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        generation: generation + 1,
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        cursor: u64::MAX,
+                        ..request
+                    },
+                ] {
+                    assert!(connection.send_request(invalid).block_task().await.is_err());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        actor.abort();
+        let _ = actor.await;
+    }
 
     impl SessionRegistry {
         pub(super) async fn reset_authentication(&self) -> bool {
@@ -3348,6 +3550,7 @@ pub(super) mod tests {
         });
         let (commands, received) = mpsc::channel(1);
         let session = SessionHandle {
+            subagents: None,
             voice_state: Default::default(),
             token,
             commands,
@@ -5308,6 +5511,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                subagents: None,
                 voice_state: Default::default(),
                 token: 1,
                 commands,
@@ -5373,6 +5577,7 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                subagents: None,
                 voice_state: Default::default(),
                 token: 1,
                 commands,

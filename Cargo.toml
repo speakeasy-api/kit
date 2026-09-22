@@ -1,6 +1,6 @@
 [package]
 name = "kit"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
@@ -77,6 +77,7 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"], optional = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
+rpassword = "=7.5.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 shlex = { version = "=2.0.1", optional = true }

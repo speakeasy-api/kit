@@ -12,6 +12,33 @@ use std::{fs, path::Path, process::Command};
 
 use agentkit_core::{Item, ItemKind};
 
+#[test]
+fn typesafe_auth_environment_status_and_logout() {
+    let home = tempfile::tempdir().unwrap();
+    for (action, key, expected) in [
+        (
+            "status",
+            "test-secret",
+            "TypeSafe: configured via TYPESAFE_API_KEY.",
+        ),
+        ("status", "", "TypeSafe: not configured."),
+        ("logout", "test-secret", "TYPESAFE_API_KEY remains active"),
+        ("logout", "", "no saved key"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .env("TYPESAFE_API_KEY", key)
+            .args(["auth", action, "typesafe", "--credential-store", "memory"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(expected), "{stdout}");
+        assert!(!stdout.contains("test-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("test-secret"));
+    }
+}
+
 fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
     let root = root.canonicalize().unwrap();
     let identity = blake3::hash(root.as_os_str().as_encoded_bytes());

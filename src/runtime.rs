@@ -468,6 +468,7 @@ impl Drop for SessionClaim {
 }
 
 pub(crate) struct AcpDriver {
+    pub subagents: Subagents,
     pub driver: LoopDriver<SelectableSession>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
@@ -504,6 +505,7 @@ impl std::fmt::Display for LogoutAuthenticationError {
 }
 
 pub struct Runtime {
+    eval: Option<crate::tools::EvalTool>,
     root: PathBuf,
     adapter: SelectableAdapter,
     provider: ProviderKind,
@@ -622,6 +624,7 @@ impl Runtime {
             max_subagent_depth,
         );
         Ok(Arc::new(Self {
+            eval: None,
             root,
             adapter,
             provider,
@@ -746,6 +749,20 @@ impl Runtime {
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
+        Ok(Arc::new(runtime))
+    }
+
+    /// Enables evaluation only after explicit user opt-in and credential resolution.
+    pub fn with_eval(runtime: Arc<Self>, enabled: bool) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure evaluation after runtime was shared".to_string())?;
+        runtime.eval = if crate::tools::EvalTool::available(enabled, &runtime.credential_storage) {
+            Some(crate::tools::EvalTool::new(
+                runtime.credential_storage.clone(),
+            ))
+        } else {
+            None
+        };
         Ok(Arc::new(runtime))
     }
 
@@ -1219,6 +1236,9 @@ impl Runtime {
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
             .with(Observed::new(EditTool::new(self.root.clone())).with_root(self.root.clone()));
+        if let Some(eval) = &self.eval {
+            children.register(Observed::new(eval.clone()));
+        }
         if depth < self.max_subagent_depth {
             children
                 .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
@@ -1713,7 +1733,7 @@ impl Runtime {
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
-                subagents,
+                subagents.clone(),
                 background_jobs.clone(),
                 skills,
                 mcp,
@@ -1730,6 +1750,7 @@ impl Runtime {
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {
+            subagents,
             driver,
             skills: skill_catalog,
             tasks,

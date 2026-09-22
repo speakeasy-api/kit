@@ -1,4 +1,5 @@
 mod recovery;
+use crate::acp_child::transcript;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -107,6 +108,7 @@ pub struct Subagents {
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
+    transcripts: Arc<transcript::Transcripts>,
     observer: Option<session::SessionObserver>,
 }
 
@@ -288,6 +290,7 @@ impl Subagents {
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
             observer: None,
+            transcripts: Arc::default(),
             event_sink: Arc::new(|event| {
                 events::emit(event);
                 Ok(())
@@ -316,7 +319,34 @@ impl Subagents {
         Self::new(config, self.max_depth)
     }
 
+    pub(crate) async fn read_transcript(
+        &self,
+        id: &str,
+        generation: u64,
+        cursor: u64,
+    ) -> Result<transcript::Page, String> {
+        let transcript = self.transcripts.get(id, generation)?;
+        let page = transcript.read(cursor).await?;
+        // Reject a generation switch that happened while disk IO was in flight.
+        self.transcripts.get(id, generation)?;
+        Ok(page)
+    }
+
     fn emit_event(&self, mut event: events::RuntimeEvent) {
+        if let events::RuntimeEvent::SubagentStateChanged {
+            id,
+            generation,
+            status,
+            ..
+        } = &event
+        {
+            self.transcripts.start(id, *generation);
+            if matches!(status, SubagentStatus::Removed)
+                && let Ok(transcript) = self.transcripts.get(id, *generation)
+            {
+                transcript.finish();
+            }
+        }
         if let events::RuntimeEvent::SubagentStateChanged {
             parent_id,
             parent_name,
@@ -467,10 +497,12 @@ impl Subagents {
         }
         self.monitor_child_exit(id.clone(), &state, &child);
         let output = match child
-            .prompt(
+            .prompt_generation(
                 id.clone(),
+                1,
                 structured_prompt(prompt, contract),
                 cancellation,
+                self.transcripts.get(&id, 1).ok(),
             )
             .await
         {
@@ -509,6 +541,15 @@ impl Subagents {
     }
 
     async fn steer(&self, id: &str, prompt: ChildPrompt) -> Result<Value, ChildError> {
+        self.steer_generation(id, None, prompt).await
+    }
+
+    pub(crate) async fn steer_generation(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        prompt: ChildPrompt,
+    ) -> Result<Value, ChildError> {
         let state = self
             .sessions
             .lock()
@@ -516,9 +557,12 @@ impl Subagents {
             .get(id)
             .map(|entry| Arc::clone(&entry.state))
             .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))?;
-        let child = {
+        let (child, generation) = {
             let locked = state.lock().await;
             self.check_active(&locked)?;
+            if generation.is_some_and(|generation| generation != locked.generation) {
+                return Err(ChildError::Failed("stale subagent generation".into()));
+            }
             if locked.forking.is_some() {
                 return Err(ChildError::Failed(
                     "subagent session is being forked".into(),
@@ -537,14 +581,16 @@ impl Subagents {
                     ));
                 }
             }
-            locked
-                .child
-                .clone()
-                .ok_or_else(|| ChildError::Failed("subagent session is still starting".into()))?
+            (
+                locked.child.clone().ok_or_else(|| {
+                    ChildError::Failed("subagent session is still starting".into())
+                })?,
+                locked.generation,
+            )
         };
         // Steering owns no lifecycle transition or generation. Do not hold state
         // across the child request: completion and close must remain independent.
-        child.steer(prompt).await
+        child.steer_generation(prompt, Some(generation)).await
     }
 
     async fn prompt(
@@ -593,10 +639,12 @@ impl Subagents {
         drop(locked);
         self.emit_event(event);
         match child
-            .prompt(
+            .prompt_generation(
                 prior.id.clone(),
+                generation,
                 structured_prompt(prompt, contract),
                 cancellation,
+                self.transcripts.get(&prior.id, generation).ok(),
             )
             .await
         {
@@ -860,8 +908,9 @@ impl Subagents {
             source_child
                 .fork(model.as_deref(), parent, &cancellation)
                 .await
+                .map(|child| (child, None))
         } else {
-            ChildSession::start(
+            ChildSession::start_with_output(
                 child_config,
                 harness.clone(),
                 Some((id.clone(), true)),
@@ -870,8 +919,9 @@ impl Subagents {
                 cancellation.clone(),
             )
             .await
+            .map(|(child, replay)| (child, Some(replay)))
         };
-        let child = match child_result {
+        let (child, replay) = match child_result {
             Ok(child) => child,
             Err(error) => {
                 self.fail_removed_and_remove(&id, &state).await;
@@ -922,11 +972,31 @@ impl Subagents {
                 .cleanup_installed_child(&id, &state, &child, ChildError::Cancelled)
                 .await);
         }
+        if let Ok(transcript) = self.transcripts.get(&id, generation) {
+            if let Some(replay) = &replay {
+                transcript.replay(&id, generation, replay);
+            } else {
+                transcript.record(&Value::Object(Map::from_iter([
+                    (
+                        "sessionUpdate".into(),
+                        Value::String("kit_transcript_partial".into()),
+                    ),
+                    (
+                        "reason".into(),
+                        Value::String(
+                            "Inherited transcript before this fork is unavailable".into(),
+                        ),
+                    ),
+                ])));
+            }
+        }
         let output = match child
-            .prompt(
+            .prompt_generation(
                 id.clone(),
+                generation,
                 structured_prompt(prompt, contract.as_deref()),
                 cancellation,
+                self.transcripts.get(&id, generation).ok(),
             )
             .await
         {
@@ -1345,6 +1415,7 @@ impl Subagents {
         let sessions = Arc::downgrade(&self.sessions);
         let state = Arc::downgrade(state);
         let event_sink = Arc::clone(&self.event_sink);
+        let transcripts = Arc::downgrade(&self.transcripts);
         let parent_id = self.config.parent_id.clone();
         let parent_name = self.config.parent_name.clone();
         let mut closed = child.closed_signal();
@@ -1368,7 +1439,13 @@ impl Subagents {
                 .generation_finished_at_unix_ms
                 .get_or_insert_with(events::now_millis);
             let mut event = locked.runtime_event(id.clone());
+            let generation = locked.generation;
             drop(locked);
+            if let Some(transcripts) = transcripts.upgrade()
+                && let Ok(transcript) = transcripts.get(&id, generation)
+            {
+                transcript.finish();
+            }
             if let Some(sessions) = sessions.upgrade()
                 && let Ok(mut sessions) = sessions.lock()
                 && sessions
@@ -2392,7 +2469,7 @@ mod steer_tests {
                 )
             };
             let capacity = manager.capacity.available_permits();
-            let receipt = manager.steer(id, "change direction".into()).await.unwrap();
+            let receipt = manager.steer(id, "original turn".into()).await.unwrap();
             assert_eq!(receipt, json!({"messageId": "injected-1"}));
             assert!(
                 !turn.is_finished(),
@@ -2435,6 +2512,41 @@ mod steer_tests {
             assert_eq!(continued.generation, before.0 + 1);
             assert_eq!(continued.output, json!("next turn"));
             assert_eq!(state.lock().await.status, SubagentStatus::Idle);
+            assert!(manager.read_transcript(id, before.0, 0).await.is_err());
+            let mut cursor = 0;
+            let mut history = Vec::new();
+            loop {
+                let page = manager
+                    .read_transcript(id, continued.generation, cursor)
+                    .await
+                    .unwrap();
+                cursor = page.next_cursor;
+                history.extend(page.updates);
+                if page.caught_up {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let user_texts: Vec<_> = history
+                .iter()
+                .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+                .filter_map(|update| update["content"]["text"].as_str())
+                .collect();
+            assert!(user_texts.contains(&"original turn"));
+            assert!(user_texts.contains(&"next turn"));
+            assert!(
+                history
+                    .iter()
+                    .any(|update| update["messageId"] == "injected-1"
+                        && update["content"][0]["text"] == "original turn")
+            );
+            crate::protocols::acp::test_support::assert_transcript_route(
+                root.path(),
+                manager.clone(),
+                id.clone(),
+                continued.generation,
+            )
+            .await;
             manager
                 .close(id, &TurnCancellation::default())
                 .await
