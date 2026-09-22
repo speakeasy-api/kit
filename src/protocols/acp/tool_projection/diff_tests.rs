@@ -60,7 +60,8 @@ async fn committed_diffs_preserve_text_and_omit_failures_and_oversized_files() {
         let mut input = input;
         input["path"] = json!("file.txt");
         let request = super::tests::request("diff-cases", "edit", input);
-        let mut receiver = bus().subscribe();
+        let registration = routes().register("diff-cases".into());
+        let mut receiver = registration.buses().v1.subscribe();
         assert_eq!(
             tool.invoke(request, &mut context.borrowed()).await.is_ok(),
             ok
@@ -99,11 +100,12 @@ async fn committed_diffs_preserve_text_and_omit_failures_and_oversized_files() {
 fn diff_bounds_and_non_text_deletions_are_omitted() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("binary");
-    let mut receiver = bus().subscribe();
+    let registration = routes().register("diff-bounds".into());
+    let mut receiver = registration.buses().v1.subscribe();
     std::fs::write(&path, [0xff]).unwrap();
-    assert!(deletion_text(&path).is_none());
-    assert!(deletion_text(root.path()).is_none());
     let request = super::tests::request("diff-bounds", "edit", json!({}));
+    assert!(deletion_text(&request, &path).is_none());
+    assert!(deletion_text(&request, root.path()).is_none());
     diff(&request, Path::new("relative"), Some("old"), Some("new"));
     diff(&request, &path, Some(&"x".repeat(MAX_DIFF_TEXT)), Some("x"));
     assert!(

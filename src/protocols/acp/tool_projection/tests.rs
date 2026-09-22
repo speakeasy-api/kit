@@ -17,7 +17,8 @@ pub(super) fn request(session: &str, name: &str, input: Value) -> ToolRequest {
 
 #[test]
 fn evaluated_metadata_has_both_wire_shapes_without_retaining_arguments() {
-    let mut receiver = bus().subscribe();
+    let registration = routes().register("metadata".into());
+    let mut receiver = registration.buses().v1.subscribe();
     for (name, kind) in [
         ("shell", "execute"),
         ("edit", "edit"),
@@ -57,7 +58,8 @@ fn evaluated_metadata_has_both_wire_shapes_without_retaining_arguments() {
 
 #[test]
 fn oversized_and_non_compose_ids_are_not_projected() {
-    let _receiver = bus().subscribe();
+    let registration = routes().register("bounds".into());
+    let _receiver = registration.buses().v1.subscribe();
     let mut request = request("bounds", "shell", json!({}));
     request.call_id = ToolCallId::new("x".repeat(MAX_ID + 1));
     assert!(Invocation::start(&request, None).is_none());
@@ -119,7 +121,8 @@ async fn real_edit_wrapper_projects_success_and_failure_without_stderr_transport
         execution_scope: None,
         approved_request: None,
     };
-    let mut receiver = bus().subscribe();
+    let registration = routes().register("real-edit".into());
+    let mut receiver = registration.buses().v1.subscribe();
     for (input, ok) in [
         (
             json!({"op": "add", "path": "example.txt", "content": "private file contents"}),
@@ -353,7 +356,8 @@ async fn real_shell_streams_bytes_before_exit_and_drains_terminal_before_call() 
 
 #[test]
 fn terminal_drop_marks_exit_and_bounds_binary_chunks_and_metadata() {
-    let mut receiver = v2_bus().subscribe();
+    let registration = routes().register("terminal-bounds".into());
+    let mut receiver = registration.buses().v2.subscribe();
     let request = request("terminal-bounds", "shell", json!({}));
     let invocation = Invocation::start(&request, None).unwrap();
     let terminal = terminal::Terminal::start(
@@ -584,4 +588,141 @@ async fn cumulative_budget_bounds_a_stalled_transport_across_calls() {
         );
         assert!(!values.iter().any(|v| v["status"] == "failed"));
     }
+}
+
+impl Buses {
+    fn publish(&self, update: Update) {
+        if !update.v2_only() {
+            let _ = self.v1.send(update.clone());
+        }
+        let _ = self.v2.send(update);
+    }
+}
+
+#[tokio::test]
+async fn unrelated_session_bursts_cannot_fail_active_calls() {
+    for v2 in [false, true] {
+        let session = format!("session-isolation-{v2}");
+        let noisy = format!("session-noise-{v2}");
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        let deliver = move |update| send.send(update).is_ok();
+        let subscription = if v2 {
+            Subscription::start_v2(session.clone(), deliver)
+        } else {
+            Subscription::start(session.clone(), deliver)
+        };
+        let noise = routes().register(noisy.clone());
+        let mut noisy_receiver = if v2 {
+            noise.buses().v2.subscribe()
+        } else {
+            noise.buses().v1.subscribe()
+        };
+        let invocation =
+            Invocation::start(&request(&session, "subagent", json!({})), None).unwrap();
+        subscription.drain().await.unwrap();
+        assert!(receive.try_recv().unwrap().start.is_some());
+        // No await: the active call's consumer cannot drain during the burst.
+        // A process-global bounded queue would lose frames and fail this card.
+        for _ in 0..CAPACITY + 1 {
+            drop(Invocation::start(
+                &request(&noisy, "shell", json!({})),
+                None,
+            ));
+        }
+        invocation.finish(true);
+        assert!(matches!(
+            noisy_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+        subscription.drain().await.unwrap();
+        assert_eq!(receive.try_recv().unwrap().value()["status"], "completed");
+        assert!(receive.try_recv().is_err());
+    }
+}
+
+#[test]
+fn route_cleanup_preserves_other_leases_and_recovers_from_poison() {
+    let session = "route-cleanup";
+    let first = routes().register(session.into());
+    let second = routes().register(session.into());
+    assert!(std::ptr::eq(first.buses(), second.buses()));
+    drop(first);
+    assert!(routes().senders(session).is_some());
+    // Poison at a completed guarded transition, without changing its invariants.
+    assert!(
+        std::panic::catch_unwind(|| {
+            let _guard = routes().lock();
+            panic!("poison registry");
+        })
+        .is_err()
+    );
+    drop(second);
+    assert!(routes().senders(session).is_none());
+    let replacement = routes().register(session.into());
+    assert!(routes().senders(session).is_some());
+    drop(replacement);
+    assert!(routes().senders(session).is_none());
+}
+
+#[tokio::test]
+async fn route_leases_are_released_on_abort_and_delivery_unwind() {
+    for unwind in [false, true] {
+        let session = format!("route-task-cleanup-{unwind}");
+        let mut subscription = Subscription::start(session.clone(), move |_| {
+            panic!("delivery callback unwound");
+        });
+        if unwind {
+            drop(Invocation::start(
+                &request(&session, "shell", json!({})),
+                None,
+            ));
+        } else {
+            subscription.task.abort();
+        }
+        let error = (&mut subscription.task).await.unwrap_err();
+        assert_eq!(error.is_panic(), unwind);
+        assert!(routes().senders(&session).is_none());
+    }
+}
+
+#[test]
+fn concurrent_last_leases_remove_routes_despite_publisher_clones() {
+    let session = "concurrent-route-cleanup";
+    let first = routes().register(session.into());
+    let second = routes().register(session.into());
+    let senders = routes().senders(session).unwrap();
+    let mut old_receiver = senders.0.subscribe();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        for lease in [first, second] {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                drop(lease);
+            });
+        }
+    });
+    assert!(routes().senders(session).is_none());
+    let replacement = routes().register(session.into());
+    let mut receiver = replacement.buses().v1.subscribe();
+    drop(Invocation::start(
+        &request(session, "shell", json!({})),
+        None,
+    ));
+    assert!(receiver.try_recv().unwrap().start.is_some());
+    assert!(old_receiver.try_recv().is_err());
+    drop(replacement);
+    assert!(routes().senders(session).is_none());
+}
+
+#[tokio::test]
+async fn failed_delivery_releases_route() {
+    let session = "failed-delivery-cleanup";
+    let mut subscription = Subscription::start(session.into(), |_| false);
+    drop(Invocation::start(
+        &request(session, "shell", json!({})),
+        None,
+    ));
+    (&mut subscription.task).await.unwrap();
+    assert!(routes().senders(session).is_none());
 }

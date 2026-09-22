@@ -5,13 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use agentkit_tools_core::ToolRequest;
 use serde_json::{Map, Value};
 
-use super::{CAPACITY, MAX_ID, Update, buses, subscribers};
+use super::{CAPACITY, MAX_ID, Update, subscribers};
 
 const MAX_ITEMS: usize = CAPACITY / 4;
 const MAX_BYTES: usize = 64 * 1024;
 
 pub(crate) fn publish(request: &ToolRequest, items: &[Value], truncated: bool) {
-    if subscribers() == 0
+    if subscribers(&request.session_id.0) == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -19,7 +19,7 @@ pub(crate) fn publish(request: &ToolRequest, items: &[Value], truncated: bool) {
         return;
     }
     for patch in patches(request, items, truncated) {
-        buses().publish(Update {
+        super::publish(Update {
             session: request.session_id.0.clone(),
             call: request.call_id.0.clone(),
             start: None,
