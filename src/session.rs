@@ -28,6 +28,8 @@ pub(crate) use children::{ChildLifecycle, DurableChild};
 
 // Separate from v4 redirects: pre-child readers must reject these records before writing.
 const CHILD_SCHEMA_VERSION: u32 = 5;
+// Older readers must reject selection records rather than silently lose settings.
+const REASONING_SCHEMA_VERSION: u32 = 6;
 pub const SCHEMA_VERSION: u32 = 3;
 const REDIRECT_SCHEMA_VERSION: u32 = 4;
 const PREVIOUS_SCHEMA_VERSION: u32 = 2;
@@ -55,6 +57,8 @@ struct Record {
     child: Option<DurableChild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot: Option<ChildSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -69,6 +73,7 @@ pub struct OpenSession {
     pub transcript: Vec<Item>,
     pub observer: SessionObserver,
     pub(crate) children: Vec<DurableChild>,
+    pub(crate) reasoning_effort: Option<Option<crate::ReasoningEffort>>,
 }
 
 /// Read-only metadata for one durable session in a workspace.
@@ -115,6 +120,7 @@ struct Writer {
     // A prepared response privately owns cleanup. Writers remain frozen until
     // that owner publishes success, or forever if submission is abandoned.
     publication: Option<Arc<AtomicBool>>,
+    reasoning_effort: Option<Option<crate::ReasoningEffort>>,
 }
 
 struct SessionLock {
@@ -236,7 +242,12 @@ pub(crate) fn clone_completed_in(
     source: &str,
     destination: &str,
 ) -> Result<(), String> {
-    let mut transcript = load_in(root, directory, source)?;
+    validate_id(source)?;
+    let authority = select_authority(directory, &canonical_workspace(root), source)?
+        .ok_or_else(|| format!("session {source:?} does not exist"))?;
+    let reasoning_effort = authority.reasoning_effort;
+    let mut transcript = authority.items;
+    crate::transcript::repair_unanswered_tool_calls(&mut transcript);
     crate::transcript::sanitize_forked_transcript(&mut transcript);
     let opened = open_with_initial_timestamps_in(
         root,
@@ -247,9 +258,13 @@ pub(crate) fn clone_completed_in(
         transcript,
         InitialTranscriptOptions {
             stamp_items: false,
-            commit_creation: true,
+            commit_creation: false,
         },
     )?;
+    if let Some(effort) = reasoning_effort {
+        opened.observer.set_reasoning_effort(effort)?;
+    }
+    opened.observer.commit_creation()?;
     drop(opened);
     Ok(())
 }
@@ -408,6 +423,7 @@ fn open_with_initial_timestamps_in(
                 break (sources, authority);
             }
         };
+        let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
         let children = authority
             .as_ref()
             .map(|a| a.children.clone())
@@ -434,6 +450,7 @@ fn open_with_initial_timestamps_in(
             legacy_locks,
             created: (!resume).then(|| CreatedTranscript::new(None, filesystem, None)),
             publication: None,
+            reasoning_effort,
         };
         return finish_open(
             writer,
@@ -474,6 +491,7 @@ fn open_with_initial_timestamps_in(
             break (sources, authority);
         }
     };
+    let reasoning_effort = authority.as_ref().and_then(|a| a.reasoning_effort);
     let children = authority
         .as_ref()
         .map(|a| a.children.clone())
@@ -492,7 +510,7 @@ fn open_with_initial_timestamps_in(
             &workspace_root,
             &authority.items,
             &authority.children,
-            title_seed.as_deref(),
+            (title_seed.as_deref(), reasoning_effort),
         )?;
         for legacy in authority.legacy_histories {
             let source_fs = migration_filesystem(&legacy, &lock, &migration_locks)?;
@@ -575,6 +593,7 @@ fn open_with_initial_timestamps_in(
         legacy_locks: migration_locks,
         created,
         publication: None,
+        reasoning_effort,
     };
     finish_open(
         writer,
@@ -624,6 +643,7 @@ fn finish_open(
         writer.commit_creation()?;
     }
     Ok(OpenSession {
+        reasoning_effort: writer.reasoning_effort,
         children,
         transcript,
         observer: SessionObserver(Arc::new(Mutex::new(writer))),
@@ -631,6 +651,18 @@ fn finish_open(
 }
 
 impl SessionObserver {
+    /// Best-effort records reasoning effort without changing transcript items.
+    /// Storage buffering or loss follows ordinary transcript persistence semantics.
+    pub(crate) fn set_reasoning_effort(
+        &self,
+        effort: Option<crate::ReasoningEffort>,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "session transcript writer poisoned".to_string())?
+            .set_reasoning_effort(effort)
+    }
+
     /// Appends parent-owned child state under the transcript lease and generation lock.
     /// Unlike ordinary transcript output, child lifecycle writes require disk.
     /// No registry callback runs while this writer guard is held; poison is isolation.
@@ -694,6 +726,36 @@ impl TranscriptObserver for SessionObserver {
 }
 
 impl Writer {
+    fn set_reasoning_effort(
+        &mut self,
+        effort: Option<crate::ReasoningEffort>,
+    ) -> Result<(), String> {
+        self.ensure_lock()?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "session generation overflowed".to_string())?;
+        let record = Record {
+            schema_version: REASONING_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            generation,
+            workspace_root: Some(self.workspace_root.clone()),
+            item: None,
+            replacement: None,
+            redirect: None,
+            child: None,
+            snapshot: None,
+            reasoning_effort: Some(
+                effort
+                    .map_or("default", crate::ReasoningEffort::as_str)
+                    .into(),
+            ),
+        };
+        self.write_record(record, generation)?;
+        self.reasoning_effort = Some(effort);
+        Ok(())
+    }
+
     fn persist_child(&mut self, child: &DurableChild) -> Result<(), String> {
         child.validate()?;
         self.ensure_lock()?;
@@ -713,6 +775,7 @@ impl Writer {
             replacement: None,
             redirect: None,
             child: Some(child.clone()),
+            reasoning_effort: None,
             snapshot: None,
         };
         self.write_record(record, generation)?;
@@ -764,6 +827,7 @@ impl Writer {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         self.write_record(record, generation)
@@ -784,6 +848,7 @@ impl Writer {
             replacement: Some(transcript.to_vec()),
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         self.write_record(record, generation)
@@ -975,7 +1040,7 @@ fn stamp_item(item: &mut Item, now: Timestamp) {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChildSnapshot {
     replacement: Vec<Item>,
@@ -987,16 +1052,19 @@ struct ChildSnapshot {
 
 // One delta per record, never one accumulated child map per checkpoint.
 // Replay borrows these payloads and runs only when comparing authorities.
+#[derive(PartialEq)]
 enum HistoryEntry {
     Item(Item),
     Replacement(Vec<Item>),
     Child(Box<DurableChild>),
     Snapshot(ChildSnapshot),
+    Settings,
 }
 
 struct TranscriptHistory {
+    reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     children: Vec<DurableChild>,
-    ancestry: Vec<HistoryEntry>,
+    ancestry: Vec<(HistoryEntry, Option<Option<crate::ReasoningEffort>>)>,
     items: Vec<Item>,
     generation: u64,
     states: Vec<Vec<Item>>,
@@ -1070,6 +1138,7 @@ fn read_record_lines(
     let mut items = Vec::new();
     let mut children = BTreeMap::new();
     let mut ancestry = Vec::new();
+    let mut reasoning_effort = None;
     let mut expected = 1_u64;
     let mut states = Vec::new();
     let mut redirect = None;
@@ -1084,12 +1153,13 @@ fn read_record_lines(
                 | SCHEMA_VERSION
                 | REDIRECT_SCHEMA_VERSION
                 | CHILD_SCHEMA_VERSION
+                | REASONING_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "unsupported session schema version {} on line {} (Kit supports {})",
                 record.schema_version,
                 index + 1,
-                CHILD_SCHEMA_VERSION
+                REASONING_SCHEMA_VERSION
             ));
         }
         if record.session_id != session_id || record.generation != expected {
@@ -1104,6 +1174,24 @@ fn read_record_lines(
                 path.display()
             ));
         }
+        let selection = record
+            .reasoning_effort
+            .as_deref()
+            .map(crate::ReasoningEffort::from_id)
+            .transpose()?;
+        if selection.is_some() {
+            if record.schema_version != REASONING_SCHEMA_VERSION
+                || record.workspace_root.is_none()
+                || record.item.is_some()
+                || record.child.is_some()
+                || record.redirect.is_some()
+            {
+                return Err("invalid reasoning effort record".into());
+            }
+            reasoning_effort = selection;
+        } else if record.schema_version == REASONING_SCHEMA_VERSION {
+            return Err("reasoning effort record missing selection".into());
+        }
         match (
             record.item,
             record.replacement,
@@ -1113,19 +1201,19 @@ fn read_record_lines(
         ) {
             (Some(item), None, None, None, None) if record.schema_version <= SCHEMA_VERSION => {
                 items.push(item.clone());
-                ancestry.push(HistoryEntry::Item(item));
+                ancestry.push((HistoryEntry::Item(item), reasoning_effort));
             }
             (None, Some(replacement), None, None, None)
                 if matches!(
                     record.schema_version,
-                    PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+                    PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION | REASONING_SCHEMA_VERSION
                 ) && !replacement.is_empty() =>
             {
                 if !items.is_empty() {
                     states.push(items.clone());
                 }
                 items = replacement.clone();
-                ancestry.push(HistoryEntry::Replacement(replacement));
+                ancestry.push((HistoryEntry::Replacement(replacement), reasoning_effort));
             }
             (None, None, Some(target), None, None)
                 if record.schema_version == REDIRECT_SCHEMA_VERSION
@@ -1139,11 +1227,13 @@ fn read_record_lines(
             {
                 child.validate()?;
                 children.insert(child.id.clone(), child.clone());
-                ancestry.push(HistoryEntry::Child(Box::new(child)));
+                ancestry.push((HistoryEntry::Child(Box::new(child)), reasoning_effort));
             }
             (None, None, None, None, Some(snapshot))
-                if record.schema_version == CHILD_SCHEMA_VERSION
-                    && record.workspace_root.is_some()
+                if matches!(
+                    record.schema_version,
+                    CHILD_SCHEMA_VERSION | REASONING_SCHEMA_VERSION
+                ) && record.workspace_root.is_some()
                     && !snapshot.replacement.is_empty() =>
             {
                 let mut next = BTreeMap::new();
@@ -1164,7 +1254,10 @@ fn read_record_lines(
                 }
                 items = snapshot.replacement.clone();
                 children = next;
-                ancestry.push(HistoryEntry::Snapshot(snapshot));
+                ancestry.push((HistoryEntry::Snapshot(snapshot), reasoning_effort));
+            }
+            (None, None, None, None, None) if selection.is_some() => {
+                ancestry.push((HistoryEntry::Settings, reasoning_effort));
             }
             _ => {
                 return Err(format!(
@@ -1183,6 +1276,7 @@ fn read_record_lines(
     }
     states.push(items.clone());
     Ok(StoredTranscript::History(TranscriptHistory {
+        reasoning_effort,
         children: children.into_values().collect(),
         ancestry,
         items,
@@ -1832,6 +1926,7 @@ fn list_ids_in_with(filesystem: &Fs, directory: &Path) -> Result<Vec<String>, St
 }
 
 struct Authority {
+    reasoning_effort: Option<Option<crate::ReasoningEffort>>,
     children: Vec<DurableChild>,
     items: Vec<Item>,
     historical_items: Vec<Vec<Item>>,
@@ -1845,12 +1940,21 @@ struct HistoryCandidate {
 }
 
 fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHistory) -> bool {
+    // Exact append prefixes outrank coincidentally repeated states, including a
+    // reasoning selection that changes away from and then back to its old value.
+    if history.ancestry.starts_with(&ancestor.ancestry) {
+        return true;
+    }
+    if ancestor.ancestry.starts_with(&history.ancestry) {
+        return false;
+    }
     let mut items: Vec<&Item> = Vec::new();
     let mut children: BTreeMap<&str, &DurableChild> = BTreeMap::new();
     // A match must hold at one committed record boundary. In particular, a
     // catalog title seed must never supply transcript ancestry for a snapshot.
-    for entry in &history.ancestry {
+    for (entry, reasoning_effort) in &history.ancestry {
         match entry {
+            HistoryEntry::Settings => {}
             HistoryEntry::Item(item) => items.push(item),
             HistoryEntry::Replacement(replacement) => items = replacement.iter().collect(),
             HistoryEntry::Child(child) => {
@@ -1875,6 +1979,7 @@ fn history_descends_from(history: &TranscriptHistory, ancestor: &TranscriptHisto
         if (items.len() == ancestor.items.len()
             || legacy_prefix && items.len() >= ancestor.items.len())
             && items.iter().zip(&ancestor.items).all(|(a, b)| *a == b)
+            && *reasoning_effort == ancestor.reasoning_effort
             && children.len() == ancestor.children.len()
             && children
                 .values()
@@ -2057,9 +2162,17 @@ fn select_authority_with(
         match (candidate_descends, current_descends) {
             (true, false) => *current = candidate,
             (false, true) => {}
-            (true, true) if candidate.path == scoped => *current = candidate,
-            (true, true) => {}
-            (false, false) => {
+            (true, true)
+                if candidate.history.reasoning_effort == current.history.reasoning_effort =>
+            {
+                if candidate.path == scoped {
+                    *current = candidate;
+                }
+            }
+            // Revisited historical selections are not equivalent authorities
+            // when their final settings disagree. Exact append prefixes above
+            // still establish one-way descent, including selection resets.
+            (true, true) | (false, false) => {
                 return Err(format!(
                     "divergent session histories for {session_id:?}: {} and {}",
                     current.path.display(),
@@ -2069,6 +2182,7 @@ fn select_authority_with(
         }
     }
     Ok(authority.map(|candidate| Authority {
+        reasoning_effort: candidate.history.reasoning_effort,
         children: candidate.history.children,
         items: candidate.history.items,
         historical_items: candidate.history.states,
@@ -2335,15 +2449,17 @@ fn establish_scoped_authority(
     root: &Path,
     items: &[Item],
     children: &[DurableChild],
-    title_seed: Option<&[Item]>,
+    metadata: (Option<&[Item]>, Option<Option<crate::ReasoningEffort>>),
 ) -> Result<(), String> {
+    let (title_seed, reasoning_effort) = metadata;
     let exists = fs::best_effort_global()
         .try_exists(path)
         .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
     let (mut generation, existing_items, had_children) = if exists {
         match read_records_direct(path, session_id)? {
             StoredTranscript::History(history)
-                if history.items == items
+                if history.reasoning_effort == reasoning_effort
+                    && history.items == items
                     && history.children == children
                     && transcript_workspace(path, session_id)?.as_deref() == Some(root) =>
             {
@@ -2374,7 +2490,11 @@ fn establish_scoped_authority(
             filesystem,
             path,
             &Record {
-                schema_version: CHILD_SCHEMA_VERSION,
+                schema_version: if reasoning_effort.is_some() {
+                    REASONING_SCHEMA_VERSION
+                } else {
+                    CHILD_SCHEMA_VERSION
+                },
                 session_id: session_id.into(),
                 generation,
                 workspace_root: Some(root.to_path_buf()),
@@ -2382,6 +2502,11 @@ fn establish_scoped_authority(
                 replacement: None,
                 redirect: None,
                 child: None,
+                reasoning_effort: reasoning_effort.map(|effort| {
+                    effort
+                        .map_or("default", crate::ReasoningEffort::as_str)
+                        .into()
+                }),
                 snapshot: Some(ChildSnapshot {
                     replacement: items.to_vec(),
                     children: children.to_vec(),
@@ -2397,7 +2522,11 @@ fn establish_scoped_authority(
             filesystem,
             path,
             &Record {
-                schema_version: SCHEMA_VERSION,
+                schema_version: if reasoning_effort.is_some() {
+                    REASONING_SCHEMA_VERSION
+                } else {
+                    SCHEMA_VERSION
+                },
                 session_id: session_id.into(),
                 generation,
                 workspace_root: Some(root.to_path_buf()),
@@ -2405,6 +2534,11 @@ fn establish_scoped_authority(
                 replacement: Some(title_seed.to_vec()),
                 redirect: None,
                 child: None,
+                reasoning_effort: reasoning_effort.map(|effort| {
+                    effort
+                        .map_or("default", crate::ReasoningEffort::as_str)
+                        .into()
+                }),
                 snapshot: None,
             },
             create,
@@ -2418,7 +2552,11 @@ fn establish_scoped_authority(
         filesystem,
         path,
         &Record {
-            schema_version: SCHEMA_VERSION,
+            schema_version: if reasoning_effort.is_some() {
+                REASONING_SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION
+            },
             session_id: session_id.into(),
             generation,
             workspace_root: Some(root.to_path_buf()),
@@ -2426,6 +2564,11 @@ fn establish_scoped_authority(
             replacement: Some(items.to_vec()),
             redirect: None,
             child: None,
+            reasoning_effort: reasoning_effort.map(|effort| {
+                effort
+                    .map_or("default", crate::ReasoningEffort::as_str)
+                    .into()
+            }),
             snapshot: None,
         },
         create,
@@ -2465,6 +2608,7 @@ fn redirect_legacy_transcript(
             replacement: None,
             redirect: Some(target),
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         },
         false,
@@ -2553,6 +2697,166 @@ mod tests {
     use super::*;
     use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
     use serde_json::json;
+
+    #[test]
+    fn reasoning_effort_absent_changes_reset_and_fork() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = open(
+            root.path(),
+            "reasoning",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        assert_eq!(opened.reasoning_effort, None);
+        let original = opened.transcript.clone();
+        drop(opened);
+        let mut opened = open(root.path(), "reasoning", true, false, vec![]).unwrap();
+        assert_eq!(opened.reasoning_effort, None);
+        for effort in [
+            Some(crate::ReasoningEffort::Low),
+            Some(crate::ReasoningEffort::Medium),
+            Some(crate::ReasoningEffort::High),
+            None,
+        ] {
+            opened.observer.set_reasoning_effort(effort).unwrap();
+            assert_eq!(load(root.path(), "reasoning").unwrap(), original);
+            drop(opened);
+            opened = open(root.path(), "reasoning", true, false, vec![]).unwrap();
+            assert_eq!(opened.reasoning_effort, Some(effort));
+        }
+        opened.observer.replace(&original).unwrap();
+        drop(opened);
+        clone_completed(root.path(), "reasoning", "fork").unwrap();
+        let fork = open(root.path(), "fork", true, false, vec![]).unwrap();
+        assert_eq!(fork.reasoning_effort, Some(None));
+        let reopened = open(root.path(), "reasoning", true, false, vec![]).unwrap();
+        assert_eq!(reopened.reasoning_effort, Some(None));
+    }
+
+    #[test]
+    fn reasoning_effort_legacy_absence_and_redirect_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = legacy_directory(root.path());
+        write_history(
+            &legacy.join("old.jsonl"),
+            LEGACY_SCHEMA_VERSION,
+            "old",
+            &["S", "U"],
+            None,
+        );
+        let old = open(root.path(), "old", true, false, vec![]).unwrap();
+        assert_eq!(old.reasoning_effort, None);
+        drop(old);
+        let opened = open(
+            root.path(),
+            "selected",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        opened
+            .observer
+            .set_reasoning_effort(Some(crate::ReasoningEffort::High))
+            .unwrap();
+        drop(opened);
+        let source = legacy.join("selected.jsonl");
+        std::fs::rename(transcript_path(root.path(), "selected"), &source).unwrap();
+        let resumed = open(root.path(), "selected", true, false, vec![]).unwrap();
+        assert_eq!(
+            resumed.reasoning_effort,
+            Some(Some(crate::ReasoningEffort::High))
+        );
+        assert!(matches!(
+            read_records_direct(&source, "selected").unwrap(),
+            StoredTranscript::Redirect(_)
+        ));
+        drop(resumed);
+        let resumed = open(root.path(), "selected", true, false, vec![]).unwrap();
+        assert_eq!(
+            resumed.reasoning_effort,
+            Some(Some(crate::ReasoningEffort::High))
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_records_validate_schema_payload_and_ids() {
+        let base = json!({"schema_version": SCHEMA_VERSION, "session_id": "abc",
+            "generation": 1, "replacement": [Item::text(ItemKind::System, "system")]});
+        for invalid in [json!("unknown"), json!(42), json!(null), json!({})] {
+            let record = json!({"schema_version": REASONING_SCHEMA_VERSION,
+                "session_id": "abc", "generation": 2, "workspace_root": "/workspace",
+                "reasoning_effort": invalid});
+            let bytes = format!("{base}\n{record}\n");
+            assert!(read_records_bytes(Path::new("abc.jsonl"), "abc", bytes.as_bytes()).is_err());
+        }
+        for version in [LEGACY_SCHEMA_VERSION, SCHEMA_VERSION, CHILD_SCHEMA_VERSION] {
+            let record = json!({"schema_version": version, "session_id": "abc",
+                "generation": 2, "workspace_root": "/workspace", "reasoning_effort": "high"});
+            let bytes = format!("{base}\n{record}\n");
+            assert!(read_records_bytes(Path::new("abc.jsonl"), "abc", bytes.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_migration_preserves_joint_ancestry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("abc.jsonl");
+        let items = vec![Item::text(ItemKind::System, "system")];
+        let lock = SessionLock::acquire(path.with_extension("lock"), true).unwrap();
+        let filesystem = lock.filesystem().unwrap();
+        establish_scoped_authority(
+            &filesystem,
+            &path,
+            "abc",
+            Path::new("/workspace"),
+            &items,
+            &[],
+            (None, Some(Some(crate::ReasoningEffort::High))),
+        )
+        .unwrap();
+        let StoredTranscript::History(high) = read_records_direct(&path, "abc").unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            high.reasoning_effort,
+            Some(Some(crate::ReasoningEffort::High))
+        );
+        establish_scoped_authority(
+            &filesystem,
+            &path,
+            "abc",
+            Path::new("/workspace"),
+            &items,
+            &[],
+            (None, Some(None)),
+        )
+        .unwrap();
+        let StoredTranscript::History(reset) = read_records_direct(&path, "abc").unwrap() else {
+            panic!()
+        };
+        assert_eq!(reset.reasoning_effort, Some(None));
+        assert!(history_descends_from(&reset, &high));
+        assert!(!history_descends_from(&high, &reset));
+        establish_scoped_authority(
+            &filesystem,
+            &path,
+            "abc",
+            Path::new("/workspace"),
+            &items,
+            &[],
+            (None, Some(Some(crate::ReasoningEffort::High))),
+        )
+        .unwrap();
+        let StoredTranscript::History(high_again) = read_records_direct(&path, "abc").unwrap()
+        else {
+            panic!()
+        };
+        assert!(history_descends_from(&high_again, &high));
+        assert!(!history_descends_from(&high, &high_again));
+    }
 
     fn session_directory(root: &Path) -> PathBuf {
         root.join("sessions")
@@ -2650,6 +2954,7 @@ mod tests {
                     replacement: None,
                     redirect: None,
                     child: None,
+                    reasoning_effort: None,
                     snapshot: None,
                 })
                 .unwrap()
@@ -2751,11 +3056,14 @@ mod tests {
         let history = parsed_child_history(&child_history_bytes(payloads));
         // HistoryEntry::Child owns exactly the incoming child, not a snapshot.
         // Iterate the real record boundary rather than adding work counters.
-        let retained = history.ancestry.iter().filter_map(|entry| match entry {
-            HistoryEntry::Child(child) => Some(child.as_ref()),
-            HistoryEntry::Replacement(_) => None,
-            _ => panic!("ordinary child records must remain individual deltas"),
-        });
+        let retained = history
+            .ancestry
+            .iter()
+            .filter_map(|(entry, _)| match entry {
+                HistoryEntry::Child(child) => Some(child.as_ref()),
+                HistoryEntry::Replacement(_) => None,
+                _ => panic!("ordinary child records must remain individual deltas"),
+            });
         assert!(retained.eq(children.iter()));
     }
 
@@ -2795,7 +3103,7 @@ mod tests {
             Path::new("/workspace"),
             &items,
             &authority.children,
-            None,
+            (None, None),
         )
         .unwrap();
         let complete = fs::read_to_string(&path).unwrap();
@@ -2829,7 +3137,7 @@ mod tests {
                 Path::new("/workspace"),
                 &items,
                 &authority.children,
-                None,
+                (None, None),
             )
             .unwrap();
             let restored = parsed_child_history(&fs::read(&path).unwrap());
@@ -3082,6 +3390,7 @@ mod tests {
                 replacement: None,
                 redirect: None,
                 child: Some(child.clone()),
+                reasoning_effort: None,
                 snapshot: None,
             },
             false,
@@ -3644,6 +3953,7 @@ mod tests {
                     replacement: None,
                     redirect: Some(target),
                     child: None,
+                    reasoning_effort: None,
                     snapshot: None,
                 };
                 let mut contents = fs::read_to_string(&path).unwrap();
@@ -3705,6 +4015,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         fs::write(
@@ -3837,6 +4148,7 @@ mod tests {
             replacement: None,
             redirect: Some(root.path().join("scoped/abc.jsonl")),
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
 
@@ -3940,7 +4252,7 @@ mod tests {
             &workspace,
             &expected,
             &[],
-            Some(&expected[..2]),
+            (Some(&expected[..2]), None),
         )
         .unwrap();
         drop(scoped_lock);
@@ -4006,6 +4318,7 @@ mod tests {
                 replacement: Some(compacted.clone()),
                 redirect: None,
                 child: None,
+                reasoning_effort: None,
                 snapshot: None,
             },
             false,
@@ -4038,6 +4351,7 @@ mod tests {
             replacement: Some(expected.clone()),
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
@@ -4078,6 +4392,7 @@ mod tests {
             replacement: None,
             redirect: Some(normalized_absolute(&scoped).unwrap()),
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let encoded = serde_json::to_vec(&record).unwrap();
@@ -4128,6 +4443,7 @@ mod tests {
                     replacement: None,
                     redirect: None,
                     child: None,
+                    reasoning_effort: None,
                     snapshot: None,
                 },
                 false,
@@ -4171,6 +4487,58 @@ mod tests {
     }
 
     #[test]
+    fn divergent_reasoning_histories_cannot_use_scoped_tiebreak() {
+        for last in [Some(crate::ReasoningEffort::Low), None] {
+            let root = tempfile::tempdir().unwrap();
+            let opened = open(
+                root.path(),
+                "abc",
+                false,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            opened
+                .observer
+                .set_reasoning_effort(Some(crate::ReasoningEffort::High))
+                .unwrap();
+            opened.observer.set_reasoning_effort(last).unwrap();
+            drop(opened);
+            let scoped = transcript_path(root.path(), "abc");
+            let original = fs::read_to_string(&scoped).unwrap();
+            let mut records: Vec<serde_json::Value> = original
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            // Both histories revisit the other's final state, but neither is
+            // an append prefix: base -> high -> low/default versus the reverse.
+            records[1]["reasoning_effort"] =
+                json!(last.map_or("default", crate::ReasoningEffort::as_str));
+            records[2]["reasoning_effort"] = json!("high");
+            let conflicting = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            let legacy = legacy_directory(root.path()).join("abc.jsonl");
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            fs::write(&legacy, &conflicting).unwrap();
+            assert!(
+                load(root.path(), "abc")
+                    .unwrap_err()
+                    .contains("divergent session histories")
+            );
+            assert!(
+                open(root.path(), "abc", true, false, vec![])
+                    .err()
+                    .unwrap()
+                    .contains("divergent session histories")
+            );
+            assert_eq!(fs::read_to_string(&scoped).unwrap(), original);
+            assert_eq!(fs::read_to_string(&legacy).unwrap(), conflicting);
+        }
+    }
+
+    #[test]
     fn divergent_scoped_and_workspace_local_histories_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         let global = open(
@@ -4193,6 +4561,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         fs::write(
@@ -4552,6 +4921,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let mut encoded = serde_json::to_vec(&record).unwrap();
@@ -4870,6 +5240,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let original_user = Record {
@@ -4881,6 +5252,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let current = vec![
@@ -4896,6 +5268,7 @@ mod tests {
             replacement: Some(current.clone()),
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let legacy = super::transcript_path(storage.path(), id);
@@ -4981,6 +5354,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         fs::write(
@@ -5036,6 +5410,7 @@ mod tests {
                 replacement: None,
                 redirect: None,
                 child: None,
+                reasoning_effort: None,
                 snapshot: None,
             },
             Record {
@@ -5047,6 +5422,7 @@ mod tests {
                 replacement: None,
                 redirect: None,
                 child: None,
+                reasoning_effort: None,
                 snapshot: None,
             },
         ];
@@ -5097,6 +5473,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         fs::write(
@@ -5238,6 +5615,7 @@ mod tests {
             replacement: None,
             redirect: None,
             child: None,
+            reasoning_effort: None,
             snapshot: None,
         };
         let unscoped = super::transcript_path(storage.path(), "legacy-id");
@@ -5858,6 +6236,19 @@ mod tests {
         assert_eq!(opened.transcript.len(), 1);
         assert!(opened.observer.0.lock().unwrap().file.is_none());
         assert!(!transcript_path(root.path(), "ephemeral").exists());
+        opened
+            .observer
+            .set_reasoning_effort(Some(crate::ReasoningEffort::High))
+            .unwrap();
+        assert_eq!(
+            opened.observer.0.lock().unwrap().reasoning_effort,
+            Some(Some(crate::ReasoningEffort::High))
+        );
+        opened.observer.set_reasoning_effort(None).unwrap();
+        assert_eq!(
+            opened.observer.0.lock().unwrap().reasoning_effort,
+            Some(None)
+        );
         drop(opened);
         assert!(!transcript_path(root.path(), "ephemeral").exists());
         assert!(!fs::shutdown_token().is_cancelled());
@@ -5896,6 +6287,13 @@ mod tests {
                 .unwrap_err()
                 .contains("poisoned")
         );
+        assert!(
+            opened
+                .observer
+                .set_reasoning_effort(None)
+                .unwrap_err()
+                .contains("poisoned")
+        );
         assert!(opened.observer.commit_creation().is_err());
         assert!(opened.observer.prepare_creation().is_err());
         let original = fs::read(&path).unwrap();
@@ -5931,6 +6329,13 @@ mod tests {
             let prepared = opened.observer.prepare_creation().unwrap();
             let item = Item::text(ItemKind::User, "later").with_created_at(Timestamp(123));
             assert!(opened.observer.prepare_creation().is_err());
+            assert!(
+                opened
+                    .observer
+                    .set_reasoning_effort(None)
+                    .unwrap_err()
+                    .contains("awaiting publication")
+            );
             assert!(opened.observer.commit_creation().is_err());
             assert!(
                 opened

@@ -188,6 +188,7 @@ struct SessionSelection {
 /// A per-session adapter whose selection is read only when a new model turn begins.
 #[derive(Clone)]
 pub struct SelectableAdapter {
+    session_observer: Option<crate::session::SessionObserver>,
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
@@ -234,6 +235,7 @@ impl SelectableAdapter {
             return Err("model name is outside canonical bounds".into());
         }
         Ok(Self {
+            session_observer: None,
             selection: Arc::new(Mutex::new(SessionSelection {
                 model: selection,
                 reasoning_effort,
@@ -243,6 +245,19 @@ impl SelectableAdapter {
             openrouter_api_key,
             openai_model_catalog: SubscriptionModelCatalogCache::default(),
         })
+    }
+
+    /// Attach persistence before publishing any clones of this session adapter.
+    pub(crate) fn with_session_observer(
+        mut self,
+        observer: crate::session::SessionObserver,
+        persist_initial: bool,
+    ) -> Result<Self, String> {
+        if persist_initial {
+            observer.set_reasoning_effort(self.reasoning_effort()?)?;
+        }
+        self.session_observer = Some(observer);
+        Ok(self)
     }
 
     pub fn selection(&self) -> Result<ModelSelection, String> {
@@ -323,6 +338,13 @@ impl SelectableAdapter {
             .selection
             .lock()
             .map_err(|_| "session selection lock is poisoned")?;
+        // Selection -> transcript writer is the only nested lock order. Persist
+        // before publishing the new revision; a rejected write leaves selection
+        // unchanged, while unwinding isolates this selection via poison. Disk
+        // failure retains the transcript writer's best-effort semantics.
+        if let Some(observer) = &self.session_observer {
+            observer.set_reasoning_effort(reasoning_effort)?;
+        }
         current.reasoning_effort = reasoning_effort;
         current.revision = current.revision.wrapping_add(1);
         Ok(())
@@ -1709,6 +1731,40 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rejected_effort_persistence_keeps_selection_and_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            "effort-rejection",
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "test/model",
+            CredentialStorage::Memory,
+            Some(ReasoningEffort::High),
+            Some(OpenRouterApiKey::new("test-key")),
+        )
+        .unwrap()
+        .with_session_observer(opened.observer.clone(), true)
+        .unwrap();
+        let before = adapter.selection.lock().unwrap().clone();
+        let pending = opened.observer.prepare_creation().unwrap();
+        assert!(adapter.select_reasoning_effort(None).is_err());
+        assert_eq!(*adapter.selection.lock().unwrap(), before);
+        pending.commit();
+        adapter.select_reasoning_effort(None).unwrap();
+        assert_eq!(adapter.reasoning_effort().unwrap(), None);
+        drop(adapter);
+        drop(opened);
+        let restored =
+            crate::session::open(root.path(), "effort-rejection", true, false, vec![]).unwrap();
+        assert_eq!(restored.reasoning_effort, Some(None));
     }
 
     #[test]

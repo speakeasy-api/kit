@@ -228,6 +228,197 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
     );
 }
 
+mod reasoning_effort_persistence {
+    use super::*;
+    use crate::ReasoningEffort;
+    use crate::runtime::{AcpDriver, AcpDriverContext, AcpForkState, SessionClaim};
+
+    #[derive(Clone)]
+    struct Observer;
+
+    impl agentkit_loop::LoopObserver for Observer {
+        fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+    }
+
+    fn runtime(root: &std::path::Path, effort: Option<ReasoningEffort>) -> Arc<Runtime> {
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        Runtime::new_with_provider_credentials_and_effort(
+            root,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            effort,
+        )
+        .unwrap()
+    }
+
+    async fn start(
+        runtime: &Arc<Runtime>,
+        mut claim: SessionClaim,
+        forked: Option<AcpForkState>,
+    ) -> (String, AcpDriver) {
+        let id = claim.request.id.clone();
+        let driver = runtime
+            .start_acp_driver_with_mcp(
+                AcpDriverContext {
+                    cwd: runtime.root().to_path_buf(),
+                    additional_directories: vec![],
+                    integration: Arc::new(Observer),
+                    cancellation: CancellationController::new().handle(),
+                    response_attempt_replacement: false,
+                },
+                &mut claim,
+                forked,
+                runtime.mcp.clone(),
+            )
+            .await
+            .unwrap();
+        claim.commit().unwrap();
+        (id, driver)
+    }
+
+    async fn load(runtime: &Arc<Runtime>, id: &str) -> AcpDriver {
+        start(runtime, runtime.claim_session_load(id).unwrap(), None)
+            .await
+            .1
+    }
+
+    #[tokio::test]
+    async fn new_session_effort_and_updates_survive_runtime_reconstruction() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), Some(ReasoningEffort::High));
+        let (id, driver) = start(&original, original.claim_session().unwrap(), None).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        drop(driver);
+        drop(original);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Low));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        driver
+            .adapter
+            .select_reasoning_effort(Some(ReasoningEffort::Medium))
+            .unwrap();
+        drop(driver);
+        drop(restarted);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Low));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Medium)
+        );
+        driver.adapter.select_reasoning_effort(None).unwrap();
+        drop(driver);
+        drop(restarted);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::High));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(driver.adapter.reasoning_effort().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_effort_falls_back_but_new_explicit_default_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy_id = crate::session::new_id();
+        // The historical session API writes no effort setting.
+        drop(
+            crate::session::open(
+                root.path(),
+                &legacy_id,
+                false,
+                false,
+                vec![agentkit_core::Item::text(ItemKind::System, "system")],
+            )
+            .unwrap(),
+        );
+        let defaults = runtime(root.path(), None);
+        let (default_id, driver) = start(&defaults, defaults.claim_session().unwrap(), None).await;
+        drop(driver);
+        drop(defaults);
+
+        // Loading a historical session must not turn its fallback into a saved preference.
+        for effort in [ReasoningEffort::High, ReasoningEffort::Low] {
+            let restarted = runtime(root.path(), Some(effort));
+            let legacy = load(&restarted, &legacy_id).await;
+            assert_eq!(legacy.adapter.reasoning_effort().unwrap(), Some(effort));
+            let explicit_default = load(&restarted, &default_id).await;
+            assert_eq!(explicit_default.adapter.reasoning_effort().unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_effort_is_persisted_and_reset_is_session_local() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), Some(ReasoningEffort::Low));
+        let (parent_id, parent) = start(&original, original.claim_session().unwrap(), None).await;
+        parent
+            .adapter
+            .select_reasoning_effort(Some(ReasoningEffort::High))
+            .unwrap();
+        let forked = AcpForkState {
+            transcript: parent.canonical_transcript.clone(),
+            selection: parent.adapter.selection().unwrap(),
+            reasoning_effort: parent.adapter.reasoning_effort().unwrap(),
+            parent_context: None,
+        };
+        let (fork_id, fork) = start(
+            &original,
+            original.claim_session_fork().unwrap(),
+            Some(forked),
+        )
+        .await;
+        assert_eq!(
+            fork.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        let (sibling_id, sibling) = start(&original, original.claim_session().unwrap(), None).await;
+        assert_eq!(
+            sibling.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        drop(fork);
+
+        // Read the fork from disk before resetting it: inherited effort must be durable.
+        let fork = load(&original, &fork_id).await;
+        assert_eq!(
+            fork.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        fork.adapter.select_reasoning_effort(None).unwrap();
+        assert_eq!(
+            parent.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            sibling.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            original.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        drop((parent, fork, sibling, original));
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Medium));
+        for (id, expected) in [
+            (parent_id, Some(ReasoningEffort::High)),
+            (fork_id, None),
+            (sibling_id, Some(ReasoningEffort::Low)),
+        ] {
+            let driver = load(&restarted, &id).await;
+            assert_eq!(driver.adapter.reasoning_effort().unwrap(), expected);
+        }
+    }
+}
+
 #[test]
 fn openrouter_keys_disable_openrouter_authentication_and_global_logout() {
     for (explicit_key, ambient_key) in [(true, false), (false, true)] {
