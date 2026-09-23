@@ -80,9 +80,18 @@ Subscription sessions try WebSocket transport first and reuse the connection acr
 turns. If the WebSocket handshake returns HTTP 426 (Upgrade Required), that session
 switches to HTTP/SSE for the current and subsequent turns. Other handshake failures
 do not trigger this fallback; they follow the provider's retry or error handling.
-Each turn sends the full transcript supplied by Kit, including continuation data,
-rather than relying on `previous_response_id`. This transport choice is automatic
-and does not change other providers or require a configuration setting.
+Kit supplies the full authoritative transcript on each turn, including continuation
+data. On a reused connection, the provider can send `previous_response_id` and only
+the new input when the transcript and request settings match the last successful
+response. A new connection, changed history, or changed settings uses the full
+transcript instead. Cancellation or an abandoned turn discards the connection.
+
+If the server explicitly reports that the exact referenced previous response is
+missing, before accepting the request or producing observable output, the provider
+can recover with a full-transcript request on a fresh connection. This narrow,
+correlated rejection does not permit replay after an ambiguous send or receive
+failure. This transport choice is automatic and does not change other providers
+or require a configuration setting.
 
 Use `kit auth status openai` to check the credential.
 

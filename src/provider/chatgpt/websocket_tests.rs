@@ -56,9 +56,17 @@ fn accept(listener: &TcpListener) -> TcpStream {
 async fn session(endpoint: &str) -> OpenAiSubscriptionSession {
     // Exercise Kit's real transport selection and request policy; override only
     // the destination, dummy authentication, and bounded test timeouts.
+    let authentication = Authentication::bearer("loopback-only");
+    let authentication_binding = authentication
+        .authenticate(None)
+        .await
+        .unwrap()
+        .binding()
+        .unwrap()
+        .to_owned();
     let config = subscription_responses_config(
         "gpt-5.4".into(),
-        Authentication::bearer("loopback-only"),
+        authentication,
         ResilienceConfig {
             max_retries: 0,
             retry_budget: WAIT,
@@ -77,7 +85,7 @@ async fn session(endpoint: &str) -> OpenAiSubscriptionSession {
             .await
             .unwrap(),
         context_window: Some(200_000),
-        authentication_binding: "loopback-only".into(),
+        authentication_binding,
     }
 }
 
@@ -98,7 +106,11 @@ fn request(second: bool) -> TurnRequest {
 }
 
 async fn begin(session: &mut OpenAiSubscriptionSession, second: bool) -> KitTurn {
-    let turn = tokio::time::timeout(WAIT, session.begin_turn(request(second), None))
+    begin_request(session, request(second)).await
+}
+
+async fn begin_request(session: &mut OpenAiSubscriptionSession, request: TurnRequest) -> KitTurn {
+    let turn = tokio::time::timeout(WAIT, session.begin_turn(request, None))
         .await
         .expect("begin turn hung")
         .unwrap();
@@ -106,16 +118,22 @@ async fn begin(session: &mut OpenAiSubscriptionSession, second: bool) -> KitTurn
 }
 
 fn receive(socket: &mut Socket, second: bool) {
+    let wire = receive_wire(socket);
+    assert!(wire.get("previous_response_id").is_none());
+    assert_transcript(&wire, second);
+}
+
+fn receive_wire(socket: &mut Socket) -> Value {
     let message = socket.read().unwrap();
     let wire: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
     assert_eq!(wire["type"], "response.create");
     assert_eq!(wire["model"], "gpt-5.4");
     assert_eq!(wire["store"], false);
     assert_eq!(wire["reasoning"]["effort"], "high");
-    for field in ["previous_response_id", "stream", "background"] {
+    for field in ["stream", "background"] {
         assert!(wire.get(field).is_none(), "unexpected WS field: {field}");
     }
-    assert_transcript(&wire, second);
+    wire
 }
 
 fn assert_transcript(wire: &Value, second: bool) {
@@ -140,8 +158,91 @@ fn response(id: &str, text: &str) -> Vec<Value> {
         json!({"type":"response.output_text.done","item_id":"msg","output_index":0,"content_index":0,"text":text}),
         json!({"type":"response.content_part.done","item_id":"msg","output_index":0,"content_index":0,"part":{"type":"output_text","text":text}}),
         json!({"type":"response.output_item.done","output_index":0,"item":{"id":"msg","type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}),
-        json!({"type":"response.completed","response":{"id":id,"model":"gpt-5.4","usage":{"input_tokens":3,"output_tokens":5}}}),
+        json!({"type":"response.completed","response":{"id":id,"model":"gpt-5.4","output":[],"usage":{"input_tokens":3,"output_tokens":5}}}),
     ]
+}
+
+// Streamed done items are authoritative even when the completion envelope has
+// an empty output array, as in the released provider's real WebSocket fixtures.
+fn tool_success(socket: &mut Socket, id: &str) {
+    let mut events = response(id, "first answer");
+    let terminal = events.pop().unwrap();
+    events.extend([
+        json!({"type":"response.output_item.added","output_index":1,"item":{"id":"reason-1","type":"reasoning"}}),
+        json!({"type":"response.reasoning_summary_part.added","item_id":"reason-1","output_index":1,"summary_index":0,"part":{"type":"summary_text"}}),
+        json!({"type":"response.reasoning_summary_text.delta","item_id":"reason-1","output_index":1,"summary_index":0,"delta":"brief"}),
+        json!({"type":"response.reasoning_summary_text.done","item_id":"reason-1","output_index":1,"summary_index":0,"text":"brief"}),
+        json!({"type":"response.reasoning_summary_part.done","item_id":"reason-1","output_index":1,"summary_index":0,"part":{"type":"summary_text","text":"brief"}}),
+        json!({"type":"response.output_item.done","output_index":1,"item":{"id":"reason-1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"brief"}],"encrypted_content":"opaque"}}),
+        json!({"type":"response.output_item.added","output_index":2,"item":{"id":"call-item","type":"function_call"}}),
+        json!({"type":"response.function_call_arguments.delta","item_id":"call-item","output_index":2,"delta":"{ \"q\" : 1 }"}),
+        json!({"type":"response.function_call_arguments.done","item_id":"call-item","output_index":2,"arguments":"{ \"q\" : 1 }"}),
+        json!({"type":"response.output_item.done","output_index":2,"item":{"id":"call-item","type":"function_call","status":"completed","call_id":"call-1","name":"lookup","arguments":"{ \"q\" : 1 }"}}),
+        terminal,
+    ]);
+    for event in events {
+        socket
+            .send(Message::Text(event.to_string().into()))
+            .unwrap();
+    }
+}
+
+fn append_tool_result(request: &mut TurnRequest) {
+    request.transcript.push(Item::new(
+        ItemKind::Tool,
+        vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+            "call-1",
+            ToolOutput::text("found"),
+        ))],
+    ));
+}
+
+fn assert_continuations(items: &[Item], binding: &str) {
+    let parts = items
+        .iter()
+        .flat_map(|item| &item.parts)
+        .collect::<Vec<_>>();
+    let reasoning = parts
+        .iter()
+        .find_map(|part| match part {
+            Part::Reasoning(reasoning) => Some(reasoning),
+            _ => None,
+        })
+        .expect("Finished must retain reasoning");
+    assert_eq!(reasoning.summary.as_deref(), Some("brief"));
+    assert_eq!(
+        reasoning.metadata[CONTINUATION_METADATA],
+        json!({
+            "schema_version": 3,
+            "authentication_binding": binding,
+            "model": "gpt-5.4",
+            "session_id": "session",
+            "item_id": "reason-1",
+            "kind": "reasoning",
+            "encrypted_content": "opaque",
+        })
+    );
+    let call = parts
+        .iter()
+        .find_map(|part| match part {
+            Part::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .expect("Finished must retain tool call");
+    assert_eq!(call.id.0, "call-1");
+    assert_eq!(call.name, "lookup");
+    assert_eq!(call.input, json!({"q": 1}));
+    assert_eq!(
+        call.metadata[CONTINUATION_METADATA],
+        json!({
+            "schema_version": 3,
+            "authentication_binding": binding,
+            "model": "gpt-5.4",
+            "session_id": "session",
+            "item_id": "call-item",
+            "kind": "function_call",
+        })
+    );
 }
 
 fn success(socket: &mut Socket, id: &str, text: &str) {
@@ -152,15 +253,28 @@ fn success(socket: &mut Socket, id: &str, text: &str) {
     }
 }
 
-async fn finished(turn: &mut KitTurn, id: &str, text: &str) {
+async fn finished(turn: &mut KitTurn, id: &str, text: &str) -> Vec<Item> {
     tokio::time::timeout(WAIT, async {
         let mut finishes = 0;
+        let mut items = Vec::new();
         let mut output = String::new();
+        let mut text_parts = HashSet::new();
         while let Some(event) = turn.next_event(None).await.unwrap() {
             match event {
-                ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) => output.push_str(&chunk),
+                ModelTurnEvent::Delta(Delta::BeginPart {
+                    part_id,
+                    kind: agentkit_core::PartKind::Text,
+                }) => {
+                    text_parts.insert(part_id);
+                }
+                ModelTurnEvent::Delta(Delta::AppendText { part_id, chunk })
+                    if text_parts.contains(&part_id) =>
+                {
+                    output.push_str(&chunk)
+                }
                 ModelTurnEvent::Finished(result) => {
                     finishes += 1;
+                    items = result.output_items;
                     assert_eq!(result.response_id.as_deref(), Some(id));
                 }
                 _ => {}
@@ -168,14 +282,15 @@ async fn finished(turn: &mut KitTurn, id: &str, text: &str) {
         }
         assert_eq!(finishes, 1);
         assert_eq!(output, text);
+        items
     })
     .await
-    .expect("turn hung");
+    .expect("turn hung")
 }
 
 #[tokio::test]
 #[allow(clippy::result_large_err)] // tungstenite's handshake callback error type.
-async fn subscription_auto_uses_websocket_and_sends_full_transcript_on_reuse() {
+async fn subscription_auto_reuses_websocket_with_authoritative_finished_output_and_suffix() {
     let (endpoint, peer) = server(|listener| {
         let mut socket = tungstenite::accept_hdr(
             accept(&listener),
@@ -192,16 +307,47 @@ async fn subscription_auto_uses_websocket_and_sends_full_transcript_on_reuse() {
         )
         .unwrap();
         receive(&mut socket, false);
-        success(&mut socket, "first", "first answer");
-        receive(&mut socket, true);
-        success(&mut socket, "second", "second answer");
+        tool_success(&mut socket, "first");
+        let wire = receive_wire(&mut socket);
+        assert_eq!(wire["previous_response_id"], "first");
+        assert_eq!(
+            wire["input"],
+            json!([
+                {"type":"function_call_output","call_id":"call-1","output":"found"}
+            ])
+        );
+        tool_success(&mut socket, "second");
+        let wire = receive_wire(&mut socket);
+        assert_eq!(wire["previous_response_id"], "second");
+        assert_eq!(
+            wire["input"],
+            json!([
+                {"type":"function_call_output","call_id":"call-1","output":"found"},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"second question"}]}
+            ])
+        );
+        success(&mut socket, "third", "second answer");
     });
     let mut session = session(&endpoint).await;
-    let mut first = begin(&mut session, false).await;
-    finished(&mut first, "first", "first answer").await;
+    let mut request = request(false);
+    let mut first = begin_request(&mut session, request.clone()).await;
+    let output = finished(&mut first, "first", "first answer").await;
+    assert_continuations(&output, &session.authentication_binding);
+    // Retain the real Finished items, not synthetic assistant text or deltas.
+    request.transcript.extend(output);
+    append_tool_result(&mut request);
     // Keep the completed wrapper alive while the next turn claims the socket.
-    let mut second = begin(&mut session, true).await;
-    finished(&mut second, "second", "second answer").await;
+    let mut second = begin_request(&mut session, request.clone()).await;
+    let output = finished(&mut second, "second", "first answer").await;
+    assert_continuations(&output, &session.authentication_binding);
+    request.transcript.extend(output);
+    append_tool_result(&mut request);
+    request.turn_id = TurnId::new("next-user-turn");
+    request
+        .transcript
+        .push(Item::text(ItemKind::User, "second question"));
+    let mut third = begin_request(&mut session, request).await;
+    finished(&mut third, "third", "second answer").await;
     peer.join().unwrap();
 }
 
