@@ -8,6 +8,7 @@
 
 mod app;
 mod attachment;
+mod background;
 mod command;
 mod editor;
 mod hyperlinks;
@@ -1861,7 +1862,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // TerminalSession guard restores modes, just like ordinary return.
             let result: Result<(), agent_client_protocol::Error> = async {
                 enum SessionEvent {
-                    Usage(Result<Result<String, String>, tokio::task::JoinError>),
+                    Usage(Result<Result<String, String>, tokio::sync::oneshot::error::RecvError>),
 
                     Voice(crate::voice::VoiceEvent),
                     StorageShutdown,
@@ -1883,7 +1884,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
                 let mut child_read: Option<ChildTranscriptRead> = None;
-                let mut usage: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
+                let mut usage: Option<tokio::sync::oneshot::Receiver<Result<String, String>>> = None;
                 let mut priority = scheduler::Priority::default();
                 let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
@@ -2094,10 +2095,15 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     } else {
                                         let storage = credential_storage.clone();
                                         let key = openrouter_api_key.cloned();
-                                        usage = Some(tokio::task::spawn_blocking(move || {
+                                        match background::spawn(move || {
                                             crate::provider::usage::fetch_usage(provider.as_deref(), &storage, key.as_ref())
-                                        }));
-                                        app.note("checking provider usage…");
+                                        }) {
+                                            Ok(receiver) => {
+                                                usage = Some(receiver);
+                                                app.note("checking provider usage…");
+                                            }
+                                            Err(error) => app.note(format!("usage: could not start check: {error}")),
+                                        }
                                     }
                                 }
                                 Action::Voice(control) => voice.control(&control, credential_storage, &mut app),

@@ -276,3 +276,9 @@ The empty starter screen adds a decorative Speakeasy rainbow line beneath the Ki
 The TUI runs a `kit serve` child with ACP v2 selected explicitly for its stdio connection; ordinary `kit serve` invocations continue to default to ACP v1 on stdio. If that child exits before opening the session—for example because the root is missing, credentials are unavailable, or an A2A address is already taken—the TUI reports the child's last diagnostics. A silent or wedged child eventually reports `the agent did not answer the ACP handshake within 30 seconds`. Fix that diagnostic and restart with the same `--resume` ID when a transcript was created.
 
 If an external hard kill leaves the shell in raw mode or mouse reporting appears as text, run `reset` (or reopen the terminal) before resuming. Prefer `Esc`, `Ctrl+C`, `Ctrl+D`, `SIGTERM`, or `SIGHUP` for normal shutdown so Kit can restore terminal modes, cancel active work, close the session, and clean up only locks proven stale.
+
+## Provider usage
+
+Use `/usage [provider]` to check account quotas or key spend without sending a
+model prompt. See [Provider usage](provider-usage.md) for supported providers,
+credentials, and the meaning of the reported limits.

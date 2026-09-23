@@ -421,6 +421,7 @@ mod tests {
                 "docs/user/mcp.md",
                 "docs/user/migrating-from-claude-code-and-codex.md",
                 "docs/user/native-voice.md",
+                "docs/user/provider-usage.md",
                 "docs/user/reporting-kit-issues.md",
                 "docs/user/security-limits-and-troubleshooting.md",
                 "docs/user/subagents-and-acp-harnesses.md",

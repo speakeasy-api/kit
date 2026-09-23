@@ -529,19 +529,20 @@ mod credential_tests {
 
     #[test]
     fn effective_key_prefers_explicit_then_environment_and_skips_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
         let explicit = OpenRouterApiKey::new("explicit-test");
         let env = |_: &str| Ok("environment-test".to_string());
-        let (key, _) =
-            adapter::resolve_openrouter_key(&CredentialStorage::Memory, Some(&explicit), env)
-                .unwrap()
-                .unwrap();
+        let (key, _) = adapter::resolve_openrouter_key(&storage, Some(&explicit), env)
+            .unwrap()
+            .unwrap();
         assert_eq!(key, "explicit-test");
-        let (key, _) = adapter::resolve_openrouter_key(&CredentialStorage::Memory, None, env)
+        let (key, _) = adapter::resolve_openrouter_key(&storage, None, env)
             .unwrap()
             .unwrap();
         assert_eq!(key, "environment-test");
         assert!(
-            adapter::resolve_openrouter_key(&CredentialStorage::Memory, None, |_| Err(
+            adapter::resolve_openrouter_key(&storage, None, |_| Err(
                 std::env::VarError::NotPresent
             ))
             .unwrap()

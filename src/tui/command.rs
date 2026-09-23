@@ -52,11 +52,6 @@ impl From<&str> for Command {
 // interpreted by the client itself.
 const LOCAL_COMMANDS: &[Spec] = &[
     Spec {
-        token: "/usage",
-        description: "Show provider usage and quota",
-        kind: Kind::Usage,
-    },
-    Spec {
         token: "/voice",
         description: "Voice: on connects/listens (billable subscription); mute pauses; off ends (headphones)",
         kind: Kind::Voice,
@@ -100,6 +95,11 @@ const LOCAL_COMMANDS: &[Spec] = &[
         token: "/login",
         description: "Authenticate with the agent",
         kind: Kind::Login,
+    },
+    Spec {
+        token: "/usage",
+        description: "Show provider usage and quota",
+        kind: Kind::Usage,
     },
 ];
 
@@ -427,6 +427,7 @@ mod tests {
                 "/model",
                 "/effort",
                 "/agents",
+                "/usage",
                 "/compact",
             ]
         );

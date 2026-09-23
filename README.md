@@ -398,6 +398,7 @@ Kit used the fewest tokens, took the least active time, and needed the least ste
 - [MCP](docs/user/mcp.md)
 - [Agent Plugins](docs/user/agent-plugins.md)
 - [TUI and sessions](docs/user/tui-and-sessions.md)
+- [Provider usage](docs/user/provider-usage.md)
 - [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md)
 - [Releasing](docs/releasing.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
