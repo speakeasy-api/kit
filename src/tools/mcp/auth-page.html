@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>{title} — Kit</title>
+<style>
+* { box-sizing: border-box; }
+:root { color-scheme: dark; background: #101010; color: #fafafa; }
+body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+main { min-height: 100svh; display: grid; place-items: center; padding: 64px 28px; }
+section { width: min(100%, 560px); }
+.badge { display: inline-flex; align-items: center; gap: 10px; color: #fafafa; font-size: 11px; font-weight: 500; text-transform: uppercase; letter-spacing: .075em; }
+.badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #d2dc91; box-shadow: 0 0 0 4px rgb(210 220 145 / 10%); }
+h1 { margin: 26px 0 10px; font-size: 26px; font-weight: 300; line-height: 1.2; letter-spacing: -.0125em; text-wrap: balance; }
+.message { margin: 0; color: #d3d3d3; font-size: 14px; line-height: 1.6; text-wrap: pretty; }
+.error-detail { margin: 26px 0 32px; padding: 10px 14px; border-left: 3px solid #c83228; background: #1b1816; color: #d3d3d3; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.rainbow { position: fixed; bottom: 0; left: 0; width: 100%; height: 5px; background: linear-gradient(90deg, #320f1e 0%, #c83228 12.5%, #fb873f 25%, #d2dc91 37.5%, #5a8250 50%, #002314 62%, #00143c 74%, #2873d7 86%, #9bc3ff 100%); }
+.failed .badge::before { background: #c83228; box-shadow: 0 0 0 4px rgb(200 50 40 / 15%); }
+</style>
+</head>
+<body class="{state}">
+<main>
+<section aria-labelledby="heading">
+<span class="badge">{badge}</span>
+{detail}
+<h1 id="heading">{heading}</h1>
+<p class="message">{message}</p>
+</section>
+</main>
+<div class="rainbow" aria-hidden="true"></div>
+</body>
+</html>
