@@ -4,6 +4,7 @@ pub(crate) mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
 pub(crate) mod typesafe_auth;
+pub mod usage;
 
 #[doc(hidden)]
 pub use typesafe_auth::{TypeSafeAuthCommand, execute_typesafe_auth};

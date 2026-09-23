@@ -570,6 +570,12 @@ fn render_status(
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
 }
 
+pub(super) fn has_credentials(storage: &CredentialStorage) -> Result<bool, AuthError> {
+    BackendCredentialStore::new(storage)
+        .load()
+        .map(|record| record.is_some())
+}
+
 pub(crate) fn access_token(
     storage: &CredentialStorage,
     deadline: Instant,

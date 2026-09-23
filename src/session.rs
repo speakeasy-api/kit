@@ -1820,7 +1820,7 @@ fn truncate_catalog_text(text: &str, limit: usize) -> String {
     value
 }
 
-fn timestamp_rfc3339(milliseconds: u64) -> String {
+pub(crate) fn timestamp_rfc3339(milliseconds: u64) -> String {
     let milliseconds = milliseconds.min(MAX_RFC3339_MILLIS);
     let seconds = milliseconds / 1_000;
     let millis = milliseconds % 1_000;

@@ -406,3 +406,8 @@ new and resumed sessions; their local TOML cannot override it.
 ask named classification, scoring, and yes/no questions with TypeSafe. A TypeSafe
 key is also required. Each call shares its supplied content with TypeSafe and
 uses your quota. See [Evaluations](evaluations.md) for setup, examples, and limits.
+
+## Provider usage
+
+See [Provider usage](provider-usage.md) for account quotas, key spend, and the
+`kit usage` and `/usage` commands.
