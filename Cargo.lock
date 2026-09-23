@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
