@@ -1374,10 +1374,21 @@ impl Runtime {
                     error,
                 )
             })?;
+            let selection = self.adapter.selection()?;
+            let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+                selection.provider,
+                selection.model,
+                self.credential_storage.clone(),
+                opened
+                    .reasoning_effort
+                    .unwrap_or(self.adapter.reasoning_effort()?),
+                self.openrouter_api_key.clone(),
+            )?
+            .with_session_observer(opened.observer.clone(), !request.resume)?;
             let pending_creation = (!request.resume).then(|| opened.observer.clone());
             let skills = self.fresh_skills();
             let compactor = crate::compaction::automatic(
-                self.adapter.clone(),
+                adapter.clone(),
                 self.agentkit_telemetry(),
                 Some(opened.observer.clone()),
                 format!("compaction-{}", crate::session::new_id()),
@@ -1404,7 +1415,7 @@ impl Runtime {
                 })?;
             let agent = Agent::builder()
                 .cancellation(controller.handle())
-                .model(self.adapter.clone())
+                .model(adapter.clone())
                 .telemetry(self.agentkit_telemetry())
                 .add_tool_source(self.compose_with_jobs(
                     0,
@@ -1694,7 +1705,7 @@ impl Runtime {
         let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
             (
                 ModelSelection::new(self.provider, self.model.clone()),
-                self.reasoning_effort,
+                opened.reasoning_effort.unwrap_or(self.reasoning_effort),
             )
         });
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
@@ -1704,6 +1715,9 @@ impl Runtime {
             reasoning_effort,
             self.openrouter_api_key.clone(),
         )
+        .and_then(|adapter| {
+            adapter.with_session_observer(opened.observer.clone(), is_fork || !request.resume)
+        })
         .map_err(AcpRuntimeError::Loop)?;
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
