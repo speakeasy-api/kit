@@ -59,16 +59,13 @@ OpenAI and MCP use one selected credential backend. The default is process-local
 `memory`, but standalone OpenAI login rejects it; select persistent `keychain` or
 `file` storage, including `--credential-dir` when selecting `file`.
 
-Kit refreshes credentials within five minutes of expiry. Refreshes are synchronized
-across threads and processes, preserve the authenticated account and credential
-generation, and are forced once after a 401 response. OpenAI subscription turns can
-retry up to 25 times within a 10-minute budget with deterministic full-jitter
-exponential backoff capped at 30 seconds. Retries cover selected transient HTTP
-statuses, request transport failures, explicit transient provider events, and stream
-failures before the first model event. Kit reuses the request body, idempotency key,
-and available turn state. Authentication, invalid requests, quota/billing failures,
-unsupported responses, and failures after observable model output remain terminal.
+Kit refreshes your credentials automatically. Subscription connections are managed
+automatically and require no additional configuration. Kit retries temporary failures
+when it is safe to do so; if a request fails, it reports the error rather than risk
+silently repeating an accepted request.
+
 Use `kit auth status openai` to check the credential.
+
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
 skips revocation and prints a warning.

@@ -44,7 +44,7 @@ agentkit-loop = { version = "=0.10.12", features = ["otel"] }
 agentkit-mcp = "=0.10.7"
 agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
-agentkit-provider-openai = "=0.10.9"
+agentkit-provider-openai = "=0.10.12"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
 agentkit-tool-compose = { version = "=0.10.11", default-features = false, features = ["runlet"] }
@@ -125,6 +125,7 @@ jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
+agentkit-provider-openai = { git = "https://git@github.com/danielkov/agentkit.git", rev = "04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58" }
 agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
@@ -135,6 +136,15 @@ agentkit-capabilities = "=0.10.5"
 agentkit-core = "=0.10.5"
 agentkit-task-manager = "=0.10.7"
 agentkit-tools-core = "=0.10.5"
+
+# Keep the provider fix on a distinct public HTTPS source so its workspace
+# dependencies reuse the existing registry packages and reviewed loop pin.
+# The git username distinguishes Cargo source IDs; anonymous fetch still works.
+[patch."https://git@github.com/danielkov/agentkit.git"]
+agentkit-adapter-completions = "=0.10.9"
+agentkit-core = "=0.10.5"
+agentkit-http = "=0.10.7"
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 
 # Deny also in test builds; only test-only scopes may relax ergonomics. Crate
 # roots additionally forbid these in production so local allows cannot evade it.
