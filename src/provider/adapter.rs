@@ -674,19 +674,18 @@ impl KitAdapter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedOpenRouterApiKeySource {
+pub(super) enum ResolvedOpenRouterApiKeySource {
     Explicit,
     Environment,
     Stored,
 }
 
-fn openrouter_config_from_env(
-    model: String,
+pub(super) fn resolve_openrouter_key(
     credential_storage: &crate::credentials::CredentialStorage,
     explicit_api_key: Option<&OpenRouterApiKey>,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<OpenRouterConfig, String> {
-    let (api_key, key_source) = match explicit_api_key {
+) -> Result<Option<(String, ResolvedOpenRouterApiKeySource)>, String> {
+    let resolved = match explicit_api_key {
         Some(api_key) if api_key.as_str().is_empty() => {
             return Err("--openrouter-api-key cannot be empty".into());
         }
@@ -699,13 +698,25 @@ fn openrouter_config_from_env(
                 (api_key, ResolvedOpenRouterApiKeySource::Environment)
             }
             _ => (
-                super::openrouter_auth::load(credential_storage)?
-                    .map(|record| record.api_key.clone())
-                    .ok_or_else(|| OPENROUTER_AUTH_REQUIRED.to_string())?,
+                match super::openrouter_auth::load(credential_storage)? {
+                    Some(record) => record.api_key.clone(),
+                    None => return Ok(None),
+                },
                 ResolvedOpenRouterApiKeySource::Stored,
             ),
         },
     };
+    Ok(Some(resolved))
+}
+
+fn openrouter_config_from_env(
+    model: String,
+    credential_storage: &crate::credentials::CredentialStorage,
+    explicit_api_key: Option<&OpenRouterApiKey>,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<OpenRouterConfig, String> {
+    let (api_key, key_source) = resolve_openrouter_key(credential_storage, explicit_api_key, &env)?
+        .ok_or_else(|| OPENROUTER_AUTH_REQUIRED.to_string())?;
     let env_model = env("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into());
     let mut config = OpenRouterConfig::new(api_key, env_model);
     if let Ok(app_name) = env("OPENROUTER_APP_NAME") {

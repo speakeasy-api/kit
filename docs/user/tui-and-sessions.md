@@ -166,7 +166,7 @@ When the agent roster is visible, terminals at least 108 columns wide show the t
 
 ## Manage sessions and compact from the TUI
 
-The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, and `/agents` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
+The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, `/usage`, and `/agents` as exact local slash-command tokens. It also discovers agent commands through ACP and highlights them without interpreting them locally:
 
 ```text
 /new
@@ -179,10 +179,14 @@ The TUI handles `/new`, `/resume`, `/sessions`, `/close`, `/model`, `/effort`, a
 /model
 /effort
 /effort high
+/usage
+/usage openrouter
 /agents
 ```
 
-These local commands are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
+`/usage [provider]` displays provider usage and quota as local informational output, using the credential storage and OpenRouter key resolved when this TUI launched. It does not send a model prompt or query a remote agent’s credentials. The check runs in the background, so input and model updates remain responsive. It is available while idle or during a turn; repeated requests are ignored while a check is in progress. Omit the provider to check authenticated supported providers. See [provider usage](getting-started-and-configuration.md#provider-usage).
+
+The other commands listed above are available only while the session is idle. `/agents` toggles the agent roster without starting a model turn. `/new` closes the current session and starts a fresh persisted session. It clears the visible transcript but does not delete or alter the previous session, which remains resumable by its ID. Text following `/new` becomes the new session's first prompt. `/resume <session-id>` closes the current session, resumes the requested durable session, and replays its transcript; selecting the already-active ID is a no-op. `/sessions` opens a visible newest-first selector for the same workspace. Up and Down move, Enter uses the existing resume flow, `R` opens an inline rename field, and Esc cancels renaming or closes the dialog. Submit an empty rename and confirm to clear the custom name. After a save, the picker remains open on the selected session and refreshes its displayed name. `/close` closes the current session and exits the TUI.
 
 `/model` opens the model selector. `/effort` opens the advertised ACP reasoning-effort selector; `/effort default|low|medium|high` selects directly. In either dialog, Tab toggles saving the selection to `~/.kit/config.toml`, Enter selects, and Esc closes. Saving `default` removes top-level `reasoning_effort`; other values update it without replacing unrelated TOML. New sessions start from the resolved CLI/TOML default. Durable sessions remember their reasoning-effort selection, including an explicit provider `default`, and restore it on load or resume even if the process default has changed. Older transcripts without a recorded effort continue to use the process default. Forks inherit the source session’s current effort. Saving to TOML changes the default for future sessions; it is not required to retain the effort of the current session. Model selection still starts from the resolved CLI/TOML default on reload. Reasoning-effort records require a Kit version that understands transcript schema 6; older versions reject these records rather than silently discard the saved selection.
 

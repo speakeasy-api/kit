@@ -438,6 +438,7 @@ pub enum Action {
     },
     OpenUserImage(UserImage),
     Voice(String),
+    Usage(Option<String>),
     None,
     Redraw,
     ReadClipboard(ClipboardRoute, ClipboardMode),
@@ -4315,6 +4316,14 @@ impl App {
                     };
                 }
 
+                if let Parsed::Usage { provider } =
+                    parse(self.editor.text(), !self.auth_methods.is_empty())
+                {
+                    let provider = provider.map(str::to_owned);
+                    self.editor.submit();
+                    self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+                    return Action::Usage(provider);
+                }
                 if let Parsed::Voice { control } =
                     parse(self.editor.text(), !self.auth_methods.is_empty())
                 {
@@ -4356,6 +4365,7 @@ impl App {
                 // the empty composer that replaces it (including commands).
                 self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
                 return match parse(&input, !self.auth_methods.is_empty()) {
+                    Parsed::Usage { provider } => Action::Usage(provider.map(str::to_owned)),
                     Parsed::Voice { control } => Action::Voice(control.unwrap_or("").to_owned()),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Resume {
@@ -7315,6 +7325,32 @@ mod tests {
             Action::None
         ));
         assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn usage_remains_local_while_idle_or_working() {
+        for provider in [None, Some("openrouter"), Some("unknown provider")] {
+            for phase in [
+                Phase::Idle,
+                Phase::Working,
+                Phase::Blocked,
+                Phase::Cancelling,
+            ] {
+                let mut app = app();
+                let expected_phase = std::mem::discriminant(&phase);
+                app.phase = phase;
+                app.paste(&provider.map_or_else(
+                    || "/usage".to_owned(),
+                    |provider| format!("/usage {provider}"),
+                ));
+                app.last_key = None;
+                assert!(
+                    matches!(app.handle_key(press(KeyCode::Enter)), Action::Usage(value) if value.as_deref() == provider)
+                );
+                assert!(app.editor.is_empty());
+                assert_eq!(std::mem::discriminant(&app.phase), expected_phase);
+            }
+        }
     }
 
     #[test]

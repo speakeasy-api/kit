@@ -7,6 +7,7 @@ use std::ops::Range;
 
 #[derive(Clone, Copy)]
 enum Kind {
+    Usage,
     New,
     Resume,
     Sessions,
@@ -50,6 +51,11 @@ impl From<&str> for Command {
 // Agent-advertised commands remain ordinary prompts. Only these commands are
 // interpreted by the client itself.
 const LOCAL_COMMANDS: &[Spec] = &[
+    Spec {
+        token: "/usage",
+        description: "Show provider usage and quota",
+        kind: Kind::Usage,
+    },
     Spec {
         token: "/voice",
         description: "Voice: on connects/listens (billable subscription); mute pauses; off ends (headphones)",
@@ -99,6 +105,7 @@ const LOCAL_COMMANDS: &[Spec] = &[
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed<'a> {
+    Usage { provider: Option<&'a str> },
     New { prompt: Option<&'a str> },
     Resume { session_id: Option<&'a str> },
     Sessions,
@@ -136,6 +143,9 @@ pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
     let remainder = input[token_end..].trim_start();
     let prompt = (!remainder.is_empty()).then_some(remainder);
     match spec.kind {
+        Kind::Usage => Parsed::Usage {
+            provider: prompt.map(str::trim),
+        },
         Kind::Voice => Parsed::Voice {
             control: prompt.map(str::trim),
         },
@@ -260,6 +270,19 @@ mod tests {
         );
         // Still reserve the local command so it cannot become an agent prompt.
         assert!(matches!(parse("/voice on"), Parsed::Voice { .. }));
+    }
+
+    #[test]
+    fn usage_is_local_and_requires_an_exact_token() {
+        assert_eq!(parse("/usage"), Parsed::Usage { provider: None });
+        assert_eq!(
+            parse("/usage  openrouter  "),
+            Parsed::Usage {
+                provider: Some("openrouter")
+            }
+        );
+        assert_eq!(parse("/usages"), Parsed::Prompt("/usages"));
+        assert_eq!(completions("/usa", 4, &[])[0].name, "/usage");
     }
 
     #[test]

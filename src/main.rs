@@ -730,6 +730,15 @@ impl Command {
                 .subcommand_required(true)
                 .arg_required_else_help(true),
         ));
+        let command = command.subcommand(CredentialArgs::augment_command(
+            clap::Command::new("usage")
+                .about("Show provider usage and quota without starting a model prompt")
+                .arg(
+                    clap::Arg::new("provider")
+                        .value_name("PROVIDER")
+                        .value_parser(["openai", "openai-subscription", "openrouter"]),
+                ),
+        ));
         let command = command.subcommand({
             let command = clap::Command::new("auth")
                 .about("Manage provider authentication without starting a runtime");
@@ -1127,6 +1136,10 @@ impl Command {
             }),
             "config" => Ok(Self::Config {
                 action: ConfigAction::from_matches(matches)?,
+            }),
+            "usage" => Ok(Self::Usage {
+                provider: matches.get_one::<String>("provider").cloned(),
+                credentials: CredentialArgs::from_matches(matches)?,
             }),
             "auth" => Ok(Self::Auth {
                 action: AuthAction::from_matches(matches)?,
@@ -1612,6 +1625,10 @@ enum SessionsAction {
 }
 
 enum Command {
+    Usage {
+        provider: Option<String>,
+        credentials: CredentialArgs,
+    },
     Update {
         dry_run: bool,
     },
@@ -2148,6 +2165,23 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Usage {
+            provider,
+            credentials,
+        } => {
+            let (config, _settings, _telemetry, openrouter_api_key) = initialize.await?;
+            let storage = credentials.storage(&config)?;
+            let output = tokio::task::spawn_blocking(move || {
+                kit::provider::usage::fetch_usage(
+                    provider.as_deref(),
+                    &storage,
+                    openrouter_api_key.as_ref().map(|(key, _)| key),
+                )
+            })
+            .await?
+            .map_err(io::Error::other)?;
+            println!("{output}");
+        }
         Command::Auth {
             action,
             credentials,
@@ -2522,6 +2556,42 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn usage_command_accepts_optional_provider_and_credential_overrides() {
+        for provider in [
+            None,
+            Some("openai"),
+            Some("openrouter"),
+            Some("openai-subscription"),
+        ] {
+            let mut args = vec!["kit", "usage"];
+            if let Some(provider) = provider {
+                args.push(provider);
+            }
+            args.extend([
+                "--credential-store",
+                "file",
+                "--credential-dir",
+                "/tmp/usage-credentials",
+            ]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Usage {
+                provider: parsed,
+                credentials,
+            } = cli.command
+            else {
+                panic!("expected usage command");
+            };
+            assert_eq!(parsed.as_deref(), provider);
+            assert!(matches!(
+                credentials.storage(&Config::default()).unwrap(),
+                CredentialStorage::Filesystem(path) if path == std::path::Path::new("/tmp/usage-credentials")
+            ));
+        }
+        assert!(Cli::try_parse_from(["kit", "usage", "openai", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "usage", "typesafe"]).is_err());
+    }
 
     #[cfg(feature = "tui")]
     #[test]

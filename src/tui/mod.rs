@@ -1861,6 +1861,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // TerminalSession guard restores modes, just like ordinary return.
             let result: Result<(), agent_client_protocol::Error> = async {
                 enum SessionEvent {
+                    Usage(Result<Result<String, String>, tokio::task::JoinError>),
 
                     Voice(crate::voice::VoiceEvent),
                     StorageShutdown,
@@ -1882,6 +1883,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                 let mut clipboard_pastes = ClipboardPastes::default();
                 let mut submit_after_paste = false;
                 let mut child_read: Option<ChildTranscriptRead> = None;
+                let mut usage: Option<tokio::task::JoinHandle<Result<String, String>>> = None;
                 let mut priority = scheduler::Priority::default();
                 let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
@@ -1943,7 +1945,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             }
                             // Only background sources rotate. A ready paced frame
                             // is rendered by its branch, after the input check.
-                            let sources = 8;
+                            let sources = 9;
                             for offset in 0..sources {
                                 let branch = (next_priority + offset) % sources;
                                 let ready = match branch {
@@ -1963,6 +1965,9 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
 
                                     5 => voice.poll(cx).map(SessionEvent::Voice),
+                                    8 => usage.as_mut().map_or(Poll::Pending, |task| {
+                                        std::pin::Pin::new(task).poll(cx).map(SessionEvent::Usage)
+                                    }),
                                     7 => child_read.as_mut().map_or(Poll::Pending, |read| {
                                         read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
                                     }),
@@ -1982,12 +1987,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     };
                     // Invalidate before handlers: early `continue`s can also mutate
                     // visible state. Worker forwarding alone never requests a frame.
-                    if matches!(&event, SessionEvent::Voice(_)
+                    if matches!(&event, SessionEvent::Usage(_) | SessionEvent::Voice(_)
                         | SessionEvent::ModelSwitch(_)) {
                         frames.invalidate();
                     }
                     match event {
 
+                        SessionEvent::Usage(result) => {
+                            usage = None;
+                            match result.map_err(|error| error.to_string()).and_then(|result| result) {
+                                Ok(output) => app.note(output),
+                                Err(error) => app.note(format!("usage: {error}")),
+                            }
+                        }
                         SessionEvent::ChildTranscript(result) => {
                             if let Some(read) = child_read.take()
                                 && read.target.0 == session_id.to_string() {
@@ -2076,6 +2088,18 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                             match action {
                                 Action::Quit => return Ok(()),
 
+                                Action::Usage(provider) => {
+                                    if usage.is_some() {
+                                        app.note("a usage check is already in progress");
+                                    } else {
+                                        let storage = credential_storage.clone();
+                                        let key = openrouter_api_key.cloned();
+                                        usage = Some(tokio::task::spawn_blocking(move || {
+                                            crate::provider::usage::fetch_usage(provider.as_deref(), &storage, key.as_ref())
+                                        }));
+                                        app.note("checking provider usage…");
+                                    }
+                                }
                                 Action::Voice(control) => voice.control(&control, credential_storage, &mut app),
                                 Action::Submit { prompt, inject } => {
 
