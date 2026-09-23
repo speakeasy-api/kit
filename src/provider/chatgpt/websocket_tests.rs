@@ -288,6 +288,51 @@ async fn finished(turn: &mut KitTurn, id: &str, text: &str) -> Vec<Item> {
     .expect("turn hung")
 }
 
+#[test]
+fn subscription_auto_websocket_ignores_environment_proxies() {
+    // Run the real three-turn WebSocket test in a fresh process so proxy
+    // discovery cannot use cached settings or mutate other tests' environment.
+    const TEST: &str = concat!(
+        "provider::chatgpt::websocket_tests::",
+        "subscription_auto_reuses_websocket_with_authoritative_finished_output_and_suffix"
+    );
+    // Reserve a blocking proxy endpoint for the child's lifetime. Nothing
+    // services it: honoring any proxy must fail, not silently reach the peer.
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", TEST, "--nocapture"]);
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        child.env(name, &proxy_url);
+    }
+    // Do not let an inherited loopback exclusion make the test pass.
+    child.env("NO_PROXY", "").env("no_proxy", "");
+    child.env_remove("REQUEST_METHOD");
+    let output = child.output().unwrap();
+    assert!(
+        output.status.success(),
+        "proxy-isolated WebSocket child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+        "child must run the exact incremental WebSocket test"
+    );
+    assert!(
+        matches!(proxy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "subscription WebSocket must not connect to the environment proxy"
+    );
+}
+
 #[tokio::test]
 #[allow(clippy::result_large_err)] // tungstenite's handshake callback error type.
 async fn subscription_auto_reuses_websocket_with_authoritative_finished_output_and_suffix() {

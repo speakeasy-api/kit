@@ -303,9 +303,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948c0cf9641e7f5a0a30509b4fb10203776581ee54e9c8a06b2549c267bde0cb"
+version = "0.10.12"
+source = "git+https://git@github.com/danielkov/agentkit.git?rev=04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58#04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",

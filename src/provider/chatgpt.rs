@@ -301,6 +301,7 @@ fn subscription_responses_config(
     let mut config = OpenAIResponsesConfig::chatgpt_private(model, authentication)
         .with_endpoint(ENDPOINT)
         .with_transport(OpenAIResponsesTransport::Auto)
+        .with_websocket_no_proxy(true)
         .with_originator("kit")
         .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
         .with_limits(OpenAIResponsesLimits {
