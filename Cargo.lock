@@ -303,9 +303,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.9"
+version = "0.10.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f6c76aa382a8d913eed413242db270701c30a9bb2626d10021b47966b50384b"
+checksum = "7cf5d74cbf8f856303de4369e4467de3085639d670b3a89bce2e54903a33bfd4"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -318,6 +318,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio-tungstenite",
  "zeroize",
 ]
 

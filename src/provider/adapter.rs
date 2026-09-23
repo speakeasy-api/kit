@@ -1165,6 +1165,13 @@ pub struct OpenRouterKitTurn {
 
 #[async_trait]
 impl ModelTurn for KitTurn {
+    fn on_cancelled(&mut self) {
+        match self {
+            Self::OpenAiSubscription(turn) => turn.on_cancelled(),
+            Self::OpenRouter(turn) | Self::Speakeasy(turn) => turn.inner.on_cancelled(),
+        }
+    }
+
     async fn next_event(
         &mut self,
         cancellation: Option<TurnCancellation>,

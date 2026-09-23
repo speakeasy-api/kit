@@ -63,12 +63,29 @@ Kit refreshes credentials within five minutes of expiry. Refreshes are synchroni
 across threads and processes, preserve the authenticated account and credential
 generation, and are forced once after a 401 response. OpenAI subscription turns can
 retry up to 25 times within a 10-minute budget with deterministic full-jitter
-exponential backoff capped at 30 seconds. Retries cover selected transient HTTP
-statuses, request transport failures, explicit transient provider events, and stream
-failures before the first model event. Kit reuses the request body, idempotency key,
-and available turn state. Authentication, invalid requests, quota/billing failures,
-unsupported responses, and failures after observable model output remain terminal.
+exponential backoff capped at 30 seconds. On HTTP/SSE, retries cover selected transient
+HTTP statuses, request transport failures, explicit transient provider events, and
+stream failures before the first model event. HTTP/SSE retries reuse the request
+body, idempotency key, and available turn state. Authentication, invalid requests,
+quota/billing failures, unsupported responses, and failures after observable model
+output remain terminal.
+
+WebSocket requests have no assumed idempotency guarantee. Interrupted sends and
+ambiguous receive failures after sending are terminal, even before visible output.
+After sending, retries require an explicit provider rejection before response
+acceptance or visible output and use a fresh connection; accepted responses are
+not replayed. Handshake failures follow the provider's bounded retry policy.
+
+Subscription sessions try WebSocket transport first and reuse the connection across
+turns. If the WebSocket handshake returns HTTP 426 (Upgrade Required), that session
+switches to HTTP/SSE for the current and subsequent turns. Other handshake failures
+do not trigger this fallback; they follow the provider's retry or error handling.
+Each turn sends the full transcript supplied by Kit, including continuation data,
+rather than relying on `previous_response_id`. This transport choice is automatic
+and does not change other providers or require a configuration setting.
+
 Use `kit auth status openai` to check the credential.
+
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
 skips revocation and prints a warning.

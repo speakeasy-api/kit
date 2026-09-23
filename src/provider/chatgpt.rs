@@ -16,7 +16,7 @@ use agentkit_loop::{
 };
 use agentkit_provider_openai::{
     OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesLimits, OpenAIResponsesSession,
-    OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
+    OpenAIResponsesTransport, OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -267,22 +267,12 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             binding,
             timeout: auth_timeout(&resilience),
         });
-        let mut config =
-            OpenAIResponsesConfig::chatgpt_private(self.config.model.clone(), authentication)
-                .with_endpoint(ENDPOINT)
-                .with_originator("kit")
-                .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
-                .with_limits(OpenAIResponsesLimits {
-                    max_request_bytes: MAX_REQUEST_BYTES,
-                    max_attempt_bytes: MAX_ATTEMPT_BYTES,
-                    max_wire_bytes: MAX_WIRE_BYTES,
-                    max_items: MAX_ITEMS,
-                    max_text_bytes: MAX_FIELD_BYTES,
-                })
-                .with_resilience(resilience);
-        if let Some(effort) = self.reasoning_effort {
-            config = config.with_reasoning_effort(effort.as_str());
-        }
+        let config = subscription_responses_config(
+            self.config.model.clone(),
+            authentication,
+            resilience,
+            self.reasoning_effort,
+        );
         let inner = OpenAIResponsesAdapter::with_client(config, self.responses_client.clone())
             .start_session(session)
             .await?;
@@ -299,6 +289,32 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
     fn provider_name(&self) -> Option<&str> {
         Some("openai-subscription")
     }
+}
+
+// Keep subscription transport policy private; other providers retain their defaults.
+fn subscription_responses_config(
+    model: String,
+    authentication: Authentication,
+    resilience: ResilienceConfig,
+    reasoning_effort: Option<super::adapter::ReasoningEffort>,
+) -> OpenAIResponsesConfig {
+    let mut config = OpenAIResponsesConfig::chatgpt_private(model, authentication)
+        .with_endpoint(ENDPOINT)
+        .with_transport(OpenAIResponsesTransport::Auto)
+        .with_originator("kit")
+        .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
+        .with_limits(OpenAIResponsesLimits {
+            max_request_bytes: MAX_REQUEST_BYTES,
+            max_attempt_bytes: MAX_ATTEMPT_BYTES,
+            max_wire_bytes: MAX_WIRE_BYTES,
+            max_items: MAX_ITEMS,
+            max_text_bytes: MAX_FIELD_BYTES,
+        })
+        .with_resilience(resilience);
+    if let Some(effort) = reasoning_effort {
+        config = config.with_reasoning_effort(effort.as_str());
+    }
+    config
 }
 
 pub struct OpenAiSubscriptionSession {
@@ -557,6 +573,10 @@ pub struct OpenAiSubscriptionTurn {
 
 #[async_trait]
 impl ModelTurn for OpenAiSubscriptionTurn {
+    fn on_cancelled(&mut self) {
+        self.inner.on_cancelled();
+    }
+
     async fn next_event(
         &mut self,
         cancellation: Option<agentkit_core::TurnCancellation>,
@@ -1802,3 +1822,6 @@ mod tests {
 #[cfg(test)]
 #[path = "chatgpt_image_tests.rs"]
 mod image_tests;
+
+#[cfg(all(test, feature = "tui"))]
+mod websocket_tests;
