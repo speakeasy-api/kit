@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     ops::Range,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,35 +14,50 @@ use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
-use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
-#[cfg(test)]
-use agentkit_core::{DataRef, Item, ItemKind, Modality, Part, ToolOutput};
+use agent_client_protocol::schema::v2::{
+    AuthMethodTerminal, StateUpdate, StopReason, ToolCallStatus, ToolKind,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{layout::Rect, text::Line};
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(test)]
-use crate::compaction::is_compaction_summary;
-use crate::events::{GenerationOutcome, RuntimeEvent, SubagentStatus};
+use super::attachment::{
+    MaterializedImage, RetainedAttachmentFiles, SessionAttachmentCache, TemporaryAttachment,
+};
+use crate::events::{GenerationOutcome, HarnessVendor, RuntimeEvent, SubagentStatus};
 use crate::file_search::FileMatch;
 
 const MAX_TOOL_OUTPUT_LINES: usize = 5_000;
+pub(super) const MAX_TOOL_IMAGES: usize = 32;
 const MAX_IMAGE_BASE64_BYTES: usize = 14 * 1024 * 1024;
 const MAX_IMAGE_SOURCE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_RETAINED_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 use super::{
     command::{self, Command as SlashCommand, Parsed, known_token, parse},
     editor::Editor,
-    plan::{PlanNode, parse as parse_plan},
+    markdown,
     wrap::LinkHit,
 };
+
+mod focus;
+pub use focus::ChildView;
 
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    ChildSteerFinished {
+        id: String,
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// Ordered ACP prompt receipt, before the accepted turn's user message.
+    VoicePromptAccepted {
+        id: String,
+        result: Result<(), String>,
+    },
     /// The actual dynamically allocated A2A listen address.
     A2aAddress(String),
     /// Result of listing sessions without blocking the terminal event loop.
@@ -57,7 +73,16 @@ pub enum Update {
         result: Result<Option<String>, String>,
     },
     /// A steer was accepted but has not been delivered into the transcript yet.
-    SteerAccepted { id: String, text: String },
+    SteerAccepted {
+        id: String,
+        text: String,
+        editable: bool,
+    },
+    SteerMutationFinished {
+        id: String,
+        token: u64,
+        result: Result<(), SteerMutationError>,
+    },
     /// A user message delivered or replayed by the agent.
     UserMessage {
         id: String,
@@ -65,12 +90,22 @@ pub enum Update {
         images: Vec<UserImage>,
         append: bool,
     },
+    /// A bounded worker request from an internal image-placeholder click.
+    OpenUserImage(UserImage),
     /// Agent prose, either appended as a chunk or replaced by an upsert.
     AgentMessage {
         id: String,
         text: String,
         append: bool,
     },
+    /// A structured assistant image, kept separate from surrounding prose.
+    AgentImage {
+        id: String,
+        image: UserImage,
+        append: bool,
+    },
+    /// Atomic replacement of an assistant message with ordered content parts.
+    AgentParts { id: String, parts: Vec<AgentPart> },
     /// Agent reasoning, either appended as a chunk or replaced by an upsert.
     AgentThought {
         id: String,
@@ -85,15 +120,6 @@ pub enum Update {
         script: Option<String>,
         backgrounded: bool,
     },
-    /// A tool call changed status or produced output.
-    #[cfg(test)]
-    ToolUpdated {
-        id: String,
-        status: Option<ToolCallStatus>,
-        script: Option<String>,
-        output: Vec<String>,
-        backgrounded: bool,
-    },
     /// A patchable ACP v2 tool call update or content chunk.
     ToolPatched {
         id: String,
@@ -102,9 +128,13 @@ pub enum Update {
         status: Option<ToolCallStatus>,
         script: Option<String>,
         output: Option<Vec<String>>,
+        images: Option<Vec<UserImage>>,
         append_output: bool,
+        intent: Option<Option<String>>,
         backgrounded: bool,
     },
+    /// ACP parent identity; absence of this update preserves the relationship.
+    ToolParent { id: String, parent: Option<String> },
     /// Agent-advertised slash commands for one session.
     AvailableCommands {
         session_id: String,
@@ -113,15 +143,13 @@ pub enum Update {
     /// Full session configuration snapshot.
     ConfigOptions(Vec<agent_client_protocol::schema::v2::SessionConfigOption>),
     /// Context window accounting.
-    Usage { used: u64, size: u64 },
-    /// Standard ACP v2 foreground state.
-    State {
-        active: bool,
-        steerable: bool,
-        cancelled: bool,
+    Usage {
+        used: u64,
+        size: u64,
+        cost: Option<agent_client_protocol::schema::v2::Cost>,
     },
-    /// An ACP v2 turn became idle with its exact terminal reason.
-    Stopped(Option<StopReason>),
+    /// The authoritative ACP v2 foreground lifecycle, preserved from the wire.
+    State(StateUpdate),
     /// A nested tool call started or finished inside a compose run.
     Runtime(RuntimeEvent),
     /// A diagnostic line from the agent process.
@@ -130,23 +158,11 @@ pub enum Update {
     ProcessExited(String),
 }
 
-#[cfg(test)]
-impl Update {
-    pub(super) fn test_text(text: String) -> Self {
-        Self::AgentMessage {
-            id: "test-agent".into(),
-            text,
-            append: true,
-        }
-    }
-
-    pub(super) fn test_thought(text: String) -> Self {
-        Self::AgentThought {
-            id: "test-thought".into(),
-            text,
-            append: true,
-        }
-    }
+fn valid_cost(cost: &agent_client_protocol::schema::v2::Cost) -> bool {
+    cost.amount.is_finite()
+        && cost.amount >= 0.0
+        && cost.currency.len() == 3
+        && cost.currency.bytes().all(|byte| byte.is_ascii_uppercase())
 }
 
 /// Latest provider-reported occupancy of the main model's context window.
@@ -200,6 +216,15 @@ pub struct ModelChoice {
     pub model: String,
 }
 
+pub struct ModelSwitch {
+    pub id: u64,
+    pub choice: ModelChoice,
+    pub save_defaults: bool,
+    pub warning: Option<crate::protocols::acp::model_switch::Warning>,
+    pub selected: usize,
+    pub cancelling: bool,
+}
+
 pub struct ModelDialog {
     pub query: String,
     pub selected: usize,
@@ -249,13 +274,112 @@ pub enum AttachmentKind {
     Audio,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Attachment {
     pub path: PathBuf,
     pub placeholder: String,
     pub mime_type: &'static str,
     pub kind: AttachmentKind,
     pub size: u64,
+    pub(super) temporary: Option<Arc<TemporaryAttachment>>,
+}
+
+impl PartialEq for Attachment {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.placeholder == other.placeholder
+            && self.mime_type == other.mime_type
+            && self.kind == other.kind
+            && self.size == other.size
+    }
+}
+
+impl Eq for Attachment {}
+
+impl Attachment {
+    pub(super) fn clipboard_image(temporary: Arc<TemporaryAttachment>, size: u64) -> Self {
+        Self {
+            path: temporary.path().to_path_buf(),
+            temporary: Some(temporary),
+            placeholder: String::new(),
+            mime_type: "image/png",
+            kind: AttachmentKind::Image,
+            size,
+        }
+    }
+}
+
+fn attachment_number(attachment: &Attachment) -> Option<usize> {
+    attachment
+        .placeholder
+        .strip_suffix(']')
+        .and_then(|placeholder| placeholder.rsplit_once('#'))
+        .and_then(|(_, number)| number.parse().ok())
+}
+
+fn max_attachment_number(text: &str) -> Option<usize> {
+    ["[Image #", "[Audio #"]
+        .into_iter()
+        .flat_map(|prefix| text.match_indices(prefix))
+        .filter_map(|(start, prefix)| {
+            let (number, target) = text[start + prefix.len()..].split_once("](")?;
+            let (uri, _) = target.split_once(')')?;
+            uri.starts_with("file://")
+                .then(|| number.parse().ok())
+                .flatten()
+        })
+        .max()
+}
+
+fn replace_image_uri_on_line(
+    text: &mut String,
+    line: usize,
+    source_uri: Option<&str>,
+    local_uri: Option<&str>,
+) -> Option<Range<usize>> {
+    let start = if line == 0 {
+        0
+    } else if let Some((index, _)) = text.match_indices('\n').nth(line - 1) {
+        index + 1
+    } else {
+        return None;
+    };
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    let Some(source_uri) = source_uri else {
+        // URI-less image blocks get their own generated placeholder line during
+        // translation. Link only that label, never arbitrary neighboring text.
+        let label = &text[start..end];
+        if let Some(number) = label
+            .strip_prefix("[Image #")
+            .and_then(|label| label.strip_suffix(']'))
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if let Some(local_uri) = local_uri {
+                text.insert_str(end, &format!("({local_uri})"));
+            }
+            return Some(start..end);
+        }
+        return None;
+    };
+    let destination = markdown::image_label_link_destinations(&text[start..end])
+        .into_iter()
+        .find_map(|(range, uri)| (uri == source_uri).then_some(range));
+    if let Some(destination) = destination {
+        let destination = start + destination.start..start + destination.end;
+        let label_end = destination.start - 1;
+        let label_start = text[start..label_end].rfind('[')? + start;
+        if let Some(local_uri) = local_uri {
+            text.replace_range(destination, local_uri);
+        } else {
+            // Remove the complete `](destination)` suffix, leaving the label as plain text.
+            text.replace_range(destination.start - 2..destination.end + 1, "]");
+        }
+        return Some(label_start..label_end);
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,14 +392,66 @@ pub struct SubmittedPrompt {
 pub(super) struct PendingSteer {
     pub id: String,
     pub text: String,
+    /// False if the accepted injection included any non-text content blocks.
+    pub editable: bool,
+}
+
+#[derive(Debug)]
+pub struct SteerMutationError {
+    pub message: String,
+    pub unavailable: bool,
+}
+
+struct SteerMutation {
+    token: u64,
+    edit_token: Option<u64>,
+    text: Option<String>,
+}
+
+struct SteerEdit {
+    id: String,
+    token: u64,
+    draft: Editor,
+    attachments: Vec<Attachment>,
+    next_attachment: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardRoute {
+    Blocked(u64),
+    Composer(u64),
+    Rename(u64),
+    Steer { id: String, token: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClipboardMode {
+    ImageOrText,
+    ImageOnly,
 }
 
 pub enum Action {
+    SteerChild {
+        id: String,
+        generation: u64,
+        text: String,
+    },
+    OpenUserImage(UserImage),
+    Voice(String),
+    Usage(Option<String>),
     None,
     Redraw,
+    ReadClipboard(ClipboardRoute, ClipboardMode),
     Submit {
         prompt: SubmittedPrompt,
         inject: bool,
+    },
+    ReplaceSteer {
+        id: String,
+        text: String,
+    },
+    RevokeSteer {
+        id: String,
     },
     New(Option<String>),
     ListSessions,
@@ -289,10 +465,12 @@ pub enum Action {
         choice: ModelChoice,
         save_defaults: bool,
     },
+    ConfirmModelSwitch(crate::protocols::acp::model_switch::Decision),
     SelectEffort {
         effort: String,
         save_defaults: bool,
     },
+    Login(AuthMethodTerminal),
     Copy(String),
     Cancel,
     DetachCompose(String),
@@ -305,53 +483,64 @@ pub enum Action {
     Quit,
 }
 
-/// One nested tool dispatch inside a compose run.
-pub struct Child {
-    pub call: String,
-    pub tool: String,
-    pub summary: String,
-    pub result: String,
-    pub started: Instant,
-    pub millis: Option<u64>,
-    pub ok: bool,
-    /// Plan node this dispatch was attributed to.
-    pub node: Option<usize>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ComposeView {
+    #[default]
+    Output,
+    Script,
 }
 
-impl Child {
-    pub fn running(&self) -> bool {
-        self.millis.is_none()
-    }
-
-    pub fn elapsed(&self) -> u64 {
-        self.millis.unwrap_or_else(|| {
-            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
-    }
+pub(super) fn observed_duration(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    let duration = end?.checked_duration_since(start?)?;
+    Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// A model-visible tool call and, for compose, the program running inside it.
 pub struct ToolCall {
+    /// Opaque ACP identity, independent of the tool name and Runlet source.
+    pub parent_id: Option<String>,
+    pub child_page: usize,
     pub id: String,
     pub title: String,
     pub kind: ToolKind,
     pub status: ToolCallStatus,
-    pub started: Instant,
+    pub started: Option<Instant>,
     pub finished: Option<Instant>,
+    /// The clock stopped, possibly without an observed terminal outcome.
+    pub timing_closed: bool,
     /// Runlet source shown inline while this compose call is running.
     pub script: String,
-    pub plan: Vec<PlanNode>,
-    pub children: Vec<Child>,
     /// Raw tool output, kept whole but folded away until asked for.
     pub output: Vec<String>,
+    /// Typed tool-result images sharing the user-image retention and decode budgets.
+    pub images: Vec<UserImage>,
+    /// User-facing summary supplied by an ACP title patch.
+    pub intent: Option<String>,
     pub expanded: bool,
-    /// The user explicitly chose the output's expanded or collapsed state.
+    /// The selected view for an expanded completed compose call.
+    pub compose_view: ComposeView,
+    /// The user explicitly chose the call's expanded state or compose view.
     pub expansion_explicit: bool,
     /// The call detached from its originating turn.
     pub backgrounded: bool,
 }
 
 impl ToolCall {
+    pub fn is_compose(&self) -> bool {
+        self.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
+    }
+
+    pub fn display_title(&self) -> &str {
+        if !self.is_compose() {
+            return &self.title;
+        }
+        self.intent
+            .as_deref()
+            .map(str::trim)
+            .filter(|intent| !intent.is_empty())
+            .unwrap_or("Running tools.")
+    }
+
     pub fn running(&self) -> bool {
         matches!(
             self.status,
@@ -359,70 +548,26 @@ impl ToolCall {
         )
     }
 
-    pub fn elapsed(&self) -> u64 {
-        let end = self.finished.unwrap_or_else(Instant::now);
-        u64::try_from(end.duration_since(self.started).as_millis()).unwrap_or(u64::MAX)
+    pub fn elapsed(&self) -> Option<u64> {
+        self.elapsed_at(Instant::now())
     }
 
-    /// Records a nested dispatch against the plan node most likely to own it.
-    ///
-    /// Runlet's own node ids stay inside the runtime, so attribution goes by
-    /// tool name and load: among the plan nodes calling this tool, the one
-    /// carrying the fewest dispatches so far wins. That is exact for the
-    /// common program shapes and otherwise degrades to a stable grouping when
-    /// one tool is called from several places. Child lifecycle itself stays
-    /// exact because start and finish are correlated by the runtime call id.
-    pub fn attach(&mut self, call: String, tool: String, summary: String) {
-        let node = self
-            .plan
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.tool.as_deref() == Some(tool.as_str()))
-            .map(|(index, _)| {
-                let load = self
-                    .children
-                    .iter()
-                    .filter(|child| child.node == Some(index))
-                    .count();
-                (load, index)
-            })
-            .min()
-            .map(|(_, index)| index);
-        self.children.push(Child {
-            call,
-            tool,
-            summary,
-            result: String::new(),
-            started: Instant::now(),
-            millis: None,
-            ok: true,
-            node,
-        });
+    fn elapsed_at(&self, now: Instant) -> Option<u64> {
+        let end = if self.running() && !self.timing_closed {
+            Some(now)
+        } else {
+            self.finished
+        };
+        observed_duration(self.started, end)
     }
 
-    pub fn finish_child(&mut self, call: &str, ok: bool, summary: String, millis: u64) {
-        if let Some(child) = self
-            .children
-            .iter_mut()
-            .rev()
-            .find(|child| child.running() && child.call == call)
-        {
-            child.millis = Some(millis);
-            child.ok = ok;
-            child.result = summary;
+    fn finalize_terminal_state(&mut self, at: Option<Instant>) {
+        if self.is_compose() && !self.expansion_explicit {
+            self.expanded = false;
+            self.compose_view = ComposeView::Output;
         }
-    }
-
-    pub fn running_children(&self) -> usize {
-        self.children.iter().filter(|child| child.running()).count()
-    }
-
-    fn finish_running_children(&mut self) {
-        let ok = self.status != ToolCallStatus::Failed;
-        for child in self.children.iter_mut().filter(|child| child.running()) {
-            child.millis = Some(child.elapsed());
-            child.ok = ok;
-        }
+        self.finished = at;
+        self.timing_closed = true;
     }
 }
 
@@ -432,12 +577,29 @@ pub struct UserImage {
     pub(super) key: [u8; 32],
     pub(super) data: String,
     pub(super) mime_type: String,
-    /// Source line after which the fixed image viewport is reserved.
+    pub(super) source_uri: Option<String>,
+    /// Source line carrying this image's clickable placeholder label.
     pub(super) line: usize,
+    /// Exact plain-label bytes trusted by translation/rewrite, never a parsed URI.
+    pub(super) open_label: Option<Range<usize>>,
 }
 
 impl UserImage {
+    /// Internal hit target only: never sent to an OS URI handler or OSC 8.
+    pub(super) fn open_target(&self) -> String {
+        format!("kit-image:{}", blake3::Hash::from(self.key).to_hex())
+    }
+
     pub(super) fn new(data: String, mime_type: String, line: usize) -> Option<Self> {
+        Self::with_source(data, mime_type, line, None)
+    }
+
+    pub(super) fn with_source(
+        data: String,
+        mime_type: String,
+        line: usize,
+        source_uri: Option<String>,
+    ) -> Option<Self> {
         // Check the encoded and maximum decoded lengths before hashing or retaining
         // attacker-controlled ACP payloads. The exact decode stays lazy.
         if data.len() > MAX_IMAGE_BASE64_BYTES {
@@ -466,7 +628,9 @@ impl UserImage {
             key: *hasher.finalize().as_bytes(),
             data,
             mime_type,
+            source_uri,
             line,
+            open_label: None,
         })
     }
 }
@@ -486,29 +650,59 @@ impl From<String> for UserMessage {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum AgentPart {
+    Text(String),
+    Image(UserImage),
+}
+
 pub enum Block {
     User(UserMessage),
     Agent(String),
+    AgentParts(Vec<AgentPart>),
     Thought {
         text: String,
-        started: Instant,
+        started: Option<Instant>,
         millis: Option<u64>,
+        closed: bool,
     },
-    Tool(ToolCall),
-    TurnDuration(u64),
+    Tool(Box<ToolCall>),
+    /// A turn ended. `background` counts detached programs still running
+    /// then; `since_prompt` is wall time since the user's last new prompt,
+    /// spanning the autonomous turns that follow a background result.
+    TurnDuration {
+        background: usize,
+        since_prompt: Option<u64>,
+    },
+    /// A detached program finished after its turn had already ended.
+    BackgroundResult {
+        title: String,
+        millis: Option<u64>,
+        failed: bool,
+    },
+    /// Transcript history was compacted into a note.
+    Compacted {
+        reason: String,
+        millis: u64,
+    },
     Notice(String),
     Error(String),
 }
 
 pub(super) struct CachedTranscriptImage {
+    pub block: Option<usize>,
     pub source: usize,
     pub row: usize,
+    pub destination: Option<String>,
 }
 
 pub(super) struct CachedTranscriptBlock {
     pub revision: u64,
     pub rows: Vec<CachedTranscriptRow>,
     pub images: Vec<CachedTranscriptImage>,
+    pub stable_prefix: String,
+    pub prefix_rows: usize,
+    pub prefix_lines: usize,
 }
 
 /// What the client is doing right now.
@@ -527,8 +721,9 @@ enum MessageRole {
     Thought,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentRow {
+    pub focus_can_steer: bool,
     pub id: String,
     pub name: String,
     pub status: SubagentStatus,
@@ -538,13 +733,78 @@ pub struct AgentRow {
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
     pub harness: String,
+    pub vendor: HarnessVendor,
     pub model: Option<String>,
     pub created_at_unix_ms: u64,
     pub generation_started_at_unix_ms: u64,
     pub generation_finished_at_unix_ms: Option<u64>,
+    pub usage: Option<ContextUsage>,
+    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
+    pub activity: AgentActivity,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentActivity {
+    tools: Vec<(String, String, bool)>,
+    plan: Option<String>,
+    title: Option<String>,
+}
+
+impl AgentActivity {
+    fn apply(&mut self, activity: crate::events::SubagentActivity) {
+        use crate::events::SubagentActivity;
+        match activity {
+            SubagentActivity::Tool { id, title, running } => {
+                let index = self
+                    .tools
+                    .iter()
+                    .position(|tool| tool.0 == id)
+                    .unwrap_or_else(|| {
+                        self.tools.push((id, String::new(), true));
+                        self.tools.len() - 1
+                    });
+                let tool = &mut self.tools[index];
+                if let Some(title) = title {
+                    tool.1 = title;
+                }
+                if let Some(running) = running {
+                    tool.2 = running;
+                }
+            }
+            SubagentActivity::Plan { entry } => self.plan = entry,
+            SubagentActivity::Title { title } => self.title = title,
+        }
+    }
+
+    fn clear_transient(&mut self) {
+        self.tools.clear();
+        self.plan = None;
+    }
+}
+
+impl AgentRow {
+    pub fn excerpt(&self) -> &str {
+        self.activity
+            .tools
+            .iter()
+            .rev()
+            .find(|tool| tool.2 && !tool.1.trim().is_empty())
+            .map(|tool| tool.1.as_str())
+            .or(self
+                .activity
+                .plan
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()))
+            .or(self
+                .activity
+                .title
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()))
+            .unwrap_or(&self.task)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentTreeRow<'a> {
     pub row: &'a AgentRow,
     pub depth: usize,
@@ -562,11 +822,21 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    pub child_focus: Option<String>,
+    child_ui: HashMap<String, focus::ChildUiState>,
+    pub child_views: HashMap<String, ChildView>,
+    pub agents_selected: Option<String>,
+    pub agents_keyboard_focus: bool,
+    pub child_back_area: Rect,
+    runtime_last_frame: Option<Instant>,
+    runtime_status_unavailable: bool,
     pub root: PathBuf,
     pub provider: String,
     pub model: String,
     pub model_choices: Vec<ModelChoice>,
     pub model_dialog: Option<ModelDialog>,
+    pub model_switch: Option<ModelSwitch>,
+    next_model_switch: u64,
     pub reasoning_effort: String,
     pub effort_choices: Vec<EffortChoice>,
     pub effort_dialog: Option<EffortDialog>,
@@ -574,7 +844,10 @@ pub struct App {
     pub session_dialog: Option<SessionDialog>,
     pub file_picker: Option<FilePickerDialog>,
     session_catalog_pending: bool,
+    pub auth_methods: Vec<AuthMethodTerminal>,
     pub available_commands: Vec<SlashCommand>,
+    /// Availability captured at TUI startup; config edits require a restart.
+    pub(super) voice_enabled: bool,
     pub command_completion_selected: usize,
     command_completion_query: Option<String>,
     command_completion_dismissed: Option<String>,
@@ -583,6 +856,11 @@ pub struct App {
     /// Session currently associated with the ordered runtime side channel.
     runtime_session_id: Option<String>,
     pub blocks: Vec<Block>,
+    tool_indices: HashMap<String, usize>,
+    /// Reverse ACP edges also retain children waiting for an unseen parent.
+    tool_dependents: HashMap<String, BTreeSet<usize>>,
+    pub(super) tool_owners: HashMap<usize, usize>,
+    pub(super) grouped_tools: HashMap<usize, Vec<usize>>,
     pub(super) transcript_cache: Vec<Option<CachedTranscriptBlock>>,
     pub(super) transcript_revisions: Vec<u64>,
     pub(super) transcript_dirty: BTreeSet<usize>,
@@ -591,14 +869,33 @@ pub struct App {
     pub(super) transcript_prefixes: Vec<usize>,
     pub(super) transcript_cache_width: usize,
     retained_image_source_bytes: usize,
+    image_source_limit_noticed: bool,
+    attachment_cache: SessionAttachmentCache,
     next_transcript_revision: u64,
     transcript_focus_index: Option<usize>,
     pub editor: Editor,
     pub attachments: Vec<Attachment>,
+    retained_attachment_files: RetainedAttachmentFiles,
     next_attachment: usize,
+    submitted_attachment: usize,
+    clipboard_route_epoch: u64,
     pub phase: Phase,
     pub turn_started: Option<Instant>,
+    /// When the user last started something new, as opposed to steering.
+    prompt_started: Option<Instant>,
+    prompt_seen: bool,
+    /// Scoped event clock: outer None is live, inner None is unknown replay timing.
+    observation_time: Option<Option<Instant>>,
     pub can_steer: bool,
+    pub can_replace_steer: bool,
+    pub(super) selected_steer: Option<String>,
+    pub(super) queue_focused: bool,
+    /// Asynchronous selector closure must not redirect stale destructive keys.
+    pub(super) queue_handoff: bool,
+    steer_edit: Option<SteerEdit>,
+    retired_steers: HashSet<String>,
+    steer_mutations: HashMap<String, SteerMutation>,
+    next_steer_token: u64,
     pub(super) pending_steers: VecDeque<PendingSteer>,
     message_blocks: HashMap<String, usize>,
     /// The previous assistant stream ended; the next text starts a new block.
@@ -607,11 +904,18 @@ pub struct App {
     latest_agent_source: String,
     pub compacting: bool,
     pub usage: Option<ContextUsage>,
+    pub cost: Option<agent_client_protocol::schema::v2::Cost>,
     pub logs: Vec<String>,
     pub show_logs: bool,
+    /// Shared child storage outlives individual sessions.
+    pub storage_pending: bool,
+    pub storage_exhausted: bool,
     pub show_thoughts: bool,
     agents_visible: bool,
+    agents_auto_opened: bool,
     agents: HashMap<String, AgentRow>,
+    /// Latest cumulative report per child session, retained after roster removal.
+    agent_costs: HashMap<String, agent_client_protocol::schema::v2::Cost>,
     agent_versions: HashMap<String, (u64, u8)>,
     /// Process-lifetime terminal suppression for IDs removed by subtree cleanup.
     cleaned_agent_ids: HashSet<String>,
@@ -619,6 +923,8 @@ pub struct App {
     agents_scroll: usize,
     agents_viewport: usize,
     agents_area: Rect,
+    /// Header cell range of the session id, a click target for the resume command.
+    pub(super) session_area: Rect,
     /// Tool card selected for output toggling or background cancellation.
     pub focused_call_id: Option<String>,
     pub tick: usize,
@@ -784,64 +1090,6 @@ fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
     ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
 }
 
-#[cfg(test)]
-fn media_label(media: &agentkit_core::MediaPart, index: usize) -> String {
-    let kind = match media.modality {
-        Modality::Image => "Image",
-        Modality::Audio => "Audio",
-        Modality::Video => "Video",
-        Modality::Binary => "Media",
-    };
-    match &media.data {
-        DataRef::Uri(uri) if safe_media_uri(uri) => format!("[{kind} #{index}]({uri})"),
-        _ => format!("[{kind} #{index}]"),
-    }
-}
-
-#[cfg(test)]
-fn safe_media_uri(uri: &str) -> bool {
-    uri.len() <= 2_048
-        && url::Url::parse(uri).is_ok_and(|uri| matches!(uri.scheme(), "file" | "http" | "https"))
-}
-
-#[cfg(test)]
-fn persisted_output(output: &ToolOutput) -> Vec<String> {
-    let text = match output {
-        ToolOutput::Text(text) => text.clone(),
-        ToolOutput::Structured(value) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        }
-        ToolOutput::Parts(parts) => {
-            let mut next_media = 0;
-            let mut next_file = 0;
-            parts
-                .iter()
-                .filter_map(|part| match part {
-                    Part::Text(text) => Some(text.text.clone()),
-                    Part::Media(media) => {
-                        next_media += 1;
-                        Some(media_label(media, next_media))
-                    }
-                    Part::File(file) => {
-                        next_file += 1;
-                        Some(match &file.data {
-                            DataRef::Uri(uri) if safe_media_uri(uri) => {
-                                format!("[File #{}]({uri})", next_file)
-                            }
-                            _ => format!("[File #{}]", next_file),
-                        })
-                    }
-                    Part::Structured(value) => Some(value.value.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        ToolOutput::Files(files) => format!("{} files", files.len()),
-    };
-    text.lines().map(str::to_string).collect()
-}
-
 fn agent_status_rank(status: SubagentStatus) -> u8 {
     match status {
         SubagentStatus::Starting => 0,
@@ -854,11 +1102,21 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
+            child_focus: None,
+            child_ui: HashMap::new(),
+            child_views: HashMap::new(),
+            agents_selected: None,
+            agents_keyboard_focus: false,
+            child_back_area: Rect::default(),
+            runtime_last_frame: None,
+            runtime_status_unavailable: false,
             root,
             provider,
             model,
             model_choices: Vec::new(),
             model_dialog: None,
+            model_switch: None,
+            next_model_switch: 0,
             reasoning_effort: "default".into(),
             effort_choices: Vec::new(),
             effort_dialog: None,
@@ -866,7 +1124,9 @@ impl App {
             session_dialog: None,
             file_picker: None,
             session_catalog_pending: false,
+            auth_methods: Vec::new(),
             available_commands: Vec::new(),
+            voice_enabled: false,
             command_completion_selected: 0,
             command_completion_query: None,
             command_completion_dismissed: None,
@@ -874,6 +1134,10 @@ impl App {
             session_id: None,
             runtime_session_id: None,
             blocks: Vec::new(),
+            tool_indices: HashMap::new(),
+            tool_dependents: HashMap::new(),
+            tool_owners: HashMap::new(),
+            grouped_tools: HashMap::new(),
             transcript_cache: Vec::new(),
             transcript_revisions: Vec::new(),
             transcript_dirty: BTreeSet::new(),
@@ -882,31 +1146,53 @@ impl App {
             transcript_prefixes: vec![0],
             transcript_cache_width: 0,
             retained_image_source_bytes: 0,
+            image_source_limit_noticed: false,
+            attachment_cache: SessionAttachmentCache::default(),
             next_transcript_revision: 0,
             transcript_focus_index: None,
             editor: Editor::default(),
             attachments: Vec::new(),
+            retained_attachment_files: RetainedAttachmentFiles::default(),
             next_attachment: 0,
+            submitted_attachment: 0,
+            clipboard_route_epoch: 0,
             phase: Phase::Idle,
             turn_started: None,
+            prompt_started: None,
+            prompt_seen: false,
+            observation_time: None,
             can_steer: false,
+            can_replace_steer: false,
+            selected_steer: None,
+            queue_focused: false,
+            queue_handoff: false,
+            steer_edit: None,
+            retired_steers: HashSet::new(),
+            steer_mutations: HashMap::new(),
+            next_steer_token: 0,
             pending_steers: VecDeque::new(),
             message_blocks: HashMap::new(),
             agent_stream_sealed: false,
             latest_agent_source: String::new(),
             compacting: false,
             usage: None,
+            cost: None,
             logs: Vec::new(),
             show_logs: false,
+            storage_pending: false,
+            storage_exhausted: false,
             show_thoughts: false,
             agents_visible: false,
+            agents_auto_opened: false,
             agents: HashMap::new(),
+            agent_costs: HashMap::new(),
             agent_versions: HashMap::new(),
             cleaned_agent_ids: HashSet::new(),
             cleaned_agent_ancestors: HashSet::new(),
             agents_scroll: 0,
             agents_viewport: 0,
             agents_area: Rect::default(),
+            session_area: Rect::default(),
             focused_call_id: None,
             tick: 0,
             scroll: 0,
@@ -933,6 +1219,9 @@ impl App {
     }
 
     fn command_completion_prefix(&self) -> Option<&str> {
+        if self.editing_steer() || self.queue_focused {
+            return None;
+        }
         command::completion_prefix(self.editor.text(), self.editor.cursor())
     }
 
@@ -947,6 +1236,8 @@ impl App {
             self.editor.text(),
             self.editor.cursor(),
             &self.available_commands,
+            !self.auth_methods.is_empty(),
+            self.voice_enabled,
         )
     }
 
@@ -961,6 +1252,8 @@ impl App {
             self.editor.text(),
             self.editor.cursor(),
             &self.available_commands,
+            !self.auth_methods.is_empty(),
+            self.voice_enabled,
         )
         .len();
         self.command_completion_selected = self
@@ -984,7 +1277,7 @@ impl App {
     }
 
     fn push_block(&mut self, block: Block) {
-        if !matches!(block, Block::TurnDuration(_)) {
+        if !matches!(block, Block::TurnDuration { .. }) {
             self.collapse_last_tool_output();
         }
         let index = self.blocks.len();
@@ -1008,6 +1301,10 @@ impl App {
         if dynamic {
             self.transcript_dynamic.insert(index);
         }
+        if let Some(id) = &tool_id {
+            self.tool_indices.insert(id.clone(), index);
+            self.refresh_tool_groups(index);
+        }
         if tool_id.as_deref() == self.focused_call_id.as_deref()
             || tool_id.is_some() && self.focused_call_id.is_none()
         {
@@ -1015,18 +1312,10 @@ impl App {
         }
     }
 
-    fn call_is_latest_message(&self, id: &str) -> bool {
-        self.call_index(id).is_some_and(|index| {
-            self.blocks[index + 1..]
-                .iter()
-                .all(|block| matches!(block, Block::TurnDuration(_)))
-        })
-    }
-
     fn block_is_dynamic(block: &Block) -> bool {
         match block {
-            Block::Thought { millis, .. } => millis.is_none(),
-            Block::Tool(call) => call.running() || call.running_children() > 0,
+            Block::Thought { closed, .. } => !closed,
+            Block::Tool(call) => call.running() && !call.timing_closed,
             _ => false,
         }
     }
@@ -1040,6 +1329,16 @@ impl App {
     }
 
     fn mark_block_dirty(&mut self, index: usize) {
+        // Hit ranges describe the last presented frame, not the newly mutated
+        // source. Only inspect the bounded viewport; preserve selection state.
+        for hit in &mut self.row_code {
+            if hit.as_ref().is_some_and(|hit| hit.block == index) {
+                *hit = None;
+            }
+        }
+        if let Some(&owner) = self.tool_owners.get(&index) {
+            self.mark_block_dirty(owner);
+        }
         if let Some(revision) = self.transcript_revisions.get_mut(index) {
             self.next_transcript_revision = self.next_transcript_revision.wrapping_add(1);
             *revision = self.next_transcript_revision;
@@ -1069,6 +1368,9 @@ impl App {
             }
             if Self::block_is_dynamic(&self.blocks[index]) {
                 self.transcript_dynamic.insert(index);
+            }
+            if let Block::Tool(call) = &self.blocks[index] {
+                self.tool_indices.insert(call.id.clone(), index);
             }
             if matches!(self.blocks[index], Block::Tool(_))
                 && (self.focused_call_id.is_none()
@@ -1115,10 +1417,7 @@ impl App {
     }
 
     fn focus_call_by_id(&mut self, id: String) {
-        let index = self
-            .blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id));
+        let index = self.call_index(&id);
         self.focused_call_id = Some(id);
         self.set_focus_index(index);
     }
@@ -1135,11 +1434,17 @@ impl App {
         }
     }
 
-    /// Whether the periodic animation clock can change anything on screen.
+    /// Whether periodic polling must run maintenance or advance animations.
+    /// This does not mean that every poll needs a terminal frame.
     pub fn needs_redraw_tick(&self) -> bool {
+        (!self.runtime_status_unavailable && self.runtime_last_frame.is_some())
+            || self.toast.is_some()
+            || self.has_tick_animation()
+    }
+
+    fn has_tick_animation(&self) -> bool {
         self.working()
             || !self.transcript_dynamic.is_empty()
-            || self.toast.is_some()
             || self.agents.values().any(|row| match row.status {
                 SubagentStatus::Starting | SubagentStatus::Working => true,
                 SubagentStatus::Removed => row.outcome == Some(GenerationOutcome::Failed),
@@ -1152,9 +1457,18 @@ impl App {
             })
     }
 
-    /// Advances animations and removes expired transient state.
-    pub fn tick(&mut self) {
+    /// Runs periodic maintenance and reports whether a new frame is needed.
+    pub fn tick(&mut self) -> bool {
+        let animated = self.has_tick_animation();
+        let unavailable = self.runtime_status_unavailable;
+        let toast = self.toast.is_some();
+        let agents = self.agents.len();
+        self.runtime_tick_at(Instant::now());
         self.tick_at(crate::events::now_millis());
+        animated
+            || unavailable != self.runtime_status_unavailable
+            || toast != self.toast.is_some()
+            || agents != self.agents.len()
     }
 
     fn tick_at(&mut self, now_unix_ms: u64) {
@@ -1176,111 +1490,6 @@ impl App {
         }
     }
 
-    /// Rebuilds the visible history from the same Items preloaded into the model.
-    #[cfg(test)]
-    pub fn restore_transcript(&mut self, session_id: String, transcript: &[Item]) {
-        self.session_id = Some(session_id);
-        for item in transcript {
-            match item.kind {
-                ItemKind::Developer if is_compaction_summary(item) => {
-                    self.push_block(Block::Notice("context compacted".into()));
-                }
-                ItemKind::System
-                | ItemKind::Developer
-                | ItemKind::Context
-                | ItemKind::Notification => continue,
-                ItemKind::User => {
-                    let mut next_media = 0;
-                    let text = item
-                        .parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            Part::Text(text) => Some(text.text.clone()),
-                            Part::Media(media) => {
-                                next_media += 1;
-                                Some(media_label(media, next_media))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        if item.kind == ItemKind::User {
-                            self.latest_agent_source.clear();
-                            self.push_block(Block::User(UserMessage {
-                                text,
-                                images: Vec::new(),
-                            }));
-                        } else {
-                            self.push_block(Block::Notice(text));
-                        }
-                    }
-                }
-                ItemKind::Assistant => {
-                    let mut next_media = 0;
-                    for part in &item.parts {
-                        match part {
-                            Part::Text(text) if !text.text.is_empty() => {
-                                self.latest_agent_source.push_str(&text.text);
-                                self.push_block(Block::Agent(text.text.clone()))
-                            }
-                            Part::Media(media) => {
-                                next_media += 1;
-                                self.push_block(Block::Agent(media_label(media, next_media)));
-                            }
-                            Part::Reasoning(reasoning) if reasoning.summary.is_some() => self
-                                .push_block(Block::Thought {
-                                    text: reasoning.summary.clone().unwrap_or_default(),
-                                    started: Instant::now(),
-                                    millis: Some(0),
-                                }),
-                            Part::ToolCall(call) => self.push_block(Block::Tool(ToolCall {
-                                id: call.id.to_string(),
-                                title: call.name.clone(),
-                                kind: ToolKind::Other,
-                                status: ToolCallStatus::Completed,
-                                started: Instant::now(),
-                                finished: Some(Instant::now()),
-                                script: call
-                                    .input
-                                    .get("script")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                plan: call
-                                    .input
-                                    .get("script")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(parse_plan)
-                                    .unwrap_or_default(),
-                                children: Vec::new(),
-                                output: Vec::new(),
-                                expanded: call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME,
-                                expansion_explicit: false,
-                                backgrounded: false,
-                            })),
-                            _ => {}
-                        }
-                    }
-                }
-                ItemKind::Tool => {
-                    for part in &item.parts {
-                        if let Part::ToolResult(result) = part
-                            && let Some(call) = self.call_mut(&result.call_id.to_string())
-                        {
-                            call.output = persisted_output(&result.output);
-                            if result.is_error {
-                                call.status = ToolCallStatus::Failed;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        self.follow = true;
-        self.scroll = usize::MAX;
-    }
-
     /// The tool call the graph pane should show: the running one, else the
     /// most recent, so a finished program stays readable.
     pub fn focus_call(&self) -> Option<&ToolCall> {
@@ -1298,14 +1507,14 @@ impl App {
         if self.transcript_revisions.len() != self.blocks.len() || self.focused_call_id.is_some() {
             if let Some(id) = &self.focused_call_id
                 && let Some(call) = self.blocks.iter().rev().find_map(|block| match block {
-                    Block::Tool(call) if &call.id == id => Some(call),
+                    Block::Tool(call) if &call.id == id => Some(call.as_ref()),
                     _ => None,
                 })
             {
                 return Some(call);
             }
             return self.blocks.iter().rev().find_map(|block| match block {
-                Block::Tool(call) => Some(call),
+                Block::Tool(call) => Some(call.as_ref()),
                 _ => None,
             });
         }
@@ -1319,7 +1528,7 @@ impl App {
                     && call.running()
                     && !call.backgrounded =>
             {
-                Some(call)
+                Some(call.as_ref())
             }
             _ => None,
         })
@@ -1332,14 +1541,6 @@ impl App {
     pub fn toggle_agents(&mut self) {
         self.agents_visible = !self.agents_visible;
         self.clamp_agents_scroll();
-    }
-
-    #[cfg(test)]
-    pub fn agents(&self) -> Vec<&AgentRow> {
-        self.agent_tree_rows()
-            .into_iter()
-            .map(|tree_row| tree_row.row)
-            .collect()
     }
 
     pub fn agent_tree_rows(&self) -> Vec<AgentTreeRow<'_>> {
@@ -1447,6 +1648,22 @@ impl App {
         rows
     }
 
+    /// Reported child costs only: unknown costs are not counted as zero.
+    pub fn subagent_cost_totals(&self) -> std::collections::BTreeMap<String, f64> {
+        let mut totals = std::collections::BTreeMap::new();
+        for cost in self.agent_costs.values() {
+            *totals.entry(cost.currency.clone()).or_default() += cost.amount;
+        }
+        totals
+    }
+
+    /// Harness marks only earn their column when the roster mixes vendors.
+    pub fn agents_all_kit(&self) -> bool {
+        self.agents
+            .values()
+            .all(|row| row.vendor == HarnessVendor::Kit)
+    }
+
     pub fn agent_counts(&self) -> AgentCounts {
         self.agents
             .values()
@@ -1483,16 +1700,17 @@ impl App {
         self.agents_scroll = self.agents_scroll.saturating_add_signed(rows).min(top);
     }
 
-    pub fn elapsed(&self) -> u64 {
-        self.turn_started.map_or(0, |started| {
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
+    pub fn elapsed(&self) -> Option<u64> {
+        observed_duration(self.turn_started, Some(Instant::now()))
+    }
+
+    fn observed_at(&self) -> Option<Instant> {
+        self.observation_time
+            .unwrap_or_else(|| Some(Instant::now()))
     }
 
     fn stop_turn_timer(&mut self) -> Option<u64> {
-        self.turn_started
-            .take()
-            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+        observed_duration(self.turn_started.take(), self.observed_at())
     }
 
     pub fn toast_text(&self) -> Option<&str> {
@@ -1502,22 +1720,169 @@ impl App {
             .map(|(text, _)| text.as_str())
     }
 
-    fn toast(&mut self, text: impl Into<String>) {
+    pub(super) fn toast(&mut self, text: impl Into<String>) {
         self.toast = Some((text.into(), Instant::now()));
+    }
+
+    fn apply_agent_parts(&mut self, id: String, incoming: Vec<AgentPart>, append: bool) {
+        self.close_thought();
+        self.collapse_last_tool_output();
+        let existing =
+            self.message_blocks.get(&id).copied().filter(|&index| {
+                matches!(self.blocks[index], Block::Agent(_) | Block::AgentParts(_))
+            });
+        let previous = existing
+            .map(|index| match &mut self.blocks[index] {
+                Block::Agent(text) => vec![AgentPart::Text(std::mem::take(text))],
+                Block::AgentParts(parts) => std::mem::take(parts),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        let previous_text = if append {
+            String::new()
+        } else {
+            previous
+                .iter()
+                .filter_map(|part| match part {
+                    AgentPart::Text(text) => Some(text.as_str()),
+                    AgentPart::Image(_) => None,
+                })
+                .collect::<String>()
+        };
+        if !append {
+            let released = previous
+                .iter()
+                .map(|part| match part {
+                    AgentPart::Image(image) => image.data.len(),
+                    AgentPart::Text(_) => 0,
+                })
+                .sum::<usize>();
+            self.retained_image_source_bytes =
+                self.retained_image_source_bytes.saturating_sub(released);
+        }
+        let mut parts = if append { previous } else { Vec::new() };
+        let mut added_text = String::new();
+        for part in incoming {
+            let part = match part {
+                AgentPart::Image(image) => {
+                    let retained = self
+                        .retained_image_source_bytes
+                        .saturating_add(image.data.len());
+                    if retained <= MAX_RETAINED_IMAGE_SOURCE_BYTES {
+                        self.retained_image_source_bytes = retained;
+                        AgentPart::Image(image)
+                    } else {
+                        AgentPart::Text("[Image]".into())
+                    }
+                }
+                part => part,
+            };
+            match part {
+                AgentPart::Text(text) => {
+                    added_text.push_str(&text);
+                    if let Some(AgentPart::Text(previous)) = parts.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        parts.push(AgentPart::Text(text));
+                    }
+                }
+                part => parts.push(part),
+            }
+        }
+        if !append && existing.is_some() {
+            if self.latest_agent_source.ends_with(&previous_text) {
+                self.latest_agent_source
+                    .truncate(self.latest_agent_source.len() - previous_text.len());
+                self.latest_agent_source.push_str(&added_text);
+            } else {
+                self.latest_agent_source = added_text;
+            }
+        } else if self.agent_stream_sealed {
+            self.latest_agent_source = added_text;
+        } else {
+            self.latest_agent_source.push_str(&added_text);
+        }
+        self.agent_stream_sealed = false;
+        let block = if parts.iter().any(|part| matches!(part, AgentPart::Image(_))) {
+            Block::AgentParts(parts)
+        } else {
+            Block::Agent(
+                parts
+                    .into_iter()
+                    .filter_map(|part| match part {
+                        AgentPart::Text(text) => Some(text),
+                        AgentPart::Image(_) => None,
+                    })
+                    .collect(),
+            )
+        };
+        if let Some(index) = existing {
+            self.blocks[index] = block;
+            self.mark_block_dirty(index);
+        } else {
+            self.push_block(block);
+            self.message_blocks.insert(id, self.blocks.len() - 1);
+        }
     }
 
     fn apply_message(
         &mut self,
         id: String,
-        text: String,
+        mut text: String,
         images: Vec<UserImage>,
         append: bool,
         role: MessageRole,
     ) {
+        if !append
+            && matches!(role, MessageRole::Agent)
+            && self
+                .message_blocks
+                .get(&id)
+                .is_some_and(|&index| matches!(self.blocks[index], Block::AgentParts(_)))
+        {
+            self.apply_agent_parts(id, vec![AgentPart::Text(text)], append);
+            return;
+        }
         if !text.is_empty() || !images.is_empty() {
             self.collapse_last_tool_output();
         }
+        if matches!(role, MessageRole::User)
+            && let Some(number) = max_attachment_number(&text)
+        {
+            self.submitted_attachment = self.submitted_attachment.max(number);
+            self.next_attachment = self.next_attachment.max(self.submitted_attachment);
+        }
         let mut images = images;
+        for index in 0..images.len() {
+            let image = &images[index];
+            if image
+                .source_uri
+                .as_deref()
+                .is_none_or(|uri| uri.starts_with("file:"))
+            {
+                let uri = self.attachment_cache.image_uri(image.key);
+                let old_len = text.len();
+                let label = replace_image_uri_on_line(
+                    &mut text,
+                    image.line,
+                    image.source_uri.as_deref(),
+                    uri.as_deref(),
+                );
+                if let Some(label) = label {
+                    // Later rewrites may precede already associated labels (ACP
+                    // image order need not match text order).
+                    for previous in &mut images[..index] {
+                        if let Some(range) = &mut previous.open_label
+                            && range.start >= label.end
+                        {
+                            range.start = range.start + text.len() - old_len;
+                            range.end = range.end + text.len() - old_len;
+                        }
+                    }
+                    images[index].open_label = uri.is_none().then_some(label);
+                }
+            }
+        }
         let existing_index = self.message_blocks.get(&id).copied();
         if !append
             && matches!(role, MessageRole::User)
@@ -1532,6 +1897,7 @@ impl App {
             self.retained_image_source_bytes =
                 self.retained_image_source_bytes.saturating_sub(replaced);
         }
+        let source_count = images.len();
         images.retain(|image| {
             let retained = self
                 .retained_image_source_bytes
@@ -1543,12 +1909,22 @@ impl App {
                 true
             }
         });
+        // Notify once per session; later messages and resume replays stay quiet.
+        if images.len() < source_count && !self.image_source_limit_noticed {
+            self.image_source_limit_noticed = true;
+            self.toast("image source limit reached; start a new session to retain more images");
+        }
         if let Some(index) = existing_index {
             let mut changed = false;
             match (&mut self.blocks[index], role) {
                 (Block::User(existing), MessageRole::User) => {
                     if append {
-                        let last_line = existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        let last_line = if existing.images.is_empty() && images.is_empty() {
+                            0
+                        } else {
+                            existing.text.bytes().filter(|&byte| byte == b'\n').count()
+                        };
+                        let mut line_offset = last_line;
                         let follows_image =
                             existing.images.iter().any(|image| image.line == last_line);
                         let starts_image = !images.is_empty();
@@ -1559,11 +1935,15 @@ impl App {
                             && (follows_image || starts_image)
                         {
                             existing.text.push('\n');
+                            line_offset += 1;
                         }
-                        let line_offset =
-                            existing.text.bytes().filter(|&byte| byte == b'\n').count();
+                        let byte_offset = existing.text.len();
                         existing.text.push_str(&text);
                         for image in &mut images {
+                            if let Some(range) = &mut image.open_label {
+                                range.start += byte_offset;
+                                range.end += byte_offset;
+                            }
                             image.line += line_offset;
                         }
                         existing.images.extend(std::mem::take(&mut images));
@@ -1571,6 +1951,15 @@ impl App {
                         existing.text = text.clone();
                         existing.images = std::mem::take(&mut images);
                     }
+                    changed = true;
+                }
+                (Block::AgentParts(parts), MessageRole::Agent) => {
+                    if let Some(AgentPart::Text(previous)) = parts.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        parts.push(AgentPart::Text(text.clone()));
+                    }
+                    self.latest_agent_source.push_str(&text);
                     changed = true;
                 }
                 (Block::Agent(existing), MessageRole::Agent) => {
@@ -1623,15 +2012,12 @@ impl App {
             }
             MessageRole::Thought => self.push_block(Block::Thought {
                 text,
-                started: Instant::now(),
+                started: self.observed_at(),
                 millis: None,
+                closed: false,
             }),
         }
         self.message_blocks.insert(id, self.blocks.len() - 1);
-    }
-
-    fn finish_turn(&mut self, cancelled: bool) {
-        self.finish_turn_with_outcome(!cancelled, cancelled.then_some("turn interrupted".into()));
     }
 
     fn finish_with_stop_reason(&mut self, reason: Option<StopReason>) {
@@ -1658,20 +2044,28 @@ impl App {
     }
 
     fn finish_turn_with_outcome(&mut self, successful: bool, notice: Option<String>) {
-        self.pending_steers.clear();
+        self.retired_steers
+            .extend(self.pending_steers.drain(..).map(|pending| pending.id));
+        self.close_queue_after_update();
         if self.phase == Phase::Idle {
             self.agent_stream_sealed = true;
             return;
         }
         self.close_thought();
         self.agent_stream_sealed = true;
-        let interrupted = self.phase == Phase::Cancelling;
+        let at = self.observed_at();
         let turn_millis = self.stop_turn_timer();
         self.phase = Phase::Idle;
         self.compacting = false;
+        // Only running calls can need terminalization. Historical calls cannot
+        // change here, and need not walk their ancestor chains again.
+        let candidates: Vec<_> = self.transcript_dynamic.iter().copied().collect();
         let mut finished = Vec::new();
-        for (index, block) in self.blocks.iter_mut().enumerate() {
-            if let Block::Tool(call) = block
+        for index in candidates {
+            if self.has_background_ancestor(index) {
+                continue;
+            }
+            if let Block::Tool(call) = &mut self.blocks[index]
                 && call.running()
                 && !call.backgrounded
             {
@@ -1680,8 +2074,7 @@ impl App {
                 } else {
                     ToolCallStatus::Failed
                 };
-                call.finished = Some(Instant::now());
-                call.finish_running_children();
+                call.finalize_terminal_state(at);
                 finished.push(index);
             }
         }
@@ -1689,18 +2082,143 @@ impl App {
             self.mark_block_dirty(index);
             self.reclassify_dynamic(index);
         }
-        if interrupted {
-            self.note("turn interrupted");
-        } else if let Some(notice) = notice {
+        if let Some(notice) = notice {
             self.note(notice);
         }
-        if let Some(millis) = turn_millis {
-            self.push_block(Block::TurnDuration(millis));
+        let background = self.background_calls().len();
+        let since_prompt = if self.prompt_seen {
+            observed_duration(self.prompt_started, at)
+        } else {
+            turn_millis
+        };
+        self.push_block(Block::TurnDuration {
+            background,
+            since_prompt,
+        });
+    }
+
+    /// Top-level calls that detached from their turn and are still running.
+    pub fn background_calls(&self) -> Vec<&ToolCall> {
+        // The ordered dynamic index includes every running call, including
+        // detached calls; preserve transcript order without scanning history.
+        self.transcript_dynamic
+            .iter()
+            .filter_map(|&index| match &self.blocks[index] {
+                Block::Tool(call)
+                    if call.parent_id.is_none() && call.backgrounded && call.running() =>
+                {
+                    Some(call.as_ref())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The session's name: its catalog title when known, else its first prompt.
+    pub fn session_title(&self) -> Option<String> {
+        if let Some(id) = &self.session_id
+            && let Some(title) = self
+                .session_choices
+                .iter()
+                .find(|entry| &entry.id == id)
+                .and_then(|entry| entry.title.clone())
+        {
+            return Some(title);
         }
+        self.blocks.iter().find_map(|block| match block {
+            Block::User(message) => {
+                let text = message
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+    }
+
+    pub(super) fn apply_materialized(&mut self, update: Update, images: Vec<MaterializedImage>) {
+        if matches!(update, Update::OpenUserImage(_)) {
+            use super::attachment::RetainOpenedError;
+            let result = images
+                .into_iter()
+                .next()
+                .ok_or(RetainOpenedError::InvalidPath)
+                .and_then(|image| self.attachment_cache.retain_opened(image));
+            match result {
+                Ok(uri) => open_url(&uri),
+                Err(RetainOpenedError::Exhausted) => {
+                    self.toast("image open limit reached; start a new session to open more images")
+                }
+                Err(RetainOpenedError::InvalidPath) => self.toast("image could not be opened"),
+            }
+            return;
+        }
+        for image in images {
+            self.attachment_cache.admit(image);
+        }
+        self.apply(update);
     }
 
     pub fn apply(&mut self, update: Update) {
+        self.apply_at(update, self.observed_at());
+    }
+
+    /// Apply a transcript event at its original observation time. Missing timing
+    /// remains unknown; it must never be substituted with the replay clock.
+    pub fn apply_at(&mut self, update: Update, at: Option<Instant>) {
+        let previous = self.observation_time.replace(at);
+        self.apply_observed(update);
+        self.observation_time = previous;
+    }
+
+    /// Stop clocks after a caught-up, inactive replay that lacks terminal events.
+    /// This records neither a successful outcome nor a fabricated finish time.
+    /// A later real terminal update can still supply the missing boundary.
+    pub fn finish_replay_incomplete(&mut self) {
+        let mut changed = Vec::new();
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            match block {
+                Block::Thought { millis, closed, .. } if !*closed => {
+                    *millis = None;
+                    *closed = true;
+                    changed.push(index);
+                }
+                Block::Tool(call) if call.running() && !call.timing_closed => {
+                    call.finished = None;
+                    call.timing_closed = true;
+                    changed.push(index);
+                }
+                _ => {}
+            }
+        }
+        for index in changed {
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
+        }
+        if self.phase != Phase::Idle {
+            self.push_block(Block::TurnDuration {
+                background: self.background_calls().len(),
+                since_prompt: None,
+            });
+        }
+        self.turn_started = None;
+        self.phase = Phase::Idle;
+        self.compacting = false;
+        self.agent_stream_sealed = true;
+    }
+
+    fn apply_observed(&mut self, update: Update) {
+        let at = self.observed_at();
         match update {
+            Update::ChildSteerFinished {
+                id,
+                generation,
+                result,
+            } => self.child_steer_finished(&id, generation, result),
+            Update::OpenUserImage(_) => {}
+            Update::VoicePromptAccepted { .. } => {}
             Update::A2aAddress(address) => self.a2a = address,
             Update::SessionCatalog(result) => {
                 self.session_catalog_pending = false;
@@ -1779,8 +2297,11 @@ impl App {
                     self.sync_command_completion();
                 }
             }
-            Update::SteerAccepted { id, text } => {
-                if self.message_blocks.contains_key(&id) {
+            Update::SteerMutationFinished { id, token, result } => {
+                self.finish_steer_mutation(&id, token, result);
+            }
+            Update::SteerAccepted { id, text, editable } => {
+                if self.message_blocks.contains_key(&id) || self.retired_steers.contains(&id) {
                     return;
                 }
                 if let Some(pending) = self
@@ -1789,8 +2310,13 @@ impl App {
                     .find(|pending| pending.id == id)
                 {
                     pending.text = text;
+                    pending.editable = editable;
                 } else {
-                    self.pending_steers.push_back(PendingSteer { id, text });
+                    if self.queue_focused && self.selected_steer.is_none() {
+                        self.selected_steer = Some(id.clone());
+                    }
+                    self.pending_steers
+                        .push_back(PendingSteer { id, text, editable });
                 }
             }
             Update::UserMessage {
@@ -1799,14 +2325,50 @@ impl App {
                 images,
                 append,
             } => {
-                self.pending_steers.retain(|pending| pending.id != id);
+                let steer = self.pending_steers.iter().any(|pending| pending.id == id);
+                let new_message = !self.message_blocks.contains_key(&id);
+                self.remove_pending_steer(&id);
+                if new_message && !steer {
+                    self.prompt_seen = true;
+                    self.prompt_started = at;
+                }
                 self.apply_message(id, text, images, append, MessageRole::User);
+            }
+            Update::AgentImage { id, image, append } => {
+                self.apply_agent_parts(id, vec![AgentPart::Image(image)], append);
+            }
+            Update::AgentParts { id, parts } => {
+                self.apply_agent_parts(id, parts, false);
             }
             Update::AgentMessage { id, text, append } => {
                 self.apply_message(id, text, Vec::new(), append, MessageRole::Agent);
             }
             Update::AgentThought { id, text, append } => {
                 self.apply_message(id, text, Vec::new(), append, MessageRole::Thought);
+            }
+            Update::ToolParent { id, parent } => {
+                if let Some(index) = self.call_index(&id)
+                    && let Block::Tool(call) = &mut self.blocks[index]
+                    && call.parent_id != parent
+                {
+                    let old = std::mem::replace(&mut call.parent_id, parent.clone());
+                    if let Some(old) = old
+                        && let Some(children) = self.tool_dependents.get_mut(&old)
+                    {
+                        children.remove(&index);
+                        if children.is_empty() {
+                            self.tool_dependents.remove(&old);
+                        }
+                    }
+                    if let Some(parent) = parent {
+                        self.tool_dependents
+                            .entry(parent)
+                            .or_default()
+                            .insert(index);
+                    }
+                    self.mark_block_dirty(index);
+                    self.refresh_tool_groups(index);
+                }
             }
             Update::ToolStarted {
                 id,
@@ -1816,67 +2378,34 @@ impl App {
                 backgrounded,
             } => {
                 self.close_thought();
-                self.prepare_focused_call(id.clone());
+                // A late parent attaches an already visible child; do not steal
+                // that child's selection just because its owner arrived later.
+                if self
+                    .focus_call()
+                    .is_none_or(|call| call.parent_id.as_deref() != Some(id.as_str()))
+                {
+                    self.prepare_focused_call(id.clone());
+                }
                 let expanded = title == agentkit_tool_compose::COMPOSE_TOOL_NAME;
-                self.push_block(Block::Tool(ToolCall {
+                self.push_block(Block::Tool(Box::new(ToolCall {
                     id,
+                    parent_id: None,
+                    child_page: 0,
                     title,
                     kind,
                     status: ToolCallStatus::Pending,
-                    started: Instant::now(),
+                    started: at,
                     finished: None,
-                    plan: script.as_deref().map(parse_plan).unwrap_or_default(),
-                    script: script.unwrap_or_default(),
-                    children: Vec::new(),
+                    timing_closed: false,
+                    script: super::source::bounded_source(script.unwrap_or_default()),
                     output: Vec::new(),
+                    images: Vec::new(),
+                    intent: None,
                     expanded,
+                    compose_view: ComposeView::Output,
                     expansion_explicit: false,
                     backgrounded,
-                }));
-            }
-            #[cfg(test)]
-            Update::ToolUpdated {
-                id,
-                status,
-                script,
-                output,
-                backgrounded,
-            } => {
-                let expand_compose = self.call_is_latest_message(&id);
-                let completed_background = {
-                    let Some(call) = self.call_mut(&id) else {
-                        return;
-                    };
-                    let was_running = call.running();
-                    if let Some(script) = script {
-                        call.plan = parse_plan(&script);
-                        call.script = script;
-                    }
-                    if !output.is_empty() {
-                        call.output = output;
-                    }
-                    call.backgrounded |= backgrounded;
-                    if let Some(status) = status {
-                        call.status = status;
-                        if !call.running() {
-                            if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
-                                && !call.expansion_explicit
-                            {
-                                call.expanded = expand_compose;
-                            }
-                            call.finished = Some(Instant::now());
-                            call.finish_running_children();
-                        }
-                    }
-                    was_running && !call.running() && call.backgrounded
-                };
-                // Autonomous model output follows the terminal update for a
-                // detached call without a new ACP prompt/TurnEnded pair. Seal
-                // the current stream so that output starts a new agent block.
-                self.agent_stream_sealed |= completed_background;
-                if let Some(index) = self.call_index(&id) {
-                    self.reclassify_dynamic(index);
-                }
+                })));
             }
             Update::ToolPatched {
                 id,
@@ -1885,7 +2414,9 @@ impl App {
                 status,
                 script,
                 output,
+                images,
                 append_output,
+                intent,
                 backgrounded,
             } => {
                 if self.call_index(&id).is_none() {
@@ -1896,25 +2427,79 @@ impl App {
                         script: script.clone(),
                         backgrounded,
                     });
+                    // A terminal-only observation proves the end, not the start.
+                    // Keep the event clock for other boundaries (such as closing
+                    // reasoning), but do not manufacture a zero-length tool run.
+                    if matches!(
+                        status,
+                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    ) && let Some(index) = self.call_index(&id)
+                        && let Block::Tool(call) = &mut self.blocks[index]
+                    {
+                        call.started = None;
+                    }
                 }
-                let expand_compose = self.call_is_latest_message(&id);
+                if let Some(images) = images
+                    && let Some(index) = self.call_index(&id)
+                    && let Block::Tool(call) = &mut self.blocks[index]
+                {
+                    if !append_output {
+                        let replaced = call
+                            .images
+                            .iter()
+                            .map(|image| image.data.len())
+                            .sum::<usize>();
+                        self.retained_image_source_bytes =
+                            self.retained_image_source_bytes.saturating_sub(replaced);
+                        call.images.clear();
+                    }
+                    for image in images {
+                        if call.images.len() >= MAX_TOOL_IMAGES {
+                            break;
+                        }
+                        if call.images.iter().any(|existing| existing.key == image.key) {
+                            continue;
+                        }
+                        let retained = self
+                            .retained_image_source_bytes
+                            .saturating_add(image.data.len());
+                        if retained <= MAX_RETAINED_IMAGE_SOURCE_BYTES {
+                            self.retained_image_source_bytes = retained;
+                            call.images.push(image);
+                        }
+                    }
+                }
                 let Some(call) = self.call_mut(&id) else {
                     return;
                 };
+                let was_compose = call.is_compose();
+                let was_running = call.running();
                 if let Some(title) = title {
                     if title == agentkit_tool_compose::COMPOSE_TOOL_NAME
                         && call.title != agentkit_tool_compose::COMPOSE_TOOL_NAME
+                        && call.running()
                         && !call.expansion_explicit
                     {
                         call.expanded = true;
                     }
-                    call.title = title;
+                    // ACP title patches describe the current operation, not a new
+                    // tool identity. Keep compose's identity for its specialized view.
+                    if call.is_compose() {
+                        call.intent = (title != agentkit_tool_compose::COMPOSE_TOOL_NAME)
+                            .then(|| title.trim().to_owned())
+                            .filter(|title| !title.is_empty() && title != "Tool");
+                    } else {
+                        call.title = title;
+                    }
                 }
                 if let Some(kind) = kind {
                     call.kind = kind;
                 }
+                if let Some(intent) = intent {
+                    call.intent = intent;
+                }
                 if let Some(script) = script {
-                    call.plan = parse_plan(&script);
+                    let script = super::source::bounded_source(script);
                     call.script = script;
                 }
                 if let Some(output) = output {
@@ -1928,22 +2513,46 @@ impl App {
                 call.backgrounded |= backgrounded;
                 if let Some(status) = status {
                     call.status = status;
-                    if !call.running() {
-                        if call.title == agentkit_tool_compose::COMPOSE_TOOL_NAME
-                            && !call.expansion_explicit
-                        {
-                            call.expanded = expand_compose;
-                        }
-                        call.finished = Some(Instant::now());
-                        call.finish_running_children();
+                    if was_running && !call.running() {
+                        call.finalize_terminal_state(at);
                     }
                 }
+                let identity_changed = was_compose != call.is_compose();
+                let completed_background = was_running && !call.running() && call.backgrounded;
+                // Autonomous output after a detached call starts a new agent stream.
+                let landed = (completed_background && call.parent_id.is_none()).then(|| {
+                    (
+                        call.display_title().to_owned(),
+                        call.elapsed(),
+                        call.status == ToolCallStatus::Failed,
+                    )
+                });
+                self.agent_stream_sealed |= completed_background;
                 if let Some(index) = self.call_index(&id) {
+                    if identity_changed {
+                        self.refresh_tool_groups(index);
+                    }
                     self.mark_block_dirty(index);
                     self.reclassify_dynamic(index);
+                    // A result arriving after its turn ended is marked where it
+                    // lands; the card itself stays back in its own turn.
+                    if let Some((title, millis, failed)) = landed
+                        && self.blocks[index + 1..]
+                            .iter()
+                            .any(|block| matches!(block, Block::TurnDuration { .. }))
+                    {
+                        self.push_block(Block::BackgroundResult {
+                            title,
+                            millis,
+                            failed,
+                        });
+                    }
                 }
             }
-            Update::Usage { used, size } => {
+            Update::Usage { used, size, cost } => {
+                if let Some(cost) = cost.filter(valid_cost) {
+                    self.cost = Some(cost);
+                }
                 self.usage = Some(ContextUsage { used, size });
             }
             Update::Runtime(event) => self.apply_runtime(event),
@@ -1954,18 +2563,14 @@ impl App {
                 }
             }
             Update::ConfigOptions(_) => {}
-            Update::State {
-                active,
-                steerable,
-                cancelled,
-            } => {
-                if active {
+            Update::State(state) => match state {
+                StateUpdate::Running(_) | StateUpdate::RequiresAction(_) => {
                     if self.phase == Phase::Idle {
                         self.agent_stream_sealed = true;
-                        self.turn_started = Some(Instant::now());
+                        self.turn_started = at;
                     }
                     if self.phase != Phase::Cancelling {
-                        self.phase = if steerable {
+                        self.phase = if matches!(state, StateUpdate::Running(_)) {
                             Phase::Working
                         } else {
                             Phase::Blocked
@@ -1973,12 +2578,14 @@ impl App {
                     }
                     self.follow = true;
                     self.scroll = usize::MAX;
-                } else {
-                    self.finish_turn(cancelled);
                 }
-            }
-            Update::Stopped(reason) => self.finish_with_stop_reason(reason),
+                StateUpdate::Idle(idle) => self.finish_with_stop_reason(idle.stop_reason),
+                _ => {}
+            },
             Update::ProcessExited(error) => {
+                // Confirmed process exit can retire known roster rows. A mere
+                // diagnostic gap cannot claim those terminal outcomes.
+                self.invalidate_runtime_status();
                 self.finish_turn_with_outcome(false, None);
                 self.retire_active_agents_at(crate::events::now_millis());
                 self.push_block(Block::Error(error));
@@ -1989,243 +2596,116 @@ impl App {
         }
     }
 
-    fn apply_runtime(&mut self, event: RuntimeEvent) {
-        if let RuntimeEvent::SessionStarted { session_id } = event {
-            self.runtime_session_id = Some(session_id);
-            return;
-        }
-        if self.session_id.is_some() && self.runtime_session_id != self.session_id {
-            return;
-        }
-        let event = match event {
-            RuntimeEvent::SessionStarted { .. } => unreachable!("handled above"),
-            RuntimeEvent::CompactionStarted { .. } => {
-                self.compacting = true;
-                return;
-            }
-            RuntimeEvent::CompactionFinished { ok, compacted, .. } => {
-                self.compacting = false;
-                if ok && compacted {
-                    self.usage = None;
-                    self.note("context compacted");
-                }
-                return;
-            }
-            RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
-                self.apply_agent_runtime(event);
-                return;
-            }
-            event => event,
-        };
-        let parent = event.parent_call().map(str::to_string);
-        let call = match parent.and_then(|parent| self.call_mut(&parent)) {
-            Some(call) => call,
-            // Compose runs started by a subagent report against a call this
-            // client never saw; fold them into the visible run instead.
-            None => match self.running_call_mut() {
-                Some(call) => call,
-                None => return,
-            },
-        };
-        let owner_id = call.id.clone();
-        match event {
-            RuntimeEvent::ChildStarted {
-                call: child_call,
-                tool,
-                summary,
-                ..
-            } => call.attach(child_call, tool, summary),
-            RuntimeEvent::ChildFinished {
-                call: child_call,
-                ok,
-                summary,
-                millis,
-                ..
-            } => call.finish_child(&child_call, ok, summary, millis),
-            RuntimeEvent::SessionStarted { .. }
-            | RuntimeEvent::CompactionStarted { .. }
-            | RuntimeEvent::CompactionFinished { .. }
-            | RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => unreachable!("handled above"),
-        }
-        if let Some(index) = self.call_index(&owner_id) {
-            self.reclassify_dynamic(index);
-        }
-    }
-
-    fn call_index(&self, id: &str) -> Option<usize> {
-        self.blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.id == id))
-    }
-
-    fn call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
-        let index = self.call_index(id)?;
-        self.mark_block_dirty(index);
-        match &mut self.blocks[index] {
-            Block::Tool(call) => Some(call),
-            _ => unreachable!(),
-        }
-    }
-
-    fn running_call_mut(&mut self) -> Option<&mut ToolCall> {
-        let index = self
-            .blocks
-            .iter()
-            .rposition(|block| matches!(block, Block::Tool(call) if call.running()))?;
-        self.mark_block_dirty(index);
-        match &mut self.blocks[index] {
-            Block::Tool(call) => Some(call),
-            _ => unreachable!(),
-        }
-    }
-
-    fn close_thought(&mut self) {
-        if let Some(Block::Thought {
-            started,
-            millis: millis @ None,
-            ..
-        }) = self.blocks.last_mut()
-        {
-            *millis = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            let index = self.blocks.len() - 1;
-            self.mark_block_dirty(index);
-            self.reclassify_dynamic(index);
-        }
-    }
-
-    /// Switches the visible client state to a fresh persisted session. Editor
-    /// history and diagnostics remain useful, while transcript-derived state
-    /// starts empty.
-    pub fn start_session(&mut self, session_id: String) {
-        self.session_catalog_pending = false;
-        self.session_id = Some(session_id);
-        self.file_picker = None;
-        self.available_commands.clear();
-        self.command_completion_selected = 0;
-        self.command_completion_query = None;
-        self.command_completion_dismissed = None;
-        self.blocks.clear();
-        self.transcript_cache.clear();
-        self.transcript_revisions.clear();
-        self.transcript_dirty.clear();
-        self.transcript_dynamic.clear();
-        self.transcript_thoughts.clear();
-        self.transcript_prefixes.clear();
-        self.transcript_prefixes.push(0);
-        self.transcript_cache_width = 0;
-        self.retained_image_source_bytes = 0;
-        self.transcript_focus_index = None;
-        self.clear_attachments();
-        self.latest_agent_source.clear();
-        self.phase = Phase::Idle;
-        self.turn_started = None;
-        self.message_blocks.clear();
-        self.pending_steers.clear();
-        self.compacting = false;
-        self.usage = None;
-        self.show_logs = false;
-        self.scroll = usize::MAX;
-        self.follow = true;
-        self.focused_call_id = None;
+    fn disable_runtime(&mut self) {
+        // Cost reports remain valid historical observations after transport loss.
         self.agents.clear();
+        self.invalidate_runtime_status();
+    }
+
+    fn invalidate_runtime_status(&mut self) {
+        if self.runtime_status_unavailable {
+            return;
+        }
+        self.runtime_status_unavailable = true;
+        for view in self.child_views.values_mut() {
+            view.disable("Child connection unavailable; retained transcript is read-only");
+        }
+        for row in self.agents.values_mut() {
+            row.focus_can_steer = false;
+        }
+        // All these fields depend on the same lossy side channel. Absence is
+        // unknown, not idle/success/healthy; the UI exposes unavailability.
         self.agent_versions.clear();
         self.cleaned_agent_ids.clear();
         self.cleaned_agent_ancestors.clear();
         self.agents_scroll = 0;
-        self.agents_viewport = 0;
-        self.agents_area = Rect::default();
-        self.viewport = 0;
-        self.total_lines = 0;
-        self.transcript_top = 0;
-        self.transcript_left = 0;
-        self.transcript_width = 0;
-        self.row_calls.clear();
-        self.row_links.clear();
-        self.row_code.clear();
-        self.selection = None;
-        self.press = None;
+        // Attachment identity survives transport loss; ACP emits it only when
+        // attaching. Keep it distinct from session_id to reject another session.
+        self.compacting = false;
+        self.storage_pending = false;
+        self.storage_exhausted = false;
     }
 
-    #[cfg(test)]
-    pub fn push_user(&mut self, prompt: String) -> u64 {
-        let id = format!("test-user-{}", self.blocks.len());
-        self.apply(Update::UserMessage {
-            id,
-            text: prompt,
-            images: Vec::new(),
-            append: false,
-        });
-        self.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        self.blocks.len() as u64
+    pub(super) fn runtime_unavailable(&self) -> bool {
+        self.runtime_status_unavailable
     }
 
-    /// Folds a tool call's raw output open or shut.
-    pub fn toggle_output(&mut self, id: &str) {
-        if let Some(call) = self.call_mut(id) {
-            call.expanded = !call.expanded;
-            call.expansion_explicit = true;
+    /// Monotonic transport deadline, also checked before accepting new traffic.
+    pub(super) fn runtime_tick_at(&mut self, now: Instant) {
+        if !self.runtime_status_unavailable
+            && self.runtime_last_frame.is_some_and(|last| {
+                now.saturating_duration_since(last) >= crate::diagnostic_transport::LEASE
+            })
+        {
+            self.disable_runtime();
         }
-        if let Some(index) = self.call_index(id) {
-            self.mark_block_dirty(index);
+    }
+    fn runtime_activity(&mut self) {
+        let now = Instant::now();
+        self.runtime_tick_at(now);
+        if !self.runtime_status_unavailable {
+            self.runtime_last_frame = Some(now);
         }
     }
 
-    /// Folds the most recent tool call, for keyboard use.
-    pub fn toggle_last_output(&mut self) {
-        if let Some(id) = self.blocks.iter().rev().find_map(|block| match block {
-            Block::Tool(call) => Some(call.id.clone()),
-            _ => None,
-        }) {
-            self.toggle_output(&id);
-        }
+    fn apply_runtime(&mut self, event: RuntimeEvent) {
+        self.apply_runtime_at(event, crate::events::now_millis());
     }
 
-    pub fn note(&mut self, text: impl Into<String>) {
-        self.push_block(Block::Notice(text.into()));
-    }
-
-    fn apply_agent_runtime(&mut self, event: RuntimeEvent) {
-        self.apply_agent_runtime_at(event, crate::events::now_millis());
-    }
-
-    fn retire_active_agents_at(&mut self, now_unix_ms: u64) {
-        for row in self.agents.values_mut() {
-            if matches!(
-                row.status,
-                SubagentStatus::Starting | SubagentStatus::Working
-            ) {
-                row.status = SubagentStatus::Removed;
-                row.outcome = Some(GenerationOutcome::Failed);
-                row.generation_finished_at_unix_ms
-                    .get_or_insert(now_unix_ms);
-                self.agent_versions.insert(
-                    row.id.clone(),
-                    (row.generation, agent_status_rank(SubagentStatus::Removed)),
-                );
-            }
-        }
-        self.clamp_agents_scroll();
-    }
-
-    #[cfg(test)]
     fn apply_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
-        match event {
-            RuntimeEvent::SubagentStateChanged { .. }
-            | RuntimeEvent::SubagentDescendantsRemoved { .. } => {
-                self.apply_agent_runtime_at(event, now_unix_ms);
+        // Check expiry before any frame can refresh the lease or revive a
+        // lifecycle map. Loss applies to every diagnostic lifecycle event.
+        self.runtime_activity();
+        if let RuntimeEvent::RunletTransport { available } = event {
+            if available {
+                if self.runtime_status_unavailable {
+                    // A heartbeat restores transport, not the observations lost
+                    // during the gap. Keep cleared state.
+                    self.note("Runtime status resumed; earlier agent, compaction and storage state remains unknown");
+                }
+                self.runtime_status_unavailable = false;
+                self.runtime_last_frame = Some(Instant::now());
+            } else {
+                self.disable_runtime();
             }
-            event => self.apply_runtime(event),
+            return;
         }
-    }
-
-    fn apply_agent_runtime_at(&mut self, event: RuntimeEvent, now_unix_ms: u64) {
+        // Attachment markers identify the stream even during a gap, but do not
+        // restore transport health or any lifecycle observations.
+        if let RuntimeEvent::SessionStarted { session_id } = event {
+            self.runtime_session_id = Some(session_id);
+            return;
+        }
+        if self.runtime_unavailable() {
+            return;
+        }
         match event {
+            RuntimeEvent::RunletTransport { .. } | RuntimeEvent::SessionStarted { .. } => (),
+            RuntimeEvent::StorageStatus { pending, exhausted } => {
+                self.storage_pending = pending;
+                self.storage_exhausted = exhausted;
+            }
+            _ if self.session_id.is_some() && self.runtime_session_id != self.session_id => (),
+            RuntimeEvent::CompactionStarted { .. } => {
+                self.compacting = true;
+            }
+            RuntimeEvent::CompactionFinished {
+                reason,
+                ok,
+                compacted,
+                millis,
+            } => {
+                self.compacting = false;
+                if ok && compacted {
+                    self.usage = None;
+                    self.push_block(Block::Compacted { reason, millis });
+                }
+            }
+            RuntimeEvent::SubagentCapabilities {
+                id,
+                generation,
+                can_steer,
+            } => self.child_capabilities(&id, generation, can_steer),
             RuntimeEvent::SubagentStateChanged {
                 id,
                 name,
@@ -2236,6 +2716,7 @@ impl App {
                 parent_id,
                 parent_name,
                 harness,
+                vendor,
                 model,
                 created_at_unix_ms,
                 generation_started_at_unix_ms,
@@ -2272,10 +2753,29 @@ impl App {
                 {
                     self.agents.remove(&id);
                 } else {
+                    if !self.agents_auto_opened && status != SubagentStatus::Removed {
+                        self.agents_visible = true;
+                        self.agents_auto_opened = true;
+                    }
+                    // Usage arrives on its own event stream; a lifecycle
+                    // transition must not blank a reading already shown.
+                    let usage = self.agents.get(&id).and_then(|row| row.usage);
+                    let previous = self.agents.get(&id);
+                    let mut activity = previous.map(|row| row.activity.clone()).unwrap_or_default();
+                    if previous.is_none_or(|row| row.generation != generation)
+                        || matches!(status, SubagentStatus::Idle | SubagentStatus::Removed)
+                    {
+                        activity.clear_transient();
+                    }
+
+                    let focus_can_steer = previous
+                        .is_some_and(|row| row.generation == generation && row.focus_can_steer)
+                        && status == SubagentStatus::Working;
                     self.agents.insert(
                         id.clone(),
                         AgentRow {
-                            id,
+                            focus_can_steer,
+                            id: id.clone(),
                             name,
                             status,
                             outcome,
@@ -2284,12 +2784,45 @@ impl App {
                             parent_id,
                             parent_name,
                             harness,
+                            vendor,
                             model,
                             created_at_unix_ms,
                             generation_started_at_unix_ms,
                             generation_finished_at_unix_ms,
+                            usage,
+                            cost: self.agent_costs.get(&id).cloned(),
+                            activity,
                         },
                     );
+                }
+                self.child_lifecycle(&id, generation, status);
+                self.clamp_agents_scroll();
+            }
+            RuntimeEvent::SubagentActivity { id, activity } => {
+                if let Some(row) = self.agents.get_mut(&id)
+                    && (matches!(activity, crate::events::SubagentActivity::Title { .. })
+                        || matches!(
+                            row.status,
+                            SubagentStatus::Starting | SubagentStatus::Working
+                        ))
+                {
+                    row.activity.apply(activity);
+                }
+            }
+            RuntimeEvent::SubagentUsage {
+                id,
+                used,
+                size,
+                cost,
+            } => {
+                if let Some(cost) = cost.filter(valid_cost) {
+                    self.agent_costs.insert(id.clone(), cost.clone());
+                    if let Some(row) = self.agents.get_mut(&id) {
+                        row.cost = Some(cost);
+                    }
+                }
+                if let Some(row) = self.agents.get_mut(&id) {
+                    row.usage = Some(ContextUsage { used, size });
                 }
             }
             RuntimeEvent::SubagentDescendantsRemoved { ancestor_id } => {
@@ -2309,11 +2842,369 @@ impl App {
                         break;
                     }
                 }
+                for id in &removed {
+                    if let Some(view) = self.child_views.get_mut(id) {
+                        view.disable("Child removed; retained transcript is read-only");
+                    }
+                }
                 self.agents.retain(|id, _| !removed.contains(id));
                 self.cleaned_agent_ancestors.insert(ancestor_id);
                 self.cleaned_agent_ids.extend(removed);
+                self.clamp_agents_scroll();
             }
-            _ => unreachable!("only subagent runtime events reach the roster reducer"),
+        }
+    }
+
+    pub(super) fn tool_call(&self, id: &str) -> Option<&ToolCall> {
+        self.call_index(id)
+            .and_then(|index| match &self.blocks[index] {
+                Block::Tool(call) => Some(call.as_ref()),
+                _ => None,
+            })
+    }
+
+    fn call_index(&self, id: &str) -> Option<usize> {
+        self.tool_indices.get(id).copied()
+    }
+
+    fn call_mut(&mut self, id: &str) -> Option<&mut ToolCall> {
+        let index = self.call_index(id)?;
+        self.mark_block_dirty(index);
+        match &mut self.blocks[index] {
+            Block::Tool(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    /// Resolve explicit ACP edges, memoizing paths only for this affected update.
+    /// Missing ancestors and cycles leave calls visible without a displayed owner.
+    fn compose_root(
+        &self,
+        index: usize,
+        resolved: &mut HashMap<usize, Option<usize>>,
+    ) -> Option<usize> {
+        let mut path = HashSet::new();
+        let mut cursor = index;
+        let root = loop {
+            if let Some(root) = resolved.get(&cursor) {
+                break *root;
+            }
+            if !path.insert(cursor) {
+                break None;
+            }
+            let Block::Tool(call) = &self.blocks[cursor] else {
+                break None;
+            };
+            let Some(parent) = &call.parent_id else {
+                break call.is_compose().then_some(cursor);
+            };
+            let Some(&parent) = self.tool_indices.get(parent) else {
+                break None;
+            };
+            cursor = parent;
+        };
+        for index in path {
+            resolved.insert(index, root);
+        }
+        root
+    }
+
+    /// Only descendants of an arriving/reparented/renamed call can change owner.
+    /// Reverse edges include unresolved parents, so arrivals attach existing orphans.
+    fn refresh_tool_groups(&mut self, index: usize) {
+        let mut affected = BTreeSet::new();
+        let mut pending = vec![index];
+        while let Some(index) = pending.pop() {
+            if !affected.insert(index) {
+                continue;
+            }
+            if let Block::Tool(call) = &self.blocks[index]
+                && let Some(children) = self.tool_dependents.get(&call.id)
+            {
+                pending.extend(children.iter().copied());
+            }
+        }
+        let mut resolved = HashMap::new();
+        let mut changed = BTreeSet::new();
+        for index in affected {
+            let owner = self
+                .compose_root(index, &mut resolved)
+                .filter(|&root| root != index);
+            let previous = self.tool_owners.get(&index).copied();
+            if owner == previous {
+                continue;
+            }
+            changed.insert(index);
+            if let Some(previous) = previous {
+                self.tool_owners.remove(&index);
+                if let Some(children) = self.grouped_tools.get_mut(&previous) {
+                    if let Ok(position) = children.binary_search(&index) {
+                        children.remove(position);
+                    }
+                    if children.is_empty() {
+                        self.grouped_tools.remove(&previous);
+                    }
+                }
+                changed.insert(previous);
+            }
+            if let Some(owner) = owner {
+                // Child creation can precede its ACP parent patch and implicitly
+                // fold the previous card. Restore the running group's default
+                // expansion, but never override an explicit user choice.
+                if let Block::Tool(call) = &mut self.blocks[owner]
+                    && call.running()
+                    && !call.expansion_explicit
+                {
+                    call.expanded = true;
+                }
+                self.tool_owners.insert(index, owner);
+                let children = self.grouped_tools.entry(owner).or_default();
+                if let Err(position) = children.binary_search(&index) {
+                    children.insert(position, index);
+                }
+                changed.insert(owner);
+            }
+        }
+        if let Some(focus) = self.transcript_focus_index
+            && let Some(&owner) = self.tool_owners.get(&focus)
+            && changed.contains(&focus)
+            && let Ok(position) = self.grouped_tools[&owner].binary_search(&focus)
+            && let Block::Tool(call) = &mut self.blocks[owner]
+        {
+            call.child_page = position / 32;
+            // A collapsed group (or its script view) cannot display the focused
+            // child. Keep keyboard actions on the visible owner instead.
+            if !call.expanded || call.compose_view != ComposeView::Output {
+                let id = call.id.clone();
+                self.focus_call_by_id(id);
+            }
+        }
+        if !changed.is_empty() {
+            self.clear_transcript_interaction();
+        }
+        for index in changed {
+            self.mark_block_dirty(index);
+        }
+    }
+
+    fn has_background_ancestor(&self, index: usize) -> bool {
+        let mut cursor = index;
+        let mut visited = HashSet::new();
+        while visited.insert(cursor) {
+            let Block::Tool(call) = &self.blocks[cursor] else {
+                break;
+            };
+            if call.backgrounded {
+                return true;
+            }
+            let Some(parent) = call
+                .parent_id
+                .as_ref()
+                .and_then(|id| self.tool_indices.get(id))
+            else {
+                break;
+            };
+            cursor = *parent;
+        }
+        false
+    }
+
+    pub(super) fn has_grouped_tools(&self, id: &str) -> bool {
+        self.call_index(id)
+            .is_some_and(|index| self.grouped_tools.contains_key(&index))
+    }
+
+    pub(super) fn child_window(&self, owner: usize) -> (&[usize], usize, usize) {
+        const PAGE: usize = 32;
+        let Some(children) = self.grouped_tools.get(&owner) else {
+            return (&[], 0, 0);
+        };
+        let Block::Tool(call) = &self.blocks[owner] else {
+            return (&[], 0, 0);
+        };
+        let start = call.child_page.min((children.len() - 1) / PAGE) * PAGE;
+        (
+            &children[start..(start + PAGE).min(children.len())],
+            start,
+            children.len(),
+        )
+    }
+
+    fn page_children(&mut self, forward: bool) -> bool {
+        let Some(focus) = self.transcript_focus_index else {
+            return false;
+        };
+        let owner = self.tool_owners.get(&focus).copied().unwrap_or(focus);
+        let Some(children) = self.grouped_tools.get(&owner) else {
+            return false;
+        };
+        let last = (children.len() - 1) / 32;
+        let Block::Tool(call) = &mut self.blocks[owner] else {
+            return false;
+        };
+        call.child_page = if forward {
+            (call.child_page + 1).min(last)
+        } else {
+            call.child_page.saturating_sub(1)
+        };
+        call.expanded = true;
+        call.compose_view = ComposeView::Output;
+        call.expansion_explicit = true;
+        let id = call.id.clone();
+        self.focus_call_by_id(id);
+        self.mark_block_dirty(owner);
+        self.clear_transcript_interaction();
+        true
+    }
+
+    fn close_thought(&mut self) {
+        let at = self.observed_at();
+        if let Some(Block::Thought {
+            started,
+            millis,
+            closed,
+            ..
+        }) = self.blocks.last_mut()
+            && !*closed
+        {
+            *millis = observed_duration(*started, at);
+            *closed = true;
+            let index = self.blocks.len() - 1;
+            self.mark_block_dirty(index);
+            self.reclassify_dynamic(index);
+        }
+    }
+
+    /// Switches the visible client state to a fresh persisted session. Editor
+    /// history and diagnostics remain useful, while transcript-derived state
+    /// starts empty.
+    pub fn start_session(&mut self, session_id: String) {
+        self.model_switch = None;
+        self.cancel_steer_edit();
+        self.selected_steer = None;
+        self.queue_focused = false;
+        self.queue_handoff = false;
+        self.retired_steers.clear();
+        self.steer_mutations.clear();
+        self.session_catalog_pending = false;
+        self.session_id = Some(session_id);
+        self.file_picker = None;
+        self.available_commands.clear();
+        self.command_completion_selected = 0;
+        self.command_completion_query = None;
+        self.command_completion_dismissed = None;
+        self.blocks.clear();
+        self.tool_indices.clear();
+        self.tool_dependents.clear();
+        self.tool_owners.clear();
+        self.grouped_tools.clear();
+        self.transcript_cache.clear();
+        self.transcript_revisions.clear();
+        self.transcript_dirty.clear();
+        self.transcript_dynamic.clear();
+        self.transcript_thoughts.clear();
+        self.transcript_prefixes.clear();
+        self.transcript_prefixes.push(0);
+        self.transcript_cache_width = 0;
+        self.retained_image_source_bytes = 0;
+        self.image_source_limit_noticed = false;
+        self.attachment_cache.clear();
+        self.transcript_focus_index = None;
+        self.clear_attachments();
+        self.latest_agent_source.clear();
+        self.phase = Phase::Idle;
+        self.turn_started = None;
+        self.prompt_started = None;
+        self.prompt_seen = false;
+        self.message_blocks.clear();
+        self.pending_steers.clear();
+        self.compacting = false;
+        self.usage = None;
+        self.show_logs = false;
+        self.scroll = usize::MAX;
+        self.follow = true;
+        self.focused_call_id = None;
+        self.child_focus = None;
+        self.child_views.clear();
+        self.child_ui.clear();
+        self.agents_selected = None;
+        self.agents_keyboard_focus = false;
+        self.child_back_area = Rect::default();
+        self.agents_auto_opened = false;
+        self.cost = None;
+        self.agent_costs.clear();
+        self.agents.clear();
+        self.agent_versions.clear();
+        self.cleaned_agent_ids.clear();
+        self.cleaned_agent_ancestors.clear();
+        self.agents_scroll = 0;
+        self.agents_viewport = 0;
+        self.agents_area = Rect::default();
+        self.viewport = 0;
+        self.total_lines = 0;
+        self.transcript_top = 0;
+        self.transcript_left = 0;
+        self.transcript_width = 0;
+        self.row_calls.clear();
+        self.row_links.clear();
+        self.row_code.clear();
+        self.selection = None;
+        self.press = None;
+    }
+
+    /// Folds a tool call's raw output open or shut. Completed compose calls
+    /// cycle through their output and source views before folding closed.
+    pub fn toggle_output(&mut self, id: &str) {
+        if let Some(call) = self.call_mut(id) {
+            if call.is_compose() && !call.running() {
+                match (call.expanded, call.compose_view) {
+                    (false, _) => {
+                        call.expanded = true;
+                        call.compose_view = ComposeView::Output;
+                    }
+                    (true, ComposeView::Output) => call.compose_view = ComposeView::Script,
+                    (true, ComposeView::Script) => call.expanded = false,
+                }
+            } else {
+                call.expanded = !call.expanded;
+            }
+            call.expansion_explicit = true;
+        }
+        if let Some(index) = self.call_index(id) {
+            self.mark_block_dirty(index);
+        }
+    }
+
+    /// Folds the most recent tool call, for keyboard use.
+    pub fn toggle_last_output(&mut self) {
+        if let Some(id) = self.blocks.iter().rev().find_map(|block| match block {
+            Block::Tool(call) => Some(call.id.clone()),
+            _ => None,
+        }) {
+            self.toggle_output(&id);
+        }
+    }
+
+    pub fn note(&mut self, text: impl Into<String>) {
+        self.push_block(Block::Notice(text.into()));
+    }
+
+    fn retire_active_agents_at(&mut self, now_unix_ms: u64) {
+        for row in self.agents.values_mut() {
+            if matches!(
+                row.status,
+                SubagentStatus::Starting | SubagentStatus::Working
+            ) {
+                row.status = SubagentStatus::Removed;
+                row.activity.clear_transient();
+                row.outcome = Some(GenerationOutcome::Failed);
+                row.generation_finished_at_unix_ms
+                    .get_or_insert(now_unix_ms);
+                self.agent_versions.insert(
+                    row.id.clone(),
+                    (row.generation, agent_status_rank(SubagentStatus::Removed)),
+                );
+            }
         }
         self.clamp_agents_scroll();
     }
@@ -2345,49 +3236,79 @@ impl App {
         kind: AttachmentKind,
         size: u64,
     ) {
-        self.next_attachment += 1;
-        let label = match kind {
+        self.attach_attachment(Attachment {
+            path,
+            placeholder: String::new(),
+            mime_type,
+            kind,
+            size,
+            temporary: None,
+        });
+    }
+
+    pub(super) fn attach_attachment(&mut self, mut attachment: Attachment) {
+        if self.editing_steer() {
+            self.toast("pending-message edits are text-only");
+            return;
+        }
+        self.queue_handoff = false;
+        self.file_picker = None;
+        self.prune_attachments();
+        let Some(number) = self.next_attachment.checked_add(1) else {
+            self.toast("attachment numbering exhausted — start a new session");
+            return;
+        };
+        self.next_attachment = number;
+        let label = match attachment.kind {
             AttachmentKind::Image => "Image",
             AttachmentKind::Audio => "Audio",
         };
         let placeholder = format!("[{label} #{}]", self.next_attachment);
-        if self
-            .editor
-            .text()
-            .chars()
-            .last()
-            .is_some_and(|character| !character.is_whitespace())
-        {
+        let cursor = self.editor.cursor();
+        let before = self.editor.text()[..cursor].chars().next_back();
+        let after = self.editor.text()[cursor..].chars().next();
+        if before.is_some_and(|character| !character.is_whitespace()) {
             self.editor.insert_char(' ');
         }
         self.editor.insert_str(&placeholder);
-        self.attachments.push(Attachment {
-            path,
-            placeholder,
-            mime_type,
-            kind,
-            size,
-        });
+        if after.is_none_or(|character| !character.is_whitespace()) {
+            self.editor.insert_char(' ');
+        } else {
+            self.editor.move_right();
+        }
+        attachment.placeholder = placeholder;
+        self.attachments.push(attachment);
         self.toast(format!("attached {label} #{}", self.next_attachment));
     }
 
     pub fn clear_attachments(&mut self) {
         self.attachments.clear();
+        self.retained_attachment_files.clear();
         self.next_attachment = 0;
+        self.submitted_attachment = 0;
+    }
+
+    pub fn accept_attachments(&mut self, accepted: &[Attachment]) {
+        if let Some(number) = accepted.iter().filter_map(attachment_number).max() {
+            self.submitted_attachment = self.submitted_attachment.max(number);
+        }
+        self.retained_attachment_files.extend(
+            accepted
+                .iter()
+                .filter_map(|attachment| attachment.temporary.clone()),
+        );
+        self.attachments.clear();
+        self.next_attachment = self.submitted_attachment;
     }
 
     pub fn restore_attachments(&mut self, attachments: Vec<Attachment>) {
-        self.next_attachment = attachments
-            .iter()
-            .filter_map(|attachment| {
-                attachment
-                    .placeholder
-                    .strip_suffix(']')
-                    .and_then(|placeholder| placeholder.rsplit_once('#'))
-                    .and_then(|(_, number)| number.parse().ok())
-            })
-            .max()
-            .unwrap_or(0);
+        self.next_attachment = self.submitted_attachment.max(
+            attachments
+                .iter()
+                .filter_map(attachment_number)
+                .max()
+                .unwrap_or(0),
+        );
         self.attachments = attachments;
     }
 
@@ -2395,6 +3316,62 @@ impl App {
         let prompt = self.editor.text();
         self.attachments
             .retain(|attachment| prompt.contains(&attachment.placeholder));
+        self.next_attachment = self.submitted_attachment.max(
+            self.attachments
+                .iter()
+                .filter_map(attachment_number)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+
+    fn delete_with_attachments(&mut self, backwards: bool, delete: fn(&mut Editor)) {
+        if self.attachments.is_empty() {
+            delete(&mut self.editor);
+            return;
+        }
+        let old_text = self.editor.text().to_owned();
+        let old_cursor = self.editor.cursor();
+        delete(&mut self.editor);
+        let removed = old_text.len().saturating_sub(self.editor.text().len());
+        if removed == 0 {
+            return;
+        }
+        let deleted = if backwards {
+            old_cursor - removed..old_cursor
+        } else {
+            old_cursor..old_cursor + removed
+        };
+        let mut expanded = deleted.clone();
+        for attachment in &self.attachments {
+            for (start, placeholder) in old_text.match_indices(&attachment.placeholder) {
+                let end = start + placeholder.len();
+                let deleted_separator = backwards
+                    && end == deleted.start
+                    && old_text.as_bytes().get(end) == Some(&b' ')
+                    && deleted.end == end + 1;
+                if start < deleted.end && deleted.start < end || deleted_separator {
+                    expanded.start = expanded.start.min(start);
+                    expanded.end = expanded.end.max(end);
+                }
+            }
+        }
+        if expanded == deleted {
+            self.prune_attachments();
+            return;
+        }
+        if old_text.as_bytes().get(expanded.end) == Some(&b' ')
+            && (expanded.start == 0
+                || old_text[..expanded.start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
+        {
+            expanded.end += 1;
+        }
+        let remaining_end = deleted.start + expanded.end - deleted.end;
+        self.editor.replace_range(expanded.start..remaining_end, "");
+        self.prune_attachments();
     }
 
     /// Inserts pasted text into the prompt.
@@ -2408,7 +3385,41 @@ impl App {
             .is_some_and(|dialog| dialog.rename.is_some())
     }
 
+    pub(super) fn clipboard_route(&self) -> ClipboardRoute {
+        if self.child_focus.is_some()
+            || self.model_switch.is_some()
+            || self.model_dialog.is_some()
+            || self.effort_dialog.is_some()
+            || (self.session_dialog.is_some() && !self.session_rename_active())
+            || (self.queue_focused && !self.session_rename_active())
+        {
+            ClipboardRoute::Blocked(self.clipboard_route_epoch)
+        } else if self.session_rename_active() {
+            ClipboardRoute::Rename(self.clipboard_route_epoch)
+        } else if let Some(edit) = &self.steer_edit {
+            ClipboardRoute::Steer {
+                id: edit.id.clone(),
+                token: edit.token,
+            }
+        } else {
+            ClipboardRoute::Composer(self.clipboard_route_epoch)
+        }
+    }
+
+    pub(super) fn finish_clipboard_route_event(&mut self, before: &ClipboardRoute) {
+        if std::mem::discriminant(before) != std::mem::discriminant(&self.clipboard_route()) {
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+        }
+    }
+
     pub fn paste(&mut self, text: &str) {
+        if self.child_focus.is_some() {
+            self.paste_child(text);
+            return;
+        }
+        if self.model_switch.is_some() {
+            return;
+        }
         // An explicit bracketed paste is not part of the unbracketed key-burst heuristic.
         self.last_key = None;
         if let Some(rename) = self
@@ -2429,6 +3440,7 @@ impl App {
             return;
         }
         self.file_picker = None;
+        self.queue_handoff = false;
         self.editor.insert_str(text);
         self.sync_command_completion();
         let lines = text.lines().count();
@@ -2699,24 +3711,19 @@ impl App {
         }
     }
 
-    fn refresh_file_picker(&mut self) -> Action {
+    fn refresh_file_picker(&mut self, mut dialog: FilePickerDialog) -> Action {
         let Some(query_range) = self.active_file_query_range() else {
             self.file_picker = None;
             return Action::None;
         };
-        let activation = self
-            .file_picker
-            .as_ref()
-            .expect("active query belongs to a picker")
-            .activation;
+        let activation = dialog.activation;
         let revision = self.next_file_search_revision();
         let query = self.editor.text()[query_range.start + 1..query_range.end].to_string();
-        if let Some(dialog) = &mut self.file_picker {
-            dialog.query_range = query_range;
-            dialog.revision = revision;
-            dialog.selected = 0;
-            dialog.status = FilePickerStatus::Loading;
-        }
+        dialog.query_range = query_range;
+        dialog.revision = revision;
+        dialog.selected = 0;
+        dialog.status = FilePickerStatus::Loading;
+        self.file_picker = Some(dialog);
         Action::SearchFiles {
             query,
             revision,
@@ -2734,64 +3741,326 @@ impl App {
         }
     }
 
-    fn handle_file_picker_key(&mut self, key: KeyEvent) -> Action {
+    fn handle_file_picker_key(&mut self, key: KeyEvent, mut dialog: FilePickerDialog) -> Action {
         match key.code {
-            KeyCode::Esc => self.file_picker = None,
-            KeyCode::Up => {
-                if let Some(dialog) = &mut self.file_picker {
-                    dialog.selected = dialog.selected.saturating_sub(1);
-                }
-            }
+            KeyCode::Esc => return Action::None,
+            KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
             KeyCode::Down => {
-                if let Some(dialog) = &mut self.file_picker {
-                    dialog.selected =
-                        (dialog.selected + 1).min(dialog.matches.len().saturating_sub(1));
-                }
+                dialog.selected = (dialog.selected + 1).min(dialog.matches.len().saturating_sub(1));
             }
             KeyCode::Tab => {
-                let selection = self.file_picker.as_ref().and_then(|dialog| {
-                    dialog
-                        .matches
-                        .get(dialog.selected)
-                        .map(|item| (dialog.query_range.clone(), item.relative_path.clone()))
-                });
-                if let Some((range, path)) = selection {
-                    self.editor.replace_range(range, &format!("@{path}"));
-                    self.file_picker = None;
+                if let Some(item) = dialog.matches.get(dialog.selected) {
+                    self.editor
+                        .replace_range(dialog.query_range, &format!("@{}", item.relative_path));
+                    return Action::None;
                 }
             }
             KeyCode::Backspace => {
                 self.editor.backspace();
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
             KeyCode::Delete => {
                 self.editor.delete_forward();
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
             KeyCode::Left => {
                 self.editor.move_left();
+                self.file_picker = Some(dialog);
                 self.revalidate_file_picker();
+                return Action::None;
             }
             KeyCode::Right => {
                 self.editor.move_right();
+                self.file_picker = Some(dialog);
                 self.revalidate_file_picker();
+                return Action::None;
             }
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
                 self.editor.insert_char(character);
-                return self.refresh_file_picker();
+                return self.refresh_file_picker(dialog);
             }
-            _ => self.file_picker = None,
+            _ => return Action::None,
+        }
+        self.file_picker = Some(dialog);
+        Action::None
+    }
+
+    pub fn editing_steer(&self) -> bool {
+        self.steer_edit.is_some()
+    }
+
+    fn cancel_steer_edit(&mut self) {
+        if let Some(edit) = self.steer_edit.take() {
+            self.editor = edit.draft;
+            self.attachments = edit.attachments;
+            self.next_attachment = edit.next_attachment;
+            self.file_picker = None;
+            self.sync_command_completion();
+        }
+    }
+
+    fn close_queue_after_update(&mut self) {
+        self.queue_handoff |= self.queue_focused;
+        self.queue_focused = false;
+        self.selected_steer = None;
+    }
+
+    fn remove_pending_steer(&mut self, id: &str) {
+        self.retired_steers.insert(id.to_owned());
+        let index = self
+            .pending_steers
+            .iter()
+            .position(|pending| pending.id == id);
+        self.pending_steers.retain(|pending| pending.id != id);
+        if self.pending_steers.is_empty() {
+            self.close_queue_after_update();
+        } else if self.selected_steer.as_deref() == Some(id) {
+            self.selected_steer = index.and_then(|index| {
+                self.pending_steers
+                    .get(index.min(self.pending_steers.len().saturating_sub(1)))
+                    .map(|pending| pending.id.clone())
+            });
+        }
+    }
+
+    pub fn begin_steer_mutation(&mut self, id: &str, text: Option<String>) -> Option<u64> {
+        if self.steer_mutations.contains_key(id) {
+            self.toast("a change to this pending message is still in progress");
+            return None;
+        }
+        if !self.pending_steers.iter().any(|pending| pending.id == id) {
+            self.toast("message is no longer pending");
+            return None;
+        }
+        if text.is_some()
+            && self
+                .pending_steers
+                .iter()
+                .any(|pending| pending.id == id && !pending.editable)
+        {
+            self.toast("pending messages with media cannot be edited; removal is still available");
+            return None;
+        }
+        self.next_steer_token += 1;
+        let token = self.next_steer_token;
+        let edit_token = self
+            .steer_edit
+            .as_ref()
+            .filter(|edit| edit.id == id)
+            .map(|edit| edit.token);
+        self.steer_mutations.insert(
+            id.to_owned(),
+            SteerMutation {
+                token,
+                edit_token,
+                text,
+            },
+        );
+        self.toast(if self.steer_mutations[id].text.is_some() {
+            "saving pending message…"
+        } else {
+            "removing pending message…"
+        });
+        Some(token)
+    }
+
+    fn finish_steer_mutation(
+        &mut self,
+        id: &str,
+        token: u64,
+        result: Result<(), SteerMutationError>,
+    ) {
+        let std::collections::hash_map::Entry::Occupied(entry) =
+            self.steer_mutations.entry(id.to_owned())
+        else {
+            return;
+        };
+        if entry.get().token != token {
+            return;
+        }
+        let mutation = entry.remove();
+        match result {
+            Ok(()) => {
+                if let Some(text) = mutation.text {
+                    // Delivery may have won the race: update only an existing entry.
+                    if let Some(pending) = self
+                        .pending_steers
+                        .iter_mut()
+                        .find(|pending| pending.id == id)
+                    {
+                        pending.text = text.clone();
+                    }
+                    // Esc/reopen can create another edit for the same ID while this
+                    // request waits. Neither that edit nor newly typed text belongs
+                    // to this completion.
+                    if self
+                        .steer_edit
+                        .as_ref()
+                        .is_some_and(|edit| Some(edit.token) == mutation.edit_token)
+                    {
+                        if self.editor.text() == text {
+                            self.cancel_steer_edit();
+                        } else {
+                            self.toast("earlier revision saved; current edit is still unsaved");
+                        }
+                    }
+                } else {
+                    self.steer_revoked(id);
+                }
+            }
+            Err(error) => self.steer_mutation_failed(id, error.message, error.unavailable),
+        }
+    }
+
+    pub fn steer_revoked(&mut self, id: &str) {
+        self.remove_pending_steer(id);
+    }
+
+    pub fn steer_mutation_failed(&mut self, id: &str, error: String, unavailable: bool) {
+        if unavailable {
+            self.remove_pending_steer(id);
+            self.toast(if self.editing_steer() {
+                "message is no longer pending; copy your edit or Esc to restore draft"
+            } else {
+                "message is no longer pending; it cannot be removed"
+            });
+            return;
+        }
+        // Keep the replacement composer and its parked draft intact for retry/copy/Esc.
+        self.toast(error);
+    }
+
+    fn handle_steer_selection(&mut self, key: KeyEvent) -> Action {
+        if matches!(key.code, KeyCode::Esc | KeyCode::F(2)) {
+            self.selected_steer = None;
+            self.queue_focused = false;
+            return Action::None;
+        }
+        let Some(index) = self
+            .pending_steers
+            .iter()
+            .position(|pending| Some(&pending.id) == self.selected_steer.as_ref())
+        else {
+            self.close_queue_after_update();
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                let next = if key.code == KeyCode::Up {
+                    index.saturating_sub(1)
+                } else {
+                    (index + 1).min(self.pending_steers.len() - 1)
+                };
+                self.selected_steer = Some(self.pending_steers[next].id.clone());
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if self
+                    .steer_mutations
+                    .contains_key(&self.pending_steers[index].id)
+                {
+                    self.toast("a change to this pending message is still in progress");
+                    return Action::None;
+                }
+                return Action::RevokeSteer {
+                    id: self.pending_steers[index].id.clone(),
+                };
+            }
+            KeyCode::Enter => {
+                if !self.can_replace_steer {
+                    self.toast("this agent does not support editing pending messages");
+                    return Action::None;
+                }
+                let pending = &self.pending_steers[index];
+                if !pending.editable {
+                    self.toast(
+                        "pending messages with media cannot be edited; removal is still available",
+                    );
+                    return Action::None;
+                }
+                let mut editor = Editor::default();
+                editor.insert_str(&pending.text);
+                self.next_steer_token += 1;
+                self.steer_edit = Some(SteerEdit {
+                    id: pending.id.clone(),
+                    token: self.next_steer_token,
+                    draft: std::mem::replace(&mut self.editor, editor),
+                    attachments: std::mem::take(&mut self.attachments),
+                    next_attachment: self.next_attachment,
+                });
+                self.next_attachment = 0;
+                self.selected_steer = None;
+                self.queue_focused = false;
+                self.file_picker = None;
+                self.last_key = None;
+            }
+            _ => {}
         }
         Action::None
+    }
+
+    pub fn begin_model_switch(&mut self, choice: ModelChoice, save_defaults: bool) -> Option<u64> {
+        if self.model_switch.is_some() || self.working() {
+            self.note("wait for the current operation before changing models");
+            return None;
+        }
+        self.next_model_switch = self.next_model_switch.wrapping_add(1);
+        let id = self.next_model_switch;
+        self.model_switch = Some(ModelSwitch {
+            id,
+            choice,
+            save_defaults,
+            warning: None,
+            selected: 2,
+            cancelling: false,
+        });
+        Some(id)
     }
 
     /// Applies a key press, returning work for the event loop.
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if let Some(action) = self.handle_focus_key(key) {
+            return action;
+        }
+        if let Some(pending) = self.model_switch.as_mut() {
+            use crate::protocols::acp::model_switch::Decision;
+            let cancel = key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if pending.warning.is_none() {
+                if cancel {
+                    if pending.cancelling {
+                        return if key.code == KeyCode::Char('c') {
+                            Action::Quit
+                        } else {
+                            Action::None
+                        };
+                    }
+                    pending.cancelling = true;
+                    return Action::Cancel;
+                }
+                return Action::None;
+            }
+            if cancel {
+                self.model_switch = None;
+                return Action::Redraw;
+            }
+            match key.code {
+                KeyCode::Up => pending.selected = pending.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => pending.selected = (pending.selected + 1) % 3,
+                KeyCode::Enter => match pending.selected {
+                    0 => return Action::ConfirmModelSwitch(Decision::Continue),
+                    1 => return Action::ConfirmModelSwitch(Decision::Compact),
+                    _ => self.model_switch = None,
+                },
+                _ => {}
+            }
+            return Action::Redraw;
         }
         if self.session_dialog.is_some() {
             // Terminals without bracketed paste deliver a paste as a key burst, so
@@ -2805,6 +4074,109 @@ impl App {
         }
         if self.effort_dialog.is_some() {
             return self.handle_effort_key(key);
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.file_picker = None;
+            // A turn that will not stop must still be escapable: the second
+            // ctrl+c leaves, which takes the agent process with it.
+            if self.phase == Phase::Cancelling {
+                return Action::Quit;
+            }
+            if self.working() {
+                return self.request_cancel();
+            }
+            // A stray ctrl+c should not throw away a half-written prompt.
+            if self.editor.text().is_empty() {
+                return Action::Quit;
+            }
+            self.editor.clear();
+            self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+            self.toast("prompt cleared — ctrl+c again to quit");
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.editor.is_empty()
+        {
+            self.file_picker = None;
+            return Action::Quit;
+        }
+        if key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            && self.page_children(key.code == KeyCode::PageDown)
+        {
+            return Action::None;
+        }
+        // Queue focus owns composer keys, not global task, view, or copy actions.
+        // Ctrl+K is global only when it cancels background work; otherwise it
+        // must not fall through and delete text from the parked composer.
+        let global_key = match key.code {
+            KeyCode::Char('b') => key.modifiers == KeyModifiers::SUPER,
+            KeyCode::Char('k') => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self
+                        .focus_call()
+                        .is_some_and(|call| call.backgrounded && call.running())
+            }
+            KeyCode::Char('y' | 'r' | 'l' | 'o' | 't') | KeyCode::Home | KeyCode::End => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+            }
+            KeyCode::Up | KeyCode::Down => key.modifiers.contains(KeyModifiers::SHIFT),
+            KeyCode::PageUp | KeyCode::PageDown => true,
+            _ => false,
+        };
+        if self.queue_focused && !global_key {
+            return self.handle_steer_selection(key);
+        }
+        if self.queue_handoff && !global_key {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let command = key.modifiers.contains(KeyModifiers::SUPER);
+            let destructive = matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+            ) || (control && matches!(key.code, KeyCode::Char('w' | 'u' | 'k')))
+                || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d'));
+            if destructive {
+                self.toast("queue closed — type, move cursor or Esc before sending/deleting draft");
+                return Action::None;
+            }
+            if key.code == KeyCode::Esc {
+                self.queue_handoff = false;
+                self.toast = None;
+                return Action::None;
+            }
+            // Normal composer interaction stays responsive. View/task shortcuts
+            // above do not acknowledge the changed focus, nor do repeat deletes.
+            if matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Tab
+            ) || (matches!(key.code, KeyCode::Char(_)) && !control && !command)
+                || (control && matches!(key.code, KeyCode::Char('a' | 'e' | 'j')))
+            {
+                self.queue_handoff = false;
+                self.toast = None;
+            }
+        }
+        if key.code == KeyCode::F(2) && !self.editing_steer() {
+            let Some(pending) = self.pending_steers.front() else {
+                self.toast("no pending messages");
+                return Action::None;
+            };
+            self.selected_steer = Some(pending.id.clone());
+            self.queue_focused = true;
+            self.queue_handoff = false;
+            self.file_picker = None;
+            return Action::None;
+        }
+        if key.code == KeyCode::Esc && self.editing_steer() {
+            self.cancel_steer_edit();
+            return Action::None;
         }
         // Terminals without bracketed paste deliver a paste as a key burst, so
         // the arrival gap is the only thing separating it from typing.
@@ -2828,8 +4200,11 @@ impl App {
         };
         let pasted_input =
             pasted && matches!(key.code, KeyCode::Char(_) | KeyCode::Tab | KeyCode::Enter);
-        if self.file_picker.is_some() && !pasted_input && file_picker_key {
-            return self.handle_file_picker_key(key);
+        if !pasted_input
+            && file_picker_key
+            && let Some(dialog) = self.file_picker.take()
+        {
+            return self.handle_file_picker_key(key, dialog);
         }
         self.file_picker = None;
         // `cmd` only reaches the client in terminals that speak the Kitty
@@ -2856,7 +4231,7 @@ impl App {
                         .min(completions.len().saturating_sub(1));
                     return Action::None;
                 }
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::Enter if key.code == KeyCode::Tab || !pasted => {
                     let selected = self
                         .command_completion_selected
                         .min(completions.len().saturating_sub(1));
@@ -2864,7 +4239,10 @@ impl App {
                     self.editor.replace_command_token(&replacement);
                     self.command_completion_query = Some(replacement.clone());
                     self.command_completion_dismissed = Some(replacement);
-                    return Action::None;
+                    if key.code == KeyCode::Tab {
+                        return Action::None;
+                    }
+                    // Enter submits the completed command through the normal safety checks.
                 }
                 _ => {}
             }
@@ -2879,22 +4257,6 @@ impl App {
                 };
                 return Action::DetachCompose(call_id);
             }
-            KeyCode::Char('c') if control => {
-                // A turn that will not stop must still be escapable: the second
-                // ctrl+c leaves, which takes the agent process with it.
-                if self.phase == Phase::Cancelling {
-                    return Action::Quit;
-                }
-                if self.working() {
-                    return self.request_cancel();
-                }
-                // A stray ctrl+c should not throw away a half-written prompt.
-                if self.editor.text().is_empty() {
-                    return Action::Quit;
-                }
-                self.editor.clear();
-                self.toast("prompt cleared — ctrl+c again to quit");
-            }
             KeyCode::Char('k')
                 if control
                     && self
@@ -2907,7 +4269,6 @@ impl App {
                         .unwrap_or_default(),
                 );
             }
-            KeyCode::Char('d') if control && self.editor.is_empty() => return Action::Quit,
             KeyCode::Char('y') if control => {
                 if let Some(text) = self.selection_text() {
                     self.toast("copied selection");
@@ -2930,6 +4291,50 @@ impl App {
                 if self.editor.is_empty() {
                     return Action::None;
                 }
+                if let Some(edit) = &self.steer_edit {
+                    if self.steer_mutations.contains_key(&edit.id) {
+                        self.toast("a change to this pending message is still in progress");
+                        return Action::None;
+                    }
+                    if !self
+                        .pending_steers
+                        .iter()
+                        .any(|pending| pending.id == edit.id)
+                    {
+                        self.toast(
+                            "message is no longer pending; copy your edit or Esc to restore draft",
+                        );
+                        return Action::None;
+                    }
+                    if !self.can_replace_steer {
+                        self.toast("this agent does not support editing pending messages");
+                        return Action::None;
+                    }
+                    return Action::ReplaceSteer {
+                        id: edit.id.clone(),
+                        text: self.editor.text().to_owned(),
+                    };
+                }
+
+                if let Parsed::Usage { provider } =
+                    parse(self.editor.text(), !self.auth_methods.is_empty())
+                {
+                    let provider = provider.map(str::to_owned);
+                    self.editor.submit();
+                    self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+                    return Action::Usage(provider);
+                }
+                if let Parsed::Voice { control } =
+                    parse(self.editor.text(), !self.auth_methods.is_empty())
+                {
+                    let control = control.unwrap_or("").to_owned();
+                    self.editor.submit();
+                    if !self.voice_enabled {
+                        self.note("voice is disabled; set experimental.voice = true in ~/.kit/config.toml and restart Kit");
+                        return Action::None;
+                    }
+                    return Action::Voice(control);
+                }
                 let inject = self.working();
                 if inject {
                     if self.phase != Phase::Working {
@@ -2937,8 +4342,15 @@ impl App {
                         return Action::None;
                     }
                     let input = self.editor.text();
-                    if !matches!(parse(input), Parsed::Prompt(_))
-                        || known_token(input, &self.available_commands).is_some()
+                    if !matches!(
+                        parse(input, !self.auth_methods.is_empty()),
+                        Parsed::Prompt(_)
+                    ) || known_token(
+                        input,
+                        &self.available_commands,
+                        !self.auth_methods.is_empty(),
+                    )
+                    .is_some()
                     {
                         self.toast("commands are available only while idle");
                         return Action::None;
@@ -2949,7 +4361,12 @@ impl App {
                     }
                 }
                 let input = self.editor.submit();
-                return match parse(&input) {
+                // Pending clipboard reads belong to the submitted draft, not
+                // the empty composer that replaces it (including commands).
+                self.clipboard_route_epoch = self.clipboard_route_epoch.wrapping_add(1);
+                return match parse(&input, !self.auth_methods.is_empty()) {
+                    Parsed::Usage { provider } => Action::Usage(provider.map(str::to_owned)),
+                    Parsed::Voice { control } => Action::Voice(control.unwrap_or("").to_owned()),
                     Parsed::New { prompt } => Action::New(prompt.map(str::to_string)),
                     Parsed::Resume {
                         session_id: Some(session_id),
@@ -2971,6 +4388,30 @@ impl App {
                     Parsed::Agents => {
                         self.toggle_agents();
                         Action::None
+                    }
+                    Parsed::Login { method_id } => {
+                        let method = method_id
+                            .and_then(|method_id| {
+                                self.auth_methods
+                                    .iter()
+                                    .find(|method| method.method_id.0.as_ref() == method_id)
+                            })
+                            .or_else(|| {
+                                (method_id.is_none() && self.auth_methods.len() == 1)
+                                    .then(|| &self.auth_methods[0])
+                            });
+                        if let Some(method) = method {
+                            Action::Login(method.clone())
+                        } else {
+                            let ids = self
+                                .auth_methods
+                                .iter()
+                                .map(|method| method.method_id.0.as_ref())
+                                .collect::<Vec<_>>()
+                                .join("|");
+                            self.toast(format!("usage: /login <{ids}>"));
+                            Action::None
+                        }
                     }
                     Parsed::Model { query: Some(query) } => match self.closest_model(query) {
                         Some(choice) => Action::SelectModel {
@@ -3038,15 +4479,29 @@ impl App {
             KeyCode::Enter => self.editor.insert_char('\n'),
             KeyCode::Char('j') if control => self.editor.insert_char('\n'),
             KeyCode::Tab => self.editor.insert_str("    "),
-            KeyCode::Backspace if command => self.editor.delete_to_line_start(),
-            KeyCode::Backspace if alt || control => self.editor.delete_word_back(),
-            KeyCode::Backspace => self.editor.backspace(),
-            KeyCode::Delete if word => self.editor.delete_word_forward(),
-            KeyCode::Delete => self.editor.delete_forward(),
-            KeyCode::Char('w') if control => self.editor.delete_word_back(),
-            KeyCode::Char('u') if control => self.editor.delete_to_line_start(),
-            KeyCode::Char('k') if control => self.editor.delete_to_line_end(),
-            KeyCode::Char('d') if alt => self.editor.delete_word_forward(),
+            KeyCode::Backspace if command => {
+                self.delete_with_attachments(true, Editor::delete_to_line_start);
+            }
+            KeyCode::Backspace if alt || control => {
+                self.delete_with_attachments(true, Editor::delete_word_back);
+            }
+            KeyCode::Backspace => self.delete_with_attachments(true, Editor::backspace),
+            KeyCode::Delete if word => {
+                self.delete_with_attachments(false, Editor::delete_word_forward);
+            }
+            KeyCode::Delete => self.delete_with_attachments(false, Editor::delete_forward),
+            KeyCode::Char('w') if control => {
+                self.delete_with_attachments(true, Editor::delete_word_back);
+            }
+            KeyCode::Char('u') if control => {
+                self.delete_with_attachments(true, Editor::delete_to_line_start);
+            }
+            KeyCode::Char('k') if control => {
+                self.delete_with_attachments(false, Editor::delete_to_line_end);
+            }
+            KeyCode::Char('d') if alt => {
+                self.delete_with_attachments(false, Editor::delete_word_forward);
+            }
             // Legacy terminal encoding reports option+left/right as alt+b/f.
             KeyCode::Char('b') if alt => self.editor.move_word_left(),
             KeyCode::Char('f') if alt => self.editor.move_word_right(),
@@ -3088,7 +4543,7 @@ impl App {
                         .next_back()
                         .is_some_and(char::is_whitespace);
                 self.editor.insert_char('@');
-                if eligible {
+                if eligible && !self.editing_steer() {
                     return self.start_file_picker(at..at + 1);
                 }
             }
@@ -3119,6 +4574,12 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        if let Some(action) = self.handle_focus_mouse(mouse) {
+            return action;
+        }
+        if self.model_switch.is_some() {
+            return Action::None;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp if self.mouse_in_agents(mouse.column, mouse.row) => {
                 self.scroll_agents_by(-3);
@@ -3210,8 +4671,40 @@ impl App {
         )
     }
 
-    /// Copies code, opens links, or folds tool output at the clicked row.
+    /// The command that reopens this session from a shell.
+    pub fn resume_command(&self) -> Option<String> {
+        let id = self.session_id.as_deref()?;
+        let root = self.root.display().to_string();
+        let root = if root.is_empty()
+            || !root
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c))
+        {
+            format!("'{}'", root.replace('\'', "'\\''"))
+        } else {
+            root
+        };
+        Some(format!("kit tui --root {root} --resume {id}"))
+    }
+
+    fn mouse_in(area: Rect, column: usize, row: usize) -> bool {
+        area.width > 0
+            && area.height > 0
+            && column >= usize::from(area.x)
+            && column < usize::from(area.x) + usize::from(area.width)
+            && row >= usize::from(area.y)
+            && row < usize::from(area.y) + usize::from(area.height)
+    }
+
+    /// Copies the resume command, code, opens links, or folds tool output at
+    /// the clicked cell.
     fn click(&mut self, column: usize, row: usize) -> Action {
+        if Self::mouse_in(self.session_area, column, row)
+            && let Some(command) = self.resume_command()
+        {
+            self.toast("copied resume command");
+            return Action::Copy(command);
+        }
         if self.scroll == usize::MAX {
             return Action::None;
         }
@@ -3225,6 +4718,26 @@ impl App {
             return Action::None;
         }
         if let Some(url) = self.clicked_link(column, offset) {
+            if url.starts_with("kit-image:") {
+                let Some(image) = self.blocks.iter().find_map(|block| {
+                    let Block::User(message) = block else {
+                        return None;
+                    };
+                    message
+                        .images
+                        .iter()
+                        .find(|image| image.open_target() == url)
+                }) else {
+                    return Action::None;
+                };
+                // Files retained by an earlier open or admission need no worker
+                // round trip; only misses copy the source and materialize.
+                if let Some(uri) = self.attachment_cache.image_uri(image.key) {
+                    open_url(&uri);
+                    return Action::None;
+                }
+                return Action::OpenUserImage(image.clone());
+            }
             open_url(&url);
             return Action::None;
         }
@@ -3235,6 +4748,21 @@ impl App {
             .and_then(|hit| self.blocks.get(hit.block).map(|block| (block, hit)))
             .and_then(|(block, hit)| match block {
                 Block::Agent(source) => source.get(hit.range.clone()),
+                Block::AgentParts(parts) => {
+                    let mut offset = 0;
+                    parts.iter().find_map(|part| {
+                        let AgentPart::Text(source) = part else {
+                            return None;
+                        };
+                        let start = offset;
+                        offset += source.len();
+                        if hit.range.start >= start && hit.range.end <= offset {
+                            source.get(hit.range.start - start..hit.range.end - start)
+                        } else {
+                            None
+                        }
+                    })
+                }
                 _ => None,
             })
             .map(str::to_string);
@@ -3291,11 +4819,14 @@ impl App {
         let selection = self.selection?;
         let (start, end) = selection.ordered();
         let mut lines: Vec<String> = Vec::new();
-        let mut last_logical: Option<(usize, usize)> = None;
+        type LogicalLine<'a> = (usize, Option<&'a str>, usize);
+        let mut pending: Option<(Option<LogicalLine<'_>>, String)> = None;
         for line in start.0..=end.0 {
             let Some((block, row)) = self.transcript_row(line) else {
+                if let Some((_, text)) = pending.take() {
+                    lines.push(text);
+                }
                 lines.push(String::new());
-                last_logical = None;
                 continue;
             };
             let text: String = row
@@ -3312,19 +4843,26 @@ impl App {
                 fragment = column_slice(fragment, 2 - from, usize::MAX);
             }
             let fragment = fragment.trim_end().to_string();
-            let logical = row.1.2.map(|index| (block, index));
-            match (logical, last_logical) {
-                (Some(current), Some(previous)) if current == previous => {
-                    let joined = lines.last_mut().expect("a wrapped row follows its first");
+            // Grouped rows share the displayed cache block, not their source.
+            // Keep each canonical call's logical lines distinct when copying.
+            let logical = row.1.2.map(|index| (block, row.1.0.as_deref(), index));
+            match &mut pending {
+                Some((Some(previous), joined)) if logical == Some(*previous) => {
                     let fragment = fragment.trim_start();
                     if !fragment.is_empty() {
                         joined.push_str(&row.3);
                         joined.push_str(fragment);
                     }
                 }
-                _ => lines.push(fragment),
+                _ => {
+                    if let Some((_, text)) = pending.replace((logical, fragment)) {
+                        lines.push(text);
+                    }
+                }
             }
-            last_logical = logical;
+        }
+        if let Some((_, text)) = pending {
+            lines.push(text);
         }
         let text = lines.join("\n");
         let text = text.trim_matches('\n');
@@ -3386,25 +4924,122 @@ fn has_graphical_session(display: Option<&OsStr>, wayland_display: Option<&OsStr
         .any(|value| !value.is_empty())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn open_url(url: &str) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+
+    if url.contains('\0') {
+        return;
+    }
+    let operation = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target = std::ffi::OsStr::new(url)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both buffers are NUL-terminated UTF-16 strings and live for the call.
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn open_url(_url: &str) {}
 
+/// Fixtures and test accessors; not an alternate live event protocol.
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod test_support {
+    use agent_client_protocol::schema::v2::RunningStateUpdate;
+
+    use super::*;
+
+    impl Update {
+        pub(in crate::tui) fn test_text(text: String) -> Self {
+            Self::AgentMessage {
+                id: "test-agent".into(),
+                text,
+                append: true,
+            }
+        }
+
+        pub(in crate::tui) fn test_thought(text: String) -> Self {
+            Self::AgentThought {
+                id: "test-thought".into(),
+                text,
+                append: true,
+            }
+        }
+    }
+
+    impl App {
+        pub(super) fn agents(&self) -> Vec<&AgentRow> {
+            self.agent_tree_rows()
+                .into_iter()
+                .map(|tree_row| tree_row.row)
+                .collect()
+        }
+
+        pub(in crate::tui) fn push_user(&mut self, prompt: String) -> u64 {
+            let id = format!("test-user-{}", self.blocks.len());
+            self.apply(Update::UserMessage {
+                id,
+                text: prompt,
+                images: Vec::new(),
+                append: false,
+            });
+            self.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            self.blocks.len() as u64
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         path::PathBuf,
         time::{Duration, Instant},
     };
 
-    use agent_client_protocol::schema::v2::{StopReason, ToolCallStatus, ToolKind};
-    use agentkit_core::{DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part};
+    use agent_client_protocol::schema::v2::{
+        AuthMethodTerminal, IdleStateUpdate, RequiresActionStateUpdate, RunningStateUpdate,
+        StateUpdate, StopReason, ToolCallStatus, ToolKind,
+    };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
 
     use super::{
-        Action, App, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES, MAX_IMAGE_SOURCE_BYTES,
-        MAX_RETAINED_IMAGE_SOURCE_BYTES, Phase, Update, UserImage,
+        Action, AgentPart, App, Attachment, AttachmentKind, Block, MAX_IMAGE_BASE64_BYTES,
+        MAX_IMAGE_SOURCE_BYTES, MAX_RETAINED_IMAGE_SOURCE_BYTES, MessageRole, Phase, Update,
+        UserImage, replace_image_uri_on_line,
     };
     use crate::{events::RuntimeEvent, file_search::FileMatch, tui::wrap::LinkHit};
 
@@ -3489,6 +5124,82 @@ mod tests {
             "gpt-5.4".into(),
             "127.0.0.1:7331".into(),
         )
+    }
+
+    #[test]
+    fn model_switch_dialog_actions_preserve_input_and_selection() {
+        use crate::protocols::acp::model_switch::{Decision, Warning};
+        for (selected, expected) in [
+            (0, Some(Decision::Continue)),
+            (1, Some(Decision::Compact)),
+            (2, None),
+        ] {
+            let mut app = app();
+            app.paste("unsent draft");
+            let old_model = app.model.clone();
+            let choice = model_choice("openrouter", "target");
+            app.begin_model_switch(choice, false).unwrap();
+            let pending = app.model_switch.as_mut().unwrap();
+            pending.warning = Some(Warning {
+                token: 1,
+                guarded_tokens: "120".into(),
+                target_window: 150,
+            });
+            pending.selected = selected;
+            app.paste("must not enter composer");
+            let result = app.handle_key(press(KeyCode::Enter));
+            match expected {
+                Some(expected) => assert!(
+                    matches!(result, Action::ConfirmModelSwitch(actual) if actual == expected)
+                ),
+                None => assert!(app.model_switch.is_none()),
+            }
+            assert_eq!(app.editor.text(), "unsent draft");
+            assert_eq!(app.model, old_model);
+            assert!(app.blocks.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_switch_pending_cancel_and_stale_session_do_not_reuse_operation() {
+        let mut app = app();
+        let first = app
+            .begin_model_switch(model_choice("openrouter", "target"), false)
+            .unwrap();
+        assert!(
+            app.begin_model_switch(model_choice("openrouter", "other"), false)
+                .is_none()
+        );
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Esc)),
+            Action::Cancel
+        ));
+        assert!(app.model_switch.as_ref().unwrap().cancelling);
+        assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+        app.start_session("new-session".into());
+        assert!(app.model_switch.is_none());
+        let next = app
+            .begin_model_switch(model_choice("openrouter", "other"), false)
+            .unwrap();
+        assert_ne!(first, next);
+    }
+
+    #[test]
+    fn model_switch_dialog_escape_cancels_without_a_request() {
+        use crate::protocols::acp::model_switch::Warning;
+        let mut app = app();
+        app.begin_model_switch(model_choice("openrouter", "target"), false)
+            .unwrap();
+        app.model_switch.as_mut().unwrap().warning = Some(Warning {
+            token: 1,
+            guarded_tokens: "120".into(),
+            target_window: 150,
+        });
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Esc)),
+            Action::Redraw
+        ));
+        assert!(app.model_switch.is_none());
     }
 
     #[test]
@@ -3705,6 +5416,518 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_share_user_budget_and_release_replaced_sources() {
+        let mut app = app();
+        let bytes = 9 * 1024 * 1024;
+        let image = |byte: char| {
+            UserImage::new(byte.to_string().repeat(bytes), "image/png".into(), 0).unwrap()
+        };
+        app.apply(Update::UserMessage {
+            id: "user".into(),
+            text: "[Image]".into(),
+            images: vec![image('A')],
+            append: false,
+        });
+        let patch = |images, append_output| Update::ToolPatched {
+            id: "tool".into(),
+            title: None,
+            kind: None,
+            status: None,
+            script: None,
+            output: Some(vec!["[Image]".into()]),
+            images: Some(images),
+            append_output,
+            intent: None,
+            backgrounded: false,
+        };
+        app.apply(patch(vec![image('B'), image('C'), image('D')], false));
+        assert_eq!(app.retained_image_source_bytes, 3 * bytes);
+        let Block::Tool(call) = &app.blocks[1] else {
+            panic!("expected tool")
+        };
+        assert_eq!(call.images.len(), 2);
+        app.apply(patch(vec![image('B')], true));
+        assert_eq!(app.retained_image_source_bytes, 3 * bytes);
+        app.apply(patch(vec![image('D')], false));
+        assert_eq!(app.retained_image_source_bytes, 2 * bytes);
+        app.apply(patch(Vec::new(), false));
+        assert_eq!(app.retained_image_source_bytes, bytes);
+    }
+
+    #[test]
+    fn replay_replaces_parsed_repeated_image_links_but_not_inline_code() {
+        let source_uri = "file:///tmp/source.png";
+        let mut text =
+            format!("`[Image #1]({source_uri})` [Image #2]({source_uri}) [Image #3]({source_uri})");
+
+        replace_image_uri_on_line(
+            &mut text,
+            0,
+            Some(source_uri),
+            Some("file:///tmp/first.png"),
+        );
+        replace_image_uri_on_line(
+            &mut text,
+            0,
+            Some(source_uri),
+            Some("file:///tmp/second.png"),
+        );
+
+        assert_eq!(
+            text,
+            format!(
+                "`[Image #1]({source_uri})` [Image #2](file:///tmp/first.png) \
+                 [Image #3](file:///tmp/second.png)"
+            )
+        );
+    }
+
+    #[test]
+    fn uri_less_user_image_rewrite_only_links_generated_placeholder_lines() {
+        for label in [
+            "[Image #1]",
+            "[Image #12]",
+            "prose [Image #1]",
+            "`[Image #1]`",
+            "[Image #]",
+            "[Image #x]",
+            "[Image #1](https://example.com/image.png)",
+        ] {
+            let mut text = format!("before\n{label}\nafter");
+            replace_image_uri_on_line(&mut text, 1, None, Some("file:///tmp/local.png"));
+            let expected = if matches!(label, "[Image #1]" | "[Image #12]") {
+                format!("before\n{label}(file:///tmp/local.png)\nafter")
+            } else {
+                format!("before\n{label}\nafter")
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_image_cache_keeps_placeholders_openable_on_demand() {
+        use super::super::{BackgroundCompletion, QueuedUpdate, spawn_background_workers};
+        use base64::Engine as _;
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = spawn_background_workers(completed).unwrap();
+        let mut app = app();
+        let mut first_uri = None;
+        for color in 0..65u8 {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([color, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let image = UserImage::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                "image/png".into(),
+                0,
+            )
+            .unwrap();
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        0,
+                        Update::UserMessage {
+                            id: color.to_string(),
+                            text: "[Image #1]".into(),
+                            images: vec![image],
+                            append: false,
+                        }
+                    ))
+                    .is_ok()
+            );
+            let BackgroundCompletion::Update { queued, images } = completions.recv().await.unwrap()
+            else {
+                panic!("expected update");
+            };
+            app.apply_materialized(queued.update, images);
+            if color == 0 {
+                let Block::User(message) = &app.blocks[0] else {
+                    panic!("user");
+                };
+                first_uri = app.attachment_cache.image_uri(message.images[0].key);
+            }
+        }
+        let Block::User(last) = app.blocks.last().unwrap() else {
+            panic!("user");
+        };
+        assert_eq!(last.text, "[Image #1]");
+        let key = last.images[0].key;
+        assert!(app.attachment_cache.image_uri(key).is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        let mut runtime = super::super::image::ImageRuntime::with_picker(
+            ratatui_image::picker::Picker::halfblocks(),
+        );
+        terminal
+            .draw(|frame| super::super::ui::draw(frame, &mut app, &mut runtime))
+            .unwrap();
+        let (row, hit) = app
+            .row_links
+            .iter()
+            .enumerate()
+            .find_map(|(row, hits)| {
+                hits.iter()
+                    .find(|hit| hit.url.starts_with("kit-image:"))
+                    .map(|hit| (row, hit.clone()))
+            })
+            .unwrap();
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: (app.transcript_left + hit.start) as u16,
+            row: (app.transcript_top + row) as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = mouse(MouseEventKind::Down(MouseButton::Left));
+        let up = mouse(MouseEventKind::Up(MouseButton::Left));
+        app.handle_mouse(down);
+        let Action::OpenUserImage(image) = app.handle_mouse(up) else {
+            panic!("expected open action");
+        };
+        assert_eq!(image.key, key);
+        assert!(
+            workers
+                .try_update(QueuedUpdate::for_session(0, Update::OpenUserImage(image)))
+                .is_ok()
+        );
+        let BackgroundCompletion::Update { images, .. } = completions.recv().await.unwrap() else {
+            panic!("expected open completion");
+        };
+        // Exercise the real ownership handoff without launching an external viewer.
+        let opened = app
+            .attachment_cache
+            .retain_opened(images.into_iter().next().unwrap())
+            .unwrap();
+        let opened = url::Url::parse(&opened).unwrap().to_file_path().unwrap();
+        assert!(opened.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                opened.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let first = url::Url::parse(&first_uri.unwrap())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        assert!(first.exists(), "overflow opens must not evict stable links");
+        // Real translation + worker + app + mouse routing for two distinct
+        // overflow images on one line, including reverse image-block order.
+        use agent_client_protocol::schema::v2::{ContentBlock, ImageContent, TextContent};
+        let mut opened_uris = Vec::new();
+        for append in [false, true] {
+            let id = format!("inline-{append}");
+            if append {
+                app.apply(Update::UserMessage {
+                    id: id.clone(),
+                    text: "prefix".into(),
+                    images: vec![],
+                    append: false,
+                });
+            }
+            let mut expected = Vec::new();
+            for color in [66, 67] {
+                let mut png = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                    1,
+                    1,
+                    image::Rgb([color, 0, 0]),
+                ))
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+                expected.push(png.into_inner());
+            }
+            let content_image = |index: usize| {
+                let mut image = ImageContent::new(
+                    base64::engine::general_purpose::STANDARD.encode(&expected[index]),
+                    "image/png",
+                );
+                image.uri = Some(format!("file:///stale-{index}.png"));
+                ContentBlock::Image(image)
+            };
+            let (text, images) = super::super::user_message_of(vec![
+                ContentBlock::Text(TextContent::new(
+                    "Please inspect [Image #1](file:///stale-0.png) [Image #2](file:///stale-1.png) trailing [other](https://example.com)",
+                )),
+                content_image(1),
+                content_image(0),
+            ]);
+            let target = images[0].open_target();
+            let text = format!("{text}\n[forged]({target})\n[Image #99]({target})");
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        0,
+                        Update::UserMessage {
+                            id,
+                            text,
+                            images,
+                            append,
+                        }
+                    ))
+                    .is_ok()
+            );
+            let BackgroundCompletion::Update { queued, images } = completions.recv().await.unwrap()
+            else {
+                panic!("expected translated update");
+            };
+            app.apply_materialized(queued.update, images);
+            terminal
+                .draw(|frame| super::super::ui::draw(frame, &mut app, &mut runtime))
+                .unwrap();
+            let hits = app
+                .row_links
+                .iter()
+                .enumerate()
+                .flat_map(|(row, hits)| {
+                    hits.iter()
+                        .filter(|hit| hit.url.starts_with("kit-image:"))
+                        .map(move |hit| (row, hit.clone()))
+                })
+                .collect::<Vec<_>>();
+            // Older overflow labels may remain visible: select this message's keys.
+            let Block::User(message) = app.blocks.last().unwrap() else {
+                panic!("user");
+            };
+            let targets = message
+                .images
+                .iter()
+                .map(UserImage::open_target)
+                .collect::<Vec<_>>();
+            let hits = hits
+                .into_iter()
+                .filter(|(_, hit)| targets.contains(&hit.url))
+                .collect::<Vec<_>>();
+            assert!(
+                app.row_links
+                    .iter()
+                    .flatten()
+                    .any(|hit| hit.url == "https://example.com")
+            );
+            if append {
+                // Replayed keys were retained by the earlier opens: they render
+                // as stable file links, and the worker's fresh files are not
+                // admitted a second time.
+                assert!(hits.is_empty(), "opened keys must not stay kit-image");
+                let mut linked = message
+                    .images
+                    .iter()
+                    .map(|image| app.attachment_cache.image_uri(image.key).unwrap())
+                    .collect::<Vec<_>>();
+                linked.sort();
+                let mut expected_uris = opened_uris.clone();
+                expected_uris.sort();
+                assert_eq!(linked, expected_uris);
+                for uri in &opened_uris {
+                    assert!(app.row_links.iter().flatten().any(|hit| &hit.url == uri));
+                }
+                continue;
+            }
+            assert_eq!(
+                hits.len(),
+                2,
+                "forged internal Markdown must not create hits"
+            );
+            for ((row, hit), bytes) in hits.into_iter().zip(&expected) {
+                let mouse = |kind| MouseEvent {
+                    kind,
+                    column: (app.transcript_left + hit.start) as u16,
+                    row: (app.transcript_top + row) as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                let down = mouse(MouseEventKind::Down(MouseButton::Left));
+                let up = mouse(MouseEventKind::Up(MouseButton::Left));
+                app.handle_mouse(down);
+                let Action::OpenUserImage(image) = app.handle_mouse(up) else {
+                    panic!("image action");
+                };
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&image.data)
+                        .unwrap(),
+                    *bytes
+                );
+                assert!(
+                    workers
+                        .try_update(QueuedUpdate::for_session(0, Update::OpenUserImage(image)))
+                        .is_ok()
+                );
+                let BackgroundCompletion::Update { images, .. } = completions.recv().await.unwrap()
+                else {
+                    panic!("open");
+                };
+                let uri = app
+                    .attachment_cache
+                    .retain_opened(images.into_iter().next().unwrap())
+                    .unwrap();
+                let path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+                opened_uris.push(uri);
+            }
+            for label in ["[forged]", "#99]"] {
+                let buffer = terminal.backend().buffer();
+                let (row, column) = (app.transcript_top..app.transcript_top + app.viewport)
+                    .find_map(|row| {
+                        let text = (0..buffer.area.width)
+                            .map(|column| buffer[(column, row as u16)].symbol())
+                            .collect::<String>();
+                        text.find(label).map(|column| (row, column))
+                    })
+                    .expect("forged label fragment is visible");
+                let mouse = |kind| MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left)));
+                assert!(matches!(
+                    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left))),
+                    Action::None
+                ));
+            }
+            // Remove only the test transcript so duplicate keys in the next case
+            // cannot inflate visible hit counts; retain the exhausted real cache.
+            app.blocks.clear();
+            app.message_blocks.clear();
+        }
+        app.start_session("next".into());
+        assert!(!opened.exists());
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn exhausted_open_pool_reports_actionable_notice_without_launching() {
+        use base64::Engine as _;
+        let mut app = app();
+        for color in 0..=64 {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([color, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            let image = UserImage::new(
+                base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
+                "image/png".into(),
+                0,
+            )
+            .unwrap();
+            let materialized = super::super::attachment::materialize_image(
+                image.key,
+                &image.data,
+                &image.mime_type,
+                usize::MAX,
+            )
+            .unwrap();
+            if color < 64 {
+                app.attachment_cache.retain_opened(materialized).unwrap();
+            } else {
+                // Admission failure takes the real completion path, which must
+                // report the refusal rather than launch an unowned path.
+                app.apply_materialized(Update::OpenUserImage(image), vec![materialized]);
+                assert_eq!(
+                    app.toast_text(),
+                    Some("image open limit reached; start a new session to open more images",)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_native_image_links_are_reused_and_live_for_the_session() {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        ::image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, ::image::ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let replay = |id: &str, stale: &str| Update::UserMessage {
+            id: id.into(),
+            text: format!("[reference]({stale}) [Image]({stale})"),
+            images: vec![
+                UserImage::with_source(encoded.clone(), "image/png".into(), 0, Some(stale.into()))
+                    .unwrap(),
+            ],
+            append: false,
+        };
+        let linked_path = |app: &App, index: usize| {
+            let Block::User(message) = &app.blocks[index] else {
+                panic!("expected user message");
+            };
+            let uri = message
+                .text
+                .rsplit_once("](")
+                .and_then(|(_, target)| target.strip_suffix(')'))
+                .unwrap();
+            url::Url::parse(uri).unwrap().to_file_path().unwrap()
+        };
+
+        let prepared = || {
+            let image = UserImage::new(encoded.clone(), "image/png".into(), 0).unwrap();
+            super::super::attachment::materialize_image(
+                image.key,
+                &image.data,
+                &image.mime_type,
+                10 * 1024 * 1024,
+            )
+            .unwrap()
+        };
+        let mut app = app();
+        app.apply_materialized(
+            replay("one", "file:///tmp/deleted-one.png"),
+            vec![prepared()],
+        );
+        let first = linked_path(&app, 0);
+        assert!(first.exists());
+        assert!(matches!(&app.blocks[0], Block::User(message)
+            if message.text.starts_with("[reference](file:///tmp/deleted-one.png)")));
+        app.apply_materialized(
+            replay("two", "file:///tmp/deleted-two.png"),
+            vec![prepared()],
+        );
+        let second = linked_path(&app, 1);
+        assert_eq!(second, first, "equal image content should reuse one file");
+
+        app.start_session("replacement".into());
+        assert!(
+            !first.exists(),
+            "session switch should release native links"
+        );
+    }
+
+    #[test]
+    fn unavailable_replayed_native_image_is_not_left_as_a_dead_link() {
+        let mut app = app();
+        app.apply(Update::UserMessage {
+            id: "bad".into(),
+            text: "[Image](file:///tmp/deleted.png)".into(),
+            images: vec![
+                UserImage::with_source(
+                    "not base64".into(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///tmp/deleted.png".into()),
+                )
+                .unwrap(),
+            ],
+            append: false,
+        });
+        assert!(matches!(
+            app.blocks.first(),
+            Some(Block::User(message)) if message.text == "[Image]"
+        ));
+    }
+
+    #[test]
     fn retained_user_image_sources_have_an_aggregate_bound() {
         let source_bytes = 9 * 1024 * 1024;
         let mut app = app();
@@ -3719,12 +5942,44 @@ mod tests {
             });
         }
 
+        assert_eq!(
+            app.toast_text(),
+            Some("image source limit reached; start a new session to retain more images")
+        );
         assert_eq!(app.retained_image_source_bytes, source_bytes * 3);
         assert!(app.retained_image_source_bytes <= MAX_RETAINED_IMAGE_SOURCE_BYTES);
         assert!(matches!(
             app.blocks.last(),
             Some(Block::User(message)) if message.images.is_empty()
         ));
+
+        // Later refusals stay quiet so the notice cannot clobber other toasts.
+        app.toast("copied resume command");
+        let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+        app.apply(Update::UserMessage {
+            id: "image-4".into(),
+            text: "[Image #4]".into(),
+            images: vec![image],
+            append: false,
+        });
+        assert_eq!(app.toast_text(), Some("copied resume command"));
+
+        // A fresh session notifies again.
+        app.start_session("next".into());
+        app.toast = None;
+        for index in 0..4 {
+            let image = UserImage::new("A".repeat(source_bytes), "image/png".into(), 0).unwrap();
+            app.apply(Update::UserMessage {
+                id: format!("next-{index}"),
+                text: format!("[Image #{index}]"),
+                images: vec![image],
+                append: false,
+            });
+        }
+        assert_eq!(
+            app.toast_text(),
+            Some("image source limit reached; start a new session to retain more images")
+        );
     }
 
     fn compose(app: &mut App, script: &str) {
@@ -3735,15 +5990,6 @@ mod tests {
             script: Some(script.into()),
             backgrounded: false,
         });
-    }
-
-    fn child(call: &str, tool: &str) -> RuntimeEvent {
-        RuntimeEvent::ChildStarted {
-            call: call.into(),
-            tool: tool.into(),
-            summary: "ls".into(),
-            at: 0,
-        }
     }
 
     #[test]
@@ -3768,9 +6014,10 @@ mod tests {
         }));
         assert!(!app.compacting);
         assert!(app.usage.is_none());
-        assert!(
-            matches!(app.blocks.last(), Some(Block::Notice(text)) if text == "context compacted")
-        );
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::Compacted { reason, millis: 12 }) if reason == "TokenThreshold"
+        ));
     }
 
     #[test]
@@ -3838,164 +6085,25 @@ mod tests {
     fn turn_end_clears_compaction_state() {
         let mut app = app();
         app.compacting = true;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         assert!(!app.compacting);
-    }
-
-    #[test]
-    fn restores_only_tagged_developer_items_as_compaction_markers() {
-        let mut metadata = MetadataMap::new();
-        metadata.insert(
-            crate::compaction::COMPACTION_SUMMARY_METADATA_KEY.into(),
-            true.into(),
-        );
-        let transcript = vec![
-            Item::text(ItemKind::Developer, "ordinary instruction"),
-            Item::text(ItemKind::Developer, "summary").with_metadata(metadata),
-        ];
-        let mut app = app();
-        app.restore_transcript("session".into(), &transcript);
-        assert_eq!(app.blocks.len(), 1);
-        assert!(
-            matches!(app.blocks.first(), Some(Block::Notice(text)) if text == "context compacted")
-        );
-    }
-
-    #[test]
-    fn restored_transcript_hides_internal_notifications() {
-        let transcript = vec![
-            Item::text(ItemKind::User, "run the build"),
-            Item::notification("Background tool call completed: very long raw output"),
-            Item::text(ItemKind::Assistant, "the build passed"),
-        ];
-        let mut app = app();
-
-        app.restore_transcript("session".into(), &transcript);
-
-        assert_eq!(app.blocks.len(), 2);
-        assert!(matches!(&app.blocks[0], Block::User(message) if message.text == "run the build"));
-        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "the build passed"));
-    }
-
-    #[test]
-    fn restored_media_uses_safe_links_and_never_exposes_data_urls() {
-        let transcript = vec![
-            Item::new(
-                ItemKind::User,
-                vec![
-                    Part::text("inspect these"),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("file:///tmp/image.png".into()),
-                    )),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("data:image/png;base64,c2VjcmV0".into()),
-                    )),
-                ],
-            ),
-            Item::new(
-                ItemKind::Assistant,
-                vec![
-                    Part::text("done"),
-                    Part::Media(MediaPart::new(
-                        Modality::Image,
-                        "image/png",
-                        DataRef::Uri("https://example.com/result.png".into()),
-                    )),
-                ],
-            ),
-        ];
-        let mut app = app();
-
-        app.restore_transcript("session".into(), &transcript);
-
-        assert!(matches!(
-            &app.blocks[0],
-            Block::User(message)
-                if message.text == "inspect these\n[Image #1](file:///tmp/image.png)\n[Image #2]"
-                    && !message.text.contains("data:")
-        ));
-        assert!(matches!(&app.blocks[1], Block::Agent(text) if text == "done"));
-        assert!(matches!(
-            &app.blocks[2],
-            Block::Agent(text) if text == "[Image #1](https://example.com/result.png)"
-        ));
-    }
-
-    #[test]
-    fn attributes_nested_calls_to_the_owning_tool_call() {
-        let mut app = app();
-        compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::Runtime(child("call-1:compose:abc", "shell")));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.children.len(), 1);
-        assert_eq!(call.children[0].node, Some(0));
-        assert_eq!(call.running_children(), 1);
-    }
-
-    #[test]
-    fn terminal_parent_finishes_children_missing_completion_events() {
-        let mut app = app();
-        compose(&mut app, "a = shell({ command: \"sleep 60\" })\nreturn a");
-        app.apply(Update::Runtime(child("call-1:compose:shell", "shell")));
-
-        app.apply(Update::ToolUpdated {
-            id: "call-1".into(),
-            status: Some(ToolCallStatus::Failed),
-            script: None,
-            output: Vec::new(),
-            backgrounded: false,
-        });
-
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        assert_eq!(call.status, ToolCallStatus::Failed);
-        assert_eq!(call.running_children(), 0);
-        assert!(call.children[0].millis.is_some());
-        assert!(!call.children[0].ok);
-    }
-
-    #[test]
-    fn spreads_repeated_dispatches_across_matching_plan_nodes() {
-        let mut app = app();
-        compose(
-            &mut app,
-            "a = shell({ command: \"one\" })\nb = shell({ command: \"two\" })\nreturn [a, b]",
-        );
-        app.apply(Update::Runtime(child("call-1:compose:a", "shell")));
-        app.apply(Update::Runtime(child("call-1:compose:b", "shell")));
-        let Some(Block::Tool(call)) = app.blocks.last() else {
-            panic!("expected a tool block");
-        };
-        let nodes: Vec<_> = call.children.iter().map(|child| child.node).collect();
-        assert_eq!(nodes, [Some(0), Some(1)]);
     }
 
     #[test]
     fn closes_running_calls_when_the_turn_ends() {
         let mut app = app();
         compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        app.apply(Update::Stopped(Some(StopReason::EndTurn)));
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         let call = app
             .blocks
             .iter()
@@ -4006,6 +6114,7 @@ mod tests {
             })
             .expect("tool block");
         assert_eq!(call.status, ToolCallStatus::Completed);
+        assert!(!call.expanded);
         assert!(!app.working());
     }
 
@@ -4027,12 +6136,12 @@ mod tests {
         ] {
             let mut app = app();
             compose(&mut app, "a = shell({ command: \"ls\" })\nreturn a");
-            app.apply(Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false,
-            });
-            app.apply(Update::Stopped(Some(reason)));
+            app.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            app.apply(Update::State(StateUpdate::Idle(
+                IdleStateUpdate::new().stop_reason(reason),
+            )));
 
             let notice = app
                 .blocks
@@ -4057,31 +6166,348 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_state_updates_are_idempotent() {
+    fn transcript_and_tool_activity_do_not_drive_foreground_lifecycle() {
         let mut app = app();
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
+        app.apply(Update::UserMessage {
+            id: "user".into(),
+            text: "hello".into(),
+            images: Vec::new(),
+            append: false,
         });
-        let started = app.turn_started;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
-        assert_eq!(app.turn_started, started);
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
+        compose(&mut app, "return 1");
+        app.apply(Update::AgentMessage {
+            id: "agent".into(),
+            text: "hello".into(),
+            append: false,
         });
         assert!(!app.working());
+        assert!(app.turn_started.is_none());
+
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::ToolPatched {
+            id: "call-1".into(),
+            title: None,
+            kind: None,
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: None,
+            images: None,
+            append_output: false,
+            intent: None,
+            backgrounded: false,
+        });
+        assert!(app.working());
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        app.apply(Update::AgentMessage {
+            id: "late".into(),
+            text: "background result".into(),
+            append: false,
+        });
+        compose(&mut app, "return 2");
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+    }
+
+    #[test]
+    fn requires_action_preserves_the_running_turn_timer() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::State(StateUpdate::RequiresAction(
+            RequiresActionStateUpdate::new(),
+        )));
+        assert!(app.phase == Phase::Blocked);
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        assert!(app.phase == Phase::Working);
+        assert_eq!(app.turn_started, started);
+    }
+
+    #[test]
+    fn cancellation_request_does_not_override_the_actual_stop_reason() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        assert!(matches!(app.request_cancel(), Action::Cancel));
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+        assert!(
+            !app.blocks
+                .iter()
+                .any(|block| matches!(block, Block::Notice(text) if text == "turn interrupted"))
+        );
+    }
+
+    #[test]
+    fn duplicate_state_updates_are_idempotent() {
+        let mut app = app();
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        let started = app.turn_started;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        assert_eq!(app.turn_started, started);
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(!app.working());
+        assert!(app.turn_started.is_none());
+        assert_eq!(
+            app.blocks
+                .iter()
+                .filter(|block| matches!(block, Block::TurnDuration { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replay_terminal_only_tool_keeps_start_and_duration_unknown() {
+        let base = Instant::now();
+        for status in [ToolCallStatus::Completed, ToolCallStatus::Failed] {
+            let mut app = app();
+            app.apply_at(
+                Update::AgentThought {
+                    id: "thought".into(),
+                    text: "reasoning".into(),
+                    append: false,
+                },
+                Some(base),
+            );
+            app.apply_at(
+                Update::ToolPatched {
+                    id: "tool".into(),
+                    title: Some("shell".into()),
+                    kind: None,
+                    status: Some(status.clone()),
+                    script: None,
+                    output: None,
+                    images: None,
+                    append_output: false,
+                    intent: None,
+                    backgrounded: false,
+                },
+                Some(base + Duration::from_secs(7)),
+            );
+            let call = app.tool_call("tool").unwrap();
+            assert_eq!(call.status, status);
+            assert_eq!(call.started, None);
+            assert_eq!(call.finished, Some(base + Duration::from_secs(7)));
+            assert_eq!(call.elapsed_at(base + Duration::from_secs(40)), None);
+            assert!(app.blocks.iter().any(|block| matches!(
+                block,
+                Block::Thought {
+                    millis: Some(7_000),
+                    closed: true,
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn replay_incomplete_stops_clocks_without_fabricating_outcomes() {
+        let base = Instant::now();
+        let mut app = app();
+        app.apply_at(
+            Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+            Some(base),
+        );
+        app.apply_at(
+            Update::ToolStarted {
+                id: "tool".into(),
+                title: "shell".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: false,
+            },
+            Some(base),
+        );
+        app.apply_at(
+            Update::AgentThought {
+                id: "thought".into(),
+                text: "reasoning".into(),
+                append: false,
+            },
+            Some(base),
+        );
+        let call = app.tool_call("tool").unwrap();
+        assert_eq!(call.elapsed_at(base + Duration::from_secs(4)), Some(4_000));
+        assert_eq!(call.elapsed_at(base - Duration::from_secs(1)), None);
+        assert_eq!(
+            super::observed_duration(Some(base), Some(base - Duration::from_secs(1))),
+            None
+        );
+
+        app.finish_replay_incomplete();
+        let call = app.tool_call("tool").unwrap();
+        assert_eq!(call.status, ToolCallStatus::Pending);
+        assert_eq!(call.started, Some(base));
+        assert_eq!(call.finished, None);
+        assert_eq!(call.elapsed_at(base + Duration::from_secs(40)), None);
+        assert!(call.timing_closed);
+        assert!(!app.working());
+        assert_eq!(app.elapsed(), None);
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Thought {
+                millis: None,
+                closed: true,
+                ..
+            }
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration {
+                since_prompt: None,
+                ..
+            })
+        ));
+        assert!(app.transcript_dynamic.is_empty());
+        let count = app.blocks.len();
+        app.finish_replay_incomplete();
+        assert_eq!(app.blocks.len(), count);
+
+        // Real terminal evidence may arrive later without losing the known start.
+        app.apply_at(
+            Update::ToolPatched {
+                id: "tool".into(),
+                title: None,
+                kind: None,
+                status: Some(ToolCallStatus::Completed),
+                script: None,
+                output: None,
+                images: None,
+                append_output: false,
+                intent: None,
+                backgrounded: false,
+            },
+            Some(base + Duration::from_secs(7)),
+        );
+        assert_eq!(app.tool_call("tool").unwrap().elapsed(), Some(7_000));
+    }
+
+    #[test]
+    fn replay_timing_uses_original_boundaries_and_preserves_unknowns() {
+        let base = Instant::now() - Duration::from_secs(600);
+        for (start, end, expected) in [
+            (Some(base), Some(base + Duration::from_secs(7)), Some(7_000)),
+            (None, Some(base + Duration::from_secs(7)), None),
+            (Some(base), None, None),
+            (None, None, None),
+            (Some(base), Some(base - Duration::from_secs(1)), None),
+        ] {
+            let mut app = app();
+            app.apply_at(
+                Update::UserMessage {
+                    id: "prompt".into(),
+                    text: "hello".into(),
+                    images: vec![],
+                    append: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+                start,
+            );
+            app.apply_at(
+                Update::AgentThought {
+                    id: "thought".into(),
+                    text: "reasoning".into(),
+                    append: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::ToolStarted {
+                    id: "tool".into(),
+                    title: "shell".into(),
+                    kind: ToolKind::Other,
+                    script: None,
+                    backgrounded: false,
+                },
+                start,
+            );
+            app.apply_at(
+                Update::State(StateUpdate::Idle(IdleStateUpdate::new())),
+                end,
+            );
+            assert_eq!(app.tool_call("tool").unwrap().elapsed(), expected);
+            assert!(
+                matches!(app.blocks.last(), Some(Block::TurnDuration { since_prompt, .. }) if *since_prompt == expected)
+            );
+            // Reasoning closes when the tool starts, at the original observation time.
+            assert!(app.blocks.iter().any(|block| matches!(block,
+                Block::Thought { millis, closed: true, .. } if *millis == start.map(|_| 0))));
+        }
+    }
+
+    #[test]
+    fn replay_reasoning_and_prompt_have_independent_original_boundaries() {
+        let base = Instant::now() - Duration::from_secs(600);
+        let mut app = app();
+        app.apply_at(
+            Update::UserMessage {
+                id: "prompt".into(),
+                text: "hello".into(),
+                images: vec![],
+                append: false,
+            },
+            Some(base),
+        );
+        app.apply_at(
+            Update::State(StateUpdate::Running(RunningStateUpdate::new())),
+            Some(base + Duration::from_secs(2)),
+        );
+        app.apply_at(
+            Update::AgentThought {
+                id: "thought".into(),
+                text: "reasoning".into(),
+                append: false,
+            },
+            Some(base + Duration::from_secs(3)),
+        );
+        app.apply_at(
+            Update::State(StateUpdate::Idle(IdleStateUpdate::new())),
+            Some(base + Duration::from_secs(9)),
+        );
+        assert!(app.blocks.iter().any(|block| matches!(
+            block,
+            Block::Thought {
+                millis: Some(6_000),
+                closed: true,
+                ..
+            }
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration {
+                since_prompt: Some(9_000),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4089,16 +6515,15 @@ mod tests {
         let mut app = app();
         app.push_user("hello".into());
         app.turn_started = Some(Instant::now() - Duration::from_secs(65));
+        app.prompt_started = app.turn_started;
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
 
         assert!(matches!(
             app.blocks.last(),
-            Some(Block::TurnDuration(millis)) if *millis >= 65_000
+            Some(Block::TurnDuration { since_prompt, .. }) if since_prompt.is_some_and(|ms| ms >= 65_000)
         ));
     }
 
@@ -4106,26 +6531,22 @@ mod tests {
     fn autonomous_turn_is_visible_and_cancellable() {
         let mut app = app();
 
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
 
         assert!(app.working());
         assert!(matches!(app.request_cancel(), Action::Cancel));
         assert!(app.phase == Phase::Cancelling);
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::Cancelled),
+        )));
 
         assert!(!app.working());
         assert!(matches!(
             app.blocks.as_slice(),
-            [.., Block::Notice(text), Block::TurnDuration(_)] if text == "turn interrupted"
+            [.., Block::Notice(text), Block::TurnDuration { .. }] if text == "turn interrupted"
         ));
     }
 
@@ -4147,11 +6568,9 @@ mod tests {
             backgrounded: true,
         });
 
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
 
         let running = app
             .blocks
@@ -4164,6 +6583,60 @@ mod tests {
             Some("background-2")
         );
         assert!(!app.working());
+    }
+
+    #[test]
+    fn background_programs_are_tracked_across_turns_until_their_result_lands() {
+        let mut app = app();
+        app.push_user("start".into());
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::ToolStarted {
+            id: "background".into(),
+            title: "compose".into(),
+            kind: ToolKind::Other,
+            script: Some("return 1".into()),
+            backgrounded: true,
+        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration { background: 1, .. })
+        ));
+
+        app.push_user("meanwhile".into());
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::TurnDuration { background: 1, since_prompt, .. }) if since_prompt.is_some_and(|ms| ms < 5_000)
+        ));
+
+        app.apply(Update::ToolPatched {
+            id: "background".into(),
+            title: None,
+            kind: None,
+            status: Some(ToolCallStatus::Completed),
+            script: None,
+            output: Some(vec!["done".into()]),
+            images: None,
+            append_output: false,
+            intent: None,
+            backgrounded: true,
+        });
+        assert!(matches!(
+            app.blocks.last(),
+            Some(Block::BackgroundResult { failed: false, .. })
+        ));
+
+        assert!(app.background_calls().is_empty());
     }
 
     #[test]
@@ -4265,9 +6738,205 @@ mod tests {
     }
 
     #[test]
-    fn rejected_prompt_restores_unique_attachment_numbering() {
+    fn attachment_placeholders_are_deleted_atomically_from_the_requested_direction() {
+        for (key, offset) in [
+            (KeyCode::Delete, 0),
+            (KeyCode::Delete, "[Image #1]".len() / 2),
+            (KeyCode::Backspace, "[Image #1]".len() / 2),
+            (KeyCode::Backspace, "[Image #1] ".len()),
+        ] {
+            let mut app = app();
+            app.paste("left");
+            app.attach(
+                PathBuf::from("/tmp/media"),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+            app.paste("right");
+
+            let cursor = "left ".len() + offset;
+            while app.editor.cursor() > cursor {
+                assert!(matches!(app.handle_key(press(KeyCode::Left)), Action::None));
+            }
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+
+            assert_eq!(app.editor.text(), "left right");
+            assert!(app.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn attachment_deletion_does_not_cross_the_opposite_boundary() {
         let mut app = app();
-        for name in ["one.png", "two.png"] {
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.handle_key(press(KeyCode::Delete));
+        assert_eq!(app.editor.text(), "[Image #1] ");
+
+        while app.editor.cursor() > 0 {
+            app.handle_key(press(KeyCode::Left));
+        }
+        app.handle_key(press(KeyCode::Backspace));
+        assert_eq!(app.editor.text(), "[Image #1] ");
+        assert_eq!(app.attachments.len(), 1);
+    }
+
+    #[test]
+    fn modified_deletion_never_leaves_a_partial_attachment_placeholder() {
+        let mut app = app();
+        app.paste("left");
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("right");
+        while app.editor.cursor() > "left [Image".len() {
+            app.handle_key(press(KeyCode::Left));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+
+        assert!(!app.editor.text().contains("[Image"));
+        assert!(!app.editor.text().contains("#1]"));
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn line_start_deletion_keys_continue_through_newlines() {
+        for key in [
+            modified_press(KeyCode::Backspace, KeyModifiers::SUPER),
+            modified_press(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = app();
+            app.paste("first\nsecond");
+            for expected in ["first\n", "first", "", ""] {
+                app.handle_key(key);
+                assert_eq!(app.editor.text(), expected);
+                assert_eq!(app.editor.cursor(), expected.len());
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_placeholder_includes_a_separator_before_following_text() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("describe this");
+
+        assert_eq!(app.editor.text(), "[Image #1] describe this");
+    }
+
+    #[test]
+    fn attachment_insert_before_existing_separator_leaves_cursor_after_it() {
+        let mut app = app();
+        app.paste("left right");
+        for _ in 0..6 {
+            app.handle_key(press(KeyCode::Left));
+        }
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.paste("typed ");
+
+        assert_eq!(app.editor.text(), "left [Image #1] typed right");
+    }
+
+    #[test]
+    fn deleting_an_attachment_never_consumes_a_following_newline() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.insert_char('\n');
+        app.handle_key(press(KeyCode::Left));
+        app.handle_key(press(KeyCode::Backspace));
+
+        assert_eq!(app.editor.text(), "\n");
+    }
+
+    #[test]
+    fn stale_cleared_attachment_metadata_does_not_consume_a_number() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/stale.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/current.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+        assert_eq!(app.attachments.len(), 1);
+    }
+
+    #[test]
+    fn attachment_numbering_resets_after_the_only_placeholder_is_deleted() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/first.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.handle_key(press(KeyCode::Backspace));
+        app.attach(
+            PathBuf::from("/tmp/second.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #1] ");
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn accepted_clipboard_image_file_lives_until_the_session_is_cleared() {
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let path_buf = path.to_path_buf();
+        let mut app = app();
+        app.attach_attachment(Attachment::clipboard_image(
+            crate::tui::attachment::own_temp_path(path),
+            0,
+        ));
+
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        assert!(path_buf.exists());
+        drop(accepted);
+
+        app.clear_attachments();
+        assert!(!path_buf.exists());
+    }
+
+    #[test]
+    fn accepting_only_submitted_attachments_reuses_the_highest_omitted_number() {
+        let mut app = app();
+        for name in ["accepted.png", "omitted.png"] {
             app.attach(
                 PathBuf::from(format!("/tmp/{name}")),
                 "image/png",
@@ -4275,9 +6944,205 @@ mod tests {
                 3,
             );
         }
-        let rejected = std::mem::take(&mut app.attachments);
+        let accepted = vec![app.attachments[0].clone()];
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/reused.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #2]");
+    }
+
+    #[test]
+    fn attachment_numbering_continues_after_a_prompt_is_accepted() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/first.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/second.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #2] ");
+        assert_eq!(app.attachments[0].placeholder, "[Image #2]");
+    }
+
+    #[test]
+    fn attachment_numbering_continues_from_replayed_session_history() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "look [Image #3](file:///tmp/third.png)".into(),
+            vec![UserImage::new("AQID".into(), "image/png".into(), 0).unwrap()],
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/fourth.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.editor.text(), "[Image #4] ");
+    }
+
+    #[test]
+    fn audio_only_history_resumes_numbering_and_reset_starts_over() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "listen [Audio #7](file:///tmp/seven.wav)".into(),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/eight.wav"),
+            "audio/wav",
+            AttachmentKind::Audio,
+            3,
+        );
+        assert_eq!(app.attachments[0].placeholder, "[Audio #8]");
+
         app.clear_attachments();
-        app.restore_attachments(rejected);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/one.wav"),
+            "audio/wav",
+            AttachmentKind::Audio,
+            3,
+        );
+        assert_eq!(app.attachments[0].placeholder, "[Audio #1]");
+    }
+
+    #[test]
+    fn literal_image_marker_does_not_change_numbering() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            "literal [Image #999]".into(),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments[0].placeholder, "[Image #1]");
+    }
+
+    #[test]
+    fn maximum_history_attachment_number_does_not_overflow_or_reuse_a_number() {
+        let mut app = app();
+        app.apply_message(
+            "history".into(),
+            format!("[Image #{}](file:///tmp/image.png)", usize::MAX),
+            Vec::new(),
+            false,
+            MessageRole::User,
+        );
+        app.attach(
+            PathBuf::from("/tmp/image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert!(app.attachments.is_empty());
+        assert!(app.editor.is_empty());
+        assert_eq!(
+            app.toast_text(),
+            Some("attachment numbering exhausted — start a new session")
+        );
+    }
+
+    #[test]
+    fn attachment_aware_deletion_does_not_change_normal_text_behavior() {
+        for key in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut app = app();
+            app.paste("abc");
+            if key == KeyCode::Delete {
+                assert!(matches!(app.handle_key(press(KeyCode::Left)), Action::None));
+            }
+
+            assert!(matches!(app.handle_key(press(key)), Action::None));
+            assert_eq!(app.editor.text(), "ab");
+        }
+    }
+
+    #[test]
+    fn deleting_highest_pending_attachment_reuses_its_number_after_an_accept() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/one.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        for name in ["two.png", "three.png"] {
+            app.attach(
+                PathBuf::from(format!("/tmp/{name}")),
+                "image/png",
+                AttachmentKind::Image,
+                3,
+            );
+        }
+        app.handle_key(press(KeyCode::Backspace));
+        app.attach(
+            PathBuf::from("/tmp/reused.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+
+        assert_eq!(app.attachments.last().unwrap().placeholder, "[Image #3]");
+    }
+
+    #[test]
+    fn rejected_prompt_restores_draft_and_submitted_attachment_watermark() {
+        let mut app = app();
+        app.attach(
+            PathBuf::from("/tmp/one.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let accepted = app.attachments.clone();
+        app.accept_attachments(&accepted);
+        app.editor.clear();
+        app.attach(
+            PathBuf::from("/tmp/two.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected submission");
+        };
+
+        app.paste(&prompt.text);
+        app.restore_attachments(prompt.attachments);
         app.attach(
             PathBuf::from("/tmp/three.png"),
             "image/png",
@@ -4285,12 +7150,13 @@ mod tests {
             3,
         );
 
+        assert_eq!(app.editor.text(), "[Image #2] [Image #3] ");
         assert_eq!(
             app.attachments
                 .iter()
                 .map(|attachment| attachment.placeholder.as_str())
                 .collect::<Vec<_>>(),
-            ["[Image #1]", "[Image #2]", "[Image #3]"]
+            ["[Image #2]", "[Image #3]"]
         );
     }
 
@@ -4367,6 +7233,37 @@ mod tests {
     }
 
     #[test]
+    fn login_is_exposed_only_for_advertised_terminal_auth_methods() {
+        let mut unavailable = app();
+        unavailable.paste("/login");
+        unavailable.last_key = Some(Instant::now() - Duration::from_millis(500));
+        let Action::Submit { prompt, .. } = unavailable.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected an ordinary prompt");
+        };
+        assert_eq!(prompt.text, "/login");
+
+        let mut available = app();
+        available.auth_methods = vec![
+            AuthMethodTerminal::new("openai", "ChatGPT").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openai".into(),
+            ]),
+            AuthMethodTerminal::new("openrouter", "OpenRouter").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openrouter".into(),
+            ]),
+        ];
+        available.paste("/login openrouter");
+        available.last_key = Some(Instant::now() - Duration::from_millis(500));
+        assert!(matches!(
+            available.handle_key(press(KeyCode::Enter)),
+            Action::Login(method) if method.method_id.0.as_ref() == "openrouter"
+        ));
+    }
+
+    #[test]
     fn advertised_compact_command_is_submitted_unchanged() {
         let mut app = app();
         app.available_commands = vec!["compact".into()];
@@ -4399,6 +7296,162 @@ mod tests {
         assert!(matches!(app.handle_key(press(KeyCode::Tab)), Action::None));
         assert_eq!(app.editor.text(), "/model");
         assert!(app.command_completions().is_empty());
+    }
+
+    #[test]
+    fn voice_availability_snapshot_survives_session_changes() {
+        for enabled in [false, true] {
+            let mut app = app();
+            app.voice_enabled = enabled;
+            app.start_session("first".into());
+            app.start_session("second".into());
+            app.paste("/voi");
+            assert_eq!(!app.command_completions().is_empty(), enabled);
+        }
+        // A fresh TUI defaults to disabled rather than inheriting availability.
+        assert!(!app().voice_enabled);
+    }
+
+    #[test]
+    fn disabled_voice_is_hidden_and_rejected_locally() {
+        let mut app = app();
+        app.paste("/voi");
+        assert!(app.command_completions().is_empty());
+        app.editor.clear();
+        app.paste("/voice on");
+        app.last_key = None;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn usage_remains_local_while_idle_or_working() {
+        for provider in [None, Some("openrouter"), Some("unknown provider")] {
+            for phase in [
+                Phase::Idle,
+                Phase::Working,
+                Phase::Blocked,
+                Phase::Cancelling,
+            ] {
+                let mut app = app();
+                let expected_phase = std::mem::discriminant(&phase);
+                app.phase = phase;
+                app.paste(&provider.map_or_else(
+                    || "/usage".to_owned(),
+                    |provider| format!("/usage {provider}"),
+                ));
+                app.last_key = None;
+                assert!(
+                    matches!(app.handle_key(press(KeyCode::Enter)), Action::Usage(value) if value.as_deref() == provider)
+                );
+                assert!(app.editor.is_empty());
+                assert_eq!(std::mem::discriminant(&app.phase), expected_phase);
+            }
+        }
+    }
+
+    #[test]
+    fn voice_off_and_mute_remain_available_while_working() {
+        for control in ["off", "mute"] {
+            for phase in [Phase::Working, Phase::Blocked, Phase::Cancelling] {
+                let mut app = app();
+                app.voice_enabled = true;
+                app.phase = phase;
+                app.paste(&format!("/voice {control}"));
+                app.last_key = None;
+                assert!(
+                    matches!(app.handle_key(press(KeyCode::Enter)), Action::Voice(value) if value == control)
+                );
+                assert!(app.editor.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn enter_activates_the_filtered_slash_command() {
+        let mut app = app();
+        app.paste("/ses");
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ListSessions
+        ));
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn enter_activates_the_arrow_selected_slash_command() {
+        let mut app = app();
+        app.paste("/");
+        let index = app
+            .command_completions()
+            .iter()
+            .position(|cmd| cmd.name == "/sessions")
+            .unwrap();
+        for _ in 0..index + 1 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Up));
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ListSessions
+        ));
+    }
+
+    #[test]
+    fn enter_does_not_complete_a_dismissed_slash_command() {
+        let mut app = app();
+        app.paste("/ses");
+        app.handle_key(press(KeyCode::Esc));
+        app.last_key = None;
+
+        let Action::Submit { prompt, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected the dismissed input to be submitted unchanged");
+        };
+        assert_eq!(prompt.text, "/ses");
+    }
+
+    #[test]
+    fn enter_completion_preserves_active_turn_command_guard() {
+        let mut app = app();
+        app.phase = Phase::Working;
+        app.can_steer = true;
+        app.paste("/ses");
+        app.last_key = None;
+
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "/sessions");
+        assert_eq!(
+            app.toast_text(),
+            Some("commands are available only while idle")
+        );
+    }
+
+    #[test]
+    fn modified_or_pasted_enter_does_not_accept_slash_completion() {
+        for pasted in [false, true] {
+            let mut app = app();
+            app.paste("/ses");
+            let key = if pasted {
+                app.last_key = Some(Instant::now());
+                press(KeyCode::Enter)
+            } else {
+                app.last_key = None;
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            };
+
+            assert!(matches!(app.handle_key(key), Action::None));
+            assert_eq!(app.editor.text(), "/ses\n");
+        }
     }
 
     #[test]
@@ -4463,11 +7516,9 @@ mod tests {
     fn active_plain_text_is_submitted_as_steering_when_advertised() {
         let mut app = app();
         app.can_steer = true;
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         app.paste("change direction");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
 
@@ -4483,6 +7534,7 @@ mod tests {
         );
 
         app.apply(Update::SteerAccepted {
+            editable: true,
             id: "injected-1".into(),
             text: prompt.text,
         });
@@ -4506,14 +7558,736 @@ mod tests {
         assert!(app.working());
     }
 
+    fn queued_app() -> App {
+        let mut app = app();
+        app.can_steer = true;
+        app.can_replace_steer = true;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        for id in ["a", "b", "c"] {
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: id.into(),
+                text: format!("pending {id}"),
+            });
+        }
+        app
+    }
+
+    fn begin_steer_edit(app: &mut App) {
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.editing_steer());
+    }
+
+    #[test]
+    fn queued_focus_preserves_global_task_view_and_copy_shortcuts() {
+        for drained in [false, true] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.latest_agent_source = "answer".into();
+            app.handle_key(press(KeyCode::F(2)));
+            if drained {
+                for id in ["a", "b", "c"] {
+                    app.steer_revoked(id);
+                }
+            }
+            // Without background work Ctrl+K is an editor key, so suppress it.
+            app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(modified_press(KeyCode::Char('l'), KeyModifiers::CONTROL));
+            assert!(app.show_logs);
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+                Action::Copy(text) if text == "answer"
+            ));
+            app.apply(Update::ToolStarted {
+                id: "foreground".into(),
+                title: "compose".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: false,
+            });
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('b'), KeyModifiers::SUPER)),
+                Action::DetachCompose(id) if id == "foreground"
+            ));
+            app.apply(Update::ToolStarted {
+                id: "background".into(),
+                title: "compose".into(),
+                kind: ToolKind::Other,
+                script: None,
+                backgrounded: true,
+            });
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+                Action::CancelBackground(id) if id == "background"
+            ));
+            assert_eq!(app.queue_focused, !drained);
+            assert_eq!(app.editor.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn queued_selector_navigation_and_revoke_preserve_order_and_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.selected_steer.as_deref(), Some("a"));
+        app.handle_key(press(KeyCode::Down));
+        let Action::RevokeSteer { id } = app.handle_key(press(KeyCode::Delete)) else {
+            panic!("expected revoke");
+        };
+        assert_eq!(id, "b");
+        assert_eq!(
+            app.pending_steers.len(),
+            3,
+            "wait for server acknowledgment"
+        );
+        app.steer_mutation_failed(&id, "temporary failure".into(), false);
+        assert_eq!(app.pending_steers.len(), 3);
+        assert_eq!(app.selected_steer.as_deref(), Some("b"));
+        app.steer_revoked(&id);
+        assert_eq!(
+            app.pending_steers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(app.selected_steer.as_deref(), Some("c"));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.selected_steer.as_deref(), Some("c"));
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.selected_steer.is_none());
+        assert!(app.working(), "Esc in selector must not cancel the turn");
+        assert_eq!(app.editor.text(), "draft");
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id,
+            text: "late acceptance".into(),
+        });
+        assert_eq!(app.pending_steers.len(), 2, "revoked IDs stay retired");
+    }
+
+    #[test]
+    fn queued_edit_cancel_restores_draft_cursor_and_attachments() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.attach(
+            PathBuf::from("image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        app.editor.move_left();
+        let draft = app.editor.text().to_owned();
+        let cursor = app.editor.cursor();
+        let attachments = app.attachments.clone();
+        let sequence = app.next_attachment;
+        begin_steer_edit(&mut app);
+        assert_eq!(app.editor.text(), "pending a");
+        assert!(app.attachments.is_empty());
+        app.paste(" revised");
+        app.attach(
+            PathBuf::from("other.png"),
+            "image/png",
+            AttachmentKind::Image,
+            4,
+        );
+        assert!(app.attachments.is_empty(), "replacement is text-only");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.editing_steer());
+        assert_eq!(app.editor.text(), draft);
+        assert_eq!(app.editor.cursor(), cursor);
+        assert_eq!(app.attachments, attachments);
+        assert_eq!(app.next_attachment, sequence);
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        assert!(app.working());
+    }
+
+    #[test]
+    fn queued_edit_save_keeps_id_order_and_restores_draft() {
+        let mut app = queued_app();
+        app.paste("next draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        app.paste(" revised");
+        let Action::ReplaceSteer { id, text } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected replacement");
+        };
+        assert_eq!(id, "b");
+        assert_eq!(text, "pending b revised");
+        assert_eq!(app.pending_steers[1].text, "pending b");
+        assert_eq!(app.editor.text(), text, "keep edit until acknowledged");
+        let token = app.begin_steer_mutation(&id, Some(text)).unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: id.clone(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.pending_steers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(app.pending_steers[1].text, "pending b revised");
+        assert_eq!(app.editor.text(), "next draft");
+        assert!(!app.editing_steer());
+    }
+
+    #[test]
+    fn queued_edit_failure_keeps_both_drafts_and_allows_retry() {
+        let mut app = queued_app();
+        app.paste("original draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revision");
+        app.steer_mutation_failed("a", "temporary failure".into(), false);
+        assert_eq!(app.editor.text(), "pending a revision");
+        assert!(app.editing_steer());
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ReplaceSteer { .. }
+        ));
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "original draft");
+    }
+
+    #[test]
+    fn queued_edit_delivery_races_never_resurrect_messages() {
+        for unavailable_error in [false, true] {
+            let mut app = queued_app();
+            app.paste("original draft");
+            begin_steer_edit(&mut app);
+            app.paste(" revision");
+            let token = app
+                .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+                .unwrap();
+            if unavailable_error {
+                app.steer_mutation_failed("a", "unknown message".into(), true);
+            } else {
+                app.apply(Update::UserMessage {
+                    id: "a".into(),
+                    text: "pending a".into(),
+                    images: Vec::new(),
+                    append: false,
+                });
+            }
+            assert_eq!(app.editor.text(), "pending a revision");
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::None
+            ));
+            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
+            app.apply(Update::SteerMutationFinished {
+                id: "a".into(),
+                token,
+                result: Ok(()),
+            });
+            app.apply(Update::SteerAccepted {
+                editable: true,
+                id: "a".into(),
+                text: "late acceptance".into(),
+            });
+            assert!(!app.pending_steers.iter().any(|pending| pending.id == "a"));
+            assert_eq!(app.editor.text(), "original draft");
+        }
+    }
+
+    #[test]
+    fn queued_delivery_reselects_neighbor_and_session_switch_clears_edit() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.apply(Update::UserMessage {
+            id: "a".into(),
+            text: "pending a".into(),
+            images: Vec::new(),
+            append: false,
+        });
+        assert_eq!(app.selected_steer.as_deref(), Some("b"));
+        app.handle_key(press(KeyCode::Enter));
+        app.start_session("other-session".into());
+        assert!(!app.editing_steer());
+        assert!(app.selected_steer.is_none());
+        assert!(app.pending_steers.is_empty());
+        assert!(app.retired_steers.is_empty());
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_edit_capability_is_required_but_revoke_is_always_available() {
+        let mut app = queued_app();
+        app.can_replace_steer = false;
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(!app.editing_steer());
+        assert_eq!(app.editor.text(), "draft");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Delete)),
+            Action::RevokeSteer { .. }
+        ));
+        app.can_replace_steer = true;
+        app.handle_key(press(KeyCode::Enter));
+        app.can_replace_steer = false;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "pending a");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn empty_queue_does_not_capture_composer_focus() {
+        let mut app = app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(!app.queue_focused);
+        assert!(!app.queue_handoff);
+        assert!(app.selected_steer.is_none());
+        assert_eq!(app.toast_text(), Some("no pending messages"));
+        app.handle_key(press(KeyCode::Char('!')));
+        assert_eq!(app.editor.text(), "draft!");
+    }
+
+    #[test]
+    fn draining_the_queue_returns_keyboard_focus_to_the_composer() {
+        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            if outcome == "turn_end" {
+                app.apply(Update::State(StateUpdate::Idle(
+                    IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+                )));
+            } else {
+                for id in ["a", "b", "c"] {
+                    match outcome {
+                        "delivery" => app.apply(Update::UserMessage {
+                            id: id.into(),
+                            text: id.into(),
+                            images: Vec::new(),
+                            append: false,
+                        }),
+                        "removal" => app.steer_revoked(id),
+                        "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            assert!(app.pending_steers.is_empty(), "{outcome}");
+            assert!(!app.queue_focused, "{outcome}");
+            assert!(app.selected_steer.is_none(), "{outcome}");
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(press(KeyCode::Char('!')));
+            assert_eq!(app.editor.text(), "draft!", "{outcome}");
+        }
+    }
+
+    #[test]
+    fn automatic_queue_closure_guards_stale_destructive_keys_until_acknowledged() {
+        for outcome in ["delivery", "removal", "unavailable", "turn_end"] {
+            for key in [KeyCode::Enter, KeyCode::Backspace, KeyCode::Delete] {
+                let mut app = queued_app();
+                app.paste("draft");
+                app.attach(
+                    PathBuf::from("image.png"),
+                    "image/png",
+                    AttachmentKind::Image,
+                    3,
+                );
+                app.editor.move_left();
+                let draft = app.editor.text().to_owned();
+                let attachments = app.attachments.clone();
+                app.handle_key(press(KeyCode::F(2)));
+                if outcome == "turn_end" {
+                    app.apply(Update::State(StateUpdate::Idle(
+                        IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+                    )));
+                } else {
+                    for id in ["a", "b", "c"] {
+                        match outcome {
+                            "delivery" => app.apply(Update::UserMessage {
+                                id: id.into(),
+                                text: id.into(),
+                                images: Vec::new(),
+                                append: false,
+                            }),
+                            "removal" => {
+                                let token = app.begin_steer_mutation(id, None).unwrap();
+                                app.apply(Update::SteerMutationFinished {
+                                    id: id.into(),
+                                    token,
+                                    result: Ok(()),
+                                });
+                            }
+                            "unavailable" => app.steer_mutation_failed(id, "gone".into(), true),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                assert!(!app.queue_focused);
+                assert!(app.queue_handoff);
+                for _ in 0..3 {
+                    assert!(matches!(app.handle_key(press(key)), Action::None));
+                    assert_eq!(app.editor.text(), draft, "{outcome} {key:?}");
+                    assert_eq!(app.attachments, attachments);
+                    assert!(app.queue_handoff);
+                }
+                assert!(app.toast_text().unwrap().contains("queue closed"));
+                // Esc acknowledges composer focus rather than cancelling the turn.
+                assert!(matches!(app.handle_key(press(KeyCode::Esc)), Action::None));
+                assert!(!app.queue_handoff);
+                assert!(app.phase != Phase::Cancelling);
+                let action = app.handle_key(press(key));
+                if key == KeyCode::Enter {
+                    assert!(
+                        matches!(action, Action::Submit { prompt, .. } if prompt.text == draft && prompt.attachments == attachments)
+                    );
+                } else {
+                    assert_ne!(app.editor.text(), draft);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typing_paste_and_cursor_movement_acknowledge_queue_handoff() {
+        for interaction in ["typing", "paste", "cursor"] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            for id in ["a", "b", "c"] {
+                app.steer_revoked(id);
+            }
+            assert!(app.queue_handoff);
+            match interaction {
+                "typing" => {
+                    app.handle_key(press(KeyCode::Char('!')));
+                }
+                "paste" => app.paste("!"),
+                "cursor" => {
+                    app.handle_key(press(KeyCode::Left));
+                }
+                _ => unreachable!(),
+            }
+            assert!(!app.queue_handoff, "{interaction}");
+            assert!(!app.queue_focused);
+            app.apply(Update::State(StateUpdate::Idle(
+                IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+            )));
+            assert!(
+                !app.queue_handoff,
+                "turn completion must not rearm the handoff"
+            );
+            app.last_key = None;
+            assert!(matches!(
+                app.handle_key(press(KeyCode::Enter)),
+                Action::Submit { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_queue_exit_and_session_switch_do_not_require_handoff_acknowledgement() {
+        let mut app = queued_app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.queue_handoff);
+        app.handle_key(press(KeyCode::F(2)));
+        for id in ["a", "b", "c"] {
+            app.steer_revoked(id);
+        }
+        assert!(app.queue_handoff);
+        app.start_session("other-session".into());
+        assert!(!app.queue_handoff);
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn backspace_and_forward_delete_remove_only_after_acknowledgement() {
+        for key in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            for (index, expected) in ["a", "b", "c"].into_iter().enumerate() {
+                let Action::RevokeSteer { id } = app.handle_key(press(key)) else {
+                    panic!("expected removal from {key:?}");
+                };
+                assert_eq!(id, expected);
+                let token = app.begin_steer_mutation(&id, None).unwrap();
+                assert_eq!(app.pending_steers.len(), 3 - index);
+                assert!(app.queue_focused);
+                assert!(matches!(app.handle_key(press(key)), Action::None));
+                assert_eq!(app.editor.text(), "draft");
+                app.apply(Update::SteerMutationFinished {
+                    id,
+                    token,
+                    result: Ok(()),
+                });
+                assert_eq!(app.pending_steers.len(), 2 - index);
+                assert_eq!(app.queue_focused, index < 2);
+            }
+            assert!(app.selected_steer.is_none());
+            assert_eq!(app.editor.text(), "draft");
+            app.handle_key(press(KeyCode::Char('!')));
+            assert_eq!(app.editor.text(), "draft!");
+        }
+    }
+
+    #[test]
+    fn queued_edit_stays_recoverable_when_turn_finishes() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revised");
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
+        assert!(app.pending_steers.is_empty());
+        assert!(app.editing_steer());
+        assert!(!app.queue_handoff);
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "pending a revised");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_ctrl_c_cancels_then_quits_even_after_delivery_empties_selection() {
+        for empty in [false, true] {
+            let mut app = queued_app();
+            app.paste("draft");
+            app.handle_key(press(KeyCode::F(2)));
+            if empty {
+                for id in ["a", "b", "c"] {
+                    app.steer_revoked(id);
+                }
+            }
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Action::Cancel
+            ));
+            assert_eq!(app.editor.text(), "draft");
+            assert!(matches!(
+                app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Action::Quit
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_ctrl_c_retains_idle_clear_then_quit_semantics() {
+        let mut app = app();
+        app.paste("draft");
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert!(app.editor.is_empty());
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn queued_ctrl_d_keeps_empty_composer_exit_semantics() {
+        let mut app = queued_app();
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Action::Quit
+        ));
+        app.paste("draft");
+        assert!(matches!(
+            app.handle_key(modified_press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_inflight_mutations_reject_duplicates_and_keep_newer_edit_text() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let text = app.editor.text().to_owned();
+        let token = app.begin_steer_mutation("a", Some(text.clone())).unwrap();
+        assert!(app.begin_steer_mutation("a", Some(text.clone())).is_none());
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        app.paste(" newer revision");
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.pending_steers[0].text, text);
+        assert_eq!(app.editor.text(), "pending a newer revision");
+        assert!(app.editing_steer());
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+        app.handle_key(press(KeyCode::F(2)));
+        app.begin_steer_mutation("a", None).unwrap();
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Delete)),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn queued_old_completion_cannot_close_reopened_same_id_edit_or_new_request() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let token = app
+            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+            .unwrap();
+        app.handle_key(press(KeyCode::Esc));
+        begin_steer_edit(&mut app); // Identical text and ID, but a different edit.
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert!(app.editing_steer());
+        let next = app
+            .begin_steer_mutation("a", Some("replacement".into()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.steer_mutations["a"].token, next);
+        assert_eq!(app.pending_steers[0].text, "pending a");
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_async_error_unlocks_retry_without_losing_either_draft() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        app.paste(" revision");
+        let token = app
+            .begin_steer_mutation("a", Some(app.editor.text().to_owned()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Err(super::SteerMutationError {
+                message: "retry".into(),
+                unavailable: false,
+            }),
+        });
+        assert!(app.steer_mutations.is_empty());
+        assert_eq!(app.editor.text(), "pending a revision");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::ReplaceSteer { .. }
+        ));
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn queued_session_switch_clears_inflight_state_and_rejects_old_completion() {
+        let mut app = queued_app();
+        app.paste("draft");
+        begin_steer_edit(&mut app);
+        let token = app
+            .begin_steer_mutation("a", Some("old replacement".into()))
+            .unwrap();
+        app.start_session("new-session".into());
+        assert!(app.steer_mutations.is_empty());
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "new session message".into(),
+        });
+        begin_steer_edit(&mut app);
+        let next = app
+            .begin_steer_mutation("a", Some("new replacement".into()))
+            .unwrap();
+        app.apply(Update::SteerMutationFinished {
+            id: "a".into(),
+            token,
+            result: Ok(()),
+        });
+        assert_eq!(app.steer_mutations["a"].token, next);
+        assert_eq!(app.pending_steers[0].text, "new session message");
+        assert_eq!(app.editor.text(), "new session message");
+    }
+
+    #[test]
+    fn queued_media_steering_submits_but_only_allows_removal() {
+        let mut app = queued_app();
+        app.attach(
+            PathBuf::from("image.png"),
+            "image/png",
+            AttachmentKind::Image,
+            3,
+        );
+        let Action::Submit { prompt, inject } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected media steer submission");
+        };
+        assert!(inject);
+        assert_eq!(prompt.attachments.len(), 1);
+        app.apply(Update::SteerAccepted {
+            id: "media".into(),
+            text: prompt.text,
+            editable: false,
+        });
+        app.selected_steer = Some("media".into());
+        app.queue_focused = true;
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(!app.editing_steer());
+        assert!(
+            app.toast_text()
+                .unwrap()
+                .contains("with media cannot be edited")
+        );
+        assert!(
+            app.begin_steer_mutation("media", Some("text replacement".into()))
+                .is_none()
+        );
+        assert!(
+            matches!(app.handle_key(press(KeyCode::Delete)), Action::RevokeSteer { id } if id == "media")
+        );
+        assert!(app.begin_steer_mutation("media", None).is_some());
+    }
+
     #[test]
     fn active_text_is_preserved_when_steering_is_not_advertised() {
         let mut app = app();
-        app.apply(Update::State {
-            active: true,
-            steerable: true,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
         app.paste("wait");
         app.last_key = Some(Instant::now() - Duration::from_millis(500));
         assert!(matches!(
@@ -4534,6 +8308,31 @@ mod tests {
             Action::None
         ));
         assert_eq!(app.editor.text(), "/new");
+    }
+
+    #[test]
+    fn storage_status_survives_session_switch_and_clears_after_recovery() {
+        let mut app = app();
+        app.start_session("old".into());
+        // Storage events must bypass the session routing guard.
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: false,
+        }));
+        assert!(app.storage_pending);
+        assert!(!app.show_logs);
+        app.start_session("new".into());
+        assert!(app.storage_pending);
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: false,
+        }));
+        assert!(!app.storage_pending);
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: false,
+            exhausted: true,
+        }));
+        assert!(app.storage_exhausted);
     }
 
     #[test]
@@ -4634,11 +8433,9 @@ mod tests {
     fn copies_only_agent_text_after_the_latest_user_message() {
         let mut app = app();
         app.apply(Update::test_text("old".into()));
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         app.push_user("next".into());
         app.apply(Update::AgentMessage {
             id: "next-agent".into(),
@@ -4647,6 +8444,197 @@ mod tests {
         });
 
         assert_eq!(app.latest_agent_text().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn assistant_images_preserve_bytes_and_split_streamed_text() {
+        let mut app = app();
+        app.apply(Update::test_text("before".into()));
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        let key = image.key;
+        app.apply(Update::AgentImage {
+            id: "test-agent".into(),
+            image,
+            append: true,
+        });
+        app.apply(Update::test_text("after".into()));
+        app.apply(Update::test_text(" more".into()));
+        let [Block::AgentParts(parts)] = app.blocks.as_slice() else {
+            panic!("expected one multipart message");
+        };
+        let [
+            AgentPart::Text(before),
+            AgentPart::Image(image),
+            AgentPart::Text(after),
+        ] = parts.as_slice()
+        else {
+            panic!("expected ordered text, image, text");
+        };
+        assert_eq!(before, "before");
+        assert_eq!(after, "after more");
+        assert_eq!(image.data, "AQID");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.key, key);
+        assert_eq!(app.retained_image_source_bytes, 4);
+        assert_eq!(app.latest_agent_text().as_deref(), Some("beforeafter more"));
+    }
+
+    #[test]
+    fn user_appends_preserve_image_lines_and_label_byte_ranges() {
+        let mut app = app();
+        for (text, image_line) in [
+            ("α\nbeta", None),
+            (" plus", None),
+            ("[Image #1]", Some(0)),
+            ("after", None),
+            ("\n[Image #2]", Some(1)),
+        ] {
+            app.apply(Update::UserMessage {
+                id: "user-stream".into(),
+                text: text.into(),
+                append: true,
+                images: image_line
+                    .map(|line| UserImage::new("AQID".into(), "image/png".into(), line).unwrap())
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        let Block::User(message) = &app.blocks[0] else {
+            panic!("user");
+        };
+        assert_eq!(message.text, "α\nbeta plus\n[Image #1]\nafter\n[Image #2]");
+        assert_eq!(
+            message
+                .images
+                .iter()
+                .map(|image| image.line)
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        for (image, label) in message.images.iter().zip(["[Image #1]", "[Image #2]"]) {
+            assert_eq!(&message.text[image.open_label.clone().unwrap()], label);
+        }
+    }
+
+    #[test]
+    fn multipart_append_then_replacement_preserves_source_and_releases_images() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        app.apply(Update::AgentParts {
+            id: "parts".into(),
+            parts: vec![
+                AgentPart::Text("before".into()),
+                AgentPart::Image(image),
+                AgentPart::Text("after".into()),
+            ],
+        });
+        app.apply(Update::AgentMessage {
+            id: "parts".into(),
+            text: " appended".into(),
+            append: true,
+        });
+        assert_eq!(
+            app.latest_agent_text().as_deref(),
+            Some("beforeafter appended")
+        );
+        assert_eq!(app.retained_image_source_bytes, 4);
+        let Block::AgentParts(parts) = &app.blocks[0] else {
+            panic!("parts");
+        };
+        assert!(matches!(parts.last(), Some(AgentPart::Text(text)) if text == "after appended"));
+        app.apply(Update::AgentParts {
+            id: "parts".into(),
+            parts: vec![AgentPart::Text("replacement".into())],
+        });
+        assert_eq!(app.latest_agent_text().as_deref(), Some("replacement"));
+        assert_eq!(app.retained_image_source_bytes, 0);
+        app.apply(Update::AgentMessage {
+            id: "parts".into(),
+            text: " tail".into(),
+            append: true,
+        });
+        assert_eq!(app.latest_agent_text().as_deref(), Some("replacement tail"));
+    }
+
+    #[test]
+    fn assistant_images_complete_upsert_replaces_stream_and_shrinks_in_place() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        app.apply(Update::test_text("before".into()));
+        app.apply(Update::AgentImage {
+            id: "test-agent".into(),
+            image: image.clone(),
+            append: true,
+        });
+        app.apply(Update::test_text("after".into()));
+        app.push_block(Block::Notice("following block".into()));
+        for _ in 0..2 {
+            app.apply(Update::AgentParts {
+                id: "test-agent".into(),
+                parts: vec![
+                    AgentPart::Text("complete".into()),
+                    AgentPart::Image(image.clone()),
+                    AgentPart::Image(image.clone()),
+                    AgentPart::Text("end".into()),
+                ],
+            });
+            assert_eq!(app.blocks.len(), 2);
+            assert_eq!(app.retained_image_source_bytes, 8);
+            assert!(matches!(&app.blocks[0], Block::AgentParts(parts) if parts.len() == 4));
+            assert_eq!(app.latest_agent_text().as_deref(), Some("completeend"));
+        }
+        app.apply(Update::AgentParts {
+            id: "test-agent".into(),
+            parts: vec![AgentPart::Image(image)],
+        });
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.retained_image_source_bytes, 4);
+        assert!(matches!(&app.blocks[0], Block::AgentParts(parts) if parts.len() == 1));
+        app.apply(Update::AgentMessage {
+            id: "test-agent".into(),
+            text: "only text".into(),
+            append: false,
+        });
+        assert_eq!(app.retained_image_source_bytes, 0);
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text == "only text"));
+        assert!(matches!(&app.blocks[1], Block::Notice(text) if text == "following block"));
+        app.apply(Update::AgentParts {
+            id: "test-agent".into(),
+            parts: Vec::new(),
+        });
+        assert_eq!(app.blocks.len(), 2);
+        assert!(matches!(&app.blocks[0], Block::Agent(text) if text.is_empty()));
+    }
+
+    #[test]
+    fn assistant_images_share_source_budget_and_release_replaced_bytes() {
+        let mut app = app();
+        let image = UserImage::new("AQID".into(), "image/png".into(), 0).unwrap();
+        for _ in 0..2 {
+            app.apply(Update::AgentImage {
+                id: "image".into(),
+                image: image.clone(),
+                append: false,
+            });
+            assert_eq!(app.retained_image_source_bytes, 4);
+            assert_eq!(app.blocks.len(), 1);
+        }
+        app.apply(Update::AgentMessage {
+            id: "image".into(),
+            text: "replacement".into(),
+            append: false,
+        });
+        assert_eq!(app.retained_image_source_bytes, 0);
+        let large = UserImage::new("A".repeat(12 * 1024 * 1024), "image/png".into(), 0).unwrap();
+        for index in 0..3 {
+            app.apply(Update::AgentImage {
+                id: format!("large-{index}"),
+                image: large.clone(),
+                append: true,
+            });
+        }
+        assert_eq!(app.retained_image_source_bytes, 24 * 1024 * 1024);
+        assert!(matches!(app.blocks.last(), Some(Block::Agent(text)) if text == "[Image]"));
     }
 
     #[test]
@@ -4665,11 +8653,9 @@ mod tests {
     fn autonomous_text_starts_a_new_block_after_turn_end() {
         let mut app = app();
         app.apply(Update::test_text("Started.".into()));
-        app.apply(Update::State {
-            active: false,
-            steerable: false,
-            cancelled: false,
-        });
+        app.apply(Update::State(StateUpdate::Idle(
+            IdleStateUpdate::new().stop_reason(StopReason::EndTurn),
+        )));
         app.apply(Update::AgentMessage {
             id: "autonomous".into(),
             text: "RAVENS_".into(),
@@ -4707,11 +8693,16 @@ mod tests {
             backgrounded: true,
         });
         app.apply(Update::test_text("first completion".into()));
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "background".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            images: None,
+            append_output: false,
+            intent: None,
             backgrounded: false,
         });
         app.apply(Update::AgentMessage {
@@ -4734,6 +8725,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(agents, ["first completion", "second completion continued"]);
+        assert_eq!(
+            app.latest_agent_text().as_deref(),
+            Some("second completion continued")
+        );
     }
 
     fn model_choice(provider: &str, model: &str) -> super::ModelChoice {
@@ -4784,6 +8779,7 @@ mod tests {
         ));
         app.apply(Update::SessionCatalog(Ok(vec![
             crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: "saved".into(),
                 title: Some("Saved".into()),
                 preview: None,
@@ -4802,6 +8798,7 @@ mod tests {
         app.session_choices = ["newer", "older"]
             .into_iter()
             .map(|id| crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
@@ -4828,6 +8825,7 @@ mod tests {
         app.session_choices = ["newer", "older"]
             .into_iter()
             .map(|id| crate::session::CatalogEntry {
+                additional_directories: Vec::new(),
                 id: id.into(),
                 title: Some(format!("{id} title")),
                 preview: None,
@@ -4884,6 +8882,7 @@ mod tests {
     fn session_dialog_confirms_before_clearing_a_name() {
         let mut app = app();
         app.session_choices = vec![crate::session::CatalogEntry {
+            additional_directories: Vec::new(),
             id: "saved".into(),
             title: Some("Generated".into()),
             preview: None,
@@ -5074,6 +9073,103 @@ mod tests {
     }
 
     #[test]
+    fn idle_runtime_lease_keeps_timer_scheduled_until_state_is_invalidated() {
+        use crate::events::{GenerationOutcome, SubagentStatus};
+
+        let mut app = app();
+        assert!(!app.needs_redraw_tick());
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        app.apply(Update::Runtime(agent_event(
+            "idle",
+            "Completed worker",
+            SubagentStatus::Idle,
+            Some(GenerationOutcome::Success),
+            1,
+            None,
+            (10, 20, Some(30)),
+        )));
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        assert!(!app.working());
+        assert!(app.transcript_dynamic.is_empty());
+        assert!(app.toast.is_none());
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+        assert!(app.needs_redraw_tick());
+        assert!(!app.tick(), "a healthy lease needs polling, not a frame");
+        assert!(!app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 1);
+
+        // Advance the lease age without sleeping, then use the same scheduling
+        // predicate and tick entry point as both event loops. No new traffic.
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
+        assert!(app.needs_redraw_tick());
+        if app.needs_redraw_tick() {
+            assert!(app.tick(), "lease expiration must become visible");
+        }
+        assert!(app.runtime_unavailable());
+        assert_eq!(app.agent_counts().total, 0);
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(!app.needs_redraw_tick());
+    }
+
+    #[test]
+    fn healthy_heartbeat_expires_old_state_before_renewing_lease() {
+        let mut app = app();
+        app.apply(Update::Runtime(RuntimeEvent::StorageStatus {
+            pending: true,
+            exhausted: true,
+        }));
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert!(!app.runtime_unavailable());
+        assert!(!app.storage_pending && !app.storage_exhausted);
+        assert!(app.needs_redraw_tick());
+        assert!(
+            matches!(app.blocks.last(), Some(Block::Notice(text)) if text.contains("state remains unknown"))
+        );
+
+        let blocks = app.blocks.len();
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: true,
+        }));
+        assert_eq!(app.blocks.len(), blocks);
+        app.tick();
+        assert!(!app.runtime_unavailable());
+
+        app.runtime_last_frame = Some(Instant::now() - crate::diagnostic_transport::LEASE);
+        app.tick();
+        assert!(app.runtime_unavailable());
+    }
+
+    #[test]
+    fn maintenance_ticks_redraw_only_for_visible_changes() {
+        let mut app = app();
+        assert!(!app.tick());
+        app.toast = Some(("done".into(), Instant::now()));
+        assert!(app.needs_redraw_tick());
+        assert!(
+            !app.tick(),
+            "a static toast should not redraw until it expires"
+        );
+        app.toast.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(5);
+        assert!(app.tick());
+        assert!(app.toast.is_none());
+        assert!(!app.tick());
+
+        app.phase = Phase::Working;
+        assert!(app.tick(), "working animations still advance");
+        app.phase = Phase::Idle;
+        assert!(!app.tick());
+    }
+
+    #[test]
     fn redraw_ticks_only_while_time_dependent_ui_is_visible() {
         let mut app = app();
         assert!(!app.needs_redraw_tick());
@@ -5091,12 +9187,18 @@ mod tests {
         });
         app.phase = Phase::Idle;
         assert!(app.needs_redraw_tick());
+        assert!(app.tick(), "background tool animations still advance");
 
-        app.apply(Update::ToolUpdated {
+        app.apply(Update::ToolPatched {
             id: "background".into(),
+            title: None,
+            kind: None,
             status: Some(ToolCallStatus::Completed),
             script: None,
-            output: Vec::new(),
+            output: None,
+            images: None,
+            append_output: false,
+            intent: None,
             backgrounded: true,
         });
         assert!(!app.needs_redraw_tick());
@@ -5154,11 +9256,370 @@ mod tests {
             parent_id: parent.map(|(id, _)| id.into()),
             parent_name: parent.map(|(_, name)| name.into()),
             harness: "acp.kit".into(),
+            vendor: crate::events::HarnessVendor::Kit,
             model: Some("test".into()),
             created_at_unix_ms: created,
             generation_started_at_unix_ms: started,
             generation_finished_at_unix_ms: finished,
         }
+    }
+
+    #[test]
+    fn roster_excerpt_prioritizes_activity_and_resets_each_turn() {
+        use crate::events::{SubagentActivity as Activity, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        let apply = |app: &mut App, activity| {
+            app.apply_runtime_at(
+                RuntimeEvent::SubagentActivity {
+                    id: "scout".into(),
+                    activity,
+                },
+                10,
+            )
+        };
+        assert_eq!(app.agents["scout"].excerpt(), "task for scout");
+        apply(
+            &mut app,
+            Activity::Title {
+                title: Some("Session title".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Plan {
+                entry: Some("Implement parser".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Implement parser");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: Some("Reading files".into()),
+                running: Some(true),
+            },
+        );
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: Some("Running tests".into()),
+                running: Some(true),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Running tests");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: None,
+                running: Some(false),
+            },
+        );
+        // A late content-only or title update must not resurrect a completed tool.
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "b".into(),
+                title: Some("Tests passed".into()),
+                running: None,
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Reading files");
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: None,
+                running: Some(false),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Implement parser");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 2, Some(10)),
+            ),
+            10,
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Plan {
+                entry: Some("Late plan".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                2,
+                None,
+                (1, 12, None),
+            ),
+            12,
+        );
+        apply(
+            &mut app,
+            Activity::Tool {
+                id: "a".into(),
+                title: Some("New turn".into()),
+                running: Some(true),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "New turn");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                3,
+                None,
+                (1, 14, None),
+            ),
+            14,
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "Session title");
+        apply(
+            &mut app,
+            Activity::Title {
+                title: Some("  ".into()),
+            },
+        );
+        assert_eq!(app.agents["scout"].excerpt(), "task for scout");
+    }
+
+    #[test]
+    fn session_cost_reports_replace_totals_and_reset_with_session() {
+        use agent_client_protocol::schema::v2::Cost;
+        let mut app = app();
+        assert!(app.cost.is_none());
+        for amount in [0.0, 1.25, 1.25, 2.0] {
+            app.apply(Update::Usage {
+                used: 1,
+                size: 2,
+                cost: Some(Cost::new(amount, "USD")),
+            });
+            assert_eq!(app.cost.as_ref().unwrap().amount, amount);
+        }
+        for cost in [
+            None,
+            Some(Cost::new(f64::NAN, "USD")),
+            Some(Cost::new(-1.0, "USD")),
+            Some(Cost::new(3.0, "bad")),
+        ] {
+            app.apply(Update::Usage {
+                used: 2,
+                size: 3,
+                cost,
+            });
+            assert_eq!(app.cost.as_ref().unwrap().amount, 2.0);
+        }
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: false,
+        }));
+        assert_eq!(app.cost.as_ref().unwrap().amount, 2.0);
+        app.start_session("replacement".into());
+        assert!(app.cost.is_none());
+    }
+
+    #[test]
+    fn subagent_cost_totals_include_nested_and_removed_sessions_by_currency() {
+        use crate::events::SubagentStatus;
+        use agent_client_protocol::schema::v2::Cost;
+        let mut app = app();
+        assert!(app.subagent_cost_totals().is_empty());
+        for (id, parent) in [
+            ("scout", None),
+            ("nested", Some(("scout", "Scout"))),
+            ("euro", None),
+        ] {
+            app.apply_runtime_at(
+                agent_event(
+                    id,
+                    id,
+                    SubagentStatus::Working,
+                    None,
+                    1,
+                    parent,
+                    (1, 2, None),
+                ),
+                10,
+            );
+        }
+        for (id, amount, currency) in [
+            ("scout", 1.0, "USD"),
+            ("scout", 1.0, "USD"),
+            ("scout", 1.5, "USD"),
+            ("nested", 0.5, "USD"),
+            ("euro", 0.0, "EUR"),
+        ] {
+            app.apply_runtime_at(
+                RuntimeEvent::SubagentUsage {
+                    id: id.into(),
+                    used: 1,
+                    size: 2,
+                    cost: Some(Cost::new(amount, currency)),
+                },
+                11,
+            );
+        }
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 2,
+                size: 3,
+                cost: None,
+            },
+            12,
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                None,
+                1,
+                None,
+                (1, 2, Some(12)),
+            ),
+            12,
+        );
+        assert_eq!(app.agents["scout"].cost.as_ref().unwrap().amount, 1.5);
+        let totals = app.subagent_cost_totals();
+        assert_eq!(totals["USD"], 2.0);
+        assert_eq!(totals["EUR"], 0.0);
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentDescendantsRemoved {
+                ancestor_id: "scout".into(),
+            },
+            13,
+        );
+        assert!(!app.agents.contains_key("nested"));
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Removed,
+                None,
+                2,
+                None,
+                (1, 2, Some(14)),
+            ),
+            14,
+        );
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.apply(Update::Runtime(RuntimeEvent::RunletTransport {
+            available: false,
+        }));
+        assert_eq!(app.subagent_cost_totals(), totals);
+        app.start_session("replacement".into());
+        assert!(app.subagent_cost_totals().is_empty());
+    }
+
+    #[test]
+    fn subagent_usage_tracks_known_rows_and_survives_lifecycle_updates() {
+        use crate::events::{HarnessVendor, SubagentStatus};
+        let mut app = app();
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 1,
+                size: 2,
+                cost: None,
+            },
+            10,
+        );
+        assert!(app.agents.is_empty(), "usage for an unknown row is dropped");
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Working,
+                None,
+                1,
+                None,
+                (1, 2, None),
+            ),
+            10,
+        );
+        assert!(app.agents_all_kit());
+        app.apply_runtime_at(
+            RuntimeEvent::SubagentUsage {
+                id: "scout".into(),
+                used: 40_000,
+                size: 200_000,
+                cost: None,
+            },
+            11,
+        );
+        assert_eq!(
+            app.agents["scout"].usage,
+            Some(super::ContextUsage {
+                used: 40_000,
+                size: 200_000
+            })
+        );
+        app.apply_runtime_at(
+            agent_event(
+                "scout",
+                "Scout",
+                SubagentStatus::Idle,
+                Some(crate::events::GenerationOutcome::Success),
+                1,
+                None,
+                (1, 2, Some(9)),
+            ),
+            12,
+        );
+        assert_eq!(
+            app.agents["scout"].usage.map(|usage| usage.used),
+            Some(40_000),
+            "a lifecycle transition keeps the last reading"
+        );
+
+        let mut claude = agent_event(
+            "designer",
+            "Designer",
+            SubagentStatus::Working,
+            None,
+            1,
+            None,
+            (1, 2, None),
+        );
+        if let RuntimeEvent::SubagentStateChanged {
+            vendor, harness, ..
+        } = &mut claude
+        {
+            *vendor = HarnessVendor::Claude;
+            *harness = "acp.claude".into();
+        }
+        app.apply_runtime_at(claude, 13);
+        assert!(!app.agents_all_kit());
+        assert_eq!(app.agents["designer"].vendor, HarnessVendor::Claude);
     }
 
     #[test]
@@ -5358,7 +9819,8 @@ mod tests {
         assert!(app.needs_redraw_tick());
         app.tick_at(5_000);
         assert!(!app.agents.contains_key("failed"));
-        assert!(!app.needs_redraw_tick());
+        // Runtime traffic established a lease even after the animation ends.
+        assert!(app.needs_redraw_tick());
     }
 
     #[test]
@@ -5905,6 +10367,54 @@ mod tests {
     }
 
     #[test]
+    fn agents_roster_auto_opens_once_per_session() {
+        use crate::events::SubagentStatus;
+
+        let mut app = app();
+        app.editor.insert_str("draft");
+        assert!(!app.show_agents());
+
+        let launch = agent_event(
+            "scout",
+            "Scout",
+            SubagentStatus::Starting,
+            None,
+            1,
+            None,
+            (10, 10, None),
+        );
+        app.apply_runtime_at(launch.clone(), 10);
+        assert!(app.show_agents());
+        assert_eq!(app.editor.text(), "draft");
+
+        app.toggle_agents();
+        app.apply_runtime_at(launch.clone(), 11);
+        app.apply_runtime_at(
+            agent_event(
+                "second",
+                "Second",
+                SubagentStatus::Starting,
+                None,
+                1,
+                None,
+                (12, 12, None),
+            ),
+            12,
+        );
+        assert!(!app.show_agents());
+
+        app.start_session("replacement".into());
+        app.apply_runtime_at(
+            RuntimeEvent::SessionStarted {
+                session_id: "replacement".into(),
+            },
+            13,
+        );
+        app.apply_runtime_at(launch, 13);
+        assert!(app.show_agents());
+    }
+
+    #[test]
     fn agents_toggle_without_disturbing_editor() {
         let mut app = app();
         app.editor.insert_str("abc");
@@ -5966,5 +10476,297 @@ mod tests {
         assert_eq!(app.agents_scroll(), 0);
         app.handle_mouse(wheel(MouseEventKind::ScrollDown, 30, 8));
         assert_eq!(app.agents_scroll(), 0);
+    }
+
+    mod canonical_group_tests {
+        use super::super::*;
+
+        fn app() -> App {
+            App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            )
+        }
+        fn start(app: &mut App, id: &str, compose: bool, backgrounded: bool) {
+            app.apply(Update::ToolStarted {
+                id: id.into(),
+                title: if compose { "compose" } else { "shell" }.into(),
+                kind: ToolKind::default(),
+                script: None,
+                backgrounded,
+            });
+        }
+        fn parent(app: &mut App, id: &str, owner: &str) {
+            app.apply(Update::ToolParent {
+                id: id.into(),
+                parent: Some(owner.into()),
+            });
+        }
+        fn patch(app: &mut App, id: &str, status: Option<ToolCallStatus>, text: &str) {
+            app.apply(Update::ToolPatched {
+                id: id.into(),
+                title: None,
+                kind: None,
+                status,
+                script: None,
+                output: Some(vec![text.into()]),
+                images: None,
+                append_output: true,
+                intent: None,
+                backgrounded: false,
+            });
+        }
+        fn call<'a>(app: &'a App, id: &str) -> &'a ToolCall {
+            let Block::Tool(call) = &app.blocks[app.call_index(id).unwrap()] else {
+                panic!("tool")
+            };
+            call
+        }
+
+        #[test]
+        fn canonical_interleaving_orphans_cycles_and_sessions() {
+            let mut app = app();
+            start(&mut app, "arbitrary child", false, false);
+            parent(&mut app, "arbitrary child", "root-b");
+            assert!(app.tool_owners.is_empty());
+            start(&mut app, "root-a", true, false);
+            start(&mut app, "root-b", false, false);
+            assert!(app.tool_owners.is_empty());
+            app.apply(Update::ToolPatched {
+                id: "root-b".into(),
+                title: Some("compose".into()),
+                kind: None,
+                status: None,
+                script: None,
+                output: None,
+                images: None,
+                append_output: false,
+                intent: None,
+                backgrounded: false,
+            });
+            assert_eq!(app.tool_owners.get(&0), Some(&2));
+            start(&mut app, "root-b/looks-related", false, false);
+            parent(&mut app, "root-b/looks-related", "root-a");
+            assert_eq!(app.grouped_tools[&1], vec![3]);
+            assert_eq!(app.grouped_tools[&2], vec![0]);
+            parent(&mut app, "root-b", "arbitrary child");
+            assert!(!app.tool_owners.contains_key(&0));
+            assert!(!app.tool_owners.contains_key(&2));
+            parent(&mut app, "root-a", "root-a");
+            assert!(app.tool_owners.is_empty());
+            app.start_session("new".into());
+            assert!(app.tool_indices.is_empty());
+            assert!(app.grouped_tools.is_empty());
+            start(&mut app, "arbitrary child", false, false);
+            assert!(call(&app, "arbitrary child").parent_id.is_none());
+        }
+
+        #[test]
+        fn canonical_terminal_parent_does_not_finish_child_and_patches_keep_identity() {
+            let mut app = app();
+            app.phase = Phase::Working;
+            start(&mut app, "root", true, true);
+            start(&mut app, "child", false, false);
+            parent(&mut app, "child", "root");
+            patch(
+                &mut app,
+                "root",
+                Some(ToolCallStatus::Completed),
+                "detached",
+            );
+            assert!(call(&app, "child").running());
+            app.finish_turn_with_outcome(false, None);
+            assert!(call(&app, "child").running());
+            patch(&mut app, "child", Some(ToolCallStatus::Failed), "cancelled");
+            patch(&mut app, "child", None, "late output");
+            let child = call(&app, "child");
+            assert_eq!(child.parent_id.as_deref(), Some("root"));
+            assert_eq!(child.status, ToolCallStatus::Failed);
+            assert_eq!(child.output, ["cancelled", "late output"]);
+            assert!(!child.backgrounded);
+            assert!(app.transcript_dirty.contains(&0));
+        }
+
+        #[test]
+        fn finish_turn_only_terminalizes_active_foreground_calls() {
+            for successful in [false, true] {
+                let mut app = app();
+                app.phase = Phase::Working;
+                start(&mut app, "historical", false, false);
+                patch(&mut app, "historical", Some(ToolCallStatus::Failed), "old");
+                start(&mut app, "foreground", true, false);
+                start(&mut app, "foreground-child", false, false);
+                parent(&mut app, "foreground-child", "foreground");
+                start(&mut app, "detached-completed", true, true);
+                start(&mut app, "middle", true, false);
+                parent(&mut app, "middle", "detached-completed");
+                start(&mut app, "leaf", false, false);
+                parent(&mut app, "leaf", "middle");
+                patch(
+                    &mut app,
+                    "detached-completed",
+                    Some(ToolCallStatus::Completed),
+                    "done",
+                );
+                start(&mut app, "background-a", true, true);
+                start(&mut app, "background-b", false, true);
+                app.finish_turn_with_outcome(successful, None);
+                let expected = if successful {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                };
+                for id in ["foreground", "foreground-child"] {
+                    assert_eq!(call(&app, id).status, expected);
+                    assert!(call(&app, id).finished.is_some());
+                }
+                assert_eq!(call(&app, "historical").status, ToolCallStatus::Failed);
+                assert_eq!(
+                    call(&app, "detached-completed").status,
+                    ToolCallStatus::Completed
+                );
+                for id in ["middle", "leaf", "background-a", "background-b"] {
+                    assert!(call(&app, id).running(), "{id}");
+                }
+                assert_eq!(
+                    app.background_calls()
+                        .iter()
+                        .map(|call| call.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["background-a", "background-b"]
+                );
+                // Repeated idle terminal events cannot change inherited work.
+                app.finish_turn_with_outcome(!successful, None);
+                assert!(call(&app, "leaf").running());
+            }
+        }
+
+        #[test]
+        fn canonical_reparenting_updates_only_the_related_tree() {
+            let mut app = app();
+            start(&mut app, "leaf", false, false);
+            parent(&mut app, "leaf", "middle");
+            start(&mut app, "a", true, false);
+            start(&mut app, "b", true, false);
+            start(&mut app, "middle", false, false);
+            parent(&mut app, "middle", "a");
+            assert_eq!(app.grouped_tools[&1], vec![0, 3]);
+            parent(&mut app, "middle", "b");
+            assert!(!app.grouped_tools.contains_key(&1));
+            assert_eq!(app.grouped_tools[&2], vec![0, 3]);
+            parent(&mut app, "a", "b");
+            parent(&mut app, "b", "a");
+            assert!(app.tool_owners.is_empty());
+            app.apply(Update::ToolParent {
+                id: "a".into(),
+                parent: None,
+            });
+            assert_eq!(app.grouped_tools[&1], vec![0, 2, 3]);
+            parent(&mut app, "leaf", "missing");
+            assert!(!app.tool_owners.contains_key(&0));
+            assert_eq!(app.grouped_tools[&1], vec![2, 3]);
+            start(&mut app, "missing", true, false);
+            assert_eq!(app.grouped_tools[&4], vec![0]);
+            assert_eq!(app.grouped_tools[&1], vec![2, 3]);
+        }
+
+        /// Opt-in benchmark at the real App update boundary. No timing assertions
+        /// or production instrumentation: compare scaling across transcript sizes.
+        #[test]
+        #[ignore = "manual canonical ingestion benchmark; run with --ignored --nocapture"]
+        fn canonical_ingestion_benchmark() {
+            for count in [1_000, 2_000, 4_000, 8_000, 16_000] {
+                let mut app = app();
+                start(&mut app, "root", true, false);
+                let started = Instant::now();
+                for i in 0..count {
+                    let id = format!("child-{i}");
+                    app.apply(Update::ToolPatched {
+                        id: id.clone(),
+                        title: Some("shell".into()),
+                        kind: None,
+                        status: None,
+                        script: None,
+                        output: None,
+                        images: None,
+                        append_output: false,
+                        intent: None,
+                        backgrounded: false,
+                    });
+                    parent(&mut app, &id, "root");
+                }
+                let elapsed = started.elapsed();
+                std::hint::black_box(&app);
+                eprintln!(
+                    "canonical ingestion: {count} calls, {elapsed:?}, {} ns/call",
+                    elapsed.as_nanos() / count
+                );
+            }
+        }
+
+        #[test]
+        fn canonical_automatic_focus_preserves_word_movement_and_separate_paging() {
+            let mut app = app();
+            app.paste("first second");
+            start(&mut app, "root", true, false);
+            for i in 0..70 {
+                let id = format!("child {i}");
+                start(&mut app, &id, false, false);
+                parent(&mut app, &id, "root");
+            }
+            assert_eq!(app.focus_call().unwrap().id, "child 69");
+            let page = call(&app, "root").child_page;
+            assert!(page > 0);
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 6);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(call(&app, "root").child_page, page);
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page - 1);
+            assert_eq!(app.editor.cursor(), 12);
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::ALT));
+            assert_eq!(call(&app, "root").child_page, page);
+            assert_eq!(app.editor.cursor(), 12);
+            assert_eq!(app.editor.text(), "first second");
+        }
+
+        #[test]
+        fn canonical_nested_background_and_bounded_navigation() {
+            let mut app = app();
+            app.phase = Phase::Working;
+            start(&mut app, "root", true, false);
+            start(&mut app, "nested", true, true);
+            parent(&mut app, "nested", "root");
+            for i in 0..70 {
+                let id = format!("child {i}");
+                start(&mut app, &id, false, false);
+                parent(&mut app, &id, "nested");
+            }
+            assert!(app.child_window(0).0.len() <= 32);
+            app.finish_turn_with_outcome(false, None);
+            assert!(call(&app, "child 69").running());
+            app.focus_call_by_id("root".into());
+            for _ in 0..3 {
+                assert!(app.page_children(false));
+            }
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                seen.extend_from_slice(app.child_window(0).0);
+                assert!(app.page_children(true));
+            }
+            assert_eq!(seen, app.grouped_tools[&0]);
+            app.toggle_output("child 0");
+            assert!(call(&app, "child 0").expanded);
+            app.apply(Update::ToolParent {
+                id: "child 0".into(),
+                parent: None,
+            });
+            assert!(!app.tool_owners.contains_key(&2));
+            assert!(call(&app, "child 0").expanded);
+        }
     }
 }

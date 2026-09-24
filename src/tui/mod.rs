@@ -4,25 +4,38 @@
 //! process's stdio, so the UI runs against exactly the protocol surface any
 //! other editor would use. The child's stderr carries two things: ordinary
 //! diagnostics, shown in the log pane, and the runtime side channel
-//! ([`crate::events`]) that feeds the live graph of a running Runlet program.
+//! ([`crate::events`]) that reports tool-call and subagent activity.
 
 mod app;
+mod attachment;
+mod background;
 mod command;
 mod editor;
+mod hyperlinks;
 mod image;
+mod input;
+#[cfg(all(test, unix))]
+mod keyboard_tests;
 mod markdown;
-mod plan;
+mod scheduler;
+mod source;
+mod startup;
+
+pub use startup::pick_session;
 mod theme;
 mod ui;
 mod wrap;
 
 use std::{
+    future::{Future, poll_fn},
     path::{Path, PathBuf},
+    pin::pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -34,14 +47,18 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
+    terminal::EnterAlternateScreen,
 };
-use futures_util::StreamExt;
-use ratatui::DefaultTerminal;
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
+type DefaultTerminal = ratatui::Terminal<hyperlinks::HyperlinkBackend<std::io::Stdout>>;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -57,18 +74,440 @@ use wire::{
 
 use crate::{
     events::{self, EVENTS_ENV},
-    protocols::acp::FileSearchRequest,
+    protocols::acp::{
+        FileSearchRequest, MODEL_CONFIG_ID, REASONING_EFFORT_CONFIG_ID, model_switch,
+    },
     tools::mcp::CredentialStorage,
 };
 
 use app::{
-    Action, App, Attachment, AttachmentKind, EffortChoice, ModelChoice, SubmittedPrompt, Update,
-    UserImage,
+    Action, AgentPart, App, Attachment, AttachmentKind, ClipboardMode, ClipboardRoute,
+    EffortChoice, ModelChoice, SubmittedPrompt, Update, UserImage,
 };
+use attachment::MaterializedImage;
+
+// This state is local to one ACP UI lifecycle. Dropping startup cancels the
+// connection attempt; dropping a live session stops audio even on early returns.
+
+type VoiceStartup =
+    std::pin::Pin<Box<dyn Future<Output = Result<crate::voice::VoiceSession, String>>>>;
+
+#[derive(Default)]
+struct NativeVoice {
+    starting: Option<VoiceStartup>,
+    microphone_enabled: bool,
+    session: Option<crate::voice::VoiceSession>,
+    handoff: Option<VoiceHandoff>,
+    ready: bool,
+    // The ACP session whose active notice was queued, not a mutable
+    // pointer to whichever session the UI happens to display next.
+    announced_session: Option<wire::SessionId>,
+}
+
+#[derive(Default)]
+struct VoiceHandoff {
+    id: String,
+    accepted: bool,
+    user_message_id: Option<String>,
+    // Only the most recent assistant message is spoken back, never thoughts or
+    // tool output. Both message identity and content have bounded storage.
+    message_id: String,
+    text: String,
+}
+
+impl NativeVoice {
+    fn mark_ready(&mut self, app: &mut App) {
+        self.ready = true;
+        app.note(if self.microphone_enabled {
+            "voice ready — microphone enable requested; /voice mute to stop listening, /voice off to disconnect"
+        } else {
+            "voice ready — microphone muted; /voice on to listen, /voice off to disconnect"
+        });
+    }
+
+    fn state_notifications(
+        &mut self,
+        current: &wire::SessionId,
+    ) -> Vec<crate::protocols::acp::VoiceStateNotification> {
+        let desired = self.ready.then_some(current);
+        if self.announced_session.as_ref() == desired {
+            return Vec::new();
+        }
+        let mut notices = Vec::with_capacity(2);
+        if let Some(previous) = self.announced_session.take() {
+            notices.push(crate::protocols::acp::VoiceStateNotification {
+                session_id: agentkit_acp::SessionId::new(previous.to_string()),
+                active: false,
+            });
+        }
+        if let Some(current) = desired {
+            self.announced_session = Some(current.clone());
+            notices.push(crate::protocols::acp::VoiceStateNotification {
+                session_id: agentkit_acp::SessionId::new(current.to_string()),
+                active: true,
+            });
+        }
+        notices
+    }
+
+    fn notify_state(
+        &mut self,
+        connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+        current: &wire::SessionId,
+    ) {
+        for notice in self.state_notifications(current) {
+            // Queue-only, no request/response or model turn. On a disconnected
+            // transport the server's connection teardown clears the state.
+            let _ = connection.send_notification(notice);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.ready = false;
+        self.starting = None;
+        self.microphone_enabled = false;
+        if let Some(mut session) = self.session.take() {
+            session.stop();
+        }
+        self.handoff = None;
+    }
+
+    fn control(&mut self, control: &str, storage: &CredentialStorage, app: &mut App) {
+        if !app.voice_enabled {
+            app.note("voice is disabled; set experimental.voice = true in ~/.kit/config.toml and restart Kit");
+            return;
+        }
+        match control {
+            "on" if self.starting.is_none() && self.session.is_none() => {
+                self.microphone_enabled = true;
+                self.starting = Some(Box::pin(crate::voice::VoiceSession::start(storage.clone())));
+                app.note(
+                    "voice connecting: this starts a billable session using subscription usage. Use headphones; microphone capture starts when connected; /voice mute stops listening; /voice off cancels",
+                );
+            }
+            "off" => {
+                self.stop();
+                app.note(
+                    "voice off (any accepted Kit task continues; use normal cancel to stop it)",
+                );
+            }
+            "on" | "mute" => {
+                self.microphone_enabled = control == "on";
+                if let Some(session) = self.session.as_mut() {
+                    match session.set_microphone(self.microphone_enabled) {
+                        Ok(()) => app.note(if self.microphone_enabled {
+                            "voice microphone enable requested — headphones required; /voice mute requests stopping capture"
+                        } else {
+                            "voice microphone mute requested"
+                        }),
+                        Err(error) => self.fail(error, app),
+                    }
+                } else if self.starting.is_some() {
+                    app.note(if self.microphone_enabled {
+                        "voice connecting — microphone will start when ready"
+                    } else {
+                        "voice connecting — microphone will stay muted"
+                    });
+                } else {
+                    app.note("voice is not ready; /voice on first");
+                }
+            }
+            _ => app.note("usage: /voice on (billable subscription session) | mute | off; headphones required"),
+        }
+    }
+
+    fn fail(&mut self, error: String, app: &mut App) {
+        self.stop();
+        app.note(format!("voice stopped: {}", voice_display_text(&error)));
+    }
+
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<crate::voice::VoiceEvent> {
+        if let Some(starting) = self.starting.as_mut() {
+            match starting.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => {
+                    self.starting = None;
+                    match result {
+                        Ok(mut session) => {
+                            if let Err(error) = session.set_microphone(self.microphone_enabled) {
+                                session.stop();
+                                return Poll::Ready(crate::voice::VoiceEvent::Error(error));
+                            }
+                            self.session = Some(session);
+                        }
+                        Err(error) => return Poll::Ready(crate::voice::VoiceEvent::Error(error)),
+                    }
+                }
+            }
+        }
+        match self.session.as_mut() {
+            Some(session) => session
+                .events
+                .poll_recv(cx)
+                .map(|event| event.unwrap_or(crate::voice::VoiceEvent::Stopped)),
+            None => Poll::Pending,
+        }
+    }
+
+    fn result(&mut self, id: String, text: String, app: &mut App) {
+        if let Some(session) = self.session.as_mut()
+            && let Err(error) = session.send_result(id, text)
+        {
+            self.fail(error, app);
+        }
+    }
+
+    fn observe(&mut self, update: &Update, app: &mut App) {
+        if matches!(update, Update::ProcessExited(_)) {
+            self.stop();
+            return;
+        }
+        let Some(handoff) = self.handoff.as_mut() else {
+            return;
+        };
+        match update {
+            Update::VoicePromptAccepted { id, result } if id == &handoff.id => match result {
+                Ok(()) => handoff.accepted = true,
+                Err(error) => {
+                    let id = handoff.id.clone();
+                    self.handoff = None;
+                    self.result(id, format!("Kit did not accept the task: {error}"), app);
+                }
+            },
+            Update::UserMessage { id, .. }
+                if handoff.accepted && handoff.user_message_id.is_none() =>
+            {
+                handoff.user_message_id = Some(id.clone());
+            }
+            Update::AgentMessage { id, text, append } if handoff.user_message_id.is_some() => {
+                handoff.record(id, text, *append);
+            }
+            Update::AgentParts { id, parts } if handoff.user_message_id.is_some() => {
+                handoff.record(id, "", false);
+                for part in parts {
+                    if let AgentPart::Text(text) = part {
+                        handoff.record(id, text, true);
+                    }
+                }
+            }
+            Update::State(wire::StateUpdate::Idle(idle)) if handoff.user_message_id.is_some() => {
+                let Some(handoff) = self.handoff.take() else {
+                    return;
+                };
+                let text = format!(
+                    "Kit task stopped ({:?}).\n{}",
+                    idle.stop_reason, handoff.text
+                );
+                self.result(handoff.id, text, app);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl VoiceHandoff {
+    fn record(&mut self, id: &str, text: &str, append: bool) {
+        if id.len() > 1024 {
+            return;
+        }
+        if self.message_id != id || !append {
+            self.message_id = id.to_owned();
+            self.text.clear();
+        }
+        let remaining = 16_384_usize.saturating_sub(self.text.len());
+        let end = text.floor_char_boundary(remaining.min(text.len()));
+        self.text.push_str(&text[..end]);
+    }
+}
+
+// Voice text is untrusted remote display content, not terminal instructions.
+// Bound the inspected prefix as well as the stored result, and neutralize C0,
+// C1, DEL and Unicode directional controls before handing it to the renderer.
+
+fn voice_display_text(text: &str) -> String {
+    text.chars().take(4096).map(|character| {
+        if character.is_control()
+            || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            ' '
+        } else {
+            character
+        }
+    }).collect()
+}
+
+impl Drop for NativeVoice {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Default)]
+struct ClipboardPastes {
+    pending: Option<PendingClipboardPastes>,
+}
+
+struct PendingClipboardPastes {
+    generation: u64,
+    route: ClipboardRoute,
+    remaining: usize,
+    submit: bool,
+}
+
+impl ClipboardPastes {
+    fn retain_current(&mut self, generation: Option<u64>, route: &ClipboardRoute) {
+        if self.pending.as_ref().is_some_and(|pending| {
+            Some(pending.generation) != generation || &pending.route != route
+        }) {
+            self.pending = None;
+        }
+    }
+
+    fn queued(&mut self, generation: u64, route: ClipboardRoute) {
+        if !matches!(route, ClipboardRoute::Composer(_)) {
+            return;
+        }
+        if let Some(pending) = &mut self.pending
+            && pending.generation == generation
+            && pending.route == route
+        {
+            pending.remaining += 1;
+        } else {
+            self.pending = Some(PendingClipboardPastes {
+                generation,
+                route,
+                remaining: 1,
+                submit: false,
+            });
+        }
+    }
+
+    fn finish(&mut self, generation: u64, route: &ClipboardRoute, accepted: bool) -> bool {
+        let Some(pending) = &mut self.pending else {
+            return false;
+        };
+        if pending.generation != generation || &pending.route != route {
+            return false;
+        }
+        pending.remaining -= 1;
+        if !accepted {
+            pending.submit = false;
+        }
+        if pending.remaining != 0 {
+            return false;
+        }
+        let submit = pending.submit && accepted;
+        self.pending = None;
+        submit
+    }
+}
+
+struct ModelSwitchCompletion {
+    generation: u64,
+    operation: u64,
+    response: Result<wire::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
+}
+
+/// Keep model-switch requests off the terminal loop on the normal Tokio runtime.
+fn spawn_model_switch(
+    connection: agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    request: SetSessionConfigOptionRequest,
+    generation: u64,
+    operation: u64,
+    completed: mpsc::UnboundedSender<ModelSwitchCompletion>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let response = connection.send_request(request).block_task().await;
+        let _ = completed.send(ModelSwitchCompletion {
+            generation,
+            operation,
+            response,
+        });
+    })
+}
+
+fn prepare_model_switch_request(
+    app: &mut App,
+    action: Action,
+    session_id: wire::SessionId,
+) -> Result<(u64, SetSessionConfigOptionRequest), agent_client_protocol::Error> {
+    let confirmation = match action {
+        Action::SelectModel {
+            choice,
+            save_defaults,
+        } => {
+            app.begin_model_switch(choice, save_defaults)
+                .ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "wait for the current operation before changing models",
+                    )
+                })?;
+            None
+        }
+        Action::ConfirmModelSwitch(decision) => {
+            let warning = app
+                .model_switch
+                .as_ref()
+                .and_then(|pending| pending.warning.as_ref())
+                .ok_or_else(|| {
+                    agent_client_protocol::util::internal_error(
+                        "no model-switch warning to confirm",
+                    )
+                })?;
+            Some(
+                serde_json::to_value(model_switch::Confirmation {
+                    token: warning.token,
+                    action: decision,
+                })
+                .map_err(agent_client_protocol::Error::into_internal_error)?,
+            )
+        }
+        _ => {
+            return Err(agent_client_protocol::util::internal_error(
+                "invalid model-switch action",
+            ));
+        }
+    };
+    let pending = app
+        .model_switch
+        .as_mut()
+        .ok_or_else(|| agent_client_protocol::util::internal_error("no pending model switch"))?;
+    let mut request =
+        SetSessionConfigOptionRequest::new(session_id, MODEL_CONFIG_ID, pending.choice.id.as_str());
+    if let Some(confirmation) = confirmation {
+        request.meta = Some(serde_json::Map::from_iter([(
+            model_switch::META.into(),
+            confirmation,
+        )]));
+        // Keep the warning available if preparing its confirmation fails.
+        pending.warning = None;
+    }
+    Ok((pending.id, request))
+}
+
+fn take_model_switch_completion(
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    generation: u64,
+    operation: u64,
+) -> Result<Option<app::ModelSwitch>, agent_client_protocol::Error> {
+    let route = route.lock().map_err(|_| {
+        agent_client_protocol::util::internal_error("active session route poisoned")
+    })?;
+    if route.generation != generation
+        || app
+            .model_switch
+            .as_ref()
+            .is_none_or(|pending| pending.id != operation)
+    {
+        return Ok(None);
+    }
+    Ok(app.model_switch.take())
+}
 
 /// Animation and elapsed-time refresh interval.
 const TICK: Duration = Duration::from_millis(90);
-/// Terminal events applied per frame, so a paste lands in one redraw.
+/// Terminal events or queued updates applied per frame.
 const MAX_BURST: usize = 4_096;
 const MAX_ATTACHMENTS: usize = 8;
 const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -85,6 +524,194 @@ struct ActiveSessionRoute {
 struct QueuedUpdate {
     generation: Option<u64>,
     update: Update,
+}
+
+const BACKGROUND_QUEUE: usize = 8;
+
+struct BackgroundWorkers {
+    updates: Option<std::sync::mpsc::SyncSender<QueuedUpdate>>,
+    clipboard: Option<std::sync::mpsc::SyncSender<(u64, ClipboardRoute, ClipboardMode)>>,
+    stopping: Arc<AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundWorkers {
+    fn try_update(
+        &self,
+        update: QueuedUpdate,
+    ) -> Result<(), Box<std::sync::mpsc::TrySendError<QueuedUpdate>>> {
+        let Some(sender) = &self.updates else {
+            return Err(Box::new(std::sync::mpsc::TrySendError::Disconnected(
+                update,
+            )));
+        };
+        sender.try_send(update).map_err(Box::new)
+    }
+
+    fn try_clipboard(
+        &self,
+        generation: u64,
+        route: ClipboardRoute,
+        mode: ClipboardMode,
+    ) -> Result<(), std::sync::mpsc::TrySendError<(u64, ClipboardRoute, ClipboardMode)>> {
+        let Some(sender) = &self.clipboard else {
+            return Err(std::sync::mpsc::TrySendError::Disconnected((
+                generation, route, mode,
+            )));
+        };
+        sender.try_send((generation, route, mode))
+    }
+}
+
+impl Drop for BackgroundWorkers {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.updates.take();
+        self.clipboard.take();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+enum ClipboardResult {
+    NoImage,
+    Text(String),
+    Attachment(Attachment),
+    Error(String),
+}
+
+enum BackgroundCompletion {
+    Update {
+        queued: QueuedUpdate,
+        images: Vec<MaterializedImage>,
+    },
+    Clipboard {
+        generation: u64,
+        route: ClipboardRoute,
+        result: ClipboardResult,
+    },
+}
+
+fn send_background_completion(
+    completed: &mpsc::Sender<BackgroundCompletion>,
+    stopping: &AtomicBool,
+    mut completion: BackgroundCompletion,
+) -> bool {
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return false;
+        }
+        match completed.try_send(completion) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                completion = returned;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+}
+
+fn spawn_background_workers(
+    completed: mpsc::Sender<BackgroundCompletion>,
+) -> std::io::Result<BackgroundWorkers> {
+    let (updates, update_rx) = std::sync::mpsc::sync_channel::<QueuedUpdate>(BACKGROUND_QUEUE);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let update_stopping = stopping.clone();
+    let update_completed = completed.clone();
+    let update_thread = std::thread::Builder::new()
+        .name("kit-tui-images".into())
+        .spawn(move || {
+            while let Ok(queued) = update_rx.recv() {
+                if update_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut remaining = 64 * 1024 * 1024;
+                let images = match &queued.update {
+                    Update::UserMessage { images, .. } => images
+                        .iter()
+                        // File-backed placeholders need materialization before they can
+                        // open. Give them priority over URI-less image candidates.
+                        .filter(|image| {
+                            image
+                                .source_uri
+                                .as_deref()
+                                .is_some_and(|uri| uri.starts_with("file:"))
+                        })
+                        .chain(images.iter().filter(|image| image.source_uri.is_none()))
+                        .take_while(|_| !update_stopping.load(Ordering::Acquire))
+                        // Bound attempts, including failed decodes, across both groups.
+                        .take(64)
+                        .filter_map(|image| {
+                            let prepared = attachment::materialize_image(
+                                image.key,
+                                &image.data,
+                                &image.mime_type,
+                                remaining,
+                            )?;
+                            if prepared.bytes > remaining {
+                                return None;
+                            }
+                            remaining -= prepared.bytes;
+                            Some(prepared)
+                        })
+                        .collect(),
+                    // Sources were bounded at ingest; materialization enforces
+                    // its own per-image limit.
+                    Update::OpenUserImage(image) => attachment::materialize_image(
+                        image.key,
+                        &image.data,
+                        &image.mime_type,
+                        usize::MAX,
+                    )
+                    .into_iter()
+                    .collect(),
+                    _ => Vec::new(),
+                };
+                if !send_background_completion(
+                    &update_completed,
+                    &update_stopping,
+                    BackgroundCompletion::Update { queued, images },
+                ) {
+                    break;
+                }
+            }
+        })?;
+    let (clipboard, clipboard_rx) =
+        std::sync::mpsc::sync_channel::<(u64, ClipboardRoute, ClipboardMode)>(BACKGROUND_QUEUE);
+    let clipboard_stopping = stopping.clone();
+    let clipboard_thread = std::thread::Builder::new()
+        .name("kit-tui-clipboard".into())
+        .spawn(move || {
+            while let Ok((generation, route, mode)) = clipboard_rx.recv() {
+                if clipboard_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let result = read_clipboard(&route, mode);
+                if !send_background_completion(
+                    &completed,
+                    &clipboard_stopping,
+                    BackgroundCompletion::Clipboard {
+                        generation,
+                        route,
+                        result,
+                    },
+                ) {
+                    break;
+                }
+            }
+        })?;
+    drop(clipboard_thread);
+    Ok(BackgroundWorkers {
+        updates: Some(updates),
+        clipboard: Some(clipboard),
+        stopping,
+        // Native clipboard APIs provide no portable cancellation mechanism.
+        // Detach that thread so a wedged platform clipboard cannot wedge exit;
+        // the closed completion receiver still rejects stale results.
+        threads: vec![update_thread],
+    })
 }
 
 impl QueuedUpdate {
@@ -122,6 +749,26 @@ fn accept_queued_update(
     accepted.then_some(queued.update)
 }
 
+fn apply_pending_updates(
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
+    first: QueuedUpdate,
+) {
+    for queued in std::iter::once(first)
+        .chain(std::iter::from_fn(|| updates.try_recv().ok()))
+        .take(MAX_BURST)
+    {
+        let Some(update) = accept_queued_update(route, queued) else {
+            continue;
+        };
+        if let Update::ConfigOptions(options) = &update {
+            refresh_config_state(app, Some(options));
+        }
+        app.apply(update);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
 struct CancelBackgroundRequest {
@@ -155,6 +802,7 @@ const CLOSE_SESSION: Duration = Duration::from_secs(3);
 const LAST_WORDS: Duration = Duration::from_millis(250);
 /// Diagnostic lines quoted back when the agent dies during the handshake.
 const FAILURE_LINES: usize = 5;
+const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 #[cfg(unix)]
 fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
@@ -178,15 +826,337 @@ fn detach_from_controlling_terminal(command: &mut tokio::process::Command) {
 #[cfg(windows)]
 fn detach_from_controlling_terminal(_command: &mut tokio::process::Command) {}
 
-fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
-    let current = options
-        .unwrap_or_default()
+fn error_detail(error: &agent_client_protocol::Error) -> &str {
+    match error.data.as_ref() {
+        Some(Value::String(detail)) => detail,
+        Some(data) => crate::protocols::acp::AuthenticationRequiredData::from_value(data)
+            .map(|required| required.detail)
+            .unwrap_or(&error.message),
+        _ => &error.message,
+    }
+}
+
+fn authentication_required(
+    error: &agent_client_protocol::Error,
+    methods: &[wire::AuthMethodTerminal],
+) -> bool {
+    if error.code != agent_client_protocol::ErrorCode::AuthRequired {
+        return false;
+    }
+    error
+        .data
+        .as_ref()
+        .and_then(crate::protocols::acp::AuthenticationRequiredData::from_value)
+        .is_none_or(|required| {
+            methods
+                .iter()
+                .any(|method| method.method_id.0.as_ref() == required.method_id)
+        })
+}
+
+fn credential_storage_for_launch(
+    credential_storage: &CredentialStorage,
+    current_dir: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<CredentialStorage> {
+    match credential_storage {
+        CredentialStorage::Filesystem(directory) if directory.is_relative() => Ok(
+            CredentialStorage::Filesystem(current_dir()?.join(directory)),
+        ),
+        credential_storage => Ok(credential_storage.clone()),
+    }
+}
+
+fn client_capabilities(credential_storage: &CredentialStorage) -> wire::ClientCapabilities {
+    let capabilities = wire::ClientCapabilities::new();
+    if credential_storage.is_persistent() {
+        capabilities
+            .auth(wire::AuthCapabilities::new().terminal(wire::TerminalAuthCapabilities::new()))
+    } else {
+        capabilities
+    }
+}
+
+fn usable_terminal_auth_methods(methods: &[wire::AuthMethod]) -> Vec<wire::AuthMethodTerminal> {
+    methods
         .iter()
-        .find(|option| option.config_id.to_string() == "model")
-        .and_then(|option| match &option.kind {
-            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+        .filter_map(|method| match method {
+            wire::AuthMethod::Terminal(method) if !method.method_id.0.is_empty() => {
+                Some(method.clone())
+            }
             _ => None,
-        })?;
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct AgentInvocation {
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+    env: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    current_dir: Option<PathBuf>,
+}
+
+impl AgentInvocation {
+    fn from_command(command: &std::process::Command) -> Self {
+        Self {
+            program: command.get_program().to_owned(),
+            args: command.get_args().map(std::ffi::OsStr::to_owned).collect(),
+            env: command
+                .get_envs()
+                .filter(|(name, _)| *name != std::ffi::OsStr::new(OPENROUTER_API_KEY_ENV))
+                .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+                .collect(),
+            current_dir: command.get_current_dir().map(Path::to_path_buf),
+        }
+    }
+
+    fn command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(current_dir) = &self.current_dir {
+            command.current_dir(current_dir);
+        }
+        for (name, value) in &self.env {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        command
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_command_for_launch(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    cerebras_api_key: Option<&crate::provider::CerebrasApiKey>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    telemetry: &crate::telemetry::Settings,
+    credential_storage: &CredentialStorage,
+    session_id: &str,
+    resume: bool,
+    force: bool,
+) -> std::io::Result<tokio::process::Command> {
+    let mut command = crate::acp_child::serve_command(
+        root,
+        model,
+        provider,
+        reasoning_effort,
+        openrouter_api_key,
+        cerebras_api_key,
+        session_id,
+        resume,
+    )?;
+    if let Some(address) = a2a {
+        command.arg("--a2a").arg(address);
+    }
+    if let Some(path) = mcp_config {
+        command.arg("--mcp-config").arg(path);
+    }
+    telemetry.append_cli_args(&mut command);
+    credential_storage.append_cli_args(&mut command);
+    if force {
+        command.arg("--force");
+    }
+    Ok(command)
+}
+
+fn terminal_auth_command(
+    invocation: &AgentInvocation,
+    root: &Path,
+    method: &wire::AuthMethodTerminal,
+) -> tokio::process::Command {
+    let mut command = invocation.command();
+    command
+        .env_remove(OPENROUTER_API_KEY_ENV)
+        .args(&method.args)
+        .current_dir(root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    for variable in &method.env {
+        command.env(&variable.name, &variable.value);
+    }
+    command
+}
+
+fn authenticate_in_terminal<'a>(
+    invocation: &AgentInvocation,
+    root: &Path,
+    method: &wire::AuthMethodTerminal,
+    stop: &'a mut Stop,
+) -> impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>> + 'a {
+    wait_for_terminal_auth(terminal_auth_command(invocation, root, method), stop)
+}
+
+enum ConnectedAuthentication {
+    Completed(Option<std::io::Result<std::process::ExitStatus>>),
+    AgentExited(Result<std::io::Result<std::process::ExitStatus>, oneshot::error::RecvError>),
+    UpdatesClosed,
+}
+
+async fn wait_for_connected_authentication(
+    authentication: impl std::future::Future<Output = Option<std::io::Result<std::process::ExitStatus>>>,
+    app: &mut App,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    updates: &mut mpsc::UnboundedReceiver<QueuedUpdate>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+) -> ConnectedAuthentication {
+    let mut authentication = pin!(authentication);
+    let mut next_priority = 0;
+    loop {
+        // Poll only until one source is ready: an update must not be consumed
+        // when authentication or exit wins. Rotate after each delivered update
+        // so a continuously ready update queue cannot starve completion.
+        let outcome = poll_fn(|cx| {
+            for offset in 0..3 {
+                let branch = (next_priority + offset) % 3;
+                let ready = match branch {
+                    0 => authentication
+                        .as_mut()
+                        .poll(cx)
+                        .map(|output| Err(ConnectedAuthentication::Completed(output))),
+                    1 => updates.poll_recv(cx).map(|update| match update {
+                        Some(update) => Ok(update),
+                        None => Err(ConnectedAuthentication::UpdatesClosed),
+                    }),
+                    _ => std::pin::Pin::new(&mut *exit)
+                        .poll(cx)
+                        .map(|status| Err(ConnectedAuthentication::AgentExited(status))),
+                };
+                if ready.is_ready() {
+                    next_priority = (branch + 1) % 3;
+                    return ready;
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        match outcome {
+            Ok(update) => apply_pending_updates(app, route, updates, update),
+            Err(outcome) => return outcome,
+        }
+    }
+}
+
+async fn wait_for_terminal_auth(
+    mut command: tokio::process::Command,
+    stop: &mut Stop,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let mut child = match command.kill_on_drop(true).spawn() {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
+    };
+    // Completion wins a simultaneous stop, an outcome the old race allowed.
+    // This scope destroys both wait futures before killing/reborrowing child.
+    let status = {
+        let waited = pin!(child.wait());
+        let stopped = pin!(stop.requested());
+        match select(waited, stopped).await {
+            Either::Left((status, _)) => Some(status),
+            Either::Right(((), _)) => None,
+        }
+    };
+    match status {
+        Some(status) => Some(status),
+        None => {
+            let _ = child.kill().await;
+            None
+        }
+    }
+}
+
+enum RequestInterrupt {
+    AgentExited(Option<std::process::ExitStatus>),
+    Stopped,
+    TimedOut,
+}
+
+enum RequestFailure {
+    AgentExited(Option<std::process::ExitStatus>),
+    TimedOut,
+}
+
+async fn bounded_agent_request<T>(
+    request: impl std::future::Future<Output = T>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    stop: impl std::future::Future<Output = ()>,
+    timeout: Duration,
+) -> Result<T, RequestInterrupt> {
+    // One-shot ties prefer request, exit, stop, then timeout; each was a
+    // previously allowed winner. All losers are owned here and drop on return.
+    let request = pin!(request);
+    let stop = pin!(stop);
+    let timeout = pin!(tokio::time::sleep(timeout));
+    let interrupted = select(&mut *exit, select(stop, timeout));
+    match select(request, interrupted).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right((Either::Left((status, _)), _)) => Err(RequestInterrupt::AgentExited(
+            status.ok().and_then(Result::ok),
+        )),
+        Either::Right((Either::Right((Either::Left(_), _)), _)) => Err(RequestInterrupt::Stopped),
+        Either::Right((Either::Right((Either::Right(_), _)), _)) => Err(RequestInterrupt::TimedOut),
+    }
+}
+
+async fn bounded_cancellable_request<T>(
+    request: impl std::future::Future<Output = T>,
+    exit: &mut oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    stop: impl std::future::Future<Output = ()>,
+    timeout: Duration,
+) -> Result<Option<T>, RequestFailure> {
+    match bounded_agent_request(request, exit, stop, timeout).await {
+        Ok(output) => Ok(Some(output)),
+        Err(RequestInterrupt::AgentExited(status)) => Err(RequestFailure::AgentExited(status)),
+        Err(RequestInterrupt::Stopped) => Ok(None),
+        Err(RequestInterrupt::TimedOut) => Err(RequestFailure::TimedOut),
+    }
+}
+
+async fn request_failure(
+    failure: RequestFailure,
+    stderr: tokio::task::JoinHandle<()>,
+    recent: &Mutex<Vec<String>>,
+    when: &str,
+    timeout_message: String,
+) -> agent_client_protocol::Error {
+    let detail = match failure {
+        RequestFailure::AgentExited(status) => died(status, stderr, recent, when).await,
+        RequestFailure::TimedOut => timeout_message,
+    };
+    agent_client_protocol::Error::into_internal_error(std::io::Error::other(detail))
+}
+
+async fn request_initial_session(
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    resume_id: Option<&str>,
+    root: &Path,
+) -> Result<(wire::SessionId, Vec<SessionConfigOption>), agent_client_protocol::Error> {
+    if let Some(resume_id) = resume_id {
+        let response = connection
+            .send_request(
+                wire::ResumeSessionRequest::new(resume_id, root.to_path_buf())
+                    .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+            )
+            .block_task()
+            .await?;
+        Ok((wire::SessionId::new(resume_id), response.config_options))
+    } else {
+        let response = connection
+            .send_request(wire::NewSessionRequest::new(root.to_path_buf()))
+            .block_task()
+            .await?;
+        Ok((response.session_id, response.config_options))
+    }
+}
+
+fn current_model_choice(options: Option<&[SessionConfigOption]>) -> Option<ModelChoice> {
+    let current = current_config_value(options.unwrap_or_default(), MODEL_CONFIG_ID)?;
     model_choices(options)
         .into_iter()
         .find(|choice| choice.id == current)
@@ -198,7 +1168,7 @@ fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<
         ..
     } = options?
         .iter()
-        .find(|option| option.config_id.to_string() == "reasoning_effort")?
+        .find(|option| option.config_id.to_string() == REASONING_EFFORT_CONFIG_ID)?
     else {
         return None;
     };
@@ -214,6 +1184,64 @@ fn effort_state(options: Option<&[SessionConfigOption]>) -> Option<(String, Vec<
         _ => return None,
     };
     Some((select.current_value.to_string(), choices))
+}
+
+struct ActiveSessionConfig {
+    model: String,
+    reasoning_effort: Option<String>,
+}
+
+fn active_session_config(app: &App) -> ActiveSessionConfig {
+    ActiveSessionConfig {
+        model: app
+            .model_choices
+            .iter()
+            .find(|choice| choice.provider == app.provider && choice.model == app.model)
+            .map_or_else(
+                || format!("{}:{}", app.provider, app.model),
+                |choice| choice.id.clone(),
+            ),
+        reasoning_effort: (!app.effort_choices.is_empty()).then(|| app.reasoning_effort.clone()),
+    }
+}
+
+fn current_config_value(options: &[SessionConfigOption], config_id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.config_id.to_string() == config_id)
+        .and_then(|option| match &option.kind {
+            SessionConfigKind::Select(select) => Some(select.current_value.to_string()),
+            _ => None,
+        })
+}
+
+fn active_config_matches(active: &ActiveSessionConfig, options: &[SessionConfigOption]) -> bool {
+    current_config_value(options, MODEL_CONFIG_ID).as_deref() == Some(active.model.as_str())
+        && active.reasoning_effort.as_deref().is_none_or(|effort| {
+            current_config_value(options, REASONING_EFFORT_CONFIG_ID).as_deref() == Some(effort)
+        })
+}
+
+async fn refresh_session_after_auth(
+    connection: &agent_client_protocol::V2ConnectionTo<agent_client_protocol::Agent>,
+    session_id: wire::SessionId,
+    active: &ActiveSessionConfig,
+) -> Result<Vec<SessionConfigOption>, agent_client_protocol::Error> {
+    let options = connection
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id,
+            MODEL_CONFIG_ID,
+            active.model.as_str(),
+        ))
+        .block_task()
+        .await?
+        .config_options;
+    if !active_config_matches(active, &options) {
+        return Err(agent_client_protocol::Error::into_internal_error(
+            std::io::Error::other("authentication refresh changed the active session settings"),
+        ));
+    }
+    Ok(options)
 }
 
 fn refresh_config_state(app: &mut App, options: Option<&[SessionConfigOption]>) {
@@ -236,7 +1264,7 @@ fn model_choices(options: Option<&[SessionConfigOption]>) -> Vec<ModelChoice> {
     }) = options
         .unwrap_or_default()
         .iter()
-        .find(|option| option.config_id.to_string() == "model")
+        .find(|option| option.config_id.to_string() == MODEL_CONFIG_ID)
     else {
         return Vec::new();
     };
@@ -314,6 +1342,8 @@ pub async fn run_with_reasoning_effort(
         None,
         resume,
         force,
+        false,
+        &mut Stop::new()?,
     )
     .await
 }
@@ -332,6 +1362,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
     resume: Option<&str>,
     force: bool,
+    voice_enabled: bool,
+    stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_reasoning_effort_and_api_keys(
         root,
@@ -346,6 +1378,8 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         None,
         resume,
         force,
+        voice_enabled,
+        stop,
     )
     .await
 }
@@ -365,6 +1399,8 @@ pub async fn run_with_reasoning_effort_and_api_keys(
     cerebras_api_key: Option<&crate::provider::CerebrasApiKey>,
     resume: Option<&str>,
     force: bool,
+    voice_enabled: bool,
+    stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
@@ -372,6 +1408,9 @@ pub async fn run_with_reasoning_effort_and_api_keys(
     let root = &root
         .canonicalize()
         .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
+    let credential_storage =
+        credential_storage_for_launch(credential_storage, std::env::current_dir)?;
+    let credential_storage = &credential_storage;
     let resume_session_id = resume.map(str::to_string);
     let persisted_session_id = resume_session_id
         .clone()
@@ -380,104 +1419,143 @@ pub async fn run_with_reasoning_effort_and_api_keys(
         id: persisted_session_id.clone(),
         generation: 0,
     }));
-    let mut command = crate::acp_child::serve_command(
-        root,
-        model,
-        provider,
-        reasoning_effort,
-        openrouter_api_key,
-        cerebras_api_key,
-        &persisted_session_id,
-        resume_session_id.is_some(),
-    )?;
-    if let Some(address) = a2a {
-        command.arg("--a2a").arg(address);
-    }
-    if let Some(path) = mcp_config {
-        command.arg("--mcp-config").arg(path);
-    }
-    telemetry.append_cli_args(&mut command);
-    command
-        .arg("--credential-store")
-        .arg(credential_storage.cli_name());
-    if let Some(directory) = credential_storage.directory() {
-        command.arg("--credential-dir").arg(directory);
-    }
-    if force {
-        command.arg("--force");
-    }
-    detach_from_controlling_terminal(&mut command);
-    let mut child = command
-        .env(EVENTS_ENV, "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let stdin = child.stdin.take().ok_or("could not open Kit stdin")?;
-    let stdout = child.stdout.take().ok_or("could not open Kit stdout")?;
-    let stderr = child.stderr.take().ok_or("could not open Kit stderr")?;
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
     let root = root.to_path_buf();
     let model = model.to_string();
-    let a2a = a2a.unwrap_or("allocating…").to_string();
-    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+    let a2a_address = a2a.map(str::to_string);
+    let a2a = a2a_address.clone().unwrap_or_else(|| "allocating…".into());
+    let mcp_config = mcp_config.map(Path::to_path_buf);
 
-    // The agent's own diagnostics are the only explanation of a failed start,
-    // so they are kept aside as well as shown in the log pane.
-    let recent: Arc<Mutex<Vec<String>>> = Arc::default();
-    let recorder = Arc::clone(&recent);
-    let diagnostics = updates_tx.clone();
-    let stderr_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let update = match events::parse(&line) {
-                Some(event) => Update::Runtime(event),
-                None if line.starts_with("A2A listening on ") => {
-                    Update::A2aAddress(line.trim_start_matches("A2A listening on ").to_string())
-                }
-                None => {
-                    if let Ok(mut recent) = recorder.lock() {
-                        recent.push(line.clone());
-                        let extra = recent.len().saturating_sub(FAILURE_LINES);
-                        recent.drain(..extra);
+    {
+        let launch_session_id = resume_session_id
+            .as_deref()
+            .unwrap_or(&persisted_session_id);
+        let mut command = agent_command_for_launch(
+            &root,
+            &model,
+            provider,
+            reasoning_effort,
+            openrouter_api_key,
+            cerebras_api_key,
+            a2a_address.as_deref(),
+            mcp_config.as_deref(),
+            telemetry,
+            credential_storage,
+            launch_session_id,
+            resume_session_id.is_some(),
+            force,
+        )?;
+        let child_mcp_config = mcp_config.clone();
+        let prepared = stop
+            .until(async {
+                tokio::task::spawn_blocking(move || {
+                    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                        crate::resilient_fs::global()
+                            .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
                     }
-                    Update::Log(line)
+                    if let Some(path) = child_mcp_config {
+                        crate::resilient_fs::global().require_disk(path)?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
+                .await
+            })
+            .await;
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        prepared??;
+        let auth_invocation = AgentInvocation::from_command(command.as_std());
+        detach_from_controlling_terminal(&mut command);
+        let mut child = command
+            .env(EVENTS_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stdin = child.stdin.take().ok_or("could not open Kit stdin")?;
+        let stdout = child.stdout.take().ok_or("could not open Kit stdout")?;
+        let stderr = child.stderr.take().ok_or("could not open Kit stderr")?;
+        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
+
+        // The agent's own diagnostics are the only explanation of a failed start,
+        // so they are kept aside as well as shown in the log pane.
+        let recent: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorder = Arc::clone(&recent);
+        let diagnostics = updates_tx.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Some(update) = stderr_update(line) else {
+                    continue;
+                };
+                if let Update::Log(line) = &update
+                    && let Ok(mut recent) = recorder.lock()
+                {
+                    recent.push(line.clone());
+                    let extra = recent.len().saturating_sub(FAILURE_LINES);
+                    recent.drain(..extra);
+                }
+                if diagnostics.send(QueuedUpdate::global(update)).is_err() {
+                    return;
+                }
+            }
+            // Stderr closing means the agent process is gone; stop any spinner
+            // waiting on a turn that can no longer finish.
+            let _ = diagnostics.send(QueuedUpdate::global(Update::ProcessExited(
+                "the agent process exited — press ctrl+c to leave".into(),
+            )));
+        });
+
+        // The child is watched from its own task, which also owns it: aborting that
+        // task drops the handle, and `kill_on_drop` takes the process with it.
+        let (exit_tx, mut exit_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let watcher = tokio::spawn(async move {
+            // A completed child wins a shutdown tie, as it could before.
+            // End the wait borrow before storage cleanup starts another wait.
+            let exited = {
+                let waited = pin!(child.wait());
+                match select(waited, shutdown_rx).await {
+                    Either::Left((status, _)) => Some(status),
+                    Either::Right(_) => None,
                 }
             };
-            if diagnostics.send(QueuedUpdate::global(update)).is_err() {
-                return;
+            let status = match exited {
+                Some(status) => {
+                    let notification = status
+                        .as_ref()
+                        .copied()
+                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()));
+                    let _ = exit_tx.send(notification);
+                    status
+                }
+                None => {
+                    // ACP EOF makes serve stop A2A, drain sessions, and run
+                    // final storage recovery before exiting.
+                    wait_for_storage_exit(&mut child, Duration::from_secs(10)).await
+                }
+            }?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!(
+                    "agent exited with {status}; final storage recovery may have failed; unpersisted data may have been lost"
+                )));
             }
-        }
-        // Stderr closing means the agent process is gone; stop any spinner
-        // waiting on a turn that can no longer finish.
-        let _ = diagnostics.send(QueuedUpdate::global(Update::ProcessExited(
-            "the agent process exited — press ctrl+c to leave".into(),
-        )));
-    });
+            Ok::<_, std::io::Error>(())
+        });
 
-    // The child is watched from its own task, which also owns it: aborting that
-    // task drops the handle, and `kill_on_drop` takes the process with it.
-    let (exit_tx, exit_rx) = oneshot::channel();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let watcher = tokio::spawn(async move {
-        tokio::select! {
-            status = child.wait() => {
-                let _ = exit_tx.send(status);
-            }
-            _ = shutdown_rx => {
-                // Unlike dropping a `kill_on_drop` child, `kill().await` waits
-                // until the process is gone and its OS file locks are released.
-                let _ = child.kill().await;
-            }
-        }
-    });
-
-    let notifications = updates_tx.clone();
-    let cleanup_root = root.clone();
-    let transition_session = Arc::clone(&active_persisted_id);
-    let notification_session = Arc::clone(&active_persisted_id);
-    let result = agent_client_protocol::Client
+        let notifications = updates_tx.clone();
+        let cleanup_root = root.clone();
+        let transition_session = Arc::clone(&active_persisted_id);
+        let notification_session = Arc::clone(&active_persisted_id);
+        let result = {
+            let root = root.clone();
+            let model = model.clone();
+            let a2a = a2a.clone();
+            let auth_invocation = auth_invocation.clone();
+            let resume_session_id = resume_session_id.clone();
+            agent_client_protocol::Client
         .v2()
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
@@ -504,92 +1582,526 @@ pub async fn run_with_reasoning_effort_and_api_keys(
             // credentials — leaves its half of the handshake unanswered, and
             // waiting on it forever shows the user nothing at all. Its exit and
             // its silence both end the wait with something to read.
-            let handshake = async {
-                let initialized = connection
-                    .send_request(wire::InitializeRequest::new(
+            let initialize = connection
+                .send_request(
+                    wire::InitializeRequest::new(
                         ProtocolVersion::V2,
-                        wire::Implementation::new("kit-tui", env!("CARGO_PKG_VERSION")),
-                    ))
-                    .block_task()
-                    .await?;
-                if initialized.protocol_version != ProtocolVersion::V2 {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other("the agent did not negotiate ACP v2"),
-                    ));
-                }
-                let can_steer = initialized.capabilities.session.as_ref()
-                    .and_then(|session| session.inject.as_ref())
-                    .is_some_and(|inject| {
-                        inject.modes.contains(&wire::SessionInjectMode::Steer)
-                            && inject.steer_in_stream.as_ref().is_some_and(|modes| {
-                                modes.contains(&wire::SessionInjectSteerInStream::Finish)
-                            })
-                    });
-                if let Some(resume_id) = resume_session_id.clone() {
-                    let response = connection
-                        .send_request(
-                            wire::ResumeSessionRequest::new(resume_id.clone(), root.clone())
-                                .replay_from(wire::ReplayFrom::Start(wire::ReplayFromStart::new())),
+                        wire::Implementation::new(
+                            "kit-tui",
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    )
+                    .capabilities(client_capabilities(credential_storage)),
+                )
+                .block_task();
+            let initialized =
+                match bounded_cancellable_request(initialize, &mut exit_rx, stop.requested(), HANDSHAKE).await {
+                    Ok(Some(initialized)) => initialized?,
+                    Ok(None) => return Ok(()),
+                    Err(failure) => {
+                        return Err(request_failure(
+                            failure,
+                            stderr_task,
+                            &recent,
+                            "before the session opened",
+                            format!(
+                                "the agent did not answer the ACP handshake within {} seconds",
+                                HANDSHAKE.as_secs()
+                            ),
                         )
-                        .block_task()
-                        .await?;
-                    Ok((wire::SessionId::new(resume_id), response.config_options, can_steer))
-                } else {
-                    let response = connection
-                        .send_request(wire::NewSessionRequest::new(root.clone()))
-                        .block_task()
-                        .await?;
-                    Ok((response.session_id, response.config_options, can_steer))
-                }
-            };
-            let session = tokio::select! {
-                session = handshake => session?,
-                status = exit_rx => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(died(status.ok().and_then(Result::ok), stderr_task, &recent).await),
-                    ));
-                }
-                () = tokio::time::sleep(HANDSHAKE) => {
-                    return Err(agent_client_protocol::Error::into_internal_error(
-                        std::io::Error::other(format!(
-                            "the agent did not answer the ACP handshake within {} seconds",
+                        .await);
+                    }
+                };
+            if initialized.protocol_version != ProtocolVersion::V2 {
+                return Err(agent_client_protocol::Error::into_internal_error(
+                    std::io::Error::other("the agent did not negotiate ACP v2"),
+                ));
+            }
+            let auth_methods = usable_terminal_auth_methods(&initialized.auth_methods);
+            let can_steer = initialized.capabilities.session.as_ref()
+                .and_then(|session| session.inject.as_ref())
+                .is_some_and(|inject| {
+                    inject.modes.contains(&wire::SessionInjectMode::Steer)
+                        && inject.steer_in_stream.as_ref().is_some_and(|modes| {
+                            modes.contains(&wire::SessionInjectSteerInStream::Finish)
+                        })
+                });
+
+            let initial = match bounded_cancellable_request(
+                request_initial_session(
+                    &connection,
+                    resume_session_id.as_deref(),
+                    &root,
+                ),
+                &mut exit_rx,
+                stop.requested(),
+                HANDSHAKE,
+            )
+            .await
+            {
+                Ok(Some(session)) => session,
+                Ok(None) => return Ok(()),
+                Err(failure) => {
+                    return Err(request_failure(
+                        failure,
+                        stderr_task,
+                        &recent,
+                        "before the session opened",
+                        format!(
+                            "the agent did not start a session within {} seconds",
                             HANDSHAKE.as_secs()
-                        )),
-                    ));
+                        ),
+                    )
+                    .await);
                 }
             };
-            let (mut session_id, config_options, can_steer) = session;
-            let active_session_id = durable_session_id(&session_id).map_err(|error| {
-                agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
-            })?;
-            // Install every fallible signal handler before changing terminal modes so
-            // an installation failure cannot leave the caller's terminal altered.
-            let mut stop =
-                Stop::new().map_err(agent_client_protocol::Error::into_internal_error)?;
+            let initial = match initial {
+                Err(error)
+                    if auth_methods.is_empty()
+                        || !authentication_required(&error, &auth_methods) =>
+                {
+                    return Err(error);
+                }
+                result => result,
+            };
+
             let (mut terminal, mut images) =
                 enter().map_err(agent_client_protocol::Error::into_internal_error)?;
             let mut app = App::new(
                 root.clone(),
                 provider.as_str().to_string(),
-                model,
+                model.clone(),
                 a2a,
             );
-            refresh_config_state(&mut app, Some(&config_options));
+            app.voice_enabled = voice_enabled;
             app.can_steer = can_steer;
+            app.can_replace_steer = supports_pending_replace(
+                initialized.capabilities.session.as_ref().and_then(|session| session.inject.as_ref()),
+            );
+            app.auth_methods = auth_methods;
+            // TerminalSession restores modes if spawning the reader fails.
+            let mut events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
+            let mut ticker = tokio::time::interval(TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            let (mut session_id, config_options) = match initial {
+                Ok(session) => session,
+                Err(session_error) => {
+                    app.note(format!(
+                        "could not start the session: {}; use /login to authenticate",
+                        error_detail(&session_error)
+                    ));
+                    enum LoginEvent {
+                        Terminal(Option<std::io::Result<Event>>),
+                        Tick,
+                        Stop,
+                    }
+                    let mut next_priority = 0;
+                    let mut redraw_frame = true;
+                    loop {
+                    if redraw_frame && let Err(error) = draw_frame(&mut terminal, &mut app, &mut images) {
+                        drop(events);
+                        leave(&mut terminal);
+                        return Err(agent_client_protocol::Error::into_internal_error(error));
+                    }
+                    let event = {
+                        let redraw = app.needs_redraw_tick() || images.pending();
+                        let mut stopped = pin!(stop.requested());
+                        // Rotate the first eligible source after every winner.
+                        // If none is ready, poll every eligible source with the
+                        // real task waker. Keep the signal future alive across
+                        // Pending, and drop it before any handler resets input.
+                        poll_fn(|cx| {
+                            for offset in 0..4 {
+                                let branch = (next_priority + offset) % 4;
+                                let ready = match branch {
+                                    0 => events.poll_next_unpin(cx).map(|event| Err(LoginEvent::Terminal(event))),
+                                    1 => updates_rx.poll_recv(cx).map(Ok),
+                                    2 if redraw => ticker.poll_tick(cx).map(|_| Err(LoginEvent::Tick)),
+                                    3 => stopped.as_mut().poll(cx).map(|()| Err(LoginEvent::Stop)),
+                                    _ => Poll::Pending,
+                                };
+                                if ready.is_ready() {
+                                    next_priority = (branch + 1) % 4;
+                                    return ready;
+                                }
+                            }
+                            Poll::Pending
+                        }).await
+                    };
+                    redraw_frame = true;
+                    match event {
+                        Err(LoginEvent::Terminal(event)) => {
+                            let action = match event {
+                                Some(Ok(event)) => handle(&mut app, event),
+                                Some(Err(error)) => {
+                                    drop(events);
+                                    leave(&mut terminal);
+                                    return Err(agent_client_protocol::Error::into_internal_error(error));
+                                }
+                                None => {
+                                    drop(events);
+                                    leave(&mut terminal);
+                                    return Ok(());
+                                }
+                            };
+                            match action {
+                                Action::Quit => {
+                                    drop(events);
+                                    leave(&mut terminal);
+                                    return Ok(());
+                                }
+                                Action::Login(method) => {
+                                    drop(events);
+                                    let authentication = authenticate_in_terminal(
+                                        &auth_invocation,
+                                        &root,
+                                        &method,
+                                        stop,
+                                    );
+                                    leave(&mut terminal);
+                                    println!("Starting {}…", method.name);
+                                    let authenticated = wait_for_connected_authentication(
+                                        authentication,
+                                        &mut app,
+                                        &transition_session,
+                                        &mut updates_rx,
+                                        &mut exit_rx,
+                                    )
+                                    .await;
+                                    let authenticated = match authenticated {
+                                        ConnectedAuthentication::Completed(authenticated) => authenticated,
+                                        ConnectedAuthentication::UpdatesClosed => return Ok(()),
+                                        ConnectedAuthentication::AgentExited(status) => {
+                                            return Err(agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(died(
+                                                    status.ok().and_then(Result::ok),
+                                                    stderr_task,
+                                                    &recent,
+                                                    "before the session opened",
+                                                ).await),
+                                            ));
+                                        }
+                                    };
+                                    let Some(outcome) = authenticated else {
+                                        return Ok(());
+                                    };
+                                    match outcome {
+                                        Ok(status) if status.success() => {
+                                            let requested = bounded_cancellable_request(
+                                                request_initial_session(
+                                                    &connection,
+                                                    resume_session_id.as_deref(),
+                                                    &root,
+                                                ),
+                                                &mut exit_rx,
+                                                stop.requested(),
+                                                HANDSHAKE,
+                                            )
+                                            .await;
+                                            let Some(initial) = (match requested {
+                                                Ok(initial) => initial,
+                                                Err(failure) => {
+                                                    return Err(request_failure(
+                                                        failure,
+                                                        stderr_task,
+                                                        &recent,
+                                                        "before the session opened",
+                                                        format!(
+                                                            "the agent did not start a session within {} seconds",
+                                                            HANDSHAKE.as_secs()
+                                                        ),
+                                                    )
+                                                    .await);
+                                                }
+                                            }) else {
+                                                return Ok(());
+                                            };
+                                            match initial {
+                                                Ok(session) => {
+                                                    images = resume_terminal(&mut terminal).map_err(
+                                                        agent_client_protocol::Error::into_internal_error,
+                                                    )?;
+                                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
+                                                    break session;
+                                                }
+                                                Err(error) if authentication_required(
+                                                    &error,
+                                                    &app.auth_methods,
+                                                ) => app.note(format!(
+                                                    "could not start the session: {}; use /login to authenticate",
+                                                    error_detail(&error)
+                                                )),
+                                                Err(error) => return Err(error),
+                                            }
+                                        }
+                                        Ok(status) => app.note(format!(
+                                            "authentication with {} failed: {status}",
+                                            method.name
+                                        )),
+                                        Err(error) => app.note(format!(
+                                            "could not start authentication with {}: {error}",
+                                            method.name
+                                        )),
+                                    }
+                                    images = resume_terminal(&mut terminal).map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
+                                }
+                                Action::None | Action::Redraw => {}
+                                Action::ReadClipboard(_, _) => {
+                                    app.note("authenticate before reading the clipboard");
+                                }
+                                _ => app.note("authenticate before starting a session"),
+                            }
+                        }
+                        Ok(update) => match update {
+                            Some(update) => app.apply(update.update),
+                            None => {
+                                drop(events);
+                                leave(&mut terminal);
+                                return Ok(());
+                            }
+                        },
+                        Err(LoginEvent::Tick) => redraw_frame = tick_frame(&mut app, &mut images),
+                        Err(LoginEvent::Stop) => {
+                            drop(events);
+                            leave(&mut terminal);
+                            return Ok(());
+                        }
+                    }
+                    }
+                },
+            };
+            let active_session_id = match durable_session_id(&session_id) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    drop(events);
+                    leave(&mut terminal);
+                    return Err(agent_client_protocol::Error::into_internal_error(
+                        std::io::Error::other(error),
+                    ));
+                }
+            };
+            refresh_config_state(&mut app, Some(&config_options));
+            let mut saved_model_default = current_model_choice(Some(&config_options));
+            let (switch_tx, mut switch_rx) = mpsc::unbounded_channel::<ModelSwitchCompletion>();
+            let (background_tx, mut background_rx) =
+                mpsc::channel::<BackgroundCompletion>(BACKGROUND_QUEUE);
+            let background_workers = spawn_background_workers(background_tx)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
             if let Ok(mut active) = transition_session.lock() {
                 active.id = active_session_id.clone();
             }
-            app.start_session(active_session_id);
-            let mut events = EventStream::new();
-            let mut ticker = tokio::time::interval(TICK);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            app.start_session(active_session_id.clone());
+            let storage_shutdown = crate::resilient_fs::shutdown_token();
+            let mut voice = NativeVoice::default();
+            // This scope owns events (authentication moves/drops it) but only
+            // borrows terminal. Cancelling it joins input before the outer
+            // TerminalSession guard restores modes, just like ordinary return.
             let result: Result<(), agent_client_protocol::Error> = async {
+                enum SessionEvent {
+                    Usage(Result<Result<String, String>, tokio::sync::oneshot::error::RecvError>),
+
+                    Voice(crate::voice::VoiceEvent),
+                    StorageShutdown,
+                    ChildTranscript(Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>),
+                    Terminal(Option<std::io::Result<Event>>),
+                    ModelSwitch(ModelSwitchCompletion),
+                    Background(Option<BackgroundCompletion>),
+                    Update(Option<QueuedUpdate>),
+                    Tick,
+                    Frame,
+                    Forward,
+                    Stop,
+                }
+                let mut forward_retry = tokio::time::interval(Duration::from_millis(2));
+                forward_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut next_priority = 0;
+                let mut switches_closed = false;
+                let mut pending_update = None;
+                let mut clipboard_pastes = ClipboardPastes::default();
+                let mut submit_after_paste = false;
+                let mut child_read: Option<ChildTranscriptRead> = None;
+                let mut usage: Option<tokio::sync::oneshot::Receiver<Result<String, String>>> = None;
+                let mut priority = scheduler::Priority::default();
+                let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
-                    terminal
-                        .draw(|frame| ui::draw(frame, &mut app, &mut images))
-                        .map_err(agent_client_protocol::Error::into_internal_error)?;
-                    tokio::select! {
-                        terminal_event = events.next() => {
+                    let target = app.child_read_target().map(|target| (session_id.to_string(), target));
+                    if child_read.as_ref().is_some_and(|read| Some(&read.target) != target.as_ref()) {
+                        // Dropping the future cancels the local request and frees its page.
+                        child_read = None;
+                    }
+                    if child_read.is_none() && let Some(target) = target {
+                        let backoff = app.child_views[&target.1.0].read_backoff;
+                        let request = crate::protocols::acp::ReadSubagentTranscriptRequest {
+                            session_id: target.0.clone().into(),
+                            id: target.1.0.clone(), generation: target.1.1, cursor: target.1.3,
+                        };
+                        let connection = connection.clone();
+                        child_read = Some(ChildTranscriptRead {
+                            target,
+                            future: Box::pin(async move {
+                                if backoff { tokio::time::sleep(Duration::from_millis(150)).await; }
+                                match tokio::time::timeout(HANDSHAKE, connection.send_request(request).block_task()).await {
+                                    Ok(result) => result.map_err(|error| error.message.to_string()),
+                                    Err(_) => Err("child transcript read timed out".into()),
+                                }
+                            }),
+                        });
+                    }
+
+                    // Reconcile after every prior event, including failures in
+                    // result/observe, before accepting any next user input.
+                    voice.notify_state(&connection, &session_id);
+                    clipboard_pastes.retain_current(
+                        transition_session.lock().map(|active| active.generation).ok(),
+                        &app.clipboard_route(),
+                    );
+                    let event = {
+                        let redraw = app.needs_redraw_tick() || images.pending();
+                        let frame_deadline = frames.deadline();
+                        let mut frame = pin!(tokio::time::sleep_until(
+                            frame_deadline.unwrap_or_else(tokio::time::Instant::now),
+                        ));
+                        let mut stopped = pin!(stop.requested());
+                        let mut shutdown = pin!(storage_shutdown.cancelled());
+                        // Safety first, then present the previous input before
+                        // accepting more work. Synthetic submit remains ahead of
+                        // real terminal events and all background completions.
+                        // Poll crossterm with the real task waker, never a noop
+                        // probe; return on first Ready without consuming losers.
+                        poll_fn(|cx| loop {
+                            if let Poll::Ready(event) = priority.poll(
+                                cx, shutdown.as_mut(), stopped.as_mut(), &mut events,
+                                &frames, &mut submit_after_paste,
+                            ) {
+                                return Poll::Ready(match event {
+                                    scheduler::PriorityEvent::Shutdown => SessionEvent::StorageShutdown,
+                                    scheduler::PriorityEvent::Stop => SessionEvent::Stop,
+                                    scheduler::PriorityEvent::Frame => SessionEvent::Frame,
+                                    scheduler::PriorityEvent::Terminal(event) => SessionEvent::Terminal(event),
+                                });
+                            }
+                            // Only background sources rotate. A ready paced frame
+                            // is rendered by its branch, after the input check.
+                            let sources = 9;
+                            for offset in 0..sources {
+                                let branch = (next_priority + offset) % sources;
+                                let ready = match branch {
+                                    0 if pending_update.is_some() => forward_retry.poll_tick(cx).map(|_| SessionEvent::Forward),
+                                    1 if !switches_closed => match switch_rx.poll_recv(cx) {
+                                        Poll::Ready(Some(completion)) => Poll::Ready(SessionEvent::ModelSwitch(completion)),
+                                        Poll::Ready(None) => {
+                                            // Like the former Some pattern, EOF
+                                            // disables this branch, not the loop.
+                                            switches_closed = true;
+                                            Poll::Pending
+                                        }
+                                        Poll::Pending => Poll::Pending,
+                                    },
+                                    2 => background_rx.poll_recv(cx).map(SessionEvent::Background),
+                                    3 if pending_update.is_none() => updates_rx.poll_recv(cx).map(SessionEvent::Update),
+                                    4 if redraw => ticker.poll_tick(cx).map(|_| SessionEvent::Tick),
+
+                                    5 => voice.poll(cx).map(SessionEvent::Voice),
+                                    8 => usage.as_mut().map_or(Poll::Pending, |task| {
+                                        std::pin::Pin::new(task).poll(cx).map(SessionEvent::Usage)
+                                    }),
+                                    7 => child_read.as_mut().map_or(Poll::Pending, |read| {
+                                        read.future.as_mut().poll(cx).map(SessionEvent::ChildTranscript)
+                                    }),
+                                    6 if frame_deadline.is_some() => frame.as_mut().poll(cx).map(|()| SessionEvent::Frame),
+                                    _ => Poll::Pending,
+                                };
+                                if ready.is_ready() {
+                                    priority.background_polled();
+                                    next_priority = (branch + 1) % sources;
+                                    return ready;
+                                }
+                            }
+                            if !priority.background_polled() {
+                                return Poll::Pending;
+                            }
+                        }).await
+                    };
+                    // Invalidate before handlers: early `continue`s can also mutate
+                    // visible state. Worker forwarding alone never requests a frame.
+                    if matches!(&event, SessionEvent::Usage(_) | SessionEvent::Voice(_)
+                        | SessionEvent::ModelSwitch(_)) {
+                        frames.invalidate();
+                    }
+                    match event {
+
+                        SessionEvent::Usage(result) => {
+                            usage = None;
+                            match result.map_err(|error| error.to_string()).and_then(|result| result) {
+                                Ok(output) => app.note(output),
+                                Err(error) => app.note(format!("usage: {error}")),
+                            }
+                        }
+                        SessionEvent::ChildTranscript(result) => {
+                            if let Some(read) = child_read.take()
+                                && read.target.0 == session_id.to_string() {
+                                finish_child_transcript(&mut app, &mut frames, &read.target.1, result);
+                            }
+                        }
+                        SessionEvent::Voice(event) => match event {
+                            crate::voice::VoiceEvent::Ready => voice.mark_ready(&mut app),
+                            crate::voice::VoiceEvent::Transcript { speaker, text } => {
+                                // Transcripts are display-only. Only explicit tool delegation
+                                // enters the same Kit ACP request/approval path as typed work.
+                                app.note(format!("voice {}: {}", voice_display_text(&speaker), voice_display_text(&text)));
+                            }
+                            crate::voice::VoiceEvent::Delegation { id, text } => {
+                                if app.child_focus.is_some() {
+                                    voice.result(id, "Task was NOT submitted: return to the root session before delegating voice work.".into(), &mut app);
+                                } else if app.working() || app.model_switch.is_some() || voice.handoff.is_some() {
+                                    voice.result(id, "Kit is busy. Task was NOT submitted; ask the user to try again when idle.".into(), &mut app);
+                                } else if text.trim().is_empty() || text.len() > 32_768 || id.len() > 1024 {
+                                    voice.result(id, "Task was NOT submitted: empty or oversized delegation.".into(), &mut app);
+                                } else {
+                                    let task_id = id.clone();
+                                    voice.handoff = Some(VoiceHandoff { id, ..Default::default() });
+                                    let prompt = SubmittedPrompt { text, attachments: Vec::new() };
+                                    match prompt_blocks(&prompt) {
+                                        Ok(blocks) => {
+                                            // This is Kit's existing session, not a second agent
+                                            // or a Codex execution channel. ACP owns approvals.
+                                            // PromptResponse has no message ID. Ordered receipt
+                                            // consumption places this boundary after prior wire
+                                            // updates and before the accepted user_message.
+                                            let updates = updates_tx.clone();
+                                            if let Err(error) = connection
+                                                .send_request(wire::PromptRequest::new(session_id.clone(), blocks))
+                                                .on_receiving_result(move |result| async move {
+                                                    let _ = updates.send(QueuedUpdate::global(Update::VoicePromptAccepted {
+                                                        id: task_id,
+                                                        result: result.map(|_| ()).map_err(|error| error.message.to_string()),
+                                                    }));
+                                                    Ok(())
+                                                })
+                                            {
+                                                let Some(handoff) = voice.handoff.take() else { continue; };
+                                                voice.result(handoff.id, format!("Kit did not accept the task: {}", error.message), &mut app);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let Some(handoff) = voice.handoff.take() else { continue; };
+                                            voice.result(handoff.id, format!("Task was NOT submitted: {error}"), &mut app);
+                                        }
+                                    }
+                                }
+                            }
+                            crate::voice::VoiceEvent::Error(error) => voice.fail(error, &mut app),
+                            crate::voice::VoiceEvent::Stopped => {
+                                voice.stop();
+                                app.note("voice disconnected");
+                            }
+                        },
+                        SessionEvent::StorageShutdown => return Ok(()),
+                        SessionEvent::Terminal(terminal_event) => {
                             // A paste is a burst: one bracketed-paste event, or
                             // thousands of key events where the terminal cannot
                             // bracket it. Applying everything the terminal has
@@ -597,28 +2109,52 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                             // instead of one frame per character.
                             let mut next = terminal_event;
                             let mut action = Action::None;
-                            for _ in 0..MAX_BURST {
+                            for index in 0..MAX_BURST {
                                 match next {
-                                    Some(Ok(event)) => action = handle(&mut app, event),
-                                    Some(Err(_)) | None => return Ok(()),
+                                    Some(Ok(event)) => action = handle_terminal(
+                                        &mut app, &mut clipboard_pastes, &mut frames, event,
+                                    ),
+                                    Some(Err(error)) => return Err(agent_client_protocol::Error::into_internal_error(error)),
+                                    None => return Ok(()),
                                 }
-                                if !matches!(action, Action::None) {
+                                if !matches!(action, Action::None) || index + 1 == MAX_BURST {
                                     break;
                                 }
-                                // `EventStream::next().now_or_never()` polls with a noop
-                                // waker. If no event is ready, crossterm's background reader
-                                // retains that waker and cannot wake this select loop when the
-                                // next key arrives. Check synchronously before polling the
-                                // stream so an empty burst cannot make the TUI unresponsive.
-                                if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-                                    next = events.next().await;
+                                if let Some(event) = events.try_next() {
+                                    next = Some(event);
                                 } else {
                                     break;
                                 }
                             }
                             match action {
                                 Action::Quit => return Ok(()),
+
+                                Action::Usage(provider) => {
+                                    if usage.is_some() {
+                                        app.note("a usage check is already in progress");
+                                    } else {
+                                        let storage = credential_storage.clone();
+                                        let key = openrouter_api_key.cloned();
+                                        match background::spawn(move || {
+                                            crate::provider::usage::fetch_usage(provider.as_deref(), &storage, key.as_ref())
+                                        }) {
+                                            Ok(receiver) => {
+                                                usage = Some(receiver);
+                                                app.note("checking provider usage…");
+                                            }
+                                            Err(error) => app.note(format!("usage: could not start check: {error}")),
+                                        }
+                                    }
+                                }
+                                Action::Voice(control) => voice.control(&control, credential_storage, &mut app),
                                 Action::Submit { prompt, inject } => {
+
+                                    if voice.handoff.is_some() {
+                                        app.paste(&prompt.text);
+                                        app.restore_attachments(prompt.attachments);
+                                        app.note("a voice task is pending; cancel it or wait before submitting another prompt");
+                                        continue;
+                                    }
                                     let blocks = match prompt_blocks(&prompt) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
@@ -628,7 +2164,7 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                             continue;
                                         }
                                     };
-                                    app.clear_attachments();
+                                    let editable = pending_steer_is_editable(&blocks);
                                     let outcome = if inject {
                                         connection
                                             .send_request(wire::InjectSessionRequest::new(
@@ -647,11 +2183,15 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                             .map(|_| None)
                                     };
                                     match outcome {
-                                        Ok(Some(message_id)) => app.apply(Update::SteerAccepted {
-                                            id: message_id.to_string(),
-                                            text: prompt.text,
-                                        }),
-                                        Ok(None) => {}
+                                        Ok(Some(message_id)) => {
+                                            app.accept_attachments(&prompt.attachments);
+                                            app.apply(Update::SteerAccepted {
+                                                id: message_id.to_string(),
+                                                text: prompt.text,
+                                                editable,
+                                            });
+                                        }
+                                        Ok(None) => app.accept_attachments(&prompt.attachments),
                                         Err(error) => {
                                             app.paste(&prompt.text);
                                             app.restore_attachments(prompt.attachments);
@@ -659,7 +2199,76 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                         }
                                     }
                                 }
+                                Action::SteerChild { id, generation, text } => {
+                                    // transition_route is the only route writer. Snapshot its
+                                    // generation synchronously with the root ACP identity, and
+                                    // drop the guard before starting any asynchronous work.
+                                    let route_generation = match transition_session.lock() {
+                                        Ok(route) => route.generation,
+                                        Err(_) => {
+                                            app.apply(Update::ChildSteerFinished {
+                                                id, generation,
+                                                result: Err("active session route unavailable; child steering was not submitted".into()),
+                                            });
+                                            continue;
+                                        }
+                                    };
+                                    let request = crate::protocols::acp::SteerSubagentRequest {
+                                        session_id: session_id.to_string().into(),
+                                        id: id.clone(),
+                                        generation,
+                                        prompt: text,
+                                    };
+                                    let connection = connection.clone();
+                                    spawn_child_steer(route_generation, id, generation, updates_tx.clone(), async move {
+                                        connection.send_request(request).block_task().await.map(|_| ())
+                                    });
+                                }
+                                Action::ReplaceSteer { id, text } => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start pending-message edit");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let Some(token) = app.begin_steer_mutation(&id, Some(text.clone())) else { continue; };
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let request_id = id.clone();
+                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
+                                        connection
+                                            .send_request(wire::ReplaceInjectSessionRequest::new(
+                                                session_id,
+                                                request_id,
+                                                vec![wire::ContentBlock::Text(wire::TextContent::new(text))],
+                                            ))
+                                            .block_task()
+                                            .await
+                                            .map(|_| ())
+                                    });
+                                }
+                                Action::RevokeSteer { id } => {
+                                    let Ok(route) = transition_session.lock() else {
+                                        app.note("could not start pending-message removal");
+                                        continue;
+                                    };
+                                    let generation = route.generation;
+                                    drop(route);
+                                    let Some(token) = app.begin_steer_mutation(&id, None) else { continue; };
+                                    let connection = connection.clone();
+                                    let session_id = session_id.clone();
+                                    let request_id = id.clone();
+                                    spawn_steer_mutation(generation, id, token, updates_tx.clone(), async move {
+                                        connection
+                                            .send_request(wire::RevokeInjectSessionRequest::new(session_id, request_id))
+                                            .block_task()
+                                            .await
+                                            .map(|_| ())
+                                    });
+                                }
                                 Action::New(first_prompt) => {
+                                    voice.stop();
+                                    voice.notify_state(&connection, &session_id);
                                     connection
                                         .send_request(CloseSessionRequest::new(session_id.clone()))
                                         .block_task()
@@ -669,13 +2278,26 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                         .block_task()
                                         .await?;
                                     session_id = session.session_id;
+                                    let config_options = if let Some(choice) = &saved_model_default {
+                                        connection
+                                            .send_request(SetSessionConfigOptionRequest::new(
+                                                session_id.clone(),
+                                                MODEL_CONFIG_ID,
+                                                choice.id.as_str(),
+                                            ))
+                                            .block_task()
+                                            .await?
+                                            .config_options
+                                    } else {
+                                        session.config_options
+                                    };
                                     let persisted_id = durable_session_id(&session_id).map_err(|error| {
                                         agent_client_protocol::Error::into_internal_error(std::io::Error::other(error))
                                     })?;
                                     transition_route(&transition_session, persisted_id.clone());
                                     images.clear();
                                     app.start_session(persisted_id);
-                                    refresh_config_state(&mut app, Some(&session.config_options));
+                                    refresh_config_state(&mut app, Some(&config_options));
                                     if let Some(prompt) = first_prompt {
                                         let outcome = connection
                                             .send_request(wire::PromptRequest::new(
@@ -753,6 +2375,8 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                     });
                                 }
                                 Action::Resume(requested_id) => {
+                                    voice.stop();
+                                    voice.notify_state(&connection, &session_id);
                                     if let Err(error) = crate::session::validate_id(&requested_id) {
                                         app.note(format!("invalid session id: {error}"));
                                         continue;
@@ -837,35 +2461,32 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                     }
                                 }
                                 Action::Close => return Ok(()),
-                                Action::SelectModel { choice, save_defaults } => {
-                                    let response = connection.send_request(
-                                        SetSessionConfigOptionRequest::new(
-                                            session_id.clone(), "model", choice.id.as_str(),
-                                        ),
-                                    ).block_task().await;
-                                    match response {
-                                        Ok(response) => {
-                                            app.usage = None;
-                                            refresh_config_state(
-                                                &mut app,
-                                                Some(&response.config_options),
-                                            );
-                                            app.note(format!("model changed to {} via {}", choice.model, choice.provider));
-                                            if save_defaults {
-                                                match save_model_defaults(&choice) {
-                                                    Ok(()) => app.note("saved model defaults to ~/.kit/config.toml"),
-                                                    Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
-                                                }
-                                            }
+                                action @ (Action::SelectModel { .. } | Action::ConfirmModelSwitch(_)) => {
+                                    // A poisoned route may pair a session ID with the wrong generation.
+                                    // Stop explicitly rather than send a request with untrusted correlation.
+                                    let generation = transition_session.lock().map_err(|_| {
+                                        agent_client_protocol::util::internal_error("active session route poisoned")
+                                    })?.generation;
+                                    let (operation, request) = match prepare_model_switch_request(&mut app, action, session_id.clone()) {
+                                        Ok(request) => request,
+                                        Err(error) => {
+                                            app.note(format!("could not change model: {}", error.message));
+                                            continue;
                                         }
-                                        Err(error) => app.note(format!("model change failed: {}", error.message)),
-                                    }
+                                    };
+                                    spawn_model_switch(
+                                        connection.clone(),
+                                        request,
+                                        generation,
+                                        operation,
+                                        switch_tx.clone(),
+                                    );
                                 }
                                 Action::SelectEffort { effort, save_defaults } => {
                                     let response = connection
                                         .send_request(SetSessionConfigOptionRequest::new(
                                             session_id.clone(),
-                                            "reasoning_effort",
+                                            REASONING_EFFORT_CONFIG_ID,
                                             effort.as_str(),
                                         ))
                                         .block_task()
@@ -880,9 +2501,13 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                                 "reasoning effort changed to {effort}"
                                             ));
                                             if save_defaults {
-                                                match save_effort_default(&effort) {
+                                                let saved = {
+                                                    let effort = effort.clone();
+                                                    tokio::task::spawn_blocking(move || save_effort_default(&effort)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                                };
+                                                match saved {
                                                     Ok(()) => app.note(
-                                                        "saved reasoning effort default to ~/.kit/config.toml",
+                                                        config_save_message("reasoning effort default"),
                                                     ),
                                                     Err(error) => app.note(format!(
                                                         "reasoning effort changed, but default was not saved: {error}"
@@ -894,6 +2519,110 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                             "reasoning effort change failed: {}",
                                             error.message
                                         )),
+                                    }
+                                }
+                                Action::Login(method) => {
+                                    drop(events);
+                                    let active_config = active_session_config(&app);
+                                    let authentication = authenticate_in_terminal(
+                                        &auth_invocation,
+                                        &root,
+                                        &method,
+                                        stop,
+                                    );
+                                    leave(&mut terminal);
+                                    println!("Starting {}…", method.name);
+                                    let authenticated = wait_for_connected_authentication(
+                                        authentication,
+                                        &mut app,
+                                        &transition_session,
+                                        &mut updates_rx,
+                                        &mut exit_rx,
+                                    )
+                                    .await;
+                                    let authenticated = match authenticated {
+                                        ConnectedAuthentication::Completed(authenticated) => authenticated,
+                                        ConnectedAuthentication::UpdatesClosed => return Ok(()),
+                                        ConnectedAuthentication::AgentExited(status) => {
+                                            return Err(agent_client_protocol::Error::into_internal_error(
+                                                std::io::Error::other(died(
+                                                    status.ok().and_then(Result::ok),
+                                                    stderr_task,
+                                                    &recent,
+                                                    "during authentication",
+                                                ).await),
+                                            ));
+                                        }
+                                    };
+                                    let Some(outcome) = authenticated else {
+                                        return Ok(());
+                                    };
+                                    match outcome {
+                                        Ok(status) if status.success() => {
+                                            let refreshed = bounded_cancellable_request(
+                                                refresh_session_after_auth(
+                                                    &connection,
+                                                    session_id.clone(),
+                                                    &active_config,
+                                                ),
+                                                &mut exit_rx,
+                                                stop.requested(),
+                                                HANDSHAKE,
+                                            )
+                                            .await;
+                                            let Some(options) = (match refreshed {
+                                                Ok(options) => options,
+                                                Err(failure) => {
+                                                    return Err(request_failure(
+                                                        failure,
+                                                        stderr_task,
+                                                        &recent,
+                                                        "during authentication refresh",
+                                                        format!(
+                                                            "the agent did not refresh the session within {} seconds",
+                                                            HANDSHAKE.as_secs()
+                                                        ),
+                                                    )
+                                                    .await);
+                                                }
+                                            }) else {
+                                                return Ok(());
+                                            };
+                                            let options = options?;
+                                            refresh_config_state(&mut app, Some(&options));
+                                            app.note(format!(
+                                                "authentication with {} succeeded",
+                                                method.name
+                                            ));
+                                        }
+                                        Ok(status) => app.note(format!(
+                                            "authentication with {} failed: {status}",
+                                            method.name
+                                        )),
+                                        Err(error) => app.note(format!(
+                                            "could not start authentication with {}: {error}",
+                                            method.name
+                                        )),
+                                    }
+                                    images = resume_terminal(&mut terminal).map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                    events = input::Events::new().map_err(agent_client_protocol::Error::into_internal_error)?;
+                                }
+                                Action::OpenUserImage(image) => {
+                                    // Snapshot only; release the guard before queueing work.
+                                    // Poison rejects this request rather than selecting another session.
+                                    let generation = transition_session.lock().ok().map(|route| route.generation);
+                                    if let Some(generation) = generation {
+                                        match background_workers.try_update(QueuedUpdate::for_session(
+                                            generation, Update::OpenUserImage(image),
+                                        )) {
+                                            Ok(()) => {}
+                                            Err(error) => match *error {
+                                                std::sync::mpsc::TrySendError::Full(_) => app.note("image worker is busy; click again to open"),
+                                                std::sync::mpsc::TrySendError::Disconnected(_) => app.note("image worker is unavailable"),
+                                            },
+                                        }
                                     }
                                 }
                                 Action::Copy(text) => {
@@ -956,36 +2685,112 @@ pub async fn run_with_reasoning_effort_and_api_keys(
                                         ));
                                     });
                                 }
+                                Action::ReadClipboard(route, mode) => {
+                                    let generation = transition_session
+                                        .lock()
+                                        .map(|route| route.generation)
+                                        .unwrap_or_default();
+                                    match background_workers.try_clipboard(generation, route.clone(), mode) {
+                                        Ok(()) => clipboard_pastes.queued(generation, route),
+                                        Err(std::sync::mpsc::TrySendError::Full(_)) => app.note("clipboard is busy; try again"),
+                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => app.note("clipboard worker is unavailable"),
+                                    }
+                                }
                                 Action::None | Action::Redraw => {}
                             }
                         },
-                        update = updates_rx.recv() => match update {
-                            Some(update) => {
-                                if let Some(update) = accept_queued_update(&transition_session, update) {
-                                    if let Update::ConfigOptions(options) = &update {
-                                        refresh_config_state(&mut app, Some(options));
-                                    }
-                                    app.apply(update);
+                        SessionEvent::Background(completion) => match completion {
+                            Some(completion) => {
+                                let applied = scheduler::apply_completions(
+                                    &mut app, &transition_session, &mut voice,
+                                    &mut clipboard_pastes, &mut background_rx, completion,
+                                );
+                                if applied.urgent {
+                                    frames.invalidate_input();
+                                } else if applied.dirty {
+                                    frames.invalidate();
                                 }
-                                while let Ok(update) = updates_rx.try_recv() {
-                                    let Some(update) = accept_queued_update(&transition_session, update) else {
-                                        continue;
-                                    };
-                                    if let Update::ConfigOptions(options) = &update {
-                                        refresh_config_state(&mut app, Some(options));
-                                    }
-                                    app.apply(update);
-                                }
+                                submit_after_paste = applied.submit_after_paste;
                             }
                             None => return Ok(()),
                         },
-                        _ = ticker.tick(), if app.needs_redraw_tick() => app.tick(),
-                        () = stop.requested() => return Ok(()),
+                        SessionEvent::ModelSwitch(completion) => {
+                            let Some(mut pending) = take_model_switch_completion(&mut app, &transition_session, completion.generation, completion.operation)? else { continue; };
+                            match completion.response {
+                                Ok(response) => {
+                                    let choice = pending.choice;
+                                    let save_defaults = pending.save_defaults;
+                                    app.usage = None;
+                                    refresh_config_state(&mut app, Some(&response.config_options));
+                                    app.note(format!("model changed to {} via {}", choice.model, choice.provider));
+                                    if save_defaults {
+                                        let saved = {
+                                            let choice = choice.clone();
+                                            tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
+                                        };
+                                        match saved {
+                                            Ok(()) => { saved_model_default = Some(choice); app.note(config_save_message("model defaults")); }
+                                            Err(error) => app.note(format!("model changed, but defaults were not saved: {error}")),
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let warning = error.data.as_ref().and_then(|data| data.get(model_switch::META)).and_then(|value| serde_json::from_value::<model_switch::Warning>(value.clone()).ok());
+                                    if let Some(warning) = warning.filter(|_| !pending.cancelling) {
+                                        pending.warning = Some(warning);
+                                        app.model_switch = Some(pending);
+                                    } else {
+                                        app.note(format!("model change failed: {}", error.message));
+                                    }
+                                }
+                            }
+                        },
+                        SessionEvent::Update(update) => match update {
+                            Some(update) => {
+                                pending_update = match scheduler::forward_updates(
+                                    &background_workers, &mut updates_rx, update,
+                                ) {
+                                    Ok(pending) => pending,
+                                    Err(()) => return Ok(()),
+                                };
+                            }
+                            None => return Ok(()),
+                        },
+                        SessionEvent::Forward => {
+                            if let Some(queued) = pending_update.take() {
+                                pending_update = match scheduler::forward_updates(
+                                    &background_workers, &mut updates_rx, queued,
+                                ) {
+                                    Ok(pending) => pending,
+                                    Err(()) => return Ok(()),
+                                };
+                            }
+                        },
+                        SessionEvent::Frame => {
+                            let started = tokio::time::Instant::now();
+                            if frames.ready(started) {
+                                draw_frame(&mut terminal, &mut app, &mut images)
+                                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                                frames.drawn(started);
+                            }
+                        },
+                        SessionEvent::Tick => {
+                            if tick_frame(&mut app, &mut images) {
+                                frames.invalidate();
+                            }
+                        },
+                        SessionEvent::Stop => return Ok(()),
                     }
                 }
             }
             .await;
-            leave(terminal);
+            // The completed async block owned and dropped the input reader.
+            // Best effort, nonblocking even on quit or an early error. Audio
+            // stops first; connection teardown is the final cleanup boundary.
+            voice.stop();
+            voice.notify_state(&connection, &session_id);
+            leave(&mut terminal);
+            print_exit_message(&app);
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -1004,21 +2809,53 @@ pub async fn run_with_reasoning_effort_and_api_keys(
             Ok(())
         })
         .await
-        .map_err(explain);
+        .map_err(explain)
+        };
 
-    // The A2A listener keeps the child alive after ACP closes. Stop it only
-    // after CloseSession has unwound the lock owner, then wait for OS locks to
-    // be released rather than relying on `kill_on_drop`.
-    let _ = shutdown_tx.send(());
-    let _ = watcher.await;
-    // If the server failed before acknowledging CloseSession, reclaim only a
-    // lock that is now provably stale; a live owner's OS lock is never stolen.
-    if let Ok(active) = active_persisted_id.lock() {
-        let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
+        // The client future has dropped its transport. Allow the storage-owning
+        // process to complete graceful shutdown, including its final recovery.
+        let _ = shutdown_tx.send(());
+        let shutdown_result = watcher.await;
+        // If the server failed before acknowledging CloseSession, reclaim only a
+        // lock that is now provably stale; a live owner's OS lock is never stolen.
+        if let Ok(active) = active_persisted_id.lock() {
+            let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
+        }
+
+        // Keep startup/protocol diagnostics as well as final persistence failure.
+        if let Err(shutdown) = shutdown_result? {
+            return Err(match result {
+                Err(error) => std::io::Error::other(format!("{error}\n{shutdown}")),
+                Ok(()) => shutdown,
+            }
+            .into());
+        }
+        result?;
+        Ok(())
     }
+}
 
-    result?;
-    Ok(())
+async fn wait_for_storage_exit(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let message = "kit: agent graceful shutdown timed out; forcing termination. Final storage recovery may not have completed; unpersisted data may be lost.";
+            eprintln!("{message}");
+            child.kill().await?;
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+        }
+    }
+}
+
+fn config_save_message(setting: &str) -> String {
+    if crate::resilient_fs::global().status().pending_operations > 0 {
+        format!("updated {setting} in memory; disk persistence is pending (not durable)")
+    } else {
+        format!("saved {setting} to ~/.kit/config.toml")
+    }
 }
 
 fn save_effort_default(effort: &str) -> Result<(), String> {
@@ -1032,16 +2869,11 @@ fn save_effort_default(effort: &str) -> Result<(), String> {
 }
 
 fn save_effort_default_to(path: &Path, effort: &str) -> Result<(), String> {
-    update_config(path, |root| {
-        if effort == "default" {
-            root.remove("reasoning_effort");
-        } else {
-            root.insert(
-                "reasoning_effort".into(),
-                toml::Value::String(effort.to_string()),
-            );
-        }
-    })
+    crate::config_editor::set_strings(
+        path,
+        &[("reasoning_effort", (effort != "default").then_some(effort))],
+    )
+    .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
@@ -1055,45 +2887,14 @@ fn save_model_defaults(choice: &ModelChoice) -> Result<(), String> {
 }
 
 fn save_model_defaults_to(path: &Path, choice: &ModelChoice) -> Result<(), String> {
-    update_config(path, |root| {
-        root.insert(
-            "provider".into(),
-            toml::Value::String(choice.provider.clone()),
-        );
-        root.insert("model".into(), toml::Value::String(choice.model.clone()));
-    })
-}
-
-fn update_config(
-    path: &Path,
-    update: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
-) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let contents = match std::fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
-    };
-    let mut config = if contents.is_empty() {
-        toml::Value::Table(Default::default())
-    } else {
-        toml::from_str::<toml::Value>(&contents)
-            .map_err(|error| format!("invalid {}: {error}", path.display()))?
-    };
-    let root = config
-        .as_table_mut()
-        .ok_or_else(|| format!("invalid {}: root must be a table", path.display()))?;
-    update(root);
-    let output = toml::to_string_pretty(&config)
-        .map_err(|error| format!("could not serialize {}: {error}", path.display()))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "config path has no parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
-        .write(|file| file.write_all(output.as_bytes()))
-        .map_err(|error| format!("could not save {}: {error}", path.display()))
+    crate::config_editor::set_strings(
+        path,
+        &[
+            ("provider", Some(&choice.provider)),
+            ("model", Some(&choice.model)),
+        ],
+    )
+    .map_err(|error| format!("could not save {}: {error}", path.display()))
 }
 
 /// An ACP error prints its whole JSON-RPC envelope; on the way out of the
@@ -1123,12 +2924,24 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-/// Explains an agent that exited before the session was open, quoting the last
-/// thing it said.
+/// ACP owns tool cards, but the stderr transport lease and general diagnostics
+/// still drive runtime availability, subagent status, storage, and failure reports.
+fn stderr_update(line: String) -> Option<Update> {
+    match events::parse(&line) {
+        Some(event) => Some(Update::Runtime(event)),
+        None if line.starts_with("A2A listening on ") => Some(Update::A2aAddress(
+            line.trim_start_matches("A2A listening on ").to_string(),
+        )),
+        None => Some(Update::Log(line)),
+    }
+}
+
+/// Explains an agent exit, quoting the last thing it said.
 async fn died(
     status: Option<std::process::ExitStatus>,
     stderr: tokio::task::JoinHandle<()>,
     recent: &Mutex<Vec<String>>,
+    when: &str,
 ) -> String {
     // Its final diagnostics are usually still in flight when it exits, and they
     // are the part worth reading.
@@ -1145,9 +2958,9 @@ async fn died(
         None => "exited".to_string(),
     };
     if said.is_empty() {
-        format!("the agent {how} before the session opened")
+        format!("the agent {how} {when}")
     } else {
-        format!("the agent {how} before the session opened: {said}")
+        format!("the agent {how} {when}: {said}")
     }
 }
 
@@ -1156,46 +2969,380 @@ fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", STANDARD.encode(text))
 }
 
+/// One cancellable page request, scoped to the root session and focus epoch.
+struct ChildTranscriptRead {
+    target: (String, (String, u64, u64, u64)),
+    future: std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
+                > + Send,
+        >,
+    >,
+}
+
+/// Apply only the current focus epoch and schedule its visible page or notice.
+fn finish_child_transcript(
+    app: &mut App,
+    frames: &mut scheduler::Frames,
+    target: &(String, u64, u64, u64),
+    result: Result<crate::protocols::acp::ReadSubagentTranscriptResponse, String>,
+) {
+    if app.child_read_target().as_ref() == Some(target) {
+        app.child_read_finished(target, result);
+        frames.invalidate();
+    }
+}
+
+/// Child steering never enters the root prompt path. Its completion is scoped
+/// independently to the captured root route and the selected child generation.
+fn spawn_child_steer(
+    route_generation: u64,
+    id: String,
+    generation: u64,
+    updates: mpsc::UnboundedSender<QueuedUpdate>,
+    request: impl Future<Output = Result<(), agent_client_protocol::Error>> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(HANDSHAKE, request).await {
+            Ok(result) => result.map_err(|error| error.message.to_string()),
+            Err(_) => Err("child steering timed out; delivery is unknown".into()),
+        };
+        let _ = updates.send(QueuedUpdate::for_session(
+            route_generation,
+            Update::ChildSteerFinished {
+                id,
+                generation,
+                result,
+            },
+        ));
+    })
+}
+
+/// Await delivery-sensitive ACP mutations off the terminal event loop. Both
+/// session generation and the app's mutation token must match at completion.
+fn spawn_steer_mutation(
+    generation: u64,
+    id: String,
+    token: u64,
+    updates: mpsc::UnboundedSender<QueuedUpdate>,
+    request: impl std::future::Future<Output = Result<(), agent_client_protocol::Error>>
+    + Send
+    + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = request.await.map_err(|error| app::SteerMutationError {
+            unavailable: pending_message_unavailable(&error),
+            message: format!(
+                "pending-message change failed: {}; retry or Esc to restore draft",
+                error.message
+            ),
+        });
+        let _ = updates.send(QueuedUpdate::for_session(
+            generation,
+            Update::SteerMutationFinished { id, token, result },
+        ));
+    })
+}
+
+fn supports_pending_replace(inject: Option<&wire::SessionInjectCapabilities>) -> bool {
+    inject
+        .and_then(|inject| inject.pending.as_ref())
+        .is_some_and(|pending| pending.replace == Some(true))
+}
+
+fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
+    matches!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("already_delivered" | "unknown_message_id")
+    )
+}
+
+/// Keep Enter behind earlier native pastes without blocking terminal events.
+fn handle_with_clipboard(app: &mut App, pastes: &mut ClipboardPastes, event: Event) -> Action {
+    if let Some(pending) = &mut pastes.pending {
+        if pending.route != app.clipboard_route() {
+            pastes.pending = None;
+        } else if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            })
+        ) {
+            pending.submit = true;
+            app.toast("waiting for clipboard paste before submitting");
+            return Action::None;
+        } else if matches!(&event, Event::Paste(_))
+            || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release)
+        {
+            // Further editing cancels automatic submission rather than sending
+            // text typed after Enter without another explicit submission.
+            pending.submit = false;
+        }
+    }
+    handle(app, event)
+}
+
+struct ClipboardPasteOutcome {
+    // Includes current-route errors/toasts, but never stale results.
+    accepted: bool,
+    submit: bool,
+}
+
+fn finish_clipboard_paste(
+    app: &mut App,
+    active: &Arc<Mutex<ActiveSessionRoute>>,
+    pastes: &mut ClipboardPastes,
+    generation: u64,
+    route: ClipboardRoute,
+    result: ClipboardResult,
+) -> ClipboardPasteOutcome {
+    let applied = apply_clipboard_completion(app, active, generation, route.clone(), result);
+    let submit = pastes.finish(generation, &route, applied == Some(true));
+    if submit {
+        // The deferred Enter is an explicit submission, not a pasted newline.
+        app.last_key = None;
+    }
+    ClipboardPasteOutcome {
+        accepted: applied.is_some(),
+        submit,
+    }
+}
+
+/// Mouse handlers request redraw explicitly; ignored motion and releases must
+/// not turn a pending stream frame into an urgent input frame.
+fn handle_terminal(
+    app: &mut App,
+    pastes: &mut ClipboardPastes,
+    frames: &mut scheduler::Frames,
+    event: Event,
+) -> Action {
+    let mouse = matches!(&event, Event::Mouse(_));
+    let action = handle_with_clipboard(app, pastes, event);
+    if !mouse || !matches!(&action, Action::None) {
+        frames.invalidate_input();
+    }
+    action
+}
+
 /// Applies one terminal event, returning the work it asks for.
 fn handle(app: &mut App, event: Event) -> Action {
+    let route = app.clipboard_route();
+    let action = handle_inner(app, event);
+    app.finish_clipboard_route_event(&route);
+    action
+}
+
+fn handle_inner(app: &mut App, event: Event) -> Action {
     match event {
+        Event::Key(key) if clipboard_paste_key(key) => {
+            if paste_blocked(app) {
+                Action::None
+            } else {
+                Action::ReadClipboard(app.clipboard_route(), ClipboardMode::ImageOrText)
+            }
+        }
         Event::Key(key) => app.handle_key(key),
         Event::Mouse(mouse) => app.handle_mouse(mouse),
-        Event::Paste(text) => {
-            if app.session_rename_active() {
-                app.paste(&text);
-            } else if let Some(attachments) = attachments_from_paste(&app.root, &text) {
-                app.prune_attachments();
-                let pending_bytes = app
-                    .attachments
-                    .iter()
-                    .chain(&attachments)
-                    .try_fold(0_u64, |total, attachment| {
-                        total.checked_add(attachment.size)
-                    });
-                if app.attachments.len() + attachments.len() > MAX_ATTACHMENTS {
-                    app.note(format!(
-                        "at most {MAX_ATTACHMENTS} attachments can be pending"
-                    ));
-                } else if pending_bytes.is_none_or(|total| total > MAX_TOTAL_ATTACHMENT_BYTES) {
-                    app.note("attachments exceed the 20 MiB total limit");
-                } else {
-                    for attachment in attachments {
-                        app.attach(
-                            attachment.path,
-                            attachment.mime_type,
-                            attachment.kind,
-                            attachment.size,
-                        );
-                    }
-                }
+        Event::Paste(text) if text.is_empty() => {
+            // VS Code/xterm can represent Command+V with an image-only
+            // clipboard as an empty bracketed paste, not a Super+V key.
+            let route = app.clipboard_route();
+            if matches!(route, ClipboardRoute::Composer(_)) {
+                Action::ReadClipboard(route, ClipboardMode::ImageOnly)
             } else {
-                app.paste(&text);
+                Action::None
             }
+        }
+        Event::Paste(text) => {
+            handle_paste(app, &text);
             Action::None
         }
         _ => Action::None,
     }
+}
+
+fn clipboard_paste_key(key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    match key.code {
+        KeyCode::Insert => key.modifiers == KeyModifiers::SHIFT,
+        KeyCode::Char('v' | 'V') => {
+            key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::SUPER
+                || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
+        _ => false,
+    }
+}
+
+fn paste_blocked(app: &App) -> bool {
+    app.model_switch.is_some()
+        || app.model_dialog.is_some()
+        || app.effort_dialog.is_some()
+        || (app.session_dialog.is_some() && !app.session_rename_active())
+        || (app.queue_focused && !app.session_rename_active())
+}
+
+fn read_clipboard(route: &ClipboardRoute, mode: ClipboardMode) -> ClipboardResult {
+    if mode == ClipboardMode::ImageOnly && !matches!(route, ClipboardRoute::Composer(_)) {
+        return ClipboardResult::NoImage;
+    }
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => return ClipboardResult::Error(format!("clipboard unavailable: {error}")),
+    };
+    if matches!(route, ClipboardRoute::Composer(_)) {
+        match clipboard.get_image() {
+            Ok(image) => {
+                return match clipboard_image_attachment(image) {
+                    Ok(attachment) => ClipboardResult::Attachment(attachment),
+                    Err(error) => ClipboardResult::Error(error),
+                };
+            }
+            Err(arboard::Error::ContentNotAvailable) if mode == ClipboardMode::ImageOnly => {
+                return ClipboardResult::NoImage;
+            }
+            Err(error) if mode == ClipboardMode::ImageOnly => {
+                return ClipboardResult::Error(format!("could not read clipboard image: {error}"));
+            }
+            Err(_) => {}
+        }
+    }
+    match clipboard.get_text() {
+        Ok(text) => ClipboardResult::Text(text),
+        Err(_) => {
+            ClipboardResult::Error("clipboard does not contain text or a supported image".into())
+        }
+    }
+}
+
+// None rejects a stale/blocked route. Some(false) reports a current-route
+// failure that still needs immediate visual feedback, but must not submit.
+fn apply_clipboard_completion(
+    app: &mut App,
+    active: &Arc<Mutex<ActiveSessionRoute>>,
+    generation: u64,
+    route: ClipboardRoute,
+    result: ClipboardResult,
+) -> Option<bool> {
+    let current_generation = active.lock().map(|route| route.generation).ok();
+    if current_generation != Some(generation)
+        || app.clipboard_route() != route
+        || paste_blocked(app)
+    {
+        return None;
+    }
+    Some(match result {
+        ClipboardResult::NoImage => true,
+        ClipboardResult::Text(text) => handle_paste(app, &text),
+        ClipboardResult::Attachment(attachment) => attach_pasted(app, vec![attachment]),
+        ClipboardResult::Error(error) => {
+            app.note(error);
+            false
+        }
+    })
+}
+
+fn handle_paste(app: &mut App, text: &str) -> bool {
+    if app.child_focus.is_some() {
+        app.paste(text);
+        return true;
+    }
+    if paste_blocked(app) {
+        return false;
+    }
+    if app.session_rename_active() || app.editing_steer() {
+        app.paste(text);
+        true
+    } else if let Some(attachments) = attachments_from_paste(&app.root, text) {
+        attach_pasted(app, attachments)
+    } else {
+        app.paste(text);
+        true
+    }
+}
+
+fn attach_pasted(app: &mut App, attachments: Vec<Attachment>) -> bool {
+    app.prune_attachments();
+    let pending_bytes = app
+        .attachments
+        .iter()
+        .chain(&attachments)
+        .try_fold(0_u64, |total, attachment| {
+            total.checked_add(attachment.size)
+        });
+    if app.attachments.len() + attachments.len() > MAX_ATTACHMENTS {
+        app.note(format!(
+            "at most {MAX_ATTACHMENTS} attachments can be pending"
+        ));
+        false
+    } else if pending_bytes.is_none_or(|total| total > MAX_TOTAL_ATTACHMENT_BYTES) {
+        app.note("attachments exceed the 20 MiB total limit");
+        false
+    } else {
+        for attachment in attachments {
+            if attachment.temporary.is_some() {
+                app.attach_attachment(attachment);
+            } else {
+                app.attach(
+                    attachment.path,
+                    attachment.mime_type,
+                    attachment.kind,
+                    attachment.size,
+                );
+            }
+        }
+        true
+    }
+}
+
+fn clipboard_image_attachment(image: arboard::ImageData<'_>) -> Result<Attachment, String> {
+    use ::image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
+
+    let width = u32::try_from(image.width).map_err(|_| "clipboard image is too wide")?;
+    let height = u32::try_from(image.height).map_err(|_| "clipboard image is too tall")?;
+    let expected = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or("clipboard image dimensions overflow")?;
+    // Bound source pixels as well as the compressed attachment: a solid-color
+    // image can otherwise be arbitrarily expensive while encoding to a tiny PNG.
+    if expected > 64 * 1024 * 1024 {
+        return Err("clipboard image exceeds the 64 MiB pixel-data limit".into());
+    }
+    if width == 0 || height == 0 || image.bytes.len() != expected {
+        return Err("clipboard image data is invalid".into());
+    }
+
+    let (mut file, path) = attachment::create_private_png()
+        .map_err(|error| format!("could not create clipboard image: {error}"))?;
+    let encoded = PngEncoder::new(&mut file)
+        .write_image(&image.bytes, width, height, ExtendedColorType::Rgba8)
+        .and_then(|()| {
+            file.metadata()
+                .map(|metadata| metadata.len())
+                .map_err(Into::into)
+        });
+    drop(file);
+    let size = match encoded {
+        Ok(size) if size <= MAX_ATTACHMENT_BYTES => size,
+        Ok(_) => return Err("clipboard image exceeds the 10 MiB attachment limit".into()),
+        Err(error) => return Err(format!("could not encode clipboard image: {error}")),
+    };
+    Ok(Attachment::clipboard_image(
+        attachment::own_temp_path(path),
+        size,
+    ))
 }
 
 fn attachments_from_paste(root: &Path, text: &str) -> Option<Vec<Attachment>> {
@@ -1242,7 +3389,14 @@ fn media_attachment(root: &Path, value: &str) -> Option<Attachment> {
         mime_type,
         kind,
         size: metadata.len(),
+        temporary: None,
     })
+}
+
+fn pending_steer_is_editable(blocks: &[ContentBlock]) -> bool {
+    blocks
+        .iter()
+        .all(|block| matches!(block, ContentBlock::Text(_)))
 }
 
 fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> {
@@ -1298,34 +3452,164 @@ fn prompt_blocks(prompt: &SubmittedPrompt) -> Result<Vec<ContentBlock>, String> 
     Ok(blocks)
 }
 
-fn enter() -> std::io::Result<(DefaultTerminal, image::ImageRuntime)> {
-    let terminal = ratatui::try_init()?;
-    // Query after entering the alternate screen but before the event stream owns
-    // terminal input, as required by ratatui-image. The query has a short bound.
-    let images = image::ImageRuntime::detect();
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        // Let crossterm decode layout-aware shifted characters rather than
+        // inserting the base character from an encoded Shift key event.
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
+fn enable_tui_modes() {
     let mut stdout = std::io::stdout();
-    // Bracketed paste is what keeps pasted text out of the key stream: without
-    // it every newline in a paste arrives as a return press, which submits the
-    // prompt part-way through.
     let _ = execute!(stdout, EnableBracketedPaste, EnableMouseCapture);
-    // Kitty-protocol terminals report `cmd`, `shift+enter`, and key release
-    // separately; the client falls back to control keys where they do not.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
         ENHANCED.store(true, Ordering::Relaxed);
     }
-    // Ratatui's own hook restores raw mode and the alternate screen, but not
-    // the modes turned on above: a panic would otherwise leave the shell
-    // reporting every mouse move as text.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_modes();
-        previous(info);
-    }));
+}
+
+// Poll maintenance and image completions even when neither needs a frame.
+fn tick_frame(app: &mut App, images: &mut image::ImageRuntime) -> bool {
+    let changed = app.tick();
+    images.poll() || changed
+}
+
+fn draw_frame<W: std::io::Write>(
+    terminal: &mut ratatui::Terminal<hyperlinks::HyperlinkBackend<W>>,
+    app: &mut app::App,
+    images: &mut image::ImageRuntime,
+) -> std::io::Result<()> {
+    hyperlinks::draw(terminal, |frame| {
+        ui::draw(frame, app, images);
+        // Child views render no overlays, including command completions for
+        // literal slash drafts. Only the root view uses those controls.
+        let (app, obscured) = app
+            .child_focus
+            .as_ref()
+            .and_then(|id| app.child_views.get(id))
+            .map_or_else(
+                || (&*app, ui::native_links_obscured(app)),
+                |child| (&*child.app, false),
+            );
+        hyperlinks::FrameLinks {
+            rows: app.row_links.clone(),
+            left: app.transcript_left,
+            top: app.transcript_top,
+            obscured,
+        }
+    })
+}
+
+/// Owns terminal modes across fallible setup, dropped futures, and unwind.
+/// Declare input after this guard so its reader joins before mode restoration.
+struct TerminalSession {
+    terminal: DefaultTerminal,
+    active: bool,
+}
+
+impl std::ops::Deref for TerminalSession {
+    type Target = DefaultTerminal;
+    fn deref(&self) -> &Self::Target {
+        &self.terminal
+    }
+}
+
+impl std::ops::DerefMut for TerminalSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if self.active {
+            leave(self);
+        }
+    }
+}
+
+fn enter() -> std::io::Result<(TerminalSession, image::ImageRuntime)> {
+    // Unwinding restores through TerminalSession, after Events has joined.
+    // A process-global unwind hook would restore too early, including for an
+    // unrelated worker panic whose terminal owner remains alive.
+    #[cfg(panic = "abort")]
+    {
+        // Abort cannot run either destructor. Preserve best-effort emergency
+        // restoration and diagnostic visibility, without claiming joined input.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_modes();
+            ratatui::restore();
+            previous(info);
+        }));
+    }
+    // Construct before changing modes so a construction failure needs no cleanup.
+    let mut terminal = TerminalSession {
+        terminal: ratatui::Terminal::new(hyperlinks::HyperlinkBackend::new(std::io::stdout()))?,
+        active: false,
+    };
+    let images = prepare_terminal(&mut terminal)?;
     Ok((terminal, images))
+}
+
+fn resume_terminal(terminal: &mut TerminalSession) -> std::io::Result<image::ImageRuntime> {
+    let images = prepare_terminal(terminal)?;
+    if let Err(error) = terminal.clear() {
+        leave(terminal);
+        return Err(error);
+    }
+    Ok(images)
+}
+
+fn prepare_terminal(terminal: &mut TerminalSession) -> std::io::Result<image::ImageRuntime> {
+    terminal.active = true;
+    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
+    let resumed = (|| {
+        crossterm::terminal::enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        // Image and synchronous keyboard-enhancement capability queries are
+        // setup-only readers. Both must finish before Events acquires input;
+        // steady-state UI code consumes only its queue, never crossterm locks.
+        let images = image::ImageRuntime::detect();
+        enable_tui_modes();
+        // Initial entry has fresh Ratatui buffers and a fresh alternate screen.
+        // Only resume needs clear(): it also queries the cursor position, which
+        // ordinary startup must not require the terminal to report.
+        Ok(images)
+    })();
+    if resumed.is_err() {
+        leave(terminal);
+    }
+    resumed
+}
+
+/// Avoid terminal escape sequences on protocol stdout when no TUI was entered.
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Best-effort cleanup for actual allocator failure, without command formatting,
+/// terminal queries, panic hooks, or allocating our own buffers. Raw-mode cleanup
+/// still relies on the platform terminal implementation; arbitrary failures in
+/// that implementation cannot be made allocation-safe by this hook.
+pub(crate) fn restore_after_allocation_failure() {
+    use std::io::Write as _;
+
+    if !TERMINAL_ACTIVE.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    if ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = stdout.write_all(b"\x1b[<1u");
+    }
+    // Mouse modes, bracketed paste, cursor visibility, then alternate screen.
+    let _ = stdout.write_all(
+        b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[?1049l",
+    );
+    let _ = stdout.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
 }
 
 /// Whether the keyboard enhancement flags were pushed and still need popping.
@@ -1342,6 +3626,11 @@ fn restore_modes() {
     if ENHANCED.swap(false, Ordering::Relaxed) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
+    // A panic can interrupt a frame before its ordinary I/O cleanup runs.
+    let _ = std::io::Write::write_all(&mut stdout, b"\x1b]8;;\x1b\\");
+    // Bypass the backend: an interrupted frame still defers cursor visibility.
+    let _ = execute!(stdout, crossterm::cursor::Show);
+    let _ = execute!(stdout, crossterm::terminal::EndSynchronizedUpdate);
     let _ = execute!(stdout, DisableMouseCapture, DisableBracketedPaste);
 }
 
@@ -1351,7 +3640,7 @@ fn restore_modes() {
 /// the shell in raw mode with mouse reporting on — every later mouse move
 /// arrives at the prompt as garbage. Holding the signal streams for the whole
 /// session and returning through the normal exit keeps that from happening.
-struct Stop {
+pub struct Stop {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -1361,8 +3650,18 @@ struct Stop {
 }
 
 impl Stop {
+    /// Cancel preparation before launching any detached child tasks.
+    pub async fn until<T>(&mut self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        let stopped = pin!(self.requested());
+        let work = pin!(work);
+        match select(stopped, work).await {
+            Either::Left(_) => None,
+            Either::Right((result, _)) => Some(result),
+        }
+    }
+
     #[cfg(unix)]
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
@@ -1372,17 +3671,17 @@ impl Stop {
     }
 
     #[cfg(not(unix))]
-    fn new() -> std::io::Result<Self> {
+    pub fn new() -> std::io::Result<Self> {
         Ok(Self {})
     }
 
     #[cfg(unix)]
     async fn requested(&mut self) {
-        tokio::select! {
-            _ = self.interrupt.recv() => {}
-            _ = self.terminate.recv() => {}
-            _ = self.hangup.recv() => {}
-        }
+        // All signals mean stop; deterministic ties have the same outcome.
+        let interrupt = pin!(self.interrupt.recv());
+        let terminate = pin!(self.terminate.recv());
+        let hangup = pin!(self.hangup.recv());
+        let _ = select(interrupt, select(terminate, hangup)).await;
     }
 
     #[cfg(not(unix))]
@@ -1396,17 +3695,41 @@ async fn bounded_graceful_close<T>(
     stop: impl std::future::Future<Output = ()>,
     grace: Duration,
 ) -> Option<T> {
-    tokio::select! {
-        output = close => Some(output),
-        () = stop => None,
-        () = tokio::time::sleep(grace) => None,
+    // A completed close wins a stop/deadline tie, as the previous race allowed.
+    let close = pin!(close);
+    let stop = pin!(stop);
+    let deadline = pin!(tokio::time::sleep(grace));
+    match select(close, select(stop, deadline)).await {
+        Either::Left((output, _)) => Some(output),
+        Either::Right(_) => None,
     }
 }
 
-fn leave(terminal: DefaultTerminal) {
+/// After the alternate screen is gone, leave the banner and the command that
+/// reopens this session, so nobody has to find the id in the session list.
+fn print_exit_message(app: &App) {
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout);
+    for line in ui::banner_lines() {
+        let _ = writeln!(stdout, "{line}");
+    }
+    if let Some(command) = app.resume_command() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "resume this session with:");
+        let _ = writeln!(stdout, "  {command}");
+    }
+    let _ = writeln!(stdout);
+    let _ = stdout.flush();
+}
+
+fn leave(terminal: &mut TerminalSession) {
+    terminal.active = false;
     restore_modes();
-    drop(terminal);
+    let _ = terminal.show_cursor();
     ratatui::restore();
+    TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 async fn request_resume(
@@ -1450,14 +3773,11 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 append: true,
             }]
         }
-        SessionUpdate::AgentMessageChunk(chunk) => message_of(chunk.content)
-            .map(|text| Update::AgentMessage {
-                id: chunk.message_id.to_string(),
-                text,
-                append: true,
-            })
-            .into_iter()
-            .collect(),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            agent_content_update(chunk.message_id.to_string(), chunk.content, true)
+                .into_iter()
+                .collect()
+        }
         SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Update::AgentThought {
                 id: chunk.message_id.to_string(),
@@ -1482,8 +3802,49 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
             MessageKind::Thought,
         ),
         SessionUpdate::ToolCallUpdate(update) => {
+            let parent = match &update.meta {
+                MaybeUndefined::Value(meta) => meta.get("kit/parentToolCallId").and_then(|value| {
+                    if value.is_null() {
+                        Some(None)
+                    } else {
+                        value.as_str().map(|id| Some(id.to_owned()))
+                    }
+                }),
+                MaybeUndefined::Null => Some(None),
+                MaybeUndefined::Undefined => None,
+            };
+            let parent_update = parent.map(|parent| Update::ToolParent {
+                id: update.tool_call_id.to_string(),
+                parent,
+            });
+            let images = match &update.content {
+                MaybeUndefined::Value(content) => Some(tool_images_of(content)),
+                MaybeUndefined::Null => Some(Vec::new()),
+                // Raw output is a parallel representation, not an authoritative
+                // content replacement. Only explicit content patches clear pixels.
+                MaybeUndefined::Undefined => None,
+            };
             let output = match &update.content {
-                MaybeUndefined::Value(content) => Some(output_of(Some(content))),
+                MaybeUndefined::Value(content) => {
+                    let text = output_of(Some(content));
+                    // The TUI does not replay terminal streams yet. A parallel raw
+                    // result still provides useful output for terminal-only content.
+                    Some(
+                        if text.is_empty()
+                            && content
+                                .iter()
+                                .any(|item| matches!(item, ToolCallContent::Terminal(_)))
+                        {
+                            update
+                                .raw_output
+                                .value()
+                                .map(raw_output_lines)
+                                .unwrap_or_default()
+                        } else {
+                            text
+                        },
+                    )
+                }
                 MaybeUndefined::Null => Some(Vec::new()),
                 MaybeUndefined::Undefined => match &update.raw_output {
                     MaybeUndefined::Value(output) => Some(raw_output_lines(output)),
@@ -1507,7 +3868,7 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                         .iter()
                         .any(|line| line.contains("is now running in the background"))
                 });
-            vec![Update::ToolPatched {
+            let mut updates = vec![Update::ToolPatched {
                 id: update.tool_call_id.to_string(),
                 title: match update.title {
                     MaybeUndefined::Value(title) => Some(title),
@@ -1526,11 +3887,16 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 },
                 script,
                 output,
+                images,
                 append_output: false,
+                intent: None,
                 backgrounded,
-            }]
+            }];
+            updates.extend(parent_update);
+            updates
         }
         SessionUpdate::ToolCallContentChunk(chunk) => {
+            let images = tool_images_of(std::slice::from_ref(&chunk.content));
             let output = output_of(Some(std::slice::from_ref(&chunk.content)));
             let backgrounded = output
                 .iter()
@@ -1542,7 +3908,9 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
                 status: None,
                 script: None,
                 output: Some(output),
+                images: Some(images),
                 append_output: true,
+                intent: None,
                 backgrounded,
             }]
         }
@@ -1560,21 +3928,9 @@ fn translate(notification: UpdateSessionNotification) -> (String, Vec<Update>) {
         SessionUpdate::UsageUpdate(usage) => vec![Update::Usage {
             used: usage.used,
             size: usage.size,
+            cost: usage.cost,
         }],
-        SessionUpdate::StateUpdate(state) => match state {
-            wire::StateUpdate::Running(_) => vec![Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false,
-            }],
-            wire::StateUpdate::RequiresAction(_) => vec![Update::State {
-                active: true,
-                steerable: false,
-                cancelled: false,
-            }],
-            wire::StateUpdate::Idle(idle) => vec![Update::Stopped(idle.stop_reason)],
-            _ => Vec::new(),
-        },
+        SessionUpdate::StateUpdate(state) => vec![Update::State(state)],
         _ => Vec::new(),
     };
     (session_id, updates)
@@ -1607,33 +3963,72 @@ fn message_patch(
         MaybeUndefined::Null => Vec::new(),
         MaybeUndefined::Value(blocks) => blocks,
     };
-    if matches!(kind, MessageKind::User) {
-        let (text, images) = user_message_of(blocks);
-        return vec![Update::UserMessage {
+    let patch: fn(String, String) -> Update = match kind {
+        MessageKind::User => {
+            let (text, images) = user_message_of(blocks);
+            return vec![Update::UserMessage {
+                id,
+                text,
+                images,
+                append: false,
+            }];
+        }
+        MessageKind::Agent => {
+            if !blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+            {
+                let text = blocks
+                    .into_iter()
+                    .filter_map(message_of)
+                    .collect::<String>();
+                return vec![Update::AgentMessage {
+                    id,
+                    text,
+                    append: false,
+                }];
+            }
+            let parts = blocks.into_iter().filter_map(agent_part_of).collect();
+            return vec![Update::AgentParts { id, parts }];
+        }
+        MessageKind::Thought => |id, text| Update::AgentThought {
             id,
             text,
-            images,
             append: false,
-        }];
-    }
+        },
+    };
     let text = blocks
         .into_iter()
         .filter_map(message_of)
         .collect::<Vec<_>>()
         .join("");
-    vec![match kind {
-        MessageKind::User => unreachable!("handled above"),
-        MessageKind::Agent => Update::AgentMessage {
-            id,
-            text,
-            append: false,
-        },
-        MessageKind::Thought => Update::AgentThought {
-            id,
-            text,
-            append: false,
-        },
-    }]
+    vec![patch(id, text)]
+}
+
+fn agent_content_update(id: String, content: ContentBlock, append: bool) -> Option<Update> {
+    agent_part_of(content).map(|part| match part {
+        AgentPart::Text(text) => Update::AgentMessage { id, text, append },
+        AgentPart::Image(image) => Update::AgentImage { id, image, append },
+    })
+}
+
+fn agent_part_of(content: ContentBlock) -> Option<AgentPart> {
+    if let ContentBlock::Image(image) = content {
+        let fallback = image
+            .uri
+            .as_deref()
+            .filter(|uri| safe_media_uri(uri))
+            .map_or_else(|| "[Image]".to_string(), |uri| format!("[Image]({uri})"));
+        // Bound encoded source retention here; base64 and raster decoding stay
+        // in the image worker, whose failures use the renderer's text fallback.
+        if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), 0)
+            && !image.data.is_empty()
+        {
+            return Some(AgentPart::Image(image));
+        }
+        return Some(AgentPart::Text(fallback));
+    }
+    message_of(content).map(AgentPart::Text)
 }
 
 fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
@@ -1641,15 +4036,19 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
     let mut images = Vec::new();
     let mut image_ordinal = 0;
     let mut separate_after_image = false;
+    let mut available_image_links = Vec::new();
 
     for block in blocks {
         match block {
             ContentBlock::Image(image) => {
                 image_ordinal += 1;
                 let uri = image.uri.filter(|uri| safe_media_uri(uri));
-                let existing_line = uri
-                    .as_deref()
-                    .and_then(|uri| markdown::line_with_link(&text, uri));
+                let existing_line = uri.as_deref().and_then(|uri| {
+                    let index = available_image_links
+                        .iter()
+                        .position(|(_, candidate)| candidate == uri)?;
+                    Some(available_image_links.remove(index).0)
+                });
                 let line =
                     existing_line.unwrap_or_else(|| {
                         if !text.is_empty() && !text.ends_with('\n') {
@@ -1664,7 +4063,9 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                         separate_after_image = true;
                         line
                     });
-                if let Some(image) = UserImage::new(image.data, image.mime_type.to_string(), line) {
+                if let Some(image) =
+                    UserImage::with_source(image.data, image.mime_type.to_string(), line, uri)
+                {
                     images.push(image);
                 }
             }
@@ -1679,8 +4080,16 @@ fn user_message_of(blocks: Vec<ContentBlock>) -> (String, Vec<UserImage>) {
                 {
                     text.push('\n');
                 }
+                let first_line = text.bytes().filter(|&byte| byte == b'\n').count();
+                available_image_links.extend(
+                    markdown::image_label_links(&content)
+                        .into_iter()
+                        .map(|(line, uri)| (first_line + line, uri)),
+                );
                 text.push_str(&content);
-                separate_after_image = false;
+                if !content.is_empty() {
+                    separate_after_image = false;
+                }
             }
         }
     }
@@ -1720,17 +4129,150 @@ fn script_of(input: &Value) -> Option<String> {
 
 /// A tool call's output as readable lines, kept whole for the folded card.
 fn raw_output_lines(output: &Value) -> Vec<String> {
+    let output = raw_output_without_media(output, 0);
     if let Some(text) = output
         .as_str()
         .or_else(|| output.get("text").and_then(Value::as_str))
     {
         return readable(text);
     }
-    serde_json::to_string_pretty(output)
+    serde_json::to_string_pretty(&output)
         .unwrap_or_else(|_| output.to_string())
         .lines()
         .map(str::to_string)
         .collect()
+}
+
+// ACP raw output can serialize ToolOutput::Parts (Media/DataRef), ACP content,
+// or a JSON-encoded version of either. Do not print their pixels in text-only
+// cards. This fallback deliberately does not decode, fetch, or replace images.
+fn raw_output_without_media(output: &Value, depth: usize) -> Value {
+    if depth >= 64 {
+        return Value::String("[Truncated output]".into());
+    }
+    match output {
+        Value::Object(object) => {
+            let is_image = (object.contains_key("data")
+                && ["mime_type", "mimeType"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|mime| mime.starts_with("image/"))
+                }))
+                || ["type", "modality"].iter().any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("image"))
+                });
+            if is_image {
+                return Value::String("[Image]".into());
+            }
+            if object.contains_key("InlineBytes") || object.contains_key("InlineText") {
+                return Value::String("[Media]".into());
+            }
+            Value::Object(
+                object
+                    .iter()
+                    .take(MAX_OUTPUT_LINES)
+                    .map(|(key, value)| (key.clone(), raw_output_without_media(value, depth + 1)))
+                    .collect(),
+            )
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(MAX_OUTPUT_LINES)
+                .map(|value| raw_output_without_media(value, depth + 1))
+                .collect(),
+        ),
+        Value::String(text) => {
+            if let Ok(value) = serde_json::from_str::<Value>(text) {
+                raw_output_without_media(&value, depth + 1)
+            } else {
+                Value::String(redact_image_data_urls(text))
+            }
+        }
+        _ => output.clone(),
+    }
+}
+
+// Recognize bounded data-URL headers and consume only their payload spans.
+// A literal scheme mention is not an image, and diagnostics outside a URL
+// must survive redaction. No payload decoding or network access is needed.
+fn redact_image_data_urls(text: &str) -> String {
+    const PREFIX: &str = "data:image/";
+    let mut result = String::new();
+    let mut copied = 0;
+    for (start, _) in text.match_indices(PREFIX) {
+        if start < copied {
+            continue;
+        }
+        let tail = &text[start + PREFIX.len()..];
+        let Some(header_len) = tail
+            .bytes()
+            .take(513)
+            .position(|byte| !byte.is_ascii_alphanumeric() && !b"+.-;=_%".contains(&byte))
+        else {
+            continue;
+        };
+        let header = &tail[..header_len];
+        if header.is_empty() || header.starts_with(';') || tail.as_bytes()[header_len] != b',' {
+            continue;
+        }
+        let payload = &tail[header_len + 1..];
+        let base64 = header
+            .rsplit(';')
+            .next()
+            .is_some_and(|part| part.eq_ignore_ascii_case("base64"));
+        let payload_len = payload
+            .bytes()
+            .take_while(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || if base64 {
+                        b"+/=%".contains(byte)
+                    } else {
+                        b"%:@!$&*+-./;=?_~,".contains(byte)
+                    }
+            })
+            .count();
+        if payload_len == 0 {
+            continue;
+        }
+        result.push_str(&text[copied..start]);
+        result.push_str("[Image]");
+        copied = start + PREFIX.len() + header_len + 1 + payload_len;
+    }
+    result.push_str(&text[copied..]);
+    result
+}
+
+// Keep pixels separate from text previews. Live chunks and replay snapshots
+// use this path; never fetch a model-supplied URI.
+fn tool_images_of(content: &[ToolCallContent]) -> Vec<UserImage> {
+    let mut images: Vec<UserImage> = Vec::new();
+    let mut retained = 0usize;
+    for entry in content {
+        if images.len() >= app::MAX_TOOL_IMAGES {
+            break;
+        }
+        let ToolCallContent::Content(content) = entry else {
+            continue;
+        };
+        let ContentBlock::Image(image) = &content.content else {
+            continue;
+        };
+        if retained.saturating_add(image.data.len()) > app::MAX_RETAINED_IMAGE_SOURCE_BYTES {
+            continue;
+        }
+        if let Some(image) = UserImage::new(image.data.clone(), image.mime_type.to_string(), 0)
+            && !images.iter().any(|existing| existing.key == image.key)
+        {
+            retained += image.data.len();
+            images.push(image);
+        }
+    }
+    images
 }
 
 fn output_of(content: Option<&[ToolCallContent]>) -> Vec<String> {
@@ -1777,31 +4319,375 @@ fn readable(text: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
+        borrow::Cow,
         path::PathBuf,
         sync::{Arc, Mutex},
     };
 
     use agent_client_protocol::schema::v2::{
-        AgentMessage, AgentThought, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
-        IdleStateUpdate, RunningStateUpdate, SessionConfigOption, SessionConfigSelectGroup,
-        SessionConfigSelectOption, SessionUpdate, StateUpdate, TextContent,
-        UpdateSessionNotification, UserMessage,
+        AgentMessage, AgentThought, AuthMethod, AuthMethodTerminal, AvailableCommand,
+        AvailableCommandsUpdate, ContentBlock, EnvVariable, IdleStateUpdate, RunningStateUpdate,
+        SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption, SessionUpdate,
+        StateUpdate, TextContent, UpdateSessionNotification, UserMessage,
     };
-    use crossterm::event::Event;
+    use agent_client_protocol::{Channel, ConnectTo};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
 
     use serde_json::json;
 
     use super::{
-        ActiveSessionRoute, MAX_ATTACHMENTS, ModelChoice, QueuedUpdate, accept_queued_update,
-        attachments_from_paste, command, current_model_choice, detach_from_controlling_terminal,
-        durable_session_id, effort_state, handle, message_of, osc52, previous_session_for_resume,
-        prompt_blocks, readable, refresh_config_state, save_effort_default_to,
-        save_model_defaults_to, transition_route, translate, translate_for_session,
-        user_message_of, wire,
+        ActiveSessionRoute, AgentInvocation, BackgroundCompletion, ClipboardResult,
+        ConnectedAuthentication, MAX_ATTACHMENTS, MAX_BURST, ModelChoice, OPENROUTER_API_KEY_ENV,
+        ProtocolVersion, QueuedUpdate, accept_queued_update, active_config_matches,
+        active_session_config, agent_command_for_launch, agent_content_update,
+        apply_clipboard_completion, apply_pending_updates, attachments_from_paste,
+        authentication_required, client_capabilities, clipboard_image_attachment,
+        clipboard_paste_key, command, credential_storage_for_launch, current_model_choice,
+        detach_from_controlling_terminal, durable_session_id, effort_state, error_detail, handle,
+        keyboard_enhancement_flags, message_of, osc52, previous_session_for_resume, prompt_blocks,
+        readable, refresh_config_state, refresh_session_after_auth, save_effort_default_to,
+        save_model_defaults_to, send_background_completion, terminal_auth_command,
+        transition_route, translate, translate_for_session, usable_terminal_auth_methods,
+        user_message_of, wait_for_connected_authentication, wire,
     };
-    use crate::tui::app::{App, SessionDialog, SessionRename, SubmittedPrompt, Update};
+    use crate::{
+        tools::mcp::CredentialStorage,
+        tui::app::{
+            Action, AgentPart, App, ClipboardRoute, SessionDialog, SessionRename, SubmittedPrompt,
+            Update,
+        },
+    };
+
+    fn command_args(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn stderr_filter_preserves_transport_recovery_and_general_diagnostics() {
+        use super::stderr_update;
+        use crate::events::{self, RuntimeEvent};
+
+        let line = |event: RuntimeEvent| {
+            format!(
+                "{}{}",
+                events::EVENT_MARKER,
+                serde_json::to_string(&event).unwrap()
+            )
+        };
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let heartbeat = || line(RuntimeEvent::RunletTransport { available: true });
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(!app.runtime_unavailable());
+        app.runtime_tick_at(std::time::Instant::now() + crate::diagnostic_transport::LEASE);
+        assert!(app.runtime_unavailable());
+        app.apply(stderr_update(heartbeat()).unwrap());
+        assert!(
+            !app.runtime_unavailable(),
+            "stderr heartbeats must recover the status lease"
+        );
+        app.apply(stderr_update(line(RuntimeEvent::RunletTransport { available: false })).unwrap());
+        assert!(app.runtime_unavailable());
+        for event in [
+            RuntimeEvent::SessionStarted {
+                session_id: "session".into(),
+            },
+            RuntimeEvent::StorageStatus {
+                pending: true,
+                exhausted: false,
+            },
+        ] {
+            assert!(
+                matches!(stderr_update(line(event.clone())), Some(Update::Runtime(actual)) if actual == event)
+            );
+        }
+        assert!(
+            matches!(stderr_update("ordinary diagnostic".into()), Some(Update::Log(line)) if line == "ordinary diagnostic")
+        );
+        assert!(
+            matches!(stderr_update("A2A listening on localhost:1234".into()), Some(Update::A2aAddress(address)) if address == "localhost:1234")
+        );
+        let malformed = format!("{}not json", events::EVENT_MARKER);
+        assert!(
+            matches!(stderr_update(malformed.clone()), Some(Update::Log(line)) if line == malformed)
+        );
+    }
+
+    #[test]
+    fn only_authentication_failures_enter_login_recovery() {
+        let methods = [
+            AuthMethodTerminal::new("openrouter", "OpenRouter").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openrouter".into(),
+            ]),
+        ];
+        let required = agent_client_protocol::Error::auth_required().data(
+            crate::protocols::acp::AuthenticationRequiredData::new(
+                "openrouter",
+                "run `kit auth login openrouter` before using OpenRouter",
+            )
+            .into_value(),
+        );
+        assert!(authentication_required(&required, &methods));
+        assert!(authentication_required(
+            &agent_client_protocol::Error::auth_required(),
+            &methods,
+        ));
+        assert!(!authentication_required(
+            &agent_client_protocol::Error::internal_error().data(required.data.clone()),
+            &methods,
+        ));
+        assert_eq!(
+            error_detail(&required),
+            "run `kit auth login openrouter` before using OpenRouter"
+        );
+        assert!(!authentication_required(
+            &agent_client_protocol::util::internal_error(
+                "stored OpenRouter credentials cannot be used with a noncanonical endpoint",
+            ),
+            &methods,
+        ));
+        assert!(!authentication_required(
+            &agent_client_protocol::Error::auth_required().data(
+                crate::protocols::acp::AuthenticationRequiredData::new(
+                    "unadvertised",
+                    "authentication required",
+                )
+                .into_value(),
+            ),
+            &methods,
+        ));
+    }
+
+    #[test]
+    fn relative_credential_storage_is_resolved_for_all_child_processes() {
+        assert!(matches!(
+            credential_storage_for_launch(
+                &CredentialStorage::Filesystem(PathBuf::from("credentials")),
+                || Ok(PathBuf::from("/caller")),
+            )
+            .unwrap(),
+            CredentialStorage::Filesystem(path) if path == std::path::Path::new("/caller/credentials")
+        ));
+        assert!(matches!(
+            credential_storage_for_launch(&CredentialStorage::Keychain, || {
+                panic!("absolute storage must not query the current directory")
+            })
+            .unwrap(),
+            CredentialStorage::Keychain
+        ));
+    }
+
+    #[test]
+    fn terminal_auth_is_negotiated_and_only_usable_methods_are_exposed() {
+        assert!(
+            client_capabilities(&CredentialStorage::Keychain)
+                .auth
+                .and_then(|auth| auth.terminal)
+                .is_some()
+        );
+
+        assert!(
+            client_capabilities(&CredentialStorage::Memory)
+                .auth
+                .is_none()
+        );
+
+        let methods = vec![
+            AuthMethod::Terminal(AuthMethodTerminal::new("empty", "Empty")),
+            AuthMethod::Terminal(AuthMethodTerminal::new("openai", "ChatGPT").args(vec![
+                "auth".into(),
+                "login".into(),
+                "openai".into(),
+            ])),
+        ];
+        let usable = usable_terminal_auth_methods(&methods);
+        assert_eq!(usable.len(), 2);
+        assert_eq!(usable[0].method_id.0.as_ref(), "empty");
+        assert_eq!(usable[1].method_id.0.as_ref(), "openai");
+    }
+
+    #[test]
+    fn agent_launch_tracks_transitioned_session_and_preserves_base_options() {
+        let root = tempfile::tempdir().unwrap();
+        let mcp_config = root.path().join("mcp.toml");
+        let telemetry = crate::telemetry::Settings::try_new(None, false, 12, 4096).unwrap();
+        let credentials = CredentialStorage::Memory;
+        let resumed = agent_command_for_launch(
+            root.path(),
+            "test",
+            crate::ProviderKind::Speakeasy,
+            None,
+            None,
+            None,
+            Some("127.0.0.1:0"),
+            Some(&mcp_config),
+            &telemetry,
+            &credentials,
+            "B",
+            true,
+            false,
+        )
+        .unwrap();
+        let resumed_args = command_args(&resumed);
+        assert!(
+            resumed_args
+                .windows(2)
+                .any(|args| args == ["--session-id", "B"])
+        );
+        assert!(resumed_args.iter().any(|arg| arg == "--resume"));
+        assert!(!resumed_args.iter().any(|arg| arg == "A"));
+
+        let invocation = AgentInvocation::from_command(resumed.as_std());
+        let method = AuthMethodTerminal::new("openai", "ChatGPT")
+            .args(vec!["--terminal-auth-login".into(), "openai".into()]);
+        let terminal_auth = terminal_auth_command(&invocation, root.path(), &method);
+        let terminal_auth_args = command_args(&terminal_auth);
+        assert!(
+            terminal_auth_args
+                .windows(2)
+                .any(|args| args == ["--session-id", "B"])
+        );
+        assert!(terminal_auth_args.iter().any(|arg| arg == "--resume"));
+        assert!(!terminal_auth_args.iter().any(|arg| arg == "A"));
+
+        let new_session = agent_command_for_launch(
+            root.path(),
+            "test",
+            crate::ProviderKind::Speakeasy,
+            None,
+            None,
+            None,
+            Some("127.0.0.1:0"),
+            Some(&mcp_config),
+            &telemetry,
+            &credentials,
+            "C",
+            false,
+            false,
+        )
+        .unwrap();
+        let new_args = command_args(&new_session);
+        assert!(
+            new_args
+                .windows(2)
+                .any(|args| args == ["--session-id", "C"])
+        );
+        assert!(!new_args.iter().any(|arg| arg == "--resume"));
+        assert!(!new_args.iter().any(|arg| matches!(arg.as_str(), "A" | "B")));
+        for args in [&resumed_args, &new_args] {
+            assert!(args.windows(2).any(|args| args == ["--a2a", "127.0.0.1:0"]));
+            assert!(args.windows(2).any(|args| {
+                args[0] == "--mcp-config" && args[1] == mcp_config.to_string_lossy()
+            }));
+        }
+    }
+
+    #[test]
+    fn terminal_auth_preserves_base_invocation_for_reconnect() {
+        let root = tempfile::tempdir().unwrap();
+        let base_root = tempfile::tempdir().unwrap();
+        let credentials = root.path().join("credentials");
+        let mut base = tokio::process::Command::new("kit-agent");
+        base.args(["serve", "--model", "test-model"]);
+        base.current_dir(base_root.path());
+        CredentialStorage::Filesystem(credentials.clone()).append_cli_args(&mut base);
+        base.env("KIT_BASE_TEST", "base");
+        base.env(OPENROUTER_API_KEY_ENV, "secret");
+        let invocation = AgentInvocation::from_command(base.as_std());
+        assert!(
+            invocation
+                .env
+                .iter()
+                .all(|(name, _)| name != OPENROUTER_API_KEY_ENV)
+        );
+        let method = AuthMethodTerminal::new("openai", "ChatGPT")
+            .args(vec!["--terminal-auth-login".into(), "openai".into()])
+            .env(vec![EnvVariable::new("KIT_AUTH_TEST", "set")]);
+        let command = terminal_auth_command(&invocation, root.path(), &method);
+        assert_eq!(
+            command.as_std().get_program(),
+            std::ffi::OsStr::new("kit-agent")
+        );
+        assert_eq!(command.as_std().get_current_dir(), Some(root.path()));
+        assert_eq!(
+            command_args(&command),
+            [
+                "serve",
+                "--model",
+                "test-model",
+                "--credential-store",
+                "file",
+                "--credential-dir",
+                credentials.to_str().unwrap(),
+                "--terminal-auth-login",
+                "openai",
+            ]
+        );
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "KIT_BASE_TEST" && value == Some(std::ffi::OsStr::new("base"))
+        }));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "KIT_AUTH_TEST" && value == Some(std::ffi::OsStr::new("set"))
+        }));
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(name, value)| { name == OPENROUTER_API_KEY_ENV && value.is_none() })
+        );
+
+        let replacement = invocation.command();
+        assert_eq!(
+            replacement.as_std().get_program(),
+            std::ffi::OsStr::new("kit-agent")
+        );
+        assert_eq!(
+            replacement.as_std().get_current_dir(),
+            Some(base_root.path())
+        );
+        assert_eq!(
+            command_args(&replacement),
+            [
+                "serve",
+                "--model",
+                "test-model",
+                "--credential-store",
+                "file",
+                "--credential-dir",
+                credentials.to_str().unwrap(),
+            ]
+        );
+        assert!(replacement.as_std().get_envs().any(|(name, value)| {
+            name == "KIT_BASE_TEST" && value == Some(std::ffi::OsStr::new("base"))
+        }));
+        assert!(
+            replacement
+                .as_std()
+                .get_envs()
+                .all(|(name, _)| name != "KIT_AUTH_TEST")
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1834,6 +4720,151 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_request_rejects_invalid_actions_and_missing_warnings() {
+        use crate::protocols::acp::model_switch::{Confirmation, Decision, META, Warning};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let session = wire::SessionId::new("first");
+        assert!(
+            super::prepare_model_switch_request(&mut app, Action::None, session.clone()).is_err()
+        );
+        assert!(
+            super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(Decision::Continue),
+                session.clone()
+            )
+            .is_err()
+        );
+        assert!(app.model_switch.is_none());
+        let choice = ModelChoice {
+            id: "openrouter:target".into(),
+            provider: "openrouter".into(),
+            model: "target".into(),
+        };
+        let (operation, request) = super::prepare_model_switch_request(
+            &mut app,
+            Action::SelectModel {
+                choice,
+                save_defaults: true,
+            },
+            session.clone(),
+        )
+        .unwrap();
+        assert!(request.meta.is_none());
+        assert!(
+            super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(Decision::Compact),
+                session.clone()
+            )
+            .is_err()
+        );
+        assert_eq!(app.model_switch.as_ref().unwrap().id, operation);
+        for decision in [Decision::Continue, Decision::Compact] {
+            app.model_switch.as_mut().unwrap().warning = Some(Warning {
+                token: 42,
+                guarded_tokens: "120000".into(),
+                target_window: 150000,
+            });
+            let (confirmed_operation, request) = super::prepare_model_switch_request(
+                &mut app,
+                Action::ConfirmModelSwitch(decision),
+                session.clone(),
+            )
+            .unwrap();
+            let confirmation: Confirmation =
+                serde_json::from_value(request.meta.unwrap()[META].clone()).unwrap();
+            assert_eq!(confirmation.token, 42);
+            assert_eq!(confirmation.action, decision);
+            assert_eq!(confirmed_operation, operation);
+            let pending = app.model_switch.as_ref().unwrap();
+            assert!(pending.warning.is_none());
+            assert!(pending.save_defaults);
+            assert_eq!(pending.choice.id, "openrouter:target");
+            assert_eq!(app.model, "original");
+        }
+    }
+
+    #[test]
+    fn model_switch_completion_requires_current_session_and_operation() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "first".into(),
+            generation: 0,
+        }));
+        let choice = ModelChoice {
+            id: "openrouter:target".into(),
+            provider: "openrouter".into(),
+            model: "target".into(),
+        };
+        let operation = app.begin_model_switch(choice, false).unwrap();
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 0, operation + 1)
+                .unwrap()
+                .is_none()
+        );
+        transition_route(&route, "second".into());
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 0, operation)
+                .unwrap()
+                .is_none()
+        );
+        assert!(app.model_switch.is_some());
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 1, operation)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::take_model_switch_completion(&mut app, &route, 1, operation)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(app.model, "original");
+    }
+
+    #[test]
+    fn model_switch_completion_reports_poisoned_route_without_discarding_switch() {
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "openrouter".into(),
+            "original".into(),
+            String::new(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "first".into(),
+            generation: 0,
+        }));
+        let operation = app
+            .begin_model_switch(
+                ModelChoice {
+                    id: "openrouter:target".into(),
+                    provider: "openrouter".into(),
+                    model: "target".into(),
+                },
+                false,
+            )
+            .unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = route.lock().unwrap();
+            panic!("poison session route");
+        });
+        assert!(super::take_model_switch_completion(&mut app, &route, 0, operation).is_err());
+        assert_eq!(app.model_switch.as_ref().unwrap().id, operation);
+        assert_eq!(app.model, "original");
+    }
+
+    #[test]
     fn queued_updates_from_previous_session_generations_are_dropped() {
         let route = Arc::new(Mutex::new(ActiveSessionRoute {
             id: "first".into(),
@@ -1861,6 +4892,255 @@ mod tests {
         assert!(
             accept_queued_update(&route, QueuedUpdate::global(Update::Log("global".into())))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn queued_updates_are_applied_in_bounded_bursts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..=MAX_BURST {
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(index.to_string())))
+                .unwrap();
+        }
+        let first = updates_rx.try_recv().unwrap();
+
+        apply_pending_updates(&mut app, &route, &mut updates_rx, first);
+
+        assert!(updates_rx.try_recv().is_ok());
+        assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_authentication_registers_wakes_and_preserves_updates() {
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicBool, Ordering},
+            task::{Context, Poll, Wake, Waker},
+        };
+
+        struct TaskWake(AtomicBool);
+        impl Wake for TaskWake {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let (auth_tx, auth_rx) = tokio::sync::oneshot::channel();
+        let wake = Arc::new(TaskWake(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        {
+            let authentication = async {
+                auth_rx.await.unwrap();
+                None
+            };
+            let mut waiting = std::pin::pin!(wait_for_connected_authentication(
+                authentication,
+                &mut app,
+                &route,
+                &mut updates_rx,
+                &mut exit_rx,
+            ));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(
+                    "while authenticating".into(),
+                )))
+                .unwrap();
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            auth_tx.send(()).unwrap();
+            assert!(wake.0.swap(false, Ordering::SeqCst));
+            // A simultaneous update must remain queued if authentication wins.
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(
+                    "after authentication".into(),
+                )))
+                .unwrap();
+            assert!(matches!(
+                waiting.as_mut().poll(&mut cx),
+                Poll::Ready(ConnectedAuthentication::Completed(None))
+            ));
+        }
+        assert_eq!(app.logs, ["while authenticating"]);
+        let remaining = updates_rx.try_recv().unwrap();
+        assert!(
+            matches!(remaining.update, Update::Log(message) if message == "after authentication")
+        );
+        assert!(updates_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_authentication_exit_progresses_with_a_ready_update_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Exercise the existing bounded-update API with more than one burst,
+        // without asserting an exact number of scheduler polls or deliveries.
+        let expected: Vec<_> = (0..MAX_BURST * 3).map(|index| index.to_string()).collect();
+        for message in &expected {
+            updates_tx
+                .send(QueuedUpdate::global(Update::Log(message.clone())))
+                .unwrap();
+        }
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        drop(exit_tx);
+        let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = wait_for_connected_authentication(
+            async {
+                let _ = auth_rx.await;
+                None
+            },
+            &mut app,
+            &route,
+            &mut updates_rx,
+            &mut exit_rx,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ConnectedAuthentication::AgentExited(Err(_))
+        ));
+        assert!(
+            auth_tx.is_closed(),
+            "losing authentication is dropped before return"
+        );
+        assert!(
+            !updates_rx.is_empty(),
+            "exit progresses before the backlog drains"
+        );
+        // App deliberately caps displayed logs. Verify continuity from its
+        // last retained message through every still-queued update instead.
+        let mut next = app.logs.last().unwrap().parse::<usize>().unwrap() + 1;
+        while let Ok(update) = updates_rx.try_recv() {
+            let Update::Log(message) = update.update else {
+                panic!("unexpected update")
+            };
+            assert_eq!(message, expected[next]);
+            next += 1;
+        }
+        assert_eq!(next, expected.len());
+    }
+
+    #[tokio::test]
+    async fn connected_terminal_authentication_observes_agent_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+        let authentication =
+            std::future::pending::<Option<std::io::Result<std::process::ExitStatus>>>();
+
+        let result = wait_for_connected_authentication(
+            authentication,
+            &mut app,
+            &route,
+            &mut updates_rx,
+            &mut exit_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            ConnectedAuthentication::AgentExited(Ok(Err(_)))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connected_terminal_authentication_returns_the_process_exit_status() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let route = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 0,
+        }));
+        let (_updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let mut stop = super::Stop::new().unwrap();
+        for code in [0, 7] {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", &format!("exit {code}")]);
+            let result = wait_for_connected_authentication(
+                super::wait_for_terminal_auth(command, &mut stop),
+                &mut app,
+                &route,
+                &mut updates_rx,
+                &mut exit_rx,
+            )
+            .await;
+            let ConnectedAuthentication::Completed(Some(Ok(status))) = result else {
+                panic!("authentication did not return its process status");
+            };
+            assert_eq!(status.code(), Some(code));
+        }
+    }
+
+    #[test]
+    fn translates_cumulative_session_cost() {
+        use agent_client_protocol::schema::v2::{Cost, UsageUpdate};
+        let cost = Cost::new(1.25, "USD");
+        let (session, updates) = translate(UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::UsageUpdate(UsageUpdate::new(1, 2).cost(cost.clone())),
+        ));
+        assert_eq!(session, "session");
+        assert!(
+            matches!(updates.as_slice(), [Update::Usage { used: 1, size: 2, cost: Some(actual) }] if actual == &cost)
         );
     }
 
@@ -1903,11 +5183,7 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(running, "session").as_slice(),
-            [Update::State {
-                active: true,
-                steerable: true,
-                cancelled: false
-            }]
+            [Update::State(StateUpdate::Running(_))]
         ));
         let idle = UpdateSessionNotification::new(
             "session",
@@ -1915,8 +5191,38 @@ mod tests {
         );
         assert!(matches!(
             translate_for_session(idle, "session").as_slice(),
-            [Update::Stopped(None)]
+            [Update::State(StateUpdate::Idle(idle))] if idle.stop_reason.is_none()
         ));
+    }
+
+    #[test]
+    fn preserves_requires_action_and_terminal_state_reasons() {
+        let blocked = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
+                wire::RequiresActionStateUpdate::new(),
+            )),
+        );
+        assert!(matches!(
+            translate_for_session(blocked, "session").as_slice(),
+            [Update::State(StateUpdate::RequiresAction(_))]
+        ));
+        for reason in [
+            wire::StopReason::EndTurn,
+            wire::StopReason::Cancelled,
+            wire::StopReason::Other("custom".into()),
+        ] {
+            let idle = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::StateUpdate(StateUpdate::Idle(
+                    IdleStateUpdate::new().stop_reason(reason.clone()),
+                )),
+            );
+            assert!(matches!(
+                translate_for_session(idle, "session").as_slice(),
+                [Update::State(StateUpdate::Idle(idle))] if idle.stop_reason.as_ref() == Some(&reason)
+            ));
+        }
     }
 
     #[test]
@@ -1940,6 +5246,648 @@ mod tests {
             [Update::AgentThought { id, text, append: false }]
                 if id == "thought" && text.is_empty()
         ));
+    }
+
+    #[test]
+    fn compose_title_patches_preserve_identity_and_fallback() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let patches = [
+            (
+                wire::ToolCallUpdate::new("tool")
+                    .title("compose")
+                    .raw_input(json!({"script": "return 1", "intent": "Ignored"})),
+                "Running tools.",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").title("  Checking files  "),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool")
+                    .raw_input(json!({"script": "return 2", "intent": "Still ignored"})),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").status(wire::ToolCallStatus::Completed),
+                "Checking files",
+            ),
+            (
+                wire::ToolCallUpdate::new("tool").title("  "),
+                "Running tools.",
+            ),
+        ];
+        for (patch, expected) in patches {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", SessionUpdate::ToolCallUpdate(patch)),
+                "session",
+            ) {
+                app.apply(update);
+            }
+            let Block::Tool(call) = &app.blocks[0] else {
+                panic!("expected tool");
+            };
+            assert!(call.is_compose());
+            assert_eq!(call.display_title(), expected);
+        }
+    }
+
+    #[test]
+    fn translates_acp_title_without_reading_raw_intent() {
+        let update = UpdateSessionNotification::new(
+            "session",
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool-1")
+                    .title("Checking the project.")
+                    .raw_input(json!({
+                        "script": "return 1",
+                        "intent": "Ignored raw intent"
+                    })),
+            ),
+        );
+
+        assert!(matches!(
+            translate_for_session(update, "session").as_slice(),
+            [Update::ToolPatched { title: Some(title), intent: None, script: Some(script), .. }]
+                if title == "Checking the project." && script == "return 1"
+        ));
+    }
+
+    async fn model_switch_over_transport() {
+        let agent = agent_client_protocol::Agent
+            .v2()
+            .on_receive_request(
+                async move |_request: wire::InitializeRequest, responder, _cx| {
+                    responder.respond(wire::InitializeResponse::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("model-switch-peer", "0"),
+                    ))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: wire::SetSessionConfigOptionRequest, responder, _cx| {
+                    assert_eq!(request.config_id.to_string(), super::MODEL_CONFIG_ID);
+                    assert_eq!(
+                        request.value.as_id().unwrap().to_string(),
+                        "openai-subscription:gpt-5.6-terra"
+                    );
+                    if request.session_id.to_string() == "rejected" {
+                        responder.respond_with_error(agent_client_protocol::util::internal_error(
+                            "model switch rejected",
+                        ))
+                    } else {
+                        responder.respond(wire::SetSessionConfigOptionResponse::new(vec![
+                            SessionConfigOption::select(
+                                super::MODEL_CONFIG_ID,
+                                "Model",
+                                "openai-subscription:gpt-5.6-terra",
+                                vec![SessionConfigSelectOption::new(
+                                    "openai-subscription:gpt-5.6-terra",
+                                    "gpt-5.6-terra",
+                                )],
+                            ),
+                        ]))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        agent_client_protocol::Client
+            .v2()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                for (operation, session) in [(11, "accepted"), (12, "rejected")] {
+                    let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+                    // Exercise the production spawner without a LocalSet, just like the TUI.
+                    let task = super::spawn_model_switch(
+                        connection.clone(),
+                        wire::SetSessionConfigOptionRequest::new(
+                            session,
+                            super::MODEL_CONFIG_ID,
+                            "openai-subscription:gpt-5.6-terra",
+                        ),
+                        7,
+                        operation,
+                        completed,
+                    );
+                    let completion =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    task.await.unwrap();
+                    assert_eq!(completion.generation, 7);
+                    assert_eq!(completion.operation, operation);
+                    if session == "accepted" {
+                        let response = completion.response.unwrap();
+                        assert_eq!(
+                            super::current_config_value(
+                                &response.config_options,
+                                super::MODEL_CONFIG_ID
+                            ),
+                            Some("openai-subscription:gpt-5.6-terra".into()),
+                        );
+                    } else {
+                        let error = completion.response.unwrap_err();
+                        assert_eq!(
+                            error.code,
+                            agent_client_protocol::Error::internal_error().code
+                        );
+                        assert_eq!(error.data, Some(json!("model switch rejected")));
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn model_switch_completes_without_local_set() {
+        model_switch_over_transport().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_switch_completes_on_multithread_runtime() {
+        model_switch_over_transport().await;
+    }
+
+    #[test]
+    fn replayed_media_uses_safe_display_content_instead_of_raw_payloads() {
+        use crate::tui::app::Block;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        // These are the complete content shapes produced by ACP v2 transcript replay:
+        // URI media becomes resource links; data URLs become structured image payloads.
+        let content = vec![
+            ContentBlock::Text(TextContent::new("inspect these")),
+            ContentBlock::ResourceLink(wire::ResourceLink::new(
+                "file:///tmp/image.png",
+                "file:///tmp/image.png",
+            )),
+            ContentBlock::ResourceLink(wire::ResourceLink::new(
+                "https://example.com/result.png",
+                "https://example.com/result.png",
+            )),
+            ContentBlock::Image(wire::ImageContent::new("c2VjcmV0", "image/png")),
+        ];
+        let notifications = [
+            SessionUpdate::UserMessage(UserMessage::new("user").content(content.clone())),
+            // Tagged compaction summaries are ordinary agent messages on this path.
+            SessionUpdate::AgentMessage(
+                AgentMessage::new("compaction")
+                    .content(vec![ContentBlock::Text(TextContent::new("summary"))]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool-1")
+                    .status(wire::ToolCallStatus::Completed)
+                    .raw_output(Some(json!({"uri": "data:image/png;base64,c2VjcmV0"})))
+                    .content(
+                        content
+                            .into_iter()
+                            .map(|block| {
+                                wire::ToolCallContent::Content(Box::new(wire::Content::new(block)))
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+            ),
+        ];
+        for notification in notifications {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", notification),
+                "session",
+            ) {
+                app.apply(update);
+            }
+        }
+
+        let [Block::User(user), Block::Agent(summary), Block::Tool(tool)] = app.blocks.as_slice()
+        else {
+            panic!("expected user, summary and completed tool blocks");
+        };
+        let links = "inspect these[file:///tmp/image.png](file:///tmp/image.png)[https://example.com/result.png](https://example.com/result.png)";
+        assert_eq!(user.text, format!("{links}\n[Image #1]"));
+        assert_eq!(user.images.len(), 1);
+        assert_eq!(user.images[0].data, "c2VjcmV0");
+        assert_eq!(summary, "summary");
+        assert_eq!(tool.images.len(), 1);
+        assert_eq!(tool.images[0].data, "c2VjcmV0");
+        assert_eq!(tool.status, wire::ToolCallStatus::Completed);
+        assert_eq!(
+            tool.output,
+            [
+                "inspect these",
+                "[file:///tmp/image.png](file:///tmp/image.png)",
+                "[https://example.com/result.png](https://example.com/result.png)",
+                "[Image]",
+            ]
+        );
+        for text in std::iter::once(&user.text).chain(tool.output.iter()) {
+            assert!(!text.contains("data:"));
+            assert!(!text.contains("c2VjcmV0"));
+        }
+    }
+
+    #[test]
+    fn replayed_media_translation_rejects_unsafe_and_oversized_links() {
+        for uri in [
+            "data:image/png;base64,c2VjcmV0".to_string(),
+            "javascript:alert(1)".to_string(),
+            format!("https://example.com/{}", "x".repeat(2048)),
+        ] {
+            let content = vec![
+                ContentBlock::ResourceLink(wire::ResourceLink::new(uri.clone(), uri.clone())),
+                ContentBlock::Image(
+                    wire::ImageContent::new("c2VjcmV0", "image/png").uri(Some(uri)),
+                ),
+            ];
+            let update = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::UserMessage(UserMessage::new("user").content(content.clone())),
+            );
+            assert!(
+                matches!(translate_for_session(update, "session").as_slice(),
+                [Update::UserMessage { text, images, .. }] if text == "[Image #1]" && images.len() == 1)
+            );
+            let update = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::AgentMessage(AgentMessage::new("agent").content(content)),
+            );
+            assert!(
+                matches!(translate_for_session(update, "session").as_slice(),
+                [Update::AgentParts { parts, .. }] if matches!(parts.as_slice(), [AgentPart::Image(image)] if image.data == "c2VjcmV0"))
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_image_content_survives_replay_in_order() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let content = vec![
+            ContentBlock::Text(wire::TextContent::new("before")),
+            ContentBlock::Image(wire::ImageContent::new("AQID", "image/png")),
+            ContentBlock::Text(wire::TextContent::new("after")),
+        ];
+        for _ in 0..2 {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::AgentMessage(AgentMessage::new("agent").content(content.clone())),
+            );
+            for update in translate_for_session(notification, "session") {
+                app.apply(update);
+            }
+            let [Block::AgentParts(parts)] = app.blocks.as_slice() else {
+                panic!("expected one multipart message");
+            };
+            let [
+                AgentPart::Text(before),
+                AgentPart::Image(image),
+                AgentPart::Text(after),
+            ] = parts.as_slice()
+            else {
+                panic!("expected ordered replay content");
+            };
+            assert_eq!(before, "before");
+            assert_eq!(image.data, "AQID");
+            assert_eq!(STANDARD.decode(&image.data).unwrap(), [1, 2, 3]);
+            assert_eq!(image.mime_type, "image/png");
+            assert_eq!(after, "after");
+        }
+    }
+
+    #[tokio::test]
+    async fn background_image_worker_prioritizes_files_and_bounds_decode_attempts() {
+        use super::app::UserImage;
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = STANDARD.encode(png.into_inner());
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let workers = super::spawn_background_workers(completed).unwrap();
+
+        for invalid_files in [0, 63, 64] {
+            let mut images: Vec<_> = (0..64)
+                .map(|_| UserImage::new("not base64!".into(), "image/png".into(), 0).unwrap())
+                .collect();
+            images.extend((0..invalid_files).map(|_| {
+                UserImage::with_source(
+                    "not base64!".into(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///invalid.png".into()),
+                )
+                .unwrap()
+            }));
+            images.push(
+                UserImage::with_source(
+                    encoded.clone(),
+                    "image/png".into(),
+                    0,
+                    Some("file:///valid.png".into()),
+                )
+                .unwrap(),
+            );
+            assert!(
+                workers
+                    .try_update(QueuedUpdate::for_session(
+                        1,
+                        Update::UserMessage {
+                            id: "user".into(),
+                            text: "[Image #1](file:///valid.png)".into(),
+                            images,
+                            append: false,
+                        },
+                    ))
+                    .is_ok()
+            );
+            let completion =
+                tokio::time::timeout(std::time::Duration::from_secs(5), completions.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let BackgroundCompletion::Update { queued, images } = completion else {
+                panic!("expected image worker completion");
+            };
+            assert_eq!(images.len(), usize::from(invalid_files < 64));
+            let mut app = App::new(
+                "/tmp/kit".into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.apply_materialized(queued.update, images);
+            let super::app::Block::User(message) = &app.blocks[0] else {
+                panic!("expected user");
+            };
+            if invalid_files < 64 {
+                let (_, uri) = super::markdown::image_label_links(&message.text)
+                    .pop()
+                    .unwrap();
+                let path = url::Url::parse(&uri).unwrap().to_file_path().unwrap();
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    STANDARD.decode(&encoded).unwrap()
+                );
+            } else {
+                assert_eq!(message.text, "[Image #1]");
+            }
+        }
+    }
+
+    #[test]
+    fn assistant_image_translation_defers_decode_to_worker() {
+        let update = agent_content_update(
+            "agent".into(),
+            ContentBlock::Image(wire::ImageContent::new("not base64!", "image/png")),
+            true,
+        );
+        assert!(
+            matches!(update, Some(Update::AgentImage { image, .. }) if image.data == "not base64!")
+        );
+    }
+
+    #[test]
+    fn assistant_image_invalid_source_uses_textual_fallback() {
+        for data in [String::new(), "A".repeat(14 * 1024 * 1024 + 1)] {
+            let update = agent_content_update(
+                "agent".into(),
+                ContentBlock::Image(wire::ImageContent::new(data, "image/png")),
+                true,
+            );
+            assert!(matches!(update, Some(Update::AgentMessage { text, .. }) if text == "[Image]"));
+        }
+    }
+
+    #[test]
+    fn tool_images_survive_live_chunks_and_replay_replacement() {
+        use super::app::Block;
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let image = |data: &str| {
+            wire::ToolCallContent::Content(Box::new(wire::Content::new(ContentBlock::Image(
+                wire::ImageContent::new(data, "image/png"),
+            ))))
+        };
+        let snapshots = [
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("AQID"),
+            )),
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("AQID"),
+            )),
+            SessionUpdate::ToolCallContentChunk(wire::ToolCallContentChunk::new(
+                "tool",
+                image("BAUG"),
+            )),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(vec![image("AQID"), image("BAUG")]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").status(wire::ToolCallStatus::Completed),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(vec![image("BAUG")]),
+            ),
+            SessionUpdate::ToolCallUpdate(
+                wire::ToolCallUpdate::new("tool").content(Vec::<wire::ToolCallContent>::new()),
+            ),
+        ];
+        for (notification, expected) in snapshots.into_iter().zip([1, 1, 2, 2, 2, 1, 0]) {
+            for update in translate_for_session(
+                UpdateSessionNotification::new("session", notification),
+                "session",
+            ) {
+                app.apply(update);
+            }
+            let Block::Tool(tool) = &app.blocks[0] else {
+                panic!("expected tool")
+            };
+            assert_eq!(tool.images.len(), expected);
+            assert!(
+                tool.output
+                    .iter()
+                    .all(|line| !line.contains("AQID") && !line.contains("BAUG"))
+            );
+        }
+    }
+
+    #[test]
+    fn raw_tool_output_patches_preserve_images_and_never_print_pixels() {
+        use super::app::Block;
+        use agentkit_core::{DataRef, Modality, Part, ToolOutput};
+        use serde_json::Value;
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let content = wire::ToolCallContent::Content(Box::new(wire::Content::new(
+            ContentBlock::Image(wire::ImageContent::new("c2VjcmV0", "image/png")),
+        )));
+        let initial = wire::ToolCallUpdate::new("tool").content(vec![content]);
+        for update in translate_for_session(
+            UpdateSessionNotification::new("session", SessionUpdate::ToolCallUpdate(initial)),
+            "session",
+        ) {
+            app.apply(update);
+        }
+        let inline = serde_json::to_value(ToolOutput::parts(vec![
+            Part::text("image result"),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::inline_text("c2VjcmV0"),
+            ),
+            Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::inline_bytes(vec![231, 232, 233]),
+            ),
+        ]))
+        .unwrap();
+        let raw_outputs = [
+            inline.clone(),
+            Value::String(serde_json::to_string(&inline).unwrap()),
+            json!({"output": inline}),
+            json!({"content": [{"type": "image", "data": "c2VjcmV0", "mimeType": "image/png"}]}),
+            json!({"uri": "data:image/png;base64,c2VjcmV0"}),
+            json!({"text": "data:image/png;base64,c2VjcmV0"}),
+            json!({"text": "ordinary result"}),
+            Value::Null,
+        ];
+        for raw in raw_outputs {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::ToolCallUpdate(
+                    wire::ToolCallUpdate::new("tool").raw_output(raw.clone()),
+                ),
+            );
+            for update in translate_for_session(notification, "session") {
+                app.apply(update);
+            }
+            let Block::Tool(tool) = &app.blocks[0] else {
+                panic!("expected tool")
+            };
+            assert_eq!(tool.images.len(), 1);
+            assert_eq!(tool.images[0].data, "c2VjcmV0");
+            let text = tool.output.join("\n");
+            assert!(!text.contains("c2VjcmV0"), "{text}");
+            assert!(!text.contains("231"), "{text}");
+            assert!(!text.contains("InlineBytes"), "{text}");
+            assert!(!text.contains("data:image/"), "{text}");
+
+            // Raw-only replay uses the same safe fallback even without a prior
+            // typed content notification. It must not pretend to reconstruct pixels.
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::ToolCallUpdate(
+                    wire::ToolCallUpdate::new("raw-only").raw_output(raw),
+                ),
+            );
+            assert!(
+                matches!(translate_for_session(notification, "session").as_slice(),
+                    [Update::ToolPatched { images: None, output: Some(output), .. }]
+                        if output.iter().all(|line| !line.contains("c2VjcmV0") && !line.contains("231"))
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn raw_tool_output_redacts_only_image_spans_and_preserves_diagnostics() {
+        let cases = [
+            (
+                "Screenshot: data:image/png;base64,AQID\nUpload failed: permission denied",
+                "Screenshot: [Image]\nUpload failed: permission denied",
+            ),
+            (
+                "The literal data:image/ is a URI prefix, not an image.",
+                "The literal data:image/ is a URI prefix, not an image.",
+            ),
+            (
+                "Incomplete data:image/png;base64,\nUpload failed",
+                "Incomplete data:image/png;base64,\nUpload failed",
+            ),
+            (
+                "First (data:image/png;base64,AQID), second \"data:image/jpeg;base64,BAUG\". Failed.",
+                "First ([Image]), second \"[Image]\". Failed.",
+            ),
+            (
+                "Encoded: data:image/svg+xml,%3Csvg%3E\nUpload failed",
+                "Encoded: [Image]\nUpload failed",
+            ),
+            (
+                "Image: data:image/svg+xml,%3Csvg%3E,%3C/svg%3E\nUpload failed",
+                "Image: [Image]\nUpload failed",
+            ),
+            ("data:image/png;base64,AQID", "[Image]"),
+        ];
+        for (text, expected) in cases {
+            // Both native raw objects and JSON-encoded raw output occur in live
+            // and replayed updates. Neither may discard non-image diagnostics.
+            for raw in [
+                json!({"text": text}),
+                json!(json!({"text": text}).to_string()),
+            ] {
+                let notification = UpdateSessionNotification::new(
+                    "session",
+                    SessionUpdate::ToolCallUpdate(
+                        wire::ToolCallUpdate::new("raw-only").raw_output(raw),
+                    ),
+                );
+                let updates = translate_for_session(notification, "session");
+                let [
+                    Update::ToolPatched {
+                        images: None,
+                        output: Some(lines),
+                        ..
+                    },
+                ] = updates.as_slice()
+                else {
+                    panic!("expected raw-only tool patch");
+                };
+                assert_eq!(lines.join("\n"), expected, "source: {text}");
+                assert!(!lines.iter().any(|line| line.contains("AQID")
+                    || line.contains("BAUG")
+                    || line.contains("%3Csvg")));
+            }
+        }
     }
 
     #[test]
@@ -1992,6 +5940,278 @@ mod tests {
         assert_eq!(attachments[0].mime_type, "image/png");
     }
 
+    #[tokio::test]
+    async fn queued_mutation_wait_does_not_block_delivery_updates_or_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "pending".into(),
+        });
+        app.paste("draft");
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        let token = app.begin_steer_mutation("a", None).unwrap();
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let task = super::spawn_steer_mutation(1, "a".into(), token, updates.clone(), async move {
+            waiting.await.unwrap();
+            Ok(())
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        updates
+            .send(QueuedUpdate::for_session(
+                1,
+                Update::UserMessage {
+                    id: "a".into(),
+                    text: "delivered".into(),
+                    images: vec![],
+                    append: false,
+                },
+            ))
+            .unwrap();
+        let first = receiver.recv().await.unwrap();
+        apply_pending_updates(&mut app, &route, &mut receiver, first);
+        assert!(app.pending_steers.is_empty());
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Cancel
+        ));
+        assert_eq!(app.editor.text(), "draft");
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        task.await.unwrap();
+        let completion = receiver.recv().await.unwrap();
+        apply_pending_updates(&mut app, &route, &mut receiver, completion);
+        assert!(app.pending_steers.is_empty());
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_completion_is_scoped_to_its_starting_session_generation() {
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let task = super::spawn_steer_mutation(1, "a".into(), 7, updates, async move {
+            waiting.await.unwrap();
+            Err(agent_client_protocol::Error::invalid_params()
+                .data(json!({"reason": "already_delivered"})))
+        });
+        super::transition_route(&route, "other-session".into());
+        release.send(()).unwrap();
+        task.await.unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert_eq!(completion.generation, Some(1));
+        assert!(
+            matches!(&completion.update, Update::SteerMutationFinished { token: 7, result: Err(error), .. } if error.unavailable)
+        );
+        assert!(accept_queued_update(&route, completion).is_none());
+    }
+
+    #[tokio::test]
+    async fn child_steer_completion_preserves_child_and_root_generations() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::spawn_child_steer(3, "child".into(), 9, updates, async { Ok(()) })
+            .await
+            .unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert_eq!(completion.generation, Some(3));
+        assert!(matches!(
+            &completion.update,
+            Update::ChildSteerFinished { id, generation: 9, result: Ok(()) }
+                if id == "child"
+        ));
+        let route = Arc::new(Mutex::new(super::ActiveSessionRoute {
+            id: "root".into(),
+            generation: 3,
+        }));
+        super::transition_route(&route, "other-root".into());
+        assert!(accept_queued_update(&route, completion).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn child_steer_request_is_bounded() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let task = super::spawn_child_steer(3, "child".into(), 9, updates, std::future::pending());
+        let completion = receiver.recv().await.unwrap();
+        task.await.unwrap();
+        assert!(matches!(
+            completion.update,
+            Update::ChildSteerFinished { result: Err(message), .. }
+                if message.contains("timed out") && message.contains("delivery is unknown")
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_steer_failure_is_reported_without_root_fallback() {
+        let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::spawn_child_steer(3, "child".into(), 9, updates, async {
+            Err(agent_client_protocol::Error::invalid_params())
+        })
+        .await
+        .unwrap();
+        let completion = receiver.recv().await.unwrap();
+        assert!(matches!(
+            completion.update,
+            Update::ChildSteerFinished {
+                generation: 9,
+                result: Err(_),
+                ..
+            }
+        ));
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[test]
+    fn queued_media_editability_uses_actual_submitted_content() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for (name, mime, kind) in [
+            ("image.png", "image/png", super::AttachmentKind::Image),
+            ("audio.mp3", "audio/mpeg", super::AttachmentKind::Audio),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(name);
+            std::fs::write(&path, b"media").unwrap();
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.can_steer = true;
+            app.can_replace_steer = true;
+            app.apply(Update::State(StateUpdate::Running(
+                RunningStateUpdate::new(),
+            )));
+            app.attach(path, mime, kind, 5);
+            let Action::Submit { prompt, inject } =
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("media steer must remain supported");
+            };
+            assert!(inject);
+            let blocks = prompt_blocks(&prompt).unwrap();
+            assert_eq!(blocks.len(), 2);
+            let editable = super::pending_steer_is_editable(&blocks);
+            assert!(!editable);
+            app.clear_attachments();
+            app.apply(Update::SteerAccepted {
+                id: "media".into(),
+                text: prompt.text,
+                editable,
+            });
+            app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::None
+            ));
+            assert!(!app.editing_steer());
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+                Action::RevokeSteer { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn queued_stale_attachment_metadata_does_not_disable_plain_text_editing() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.can_steer = true;
+        app.can_replace_steer = true;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.attach(
+            PathBuf::from("nonexistent.png"),
+            "image/png",
+            super::AttachmentKind::Image,
+            5,
+        );
+        app.editor.clear(); // Remove the attachment placeholder, leaving stale metadata.
+        app.paste("plain steer");
+        assert_eq!(app.attachments.len(), 1);
+        let Action::Submit { prompt, inject } =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected plain steer");
+        };
+        assert!(inject);
+        assert!(prompt.attachments.is_empty());
+        let blocks = prompt_blocks(&prompt).unwrap();
+        let editable = super::pending_steer_is_editable(&blocks);
+        assert!(editable);
+        app.clear_attachments();
+        app.apply(Update::SteerAccepted {
+            id: "plain".into(),
+            text: prompt.text,
+            editable,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.editing_steer());
+    }
+
+    #[test]
+    fn queued_replace_capability_requires_explicit_true() {
+        use agent_client_protocol::schema::v2::{
+            SessionInjectCapabilities, SessionInjectPendingCapabilities,
+        };
+        assert!(!super::supports_pending_replace(None));
+        for pending in [
+            None,
+            Some(SessionInjectPendingCapabilities::new()),
+            Some(SessionInjectPendingCapabilities::new().replace(false)),
+        ] {
+            let inject = SessionInjectCapabilities::new(vec![]).pending(pending);
+            assert!(!super::supports_pending_replace(Some(&inject)));
+        }
+        let inject = SessionInjectCapabilities::new(vec![])
+            .pending(SessionInjectPendingCapabilities::new().replace(true));
+        assert!(super::supports_pending_replace(Some(&inject)));
+    }
+
+    #[test]
+    fn queued_mutation_errors_retire_only_known_missing_or_delivered_ids() {
+        for reason in [
+            "already_delivered",
+            "unknown_message_id",
+            "replace_not_supported",
+            "temporary_failure",
+        ] {
+            let error = agent_client_protocol::Error::invalid_params()
+                .data(json!({"reason": reason, "messageId": "a"}));
+            assert_eq!(
+                super::pending_message_unavailable(&error),
+                matches!(reason, "already_delivered" | "unknown_message_id")
+            );
+        }
+        assert!(!super::pending_message_unavailable(
+            &agent_client_protocol::Error::invalid_params()
+        ));
+    }
+
     #[test]
     fn multiple_dropped_paths_become_attachments() {
         let directory = tempfile::tempdir().unwrap();
@@ -2021,6 +6241,59 @@ mod tests {
     }
 
     #[test]
+    fn paste_does_not_modify_the_composer_behind_dialogs() {
+        for dialog in 0..3 {
+            let mut app = App::new(
+                PathBuf::from("/tmp"),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("parked draft");
+            match dialog {
+                0 => {
+                    app.model_dialog = Some(super::app::ModelDialog {
+                        query: String::new(),
+                        selected: 0,
+                        save_defaults: false,
+                    })
+                }
+                1 => {
+                    app.effort_dialog = Some(super::app::EffortDialog {
+                        selected: 0,
+                        save_defaults: false,
+                    })
+                }
+                _ => {
+                    app.session_dialog = Some(super::app::SessionDialog {
+                        selected: 0,
+                        rename: None,
+                    })
+                }
+            }
+            for event in [
+                Event::Paste("hidden text".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)),
+            ] {
+                assert!(matches!(handle(&mut app, event), Action::None));
+                assert_eq!(app.editor.text(), "parked draft");
+                assert!(app.attachments.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn clipboard_image_rejects_excessive_pixel_dimensions() {
+        let result = clipboard_image_attachment(arboard::ImageData {
+            width: 8192,
+            height: 8192,
+            bytes: Cow::Borrowed(&[]),
+        });
+        assert!(result.unwrap_err().contains("pixel-data limit"));
+    }
+
+    #[test]
     fn pending_attachment_limit_applies_across_pastes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.png");
@@ -2038,6 +6311,100 @@ mod tests {
         handle(&mut app, Event::Paste(path.display().to_string()));
 
         assert_eq!(app.attachments.len(), MAX_ATTACHMENTS);
+    }
+
+    #[test]
+    fn queued_edit_media_paste_remains_text_and_preserves_original_attachments() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        let mut app = App::new(
+            directory.path().into(),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.can_replace_steer = true;
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "a".into(),
+            text: "pending".into(),
+        });
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        let draft = app.editor.text().to_owned();
+        let attachments = app.attachments.clone();
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        handle(&mut app, Event::Paste("ignored while selecting".into()));
+        assert_eq!(app.editor.text(), draft);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        handle(&mut app, Event::Paste(path.display().to_string()));
+        assert!(app.attachments.is_empty());
+        assert!(app.editor.text().contains(path.to_str().unwrap()));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.attachments, attachments);
+        assert_eq!(app.editor.text(), draft);
+    }
+
+    #[test]
+    fn async_session_catalog_rename_paste_takes_precedence_over_queue_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, b"png").unwrap();
+        for populated in [false, true] {
+            let mut app = App::new(
+                directory.path().into(),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("/sessions");
+            assert!(matches!(
+                handle(
+                    &mut app,
+                    Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                ),
+                Action::ListSessions
+            ));
+            app.paste("parked draft");
+            if populated {
+                app.apply(Update::SteerAccepted {
+                    id: "pending".into(),
+                    text: "queued text".into(),
+                    editable: true,
+                });
+            }
+            handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            );
+            assert_eq!(app.queue_focused, populated);
+            app.apply(Update::SessionCatalog(Ok(vec![
+                crate::session::CatalogEntry {
+                    additional_directories: Vec::new(),
+                    id: "saved".into(),
+                    title: Some("Saved".into()),
+                    preview: None,
+                    is_subagent: false,
+                    updated_at: 0,
+                },
+            ])));
+            handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            );
+            assert!(app.session_rename_active());
+            handle(&mut app, Event::Paste(path.display().to_string()));
+            assert!(matches!(
+                app.session_dialog.as_ref().unwrap().rename.as_ref(),
+                Some(SessionRename::Editing(input)) if input == path.to_str().unwrap()
+            ));
+            assert!(app.attachments.is_empty());
+            assert_eq!(app.queue_focused, populated);
+            assert_eq!(app.editor.text(), "parked draft");
+        }
     }
 
     #[test]
@@ -2089,6 +6456,516 @@ mod tests {
             assert!(app.editor.is_empty());
             assert!(app.session_rename_active());
         }
+    }
+
+    #[test]
+    fn empty_terminal_paste_requests_only_images_in_the_composer() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::ReadClipboard(ClipboardRoute::Composer(_), super::ClipboardMode::ImageOnly)
+        ));
+        assert!(app.editor.text().is_empty());
+        assert!(matches!(
+            handle(&mut app, Event::Paste("ordinary text".into())),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "ordinary text");
+
+        app.queue_focused = true;
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        app.queue_focused = false;
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: None,
+        });
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        app.session_dialog.as_mut().unwrap().rename = Some(SessionRename::Editing("name".into()));
+        assert!(matches!(
+            handle(&mut app, Event::Paste(String::new())),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "ordinary text");
+    }
+
+    #[test]
+    fn vscode_image_paste_finishes_before_enter_submits() {
+        for has_image in [true, false] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("describe screenshot");
+            let Action::ReadClipboard(route, super::ClipboardMode::ImageOnly) =
+                super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste(String::new()))
+            else {
+                panic!("empty bracketed paste must request an image-only read");
+            };
+            pastes.queued(1, route.clone());
+            let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(
+                super::handle_with_clipboard(&mut app, &mut pastes, enter.clone()),
+                Action::None
+            ));
+            assert_eq!(app.editor.text(), "describe screenshot");
+            let result = if has_image {
+                ClipboardResult::Attachment(
+                    clipboard_image_attachment(arboard::ImageData {
+                        width: 1,
+                        height: 1,
+                        bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+                    })
+                    .unwrap(),
+                )
+            } else {
+                ClipboardResult::NoImage
+            };
+            assert!(
+                super::finish_clipboard_paste(&mut app, &active, &mut pastes, 1, route, result)
+                    .submit
+            );
+            let Action::Submit { prompt, .. } =
+                super::handle_with_clipboard(&mut app, &mut pastes, enter)
+            else {
+                panic!("expected deferred submission");
+            };
+            assert_eq!(prompt.attachments.len(), usize::from(has_image));
+            let blocks = prompt_blocks(&prompt).unwrap();
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| matches!(block, ContentBlock::Image(_)))
+                    .count(),
+                usize::from(has_image)
+            );
+            if !has_image {
+                assert_eq!(prompt.text, "describe screenshot");
+            }
+            assert!(app.editor.is_empty());
+        }
+    }
+
+    #[test]
+    fn full_completion_queue_observes_worker_shutdown() {
+        let (completed, mut completions) = tokio::sync::mpsc::channel(1);
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        assert!(send_background_completion(
+            &completed,
+            &stopping,
+            BackgroundCompletion::Clipboard {
+                generation: 1,
+                route: ClipboardRoute::Composer(0),
+                result: ClipboardResult::Error("first".into()),
+            },
+        ));
+        stopping.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!send_background_completion(
+            &completed,
+            &stopping,
+            BackgroundCompletion::Clipboard {
+                generation: 1,
+                route: ClipboardRoute::Composer(0),
+                result: ClipboardResult::Error("second".into()),
+            },
+        ));
+        assert!(completions.try_recv().is_ok());
+    }
+
+    #[test]
+    fn clipboard_completion_is_rejected_after_session_or_modal_change() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let active = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 2,
+        }));
+
+        apply_clipboard_completion(
+            &mut app,
+            &active,
+            1,
+            ClipboardRoute::Composer(0),
+            ClipboardResult::Text("stale".into()),
+        );
+        assert!(app.editor.is_empty());
+
+        let before_modal = app.clipboard_route();
+        app.session_dialog = Some(SessionDialog {
+            selected: 0,
+            rename: None,
+        });
+        app.finish_clipboard_route_event(&before_modal);
+        let during_modal = app.clipboard_route();
+        app.session_dialog = None;
+        app.finish_clipboard_route_event(&during_modal);
+        apply_clipboard_completion(
+            &mut app,
+            &active,
+            2,
+            ClipboardRoute::Composer(0),
+            ClipboardResult::Text("misrouted".into()),
+        );
+        assert!(app.editor.is_empty());
+    }
+
+    fn queue_composer_paste(app: &mut App, pastes: &mut super::ClipboardPastes) -> ClipboardRoute {
+        let Action::ReadClipboard(route, super::ClipboardMode::ImageOrText) =
+            super::handle_with_clipboard(
+                app,
+                pastes,
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            )
+        else {
+            panic!("expected clipboard request");
+        };
+        pastes.queued(1, route.clone());
+        route
+    }
+
+    #[test]
+    fn clipboard_pastes_finish_before_deferred_submission() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let mut pastes = super::ClipboardPastes::default();
+        let active = Arc::new(Mutex::new(ActiveSessionRoute {
+            id: "session".into(),
+            generation: 1,
+        }));
+        app.paste("describe");
+        let first = queue_composer_paste(&mut app, &mut pastes);
+        let second = queue_composer_paste(&mut app, &mut pastes);
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            super::handle_with_clipboard(&mut app, &mut pastes, enter.clone()),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "describe");
+        let mut release = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        release.kind = crossterm::event::KeyEventKind::Release;
+        super::handle_with_clipboard(&mut app, &mut pastes, Event::Key(release));
+        assert!(
+            !super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                first,
+                ClipboardResult::Text(" this".into())
+            )
+            .submit
+        );
+        assert_eq!(app.editor.text(), "describe this");
+        let attachment = clipboard_image_attachment(arboard::ImageData {
+            width: 1,
+            height: 1,
+            bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+        })
+        .unwrap();
+        assert!(
+            super::finish_clipboard_paste(
+                &mut app,
+                &active,
+                &mut pastes,
+                1,
+                second,
+                ClipboardResult::Attachment(attachment)
+            )
+            .submit
+        );
+        let Action::Submit { prompt, .. } =
+            super::handle_with_clipboard(&mut app, &mut pastes, enter)
+        else {
+            panic!("expected deferred submission");
+        };
+        assert!(prompt.text.starts_with("describe this"));
+        assert_eq!(prompt.attachments.len(), 1);
+        assert!(
+            super::prompt_blocks(&prompt)
+                .unwrap()
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn failed_clipboard_paste_does_not_submit_the_draft() {
+        for full in [false, true] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("draft");
+            let attachment = clipboard_image_attachment(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+            })
+            .unwrap();
+            if full {
+                for _ in 0..MAX_ATTACHMENTS {
+                    app.attach_attachment(attachment.clone());
+                }
+            }
+            let route = queue_composer_paste(&mut app, &mut pastes);
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            );
+            let before = app.editor.text().to_owned();
+            let result = if full {
+                ClipboardResult::Attachment(attachment)
+            } else {
+                ClipboardResult::Error("clipboard unavailable".into())
+            };
+            assert!(
+                !super::finish_clipboard_paste(&mut app, &active, &mut pastes, 1, route, result)
+                    .submit
+            );
+            assert_eq!(app.editor.text(), before);
+            assert!(pastes.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn editing_or_switching_sessions_cancels_deferred_clipboard_submission() {
+        for switch in [false, true] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            let mut pastes = super::ClipboardPastes::default();
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            app.paste("draft");
+            let route = queue_composer_paste(&mut app, &mut pastes);
+            super::handle_with_clipboard(
+                &mut app,
+                &mut pastes,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            );
+            if switch {
+                active.lock().unwrap().generation = 2;
+                pastes.retain_current(Some(2), &app.clipboard_route());
+            } else {
+                super::handle_with_clipboard(&mut app, &mut pastes, Event::Paste(" edited".into()));
+            }
+            assert!(
+                !super::finish_clipboard_paste(
+                    &mut app,
+                    &active,
+                    &mut pastes,
+                    1,
+                    route,
+                    ClipboardResult::Text(" pasted".into())
+                )
+                .submit
+            );
+            assert_eq!(
+                app.editor.text(),
+                if switch {
+                    "draft"
+                } else {
+                    "draft edited pasted"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_completion_is_rejected_after_composer_reset() {
+        for reset in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = App::new(
+                PathBuf::from("."),
+                "provider".into(),
+                "model".into(),
+                "a2a".into(),
+            );
+            app.paste("first prompt");
+            let Action::ReadClipboard(route, super::ClipboardMode::ImageOrText) = handle(
+                &mut app,
+                Event::Key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            ) else {
+                panic!("expected clipboard read");
+            };
+            let action = handle(&mut app, Event::Key(reset));
+            if reset.code == KeyCode::Enter {
+                let Action::Submit { prompt, .. } = action else {
+                    panic!("expected prompt submission");
+                };
+                assert_eq!(prompt.text, "first prompt");
+            }
+            assert!(app.editor.is_empty());
+            app.paste("next prompt");
+
+            let active = Arc::new(Mutex::new(ActiveSessionRoute {
+                id: "session".into(),
+                generation: 1,
+            }));
+            apply_clipboard_completion(
+                &mut app,
+                &active,
+                1,
+                route.clone(),
+                ClipboardResult::Text("stale".into()),
+            );
+            assert_eq!(app.editor.text(), "next prompt");
+
+            let attachment = clipboard_image_attachment(arboard::ImageData {
+                width: 1,
+                height: 1,
+                bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+            })
+            .unwrap();
+            let path = attachment.path.clone();
+            apply_clipboard_completion(
+                &mut app,
+                &active,
+                1,
+                route,
+                ClipboardResult::Attachment(attachment),
+            );
+            assert_eq!(app.editor.text(), "next prompt");
+            assert!(app.attachments.is_empty());
+            assert!(!path.exists(), "discarded clipboard file must be removed");
+
+            let current_route = app.clipboard_route();
+            apply_clipboard_completion(
+                &mut app,
+                &active,
+                1,
+                current_route,
+                ClipboardResult::Text(" fresh".into()),
+            );
+            assert_eq!(app.editor.text(), "next prompt fresh");
+        }
+    }
+
+    #[test]
+    fn native_clipboard_shortcut_requires_control_or_reported_command() {
+        assert!(clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn native_clipboard_supports_forwarded_terminal_paste_shortcuts() {
+        for key in [
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+            KeyEvent::new(
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            assert!(clipboard_paste_key(key));
+            let mut release = key;
+            release.kind = crossterm::event::KeyEventKind::Release;
+            assert!(!clipboard_paste_key(release));
+        }
+        for key in [
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
+            KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT),
+        ] {
+            assert!(!clipboard_paste_key(key));
+        }
+    }
+
+    #[test]
+    fn keyboard_protocol_reports_command_modified_printable_keys() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn clipboard_image_file_lives_with_drafts_and_submissions() {
+        let attachment = clipboard_image_attachment(arboard::ImageData {
+            width: 1,
+            height: 1,
+            bytes: Cow::Borrowed(&[20, 40, 60, 255]),
+        })
+        .unwrap();
+        let path = attachment.path.clone();
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        app.attach_attachment(attachment);
+        assert!(path.is_file());
+
+        let Action::Submit { prompt, .. } =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected clipboard image submission");
+        };
+        assert!(path.is_file());
+        let restored = prompt.attachments.clone();
+        drop(prompt);
+        assert!(path.is_file());
+        app.restore_attachments(restored);
+        assert!(path.is_file());
+        app.clear_attachments();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2189,6 +7066,114 @@ mod tests {
     }
 
     #[test]
+    fn replay_destination_ranges_match_discovered_image_links() {
+        for source in [
+            "`[Image #1](file:///tmp/source.png)` [Image #2](file:///tmp/source.png)",
+            r"\[Image #1](file:///tmp/source.png) [Image #2](file:///tmp/source.png)",
+            "``literal `[Image #1](file:///tmp/source.png)` `` [Image #2](file:///tmp/source.png)",
+            "**[Image #1](file:///tmp/source.png)** [Image #2](file:///tmp/source.png)",
+        ] {
+            let discovered = super::markdown::image_label_links(source);
+            let destinations = super::markdown::image_label_link_destinations(source);
+            assert_eq!(
+                destinations.iter().map(|(_, uri)| uri).collect::<Vec<_>>(),
+                discovered.iter().map(|(_, uri)| uri).collect::<Vec<_>>(),
+                "discovery and replacement must parse the same links: {source}"
+            );
+            for (range, uri) in destinations {
+                assert_eq!(&source[range], uri);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_image_uri_occurrences_are_consumed_in_order() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[Image #1]({uri})\n[Image #2]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri})\n[Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn repeated_image_uri_occurrences_on_one_line_share_the_line() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[Image #1]({uri}) [Image #2]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri}) [Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn generated_placeholders_are_not_reconsumed() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("BAUG", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[Image #1]({uri})\n[Image #2]({uri})"));
+        assert_eq!(
+            images.iter().map(|image| image.line).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn ordinary_link_does_not_consume_an_image_uri_occurrence() {
+        let uri = "file:///tmp/image.png";
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Text(TextContent::new(format!(
+                "[reference]({uri})\n[Image #1]({uri})"
+            ))),
+            ContentBlock::Image(
+                agent_client_protocol::schema::v2::ImageContent::new("AQID", "image/png")
+                    .uri(Some(uri.into())),
+            ),
+        ]);
+
+        assert_eq!(text, format!("[reference]({uri})\n[Image #1]({uri})"));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 1);
+    }
+
+    #[test]
     fn user_image_blocks_preserve_text_image_text_order() {
         let uri = "file:///tmp/image.png";
         let (text, images) = user_message_of(vec![
@@ -2203,6 +7188,118 @@ mod tests {
         assert_eq!(text, format!("before\n[Image #1]({uri})\nafter"));
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].line, 1);
+    }
+
+    #[test]
+    fn sequential_user_image_chunks_preserve_materialized_links_and_spacing() {
+        use super::{app::Block, attachment};
+
+        let mut app = App::new(
+            PathBuf::from("/tmp"),
+            "provider".into(),
+            "model".into(),
+            "a2a".into(),
+        );
+        let image_block = |value| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                1,
+                1,
+                image::Rgb([value, 0, 0]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+            ContentBlock::Image(wire::ImageContent::new(
+                STANDARD.encode(png.into_inner()),
+                "image/png",
+            ))
+        };
+        for content in [
+            ContentBlock::Text(TextContent::new("before")),
+            image_block(0),
+            ContentBlock::Text(TextContent::new("")),
+            ContentBlock::Text(TextContent::new("after")),
+            image_block(255),
+            ContentBlock::Text(TextContent::new("end")),
+        ] {
+            let notification = UpdateSessionNotification::new(
+                "session",
+                SessionUpdate::UserMessageChunk(
+                    serde_json::from_value(json!({
+                        "messageId": "user",
+                        "content": content,
+                    }))
+                    .unwrap(),
+                ),
+            );
+            let updates = translate_for_session(notification, "session");
+            assert_eq!(updates.len(), 1);
+            for update in updates {
+                let Update::UserMessage {
+                    id, images, append, ..
+                } = &update
+                else {
+                    panic!("expected a user message chunk");
+                };
+                assert_eq!(id, "user");
+                assert!(*append);
+                let materialized = images
+                    .iter()
+                    .map(|image| {
+                        assert!(image.source_uri.is_none());
+                        attachment::materialize_image(
+                            image.key,
+                            &image.data,
+                            &image.mime_type,
+                            usize::MAX,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                app.apply_materialized(update, materialized);
+            }
+        }
+
+        let [Block::User(message)] = app.blocks.as_slice() else {
+            panic!("expected one user message");
+        };
+        assert_eq!(message.images.len(), 2);
+        assert_ne!(message.images[0].key, message.images[1].key);
+        assert_eq!(message.images[0].line, 1);
+        assert_eq!(message.images[1].line, 3);
+        let lines: Vec<_> = message.text.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "before");
+        assert_eq!(lines[2], "after");
+        assert_eq!(lines[4], "end");
+        let links = super::markdown::image_label_links(&message.text);
+        assert_eq!(links.len(), 2);
+        assert_ne!(links[0].1, links[1].1);
+        for ((line, uri), image) in links.iter().zip(&message.images) {
+            assert_eq!(*line, image.line);
+            assert!(uri.starts_with("file://"));
+            let path = url::Url::parse(uri).unwrap().to_file_path().unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                STANDARD.decode(&image.data).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn user_image_placeholder_separator_survives_empty_text() {
+        let (text, images) = user_message_of(vec![
+            ContentBlock::Image(agent_client_protocol::schema::v2::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+            ContentBlock::Text(TextContent::new("")),
+            ContentBlock::Text(TextContent::new("after")),
+        ]);
+
+        assert_eq!(text, "[Image #1]\nafter");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].line, 0);
     }
 
     #[test]
@@ -2240,7 +7337,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_defaults_by_parsing_and_reserializing_valid_toml() {
+    fn saves_defaults_by_editing_valid_toml() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2273,6 +7370,31 @@ a = [still text]
     }
 
     #[test]
+    fn default_saves_preserve_bom_comments_and_unknown_formatting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = "\u{feff}# user defaults\nprovider = 'old' # provider note\n[custom] # custom note\nvalue  =  [1,  2] # keep spacing\n";
+        std::fs::write(&path, original).unwrap();
+        let choice = ModelChoice {
+            id: "openrouter:new".into(),
+            provider: "openrouter".into(),
+            model: "new".into(),
+        };
+        save_model_defaults_to(&path, &choice).unwrap();
+        save_effort_default_to(&path, "high").unwrap();
+        save_effort_default_to(&path, "default").unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.starts_with("\u{feff}# user defaults\n"));
+        assert!(saved.contains("# provider note"));
+        assert!(saved.contains("[custom] # custom note\nvalue  =  [1,  2] # keep spacing\n"));
+        assert_eq!(
+            crate::config_editor::get(&path, Some("model")).unwrap(),
+            "\"new\""
+        );
+        assert!(crate::config_editor::get(&path, Some("reasoning_effort")).is_err());
+    }
+
+    #[test]
     fn saves_and_removes_reasoning_effort_without_losing_other_config() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -2289,6 +7411,172 @@ a = [still text]
             toml::from_str::<toml::Value>(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(saved.get("reasoning_effort").is_none());
         assert_eq!(saved["model"].as_str(), Some("kept"));
+    }
+
+    #[test]
+    fn successful_login_refresh_preserves_active_provider_model_and_effort() {
+        let options = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "openrouter:active-model",
+                vec![SessionConfigSelectGroup::new(
+                    "openrouter",
+                    "OpenRouter",
+                    vec![
+                        SessionConfigSelectOption::new("openrouter:old-model", "old-model"),
+                        SessionConfigSelectOption::new("openrouter:active-model", "active-model"),
+                    ],
+                )],
+            ),
+            SessionConfigOption::select(
+                "reasoning_effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectGroup::new(
+                    "reasoning-effort",
+                    "Reasoning effort",
+                    vec![
+                        SessionConfigSelectOption::new("default", "Default"),
+                        SessionConfigSelectOption::new("high", "High"),
+                    ],
+                )],
+            ),
+        ];
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openrouter".into(),
+            "active-model".into(),
+            "127.0.0.1:4321".into(),
+        );
+        app.set_model_choices(super::model_choices(Some(&options)));
+        app.set_effort(
+            "high".into(),
+            vec![
+                crate::tui::app::EffortChoice {
+                    id: "default".into(),
+                    name: "Default".into(),
+                },
+                crate::tui::app::EffortChoice {
+                    id: "high".into(),
+                    name: "High".into(),
+                },
+            ],
+        );
+
+        let active = active_session_config(&app);
+        assert_eq!(active.model, "openrouter:active-model");
+        assert_eq!(active.reasoning_effort.as_deref(), Some("high"));
+        assert!(active_config_matches(&active, &options));
+    }
+
+    #[test]
+    fn successful_login_refresh_preserves_a_custom_model_outside_the_catalog() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openai-subscription".into(),
+            "custom-model".into(),
+            "a2a".into(),
+        );
+        app.set_model_choices(vec![ModelChoice {
+            id: "openai-subscription:gpt-5.4".into(),
+            provider: "openai-subscription".into(),
+            model: "gpt-5.4".into(),
+        }]);
+
+        assert_eq!(
+            active_session_config(&app).model,
+            "openai-subscription:custom-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_login_refresh_is_scoped_to_the_active_session() {
+        let mut app = App::new(
+            PathBuf::from("."),
+            "openrouter".into(),
+            "same-model".into(),
+            "127.0.0.1:4321".into(),
+        );
+        let options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "openrouter:same-model",
+            vec![SessionConfigSelectGroup::new(
+                "openrouter",
+                "OpenRouter",
+                vec![SessionConfigSelectOption::new(
+                    "openrouter:same-model",
+                    "same-model",
+                )],
+            )],
+        )];
+        app.set_model_choices(super::model_choices(Some(&options)));
+        let active = active_session_config(&app);
+
+        let root = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = crate::runtime::Runtime::new_with_provider_credentials_and_effort(
+            root.path(),
+            "same-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            None,
+        )
+        .unwrap();
+        let registry = crate::protocols::acp::SessionRegistry::new();
+        let agent = crate::protocols::acp::v2::component(runtime, registry);
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(async move { agent.connect_to(agent_transport).await });
+        let workspace = root.path().to_path_buf();
+
+        agent_client_protocol::Client
+            .v2()
+            .connect_with(client_transport, async move |connection| {
+                connection
+                    .send_request(wire::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        wire::Implementation::new("test", "0"),
+                    ))
+                    .block_task()
+                    .await?;
+                let active_session = connection
+                    .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                    .block_task()
+                    .await?;
+                let unrelated_session = connection
+                    .send_request(wire::NewSessionRequest::new(workspace.clone()))
+                    .block_task()
+                    .await?;
+
+                refresh_session_after_auth(&connection, active_session.session_id.clone(), &active)
+                    .await?;
+
+                // This request proves that refreshing the TUI route left another
+                // route in the shared serve runtime active.
+                connection
+                    .send_request(wire::SetSessionConfigOptionRequest::new(
+                        unrelated_session.session_id.clone(),
+                        "reasoning_effort",
+                        "high",
+                    ))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(active_session.session_id))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(wire::CloseSessionRequest::new(unrelated_session.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -2393,8 +7681,9 @@ a = [still text]
 
     #[test]
     fn forwards_all_resolved_telemetry_settings_to_the_tui_child() {
-        let settings = crate::telemetry::Settings::try_new(
-            Some("http://collector:4317".into()),
+        let settings = crate::telemetry::Settings::try_new_with_protocol(
+            Some("http://collector:4318".into()),
+            crate::telemetry::Protocol::HttpProtobuf,
             false,
             12,
             4096,
@@ -2402,16 +7691,16 @@ a = [still text]
         .unwrap();
         let mut command = tokio::process::Command::new("kit");
         settings.append_cli_args(&mut command);
-        let args: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
+        let args = command_args(&command);
         assert_eq!(
             args,
             [
+                "--internal-capture-error-spans",
+                "false",
                 "--otel-endpoint",
-                "http://collector:4317",
+                "http://collector:4318/v1/traces",
+                "--otel-protocol",
+                "http/protobuf",
                 "--otel-capture-message-content",
                 "false",
                 "--otel-message-content-max-messages",
@@ -2454,10 +7743,222 @@ a = [still text]
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod signal_tests {
     use std::{future, time::Duration};
 
-    use super::{Stop, bounded_graceful_close};
+    use super::{RequestInterrupt, Stop, bounded_agent_request, bounded_graceful_close};
+
+    #[tokio::test]
+    async fn request_ties_preserve_exit_and_drop_losers_before_return() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = bounded_agent_request(
+            future::ready(7),
+            &mut exit_rx,
+            async move {
+                let _ = stop_rx.await;
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert!(matches!(result, Ok(7)));
+        assert!(stop_tx.is_closed());
+        assert!(
+            exit_rx.try_recv().unwrap().is_err(),
+            "losing exit was not consumed"
+        );
+
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+        let result = bounded_agent_request(
+            request_rx,
+            &mut exit_rx,
+            future::ready(()),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(matches!(result, Err(RequestInterrupt::Stopped)));
+        assert!(
+            request_tx.is_closed(),
+            "cancelled request released before cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_close_drops_the_losing_request_before_cleanup() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(
+            bounded_graceful_close(close_rx, future::ready(()), Duration::from_secs(30))
+                .await
+                .is_none()
+        );
+        assert!(close_tx.is_closed());
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        assert_eq!(
+            bounded_graceful_close(
+                future::ready(7),
+                async move {
+                    let _ = stop_rx.await;
+                },
+                Duration::ZERO
+            )
+            .await,
+            Some(7)
+        );
+        assert!(stop_tx.is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_requests_preserve_success_timeout_and_agent_exit() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            super::bounded_cancellable_request(
+                future::ready(7),
+                &mut exit_rx,
+                future::pending(),
+                Duration::from_secs(30)
+            )
+            .await,
+            Ok(Some(7))
+        ));
+        assert!(matches!(
+            super::bounded_cancellable_request(
+                future::pending::<()>(),
+                &mut exit_rx,
+                future::pending(),
+                Duration::from_secs(30)
+            )
+            .await,
+            Err(super::RequestFailure::TimedOut)
+        ));
+        drop(exit_tx);
+        assert!(matches!(
+            super::bounded_cancellable_request(
+                future::pending::<()>(),
+                &mut exit_rx,
+                future::pending(),
+                Duration::from_secs(30)
+            )
+            .await,
+            Err(super::RequestFailure::AgentExited(None))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_auth_reports_spawn_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let command = tokio::process::Command::new(root.path().join("missing-auth-command"));
+        let mut stop = Stop::new().unwrap();
+        let error = super::wait_for_terminal_auth(command, &mut stop)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_session_request_is_bounded() {
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::pending(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn agent_exit_cancels_a_session_request() {
+        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+        exit_tx
+            .send(Err(std::io::Error::other("agent exited")))
+            .unwrap();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::pending(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::AgentExited(None))));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_session_request() {
+        let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+
+        let result = bounded_agent_request(
+            future::pending::<()>(),
+            &mut exit_rx,
+            future::ready(()),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestInterrupt::Stopped)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_exit_waits_for_final_flush_and_preserves_failure_status() {
+        use tokio::io::AsyncReadExt;
+        for code in [0, 1] {
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "cat >/dev/null; sleep 0.05; printf recovered; exit {code}"
+                ))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            // Like dropping the ACP transport: EOF initiates child shutdown.
+            drop(child.stdin.take());
+            let status = super::wait_for_storage_exit(&mut child, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(status.code(), Some(code));
+            let mut flushed = String::new();
+            stdout.read_to_string(&mut flushed).await.unwrap();
+            assert_eq!(flushed, "recovered");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_exit_timeout_reports_possible_loss_and_reaps_child() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 60"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = super::wait_for_storage_exit(&mut child, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("unpersisted data may be lost"));
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn a_stuck_close_is_bounded() {
@@ -2479,6 +7980,33 @@ mod signal_tests {
         )
         .await;
         assert!(closed.is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_stop_survives_handoff_and_cancels_requests() {
+        for signal in ["-INT", "-TERM", "-HUP"] {
+            let mut stop = Stop::new().unwrap();
+            // A successful preparation leaves the same streams alive, including
+            // signals received before the next startup future begins polling.
+            assert_eq!(stop.until(future::ready(7)).await, Some(7));
+            std::process::Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                super::bounded_cancellable_request(
+                    future::pending::<()>(),
+                    &mut exit_rx,
+                    stop.requested(),
+                    Duration::from_secs(30),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, Ok(None)));
+        }
     }
 
     /// A client killed from outside must still reach its restore path, or it
@@ -2503,5 +8031,510 @@ mod signal_tests {
         tokio::time::timeout(Duration::from_secs(3), session)
             .await
             .expect("the loop leaves on the signal");
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod native_voice_tests {
+    use super::{App, NativeVoice, Update, VoiceHandoff, voice_display_text, wire};
+
+    fn voice_app() -> App {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "local".into(),
+        );
+        app.voice_enabled = true;
+        app
+    }
+
+    fn notices(voice: &mut NativeVoice, session: &str) -> Vec<(String, bool)> {
+        voice
+            .state_notifications(&wire::SessionId::new(session))
+            .into_iter()
+            .map(|notice| (notice.session_id.to_string(), notice.active))
+            .collect()
+    }
+
+    #[test]
+    fn voice_notices_require_readiness_and_ignore_microphone_changes() {
+        let mut voice = NativeVoice::default();
+        let mut app = voice_app();
+        let storage = crate::credentials::CredentialStorage::Memory;
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("on", &storage, &mut app);
+        // Startup is deliberately unpolled: no network or audio access.
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("mute", &storage, &mut app);
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.mark_ready(&mut app);
+        assert_eq!(notices(&mut voice, "old"), [("old".into(), true)]);
+        voice.control("on", &storage, &mut app);
+        voice.control("mute", &storage, &mut app);
+        voice.mark_ready(&mut app);
+        assert!(notices(&mut voice, "old").is_empty());
+        voice.control("off", &storage, &mut app);
+        assert_eq!(notices(&mut voice, "old"), [("old".into(), false)]);
+        assert!(notices(&mut voice, "old").is_empty());
+    }
+
+    #[test]
+    fn voice_failure_and_observed_disconnect_retire_announced_session() {
+        for disconnect in [false, true] {
+            let mut voice = NativeVoice::default();
+            let mut app = voice_app();
+            voice.fail("startup failure".into(), &mut app);
+            assert!(notices(&mut voice, "old").is_empty());
+            voice.mark_ready(&mut app);
+            assert_eq!(notices(&mut voice, "old"), [("old".into(), true)]);
+            if disconnect {
+                voice.observe(&Update::ProcessExited("disconnected".into()), &mut app);
+            } else {
+                // All transport/control/result failures converge at fail().
+                voice.fail("transport failure".into(), &mut app);
+            }
+            // Even if the displayed session has changed, retire the old ID.
+            assert_eq!(notices(&mut voice, "new"), [("old".into(), false)]);
+            voice.stop();
+            assert!(notices(&mut voice, "new").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_state_notifications_cross_real_acp_transport_in_order() {
+        use crate::protocols::acp::VoiceStateNotification;
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(async move {
+            agent_client_protocol::Agent
+                .v2()
+                .on_receive_request(
+                    async move |request: wire::InitializeRequest, responder, _cx| {
+                        responder.respond(wire::InitializeResponse::new(
+                            request.protocol_version,
+                            wire::Implementation::new("voice-test-agent", "0"),
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_notification(
+                    async move |notice: VoiceStateNotification, _cx| {
+                        sent.send((notice.session_id.to_string(), notice.active))
+                            .unwrap();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(agent_transport)
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent_client_protocol::Client.v2().connect_with(
+                client_transport,
+                async move |connection| {
+                    // The pinned SDK rejects ordinary notifications before the
+                    // ACP v2 handshake. Match real TUI startup rather than sending
+                    // status into an uninitialized transport.
+                    connection
+                        .send_request(wire::InitializeRequest::new(
+                            agent_client_protocol::schema::ProtocolVersion::V2,
+                            wire::Implementation::new("voice-test-client", "0"),
+                        ))
+                        .block_task()
+                        .await?;
+                    let mut voice = NativeVoice::default();
+                    let mut app = voice_app();
+                    let old = wire::SessionId::new("old");
+                    voice.notify_state(&connection, &old);
+                    voice.mark_ready(&mut app);
+                    voice.notify_state(&connection, &old);
+                    assert_eq!(received.recv().await, Some(("old".into(), true)));
+                    // This is the same stop/notify ordering used before New/Resume
+                    // and on quit. No request, prompt, or response is needed.
+                    voice.stop();
+                    voice.notify_state(&connection, &old);
+                    assert_eq!(received.recv().await, Some(("old".into(), false)));
+                    voice.notify_state(&connection, &wire::SessionId::new("new"));
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        serving.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn disabled_voice_never_starts_or_enables_microphone() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "local".into(),
+        );
+        let storage = crate::credentials::CredentialStorage::Memory;
+        let mut voice = NativeVoice::default();
+        for control in ["on", "mute", "off", "invalid"] {
+            voice.control(control, &storage, &mut app);
+            assert!(voice.starting.is_none());
+            assert!(voice.session.is_none());
+            assert!(!voice.microphone_enabled);
+        }
+    }
+
+    #[test]
+    fn on_listens_and_mute_preserves_pending_session() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let storage = crate::credentials::CredentialStorage::Memory;
+        let mut voice = NativeVoice::default();
+        app.voice_enabled = true;
+        assert!(voice.starting.is_none());
+        assert!(voice.session.is_none());
+        assert!(!voice.microphone_enabled);
+        // Do not poll startup: this test never connects or opens audio devices.
+        voice.control("on", &storage, &mut app);
+        assert!(voice.starting.is_some());
+        assert!(voice.microphone_enabled);
+        voice.control("mute", &storage, &mut app);
+        assert!(voice.starting.is_some());
+        assert!(!voice.microphone_enabled);
+        voice.control("talk", &storage, &mut app);
+        assert!(!voice.microphone_enabled);
+        voice.control("on", &storage, &mut app);
+        assert!(voice.microphone_enabled);
+        voice.control("off", &storage, &mut app);
+        assert!(voice.starting.is_none());
+        assert!(voice.session.is_none());
+        assert!(!voice.microphone_enabled);
+    }
+
+    #[test]
+    fn remote_voice_text_cannot_emit_terminal_or_directional_controls() {
+        let rendered =
+            voice_display_text("remote\x1b]52;c;clipboard\x07\r\n\u{009b}31m\u{202e}evil");
+        assert!(!rendered.chars().any(char::is_control));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(voice_display_text(&"声".repeat(5000)).chars().count() <= 4096);
+    }
+
+    #[test]
+    fn handoff_ignores_queued_prior_turn_and_waits_through_approval_until_own_idle() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff {
+                id: "task".into(),
+                ..Default::default()
+            }),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        let idle = Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new()));
+        voice.observe(&idle, &mut app);
+        assert!(voice.handoff.is_some());
+        // The entire previous turn can still be queued when admission succeeds.
+        // Identical text must not identify the delegated turn.
+        let user = |id: &str| Update::UserMessage {
+            id: id.into(),
+            text: "same prompt".into(),
+            images: Vec::new(),
+            append: false,
+        };
+        for update in [
+            user("prior-user"),
+            Update::State(wire::StateUpdate::Running(wire::RunningStateUpdate::new())),
+            Update::AgentMessage {
+                id: "prior-agent".into(),
+                text: "wrong answer".into(),
+                append: true,
+            },
+            Update::State(wire::StateUpdate::RequiresAction(
+                wire::RequiresActionStateUpdate::new(),
+            )),
+            Update::State(wire::StateUpdate::Running(wire::RunningStateUpdate::new())),
+            Update::AgentParts {
+                id: "prior-agent".into(),
+                parts: vec![super::AgentPart::Text("wrong answer".into())],
+            },
+            Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+        ] {
+            voice.observe(&update, &mut app);
+            let handoff = voice
+                .handoff
+                .as_ref()
+                .expect("prior turn cannot finish handoff");
+            assert!(handoff.user_message_id.is_none());
+            assert!(handoff.text.is_empty());
+        }
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Ok(()),
+            },
+            &mut app,
+        );
+        voice.observe(&idle, &mut app);
+        assert!(voice.handoff.is_some());
+        voice.observe(&user("accepted-user"), &mut app);
+        assert_eq!(
+            voice.handoff.as_ref().unwrap().user_message_id.as_deref(),
+            Some("accepted-user")
+        );
+        voice.observe(
+            &Update::AgentMessage {
+                id: "new-agent".into(),
+                text: "right answer".into(),
+                append: true,
+            },
+            &mut app,
+        );
+        assert_eq!(voice.handoff.as_ref().unwrap().text, "right answer");
+        for state in [
+            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
+            wire::StateUpdate::RequiresAction(wire::RequiresActionStateUpdate::new()),
+            wire::StateUpdate::Running(wire::RunningStateUpdate::new()),
+        ] {
+            let update = Update::State(state);
+            voice.observe(&update, &mut app);
+            app.apply(update);
+            assert!(voice.handoff.is_some());
+            assert!(app.working());
+        }
+        voice.observe(&idle, &mut app);
+        app.apply(idle);
+        assert!(voice.handoff.is_none());
+        assert!(!app.working());
+        voice.observe(
+            &Update::State(wire::StateUpdate::Idle(wire::IdleStateUpdate::new())),
+            &mut app,
+        );
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn handoff_receipt_ignores_other_tasks_and_rejection_retires_pending_task() {
+        let mut app = voice_app();
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff {
+                id: "task".into(),
+                ..Default::default()
+            }),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "other-task".into(),
+                result: Ok(()),
+            },
+            &mut app,
+        );
+        assert!(!voice.handoff.as_ref().unwrap().accepted);
+        voice.observe(
+            &Update::VoicePromptAccepted {
+                id: "task".into(),
+                result: Err("busy".into()),
+            },
+            &mut app,
+        );
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn acp_process_error_retires_the_handoff() {
+        let mut app = App::new(
+            "/tmp".into(),
+            "openai-subscription".into(),
+            "test".into(),
+            "127.0.0.1:7331".into(),
+        );
+        let mut voice = NativeVoice {
+            handoff: Some(VoiceHandoff::default()),
+            starting: None,
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.observe(&Update::ProcessExited("disconnected".into()), &mut app);
+        assert!(voice.handoff.is_none());
+    }
+
+    #[test]
+    fn stopping_drops_unfinished_startup_without_connecting() {
+        struct PendingStart(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Drop for PendingStart {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        impl std::future::Future for PendingStart {
+            type Output = Result<crate::voice::VoiceSession, String>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut voice = NativeVoice {
+            starting: Some(Box::pin(PendingStart(dropped.clone()))),
+            handoff: Some(VoiceHandoff::default()),
+            session: None,
+            microphone_enabled: false,
+            ready: false,
+            announced_session: None,
+        };
+        voice.stop();
+        assert!(dropped.get());
+        assert!(voice.handoff.is_none());
+        assert!(voice.starting.is_none());
+        voice.stop();
+    }
+
+    #[test]
+    fn spoken_result_tracks_replacements_and_bounds_unicode() {
+        let mut handoff = VoiceHandoff::default();
+        handoff.record("one", "first", true);
+        handoff.record("one", " second", true);
+        assert_eq!(handoff.text, "first second");
+        handoff.record("one", "replacement", false);
+        assert_eq!(handoff.text, "replacement");
+        handoff.record("two", &"声".repeat(10_000), true);
+        assert!(handoff.text.len() <= 16_384);
+        assert!(handoff.text.chars().all(|character| character == '声'));
+        handoff.record("two", "extra", true);
+        assert!(handoff.text.len() <= 16_384);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+mod scheduler_event_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new("/tmp".into(), "test".into(), "test".into(), String::new())
+    }
+
+    #[test]
+    fn ignored_mouse_keeps_stream_frames_paced() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut app = app();
+        let mut pastes = ClipboardPastes::default();
+        let now = tokio::time::Instant::now();
+        let mut frames = scheduler::Frames::new(now);
+        frames.drawn(now);
+        frames.invalidate();
+        let deadline = frames.deadline();
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert!(matches!(
+            handle_terminal(
+                &mut app,
+                &mut pastes,
+                &mut frames,
+                mouse(MouseEventKind::Moved),
+            ),
+            Action::None
+        ));
+        assert!(!frames.urgent());
+        assert_eq!(frames.deadline(), deadline);
+        assert!(!frames.ready(now));
+        assert!(matches!(
+            handle_terminal(
+                &mut app,
+                &mut pastes,
+                &mut frames,
+                mouse(MouseEventKind::ScrollUp),
+            ),
+            Action::Redraw
+        ));
+        assert!(frames.urgent());
+        assert!(frames.ready(now));
+    }
+
+    #[test]
+    fn current_child_pages_and_errors_invalidate_but_stale_reads_do_not() {
+        use crate::events::{HarnessVendor, RuntimeEvent, SubagentStatus};
+        use crate::protocols::acp::ReadSubagentTranscriptResponse;
+        let mut app = app();
+        app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+            id: "child".into(),
+            name: "child".into(),
+            status: SubagentStatus::Working,
+            outcome: None,
+            generation: 1,
+            task: "task".into(),
+            parent_id: None,
+            parent_name: None,
+            harness: "acp.kit".into(),
+            vendor: HarnessVendor::Kit,
+            model: None,
+            created_at_unix_ms: 1,
+            generation_started_at_unix_ms: 1,
+            generation_finished_at_unix_ms: None,
+        }));
+        app.focus_child("child".into());
+        let target = app.child_read_target().unwrap();
+        let now = tokio::time::Instant::now();
+        let mut frames = scheduler::Frames::new(now);
+        frames.drawn(now);
+        finish_child_transcript(
+            &mut app,
+            &mut frames,
+            &target,
+            Ok(ReadSubagentTranscriptResponse {
+                generation: 1,
+                next_cursor: 1,
+                caught_up: true,
+                updates: vec![
+                    serde_json::json!({"sessionUpdate": "agent_message_chunk", "messageId": "message", "content": {"type": "text", "text": "child output"}}),
+                ],
+            }),
+        );
+        assert!(frames.deadline().is_some());
+        assert!(!frames.urgent());
+        assert_eq!(app.child_read_target().unwrap().3, 1);
+        frames.drawn(now);
+        finish_child_transcript(&mut app, &mut frames, &target, Err("stale".into()));
+        assert_eq!(frames.deadline(), None);
+        let target = app.child_read_target().unwrap();
+        finish_child_transcript(&mut app, &mut frames, &target, Err("read failed".into()));
+        assert!(frames.deadline().is_some());
+        assert!(app.child_views["child"].notice.contains("read failed"));
     }
 }

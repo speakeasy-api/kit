@@ -1,11 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::resilient_fs as fs;
 use agentkit_loop::LoopError;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -51,6 +50,22 @@ struct FatalRecord {
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diagnostics: Option<TransportDiagnostics>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_span_context"
+    )]
+    span_context: Option<crate::telemetry::error_spans::Snapshot>,
+}
+
+fn deserialize_span_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::telemetry::error_spans::Snapshot>, D::Error> {
+    let snapshot = Option::<crate::telemetry::error_spans::Snapshot>::deserialize(deserializer)?;
+    if snapshot.as_ref().is_some_and(|snapshot| !snapshot.valid()) {
+        return Err(serde::de::Error::custom("invalid span context"));
+    }
+    Ok(snapshot)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -271,6 +286,17 @@ fn classify(
 )> {
     match error {
         LoopError::Cancelled => None,
+        LoopError::ProviderFailure(failure)
+            if failure.reason == agentkit_loop::ProviderFailureReason::Cancelled =>
+        {
+            None
+        }
+        LoopError::ProviderFailure(_) => Some((
+            "provider",
+            "provider_error",
+            "provider request failed".into(),
+            None,
+        )),
         LoopError::Provider(message) => {
             let (message, diagnostics) = split_diagnostics(message);
             if message.starts_with("openai-subscription ") {
@@ -282,9 +308,7 @@ fn classify(
                     diagnostics,
                 ))
             } else {
-                // TODO(agentkit): AgentKit 0.10 flattens OpenAI Responses status, transport,
-                // and protocol failures into LoopError::Provider(String). Keep this generic until
-                // the terminal API exposes a stable typed classification; do not parse its display.
+                // Legacy string errors have no stable classification; do not parse their display.
                 Some((
                     "provider",
                     "provider_error",
@@ -417,18 +441,6 @@ fn write_default(
     )
 }
 
-#[cfg(test)]
-fn write_in(
-    base: &Path,
-    session_id: &str,
-    surface: Surface,
-    kind: &str,
-    code: &str,
-    message: &str,
-) -> Result<PathBuf, String> {
-    write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
-}
-
 fn write_in_with_diagnostics(
     base: &Path,
     session_id: &str,
@@ -448,7 +460,7 @@ fn write_in_with_diagnostics(
         std::process::id(),
         NEXT_EVENT.fetch_add(1, Ordering::Relaxed)
     );
-    let record = FatalRecord {
+    let mut record = FatalRecord {
         schema_version: SCHEMA_VERSION,
         event_id: event_id.clone(),
         occurred_at_ms,
@@ -459,9 +471,15 @@ fn write_in_with_diagnostics(
         code: canonical_code(code).into(),
         message: bounded(message),
         diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
+        span_context: crate::telemetry::error_spans::snapshot(&tracing::Span::current()),
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    if bytes.len() >= MAX_RECORD_BYTES && record.span_context.take().is_some() {
+        // Optional diagnostics must not displace an otherwise valid ordinary error.
+        bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| format!("could not encode fatal error log: {error}"))?;
+    }
     bytes.push(b'\n');
     if bytes.len() > MAX_RECORD_BYTES {
         return Err("fatal error log exceeds size limit".into());
@@ -471,43 +489,15 @@ fn write_in_with_diagnostics(
     create_private_directory(base)?;
     create_private_directory(&directory)?;
     let path = directory.join(format!("{event_id}.json"));
-    let temporary = directory.join(format!(".{event_id}.tmp"));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| format!("could not create fatal error log: {error}"))?;
-    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_data()) {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("could not write fatal error log: {error}"));
-    }
-    fs::rename(&temporary, &path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        format!("could not commit fatal error log: {error}")
-    })?;
-    #[cfg(unix)]
-    File::open(&directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("could not sync fatal error log directory: {error}"))?;
+    fs::replace_private(&path, &bytes)
+        .map_err(|error| format!("could not retain fatal error log: {error}"))?;
     prune(&directory);
     Ok(path)
 }
 
 fn create_private_directory(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path)
-        .map_err(|error| format!("could not create fatal error log directory: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|error| format!("could not secure fatal error log directory: {error}"))?;
-    }
-    Ok(())
+    fs::create_private_dir_all(path)
+        .map_err(|error| format!("could not create fatal error log directory: {error}"))
 }
 
 fn prune(directory: &Path) {
@@ -562,8 +552,19 @@ fn event_order(path: &Path) -> Option<(u64, u32, u64)> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use agentkit_loop::LoopError;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -573,8 +574,19 @@ mod tests {
         DIAGNOSTIC_MARKER, FatalRecord, H2Reason, IoClassification, MAX_DIAGNOSTIC_BYTES,
         MAX_RECORDS_PER_SESSION, ReqwestDiagnostics, Surface, TransportDiagnostics,
         TransportSource, TransportStage, bounded, classify, event_order, record_loop_error,
-        render_loop_error, split_diagnostics, write_in, write_in_with_diagnostics,
+        render_loop_error, split_diagnostics, write_in_with_diagnostics,
     };
+
+    fn write_in(
+        base: &Path,
+        session_id: &str,
+        surface: Surface,
+        kind: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<PathBuf, String> {
+        write_in_with_diagnostics(base, session_id, surface, kind, code, message, None)
+    }
 
     fn append_diagnostics(message: String, diagnostics: &TransportDiagnostics) -> String {
         let encoded = serde_json::to_vec(diagnostics).unwrap();
@@ -647,6 +659,84 @@ mod tests {
         assert_eq!(record.session_id, "session-1");
         assert_eq!(record.surface, "prompt");
         assert_eq!(record.code, "stream_transport");
+    }
+
+    #[test]
+    fn schema_two_readers_preserve_optional_span_context() {
+        use tracing_subscriber::prelude::*;
+        // Frozen shipped schema-v2 shape: unknown top-level fields are ignored.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct ShippedV2 {
+            schema_version: u64,
+            event_id: String,
+            occurred_at_ms: u64,
+            kit_version: String,
+            session_id: String,
+            surface: String,
+            kind: String,
+            code: String,
+            message: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            diagnostics: Option<super::TransportDiagnostics>,
+        }
+        let root = tempfile::tempdir().unwrap();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(crate::telemetry::error_spans::ErrorSpanLayer),
+            || {
+                let operation = crate::telemetry::error_spans::operation("prompt");
+                operation.in_scope(|| {
+                { let _child = tracing::info_span!(target: "agentkit_loop", "agent.execute_tool", launch_kind = "plain"); }
+                let path = write_in_with_diagnostics(root.path(), "session-context", Surface::Prompt, "provider", "stream_transport", "openai-subscription stream transport failed", Some(&sample_diagnostics())).unwrap();
+                let bytes = fs::read(&path).unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["schema_version"], 2);
+                assert_eq!(value["span_context"]["fragments"][1]["fields"]["launch_kind"], "plain");
+                let current: FatalRecord = serde_json::from_slice(&bytes).unwrap();
+                let legacy: ShippedV2 = serde_json::from_slice(&bytes).unwrap();
+                let mut known = serde_json::to_value(&current).unwrap();
+                known.as_object_mut().unwrap().remove("span_context");
+                assert_eq!(serde_json::to_value(&legacy).unwrap(), known);
+                assert_eq!(current.message, "openai-subscription stream transport failed");
+                let supplied = value["span_context"].clone();
+                for marker in [1, 2, 3, 4] {
+                    value["schema_version"] = json!(marker);
+                    let parsed: FatalRecord = serde_json::from_value(value.clone()).unwrap();
+                    assert_eq!(serde_json::to_value(parsed.span_context).unwrap(), supplied);
+                }
+                value.as_object_mut().unwrap().remove("span_context");
+                assert!(serde_json::from_value::<FatalRecord>(value.clone()).unwrap().span_context.is_none());
+                value["span_context"] = supplied;
+                value["span_context"]["fragments"][1]["fields"]["launch_kind"] = json!("SECRET");
+                assert!(serde_json::from_value::<FatalRecord>(value).is_err());
+                assert_eq!(fs::read(path).unwrap(), bytes);
+                assert!(bytes.len() < super::MAX_RECORD_BYTES);
+            });
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_writer_omits_disabled_context() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let root = tempfile::tempdir().unwrap();
+            let operation = crate::telemetry::error_spans::operation("prompt");
+            let path = operation
+                .in_scope(|| {
+                    write_in(
+                        root.path(),
+                        "session-disabled",
+                        Surface::Prompt,
+                        "runtime",
+                        "runtime_error",
+                        "ordinary error",
+                    )
+                })
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert!(value.get("span_context").is_none());
+            assert_eq!(value["message"], "ordinary error");
+        });
     }
 
     #[test]
@@ -796,6 +886,38 @@ mod tests {
         assert_eq!(code, "provider_error");
         assert_eq!(message, "provider request failed");
         assert!(diagnostics.is_none());
+    }
+
+    #[test]
+    fn typed_provider_failures_preserve_fatal_and_cancellation_behavior() {
+        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+
+        for reason in [
+            ProviderFailureReason::RetryExhausted,
+            ProviderFailureReason::Authentication,
+            ProviderFailureReason::Cancelled,
+        ] {
+            let error = LoopError::ProviderFailure(Box::new(ProviderFailure {
+                route: ProviderRoute::OpenAiResponses,
+                reason,
+                last_attempt_reason: None,
+                upstream: Default::default(),
+                accounting: Default::default(),
+            }));
+            if reason == ProviderFailureReason::Cancelled {
+                assert!(
+                    record_loop_error("session-1", Surface::Acp, &error)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let (kind, code, message, diagnostics) = classify(&error).unwrap();
+                assert_eq!(kind, "provider");
+                assert_eq!(code, "provider_error");
+                assert_eq!(message, "provider request failed");
+                assert!(diagnostics.is_none());
+            }
+        }
     }
 
     #[test]

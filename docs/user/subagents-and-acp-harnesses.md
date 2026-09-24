@@ -4,6 +4,27 @@ Kit can start parent-owned nested agents through the [Agent Client Protocol (ACP
 
 A subagent is a reusable Runlet value, not a detached background task: start it with `subagent`, continue the same session with `prompt`, branch its completed context with `fork`, list retained handles with `subagents({})`, or terminate one with `close`.
 
+## Prompt content and file context
+
+The `prompt` argument to `subagent`, `prompt`, and `fork` accepts either a string (the existing text-only form) or an ordered array of ACP content blocks:
+
+```text
+child = subagent({
+  prompt: [
+    { type: "text", text: "Review this interface against the requirements." },
+    { type: "resource_link", uri: "file:///project/src/interface.rs", name: "interface.rs", mimeType: "text/x-rust" },
+    { type: "resource", resource: { uri: "file:///project/requirements.txt", mimeType: "text/plain", text: "Keep existing callers compatible." } }
+  ]
+})
+return child.output
+```
+
+- `text` and `resource_link` require no optional child capability. A resource link refers to a URI the child can access; Kit does not read the URI or copy the file automatically. A local file must be accessible to the child in its own filesystem.
+- Embedded `resource` blocks contain a `resource` object with `uri`, optional `mimeType`, and either `text` or base64 `blob`. They require the child's `promptCapabilities.embeddedContext` capability.
+- `image` blocks contain base64 `data`, `mimeType`, and an optional `uri`. They require the child's `promptCapabilities.image` capability. These are ACP blocks, not Kit managed File references; the parent's session-authorized File references are not transferred to the child.
+
+Kit rejects unsupported content rather than silently converting it to text or dropping it. The array must be nonempty. Block order and metadata are preserved. When `output_schema` is set, Kit appends the JSON-output instructions as a separate text block after the supplied blocks. Roster task summaries use only text blocks, not embedded files or image data.
+
 ## Why use another harness from Kit?
 
 Keep Kit as the orchestrator and route only a bounded task to a specialist. The parent can start independent specialists concurrently, give each child explicit context, require structured output, continue a useful session, or fork an alternative. This makes the specialist's result composable with shell commands, edits, tests, MCP calls, and other agents in the same Runlet program.
@@ -16,7 +37,7 @@ Configure a descriptive alias for that route:
 [acp.claude]
 command = "npx"
 args = ["-y", "@agentclientprotocol/claude-agent-acp@0.69.0"]
-permissions = "deny"
+permissions = "allow"
 
 [subagent.harnesses."acp.claude".models]
 designer = "opus"
@@ -40,6 +61,8 @@ return design.output
 npx -y @agentclientprotocol/claude-agent-acp@0.69.0 --cli auth login --claudeai  # Claude subscription
 # Use --console instead for Anthropic Console API billing.
 ```
+
+When a child reports `auth_required`, Kit reports the advertised authentication `methodId` values (and a `methodId` supplied by the error), so you can identify the login method. Log in to that harness outside Kit, then retry the subagent call. Kit does not execute advertised terminal authentication commands or forward authentication error messages and arbitrary data, which may contain secrets.
 
 Kit does not perform this login. You can start Kit before authenticating the adapter; authentication only needs to finish before the subagent starts.
 
@@ -65,11 +88,40 @@ branch = fork({
 return { main: second.output, alternative: branch.output }
 ```
 
-Each successful turn returns a session value with `id`, `name`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and name while incrementing its generation. `fork` creates a different ID and uses its own preferred or fallback name; its generation is one greater than the supplied source value, and it does not advance the source session. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
+Each successful turn returns a session value with `id`, `name`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and name while incrementing its generation. `fork` creates a different ID and uses its own preferred or fallback name; its generation is one greater than the supplied source value, and it does not advance the source session. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. Explicit `close` also sends `session/delete` when advertised, removing the discarded branch’s persistent history after closing it. Delete failures are reported rather than silently ignored. Process shutdown and internal cleanup do not delete persistent history; this preserves completed child sessions for restart recovery. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
 
-Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
+Always pass the latest completed value back to `prompt` or `fork`. Reusing an older value fails with `stale subagent generation N; current generation is M`. This prevents two continuations from silently racing on one session. Prompt and fork calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently. Steering injects guidance into a working turn without waiting for that turn to finish.
 
 The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness`, `model`, and `cwd` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. `cwd` selects the new subagent's working directory; relative paths resolve from Kit's working directory, and missing paths or non-directories fail before startup. Omit an argument to retain its configured default. `prompt` and `fork` retain the original session's harness, model, and working directory. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
+
+## Steer a working subagent
+
+Use `steer({ id, prompt })` to inject guidance into an existing working turn,
+without cancelling it or starting a new turn. While the originating `compose`
+is backgrounded, call `subagents({})` in a separate compose to find the child's
+immutable ID and confirm its status is `working`. Then use that ID:
+
+```text
+return steer({
+  id: "s-…",
+  prompt: "Keep the change limited to the parser; do not modify the public API."
+})
+```
+
+The prompt accepts the same text or ACP content-block input as `prompt`.
+Steering requires ACP v2 and a child that advertises `steer` support. Starting,
+idle, retired, and fork-reserved sessions are rejected, as are unknown IDs.
+Unsupported peers return an error: Kit does not fall back to cancellation or
+re-prompting. Use `prompt` with the latest completed handle for an idle child.
+
+The returned value is the child's acceptance receipt, **not proof that the
+injection was delivered, applied, or finished**. Steering does not wait for idle
+or change the turn, generation, or reusable handle. The original backgrounded
+compose remains responsible for returning the completed turn's output. The
+child can finish or close between listing and steering, so a working listing
+does not guarantee acceptance. If acknowledgement times out, delivery is unknown;
+Kit does not cancel the original turn or retry the injection. Dropping the
+steering caller also does not revoke an injection already sent to the child.
 
 ## Inspect display names
 
@@ -80,6 +132,14 @@ Kit trims preferred names and accepts 1–32 bytes of printable ASCII. Names com
 A name is reserved when creation starts. A failed creation releases it; otherwise the reservation survives starting, working, idle, and reusable failures until `close` or terminal retirement. Nested Kit processes allocate independently, so separate descendant branches can generate duplicate visible names in the agent roster even though each parent keeps its direct-child names unique.
 
 Use `subagents({})` to inspect live direct children. Each row contains `id`, `name`, `status`, `generation`, and the bounded current task summary. Closed and terminally retired children are omitted.
+
+## Read the agent roster
+
+The terminal client's agent roster lists every live subagent with its status, current activity, and elapsed time. The activity excerpt uses a running tool's title, otherwise an in-progress plan entry, otherwise the latest session title, otherwise the original prompt. These updates depend on what the harness reports over ACP. When a turn finishes, tool and plan activity clears and the excerpt returns to the session title or prompt. Kit publishes compose `intent` as an ACP tool-title update, which also supplies the main TUI's tool summary.
+
+When a harness reports context usage over ACP, the row shows the same `percent used/size` readout as the header on a separate line below the activity excerpt. Kit's own ACP server always reports it, so nested Kit subagents show usage without configuration.
+
+When every subagent runs on `acp.kit`, rows carry no harness mark. Once the roster mixes harnesses, each row gains a one-cell mark next to its name: a blue `k` for Kit, `✱` for Claude, `◎` for Codex, `◇` for OpenCode, `◈` for Copilot, `▸` for Cursor, `π` for Pi, `◭` for Antigravity, and `·` when the launch line names none of them. Kit infers the mark from the configured profile's command and arguments, matching whole tokens such as `claude-agent-acp` or `codex-acp`; the `[acp.<name>]` label itself is not consulted.
 
 ## Require structured JSON output with `output_schema`
 
@@ -116,7 +176,9 @@ Without `output_schema`, `output` is text. A turn that emits selected non-text a
 }
 ```
 
-Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. When an ACP tool update's rendered content is only a JSON copy of its structured `rawOutput`, Kit retains only `rawOutput` in the parent-visible update. Kit does not expose child thoughts, user-message echoes, usage, modes, commands, configuration, or session metadata through this value.
+Text-only turns omit `updates`. Capture is limited to 64 update objects and 64 KiB of serialized update data per turn. Excess or oversized updates are omitted and set `updates.truncated` to `true`. When an ACP tool update's rendered content is only a JSON copy of its structured `rawOutput`, Kit retains `rawOutput` and replaces the duplicate content with an empty array. This preserves the update's explicit replacement of earlier rich content. Kit also captures usage (including reported cumulative session cost), session info, available commands, notices, compaction lifecycle updates, and compaction summary chunks. These remain separate from the final answer text. Usage values describe context occupancy, not billable token deltas; cumulative costs must not be summed across updates. Kit does not add child costs to parent billing totals. Child thoughts, user-message echoes, modes, and configuration are not exposed through this value. Session titles and context usage also feed the live agent roster independently of these capture limits; thoughts are not forwarded as activity text.
+
+After a successful child turn, ACP clients receive the child's final diff and terminal content on the existing `subagent`, `prompt`, or `fork` tool card. Content updates replace earlier snapshots; content chunks append. V1 file snapshots also map to v2 file changes. Native v2 diffs without complete before/after text remain v2-only, as do agent-owned terminals. Child terminal output is replayed at completion, not streamed live; terminal IDs are scoped to the parent invocation. Kit does not execute captured terminal commands. Missing exit information remains unknown, and incomplete terminal captures carry `kit/outputIncomplete` metadata. Display is limited to 64 rich content items, with the same metadata marking additional display truncation. Raw child output and captured terminal IDs are not rewritten by this display projection. Failed or cancelled child turns do not publish a completion snapshot.
 
 ## Choose the built-in `acp.kit` harness
 
@@ -134,11 +196,17 @@ Kit appends its required runtime, resolved reasoning-effort, persistent-session,
 
 Kit's ACP server also advertises a separate reasoning-effort session selector with `Default`, `Low`, `Medium`, and `High` values. Changes take effect on the next turn without changing the selected model. `Default` leaves the effort unset, preserving provider defaults and `OPENROUTER_REASONING_EFFORT` when OpenRouter supplies one. Set the startup default with top-level `reasoning_effort` or `--reasoning-effort`; the bundled TUI exposes the same selector through `/effort`. Built-in `acp.kit` children inherit the startup value resolved from CLI and TOML, while generic ACP harnesses keep their own behavior.
 
-Built-in subagent transcripts are durable on disk, but their reusable parent-owned values exist only for the lifetime of the owning parent session. Closing that main session drops its subagent manager, which closes every child actor and terminates the retained child processes. A later Kit process cannot pass an old value to `prompt` or `fork`.
+Persistent parent sessions record their direct children’s ACP session IDs, harness references, working directories, names, and completed handle generations in the parent transcript. Loading the same parent restores completed handles without immediately starting child processes. Child lifecycle checkpoints must reach disk before a mutable prompt or explicit deletion proceeds; unavailable storage can therefore block these operations. `prompt` and native `fork` reconnect on demand using the current harness configuration. Closing the parent still releases its child processes; it does not delete their history. Nonpersistent parents retain process-lifetime handles only.
 
-## Configure a generic ACP v1 harness
+Recovery reattaches the same mutable child session, not a snapshot or a new branch. It is not the generic immutable fork fallback discussed in #12. Interrupted turns are not automatically retried, and explicitly closed children are never restored—even if remote history deletion failed. Existing transcripts without child records remain readable but cannot reconstruct their old child handles. New child-state records require a reader that understands the newer transcript schema.
 
-Generic external child harnesses remain ACP v1: they must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` and `session/close` are optional capabilities. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
+For v2 children, Kit waits for an idle `state_update` after prompt acceptance before returning output. Its stop reason uses the same success, cancellation, refusal, and request-limit handling as v1. Steering requires ACP v2 with advertised `steer` support. An omitted reason permits normal completion; an unknown reason reports an error rather than success. Whole-message updates replace text by message ID; omitted content preserves text, empty or null content clears it, and later chunks append.
+
+For generic v2 children, recovery uses `session/resume` with `replayFrom: {"type": "start"}`; v1 children must advertise `loadSession` and are reattached with `session/load`. Built-in Kit children use their persistent-session launch path. Replay completes before the next prompt and never replaces the handle’s last-turn output. Kit uses only IDs recorded by the owning parent; it does not scan and adopt unrelated child sessions. If the harness was removed, cannot load sessions, or lost its history, reconnect fails without creating a replacement session. Restore the harness configuration or explicitly close the obsolete handle. Close during an in-progress reconnect reports an error without retiring the handle; retry after startup completes or is cancelled.
+
+## Configure a generic ACP harness
+
+Kit offers ACP v2 with its client name and version during initialization, uses the version selected by the child, and falls back to ACP v1 when selected. Unsupported versions fail before a session is opened. Generic external child harnesses must speak newline-delimited JSON-RPC over stdio and support `initialize`, `session/new`, and `session/prompt`. `session/fork` is optional. `session/close` is optional in v1 and baseline for v2 sessions. Kit does not advertise filesystem or terminal services to children. Keep stdout protocol-only; the agent may log to stderr. Kit runs the executable directly from the subagent's selected working directory, which defaults to Kit's working directory, and inherits the parent environment. It does not invoke a shell, so pipes, environment assignments, compound commands, and shell quoting in `command` or `args` do not work.
 
 Configure trusted argv profiles in `~/.kit/config.toml`:
 
@@ -146,7 +214,7 @@ Configure trusted argv profiles in `~/.kit/config.toml`:
 [acp.review]
 command = "review-agent"
 args = ["acp"]
-permissions = "deny"
+permissions = "allow"
 
 [subagent]
 harness = "acp.review"
@@ -155,6 +223,39 @@ harness = "acp.review"
 References use the fully qualified `acp.<name>` form. Profile names must be non-empty and contain neither whitespace nor dots. `command` must be non-empty; use an executable on `PATH` or an absolute path. Kit does not perform a generic agent's login or ACP authentication flow, so authenticate and configure that agent before starting Kit. Generic session persistence beyond the parent process is agent-defined. Per-subagent model selection works for generic agents such as Codex, Claude, or Cursor only when their ACP adapter advertises and implements the selectable `model` session option.
 
 An unknown selection fails with `unknown ACP harness "acp.name"` or `unknown subagent ACP harness "acp.name"`. Invalid references may report `ACP harness references must use acp.<name>`.
+
+## Configure child session options
+
+Set trusted initial options per harness in the subagent profile:
+
+```toml
+[subagent.harnesses."acp.review".config_options]
+thought_level = "high"
+mode = "code"
+auto_compact = true
+```
+
+Values must be strings for ACP select options or booleans for ACP boolean options.
+Use the child's advertised option ID. If no ID matches, Kit accepts an unambiguous
+advertised category such as `thought_level` (which may map to `reasoning_effort`).
+Missing, ambiguous, or incompatible options fail startup; a child rejection also
+fails startup rather than silently using its default. Option names and accepted
+values depend on the harness. Model selection continues to use the dedicated
+`model` argument and alias/allowlist policy, not `config_options`.
+
+Kit applies an explicit model first, then profile options in key order, using the
+updated option list returned after each selection. Native forks inherit the
+child's current configuration; they do not reset it to profile defaults. A
+model explicitly selected for the source is reapplied to its forks. Fallback
+forks start a new child and apply the profile again.
+
+Returned `updates.items` includes the latest complete `config_option_update`
+snapshot advertised by the child, including changes received between prompts.
+Snapshots replace earlier state rather than merging option lists. They share the
+existing bounded update budget: Kit prioritizes the latest snapshot over earlier
+activity updates and sets `updates.truncated` when content cannot fit. A single
+oversized snapshot is omitted. This is child-reported state, not an assertion
+that the child accepted an unrequested or unsupported setting.
 
 ## Configure model aliases and allowed overrides per harness
 
@@ -187,16 +288,19 @@ Do not infer support from the agent name or an old compatibility table; ACP capa
 
 ## Headless permission policy
 
-Nested agents cannot ask the user interactively. ACP permission requests therefore use the profile's fail-closed `permissions` policy:
+Nested agents run unattended and cannot ask the user interactively. Kit selects `allow_always` when offered, otherwise `allow_once`. If the child offers no allow option, Kit cancels the request; it never selects a rejection option.
 
-- `permissions = "deny"` (the default) selects `reject_always`, or `reject_once` if that is the only rejection offered. If no rejection option exists, Kit cancels the permission request.
-- `permissions = "cancel"` always cancels the request.
+`permissions = "allow"` is the default. The legacy values `"deny"` and `"cancel"` remain accepted for existing configuration files, but now also allow requests. Remove these old settings to avoid implying a restriction that Kit no longer enforces.
 
-Kit never selects an allow option. Configure any additional non-interactive policy in the generic agent itself, with the same care as when running that executable directly.
+Only configure executables and fixed arguments you trust. Child edits and shell commands can run without approval; restrict access through the child's configuration and process privileges, as when running that executable directly.
+
+## Child elicitation
+
+Nested agents cannot collect interactive input. Kit answers child ACP `elicitation/create` requests with `cancel`, for both form and URL modes, rather than a method-not-found error. Kit does not supply form values, open URLs, or forward these requests to the parent model. This is independent of the child's permission policy; the child decides how to continue after cancellation.
 
 ## Cancellation, stop reasons, and retired sessions
 
-Cancelling an outer turn propagates to nested work. For a dispatched prompt, Kit sends ACP `session/cancel` and allows up to five seconds for the child to settle; a child that does not settle is terminated. Cancellation while starting, waiting for the session lock, prompting, or forking returns a cancelled tool result.
+Cancelling an outer turn propagates to nested work. For a dispatched prompt, Kit sends ACP `session/cancel` and allows up to five seconds for the child to settle; a child that does not settle is terminated. Cancellation while starting, waiting for the session lock, prompting, or forking returns a cancelled tool result. A cancelled fork or a fork that exceeds its 30-second deadline sends `$/cancel_request` for the in-flight request. Kit still waits for a late fork response to clean up any created session before releasing source-session serialization. A `session/close` request that exceeds its five-second deadline also sends `$/cancel_request` before its response is discarded. Protocol cancellation is advisory; it does not guarantee that the child stopped or rolled back the operation.
 
 `end_turn` and `max_tokens` are successful completed turns. In particular, a max-token response returns its partial output and remains reusable. `cancelled`, refusal (`nested agent refused the prompt`), `max_turn_requests` (`nested agent reached its turn-request limit`), protocol errors, and unknown stop reasons are failures. Once a `prompt` continuation has been dispatched and fails, Kit retires that session because its transcript may have changed; retry by starting a new subagent rather than reusing the old value. Reuse can report `unknown subagent session`, `subagent session is retired`, or `nested agent process is no longer running`.
 
@@ -207,9 +311,18 @@ Kit currently permits nesting to depth 2 and at most 120 live parent-owned subag
 ACP startup must complete within 30 seconds. Native `session/fork` must also answer within 30 seconds. Common diagnostics include:
 
 - `ACP harness spawn failure`: verify `command`, `args`, executable installation, and `PATH`.
-- `ACP harness handshake timeout` or `ACP harness protocol handshake failure`: verify ACP v1 support, required methods, and that stdout contains only protocol messages. Check stderr for lines prefixed `ACP harness <name>:`.
+- `ACP harness handshake timeout` or `ACP harness protocol handshake failure`: verify ACP v1 or v2 support, required methods, and that stdout contains only protocol messages. Check stderr for lines prefixed `ACP harness <name>:`.
 - `ACP harness did not answer session/fork within 30 seconds`: update or repair the agent, or avoid `fork`; only `acp.kit` has the transcript fallback.
 - `nested agent exited during startup` or `nested agent process exited without a response`: run the configured installed executable directly enough to verify installation and login, then inspect its stderr.
 - Structured output remains text: ask for bare JSON, inspect the raw `output`, and use a repair `prompt` with an appropriate `output_schema`.
 
 For current top-level and subcommand options, run `kit --help` or `kit <command> --help`.
+
+Child sessions inherit the owning ACP session’s additional project directories on
+`session/new` and native `session/fork`, including the Kit fork fallback. These
+directories are project context, not filesystem access boundaries. An explicit
+`subagent.cwd` changes the primary working directory without discarding the
+additional directories. Each parent session has its own directory list.
+If the parent has additional directories, a child harness must advertise ACP
+additional-directory support; otherwise Kit rejects startup with an explicit
+error instead of silently dropping project context.

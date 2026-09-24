@@ -5,25 +5,17 @@ root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 "$root/scripts/generate-acp-swift.py"
 
 required_version=2.45.4
-if [[ -n ${XCODEGEN:-} ]]; then
-  xcodegen=$XCODEGEN
-elif [[ -x ${HOME:-}/.local/bin/xcodegen && -f ${HOME:-}/.local/bin/.xcodegen-$required_version-sha256 ]]; then
-  xcodegen=${HOME}/.local/bin/xcodegen
-else
-  xcodegen=xcodegen
-fi
-required_archive_sha=090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef
+required_binary_sha=6aa2b4da95304b343bea12890c59f9655aa428c08b351d57d592cfab4e88a9f1
+xcodegen=${XCODEGEN:-xcodegen}
 tool_path=$(command -v "$xcodegen" 2>/dev/null || true)
-marker=$(dirname "${tool_path:-/missing}")/.xcodegen-$required_version-sha256
-if [[ ! -f $marker || $(cat "$marker") != "$required_archive_sha" ]]; then
-  echo "XcodeGen must come from the repository-pinned release archive." >&2
-  echo "Run scripts/install-xcodegen.sh and put its destination first in PATH." >&2
+if [[ -z $tool_path ]]; then
+  echo "xcodegen is not on PATH. Run: mise install" >&2
   exit 1
 fi
-actual_version=$($xcodegen --version | awk '/Version:/ { print $2 }')
-if [[ $actual_version != "$required_version" ]]; then
-  echo "XcodeGen $required_version is required (found ${actual_version:-unknown})" >&2
-  echo "Run scripts/install-xcodegen.sh or set XCODEGEN to the pinned binary." >&2
+actual_binary_sha=$(shasum -a 256 "$tool_path" | awk '{ print $1 }')
+if [[ $actual_binary_sha != "$required_binary_sha" ]]; then
+  echo "XcodeGen must be the repository-pinned $required_version release binary (found $tool_path)." >&2
+  echo "Run mise install, or set XCODEGEN to the pinned binary." >&2
   exit 1
 fi
 

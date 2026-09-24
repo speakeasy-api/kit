@@ -34,7 +34,7 @@ Most agent harnesses expose many tools and require one model round trip for each
 
 Fewer model round trips repeat less context and complete more work in each request. In size-matched production tasks, Kit used approximately half the input tokens and active time per hand-written line of Codex CLI or Claude Code ([comparison](#how-it-compares)).
 
-- **One tool, unlimited composition.** The model receives one tool: `compose`. A `compose` program can call `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool`, `auth`, `skill`, `a2a`, and `docs`. Independent calls run concurrently. Use data dependencies or `after` blocks to control execution order. Use `boundary retry N` and `fail()` to handle errors in the program.
+- **One tool, unlimited composition.** The model receives one tool: `compose`. A `compose` program can call `shell`, `edit`, `subagent`, `prompt`, `fork`, `tool_search`, `tool_schema`, `tool`, `auth`, `skill`, `a2a`, and `docs`. Independent calls run concurrently. Use data dependencies or `after` blocks to control execution order. Use `boundary retry N` and `fail()` to handle errors in the program.
 - **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
 - **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
 - **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
@@ -51,7 +51,37 @@ curl -fsSL https://raw.githubusercontent.com/speakeasy-api/kit/main/install.sh |
 
 The installation script downloads the release archive. It verifies the archive against `SHA256SUMS` and installs Kit in `~/.local/bin`. Set `KIT_VERSION=v0.1.108` to select a release. Set `KIT_INSTALL_DIR` to change the destination.
 
-<!-- PLACEHOLDER: record docs/media/install.gif — run the curl|sh line in a clean shell, then `kit --version`. The tape is in scripts/readme-media/install.tape; it only works once install.sh is on main. -->
+### Update Kit
+
+```sh
+kit update --dry-run  # inspect the installation method and proposed action
+kit update
+```
+
+Kit checks the **running executable**, not the first `kit` on `PATH`. Dry runs only
+read local provenance: they do not download, run package managers, or change files.
+Release CLI builds in `~/.local/bin` use the installer embedded in Kit to install
+the latest release, verify its checksum, and atomically replace the executable.
+`KIT_VERSION` is ignored for updates. For a custom installer destination, set
+`KIT_INSTALL_DIR` to that same directory. Symlinks to a recognized installation
+work; moving a binary elsewhere does not establish installer provenance.
+
+Cargo installations use the owning install root's metadata and keep their source:
+local paths rebuild the original checkout (update that checkout first), Git sources
+keep explicit branch/tag/revision selectors, and crates.io installs stay on
+crates.io. Recorded features, profile, and target are preserved when available.
+Missing checkouts, inconsistent provenance, and custom registries are refused
+rather than silently switching to upstream. Use the original `cargo install`
+command when an automatic plan is unavailable.
+
+Unknown/source-built binaries and older release builds without a release marker
+are not overwritten. Rebuild and run `mise run install`, or rerun the release
+installer explicitly. For Homebrew, verify the owning formula with `brew list`
+and use `brew upgrade <owning-formula>`; automatic Homebrew updates are not
+supported. Update desktop apps through the app distribution, and pull a new image
+and recreate containers rather than modifying bundled executables.
+
+<p align="center"><img src="docs/media/install.gif" alt="Installing kit with the release script, then checking the version" width="900"></p>
 
 ### mise
 
@@ -60,12 +90,33 @@ mise use -g github:speakeasy-api/kit        # latest
 mise use -g github:speakeasy-api/kit@0.1.108
 ```
 
+`kit update` (including `--dry-run`) recognizes mise-managed installations and
+refuses to overwrite their versioned files, even with `KIT_INSTALL_DIR` set.
+Detection checks the canonical executable under mise's actual installs directory:
+`MISE_INSTALLS_DIR`, or `MISE_DATA_DIR/installs`, defaulting to
+`${XDG_DATA_HOME:-~/.local/share}/mise/installs` on macOS and Linux.
+
+Update through mise from the directory whose configuration selects Kit:
+
+```sh
+mise ls github:speakeasy-api/kit       # inspect selected version and config
+mise upgrade github:speakeasy-api/kit # respect the configured version range
+```
+
+An exact version pin remains pinned. To deliberately update that pin, use
+`mise upgrade --bump github:speakeasy-api/kit` in the intended configuration
+scope. Kit does not choose a project/global scope or change mise config for you.
+This is distinct from `mise run install` in a source checkout, which creates a
+Cargo installation and follows the Cargo update rules above.
+
 ### Docker
 
 ```sh
-docker run --rm -it -v "$PWD:/workspace" -v ~/.kit:/home/kit/.kit \
-  ghcr.io/speakeasy-api/kit:latest tui --credential-store file
+docker run --rm -i -v "$PWD:/workspace" -v ~/.kit:/home/kit/.kit \
+  ghcr.io/speakeasy-api/kit:latest acp --credential-store file
 ```
+
+Images are headless: they serve ACP, A2A, and `prompt` but omit the `tui` command and native voice. Use a release binary or `mise run install` for the terminal client.
 
 Kit publishes images for `linux/amd64` and `linux/arm64`. Each image has three variants: `slim`, `bookworm`, and `alpine`. The default `slim` variant uses Debian slim. The `alpine` variant uses a native musl build.
 
@@ -82,13 +133,21 @@ USER kit
 
 ### From source
 
-To build Kit from source, use the Rust toolchain specified in `rust-toolchain.toml`.
+[mise](https://mise.jdx.dev) owns the toolchain: `mise.toml` pins Rust and every other build tool, and `mise run` exposes the build, test, and packaging tasks. Docker, Linux system development packages, and, on macOS, Xcode are not installed by `mise install`.
 
 ```sh
 git clone https://github.com/speakeasy-api/kit && cd kit
-cargo build --release          # target/release/kit
-scripts/sign-release.sh        # macOS only: sign before using the Keychain credential store
+mise install                   # Rust 1.94 with rustfmt and clippy; Python and XcodeGen on macOS
+mise run setup:linux           # Debian/Ubuntu only: C/C++, CMake, pkg-config, ALSA/PulseAudio headers (sudo)
+mise run install               # cargo install into ~/.cargo/bin
+mise run dev -- tui --root .   # cargo run; arguments pass through
+mise run test -- --test cli    # cargo test; arguments select a suite or a test name
+mise run check                 # lint, Rust tests, and script tests, as CI runs them
+mise run build:release         # target/release/kit
+mise run sign                  # macOS only: sign before using the Keychain credential store
 ```
+
+`mise tasks` lists the rest: `macos:run` builds and opens the desktop app (see [macos/README.md](macos/README.md)), and `docker:build` builds a container flavor with `docker buildx`.
 
 Release binaries for macOS are signed and notarized under `com.speakeasy.kit`; the outer desktop app uses `com.speakeasy.kit.desktop`. See [Releasing](docs/releasing.md).
 
@@ -157,6 +216,7 @@ return { refined: refined.output, alternative: alt.output, active: subagents({})
 <p align="center"><img src="docs/media/subagents.gif" alt="Kit orchestrating Claude and Codex ACP subagents in parallel" width="900"></p>
 
 - **Any ACP harness.** Kit includes `acp.kit`. You can add Claude, Codex, Cursor, or another harness that supports ACP v1 over stdio. The TOML configuration below requires four lines. Kit reads each harness's `initialize` response at runtime. Kit uses native `session/fork` when the harness advertises it. Otherwise, Kit creates an isolated transcript fork for Kit children.
+- **Restart recovery.** Persistent parent sessions restore completed child handles and reconnect on demand with the recorded ACP session IDs. Generic harnesses must support v2 resume or advertise v1 load; recovery does not provide a generic immutable fork fallback.
 - **Structured output.** Set `output_schema` on any call that produces a turn. If a reply does not match the schema, Kit returns the raw text and advances the generation. The next `prompt` can repair the reply.
 - **Per-harness model aliases.** `[subagent.harnesses."acp.claude".models] designer = "opus"` gives visual-design work an intentional route without exposing harness-specific model IDs in prompts. An `allow_model_overrides` list restricts explicit model overrides.
 - **Bounded resources.** Subagent depth is limited to 2. Each session can have 120 live subagents. The startup handshake has a 30-second limit. Kit rejects or cancels permission requests from headless children. Kit never approves these requests automatically.
@@ -256,7 +316,7 @@ When the provider reports 80% context-window use, Kit converts older history int
 - **Crash-safe.** Kit permits only one live process to modify each session. Kit reclaims a stale lock only when the operating system confirms that no process holds it. Use `--force` only with `--resume <session-id>` to reclaim a stale lock. The TUI also reclaims a stale lock when you switch sessions. Kit replaces an incomplete tool call with an explicit synthetic error result.
 - **OpenAI subscription retries.** Kit retries eligible transient failures with deterministic full-jitter backoff. Eligible failures include 408, 425, 429, 500, 502, 503, 504, and 529 responses. They also include transport failures and stream failures before the first token. The retry deadline is 24 hours. Kit reuses the same idempotency key. `openai-subscription` does not retry authentication failures, quota failures, or failures after output starts.
 - **Daemon operation.** `kit serve --remote-acp --no-stdio` runs independently of stdin. `SIGINT` and `SIGTERM` stop new connections, interrupt live sessions, and allow five seconds for draining. One bearer token file protects the HTTP listener.
-- **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans through OTLP/gRPC. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
+- **Observability.** Set `otel_endpoint = "http://localhost:4317"` to export AgentKit GenAI spans. OTLP/gRPC remains the default; set `otel_protocol` to `http/protobuf` or `http/json` to use an HTTP trace transport. Kit exports spans for the main agent, ACP sessions, nested children, and the compactor. Kit disables message-content capture by default. Kit limits captured message content when you enable it.
 
 See [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md) for the trust model, operational limits, and recovery guidance.
 
@@ -278,6 +338,10 @@ Any ACP-compatible client can use Kit. Use `kit acp` for stdio. Use `kit serve -
 
 `kit init` writes this configuration. Command-line flags override the configuration.
 
+Use `kit config get`, `kit config set`, and `kit config unset` to inspect and edit `~/.kit/config.toml`. For example, `kit config set model gpt-6-astra` saves a plain-string model ID without changing the provider or checking model availability. Choose a model supported by your provider; a per-command `--model` still overrides the saved value.
+
+`kit config get` prints the whole document; `kit config get model` reads one value, and `kit config unset model` removes it. Edits preserve comments, unrelated settings, unknown keys, a UTF-8 BOM, and symlinks. See [configuration editing](docs/user/getting-started-and-configuration.md#edit-configuration-from-the-command-line) for TOML paths, value parsing, and missing-file behavior.
+
 ```toml
 provider = "openai-subscription"   # openrouter | speakeasy
 model = "gpt-5.6-sol"
@@ -286,6 +350,7 @@ credential_store = "file"          # memory | keychain | file
 credential_dir = "~/.kit/credentials"
 mcp_config = "~/.kit/mcp.json"
 otel_endpoint = "http://localhost:4317"
+otel_protocol = "grpc"                  # grpc | http/protobuf | http/json
 
 [acp.claude]
 command = "npx"
@@ -334,6 +399,7 @@ Kit used the fewest tokens, took the least active time, and needed the least ste
 - [MCP](docs/user/mcp.md)
 - [Agent Plugins](docs/user/agent-plugins.md)
 - [TUI and sessions](docs/user/tui-and-sessions.md)
+- [Provider usage](docs/user/provider-usage.md)
 - [Security, limits, and troubleshooting](docs/user/security-limits-and-troubleshooting.md)
 - [Releasing](docs/releasing.md) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 

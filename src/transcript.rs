@@ -129,6 +129,14 @@ fn missing_result_metadata() -> MetadataMap {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use agentkit_core::ToolCallPart;

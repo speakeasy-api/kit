@@ -22,28 +22,59 @@ use serde_json::Value;
 
 use super::{
     CerebrasApiKey, OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
-    OpenRouterApiKey, SubscriptionConfig, cerebras::CerebrasCompatibleOpenRouter, speakeasy_auth,
+    OpenRouterApiKey, SubscriptionConfig, cerebras::CerebrasCompatibleOpenRouter,
+    chatgpt::SubscriptionModelCatalogCache, speakeasy_auth,
 };
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_SELECTOR_MODELS: usize = 2_000;
+const OPENROUTER_AUTH_REQUIRED: &str = "openrouter_auth_required: set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider";
+const SPEAKEASY_AUTH_REQUIRED: &str =
+    "speakeasy_auth_required: run `kit auth login speakeasy` before using the Speakeasy provider";
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, ValueEnum)]
+pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
+    [
+        ("openai_auth_required:", "openai"),
+        ("openrouter_auth_required:", "openrouter"),
+        ("cerebras_auth_required:", "cerebras"),
+        ("speakeasy_auth_required:", "speakeasy"),
+    ]
+    .into_iter()
+    .find_map(|(code, method_id)| detail.contains(code).then_some(method_id))
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 pub enum ProviderKind {
     #[default]
     #[serde(rename = "openai-subscription")]
-    #[value(name = "openai-subscription")]
     OpenAiSubscription,
     #[serde(rename = "openrouter")]
-    #[value(name = "openrouter")]
     OpenRouter,
     #[serde(rename = "speakeasy")]
-    #[value(name = "speakeasy")]
     Speakeasy,
     #[serde(rename = "cerebras")]
-    #[value(name = "cerebras")]
     Cerebras,
+}
+
+impl ValueEnum for ProviderKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self::OpenAiSubscription,
+            Self::OpenRouter,
+            Self::Speakeasy,
+            Self::Cerebras,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::OpenAiSubscription => "openai-subscription",
+            Self::OpenRouter => "openrouter",
+            Self::Speakeasy => "speakeasy",
+            Self::Cerebras => "cerebras",
+        }))
+    }
 }
 
 impl std::str::FromStr for ProviderKind {
@@ -113,14 +144,30 @@ pub(super) fn valid_model_id(value: &str) -> bool {
 pub struct ModelGroup {
     pub provider: ProviderKind,
     pub models: Vec<String>,
+    /// Provider-reported windows only; missing entries are unknown.
+    pub context_windows: std::collections::HashMap<String, u64>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+}
+
+impl ValueEnum for ReasoningEffort {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Low, Self::Medium, Self::High]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }))
+    }
 }
 
 impl ReasoningEffort {
@@ -147,15 +194,18 @@ impl ReasoningEffort {
 struct SessionSelection {
     model: ModelSelection,
     reasoning_effort: Option<ReasoningEffort>,
+    revision: u64,
 }
 
 /// A per-session adapter whose selection is read only when a new model turn begins.
 #[derive(Clone)]
 pub struct SelectableAdapter {
+    session_observer: Option<crate::session::SessionObserver>,
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
     cerebras_api_key: Option<CerebrasApiKey>,
+    openai_model_catalog: SubscriptionModelCatalogCache,
 }
 
 impl SelectableAdapter {
@@ -215,23 +265,31 @@ impl SelectableAdapter {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
         }
-        KitAdapter::new_with_credentials_and_effort(
-            selection.provider,
-            selection.model.clone(),
-            credential_storage.clone(),
-            reasoning_effort,
-            openrouter_api_key.as_ref(),
-            cerebras_api_key.as_ref(),
-        )?;
         Ok(Self {
+            session_observer: None,
             selection: Arc::new(Mutex::new(SessionSelection {
                 model: selection,
                 reasoning_effort,
+                revision: 0,
             })),
             credential_storage,
             openrouter_api_key,
             cerebras_api_key,
+            openai_model_catalog: SubscriptionModelCatalogCache::default(),
         })
+    }
+
+    /// Attach persistence before publishing any clones of this session adapter.
+    pub(crate) fn with_session_observer(
+        mut self,
+        observer: crate::session::SessionObserver,
+        persist_initial: bool,
+    ) -> Result<Self, String> {
+        if persist_initial {
+            observer.set_reasoning_effort(self.reasoning_effort()?)?;
+        }
+        self.session_observer = Some(observer);
+        Ok(self)
     }
 
     pub fn selection(&self) -> Result<ModelSelection, String> {
@@ -248,6 +306,33 @@ impl SelectableAdapter {
             .map_err(|_| "session selection lock is poisoned".into())
     }
 
+    async fn discovered_openai_models(&self) -> DiscoveredModels {
+        let config = match SubscriptionConfig::new(OPENAI_FALLBACK[0].to_string()) {
+            Ok(config) => config.with_credential_storage(self.credential_storage.clone()),
+            Err(_) => return DiscoveredModels::default(),
+        };
+        let adapter = match OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_catalog(
+            config,
+            None,
+            self.openai_model_catalog.clone(),
+        ) {
+            Ok(adapter) => adapter,
+            Err(_) => return DiscoveredModels::default(),
+        };
+        adapter
+            .model_catalog()
+            .await
+            .map(|catalog| DiscoveredModels {
+                models: catalog.visible_models().to_vec(),
+                context_windows: catalog.context_windows().clone(),
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn model_catalog(&self, current: &ModelSelection) -> Vec<ModelGroup> {
+        model_catalog_with_openai(current, self.discovered_openai_models()).await
+    }
+
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -261,10 +346,12 @@ impl SelectableAdapter {
             self.openrouter_api_key.as_ref(),
             self.cerebras_api_key.as_ref(),
         )?;
-        self.selection
+        let mut current = self
+            .selection
             .lock()
-            .map_err(|_| "session selection lock is poisoned")?
-            .model = selection;
+            .map_err(|_| "session selection lock is poisoned")?;
+        current.model = selection;
+        current.revision = current.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -281,10 +368,19 @@ impl SelectableAdapter {
             self.openrouter_api_key.as_ref(),
             self.cerebras_api_key.as_ref(),
         )?;
-        self.selection
+        let mut current = self
+            .selection
             .lock()
-            .map_err(|_| "session selection lock is poisoned")?
-            .reasoning_effort = reasoning_effort;
+            .map_err(|_| "session selection lock is poisoned")?;
+        // Selection -> transcript writer is the only nested lock order. Persist
+        // before publishing the new revision; a rejected write leaves selection
+        // unchanged, while unwinding isolates this selection via poison. Disk
+        // failure retains the transcript writer's best-effort semantics.
+        if let Some(observer) = &self.session_observer {
+            observer.set_reasoning_effort(reasoning_effort)?;
+        }
+        current.reasoning_effort = reasoning_effort;
+        current.revision = current.revision.wrapping_add(1);
         Ok(())
     }
 }
@@ -294,6 +390,7 @@ pub struct SelectableSession {
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
     cerebras_api_key: Option<CerebrasApiKey>,
+    openai_model_catalog: SubscriptionModelCatalogCache,
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
@@ -309,13 +406,14 @@ impl ModelAdapter for SelectableAdapter {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
-        let inner = KitAdapter::new_with_credentials_and_effort(
+        let inner = KitAdapter::new_with_credentials_effort_and_catalog(
             active.model.provider,
             active.model.model.clone(),
             self.credential_storage.clone(),
             active.reasoning_effort,
             self.openrouter_api_key.as_ref(),
             self.cerebras_api_key.as_ref(),
+            self.openai_model_catalog.clone(),
         )
         .map_err(LoopError::InvalidState)?
         .start_session(config.clone())
@@ -325,6 +423,7 @@ impl ModelAdapter for SelectableAdapter {
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
             cerebras_api_key: self.cerebras_api_key.clone(),
+            openai_model_catalog: self.openai_model_catalog.clone(),
             config,
             active,
             inner,
@@ -351,7 +450,7 @@ fn expose_background_call_ids(request: &mut TurnRequest) {
             };
             if text.contains(DETACHED) {
                 *text = format!(
-                    "Tool call ID: {} is running in the background.\nIt runs until result or failure is delivered.",
+                    "Tool call ID: {} is running in the background.\nNo independent work left? STOP.",
                     result.call_id
                 );
             }
@@ -374,13 +473,14 @@ impl ModelSession for SelectableSession {
             .map(|value| value.clone())
             .map_err(|_| LoopError::InvalidState("session selection lock is poisoned".into()))?;
         if selected != self.active {
-            let replacement = KitAdapter::new_with_credentials_and_effort(
+            let replacement = KitAdapter::new_with_credentials_effort_and_catalog(
                 selected.model.provider,
                 selected.model.model.clone(),
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
                 self.openrouter_api_key.as_ref(),
                 self.cerebras_api_key.as_ref(),
+                self.openai_model_catalog.clone(),
             )
             .map_err(LoopError::InvalidState)?
             .start_session(self.config.clone())
@@ -531,11 +631,35 @@ impl KitAdapter {
         openrouter_api_key: Option<&OpenRouterApiKey>,
         cerebras_api_key: Option<&CerebrasApiKey>,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_effort_and_catalog(
+            provider,
+            model,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            cerebras_api_key,
+            SubscriptionModelCatalogCache::default(),
+        )
+    }
+
+    fn new_with_credentials_effort_and_catalog(
+        provider: ProviderKind,
+        model: String,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+        openrouter_api_key: Option<&OpenRouterApiKey>,
+        cerebras_api_key: Option<&CerebrasApiKey>,
+        openai_model_catalog: SubscriptionModelCatalogCache,
+    ) -> Result<Self, String> {
         match provider {
             ProviderKind::OpenAiSubscription => {
                 let config =
                     SubscriptionConfig::new(model)?.with_credential_storage(credential_storage);
-                OpenAiSubscriptionAdapter::new_with_reasoning_effort(config, reasoning_effort)
+                OpenAiSubscriptionAdapter::new_with_reasoning_effort_and_catalog(
+                    config,
+                    reasoning_effort,
+                    openai_model_catalog,
+                )
             }
             .map(Self::OpenAiSubscription),
             ProviderKind::OpenRouter => {
@@ -549,7 +673,7 @@ impl KitAdapter {
                 let models_url = models_url(&config.base_url);
                 let inner = CompletionsAdapter::new(CerebrasCompatibleOpenRouter::from(config))
                     .map_err(|error| error.to_string())?
-                    .with_resilience(agentkit_http::ResilienceConfig::default());
+                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 let client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -571,7 +695,7 @@ impl KitAdapter {
                     None => match std::env::var("CEREBRAS_API_KEY") {
                         Ok(key) if !key.trim().is_empty() => CerebrasApiKey::new(key),
                         _ => super::cerebras_api_key(&credential_storage)?
-                            .ok_or("set CEREBRAS_API_KEY or run `kit auth login cerebras` before using Cerebras")?,
+                            .ok_or("cerebras_auth_required: set CEREBRAS_API_KEY or run `kit auth login cerebras` before using Cerebras")?,
                     },
                 };
                 if key.as_str().trim().is_empty() {
@@ -613,9 +737,8 @@ impl KitAdapter {
                 }))
             }
             ProviderKind::Speakeasy => {
-                let credentials = speakeasy_auth::load(&credential_storage)?.ok_or_else(|| {
-                    "run `kit auth login speakeasy` before using the Speakeasy provider".to_string()
-                })?;
+                let credentials = speakeasy_auth::load(&credential_storage)?
+                    .ok_or_else(|| SPEAKEASY_AUTH_REQUIRED.to_string())?;
                 let mut config =
                     OpenRouterConfig::new("unused", model).with_base_url(SPEAKEASY_COMPLETIONS_URL);
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
@@ -640,19 +763,18 @@ impl KitAdapter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedOpenRouterApiKeySource {
+pub(super) enum ResolvedOpenRouterApiKeySource {
     Explicit,
     Environment,
     Stored,
 }
 
-fn openrouter_config_from_env(
-    model: String,
+pub(super) fn resolve_openrouter_key(
     credential_storage: &crate::credentials::CredentialStorage,
     explicit_api_key: Option<&OpenRouterApiKey>,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
-) -> Result<OpenRouterConfig, String> {
-    let (api_key, key_source) = match explicit_api_key {
+) -> Result<Option<(String, ResolvedOpenRouterApiKeySource)>, String> {
+    let resolved = match explicit_api_key {
         Some(api_key) if api_key.as_str().is_empty() => {
             return Err("--openrouter-api-key cannot be empty".into());
         }
@@ -665,15 +787,25 @@ fn openrouter_config_from_env(
                 (api_key, ResolvedOpenRouterApiKeySource::Environment)
             }
             _ => (
-                super::openrouter_auth::load(credential_storage)?
-                    .map(|record| record.api_key.clone())
-                    .ok_or_else(|| {
-                        "set OPENROUTER_API_KEY or run `kit auth login openrouter` before using the OpenRouter provider".to_string()
-                    })?,
+                match super::openrouter_auth::load(credential_storage)? {
+                    Some(record) => record.api_key.clone(),
+                    None => return Ok(None),
+                },
                 ResolvedOpenRouterApiKeySource::Stored,
             ),
         },
     };
+    Ok(Some(resolved))
+}
+
+fn openrouter_config_from_env(
+    model: String,
+    credential_storage: &crate::credentials::CredentialStorage,
+    explicit_api_key: Option<&OpenRouterApiKey>,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<OpenRouterConfig, String> {
+    let (api_key, key_source) = resolve_openrouter_key(credential_storage, explicit_api_key, &env)?
+        .ok_or_else(|| OPENROUTER_AUTH_REQUIRED.to_string())?;
     let env_model = env("OPENROUTER_MODEL").unwrap_or_else(|_| "openrouter/auto".into());
     let mut config = OpenRouterConfig::new(api_key, env_model);
     if let Ok(app_name) = env("OPENROUTER_APP_NAME") {
@@ -787,7 +919,7 @@ impl ModelAdapter for KitAdapter {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
                 let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
-                    .with_resilience(agentkit_http::ResilienceConfig::default());
+                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 inner.start_session(config).await.map(|inner| {
                     KitSession::Speakeasy(SpeakeasyKitSession {
                         inner,
@@ -825,6 +957,249 @@ pub struct SpeakeasyKitSession {
     context_window: Option<u64>,
 }
 
+/// Project only the outbound request; the caller's canonical transcript stays typed.
+/// Completions (including OpenRouter) stringify tool Parts, but encode ordinary
+/// user Media as image_url content. Native transports retain typed tool images,
+/// but detached notification images always need ordinary user attachments.
+pub(super) fn project_tool_output_images(
+    mut request: TurnRequest,
+    native: bool,
+) -> Result<TurnRequest, LoopError> {
+    // Validate before moving or recursively visiting parts. The iterator stack
+    // bounds both depth and work without allocating a sibling-sized frontier.
+    const MAX_NODES: usize = 100_000;
+    const MAX_DEPTH: usize = 64;
+    let mut visited = 0;
+    let mut pending = Vec::new();
+    for item in &request.transcript {
+        visited += 1;
+        if visited > MAX_NODES {
+            return Err(tool_image_traversal_error());
+        }
+        // Store only one iterator per nesting level, never a transcript-wide
+        // frontier or one entry per sibling. Bound both traversal and stack size.
+        pending.push(item.parts.iter());
+        while let Some(parts) = pending.last_mut() {
+            let Some(part) = parts.next() else {
+                pending.pop();
+                continue;
+            };
+            visited += 1;
+            if visited > MAX_NODES {
+                return Err(tool_image_traversal_error());
+            }
+            if let Part::ToolResult(result) = part
+                && let ToolOutput::Parts(parts) = &result.output
+            {
+                if pending.len() >= MAX_DEPTH {
+                    return Err(tool_image_traversal_error());
+                }
+                pending.push(parts.iter());
+            }
+        }
+    }
+
+    let mut transcript = Vec::with_capacity(request.transcript.len());
+    let mut outstanding = std::collections::HashSet::new();
+    let mut images = Vec::new();
+    for mut item in request.transcript {
+        // The loop has already answered detached calls with placeholders. Its
+        // completion notification contains serialized ToolResultPart values,
+        // not another tool answer. Even native transports must lift these images.
+        if item.kind == agentkit_core::ItemKind::Notification
+            && matches!(item.parts.first(), Some(Part::Text(text)) if text.text.starts_with("Background tool results: "))
+        {
+            for part in &mut item.parts {
+                if let Part::Structured(value) = part
+                    && is_detached_result(&value.value)
+                {
+                    project_detached_images(&mut value.value, &mut images, &mut visited, 1)?;
+                }
+            }
+        }
+        // Register the whole item before processing any answers. Calls may also
+        // span multiple assistant items, and results multiple tool items.
+        for part in &item.parts {
+            if let Part::ToolCall(call) = part {
+                outstanding.insert(call.id.clone());
+            }
+        }
+        for part in &mut item.parts {
+            if let Part::ToolResult(result) = part {
+                project_result_images(result, &mut images, native)?;
+                outstanding.remove(&result.call_id);
+            }
+        }
+        transcript.push(item);
+        if outstanding.is_empty() && !images.is_empty() {
+            let mut attachment = agentkit_core::Item::new(
+                agentkit_core::ItemKind::User,
+                std::mem::take(&mut images),
+            );
+            attachment
+                .metadata
+                .insert("kit.projected_tool_images".into(), Value::Bool(true));
+            transcript.push(attachment);
+        }
+    }
+    if !images.is_empty() {
+        return Err(LoopError::InvalidState(
+            "selected-images-not-delivered: cannot attach tool images before all outstanding tool calls are answered. The program may already have completed; do not retry or rerun the program.".into(),
+        ));
+    }
+    request.transcript = transcript;
+    Ok(request)
+}
+
+// maybe_convert_detached adds no dedicated metadata marker. Match its exact
+// result envelope only inside its Background tool results notification, never
+// reinterpret arbitrary Structured tool/user output as typed media.
+fn is_detached_result(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 4
+            && value["call_id"].is_string()
+            && value["is_error"].is_boolean()
+            && value["metadata"].is_object()
+            && value["output"].is_object()
+    })
+}
+
+// Walk only the serialized Parts/ToolResult domain, not arbitrary JSON values
+// or byte arrays. This keeps large images out of the node budget and never
+// deserializes an unbounded recursive ToolResult tree.
+fn project_detached_images(
+    result: &mut Value,
+    images: &mut Vec<Part>,
+    visited: &mut usize,
+    depth: usize,
+) -> Result<(), LoopError> {
+    if depth >= 64 {
+        return Err(tool_image_traversal_error());
+    }
+    let call_id = result["call_id"].as_str().unwrap_or_default().to_owned();
+    let Some(parts) = result["output"]
+        .get_mut("Parts")
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    let mut previous_text = None;
+    for part in parts {
+        *visited += 1;
+        if *visited > 100_000 {
+            return Err(tool_image_traversal_error());
+        }
+        if part
+            .get("Media")
+            .is_some_and(|media| media["modality"] == "Image")
+        {
+            let label = format!(
+                "Image from background tool call {call_id}: see the user image message immediately after this complete result batch."
+            );
+            let placeholder =
+                serde_json::to_value(Part::text(&label)).map_err(tool_image_projection_error)?;
+            let image = std::mem::replace(part, placeholder);
+            let image: Part = serde_json::from_value(image).map_err(|error| LoopError::InvalidState(format!(
+                "selected-images-not-delivered: invalid detached image: {error}. Do not retry or rerun the program."
+            )))?;
+            images.push(Part::text(label));
+            if let Some(text) = previous_text.take() {
+                images.push(Part::Text(text));
+            }
+            images.push(image);
+        } else if let Some(nested) = part.get_mut("ToolResult") {
+            project_detached_images(nested, images, visited, depth + 1)?;
+            previous_text = None;
+        } else {
+            previous_text = part
+                .get("Text")
+                .and_then(|text| serde_json::from_value(text.clone()).ok());
+        }
+    }
+    Ok(())
+}
+
+// Recursion is safe after the complete request passes the depth/node preflight.
+fn project_result_images(
+    result: &mut agentkit_core::ToolResultPart,
+    images: &mut Vec<Part>,
+    native: bool,
+) -> Result<(), LoopError> {
+    let ToolOutput::Parts(parts) = &mut result.output else {
+        return Ok(());
+    };
+    let mut previous_text: Option<&agentkit_core::TextPart> = None;
+    for part in parts.iter_mut() {
+        match part {
+            Part::Media(media) if !native && media.modality == Modality::Image => {
+                let label = format!(
+                    "Image from tool call {}: see the user image message immediately after this complete tool-result batch.",
+                    result.call_id.0
+                );
+                images.push(Part::text(&label));
+                if let Some(text) = previous_text.take() {
+                    images.push(Part::Text(text.clone()));
+                }
+                images.push(std::mem::replace(part, Part::text(label)));
+            }
+            Part::ToolResult(nested) => {
+                project_result_images(nested, images, native)?;
+                previous_text = None;
+            }
+            Part::Text(text) => previous_text = Some(text),
+            _ => previous_text = None,
+        }
+    }
+    if !parts.iter().any(|part| matches!(part, Part::ToolResult(_))) {
+        return Ok(());
+    }
+    let mut flat = Vec::new();
+    for part in std::mem::take(parts) {
+        if let Part::ToolResult(nested) = part {
+            // Nested calls are content, not new protocol calls. Preserve their
+            // provenance and diagnostics while exposing supported content parts.
+            let provenance = Value::Object(serde_json::Map::from_iter([
+                ("call_id".into(), Value::String(nested.call_id.0)),
+                ("is_error".into(), Value::Bool(nested.is_error)),
+                (
+                    "metadata".into(),
+                    serde_json::to_value(nested.metadata).map_err(tool_image_projection_error)?,
+                ),
+            ]));
+            flat.push(Part::structured(Value::Object(serde_json::Map::from_iter(
+                [("nested_tool_result".into(), provenance)],
+            ))));
+            match nested.output {
+                ToolOutput::Parts(parts) => flat.extend(parts),
+                ToolOutput::Text(text) => flat.push(Part::text(text)),
+                ToolOutput::Structured(value) => flat.push(Part::structured(value)),
+                ToolOutput::Files(files) => flat.push(Part::structured(Value::Object(
+                    serde_json::Map::from_iter([(
+                        "files".into(),
+                        serde_json::to_value(files).map_err(tool_image_projection_error)?,
+                    )]),
+                ))),
+            }
+        } else {
+            flat.push(part);
+        }
+    }
+    *parts = flat;
+    Ok(())
+}
+
+fn tool_image_projection_error(error: serde_json::Error) -> LoopError {
+    LoopError::InvalidState(format!(
+        "selected-images-not-delivered: image request projection failed: {error}. The program may already have completed; do not retry or rerun the program."
+    ))
+}
+
+fn tool_image_traversal_error() -> LoopError {
+    LoopError::InvalidState(
+        "selected-images-not-delivered: tool-output image validation exceeds its traversal budget. The program may already have completed; do not retry or rerun the program.".into(),
+    )
+}
+
 #[async_trait]
 impl ModelSession for KitSession {
     type Turn = KitTurn;
@@ -834,6 +1209,11 @@ impl ModelSession for KitSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
+        let request = if matches!(self, Self::OpenAiSubscription(_)) {
+            request
+        } else {
+            project_tool_output_images(request, false)?
+        };
         match self {
             Self::OpenAiSubscription(session) => session
                 .begin_turn(request, cancellation)
@@ -922,6 +1302,15 @@ pub struct OpenRouterKitTurn {
 
 #[async_trait]
 impl ModelTurn for KitTurn {
+    fn on_cancelled(&mut self) {
+        match self {
+            Self::OpenAiSubscription(turn) => turn.on_cancelled(),
+            Self::OpenRouter(turn) | Self::Speakeasy(turn) | Self::Cerebras(turn) => {
+                turn.inner.on_cancelled()
+            }
+        }
+    }
+
     async fn next_event(
         &mut self,
         cancellation: Option<TurnCancellation>,
@@ -1097,55 +1486,106 @@ const OPENROUTER_FALLBACK: &[&str] = &[
     "google/gemini-2.5-pro",
 ];
 
+const OPENAI_FALLBACK: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+];
+
+fn openai_models(discovered: Vec<String>, current: &ModelSelection) -> Vec<String> {
+    let mut models = if discovered.is_empty() {
+        OPENAI_FALLBACK
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>()
+    } else {
+        discovered
+    };
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|model| seen.insert(model.clone()));
+    if current.provider == ProviderKind::OpenAiSubscription
+        && valid_model_id(&current.model)
+        && !models.contains(&current.model)
+    {
+        models.push(current.model.clone());
+    }
+    models
+}
+
 /// Returns a bounded, provider-grouped catalog. Remote discovery is best effort.
 pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
-    let openai = [
-        "gpt-5.6-sol",
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.3-codex-spark",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    match SelectableAdapter::new(current.provider, current.model.clone()) {
+        Ok(adapter) => adapter.model_catalog(current).await,
+        Err(_) => {
+            model_catalog_with_openai(current, std::future::ready(DiscoveredModels::default()))
+                .await
+        }
+    }
+}
+
+async fn model_catalog_with_openai(
+    current: &ModelSelection,
+    openai_catalog: impl std::future::Future<Output = DiscoveredModels>,
+) -> Vec<ModelGroup> {
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
     };
     let public_url = OPENROUTER_MODELS_URL.to_string();
     let same_catalog = openrouter_url.as_deref() == Some(public_url.as_str());
-    let (mut openrouter, mut speakeasy) = if same_catalog {
-        let models = fetch_model_ids(&public_url)
-            .await
-            .unwrap_or_else(|_| openrouter_fallback());
-        (models.clone(), models)
-    } else {
-        let openrouter_catalog = async {
-            match openrouter_url {
-                Some(url) => fetch_model_ids(&url)
-                    .await
-                    .unwrap_or_else(|_| openrouter_fallback()),
-                None => openrouter_fallback(),
-            }
-        };
-        let speakeasy_catalog = async {
-            fetch_model_ids(&public_url)
+    let other_catalogs = async move {
+        if same_catalog {
+            let models = fetch_model_ids(&public_url)
                 .await
-                .unwrap_or_else(|_| openrouter_fallback())
-        };
-        tokio::join!(openrouter_catalog, speakeasy_catalog)
+                .unwrap_or_else(|_| fallback_catalog());
+            (models.clone(), models)
+        } else {
+            let openrouter_catalog = async {
+                match openrouter_url {
+                    Some(url) => fetch_model_ids(&url)
+                        .await
+                        .unwrap_or_else(|_| fallback_catalog()),
+                    None => fallback_catalog(),
+                }
+            };
+            let speakeasy_catalog = async {
+                fetch_model_ids(&public_url)
+                    .await
+                    .unwrap_or_else(|_| fallback_catalog())
+            };
+            futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
+        }
     };
-    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+    let (discovered_openai, (openrouter, speakeasy)) =
+        futures_util::future::join(openai_catalog, other_catalogs).await;
+    let openai_windows = discovered_openai.context_windows;
+    let openrouter_windows = openrouter.context_windows;
+    let speakeasy_windows = speakeasy.context_windows;
+    let mut openrouter = openrouter.models;
+    let mut speakeasy = speakeasy.models;
+    let openai = openai_models(discovered_openai.models, current);
+    let current_is_valid = valid_model_id(&current.model);
+    if current_is_valid
+        && current.provider == ProviderKind::OpenRouter
+        && !openrouter.contains(&current.model)
+    {
         openrouter.push(current.model.clone());
     }
-    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::Speakeasy
+        && !speakeasy.contains(&current.model)
+    {
         speakeasy.push(current.model.clone());
     }
     openrouter.sort();
     openrouter.dedup();
     openrouter.truncate(MAX_SELECTOR_MODELS);
-    if current.provider == ProviderKind::OpenRouter && !openrouter.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::OpenRouter
+        && !openrouter.contains(&current.model)
+    {
         if openrouter.len() == MAX_SELECTOR_MODELS {
             openrouter.pop();
         }
@@ -1154,7 +1594,10 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     speakeasy.sort();
     speakeasy.dedup();
     speakeasy.truncate(MAX_SELECTOR_MODELS);
-    if current.provider == ProviderKind::Speakeasy && !speakeasy.contains(&current.model) {
+    if current_is_valid
+        && current.provider == ProviderKind::Speakeasy
+        && !speakeasy.contains(&current.model)
+    {
         if speakeasy.len() == MAX_SELECTOR_MODELS {
             speakeasy.pop();
         }
@@ -1172,19 +1615,28 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     vec![
         ModelGroup {
             provider: ProviderKind::Cerebras,
+            context_windows: cerebras
+                .iter()
+                .filter_map(|model| {
+                    super::cerebras::context_window(model).map(|window| (model.clone(), window))
+                })
+                .collect(),
             models: cerebras,
         },
         ModelGroup {
             provider: ProviderKind::OpenAiSubscription,
             models: openai,
+            context_windows: openai_windows,
         },
         ModelGroup {
             provider: ProviderKind::OpenRouter,
             models: openrouter,
+            context_windows: openrouter_windows,
         },
         ModelGroup {
             provider: ProviderKind::Speakeasy,
             models: speakeasy,
+            context_windows: speakeasy_windows,
         },
     ]
 }
@@ -1196,7 +1648,20 @@ fn openrouter_fallback() -> Vec<String> {
         .collect()
 }
 
-async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
+#[derive(Clone, Default)]
+struct DiscoveredModels {
+    models: Vec<String>,
+    context_windows: std::collections::HashMap<String, u64>,
+}
+
+fn fallback_catalog() -> DiscoveredModels {
+    DiscoveredModels {
+        models: openrouter_fallback(),
+        ..Default::default()
+    }
+}
+
+async fn fetch_model_ids(url: &str) -> Result<DiscoveredModels, String> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
@@ -1223,6 +1688,10 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| "model catalog is not valid JSON".to_string())?;
+    parse_discovered_models(&value)
+}
+
+fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
     let entries = value
         .get("data")
         .and_then(Value::as_array)
@@ -1230,17 +1699,47 @@ async fn fetch_model_ids(url: &str) -> Result<Vec<String>, String> {
     if entries.len() > MAX_MODELS {
         return Err("model catalog has too many entries".into());
     }
-    Ok(entries
+    let models: Vec<String> = entries
         .iter()
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
         .filter(|id| valid_model_id(id))
         .take(MAX_SELECTOR_MODELS)
         .map(str::to_string)
-        .collect())
+        .collect();
+    let context_windows = models
+        .iter()
+        .filter_map(|id| parse_context_window(value, id).map(|window| (id.clone(), window)))
+        .collect();
+    Ok(DiscoveredModels {
+        models,
+        context_windows,
+    })
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
+    #[test]
+    fn model_switch_catalog_retains_only_reported_positive_windows() {
+        let catalog = super::parse_discovered_models(&serde_json::json!({"data": [
+            {"id": "known", "context_length": 200000},
+            {"id": "unknown"}, {"id": "zero", "context_length": 0},
+            {"id": "bad model", "context_length": 100}
+        ]}))
+        .unwrap();
+        assert_eq!(catalog.models, ["known", "unknown", "zero"]);
+        assert_eq!(catalog.context_windows.len(), 1);
+        assert_eq!(catalog.context_windows["known"], 200000);
+        assert!(super::fallback_catalog().context_windows.is_empty());
+    }
+
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
@@ -1265,12 +1764,13 @@ mod tests {
     use crate::credentials::CredentialStorage;
 
     use super::{
-        KitAdapter, KitSession, ModelSelection, OPENROUTER_MODELS_URL, OpenRouterApiKey,
-        OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort, SelectableAdapter,
-        SelectableSession, SessionSelection, SpeakeasyKitAdapter, SpeakeasyProvider,
-        apply_openrouter_reasoning_effort, catalog_models_url, expose_background_call_ids,
-        gram_chat_id, models_url, openrouter_config_from_env, parse_context_window,
-        rewrite_openrouter_media, stamp_context_window,
+        KitAdapter, KitSession, ModelSelection, OPENAI_FALLBACK, OPENROUTER_MODELS_URL,
+        OpenRouterApiKey, OpenRouterKitSession, OpenRouterProvider, ProviderKind, ReasoningEffort,
+        SelectableAdapter, SelectableSession, SessionSelection, SpeakeasyKitAdapter,
+        SpeakeasyProvider, apply_openrouter_reasoning_effort, catalog_models_url,
+        expose_background_call_ids, gram_chat_id, models_url, openai_models,
+        openrouter_config_from_env, parse_context_window, rewrite_openrouter_media,
+        stamp_context_window,
     };
 
     #[test]
@@ -1400,6 +1900,55 @@ mod tests {
     }
 
     #[test]
+    fn selectable_adapter_defers_openrouter_credentials_until_session_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
+
+        SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "test/model",
+            storage,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejected_effort_persistence_keeps_selection_and_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            "effort-rejection",
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+            ProviderKind::OpenRouter,
+            "test/model",
+            CredentialStorage::Memory,
+            Some(ReasoningEffort::High),
+            Some(OpenRouterApiKey::new("test-key")),
+        )
+        .unwrap()
+        .with_session_observer(opened.observer.clone(), true)
+        .unwrap();
+        let before = adapter.selection.lock().unwrap().clone();
+        let pending = opened.observer.prepare_creation().unwrap();
+        assert!(adapter.select_reasoning_effort(None).is_err());
+        assert_eq!(*adapter.selection.lock().unwrap(), before);
+        pending.commit();
+        adapter.select_reasoning_effort(None).unwrap();
+        assert_eq!(adapter.reasoning_effort().unwrap(), None);
+        drop(adapter);
+        drop(opened);
+        let restored =
+            crate::session::open(root.path(), "effort-rejection", true, false, vec![]).unwrap();
+        assert_eq!(restored.reasoning_effort, Some(None));
+    }
+
+    #[test]
     fn selectable_adapter_keeps_explicit_key_across_selection_rebuilds() {
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
             ProviderKind::OpenRouter,
@@ -1490,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_results_tell_the_model_their_call_id() {
+    fn detached_results_tell_the_model_their_call_id_and_remind_it_to_stop() {
         let mut request = TurnRequest {
             session_id: SessionId::new("session"),
             turn_id: TurnId::new("turn"),
@@ -1521,7 +2070,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            "Tool call ID: call_background is running in the background.\nIt runs until result or failure is delivered."
+            "Tool call ID: call_background is running in the background.\nNo independent work left? STOP."
         );
     }
 
@@ -1670,16 +2219,107 @@ mod tests {
         let active = SessionSelection {
             model: active,
             reasoning_effort: None,
+            revision: 0,
         };
         SelectableSession {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
             openrouter_api_key: None,
             cerebras_api_key: None,
+            openai_model_catalog: Default::default(),
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,
         }
+    }
+
+    fn selected_image_request(nested: bool) -> TurnRequest {
+        let image = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![1, 2, 3]),
+        );
+        let output = if nested {
+            vec![Part::ToolResult(ToolResultPart::success(
+                "nested",
+                ToolOutput::Parts(vec![image]),
+            ))]
+        } else {
+            vec![Part::text("Selected image"), image]
+        };
+        TurnRequest {
+            session_id: SessionId::new("provider-identity-test"),
+            turn_id: TurnId::new("replay"),
+            transcript: vec![
+                Item::new(
+                    ItemKind::Tool,
+                    vec![Part::ToolResult(ToolResultPart::success(
+                        "completed-call",
+                        ToolOutput::Parts(output),
+                    ))],
+                ),
+                Item::text(ItemKind::User, "Continue after switching providers"),
+            ],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn selected_image_projection_bounds_nested_and_wide_outputs() {
+        let mut request = selected_image_request(false);
+        let mut part = Part::text("deep");
+        for _ in 0..65 {
+            part = Part::ToolResult(ToolResultPart::success(
+                "nested",
+                ToolOutput::Parts(vec![part]),
+            ));
+        }
+        request.transcript[0].parts = vec![part];
+        let error = super::project_tool_output_images(request.clone(), false).unwrap_err();
+        assert!(error.to_string().contains("traversal budget"));
+        request.transcript[0].parts = vec![Part::ToolResult(ToolResultPart::success(
+            "wide",
+            ToolOutput::Parts(vec![Part::text("text"); 100_001]),
+        ))];
+        let error = super::project_tool_output_images(request.clone(), false).unwrap_err();
+        assert!(error.to_string().contains("do not retry or rerun"));
+    }
+
+    #[test]
+    fn selected_image_projection_preserves_user_images_and_text_tool_outputs() {
+        let mut request = selected_image_request(false);
+        request.transcript[0] = Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::InlineBytes(vec![1, 2, 3]),
+            )],
+        );
+        for output in [
+            ToolOutput::Text("done".into()),
+            ToolOutput::Structured(json!({"ok": true})),
+            ToolOutput::Parts(vec![Part::text("done")]),
+        ] {
+            request.transcript.push(Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "text-call",
+                    output,
+                ))],
+            ));
+        }
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        for native in [false, true] {
+            let projected = super::project_tool_output_images(request.clone(), native).unwrap();
+            assert_eq!(
+                serde_json::to_value(&projected.transcript).unwrap(),
+                original
+            );
+        }
+        assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
     }
 
     #[tokio::test]
@@ -1701,6 +2341,7 @@ mod tests {
                 SessionSelection {
                     model: selected.clone(),
                     reasoning_effort: Some(ReasoningEffort::High),
+                    revision: 1,
                 },
                 Ok(openrouter_session(&selected.model).await),
             )
@@ -1723,6 +2364,7 @@ mod tests {
                     SessionSelection {
                         model: selected,
                         reasoning_effort: None,
+                        revision: 1,
                     },
                     Err(LoopError::Provider("replacement failed".into())),
                 )
@@ -1789,20 +2431,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cerebras_explicit_empty_key_does_not_fall_back() {
-        let error = match SelectableAdapter::new_with_credentials_effort_and_api_keys(
+    #[tokio::test]
+    async fn cerebras_explicit_empty_key_does_not_fall_back() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
             ProviderKind::Cerebras,
             "gpt-oss-120b",
             Default::default(),
             None,
             Some(OpenRouterApiKey::new("not-a-cerebras-key")),
             Some(super::CerebrasApiKey::new("")),
-        ) {
+        )
+        .unwrap();
+        let error = match adapter
+            .start_session(SessionConfig::new("empty-cerebras-key"))
+            .await
+        {
             Ok(_) => panic!("expected empty key rejection"),
             Err(error) => error,
         };
-        assert!(error.contains("--cerebras-api-key cannot be empty"));
+        assert!(
+            error
+                .to_string()
+                .contains("--cerebras-api-key cannot be empty")
+        );
+    }
+
+    #[test]
+    fn openai_catalog_keeps_the_active_custom_model() {
+        let current = ModelSelection::new(ProviderKind::OpenAiSubscription, "custom-model");
+
+        assert!(openai_models(Vec::new(), &current).contains(&current.model));
+    }
+
+    #[test]
+    fn openai_catalog_prefers_discovery_and_preserves_order() {
+        let current = ModelSelection::new(ProviderKind::OpenAiSubscription, "custom-model");
+        let models = openai_models(
+            vec!["second".into(), "first".into(), "second".into()],
+            &current,
+        );
+
+        assert_eq!(models, ["second", "first", "custom-model"]);
+    }
+
+    #[test]
+    fn openai_catalog_uses_fallback_only_when_discovery_is_empty() {
+        let current = ModelSelection::new(ProviderKind::OpenRouter, "other/model");
+
+        assert_eq!(openai_models(Vec::new(), &current), OPENAI_FALLBACK);
+    }
+
+    #[test]
+    fn reselecting_the_active_model_refreshes_the_next_turn() {
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let adapter = SelectableAdapter::new_with_credentials(
+            ProviderKind::OpenRouter,
+            "test-model",
+            credentials,
+        )
+        .unwrap();
+        let before = adapter.selection.lock().unwrap().clone();
+
+        adapter.select(before.model.clone()).unwrap();
+
+        let after = adapter.selection.lock().unwrap().clone();
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.reasoning_effort, before.reasoning_effort);
+        assert_ne!(after.revision, before.revision);
     }
 
     #[test]
@@ -1897,3 +2593,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "adapter_image_tests.rs"]
+mod image_tests;
+
+#[cfg(test)]
+#[path = "adapter_background_image_tests.rs"]
+mod background_image_tests;

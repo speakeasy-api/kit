@@ -10,7 +10,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Map, Value};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -22,69 +22,209 @@ pub struct EditTool {
 
 impl EditTool {
     pub fn new(root: PathBuf) -> Self {
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "oneOf".into(),
+                Value::Array(vec![
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "properties".into(),
+                            Value::Object(Map::from_iter([
+                                (
+                                    "op".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("string")),
+                                        ("enum".into(), Value::Array(vec![Value::from("add")])),
+                                    ])),
+                                ),
+                                (
+                                    "path".into(),
+                                    Value::Object(Map::from_iter([(
+                                        "type".into(),
+                                        Value::from("string"),
+                                    )])),
+                                ),
+                                (
+                                    "content".into(),
+                                    Value::Object(Map::from_iter([(
+                                        "type".into(),
+                                        Value::from("string"),
+                                    )])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "required".into(),
+                            Value::Array(vec![
+                                Value::from("op"),
+                                Value::from("path"),
+                                Value::from("content"),
+                            ]),
+                        ),
+                        ("additionalProperties".into(), Value::from(false)),
+                    ])),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "properties".into(),
+                            Value::Object(Map::from_iter([
+                                (
+                                    "op".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("string")),
+                                        ("enum".into(), Value::Array(vec![Value::from("edit")])),
+                                    ])),
+                                ),
+                                (
+                                    "path".into(),
+                                    Value::Object(Map::from_iter([(
+                                        "type".into(),
+                                        Value::from("string"),
+                                    )])),
+                                ),
+                                (
+                                    "hunks".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("array")),
+                                        ("minItems".into(), Value::from(1)),
+                                        (
+                                            "items".into(),
+                                            Value::Object(Map::from_iter([
+                                                ("type".into(), Value::from("object")),
+                                                (
+                                                    "properties".into(),
+                                                    Value::Object(Map::from_iter([
+                                                        (
+                                                            "context_before".into(),
+                                                            Value::Object(Map::from_iter([
+                                                                (
+                                                                    "type".into(),
+                                                                    Value::from("string"),
+                                                                ),
+                                                                ("default".into(), Value::from("")),
+                                                            ])),
+                                                        ),
+                                                        (
+                                                            "old".into(),
+                                                            Value::Object(Map::from_iter([(
+                                                                "type".into(),
+                                                                Value::from("string"),
+                                                            )])),
+                                                        ),
+                                                        (
+                                                            "new".into(),
+                                                            Value::Object(Map::from_iter([(
+                                                                "type".into(),
+                                                                Value::from("string"),
+                                                            )])),
+                                                        ),
+                                                        (
+                                                            "context_after".into(),
+                                                            Value::Object(Map::from_iter([
+                                                                (
+                                                                    "type".into(),
+                                                                    Value::from("string"),
+                                                                ),
+                                                                ("default".into(), Value::from("")),
+                                                            ])),
+                                                        ),
+                                                    ])),
+                                                ),
+                                                (
+                                                    "required".into(),
+                                                    Value::Array(vec![
+                                                        Value::from("old"),
+                                                        Value::from("new"),
+                                                    ]),
+                                                ),
+                                                ("additionalProperties".into(), Value::from(false)),
+                                            ])),
+                                        ),
+                                    ])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "required".into(),
+                            Value::Array(vec![
+                                Value::from("op"),
+                                Value::from("path"),
+                                Value::from("hunks"),
+                            ]),
+                        ),
+                        ("additionalProperties".into(), Value::from(false)),
+                    ])),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::from("object")),
+                        (
+                            "properties".into(),
+                            Value::Object(Map::from_iter([
+                                (
+                                    "op".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("string")),
+                                        ("enum".into(), Value::Array(vec![Value::from("delete")])),
+                                    ])),
+                                ),
+                                (
+                                    "path".into(),
+                                    Value::Object(Map::from_iter([(
+                                        "type".into(),
+                                        Value::from("string"),
+                                    )])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "required".into(),
+                            Value::Array(vec![Value::from("op"), Value::from("path")]),
+                        ),
+                        ("additionalProperties".into(), Value::from(false)),
+                    ])),
+                ]),
+            ),
+        ]));
+        let output_schema = Value::Object(Map::from_iter([
+            ("type".into(), Value::from("object")),
+            (
+                "properties".into(),
+                Value::Object(Map::from_iter([
+                    (
+                        "path".into(),
+                        Value::Object(Map::from_iter([("type".into(), Value::from("string"))])),
+                    ),
+                    (
+                        "status".into(),
+                        Value::Object(Map::from_iter([
+                            ("type".into(), Value::from("string")),
+                            (
+                                "enum".into(),
+                                Value::Array(vec![
+                                    Value::from("added"),
+                                    Value::from("edited"),
+                                    Value::from("deleted"),
+                                ]),
+                            ),
+                        ])),
+                    ),
+                ])),
+            ),
+            (
+                "required".into(),
+                Value::Array(vec![Value::from("path"), Value::from("status")]),
+            ),
+            ("additionalProperties".into(), Value::from(false)),
+        ]));
         Self {
             root,
             spec: ToolSpec::new(
                 ToolName::new("edit"),
                 "Apply exact, git-style text hunks to one file. Anchors must match exactly once.",
-                json!({
-                    "type": "object",
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "op": {"type": "string", "enum": ["add"]},
-                                "path": {"type": "string"},
-                                "content": {"type": "string"}
-                            },
-                            "required": ["op", "path", "content"],
-                            "additionalProperties": false
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "op": {"type": "string", "enum": ["edit"]},
-                                "path": {"type": "string"},
-                                "hunks": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "context_before": {"type": "string", "default": ""},
-                                            "old": {"type": "string"},
-                                            "new": {"type": "string"},
-                                            "context_after": {"type": "string", "default": ""}
-                                        },
-                                        "required": ["old", "new"],
-                                        "additionalProperties": false
-                                    }
-                                }
-                            },
-                            "required": ["op", "path", "hunks"],
-                            "additionalProperties": false
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "op": {"type": "string", "enum": ["delete"]},
-                                "path": {"type": "string"}
-                            },
-                            "required": ["op", "path"],
-                            "additionalProperties": false
-                        }
-                    ]
-                }),
+                input_schema,
             )
-            .with_output_schema(json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "status": {"type": "string", "enum": ["added", "edited", "deleted"]}
-                },
-                "required": ["path", "status"],
-                "additionalProperties": false
-            }))
+            .with_output_schema(output_schema)
             .with_annotations(ToolAnnotations::new()),
         }
     }
@@ -116,10 +256,10 @@ impl Tool for EditTool {
 
     async fn invoke(
         &self,
-        request: ToolRequest,
+        mut request: ToolRequest,
         _context: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let input: EditInput = serde_json::from_value(request.input)
+        let input: EditInput = serde_json::from_value(std::mem::take(&mut request.input))
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
         let path = match &input {
             EditInput::Add { path, .. }
@@ -135,37 +275,63 @@ impl Tool for EditTool {
                     )));
                 }
                 write_atomic(&path, content.as_bytes())?;
+                crate::protocols::acp::tool_projection::diff(&request, &path, None, Some(&content));
                 "added"
             }
             EditInput::Edit { hunks, .. } => {
                 let original = fs::read_to_string(&path).map_err(io_error)?;
                 let crlf = original.contains("\r\n");
                 let mut content = normalize_newlines(&original);
+                let mut first_line = None;
                 for hunk in hunks {
-                    content = apply_hunk(content, hunk)?;
+                    let (updated, line) = apply_hunk(content, hunk)?;
+                    content = updated;
+                    first_line.get_or_insert(line);
                 }
                 if crlf {
                     content = content.replace('\n', "\r\n");
                 }
                 write_atomic(&path, content.as_bytes())?;
+                if let Some(line) = first_line {
+                    crate::protocols::acp::tool_projection::location(&request, &path, line);
+                }
+                crate::protocols::acp::tool_projection::diff(
+                    &request,
+                    &path,
+                    Some(&original),
+                    Some(&content),
+                );
                 "edited"
             }
             EditInput::Delete { .. } => {
+                let original = crate::protocols::acp::tool_projection::deletion_text(&path);
                 fs::remove_file(&path).map_err(io_error)?;
+                if let Some(original) = original {
+                    crate::protocols::acp::tool_projection::diff(
+                        &request,
+                        &path,
+                        Some(&original),
+                        None,
+                    );
+                }
                 "deleted"
             }
         };
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
-            ToolOutput::structured(json!({
-                "path": path.strip_prefix(&self.root).unwrap_or(&path),
-                "status": status
-            })),
+            ToolOutput::structured(Value::Object(Map::from_iter([
+                (
+                    "path".into(),
+                    serde_json::to_value(path.strip_prefix(&self.root).unwrap_or(&path))
+                        .map_err(|error| ToolError::Internal(error.to_string()))?,
+                ),
+                ("status".into(), Value::from(status)),
+            ]))),
         )))
     }
 }
 
-fn apply_hunk(mut content: String, hunk: Hunk) -> Result<String, ToolError> {
+fn apply_hunk(mut content: String, hunk: Hunk) -> Result<(String, u32), ToolError> {
     let before = normalize_newlines(&hunk.context_before);
     let old = normalize_newlines(&hunk.old);
     let new = normalize_newlines(&hunk.new);
@@ -188,8 +354,16 @@ fn apply_hunk(mut content: String, hunk: Hunk) -> Result<String, ToolError> {
         }));
     };
     let old_start = start + before.len();
+    let line = u32::try_from(
+        content[..old_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+    .saturating_add(1);
     content.replace_range(old_start..old_start + old.len(), &new);
-    Ok(content)
+    Ok((content, line))
 }
 
 fn rooted(root: &Path, value: &str) -> Result<PathBuf, ToolError> {
@@ -234,6 +408,14 @@ fn io_error(error: std::io::Error) -> ToolError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
 
@@ -245,7 +427,10 @@ mod tests {
             new: "x\n".into(),
             context_after: "c\n".into(),
         };
-        assert_eq!(apply_hunk("a\nb\nc\n".into(), hunk()).unwrap(), "a\nx\nc\n");
+        assert_eq!(
+            apply_hunk("a\nb\nc\n".into(), hunk()).unwrap(),
+            ("a\nx\nc\n".into(), 2)
+        );
         assert!(apply_hunk("missing\n".into(), hunk()).is_err());
         assert!(apply_hunk("a\nb\nc\na\nb\nc\n".into(), hunk()).is_err());
     }

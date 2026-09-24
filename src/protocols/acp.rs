@@ -13,18 +13,20 @@ use std::{
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
-    AudioContent, AuthMethod, AuthMethodTerminal, AutoDenyResolver, AvailableCommand,
-    AvailableCommandsUpdate, BlobResourceContents, CancelNotification, CloseSessionRequest,
-    CloseSessionResponse, ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource,
-    ForkSessionRequest, ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity, PromptCapabilities,
-    PromptRequest, PromptResponse, ResourceLink, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
-    SessionForkCapabilities, SessionInfo, SessionListCapabilities, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    TextContent, TextResourceContents, ToolCallStatus, ToolCallUpdateFields,
+    AgentAuthCapabilities, AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
+    AuthenticateResponse, AutoDenyResolver, AvailableCommand, AvailableCommandsUpdate,
+    BlobResourceContents, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    ContentBlock, ContentChunk, EmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
+    ForkSessionResponse, ImageContent, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, NewSessionRequest, NewSessionResponse, Notice, NoticeSeverity,
+    PromptCapabilities, PromptRequest, PromptResponse, ResourceLink,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionForkCapabilities, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, TextContent, TextResourceContents, ToolCallStatus,
+    ToolCallUpdateFields,
 };
 use agentkit_core::{
     CancellationController, DataRef, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
@@ -36,29 +38,110 @@ use agentkit_loop::{
 };
 use agentkit_task_manager::{TaskEvent, TaskManagerHandle};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::json;
+use serde_json::{Map, Value};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::timeout,
 };
+use tracing::Instrument as _;
 
+mod activity;
+pub(crate) mod model_switch;
 mod skill_catalog;
+pub(crate) mod tool_projection;
 pub mod v2;
 
 use crate::{
-    provider::{ModelGroup, ModelSelection, ReasoningEffort, SelectableAdapter, model_catalog},
+    provider::{
+        ModelGroup, ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter,
+        authentication_method_id,
+    },
     runtime::{AcpDriverContext, AcpForkState, BackgroundJobs, DetachRegistration, Runtime},
 };
 
-const MODEL_CONFIG_ID: &str = "model";
-const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
+pub(crate) const MODEL_CONFIG_ID: &str = "model";
+pub(crate) const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 const SESSION_LIST_PAGE_SIZE: usize = 100;
 const FORK_PARENT_ID_META: &str = "kit.subagent.parent_id";
 const FORK_PARENT_NAME_META: &str = "kit.subagent.parent_name";
+const AUTH_REQUIRED_KIND: &str = "authentication_required";
+const AUTHENTICATION_RESET_TIMEOUT: Duration = Duration::from_secs(45);
 
-fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec<AuthMethod> {
+pub(crate) struct AuthenticationRequiredData<'a> {
+    pub(crate) method_id: &'a str,
+    pub(crate) detail: &'a str,
+}
+
+impl<'a> AuthenticationRequiredData<'a> {
+    pub(crate) fn new(method_id: &'a str, detail: &'a str) -> Self {
+        Self { method_id, detail }
+    }
+
+    #[cfg(any(test, feature = "tui"))]
+    pub(crate) fn from_value(value: &'a serde_json::Value) -> Option<Self> {
+        let data = value.as_object()?;
+        (data.get("kind")?.as_str()? == AUTH_REQUIRED_KIND).then_some(Self {
+            method_id: data.get("methodId")?.as_str()?,
+            detail: data.get("detail")?.as_str()?,
+        })
+    }
+
+    pub(crate) fn into_value(self) -> serde_json::Value {
+        Value::Object(Map::from_iter([
+            ("kind".into(), Value::from(AUTH_REQUIRED_KIND)),
+            ("methodId".into(), Value::from(self.method_id)),
+            ("detail".into(), Value::from(self.detail)),
+        ]))
+    }
+}
+
+pub(crate) struct TerminalAuthMethodSpec {
+    pub(crate) method_id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) provider: ProviderKind,
+}
+
+const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
+    TerminalAuthMethodSpec {
+        method_id: "openai",
+        name: "Sign in with ChatGPT",
+        description: "Authenticate Kit with a ChatGPT subscription",
+        provider: ProviderKind::OpenAiSubscription,
+    },
+    TerminalAuthMethodSpec {
+        method_id: "openrouter",
+        name: "Sign in with OpenRouter",
+        description: "Authenticate Kit with OpenRouter",
+        provider: ProviderKind::OpenRouter,
+    },
+    TerminalAuthMethodSpec {
+        method_id: "speakeasy",
+        name: "Sign in with Speakeasy",
+        description: "Authenticate Kit with Speakeasy",
+        provider: ProviderKind::Speakeasy,
+    },
+    TerminalAuthMethodSpec {
+        method_id: "cerebras",
+        name: "Sign in with Cerebras",
+        description: "Authenticate Kit with Cerebras",
+        provider: ProviderKind::Cerebras,
+    },
+];
+
+pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] {
+    TERMINAL_AUTH_METHODS
+}
+
+fn terminal_auth_methods(
+    capabilities: &agentkit_acp::ClientCapabilities,
+    provider_available: impl Fn(ProviderKind) -> bool,
+) -> Vec<AuthMethod> {
     let supports_terminal_auth = capabilities.auth.terminal
         || capabilities
             .meta
@@ -70,23 +153,20 @@ fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec
         return Vec::new();
     }
 
-    vec![
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openai", "Sign in with ChatGPT")
-                .description("Authenticate Kit with a ChatGPT subscription")
-                .args(vec!["--terminal-auth-login".into(), "openai".into()]),
-        ),
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("openrouter", "Sign in with OpenRouter")
-                .description("Authenticate Kit with OpenRouter")
-                .args(vec!["--terminal-auth-login".into(), "openrouter".into()]),
-        ),
-        AuthMethod::Terminal(
-            AuthMethodTerminal::new("cerebras", "Sign in with Cerebras")
-                .description("Authenticate Kit with Cerebras")
-                .args(vec!["--terminal-auth-login".into(), "cerebras".into()]),
-        ),
-    ]
+    terminal_auth_method_specs()
+        .iter()
+        .filter(|method| provider_available(method.provider))
+        .map(|method| {
+            AuthMethod::Terminal(
+                AuthMethodTerminal::new(method.method_id, method.name)
+                    .description(method.description)
+                    .args(vec![
+                        "--terminal-auth-login".into(),
+                        method.method_id.into(),
+                    ]),
+            )
+        })
+        .collect()
 }
 
 fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNotification {
@@ -96,6 +176,35 @@ fn available_commands_update(session_id: agentkit_acp::SessionId) -> SessionNoti
             AvailableCommand::new("compact", "Compact the session context"),
         ])),
     )
+}
+
+/// Compose keeps its tool identity in the initial call and publishes presentation
+/// metadata as a title patch, shared by live events and transcript replay.
+pub(super) fn compose_intent(call: &agentkit_core::ToolCallPart) -> Option<&str> {
+    (call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME)
+        .then(|| call.input.get("intent").and_then(Value::as_str))
+        .flatten()
+        .map(str::trim)
+        .filter(|intent| !intent.is_empty())
+}
+
+fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<SessionUpdate> {
+    if call.name != agentkit_tool_compose::COMPOSE_TOOL_NAME {
+        return None;
+    }
+    Some(SessionUpdate::ToolCallUpdate(
+        agentkit_acp::ToolCallUpdate::new(
+            agentkit_acp::ToolCallId::new(call.id.to_string()),
+            ToolCallUpdateFields::new()
+                .title(
+                    compose_intent(call)
+                        .unwrap_or("Running composed tools")
+                        .to_owned(),
+                )
+                .name("compose".to_owned())
+                .kind(agentkit_acp::ToolKind::Execute),
+        ),
+    ))
 }
 
 fn transcript_replay(
@@ -119,6 +228,11 @@ fn transcript_replay(
             };
             if let Some(update) = update {
                 replay.push(SessionNotification::new(session_id.clone(), update));
+                if let Part::ToolCall(call) = part
+                    && let Some(update) = compose_title_update(call)
+                {
+                    replay.push(SessionNotification::new(session_id.clone(), update));
+                }
             }
         }
     }
@@ -188,7 +302,10 @@ fn tool_replay_update(part: &Part) -> Option<SessionUpdate> {
 
 pub(super) fn tool_output_raw(output: &ToolOutput) -> Option<serde_json::Value> {
     match output {
-        ToolOutput::Text(text) => Some(json!({ "text": text })),
+        ToolOutput::Text(text) => Some(Value::Object(Map::from_iter([(
+            "text".into(),
+            Value::from(text.clone()),
+        )]))),
         ToolOutput::Structured(value) => Some(value.clone()),
         ToolOutput::Parts(parts) => serde_json::to_value(parts).ok(),
         ToolOutput::Files(files) => serde_json::to_value(files).ok(),
@@ -312,6 +429,40 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Bounded polling of runtime-owned disk history. Cursor zero starts replay;
+/// next_cursor is an opaque byte offset. Reuse it to transition into live reads.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/subagent/transcript/read", response = ReadSubagentTranscriptResponse)]
+pub(crate) struct ReadSubagentTranscriptRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub id: String,
+    pub generation: u64,
+    pub cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct ReadSubagentTranscriptResponse {
+    pub updates: Vec<serde_json::Value>,
+    pub next_cursor: u64,
+    pub generation: u64,
+    pub caught_up: bool,
+}
+
+/// Generation-checked steering of one live direct subagent.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/subagent/steer", response = SteerSubagentResponse)]
+pub(crate) struct SteerSubagentRequest {
+    pub session_id: agentkit_acp::SessionId,
+    pub id: String,
+    pub generation: u64,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+pub(crate) struct SteerSubagentResponse {
+    pub receipt: serde_json::Value,
+}
+
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
@@ -351,6 +502,14 @@ pub(crate) struct FileSearchResponse {
     pub matches: Vec<crate::file_search::FileMatch>,
 }
 
+/// Kit-private client-to-server status; never submits input or starts a turn.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
+#[notification(method = "kit/voice/state")]
+pub(crate) struct VoiceStateNotification {
+    pub session_id: agentkit_acp::SessionId,
+    pub active: bool,
+}
+
 /// Kit-private ACP notification that keeps the bundled TUI synchronized with
 /// turns started autonomously by background task results.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification)]
@@ -363,7 +522,12 @@ pub(crate) struct TurnStateNotification {
 }
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
-    agent_client_protocol::util::internal_error(error.to_string())
+    let detail = error.to_string();
+    match authentication_method_id(&detail) {
+        Some(method_id) => agent_client_protocol::Error::auth_required()
+            .data(AuthenticationRequiredData::new(method_id, &detail).into_value()),
+        None => agent_client_protocol::util::internal_error(detail),
+    }
 }
 
 #[derive(Debug)]
@@ -389,7 +553,9 @@ enum Command {
     Cancel,
     SetConfig {
         request: SetSessionConfigOptionRequest,
-        reply: oneshot::Sender<Result<SetSessionConfigOptionResponse, AcpRuntimeError>>,
+        cancellation_generation: u64,
+        reply:
+            oneshot::Sender<Result<SetSessionConfigOptionResponse, agent_client_protocol::Error>>,
     },
     Fork {
         parent_context: Option<(String, String)>,
@@ -401,6 +567,8 @@ enum Command {
 }
 
 struct SessionHandle {
+    subagents: Option<crate::tools::Subagents>,
+    voice_state: crate::runtime::voice_state::VoiceState,
     token: u64,
     commands: mpsc::Sender<Command>,
     background_jobs: BackgroundJobs,
@@ -434,13 +602,79 @@ struct RegisteredV2Session {
 
 struct RegistryState {
     accepting: bool,
+    permanently_closed: bool,
+    generation: u64,
+    pending_attachments: usize,
     sessions: HashMap<u64, RegisteredSession>,
     v2_sessions: HashMap<u64, RegisteredV2Session>,
 }
 
+impl RegistryState {
+    fn close_gate(&mut self, permanently: bool) {
+        self.accepting = false;
+        self.permanently_closed |= permanently;
+        if let Some(generation) = self.generation.checked_add(1) {
+            self.generation = generation;
+        } else {
+            // Never let an old admission become current again through wraparound.
+            self.permanently_closed = true;
+        }
+    }
+}
+
 struct SessionRegistryInner {
     next_token: AtomicU64,
+    lifecycle: tokio::sync::Mutex<()>,
+    attachments_changed: Notify,
     state: Mutex<RegistryState>,
+}
+
+impl SessionRegistryInner {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            // This registry owns only admission bookkeeping and live handle indexes,
+            // not the durable v2 publication commit. All writers below finish their
+            // in-memory transitions without callbacks, wakeups, arbitrary drops, or
+            // awaits: admission counts are checked before incrementing; completion
+            // consumes a validated admission; insertion rejects existing tokens;
+            // removal extracts ownership; gate closure cannot wrap its generation.
+            // Snapshots clone only concrete Arc/channel/handle types. Reopening
+            // happens only after teardown and the external reset have succeeded;
+            // cancellation or panic before then leaves admission closed. Thus unwind
+            // cannot leave a partial transition or imply an external commit succeeded.
+            // In particular, actor/admission destructors must work after poison too.
+            let state = poisoned.into_inner();
+            self.state.clear_poison();
+            state
+        })
+    }
+}
+
+pub(super) struct SessionAdmission {
+    generation: u64,
+    active: bool,
+    registry: Arc<SessionRegistryInner>,
+}
+
+impl SessionAdmission {
+    fn complete(&mut self, state: &mut RegistryState) {
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for SessionAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        let mut state = registry.lock_state();
+        state.pending_attachments = state.pending_attachments.saturating_sub(1);
+        self.active = false;
+        drop(state);
+        registry.attachments_changed.notify_waiters();
+    }
 }
 
 /// Coordinates shutdown across stdio and all connection-scoped HTTP ACP components.
@@ -454,8 +688,13 @@ impl SessionRegistry {
         Self {
             inner: Arc::new(SessionRegistryInner {
                 next_token: AtomicU64::new(1),
+                lifecycle: tokio::sync::Mutex::new(()),
+                attachments_changed: Notify::new(),
                 state: Mutex::new(RegistryState {
                     accepting: true,
+                    permanently_closed: false,
+                    generation: 0,
+                    pending_attachments: 0,
                     sessions: HashMap::new(),
                     v2_sessions: HashMap::new(),
                 }),
@@ -463,37 +702,67 @@ impl SessionRegistry {
         }
     }
 
-    pub(super) fn next_token(&self) -> u64 {
-        self.inner.next_token.fetch_add(1, Ordering::Relaxed)
+    pub(super) fn next_token(&self) -> Result<u64, AcpRuntimeError> {
+        self.inner
+            .next_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| AcpRuntimeError::Loop("ACP session registry token space exhausted".into()))
     }
 
-    fn register(&self, session: RegisteredSession) -> Result<(), ()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
+    fn begin_attachment(&self) -> Result<SessionAdmission, ()> {
+        let mut state = self.inner.lock_state();
         if !state.accepting {
             return Err(());
         }
+        state.pending_attachments = state.pending_attachments.checked_add(1).ok_or(())?;
+        Ok(SessionAdmission {
+            generation: state.generation,
+            active: true,
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    fn register(
+        &self,
+        admission: &mut SessionAdmission,
+        session: RegisteredSession,
+    ) -> Result<(), ()> {
+        let mut state = self.inner.lock_state();
+        if !admission.active
+            || !Arc::ptr_eq(&self.inner, &admission.registry)
+            || !state.accepting
+            || state.generation != admission.generation
+            || state.sessions.contains_key(&session.token)
+            || state.v2_sessions.contains_key(&session.token)
+        {
+            return Err(());
+        }
         state.sessions.insert(session.token, session);
+        admission.complete(&mut state);
+        drop(state);
+        self.inner.attachments_changed.notify_waiters();
         Ok(())
     }
 
     pub(super) fn register_v2(
         &self,
+        admission: &mut SessionAdmission,
         token: u64,
         interrupt: Arc<dyn Fn() + Send + Sync>,
         close: CloseV2Session,
         actor: AbortHandle,
         completed: watch::Receiver<bool>,
     ) -> Result<(), ()> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        if !state.accepting {
+        let mut state = self.inner.lock_state();
+        if !admission.active
+            || !Arc::ptr_eq(&self.inner, &admission.registry)
+            || !state.accepting
+            || state.generation != admission.generation
+            || state.sessions.contains_key(&token)
+            || state.v2_sessions.contains_key(&token)
+        {
             return Err(());
         }
         state.v2_sessions.insert(
@@ -506,38 +775,78 @@ impl SessionRegistry {
                 completed,
             },
         );
+        admission.complete(&mut state);
+        drop(state);
+        self.inner.attachments_changed.notify_waiters();
         Ok(())
     }
 
     pub(super) fn remove(&self, token: u64) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        state.sessions.remove(&token);
-        state.v2_sessions.remove(&token);
+        let mut state = self.inner.lock_state();
+        let session = state.sessions.remove(&token);
+        let v2_session = state.v2_sessions.remove(&token);
+        drop(state);
+        // Captured callback state can reenter the registry or panic on final drop.
+        drop(session);
+        drop(v2_session);
     }
 
-    fn close_gate_and_snapshot(&self) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("ACP session registry poisoned");
-        state.accepting = false;
+    fn close_gate_and_snapshot(
+        &self,
+        permanently: bool,
+    ) -> (Vec<RegisteredSession>, Vec<RegisteredV2Session>) {
+        let mut state = self.inner.lock_state();
+        state.close_gate(permanently);
         (
             state.sessions.values().cloned().collect(),
             state.v2_sessions.values().cloned().collect(),
         )
     }
 
-    pub async fn shutdown(&self) {
-        self.shutdown_with_timeout(Duration::from_secs(5)).await;
+    async fn wait_for_pending_attachments(&self) {
+        loop {
+            let changed = self.inner.attachments_changed.notified();
+            if self.inner.lock_state().pending_attachments == 0 {
+                return;
+            }
+            changed.await;
+        }
     }
 
-    async fn shutdown_with_timeout(&self, limit: Duration) {
-        let (sessions, v2_sessions) = self.close_gate_and_snapshot();
+    pub async fn shutdown(&self) {
+        self.close_sessions_with_timeout(Duration::from_secs(5), false, || async {})
+            .await;
+    }
+
+    async fn reset_authentication_with<T>(
+        &self,
+        reset: impl std::future::Future<Output = T>,
+    ) -> (bool, Option<T>) {
+        self.close_sessions_with_timeout(Duration::from_secs(5), true, || reset)
+            .await
+    }
+
+    async fn close_sessions_with_timeout<T, F, Fut>(
+        &self,
+        limit: Duration,
+        reopen: bool,
+        after_close: F,
+    ) -> (bool, Option<T>)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _lifecycle = match timeout(limit, self.inner.lifecycle.lock()).await {
+            Ok(lifecycle) => lifecycle,
+            Err(_) => {
+                if !reopen {
+                    let mut state = self.inner.lock_state();
+                    state.close_gate(true);
+                }
+                return (false, None);
+            }
+        };
+        let (sessions, v2_sessions) = self.close_gate_and_snapshot(!reopen);
         for session in &sessions {
             session.background_jobs.cancel_all();
             let _ = session.integration.interrupt_session(&session.session_id);
@@ -548,7 +857,6 @@ impl SessionRegistry {
 
         let mut closing = JoinSet::new();
         for mut session in sessions.iter().cloned() {
-            let registry = self.clone();
             closing.spawn(async move {
                 cancel_background_jobs(&session.tasks, &session.background_jobs).await;
                 if let Some(commands) = session.commands.upgrade() {
@@ -557,30 +865,33 @@ impl SessionRegistry {
                         let _ = acknowledged.await;
                     }
                 }
-                if !*session.completed.borrow() {
-                    let _ = session.completed.changed().await;
-                }
-                registry.remove(session.token);
+                session.completed.wait_for(|done| *done).await.is_ok()
             });
         }
 
         for mut session in v2_sessions.iter().cloned() {
-            let registry = self.clone();
             closing.spawn(async move {
                 (session.close)().await;
-                if !*session.completed.borrow() {
-                    let _ = session.completed.changed().await;
-                }
-                registry.remove(session.token);
+                session.completed.wait_for(|done| *done).await.is_ok()
             });
         }
 
-        if timeout(limit, async {
-            while closing.join_next().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
+        let graceful = matches!(
+            timeout(limit, async {
+                let mut completed = true;
+                while let Some(result) = closing.join_next().await {
+                    completed &= matches!(result, Ok(true));
+                }
+                self.wait_for_pending_attachments().await;
+                completed
+            })
+            .await,
+            Ok(true)
+        );
+        let teardown_complete = if !graceful {
+            // A panicking close callback is not successful teardown. Abort any
+            // unfinished actor and require its positive completion signal before
+            // resetting external credentials or reopening admission.
             closing.abort_all();
             for session in &sessions {
                 if !*session.completed.borrow() {
@@ -593,13 +904,48 @@ impl SessionRegistry {
                 }
             }
             while closing.join_next().await.is_some() {}
-            for session in sessions {
-                self.remove(session.token);
-            }
-            for session in v2_sessions {
-                self.remove(session.token);
-            }
+            matches!(
+                timeout(limit, async {
+                    for mut session in sessions.iter().cloned() {
+                        if session.completed.wait_for(|done| *done).await.is_err() {
+                            return false;
+                        }
+                    }
+                    for mut session in v2_sessions.iter().cloned() {
+                        if session.completed.wait_for(|done| *done).await.is_err() {
+                            return false;
+                        }
+                    }
+                    self.wait_for_pending_attachments().await;
+                    true
+                })
+                .await,
+                Ok(true)
+            )
+        } else {
+            true
+        };
+        for session in &sessions {
+            self.remove(session.token);
         }
+        for session in &v2_sessions {
+            self.remove(session.token);
+        }
+        if !teardown_complete {
+            self.inner.lock_state().permanently_closed = true;
+        }
+        let output = if teardown_complete {
+            Some(after_close().await)
+        } else {
+            None
+        };
+        let mut reopened = false;
+        if reopen && teardown_complete {
+            let mut state = self.inner.lock_state();
+            state.accepting = !state.permanently_closed;
+            reopened = state.accepting;
+        }
+        (teardown_complete && (!reopen || reopened), output)
     }
 }
 
@@ -609,12 +955,92 @@ impl Default for SessionRegistry {
     }
 }
 
-struct AttachedSession {
+enum AuthenticationReset<T> {
+    Completed(bool, Option<T>),
+    TimedOut,
+    Failed(tokio::task::JoinError),
+}
+
+async fn bounded_authentication_reset<T>(
+    registry: SessionRegistry,
+    reset: impl std::future::Future<Output = T> + Send + 'static,
+    limit: Duration,
+) -> AuthenticationReset<T>
+where
+    T: Send + 'static,
+{
+    let task = tokio::spawn(async move { registry.reset_authentication_with(reset).await });
+    match timeout(limit, task).await {
+        Ok(Ok((complete, output))) => AuthenticationReset::Completed(complete, output),
+        Ok(Err(error)) => AuthenticationReset::Failed(error),
+        Err(_) => AuthenticationReset::TimedOut,
+    }
+}
+
+async fn logout_authentication(
+    runtime: Arc<Runtime>,
+    registry: &SessionRegistry,
+) -> Result<(), AcpRuntimeError> {
+    if !runtime.supports_logout_authentication() {
+        return Err(AcpRuntimeError::Loop(
+            "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
+                .into(),
+        ));
+    }
+    let logout = async move {
+        match tokio::task::spawn_blocking(move || runtime.logout_authentication()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("authentication logout task failed: {error}")),
+        }
+    };
+    let (reset, logout) = match bounded_authentication_reset(
+        registry.clone(),
+        logout,
+        AUTHENTICATION_RESET_TIMEOUT,
+    )
+    .await
+    {
+        AuthenticationReset::Completed(reset, logout) => (reset, logout),
+        AuthenticationReset::TimedOut => {
+            return Err(AcpRuntimeError::Loop(
+                "authentication logout timed out; session admission remains paused until credential deletion finishes"
+                    .into(),
+            ));
+        }
+        AuthenticationReset::Failed(error) => {
+            return Err(AcpRuntimeError::Loop(format!(
+                "authentication logout task failed: {error}"
+            )));
+        }
+    };
+    if !reset {
+        return Err(AcpRuntimeError::Loop(
+            "authentication logout could not finish session teardown".into(),
+        ));
+    }
+    let logout = logout.ok_or_else(|| {
+        AcpRuntimeError::Loop("authentication reset did not run credential deletion".into())
+    })?;
+    match logout {
+        Ok(()) => Ok(()),
+        Err(error) => Err(AcpRuntimeError::Loop(format!(
+            "{error}; active ACP sessions were reset because credential state may have changed"
+        ))),
+    }
+}
+
+struct SessionSetup {
+    cwd: PathBuf,
+    additional_directories: Vec<PathBuf>,
+    mcp_servers: Vec<agentkit_acp::McpServer>,
+}
+
+struct AttachedSession<C> {
     session_id: agentkit_acp::SessionId,
     config_options: Vec<SessionConfigOption>,
     canonical_transcript: Vec<Item>,
     activation: oneshot::Sender<()>,
-    pending_fork_creation: Option<crate::session::SessionObserver>,
+    creation: C,
 }
 
 struct PreparedLoad {
@@ -629,6 +1055,28 @@ struct PreparedFork {
     creation: crate::session::SessionObserver,
 }
 
+impl PreparedFork {
+    /// Validation and cleanup ownership precede submission. Only private,
+    /// infallible publication and actor activation may follow a success response.
+    fn submit<E>(
+        self,
+        respond: impl FnOnce(Result<ForkSessionResponse, agent_client_protocol::Error>) -> Result<(), E>,
+    ) -> Result<Option<agentkit_acp::SessionId>, E> {
+        let creation = match self.creation.prepare_creation() {
+            Ok(creation) => creation,
+            Err(error) => {
+                respond(Err(sdk_error(AcpRuntimeError::Loop(error))))?;
+                return Ok(None);
+            }
+        };
+        let session_id = self.response.session_id.clone();
+        respond(Ok(self.response))?;
+        creation.commit();
+        let _ = self.activation.send(());
+        Ok(Some(session_id))
+    }
+}
+
 /// Owns an ACP integration binding for an in-flight request or live actor.
 /// Dropping either owner must release the durable identity.
 struct SessionBindingGuard {
@@ -636,10 +1084,29 @@ struct SessionBindingGuard {
     session_id: agentkit_acp::SessionId,
 }
 
+/// v1 retains standard prompt responses; autonomous intervals use the extension.
+fn legacy_activity(
+    session_id: agentkit_acp::SessionId,
+    notify: impl Fn(TurnStateNotification) -> Result<(), AcpRuntimeError> + Send + Sync + 'static,
+) -> activity::SessionActivity {
+    activity::SessionActivity::new(move |transition| {
+        if transition.origin == activity::ExecutionOrigin::Autonomous {
+            notify(TurnStateNotification {
+                session_id: session_id.clone(),
+                turn_id: transition.id,
+                active: transition.active,
+                error: transition.error,
+            })?;
+        }
+        Ok(())
+    })
+}
+
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
     inner: AcpIntegration,
     client: AcpClientHandle,
+    activity: activity::SessionActivity,
     session_id: agentkit_acp::SessionId,
 }
 
@@ -648,8 +1115,10 @@ impl ResponseInterruptionNoticeObserver {
         inner: AcpIntegration,
         client: AcpClientHandle,
         session_id: agentkit_acp::SessionId,
+        activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            activity,
             inner,
             client,
             session_id,
@@ -659,6 +1128,20 @@ impl ResponseInterruptionNoticeObserver {
 
 impl LoopObserver for ResponseInterruptionNoticeObserver {
     fn handle_event(&self, event: ObservedEvent) {
+        if matches!(&event.event, AgentEvent::ToolCallRequested(_)) {
+            self.activity.tool_projection.get_or_init(|| {
+                let client = self.client.clone();
+                let session_id = self.session_id.clone();
+                tool_projection::Subscription::start(event.session_id.0.clone(), move |update| {
+                    update.v1().is_ok_and(|update| {
+                        client
+                            .notify_session(SessionNotification::new(session_id.clone(), update))
+                            .is_ok()
+                    })
+                })
+            });
+        }
+        self.activity.observe(&event.event);
         if matches!(&event.event, AgentEvent::ResponseAttemptSuperseded) {
             let notification = SessionNotification::new(
                 self.session_id.clone(),
@@ -672,7 +1155,18 @@ impl LoopObserver for ResponseInterruptionNoticeObserver {
             }
             return;
         }
+        let title = match &event.event {
+            AgentEvent::ToolCallRequested(call) => compose_title_update(call),
+            _ => None,
+        };
         self.inner.handle_event(event);
+        if let Some(update) = title
+            && let Err(error) = self
+                .client
+                .notify_session(SessionNotification::new(self.session_id.clone(), update))
+        {
+            tracing::debug!(%error, "failed to queue ACP v1 compose title");
+        }
     }
 }
 
@@ -709,6 +1203,35 @@ impl Drop for SessionActorGuard {
     }
 }
 
+#[derive(Debug)]
+enum LegacyPublicationError {
+    AdmissionClosed,
+    Commit(AcpRuntimeError),
+}
+
+// Declared before the map guard: rollback runs after map exclusion is released,
+// including on unwind. Consuming a fresh admission proves registry ownership.
+struct SessionPublicationRollback<'a> {
+    registry: &'a SessionRegistry,
+    admission: &'a mut SessionAdmission,
+    token: u64,
+    actor: AbortHandle,
+    armed: bool,
+}
+
+impl Drop for SessionPublicationRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.actor.abort();
+            // Registration consumes admission before notifying waiters. A
+            // rejection must not unregister a different actor with this token.
+            if !self.admission.active {
+                self.registry.remove(self.token);
+            }
+        }
+    }
+}
+
 struct Server {
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -718,6 +1241,19 @@ struct Server {
 }
 
 impl Server {
+    fn voice_state(&self, notification: VoiceStateNotification) -> Result<(), AcpRuntimeError> {
+        let id = notification.session_id;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?;
+        let session = sessions
+            .get(&id)
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(id.to_string()))?;
+        session.voice_state.set_active(notification.active);
+        Ok(())
+    }
+
     fn new(runtime: Arc<Runtime>, integration: AcpIntegration, registry: SessionRegistry) -> Self {
         Self {
             runtime,
@@ -739,20 +1275,101 @@ impl Server {
         .map(|matches| FileSearchResponse { matches })
     }
 
+    fn authenticate(
+        &self,
+        request: AuthenticateRequest,
+    ) -> Result<AuthenticateResponse, agent_client_protocol::Error> {
+        let method_id = request.method_id.0.as_ref();
+        let detail = if terminal_auth_method_specs()
+            .iter()
+            .any(|method| method.method_id == method_id)
+        {
+            "terminal authentication methods must be launched as a separate agent invocation"
+        } else {
+            "authentication method was not advertised by this agent"
+        };
+        Err(
+            agent_client_protocol::Error::invalid_params().data(Value::Object(Map::from_iter([
+                ("detail".into(), Value::from(detail)),
+                ("methodId".into(), Value::from(method_id)),
+            ]))),
+        )
+    }
+
+    async fn logout(self: &Arc<Self>) -> Result<LogoutResponse, AcpRuntimeError> {
+        logout_authentication(Arc::clone(&self.runtime), &self.registry).await?;
+        Ok(LogoutResponse::new())
+    }
+
+    fn publish_session<T>(
+        &self,
+        admission: &mut SessionAdmission,
+        registered: RegisteredSession,
+        session: SessionHandle,
+        commit: impl FnOnce() -> Result<T, AcpRuntimeError>,
+    ) -> Result<T, LegacyPublicationError> {
+        if !admission.active || !Arc::ptr_eq(&admission.registry, &self.registry.inner) {
+            return Err(LegacyPublicationError::AdmissionClosed);
+        }
+        let mut rollback = SessionPublicationRollback {
+            registry: &self.registry,
+            admission,
+            token: registered.token,
+            actor: registered.actor.clone(),
+            armed: false,
+        };
+        // The commit coordinates durable identity with this local map. An
+        // unwind leaves that outcome unknown: isolate the connection on poison,
+        // but still abort and unregister the actor after releasing this guard.
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| LegacyPublicationError::Commit(AcpRuntimeError::ClientClosed))?;
+        if sessions.contains_key(&registered.session_id) {
+            return Err(LegacyPublicationError::Commit(AcpRuntimeError::Loop(
+                "ACP session is already published".into(),
+            )));
+        }
+        sessions.try_reserve(1).map_err(|error| {
+            LegacyPublicationError::Commit(AcpRuntimeError::Loop(error.to_string()))
+        })?;
+        let session_id = registered.session_id.clone();
+        rollback.armed = true;
+        self.registry
+            .register(rollback.admission, registered)
+            .map_err(|()| LegacyPublicationError::AdmissionClosed)?;
+        let committed = commit().map_err(LegacyPublicationError::Commit)?;
+        sessions.insert(session_id, session);
+        rollback.armed = false;
+        Ok(committed)
+    }
+
     fn remove_session(&self, session_id: &agentkit_acp::SessionId, token: u64) {
-        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        if sessions
+        // Cleanup must still unregister and signal completion after a commit
+        // unwind poisoned the map. Do not inspect uncertain publication state.
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        let removed = if sessions
             .get(session_id)
             .is_some_and(|session| session.token == token)
         {
-            sessions.remove(session_id);
-        }
+            sessions.remove(session_id)
+        } else {
+            None
+        };
+        drop(sessions);
+        drop(removed);
     }
 
     async fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
+        let logout_authentication = self.runtime.supports_logout_authentication();
         InitializeResponse::new(agent_client_protocol::schema::ProtocolVersion::V1)
-            .agent_capabilities(capabilities())
-            .auth_methods(terminal_auth_methods(&request.client_capabilities))
+            .agent_capabilities(capabilities(logout_authentication))
+            .auth_methods(terminal_auth_methods(
+                &request.client_capabilities,
+                |provider| self.runtime.supports_terminal_authentication(provider),
+            ))
             .agent_info(agentkit_acp::Implementation::new(
                 self.integration.name().to_string(),
                 self.integration.version().to_string(),
@@ -768,11 +1385,15 @@ impl Server {
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let AttachedSession {
@@ -820,6 +1441,7 @@ impl Server {
             .iter()
             .map(|entry| {
                 SessionInfo::new(entry.id.clone(), cwd.clone())
+                    .additional_directories(entry.additional_directories.clone())
                     .title(entry.title.as_deref().map(str::to_owned))
                     .updated_at(entry.updated_at_rfc3339())
             })
@@ -839,11 +1461,15 @@ impl Server {
             .claim_session_load(&request.session_id.to_string())?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 None,
+                crate::runtime::SessionClaim::commit,
             )
             .await?;
         let replay = transcript_replay(&attached.session_id, &attached.canonical_transcript);
@@ -859,11 +1485,6 @@ impl Server {
         request: ForkSessionRequest,
         connection: ConnectionTo<Client>,
     ) -> Result<PreparedFork, AcpRuntimeError> {
-        if !request.mcp_servers.is_empty() {
-            return Err(AcpRuntimeError::Loop(
-                "Kit does not accept per-session MCP servers".into(),
-            ));
-        }
         let parent_context = fork_parent_context(request.meta.as_ref());
         let sender = self.sender(&request.session_id).await?;
         let (tx, rx) = oneshot::channel();
@@ -880,48 +1501,84 @@ impl Server {
         let claim = self.runtime.claim_session_fork()?;
         let attached = self
             .attach_session(
-                request.cwd,
-                request.additional_directories,
+                SessionSetup {
+                    cwd: request.cwd,
+                    additional_directories: request.additional_directories,
+                    mcp_servers: request.mcp_servers,
+                },
                 connection,
                 claim,
                 Some(forked),
+                crate::runtime::SessionClaim::defer_fork_commit,
             )
             .await?;
         Ok(PreparedFork {
             response: ForkSessionResponse::new(attached.session_id)
                 .config_options(Some(attached.config_options)),
             activation: attached.activation,
-            creation: attached
-                .pending_fork_creation
-                .expect("fork attachment must defer transcript creation"),
+            creation: attached.creation,
         })
     }
 
-    async fn attach_session(
+    async fn attach_session<C>(
         self: &Arc<Self>,
-        cwd: PathBuf,
-        additional_directories: Vec<PathBuf>,
+        setup: SessionSetup,
         connection: ConnectionTo<Client>,
         mut claim: crate::runtime::SessionClaim,
         forked: Option<AcpForkState>,
-    ) -> Result<AttachedSession, AcpRuntimeError> {
+        commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
+    ) -> Result<AttachedSession<C>, AcpRuntimeError> {
+        let SessionSetup {
+            cwd,
+            additional_directories,
+            mcp_servers,
+        } = setup;
+        // Validate path serialization before admission or any binding/actor effects.
+        let cwd_metadata =
+            serde_json::to_value(&cwd).map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        serde_json::to_value(&additional_directories)
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        let additional_directories = self
+            .runtime
+            .additional_directories(&additional_directories)?;
+        let directories_metadata = serde_json::to_value(&additional_directories)
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+        // Reject exhaustion before admission or any binding, driver, or actor effects.
+        let token = self.registry.next_token()?;
+        let mut admission = self
+            .registry
+            .begin_attachment()
+            .map_err(|()| AcpRuntimeError::ClientClosed)?;
         // Claim the durable identity before binding ACP so every layer uses
         // the same id and any bind failure releases the selection or reservation.
         let session_id = agentkit_acp::SessionId::new(claim.id());
         let agentkit_session_id = AgentkitSessionId::new(claim.id());
+        // Client overlays own their manager, catalog, reload state, and event routes.
+        let mcp = self.runtime.session_mcp(mcp_servers, &cwd).await?;
+        let mcp_events = mcp
+            .subscribe(session_id.to_string())
+            .map_err(AcpRuntimeError::Loop)?;
+        if crate::resilient_fs::shutdown_token().is_cancelled() {
+            return Err(AcpRuntimeError::ClientClosed);
+        }
         let cancellation = CancellationController::new();
+        let shutdown_bridge =
+            crate::runtime::StorageCancellationBridge::new(cancellation.clone(), None);
         let (client, messages) = AcpClientHandle::channel();
         tokio::spawn(drain_client_messages(messages, connection.clone()));
-        let (turn_states, turn_state_messages) = mpsc::unbounded_channel();
-        tokio::spawn(drain_turn_states(turn_state_messages, connection.clone()));
+        // Lifecycle notifications enter the SDK queue synchronously. Running is
+        // enqueued before the observer can produce content; finalization flushes
+        // the content drain before enqueuing Idle on this same SDK queue.
+        let activity_connection = connection.clone();
+        let activity = legacy_activity(session_id.clone(), move |state| {
+            activity_connection
+                .send_notification(state)
+                .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+        });
 
         let mut metadata = MetadataMap::new();
-        metadata.insert("acp.cwd".into(), json!(cwd));
-        metadata.insert(
-            "acp.additional_directories".into(),
-            json!(additional_directories),
-        );
-        let mcp_events = self.runtime.subscribe_mcp(session_id.to_string());
+        metadata.insert("acp.cwd".into(), cwd_metadata);
+        metadata.insert("acp.additional_directories".into(), directories_metadata);
         let binding =
             AcpSessionBinding::new(session_id.clone(), agentkit_session_id, client.clone())
                 .cancellation(cancellation)
@@ -936,6 +1593,7 @@ impl Server {
             self.integration.as_ref().clone(),
             client,
             session_id.clone(),
+            activity.clone(),
         );
         let context = AcpDriverContext {
             cwd,
@@ -946,7 +1604,7 @@ impl Server {
         };
         let driver = match self
             .runtime
-            .start_acp_driver_with_initial(context, &mut claim, forked)
+            .start_acp_driver_with_mcp(context, &mut claim, forked, mcp)
             .await
         {
             Ok(driver) => driver,
@@ -966,7 +1624,7 @@ impl Server {
             .adapter
             .reasoning_effort()
             .map_err(|error| record_acp_runtime_failure(&session_id, "reasoning_effort", error))?;
-        let catalog = model_catalog(&current).await;
+        let catalog = driver.adapter.model_catalog(&current).await;
         let config_options = config_options(&current, reasoning_effort, &catalog);
         let background_jobs = driver.background_jobs.clone();
         let tasks = driver.tasks.clone();
@@ -975,7 +1633,9 @@ impl Server {
         let skill_catalog = skill_catalog::SkillCatalogMonitor::new(&driver.skills)
             .map_err(|error| record_acp_runtime_failure(&session_id, "skill_catalog", error))?;
         let (tx, rx) = mpsc::channel(8);
+        let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            voice_monitor: voice_state.monitor(claim.is_resumed() || claim.is_fork()),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -988,10 +1648,9 @@ impl Server {
             adapter: driver.adapter,
             catalog,
             commands: rx,
-            turn_states,
+            activity,
             mcp_events,
         };
-        let token = self.registry.next_token();
         let (activation, activated) = oneshot::channel();
         let (completed, completion) = watch::channel(false);
         let guard = SessionActorGuard {
@@ -1002,6 +1661,7 @@ impl Server {
             completed,
         };
         let actor_task = tokio::spawn(async move {
+            let _shutdown_bridge = shutdown_bridge;
             let _guard = guard;
             if activated.await.is_ok() {
                 session_actor(actor).await;
@@ -1017,47 +1677,47 @@ impl Server {
             actor: actor_task.abort_handle(),
             completed: completion,
         };
-        drop(actor_task);
 
-        // Hold the request-scoped map lock across registration, commit, and publication.
-        // Shutdown either closes the gate before this point or snapshots this actor.
-        let mut sessions = self.sessions.lock().expect("ACP session map poisoned");
-        self.registry
-            .register(registered)
-            .map_err(|()| AcpRuntimeError::ClientClosed)?;
-        let pending_fork_creation = if claim.is_fork() {
-            Some(claim.defer_fork_commit())
-        } else {
-            if let Err(error) = claim.commit() {
-                self.registry.remove(token);
-                return Err(record_acp_runtime_failure(
-                    &session_id,
-                    "session_commit",
-                    error,
-                ));
-            }
-            None
-        };
-        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
-            session_id: session_id.to_string(),
-        });
-        sessions.insert(
-            session_id.clone(),
+        // Shutdown either closes the gate before registration or snapshots this
+        // actor. The helper rolls back after releasing the local map on failure.
+        let publication = self.publish_session(
+            &mut admission,
+            registered,
             SessionHandle {
+                subagents: Some(driver.subagents),
+                voice_state,
                 token,
                 commands: tx,
                 background_jobs,
                 structured_completion,
                 tasks,
             },
+            || commit(claim),
         );
-        drop(sessions);
+        let creation = match publication {
+            Ok(creation) => creation,
+            Err(error) => {
+                drop(activation);
+                actor_task.abort();
+                let _ = actor_task.await;
+                return Err(match error {
+                    LegacyPublicationError::AdmissionClosed => AcpRuntimeError::ClientClosed,
+                    LegacyPublicationError::Commit(error) => {
+                        record_acp_runtime_failure(&session_id, "session_commit", error)
+                    }
+                });
+            }
+        };
+        crate::events::emit(&crate::events::RuntimeEvent::SessionStarted {
+            session_id: session_id.to_string(),
+        });
+        drop(actor_task);
         Ok(AttachedSession {
             session_id,
             config_options,
             canonical_transcript,
             activation,
-            pending_fork_creation,
+            creation,
         })
     }
 
@@ -1074,14 +1734,24 @@ impl Server {
     async fn set_config(
         &self,
         request: SetSessionConfigOptionRequest,
-    ) -> Result<SetSessionConfigOptionResponse, AcpRuntimeError> {
-        let sender = self.sender(&request.session_id).await?;
+    ) -> Result<SetSessionConfigOptionResponse, agent_client_protocol::Error> {
+        let sender = self.sender(&request.session_id).await.map_err(sdk_error)?;
+        let cancellation_generation = self
+            .integration
+            .cancellation_handle(&request.session_id)
+            .map_err(sdk_error)?
+            .generation();
         let (tx, rx) = oneshot::channel();
         sender
-            .send(Command::SetConfig { request, reply: tx })
+            .send(Command::SetConfig {
+                request,
+                reply: tx,
+                cancellation_generation,
+            })
             .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?;
+        rx.await
+            .map_err(|_| sdk_error(AcpRuntimeError::ClientClosed))?
     }
 
     async fn cancel(&self, notification: CancelNotification) -> Result<(), AcpRuntimeError> {
@@ -1091,7 +1761,7 @@ impl Server {
         let (sender, background_jobs, tasks, structured_completion) = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&notification.session_id)
             .map(|session| {
                 (
@@ -1122,7 +1792,7 @@ impl Server {
         let session = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
         cancel_background_jobs(&session.tasks, &session.background_jobs).await;
@@ -1142,12 +1812,55 @@ impl Server {
         &self,
         session_id: &agentkit_acp::SessionId,
     ) -> Result<mpsc::Sender<Command>, AcpRuntimeError> {
+        // Publication holds this lock across registry registration and commit.
+        // A poisoned map cannot establish that the session lifecycle is consistent.
         self.sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(session_id)
             .map(|session| session.commands.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(session_id.to_string()))
+    }
+
+    async fn read_subagent_transcript(
+        &self,
+        request: ReadSubagentTranscriptRequest,
+    ) -> Result<ReadSubagentTranscriptResponse, AcpRuntimeError> {
+        let subagents = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .get(&request.session_id.to_string().into())
+            .and_then(|session| session.subagents.clone())
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let page = subagents
+            .read_transcript(&request.id, request.generation, request.cursor)
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        Ok(ReadSubagentTranscriptResponse {
+            updates: page.updates,
+            next_cursor: page.next_cursor,
+            generation: request.generation,
+            caught_up: page.caught_up,
+        })
+    }
+
+    async fn steer_subagent(
+        &self,
+        request: SteerSubagentRequest,
+    ) -> Result<SteerSubagentResponse, AcpRuntimeError> {
+        let subagents = self
+            .sessions
+            .lock()
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
+            .get(&request.session_id.to_string().into())
+            .and_then(|session| session.subagents.clone())
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        let receipt = subagents
+            .steer_generation(&request.id, Some(request.generation), request.prompt.into())
+            .await
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        Ok(SteerSubagentResponse { receipt })
     }
 
     async fn detach_compose(
@@ -1157,7 +1870,7 @@ impl Server {
         let (background_jobs, tasks) = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&request.session_id)
             .map(|session| (session.background_jobs.clone(), session.tasks.clone()))
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
@@ -1173,7 +1886,7 @@ impl Server {
         let background_jobs = self
             .sessions
             .lock()
-            .expect("ACP session map poisoned")
+            .map_err(|_| AcpRuntimeError::ClientClosed)?
             .get(&request.session_id)
             .map(|session| session.background_jobs.clone())
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
@@ -1209,6 +1922,7 @@ pub(super) async fn detach_compose_call(
 }
 
 struct SessionActor<S: ModelSession> {
+    voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: agentkit_acp::SessionId,
     runtime: Arc<Runtime>,
     integration: Arc<AcpIntegration>,
@@ -1221,12 +1935,13 @@ struct SessionActor<S: ModelSession> {
     adapter: SelectableAdapter,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
-    turn_states: mpsc::UnboundedSender<TurnStateNotification>,
+    activity: activity::SessionActivity,
     mcp_events: crate::tools::mcp::McpSubscription,
 }
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
     let SessionActor {
+        mut voice_monitor,
         session_id,
         runtime,
         integration,
@@ -1239,36 +1954,134 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         adapter,
         catalog,
         mut commands,
-        turn_states,
+        activity,
         mut mcp_events,
     } = actor;
     let mut binding = Some(binding);
-    let mut next_autonomous_turn_id = 0_u64;
+    let mut model_switch = model_switch::Guard::default();
     loop {
-        tokio::select! {
-            // A queued cancel or close wins over a simultaneously-ready task
-            // completion, preventing autonomous progress past that boundary.
-            biased;
-            command = commands.recv() => match command {
+        // Poll in command > MCP > task order. In particular, queued cancellation
+        // must prevent an autonomous continuation from starting.
+        let event = {
+            let command = std::pin::pin!(commands.recv());
+            let mcp = std::pin::pin!(async {
+                match mcp_events.recv().await {
+                    Some(event) => event,
+                    None => std::future::pending().await,
+                }
+            });
+            let task = std::pin::pin!(tasks.next_event());
+            let work = std::pin::pin!(select(mcp, task));
+            match select(command, work).await {
+                Either::Left((command, _pending)) => Either::Left(command),
+                Either::Right((work, _pending)) => Either::Right(match work {
+                    Either::Left((event, _pending)) => Either::Left(event),
+                    Either::Right((event, _pending)) => Either::Right(event),
+                }),
+            }
+        }; // Drop the owning futures before handlers reborrow receivers/driver.
+        match event {
+            Either::Left(command) => match command {
                 Some(Command::Prompt { request, reply }) => {
-                    let result = drive_runtime_prompt(
-                        &session_id,
-                        &runtime,
-                        &integration,
-                        &mut skill_catalog,
-                        &mut driver,
-                        request,
-                        &tasks,
-                        &background_jobs,
-                        structured_completion,
-                    ).await;
-                    let _ = reply.send(result);
+                    let result = activity
+                        .execute(
+                            activity::ExecutionOrigin::Prompt,
+                            drive_runtime_prompt(
+                                &session_id,
+                                &runtime,
+                                &integration,
+                                &mut skill_catalog,
+                                &mut voice_monitor,
+                                &mut driver,
+                                request,
+                                &tasks,
+                                &background_jobs,
+                                structured_completion,
+                                &activity,
+                            ),
+                            |reason| Some(reason.clone()),
+                        )
+                        .instrument(crate::telemetry::error_spans::operation("acp"))
+                        .await;
+                    let response = result.and_then(|reason| {
+                        agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
+                    });
+                    let _ = reply.send(response);
                 }
                 // The server already interrupted the shared controller; this
                 // marker only establishes its serialized actor position.
                 Some(Command::Cancel) => {}
-                Some(Command::SetConfig { request, reply }) => {
-                    let result = set_config(&adapter, &catalog, request);
+                Some(Command::SetConfig {
+                    request,
+                    reply,
+                    cancellation_generation,
+                }) => {
+                    let result = async {
+                        let cancellation = integration
+                            .cancellation_handle(&session_id)
+                            .map_err(sdk_error)?;
+                        if cancellation.is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
+                        if request.config_id.to_string() == MODEL_CONFIG_ID {
+                            let target = request.value.as_value_id().ok_or_else(|| {
+                                model_switch::error("selection requires an id value")
+                            })?;
+                            let decision = model_switch.check(
+                                (
+                                    &adapter
+                                        .selection()
+                                        .map_err(|error| model_switch::error(&error))?,
+                                    cancellation_generation,
+                                ),
+                                ModelSelection::from_id(&target.to_string())
+                                    .map_err(|error| model_switch::error(&error))?,
+                                &catalog,
+                                driver.snapshot().transcript,
+                                request
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|meta| meta.get(model_switch::META)),
+                            )?;
+                            if decision == model_switch::Decision::Compact {
+                                let marker = model_switch::compact_marker();
+                                let marker_id = marker.id.clone();
+                                driver.submit_input(vec![marker]).map_err(|error| {
+                                    sdk_error(record_acp_loop_failure(&session_id, &error))
+                                })?;
+                                let reason = activity
+                                    .execute(
+                                        activity::ExecutionOrigin::Prompt,
+                                        drive_finalized(
+                                            &session_id,
+                                            &integration,
+                                            &mut driver,
+                                            false,
+                                            None,
+                                            &activity,
+                                        ),
+                                        |reason| Some(reason.clone()),
+                                    )
+                                    .await
+                                    .map_err(sdk_error)?;
+                                if !model_switch::compaction_completed(
+                                    &reason,
+                                    &marker_id,
+                                    &driver.snapshot().transcript,
+                                    cancellation.is_cancelled_since(cancellation_generation),
+                                ) {
+                                    return Err(model_switch::error(
+                                        "compaction did not complete; model unchanged",
+                                    ));
+                                }
+                            }
+                        }
+                        if cancellation.is_cancelled_since(cancellation_generation) {
+                            return Err(model_switch::error("model change cancelled"));
+                        }
+                        set_config(&adapter, &catalog, request).map_err(sdk_error)
+                    }
+                    .await;
                     let _ = reply.send(result);
                 }
                 Some(Command::Fork {
@@ -1300,43 +2113,35 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 None => {
                     clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
                     break;
-                },
+                }
             },
-            event = mcp_events.recv() => {
-                if let Some(event) = event {
-                    let result = driver
-                        .submit_input(vec![Item::notification(event.message)])
-                        .map_err(|error| AcpRuntimeError::Loop(error.to_string()));
-                    let result = match result {
-                        Ok(()) => drive_unsolicited(
-                            &session_id,
-                            &integration,
-                            &mut driver,
-                            &turn_states,
-                            &mut next_autonomous_turn_id,
-                        ).await,
-                        Err(error) => Err(error),
-                    };
-                    if let Err(error) = result {
-                        eprintln!("autonomous MCP continuation failed for {session_id}: {error}");
+            Either::Right(Either::Left(event)) => {
+                let result = driver
+                    .submit_input(vec![Item::notification(event.message)])
+                    .map_err(|error| AcpRuntimeError::Loop(error.to_string()));
+                let result = match result {
+                    Ok(()) => {
+                        drive_unsolicited(&session_id, &integration, &mut driver, &activity).await
                     }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("autonomous MCP continuation failed for {session_id}: {error}");
                 }
             }
             // Task events remain queued while a prompt is being driven, so a
             // completion cannot be lost in the prompt-to-idle transition.
-            event = tasks.next_event() => match event {
+            Either::Right(Either::Right(event)) => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background {
-                        let result = drive_unsolicited(
-                            &session_id,
-                            &integration,
-                            &mut driver,
-                            &turn_states,
-                            &mut next_autonomous_turn_id,
-                        ).await;
+                        let result =
+                            drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+                                .await;
                         if let Err(error) = result {
-                            eprintln!("autonomous ACP continuation failed for {session_id}: {error}");
+                            eprintln!(
+                                "autonomous ACP continuation failed for {session_id}: {error}"
+                            );
                         }
                     }
                 }
@@ -1345,7 +2150,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                 }
                 Some(_) => {}
                 None => break,
-            }
+            },
         }
     }
 }
@@ -1475,26 +2280,39 @@ pub(super) async fn settle_background_jobs(
         if !stable.active && !running && !stable.unacknowledged_terminals {
             return Ok(observed_activity);
         }
-        tokio::select! {
-            biased;
-            _ = background_jobs.activity_after(stable.generation) => {}
-            event = tasks.next_event(), if running || stable.unacknowledged_terminals => {
-                match event {
-                    Some(
-                        TaskEvent::Completed(snapshot, _)
-                        | TaskEvent::Cancelled(snapshot)
-                        | TaskEvent::Failed(snapshot, _),
-                    ) => {
-                        background_jobs.acknowledge_terminal(&snapshot.call_id);
-                    }
-                    Some(_) => {}
-                    None => {
-                        return Err(AcpRuntimeError::Loop(
-                            "background task event stream closed before quiescence".into(),
-                        ));
-                    }
+        let event = {
+            let activity = std::pin::pin!(background_jobs.activity_after(stable.generation));
+            let task = std::pin::pin!(async {
+                if running || stable.unacknowledged_terminals {
+                    tasks.next_event().await
+                } else {
+                    std::future::pending().await
                 }
+            });
+            // A generation change wins over a task event; refresh both guards
+            // on the next iteration rather than waiting on a stale snapshot.
+            match select(activity, task).await {
+                Either::Left((_activity, _pending)) => Either::Left(()),
+                Either::Right((event, _pending)) => Either::Right(event),
             }
+        };
+        match event {
+            Either::Left(()) => {}
+            Either::Right(event) => match event {
+                Some(
+                    TaskEvent::Completed(snapshot, _)
+                    | TaskEvent::Cancelled(snapshot)
+                    | TaskEvent::Failed(snapshot, _),
+                ) => {
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
+                }
+                Some(_) => {}
+                None => {
+                    return Err(AcpRuntimeError::Loop(
+                        "background task event stream closed before quiescence".into(),
+                    ));
+                }
+            },
         }
     }
 }
@@ -1578,57 +2396,20 @@ fn record_acp_loop_failure(
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-async fn drive_prompt<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    skills: &[agentkit_tool_skills::Skill],
-    integration: &AcpIntegration,
-    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
-    driver: &mut LoopDriver<S>,
-    request: PromptRequest,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
-    if structured_completion {
-        let _ = settle_background_jobs(tasks, background_jobs).await?;
-    }
-    background_jobs.begin_turn();
-    let items = integration.input_port().prompt_to_items(&request)?;
-    skill_catalog
-        .submit(skills, items, |items| driver.submit_input(items))
-        .map_err(|error| match error {
-            skill_catalog::SubmitError::Catalog(error) => {
-                record_acp_runtime_failure(session_id, "skill_catalog", error)
-            }
-            skill_catalog::SubmitError::Submit(error) => {
-                record_acp_loop_failure(session_id, &error)
-            }
-        })?;
-    drive_submitted_prompt(
-        session_id,
-        integration,
-        driver,
-        tasks,
-        background_jobs,
-        structured_completion,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn drive_runtime_prompt<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     runtime: &Arc<Runtime>,
     integration: &AcpIntegration,
     skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
+    voice_monitor: &mut crate::runtime::voice_state::VoiceMonitor,
     driver: &mut LoopDriver<S>,
     request: PromptRequest,
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
+    activity: &activity::SessionActivity,
+) -> Result<FinishReason, AcpRuntimeError> {
     if structured_completion {
         let _ = settle_background_jobs(tasks, background_jobs).await?;
     }
@@ -1639,7 +2420,9 @@ async fn drive_runtime_prompt<S: ModelSession>(
     background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
     skill_catalog
-        .submit(&current.skills, items, |items| driver.submit_input(items))
+        .submit(&current.skills, items, |items| {
+            voice_monitor.submit(items, |items| driver.submit_input(items))
+        })
         .map_err(|error| match error {
             skill_catalog::SubmitError::Catalog(error) => {
                 record_acp_runtime_failure(session_id, "skill_catalog", error)
@@ -1649,132 +2432,106 @@ async fn drive_runtime_prompt<S: ModelSession>(
             }
         })?;
     drop(current);
-    drive_submitted_prompt(
-        session_id,
-        integration,
-        driver,
-        tasks,
-        background_jobs,
-        structured_completion,
-    )
-    .await
-}
-
-async fn drive_submitted_prompt<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    integration: &AcpIntegration,
-    driver: &mut LoopDriver<S>,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-) -> Result<PromptResponse, AcpRuntimeError> {
-    let response = match drive_until_pause(
+    drive_finalized(
         session_id,
         integration,
         driver,
         true,
         structured_completion.then_some((tasks, background_jobs)),
+        activity,
     )
     .await
-    {
-        Ok(Some(response)) => response,
-        Ok(None) => {
-            return Err(AcpRuntimeError::Loop(
-                "prompt ended without a response".into(),
-            ));
-        }
-        Err(error) => {
-            if structured_completion {
-                cancel_background_jobs(tasks, background_jobs).await;
-                let _ = settle_background_jobs(tasks, background_jobs).await;
-            }
-            return Err(error);
-        }
-    };
-    if structured_completion && response.stop_reason == StopReason::Cancelled {
-        cancel_background_jobs(tasks, background_jobs).await;
-        let _ = settle_background_jobs(tasks, background_jobs).await?;
-    }
-    Ok(response)
 }
 
 async fn drive_unsolicited<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
-    turn_states: &mpsc::UnboundedSender<TurnStateNotification>,
-    next_turn_id: &mut u64,
+    activity: &activity::SessionActivity,
 ) -> Result<(), AcpRuntimeError> {
-    *next_turn_id = next_turn_id.wrapping_add(1);
-    let turn_id = *next_turn_id;
-    let _ = turn_states.send(TurnStateNotification {
-        session_id: session_id.clone(),
-        turn_id,
-        active: true,
-        error: None,
-    });
-    let result = drive_autonomous(session_id, integration, driver).await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    let _ = turn_states.send(TurnStateNotification {
-        session_id: session_id.clone(),
-        turn_id,
-        active: false,
-        error,
-    });
-    result
+    activity
+        .execute(
+            activity::ExecutionOrigin::Autonomous,
+            drive_finalized(session_id, integration, driver, false, None, activity),
+            |reason| Some(reason.clone()),
+        )
+        .instrument(crate::telemetry::error_spans::operation("acp_autonomous"))
+        .await
+        .map(|_| ())
 }
 
-async fn drive_autonomous<S: ModelSession>(
-    session_id: &agentkit_acp::SessionId,
-    integration: &AcpIntegration,
-    driver: &mut LoopDriver<S>,
-) -> Result<(), AcpRuntimeError> {
-    let _ = drive_until_pause(session_id, integration, driver, false, None).await?;
-    Ok(())
-}
-
-async fn drive_until_pause<S: ModelSession>(
+async fn drive_finalized<S: ModelSession>(
     session_id: &agentkit_acp::SessionId,
     integration: &AcpIntegration,
     driver: &mut LoopDriver<S>,
     answer_prompt: bool,
     structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-) -> Result<Option<PromptResponse>, AcpRuntimeError> {
+    activity: &activity::SessionActivity,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let cancellation = integration.cancellation_handle(session_id)?;
+    let generation = cancellation.generation();
+    let result =
+        drive_domain_until_pause(session_id, integration, driver, answer_prompt, structured).await;
+    activity::finalize(
+        activity::ExecutionOutcome::new(result, cancellation.is_cancelled_since(generation)),
+        structured,
+        async {
+            let projected = activity.drain_tool_projection().await;
+            let delivered = integration.flush_session_updates(session_id).await;
+            projected.and(delivered)
+        },
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn drive_domain_until_pause<S: ModelSession>(
+    session_id: &agentkit_acp::SessionId,
+    integration: &AcpIntegration,
+    driver: &mut LoopDriver<S>,
+    answer_prompt: bool,
+    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let cancellation = integration.cancellation_handle(session_id)?;
+    let generation = cancellation.generation();
     loop {
         let step = match driver.next().await {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
-                integration.flush_session_updates(session_id).await?;
-                return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::Cancelled)));
+                return Ok(FinishReason::Cancelled);
             }
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
+        if cancellation.is_cancelled_since(generation) {
+            driver
+                .retire_interrupted_turn()
+                .await
+                .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+            return Ok(FinishReason::Cancelled);
+        }
         match step {
             LoopStep::Finished(result) => {
                 if result.finish_reason == FinishReason::ToolCall {
                     continue;
                 }
-                integration.flush_session_updates(session_id).await?;
-                if !answer_prompt {
-                    return Ok(None);
+                if result.finish_reason == FinishReason::Error {
+                    return Err(AcpRuntimeError::Loop("model turn failed".into()));
                 }
-                let reason = agentkit_acp::finish_reason_to_stop_reason(&result.finish_reason)?;
                 if let Some((tasks, background_jobs)) = structured
                     && settle_background_jobs(tasks, background_jobs).await?
                 {
                     continue;
                 }
-                return Ok(Some(PromptResponse::new(reason)));
+                return Ok(result.finish_reason);
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                integration.flush_session_updates(session_id).await?;
                 if answer_prompt
                     && let Some((tasks, background_jobs)) = structured
                     && settle_background_jobs(tasks, background_jobs).await?
                 {
                     continue;
                 }
-                return Ok(answer_prompt.then(|| PromptResponse::new(StopReason::EndTurn)));
+                return Ok(FinishReason::Completed);
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
@@ -1796,43 +2553,123 @@ async fn drive_until_pause<S: ModelSession>(
     }
 }
 
+/// The SDK can retain its outgoing task after input EOF. Observe EOF ourselves
+/// so the serve supervisor can stop HTTP and perform final storage recovery.
+async fn connect_stdio(component: impl ConnectTo<Client>) -> Result<(), AcpRuntimeError> {
+    use std::io::{BufRead as _, Write as _};
+    // A dedicated OS thread does not hold Tokio runtime teardown hostage if a
+    // termination signal arrives while stdin is idle.
+    let (send, receive) = tokio::sync::mpsc::channel(16);
+    std::thread::Builder::new()
+        .name("kit-acp-stdin".into())
+        .spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                if send.blocking_send(line).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+    let eof = tokio_util::sync::CancellationToken::new();
+    let incoming =
+        futures_util::stream::unfold((receive, eof.clone()), async |(mut receive, eof)| {
+            match receive.recv().await {
+                Some(line) => Some((line, (receive, eof))),
+                None => {
+                    eof.cancel();
+                    None
+                }
+            }
+        });
+    let (send, mut receive) = tokio::sync::mpsc::channel::<(
+        String,
+        tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    )>(1);
+    std::thread::Builder::new()
+        .name("kit-acp-stdout".into())
+        .spawn(move || {
+            while let Some((line, reply)) = receive.blocking_recv() {
+                let mut stdout = std::io::stdout().lock();
+                let result = writeln!(stdout, "{line}").and_then(|()| stdout.flush());
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
+        })
+        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))?;
+    let outgoing = futures_util::sink::unfold(send, async |send, line: String| {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        send.send((line, reply))
+            .await
+            .map_err(std::io::Error::other)?;
+        result.await.map_err(std::io::Error::other)??;
+        Ok::<_, std::io::Error>(send)
+    });
+    let transport = agent_client_protocol::Lines::new(Box::pin(outgoing), Box::pin(incoming));
+    // On a tie, report the connection outcome before EOF. Both outcomes were
+    // permitted by the former unbiased race; connection errors stay visible.
+    let outcome = {
+        let connection = std::pin::pin!(component.connect_to(transport));
+        let eof = std::pin::pin!(eof.cancelled());
+        match select(connection, eof).await {
+            Either::Left((result, _pending)) => Some(result),
+            Either::Right(((), _pending)) => None,
+        }
+    };
+    match outcome {
+        Some(result) => result.map_err(|error| AcpRuntimeError::Sdk(error.to_string())),
+        None => Ok(()),
+    }
+}
+
 pub async fn serve(runtime: Arc<Runtime>) -> Result<(), AcpRuntimeError> {
-    serve_transport(runtime, agent_client_protocol::Stdio::new()).await
+    serve_with_registry(runtime, SessionRegistry::new()).await
 }
 
 pub async fn serve_with_registry(
     runtime: Arc<Runtime>,
     registry: SessionRegistry,
 ) -> Result<(), AcpRuntimeError> {
-    component(runtime, registry)?
-        .connect_to(agent_client_protocol::Stdio::new())
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
-}
-
-async fn serve_transport(
-    runtime: Arc<Runtime>,
-    transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
-) -> Result<(), AcpRuntimeError> {
-    let registry = SessionRegistry::new();
-    let result = component(runtime, registry.clone())?
-        .connect_to(transport)
-        .await
-        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
+    let component = component(runtime, registry.clone())?;
+    let shutdown = crate::resilient_fs::shutdown_token();
+    let result = {
+        let connection = std::pin::pin!(connect_stdio(component));
+        let shutdown = std::pin::pin!(shutdown.cancelled());
+        // Deterministically prefer the connection outcome on a tie, one of the
+        // former unbiased race's allowed outcomes. Drop it before registry cleanup.
+        match select(connection, shutdown).await {
+            Either::Left((result, _pending)) => result,
+            Either::Right(((), _pending)) => Ok(()),
+        }
+    };
     registry.shutdown().await;
     result
 }
 
+// The HTTP SDK requires an infallible factory. Carry construction failure to
+// its fallible connection boundary instead of panicking or sharing a server's
+// integration binding map between connections.
+struct HttpConnection(Result<agent_client_protocol::AgentProtocolRouter, AcpRuntimeError>);
+
+impl ConnectTo<Client> for HttpConnection {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<agent_client_protocol::Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        self.0.map_err(sdk_error)?.connect_to(client).await
+    }
+}
+
 pub(crate) fn http_router(runtime: Arc<Runtime>, registry: SessionRegistry) -> axum::Router {
     agent_client_protocol_http::AcpHttpServer::new(move || {
-        let v1 = component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP v1 integration must build");
-        let v2 = v2::component(Arc::clone(&runtime), registry.clone())
-            .expect("Kit's fixed ACP v2 integration must build");
-        agent_client_protocol::Agent
-            .protocol_router()
-            .with_v1(v1)
-            .with_v2(v2)
+        HttpConnection(component(Arc::clone(&runtime), registry.clone()).map(|v1| {
+            agent_client_protocol::Agent
+                .protocol_router()
+                .with_v1(v1)
+                .with_v2(v2::component(Arc::clone(&runtime), registry.clone()))
+        }))
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         health_endpoint: false,
@@ -1858,6 +2695,28 @@ fn component(
                 let state = Arc::clone(&state);
                 async move |request: InitializeRequest, responder, _cx| {
                     responder.respond(state.initialize(request).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: AuthenticateRequest, responder, _cx| {
+                    responder.respond_with_result(state.authenticate(request))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |_request: LogoutRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(state.logout().await.map_err(sdk_error))
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1921,11 +2780,13 @@ fn component(
                     cx.spawn(async move {
                         match state.fork_session(request, connection.clone()).await {
                             Ok(prepared) => {
-                                let session_id = prepared.response.session_id.clone();
-                                responder.respond(prepared.response)?;
-                                prepared.creation.commit_creation();
-                                let _ = prepared.activation.send(());
-                                connection.send_notification(available_commands_update(session_id))
+                                if let Some(session_id) = prepared
+                                    .submit(|response| responder.respond_with_result(response))?
+                                {
+                                    connection
+                                        .send_notification(available_commands_update(session_id))?;
+                                }
+                                Ok(())
                             }
                             Err(error) => responder.respond_with_result(Err(sdk_error(error))),
                         }
@@ -1973,8 +2834,7 @@ fn component(
                 async move |request: SetSessionConfigOptionRequest, responder, cx| {
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
-                        responder
-                            .respond_with_result(state.set_config(request).await.map_err(sdk_error))
+                        responder.respond_with_result(state.set_config(request).await)
                     })?;
                     Ok(())
                 }
@@ -1989,6 +2849,39 @@ fn component(
                     cx.spawn(async move {
                         responder.respond_with_result(
                             state.detach_compose(request).await.map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: ReadSubagentTranscriptRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state
+                                .read_subagent_transcript(request)
+                                .await
+                                .map_err(sdk_error),
+                        )
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: SteerSubagentRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        responder.respond_with_result(
+                            state.steer_subagent(request).await.map_err(sdk_error),
                         )
                     })?;
                     Ok(())
@@ -2027,6 +2920,16 @@ fn component(
                 }
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notification: VoiceStateNotification, _cx| {
+                    state.voice_state(notification).map_err(sdk_error)?;
+                    Ok(Handled::Yes)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_notification(
             {
@@ -2078,8 +2981,8 @@ fn parse_session_list_cursor(cursor: &str) -> Result<usize, ListSessionsError> {
         .ok_or(ListSessionsError::InvalidCursor)
 }
 
-fn capabilities() -> agentkit_acp::AgentCapabilities {
-    agentkit_acp::AgentCapabilities::new()
+fn capabilities(logout_authentication: bool) -> agentkit_acp::AgentCapabilities {
+    let capabilities = agentkit_acp::AgentCapabilities::new()
         .load_session(true)
         .prompt_capabilities(
             PromptCapabilities::new()
@@ -2093,15 +2996,11 @@ fn capabilities() -> agentkit_acp::AgentCapabilities {
                 .fork(SessionForkCapabilities::new())
                 .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                 .close(SessionCloseCapabilities::new()),
-        )
-}
-
-async fn drain_turn_states(
-    mut states: mpsc::UnboundedReceiver<TurnStateNotification>,
-    connection: ConnectionTo<Client>,
-) {
-    while let Some(state) = states.recv().await {
-        let _ = connection.send_notification(state);
+        );
+    if logout_authentication {
+        capabilities.auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+    } else {
+        capabilities
     }
 }
 
@@ -2109,13 +3008,16 @@ async fn drain_client_messages(
     mut messages: mpsc::UnboundedReceiver<AcpClientMessage>,
     connection: ConnectionTo<Client>,
 ) {
+    let mut failed = false;
     while let Some(message) = messages.recv().await {
         match message {
             AcpClientMessage::SessionNotification(notification) => {
-                let _ = connection.send_notification(notification);
+                failed |= connection.send_notification(notification).is_err();
             }
             AcpClientMessage::Flush { response } => {
-                let _ = response.send(());
+                if !failed {
+                    let _ = response.send(());
+                }
             }
             AcpClientMessage::PermissionRequest { request, response } => {
                 let connection = connection.clone();
@@ -2133,6 +3035,130 @@ async fn drain_client_messages(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+pub(crate) mod test_support {
+    use super::*;
+    use agentkit_task_manager::TaskManager as _;
+
+    /// Exercises the real request type and handler over ACP, with an actual
+    /// child's runtime-owned manager supplied by the subprocess regression test.
+    pub(crate) async fn assert_transcript_route(
+        root: &std::path::Path,
+        manager: crate::tools::Subagents,
+        child: String,
+        generation: u64,
+    ) {
+        let server = Arc::new(Server::new(
+            Runtime::new(root, "test-model").unwrap(),
+            AcpIntegration::builder()
+                .name("transcript-route-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        ));
+        for (id, subagents) in [("owner", manager.clone()), ("other", manager.fresh())] {
+            server.sessions.lock().unwrap().insert(
+                agentkit_acp::SessionId::new(id),
+                SessionHandle {
+                    subagents: Some(subagents),
+                    voice_state: Default::default(),
+                    token: 1,
+                    commands: mpsc::channel(1).0,
+                    background_jobs: BackgroundJobs::default(),
+                    structured_completion: false,
+                    tasks: agentkit_task_manager::AsyncTaskManager::new().handle(),
+                },
+            );
+        }
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let service = agent_client_protocol::Agent.builder().on_receive_request(
+            {
+                let server = server.clone();
+                async move |request: ReadSubagentTranscriptRequest, responder, _cx| {
+                    responder.respond_with_result(
+                        server
+                            .read_subagent_transcript(request)
+                            .await
+                            .map_err(sdk_error),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+        let actor = tokio::spawn(service.connect_to(agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .connect_with(client_transport, async move |connection| {
+                let request = ReadSubagentTranscriptRequest {
+                    session_id: agentkit_acp::SessionId::new("owner"),
+                    id: child,
+                    generation,
+                    cursor: 0,
+                };
+                let page = connection
+                    .send_request(request.clone())
+                    .block_task()
+                    .await?;
+                assert_eq!(page.generation, generation);
+                assert!(!page.updates.is_empty());
+                assert!(page.next_cursor > 0);
+                for invalid in [
+                    ReadSubagentTranscriptRequest {
+                        session_id: agentkit_acp::SessionId::new("other"),
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        session_id: agentkit_acp::SessionId::new("missing"),
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        generation: generation + 1,
+                        ..request.clone()
+                    },
+                    ReadSubagentTranscriptRequest {
+                        cursor: u64::MAX,
+                        ..request
+                    },
+                ] {
+                    assert!(connection.send_request(invalid).block_task().await.is_err());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        actor.abort();
+        let _ = actor.await;
+    }
+
+    impl SessionRegistry {
+        pub(super) async fn reset_authentication(&self) -> bool {
+            self.reset_authentication_with(async {}).await.0
+        }
+
+        pub(super) async fn shutdown_with_timeout(&self, limit: Duration) {
+            self.close_sessions_with_timeout(limit, false, || async {})
+                .await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 pub(super) mod tests {
     use std::{
         collections::VecDeque,
@@ -2163,15 +3189,198 @@ pub(super) mod tests {
     };
 
     use super::*;
+    use agentkit_acp::StopReason;
+
+    async fn serve_transport(
+        runtime: Arc<Runtime>,
+        transport: impl ConnectTo<agent_client_protocol::Agent> + 'static,
+    ) -> Result<(), AcpRuntimeError> {
+        let registry = SessionRegistry::new();
+        let result = component(runtime, registry.clone())?
+            .connect_to(transport)
+            .await
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
+        registry.shutdown().await;
+        result
+    }
+
+    fn test_activity(
+        id: agentkit_acp::SessionId,
+        tx: mpsc::UnboundedSender<TurnStateNotification>,
+    ) -> activity::SessionActivity {
+        legacy_activity(id, move |state| {
+            tx.send(state).map_err(|_| AcpRuntimeError::ClientClosed)
+        })
+    }
+
+    #[test]
+    fn rejected_fork_deferral_releases_configured_new_and_load_claims() {
+        for load in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::with_session(
+                root.path(),
+                "gpt-5.4",
+                crate::runtime::SessionRequest {
+                    id: "selected".into(),
+                    resume: false,
+                    force: false,
+                },
+            )
+            .unwrap();
+            let claim = if load {
+                runtime.claim_session_load("selected").unwrap()
+            } else {
+                runtime.claim_session().unwrap()
+            };
+            assert!(claim.is_configured());
+            assert!(claim.defer_fork_commit().is_err());
+            let retry = runtime.claim_session().unwrap();
+            assert_eq!(retry.id(), "selected");
+            assert!(retry.is_configured());
+            assert!(crate::session::load(root.path(), "selected").is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_runtime_telemetry_is_rejected_before_shared_runtime_reconfiguration() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let invalid = crate::telemetry::Settings {
+            message_content_max_messages: 0,
+            ..Default::default()
+        };
+        let error = Runtime::with_telemetry(runtime.clone(), invalid)
+            .err()
+            .unwrap();
+        assert!(error.contains("otel_message_content_max_messages"));
+        // Rejection leaves the original runtime privately owned and configurable.
+        let runtime = Runtime::with_telemetry(runtime, Default::default()).unwrap();
+        assert_eq!(runtime.base_depth(), 0);
+    }
+
+    #[test]
+    fn unopened_fork_cannot_transfer_cleanup_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        assert!(claim.defer_fork_commit().is_err());
+        assert!(crate::session::load(root.path(), &id).is_err());
+        let next = runtime.claim_session_fork().unwrap();
+        assert_ne!(next.id(), id);
+        assert!(next.is_fork());
+    }
+
+    #[tokio::test]
+    async fn http_connection_propagates_integration_construction_failure() {
+        let failure = AcpIntegration::builder().build().err().unwrap();
+        let expected = sdk_error(AcpRuntimeError::MissingField("name"));
+        let actual = HttpConnection(Err(failure))
+            .connect_to(agent_client_protocol::Client.builder())
+            .await
+            .unwrap_err();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transport_orders_running_partial_content_and_error_idle() {
+        let (client_transport, agent_transport) = Channel::duplex();
+        let (events, mut received) = mpsc::unbounded_channel();
+        let content_events = events.clone();
+        let client = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .builder()
+                .on_receive_notification(
+                    async move |state: TurnStateNotification, _cx| {
+                        events
+                            .send(if state.active { "running" } else { "idle" })
+                            .unwrap();
+                        if !state.active {
+                            assert!(state.error.is_some());
+                        }
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .on_receive_notification(
+                    async move |_content: SessionNotification, _cx| {
+                        content_events.send("content").unwrap();
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_to(client_transport)
+                .await
+        });
+        agent_client_protocol::Agent
+            .builder()
+            .connect_with(agent_transport, async move |connection| {
+                let id = agentkit_acp::SessionId::new("ordered");
+                let lifecycle_connection = connection.clone();
+                let activity = legacy_activity(id.clone(), move |state| {
+                    lifecycle_connection
+                        .send_notification(state)
+                        .map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+                });
+                let (content, messages) = AcpClientHandle::channel();
+                let result = activity
+                    .execute(
+                        activity::ExecutionOrigin::Autonomous,
+                        async {
+                            activity.observe(&AgentEvent::TurnStarted {
+                                session_id: AgentkitSessionId::new("ordered"),
+                                turn_id: agentkit_core::TurnId::new("first"),
+                            });
+                            content.notify_session(SessionNotification::new(
+                                id,
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("partial")),
+                                )),
+                            ))?;
+                            // Deliberately delay the content drain. Idle must await it,
+                            // including when the operation fails after partial output.
+                            tokio::spawn(drain_client_messages(messages, connection.clone()));
+                            activity::finalize(
+                                activity::ExecutionOutcome::new(
+                                    Err(AcpRuntimeError::Loop("approval failed".into())),
+                                    false,
+                                ),
+                                None,
+                                content.flush(),
+                                |_| Ok(()),
+                            )
+                            .await
+                        },
+                        |reason| Some(reason.clone()),
+                    )
+                    .await;
+                assert!(result.is_err());
+                for expected in ["running", "content", "idle"] {
+                    assert_eq!(
+                        timeout(Duration::from_secs(2), received.recv())
+                            .await
+                            .unwrap(),
+                        Some(expected)
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        client.abort();
+    }
 
     #[test]
     fn terminal_auth_methods_require_client_support() {
-        assert!(terminal_auth_methods(&agentkit_acp::ClientCapabilities::new()).is_empty());
+        assert!(
+            terminal_auth_methods(&agentkit_acp::ClientCapabilities::new(), |_| true).is_empty()
+        );
 
         let capabilities = agentkit_acp::ClientCapabilities::new()
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
-        let methods = terminal_auth_methods(&capabilities);
-        assert_eq!(methods.len(), 3);
+        assert!(terminal_auth_methods(&capabilities, |_| false).is_empty());
+        let methods = terminal_auth_methods(&capabilities, |_| true);
+        assert_eq!(methods.len(), 4);
         assert!(matches!(
             &methods[0],
             AuthMethod::Terminal(method)
@@ -2184,6 +3393,512 @@ pub(super) mod tests {
                 if method.id.0.as_ref() == "openrouter"
                     && method.args == ["--terminal-auth-login", "openrouter"]
         ));
+        assert!(matches!(
+            &methods[2],
+            AuthMethod::Terminal(method)
+                if method.id.0.as_ref() == "speakeasy"
+                    && method.args == ["--terminal-auth-login", "speakeasy"]
+        ));
+
+        let methods = terminal_auth_methods(&capabilities, |provider| {
+            provider != ProviderKind::OpenRouter
+        });
+        let method_ids = methods
+            .iter()
+            .map(|method| match method {
+                AuthMethod::Terminal(method) => method.id.0.as_ref(),
+                _ => unreachable!("only terminal methods are advertised"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(method_ids, ["openai", "speakeasy", "cerebras"]);
+    }
+
+    #[test]
+    fn v1_logout_capability_is_independent_from_terminal_authentication_methods() {
+        let client = agentkit_acp::ClientCapabilities::new()
+            .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
+
+        assert!(capabilities(false).auth.logout.is_none());
+        assert!(
+            !terminal_auth_methods(&client, |provider| { provider != ProviderKind::OpenRouter })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v1_authentication_errors_and_terminal_login_use_protocol_codes() {
+        let error = sdk_error(AcpRuntimeError::Loop(
+            "speakeasy_auth_required: run `kit auth login speakeasy`".into(),
+        ));
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            AcpIntegration::builder()
+                .name("auth-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        );
+        for method_id in ["openai", "unknown"] {
+            let error = server
+                .authenticate(AuthenticateRequest::new(method_id))
+                .unwrap_err();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+            assert_eq!(error.data.unwrap()["methodId"], method_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_logout_still_resets_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let storage =
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+        storage.make_entry_undeletable_for_test("openrouter", "default");
+        storage
+            .entry("speakeasy", "default")
+            .save(b"removed")
+            .unwrap();
+        let mut runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            storage.clone(),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(false);
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not remove OpenRouter credentials")
+        );
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(
+            storage
+                .entry("speakeasy", "default")
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.begin_attachment().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unsupported_logout_preserves_active_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "openrouter:test",
+            crate::ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            Some(crate::provider::OpenRouterApiKey::new("explicit")),
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(runtime, registry.clone());
+        let (_commands, closed) = register_close_tracking_session(&server, &registry);
+
+        let error = server.logout().await.unwrap_err();
+
+        assert!(error.to_string().contains("cannot be logged out"));
+        assert!(!closed.load(Ordering::SeqCst));
+
+        registry.shutdown().await;
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    fn logout_test_server(runtime: Arc<Runtime>, registry: SessionRegistry) -> Arc<Server> {
+        Arc::new(Server::new(
+            runtime,
+            AcpIntegration::builder()
+                .name("logout-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry,
+        ))
+    }
+
+    fn legacy_pending_publication(
+        server: &Arc<Server>,
+        id: &str,
+    ) -> (
+        RegisteredSession,
+        SessionHandle,
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Command>,
+    ) {
+        let session_id = agentkit_acp::SessionId::new(id.to_owned());
+        let token = server.registry.next_token().unwrap();
+        let (completed, completion) = watch::channel(false);
+        let guard = SessionActorGuard {
+            server: Arc::downgrade(server),
+            registry: server.registry.clone(),
+            session_id: session_id.clone(),
+            token,
+            completed,
+        };
+        let actor = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let (commands, received) = mpsc::channel(1);
+        let session = SessionHandle {
+            subagents: None,
+            voice_state: Default::default(),
+            token,
+            commands,
+            background_jobs: BackgroundJobs::default(),
+            structured_completion: false,
+            tasks: AsyncTaskManager::new().handle(),
+        };
+        let registered = RegisteredSession {
+            token,
+            session_id,
+            integration: Arc::clone(&server.integration),
+            background_jobs: session.background_jobs.clone(),
+            tasks: session.tasks.clone(),
+            commands: session.commands.downgrade(),
+            actor: actor.abort_handle(),
+            completed: completion,
+        };
+        (registered, session, actor, received)
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_commit_error_rolls_back_and_unwind_isolates_map() {
+        for unwind in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let registry = SessionRegistry::new();
+            let server = logout_test_server(
+                Runtime::new(root.path(), "gpt-5.4").unwrap(),
+                registry.clone(),
+            );
+            let mut admission = registry.begin_attachment().unwrap();
+            let (registered, session, actor, _received) =
+                legacy_pending_publication(&server, "failed");
+            let completed = registered.completed.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                server.publish_session(&mut admission, registered, session, || {
+                    if unwind {
+                        panic!("durable commit unwound");
+                    }
+                    Err::<(), _>(AcpRuntimeError::ClientClosed)
+                })
+            }));
+            if unwind {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert!(registry.inner.lock_state().sessions.is_empty());
+            assert_eq!(server.sessions.is_poisoned(), unwind);
+            let id = agentkit_acp::SessionId::new("failed");
+            let error = server.sender(&id).await.unwrap_err();
+            if unwind {
+                assert!(matches!(error, AcpRuntimeError::ClientClosed));
+                assert!(matches!(
+                    server.cancel(CancelNotification::new(id.clone())).await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server.close(CloseSessionRequest::new(id.clone())).await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server
+                        .detach_compose(DetachComposeRequest {
+                            session_id: id.clone(),
+                            call_id: "call".into(),
+                        })
+                        .await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+                assert!(matches!(
+                    server
+                        .cancel_background(CancelBackgroundRequest {
+                            session_id: id,
+                            call_id: "call".into(),
+                        })
+                        .await,
+                    Err(AcpRuntimeError::ClientClosed)
+                ));
+            } else {
+                assert!(matches!(error, AcpRuntimeError::SessionNotFound(_)));
+            }
+            // The real actor guard runs against the poisoned map without a
+            // second panic, then unregisters and publishes completion.
+            assert!(
+                timeout(Duration::from_secs(1), actor)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(*completed.borrow());
+            assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_closed_gate_rejects_without_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        registry.close_gate_and_snapshot(false);
+        let (registered, session, actor, _received) = legacy_pending_publication(&server, "closed");
+        assert!(matches!(
+            server.publish_session(&mut admission, registered, session, || -> Result<(), _> {
+                panic!("rejected commit ran")
+            }),
+            Err(LegacyPublicationError::AdmissionClosed)
+        ));
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert!(admission.active);
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        drop(admission);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_rejection_preserves_incumbent_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut consumed = registry.begin_attachment().unwrap();
+        let (registered, session, incumbent, _received) =
+            legacy_pending_publication(&server, "original");
+        let token = registered.token;
+        server
+            .publish_session(&mut consumed, registered, session, || Ok(()))
+            .unwrap();
+        for rejection in ["local-id", "token", "consumed", "foreign"] {
+            let foreign = SessionRegistry::new();
+            let mut fresh = if rejection == "foreign" {
+                foreign.begin_attachment().unwrap()
+            } else {
+                registry.begin_attachment().unwrap()
+            };
+            let id = if rejection == "local-id" {
+                "original"
+            } else {
+                "duplicate"
+            };
+            let (mut registered, mut session, actor, _received) =
+                legacy_pending_publication(&server, id);
+            if rejection != "local-id" {
+                registered.token = token;
+                session.token = token;
+            }
+            let admission = if rejection == "consumed" {
+                &mut consumed
+            } else {
+                &mut fresh
+            };
+            assert!(
+                server
+                    .publish_session(admission, registered, session, || -> Result<(), _> {
+                        panic!("rejected commit ran")
+                    })
+                    .is_err()
+            );
+            assert_eq!(
+                registry
+                    .inner
+                    .lock_state()
+                    .sessions
+                    .get(&token)
+                    .unwrap()
+                    .actor
+                    .id(),
+                incumbent.id()
+            );
+            assert!(!incumbent.is_finished());
+            // Pre-registration rejection leaves abort/join to the attachment
+            // caller. This actor's guard retains its separately allocated token.
+            actor.abort();
+            assert!(
+                timeout(Duration::from_secs(1), actor)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(registry.inner.lock_state().sessions.contains_key(&token));
+            assert_eq!(
+                server
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&agentkit_acp::SessionId::new("original"))
+                    .unwrap()
+                    .token,
+                token
+            );
+        }
+        incumbent.abort();
+        assert!(
+            timeout(Duration::from_secs(1), incumbent)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_actor_cleanup_drops_mailbox_outside_map_lock() {
+        struct CheckUnlocked(Weak<Server>, AtomicBool);
+        impl std::task::Wake for CheckUnlocked {
+            fn wake(self: Arc<Self>) {
+                let server = self.0.upgrade().unwrap();
+                assert!(server.sessions.try_lock().is_ok());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        let (registered, session, actor, mut received) =
+            legacy_pending_publication(&server, "mailbox-drop");
+        server
+            .publish_session(&mut admission, registered, session, || Ok(()))
+            .unwrap();
+        let wake = Arc::new(CheckUnlocked(
+            Arc::downgrade(&server),
+            AtomicBool::new(false),
+        ));
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(received.poll_recv(&mut context).is_pending());
+        actor.abort();
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(wake.1.load(Ordering::SeqCst));
+        assert!(server.sessions.lock().unwrap().is_empty());
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert!(received.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_wakeup_unwind_rolls_back_consumed_admission() {
+        struct PanicOnWake(SessionRegistry);
+        impl std::task::Wake for PanicOnWake {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                panic!("registration waiter unwound");
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let registry = SessionRegistry::new();
+        let server = logout_test_server(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            registry.clone(),
+        );
+        let mut admission = registry.begin_attachment().unwrap();
+        let waker = std::task::Waker::from(Arc::new(PanicOnWake(registry.clone())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait_for_pending_attachments());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let (registered, session, actor, _received) = legacy_pending_publication(&server, "wake");
+        let completed = registered.completed.clone();
+        let committed = AtomicBool::new(false);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                server.publish_session(&mut admission, registered, session, || {
+                    committed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            }))
+            .is_err()
+        );
+        assert!(!committed.load(Ordering::SeqCst));
+        assert!(!admission.active);
+        assert!(registry.inner.lock_state().sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(server.sessions.is_poisoned());
+        assert!(
+            timeout(Duration::from_secs(1), actor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(*completed.borrow());
+    }
+
+    fn register_close_tracking_session(
+        server: &Arc<Server>,
+        registry: &SessionRegistry,
+    ) -> (mpsc::Sender<Command>, Arc<AtomicBool>) {
+        let token = registry.next_token().unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        let (completed, completion) = watch::channel(false);
+        let closed = Arc::new(AtomicBool::new(false));
+        let actor_closed = Arc::clone(&closed);
+        let actor = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completed);
+            if let Some(Command::Close { reply }) = received.recv().await {
+                actor_closed.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+            }
+        });
+        registry
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id: agentkit_acp::SessionId::new("logout-session"),
+                    integration: Arc::clone(&server.integration),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
+            .unwrap();
+        drop(actor);
+        (commands, closed)
     }
 
     #[test]
@@ -2192,7 +3907,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities).len(), 3);
+        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 4);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);
@@ -2219,7 +3934,7 @@ pub(super) mod tests {
         let integration = shutdown_test_integration();
         let (background_jobs, tasks) = start_non_cooperative_background("shutdown-call").await;
         let session_id = agentkit_acp::SessionId::new("close-me");
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (commands, mut received) = mpsc::channel(1);
         let weak_commands = commands.downgrade();
         let (completed, completion) = watch::channel(false);
@@ -2233,25 +3948,40 @@ pub(super) mod tests {
             }
         });
         registry
-            .register(RegisteredSession {
-                token,
-                session_id,
-                integration: Arc::clone(&integration),
-                background_jobs: background_jobs.clone(),
-                tasks: tasks.clone(),
-                commands: weak_commands,
-                actor: actor.abort_handle(),
-                completed: completion,
-            })
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id,
+                    integration: Arc::clone(&integration),
+                    background_jobs: background_jobs.clone(),
+                    tasks: tasks.clone(),
+                    commands: weak_commands,
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
             .unwrap();
         drop(actor);
 
-        registry.shutdown_with_timeout(Duration::from_secs(1)).await;
-        assert!(closed.load(Ordering::SeqCst));
-        assert!(tasks.list_running().await.is_empty());
-        assert!(!background_jobs.activity().active);
+        let mut late_admission = registry.begin_attachment().unwrap();
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_registry
+                .shutdown_with_timeout(Duration::from_secs(1))
+                .await;
+        });
+        while registry
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .accepting
+        {
+            tokio::task::yield_now().await;
+        }
 
-        let late_token = registry.next_token();
+        let late_token = registry.next_token().unwrap();
         let (late_commands, _late_received) = mpsc::channel(1);
         let (late_completed, late_completion) = watch::channel(false);
         let late_actor = tokio::spawn(async move {
@@ -2260,40 +3990,792 @@ pub(super) mod tests {
         });
         assert!(
             registry
-                .register(RegisteredSession {
-                    token: late_token,
-                    session_id: agentkit_acp::SessionId::new("too-late"),
-                    integration,
-                    background_jobs: BackgroundJobs::default(),
-                    tasks: AsyncTaskManager::new().handle(),
-                    commands: late_commands.downgrade(),
-                    actor: late_actor.abort_handle(),
-                    completed: late_completion,
-                })
+                .register(
+                    &mut late_admission,
+                    RegisteredSession {
+                        token: late_token,
+                        session_id: agentkit_acp::SessionId::new("too-late"),
+                        integration,
+                        background_jobs: BackgroundJobs::default(),
+                        tasks: AsyncTaskManager::new().handle(),
+                        commands: late_commands.downgrade(),
+                        actor: late_actor.abort_handle(),
+                        completed: late_completion,
+                    }
+                )
                 .is_err()
         );
+        drop(late_admission);
+        shutdown.await.unwrap();
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(tasks.list_running().await.is_empty());
+        assert!(!background_jobs.activity().active);
         late_actor.abort();
         late_actor.await.unwrap_err();
+    }
+
+    fn register_test_v2(
+        registry: &SessionRegistry,
+        admission: &mut SessionAdmission,
+        token: u64,
+        interrupt: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), ()> {
+        let actor = tokio::spawn(std::future::pending::<()>());
+        actor.abort();
+        let (_completed, completion) = watch::channel(true);
+        registry.register_v2(
+            admission,
+            token,
+            interrupt,
+            Arc::new(|| Box::pin(async {})),
+            actor.abort_handle(),
+            completion,
+        )
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_foreign_consumed_duplicate_and_stale_admissions() {
+        let registry = SessionRegistry::new();
+        let other = SessionRegistry::new();
+        let mut admission = registry.begin_attachment().unwrap();
+        let token = registry.next_token().unwrap();
+        assert!(register_test_v2(&other, &mut admission, token, Arc::new(|| {})).is_err());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        assert_eq!(other.inner.lock_state().pending_attachments, 0);
+        assert!(other.inner.lock_state().v2_sessions.is_empty());
+        register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
+        let second_token = registry.next_token().unwrap();
+        assert!(
+            register_test_v2(&registry, &mut admission, second_token, Arc::new(|| {})).is_err()
+        );
+        let mut duplicate = registry.begin_attachment().unwrap();
+        assert!(register_test_v2(&registry, &mut duplicate, token, Arc::new(|| {})).is_err());
+        assert!(duplicate.active);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        assert_eq!(registry.inner.lock_state().v2_sessions.len(), 1);
+        registry.remove(token);
+        registry.close_gate_and_snapshot(false);
+        // Reopening never makes an old pending admission current again.
+        registry.inner.lock_state().accepting = true;
+        assert!(
+            register_test_v2(&registry, &mut duplicate, second_token, Arc::new(|| {})).is_err()
+        );
+        drop(duplicate);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(registry.begin_attachment().is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_legacy_registration_obeys_admission_and_cross_version_token_rules() {
+        let registry = SessionRegistry::new();
+        let other = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let actor = tokio::spawn(std::future::pending::<()>());
+        actor.abort();
+        let (commands, _received) = mpsc::channel(1);
+        let (_completed, completion) = watch::channel(true);
+        let mut session = RegisteredSession {
+            token,
+            session_id: agentkit_acp::SessionId::new("registry-test"),
+            integration: shutdown_test_integration(),
+            background_jobs: BackgroundJobs::default(),
+            tasks: AsyncTaskManager::new().handle(),
+            commands: commands.downgrade(),
+            actor: actor.abort_handle(),
+            completed: completion,
+        };
+        let mut admission = registry.begin_attachment().unwrap();
+        assert!(registry.register(&mut admission, session.clone()).is_err());
+        assert!(other.register(&mut admission, session.clone()).is_err());
+        assert!(admission.active);
+        assert_eq!(registry.inner.lock_state().pending_attachments, 1);
+        session.token = registry.next_token().unwrap();
+        registry.register(&mut admission, session.clone()).unwrap();
+        assert!(registry.register(&mut admission, session.clone()).is_err());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert_eq!(registry.inner.lock_state().sessions.len(), 1);
+        assert!(other.inner.lock_state().sessions.is_empty());
+        registry.remove(token);
+        registry.remove(session.token);
+    }
+
+    #[tokio::test]
+    async fn registry_attachment_wakeup_runs_after_unlock() {
+        struct ReenterOnWake(SessionRegistry, AtomicBool);
+        impl std::task::Wake for ReenterOnWake {
+            fn wake(self: Arc<Self>) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                assert!(self.0.begin_attachment().is_ok());
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let registry = SessionRegistry::new();
+        let mut admission = registry.begin_attachment().unwrap();
+        let wake = Arc::new(ReenterOnWake(registry.clone(), AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = Box::pin(registry.wait_for_pending_attachments());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let token = registry.next_token().unwrap();
+        register_test_v2(&registry, &mut admission, token, Arc::new(|| {})).unwrap();
+        assert!(wake.1.load(Ordering::SeqCst));
+        assert!(waiting.as_mut().poll(&mut context).is_ready());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        registry.remove(token);
+    }
+
+    #[tokio::test]
+    async fn registry_interrupt_unwind_leaves_gate_closed_without_poison() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        let callback_registry = registry.clone();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(move || {
+                assert!(callback_registry.inner.state.try_lock().is_ok());
+                panic!("interrupt callback");
+            }),
+        )
+        .unwrap();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move { resetting.reset_authentication().await });
+        assert!(reset.await.unwrap_err().is_panic());
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.contains_key(&token));
+        registry.remove(token);
+        assert!(registry.reset_authentication().await);
+    }
+
+    #[tokio::test]
+    async fn registry_callback_destructors_run_after_unlock_on_remove_and_rejection() {
+        struct ReenterOnDrop(SessionRegistry);
+        impl Drop for ReenterOnDrop {
+            fn drop(&mut self) {
+                assert!(self.0.inner.state.try_lock().is_ok());
+                assert!(self.0.begin_attachment().is_ok());
+                panic!("callback capture destructor");
+            }
+        }
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        let capture = ReenterOnDrop(registry.clone());
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(move || {
+                let _ = &capture;
+            }),
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.remove(token)))
+                .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.is_empty());
+        let other = SessionRegistry::new();
+        let capture = ReenterOnDrop(registry.clone());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = register_test_v2(
+                    &registry,
+                    &mut other.begin_attachment().unwrap(),
+                    token,
+                    Arc::new(move || {
+                        let _ = &capture;
+                    }),
+                );
+            }))
+            .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert_eq!(other.inner.lock_state().pending_attachments, 0);
+    }
+
+    #[tokio::test]
+    async fn registry_poison_does_not_break_unwind_cleanup_or_reopen_closed_gate() {
+        struct RemoveOnDrop(SessionRegistry, u64);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                self.0.remove(self.1);
+            }
+        }
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        register_test_v2(
+            &registry,
+            &mut registry.begin_attachment().unwrap(),
+            token,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let admission = registry.begin_attachment().unwrap();
+        registry.close_gate_and_snapshot(true);
+        let cleanup = RemoveOnDrop(registry.clone(), token);
+        // Poison injection represents an unwind with the audited state intact.
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _admission = admission;
+                let _cleanup = cleanup;
+                let _state = registry.inner.state.lock().unwrap();
+                panic!("unwind while registry guard is held");
+            }))
+            .is_err()
+        );
+        assert!(!registry.inner.state.is_poisoned());
+        assert!(registry.inner.lock_state().v2_sessions.is_empty());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.reset_authentication().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_invalid_path_metadata_rejects_before_attachment_and_releases_claim() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let selected_id = crate::session::new_id();
+        let runtime = Runtime::with_session_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::runtime::SessionRequest {
+                id: selected_id.clone(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        let server = Arc::new(Server::new(
+            runtime.clone(),
+            AcpIntegration::builder()
+                .name("invalid-path-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            registry.clone(),
+        ));
+        let (client_transport, agent_transport) = Channel::duplex();
+        let serving = tokio::spawn(async move {
+            agent_client_protocol::Client
+                .builder()
+                .connect_to(client_transport)
+                .await
+        });
+        let workspace = root.path().to_path_buf();
+        agent_client_protocol::Agent
+            .builder()
+            .connect_with(agent_transport, async move |connection| {
+                let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+                for invalid_cwd in [true, false] {
+                    let mut request = NewSessionRequest::new(if invalid_cwd {
+                        invalid.clone()
+                    } else {
+                        workspace.clone()
+                    });
+                    if !invalid_cwd {
+                        request.additional_directories = vec![invalid.clone()];
+                    }
+                    // Exercise the attachment boundary directly: a wire encoder
+                    // would reject this non-UTF-8 path before it reached the server.
+                    let error = server
+                        .new_session(request, connection.clone())
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(error, AcpRuntimeError::Sdk(_)));
+                    assert!(error.to_string().contains("UTF-8"));
+                    assert!(server.sessions.lock().unwrap().is_empty());
+                    {
+                        let state = registry.inner.lock_state();
+                        assert_eq!(state.pending_attachments, 0);
+                        assert!(state.sessions.is_empty());
+                    }
+                    let claim = runtime.claim_session().unwrap();
+                    assert_eq!(claim.id(), selected_id);
+                    drop(claim);
+                    assert!(crate::session::load(&workspace, &selected_id).is_err());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_token_exhaustion_rejects_attachment_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = crate::session::new_id();
+        let runtime = Runtime::with_session_provider_and_credentials(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::runtime::SessionRequest {
+                id: session_id.clone(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let registry = SessionRegistry::new();
+        registry
+            .inner
+            .next_token
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        let router = component(runtime.clone(), registry.clone()).unwrap();
+        let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+        let workspace = root.path().to_path_buf();
+        let client = agent_client_protocol::Client.builder().connect_with(
+            client_transport,
+            async move |connection| {
+                connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                for _ in 0..2 {
+                    let error = connection
+                        .send_request(NewSessionRequest::new(workspace.clone()))
+                        .block_task()
+                        .await
+                        .expect_err("exhausted registry must reject attachment");
+                    assert!(
+                        error
+                            .data
+                            .unwrap()
+                            .to_string()
+                            .contains("ACP session registry token space exhausted")
+                    );
+                    assert_eq!(
+                        registry
+                            .inner
+                            .next_token
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        u64::MAX
+                    );
+                    assert!(!registry.inner.state.is_poisoned());
+                    {
+                        let state = registry.inner.lock_state();
+                        assert!(state.accepting);
+                        assert_eq!(state.pending_attachments, 0);
+                        assert!(state.sessions.is_empty());
+                        assert!(state.v2_sessions.is_empty());
+                    }
+                    // Failed attachment releases its claim without creating a transcript.
+                    let claim = runtime.claim_session().unwrap();
+                    assert_eq!(claim.id(), session_id);
+                    assert!(claim.is_configured());
+                    drop(claim);
+                    assert_eq!(
+                        crate::session::load(&workspace, &session_id).unwrap_err(),
+                        format!("session {session_id:?} does not exist")
+                    );
+                }
+                Ok(())
+            },
+        );
+        let result = timeout(Duration::from_secs(2), client).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("exhaustion client timed out").unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_rejection_releases_attachment_and_claim() {
+        for poison in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let session_id = crate::session::new_id();
+            let runtime = Runtime::with_session_provider_and_credentials(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::runtime::SessionRequest {
+                    id: session_id.clone(),
+                    resume: false,
+                    force: false,
+                },
+                crate::credentials::CredentialStorage::Memory,
+            )
+            .unwrap();
+            let registry = SessionRegistry::new();
+            let expected = if poison {
+                let routes = runtime.mcp_for_test().event_route_registry();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _guard = routes.lock().unwrap();
+                        panic!("interrupted event route admission");
+                    }))
+                    .is_err()
+                );
+                "MCP event routes are poisoned"
+            } else {
+                runtime
+                    .mcp_for_test()
+                    .event_route_counter()
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                "MCP event route generation space exhausted"
+            };
+            let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+            let router = component(runtime.clone(), registry.clone()).unwrap();
+            let server = tokio::spawn(async move { router.connect_to(agent_transport).await });
+            let workspace = root.path().to_path_buf();
+            let client = agent_client_protocol::Client.builder().connect_with(
+                client_transport,
+                async move |connection| {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    for _ in 0..2 {
+                        let error = connection
+                            .send_request(NewSessionRequest::new(workspace.clone()))
+                            .block_task()
+                            .await
+                            .expect_err("unavailable MCP routes must reject attachment");
+                        assert!(error.data.unwrap().to_string().contains(expected));
+                        assert!(!registry.inner.state.is_poisoned());
+                        {
+                            let state = registry.inner.lock_state();
+                            assert!(state.accepting);
+                            assert_eq!(state.pending_attachments, 0);
+                            assert!(state.sessions.is_empty());
+                            assert!(state.v2_sessions.is_empty());
+                        }
+                        // Failed attachment releases its claim without creating a transcript.
+                        let claim = runtime.claim_session().unwrap();
+                        assert_eq!(claim.id(), session_id);
+                        assert!(claim.is_configured());
+                        drop(claim);
+                        assert_eq!(
+                            crate::session::load(&workspace, &session_id).unwrap_err(),
+                            format!("session {session_id:?} does not exist")
+                        );
+                    }
+                    Ok(())
+                },
+            );
+            let result = timeout(Duration::from_secs(2), client).await;
+            server.abort();
+            let _ = server.await;
+            result.expect("MCP rejection client timed out").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_counter_exhaustion_does_not_wrap_or_poison() {
+        let registry = SessionRegistry::new();
+        registry
+            .inner
+            .next_token
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(registry.next_token().unwrap(), u64::MAX - 1);
+        for _ in 0..2 {
+            assert!(matches!(
+                registry.next_token(),
+                Err(AcpRuntimeError::Loop(message))
+                    if message == "ACP session registry token space exhausted"
+            ));
+            assert_eq!(registry.inner.next_token.load(Ordering::Relaxed), u64::MAX);
+            assert!(!registry.inner.state.is_poisoned());
+            let state = registry.inner.lock_state();
+            assert!(state.accepting);
+            assert_eq!(state.pending_attachments, 0);
+            assert!(state.sessions.is_empty());
+            assert!(state.v2_sessions.is_empty());
+        }
+        // Allocation failure does not corrupt admission or its drop cleanup.
+        drop(registry.begin_attachment().unwrap());
+        assert_eq!(registry.inner.lock_state().pending_attachments, 0);
+        registry.inner.lock_state().pending_attachments = usize::MAX;
+        assert!(registry.begin_attachment().is_err());
+        assert!(!registry.inner.state.is_poisoned());
+        assert_eq!(registry.inner.lock_state().pending_attachments, usize::MAX);
+        registry.inner.lock_state().pending_attachments = 0;
+        registry.inner.lock_state().generation = u64::MAX;
+        assert!(!registry.reset_authentication().await);
+        assert_eq!(registry.inner.lock_state().generation, u64::MAX);
+        assert!(registry.begin_attachment().is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_cancelled_reset_keeps_admission_closed() {
+        let registry = SessionRegistry::new();
+        let started = Arc::new(Notify::new());
+        let resetting = registry.clone();
+        let action_started = Arc::clone(&started);
+        let reset = tokio::spawn(async move {
+            resetting
+                .reset_authentication_with(async move {
+                    action_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        started.notified().await;
+        let generation = registry.inner.lock_state().generation;
+        reset.abort();
+        assert!(reset.await.unwrap_err().is_cancelled());
+        assert!(registry.begin_attachment().is_err());
+        assert_eq!(registry.inner.lock_state().generation, generation);
+        // A later completed reset can reopen; cancellation itself cannot.
+        assert!(registry.reset_authentication().await);
+        assert!(registry.begin_attachment().is_ok());
+        assert!(registry.inner.lock_state().generation > generation);
+    }
+
+    #[tokio::test]
+    async fn registry_close_panic_requires_positive_actor_completion_before_reset() {
+        struct Completion {
+            alive: Arc<AtomicBool>,
+            completed: watch::Sender<bool>,
+            acknowledge: bool,
+        }
+        impl Drop for Completion {
+            fn drop(&mut self) {
+                self.alive.store(false, Ordering::SeqCst);
+                if self.acknowledge {
+                    self.completed.send_replace(true);
+                }
+            }
+        }
+        for acknowledge in [true, false] {
+            let registry = SessionRegistry::new();
+            let alive = Arc::new(AtomicBool::new(true));
+            let (completed, completion) = watch::channel(false);
+            let guard = Completion {
+                alive: Arc::clone(&alive),
+                completed,
+                acknowledge,
+            };
+            let actor = tokio::spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            registry
+                .register_v2(
+                    &mut registry.begin_attachment().unwrap(),
+                    registry.next_token().unwrap(),
+                    Arc::new(|| {}),
+                    Arc::new(|| Box::pin(async { panic!("close callback unwound") })),
+                    actor.abort_handle(),
+                    completion,
+                )
+                .unwrap();
+            let reset_ran = AtomicBool::new(false);
+            let (reopened, _) = registry
+                .close_sessions_with_timeout(Duration::from_millis(100), true, || async {
+                    assert!(!alive.load(Ordering::SeqCst));
+                    reset_ran.store(true, Ordering::SeqCst);
+                })
+                .await;
+            assert_eq!(reopened, acknowledge);
+            assert_eq!(reset_ran.load(Ordering::SeqCst), acknowledge);
+            assert_eq!(registry.begin_attachment().is_ok(), acknowledge);
+            assert!(actor.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_reset_closes_shared_v2_sessions_and_reopens_registration() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_flag = Arc::clone(&closed);
+        let (completed, completion) = watch::channel(false);
+        let close = Arc::new(move || {
+            let close_flag = Arc::clone(&close_flag);
+            let completed = completed.clone();
+            Box::pin(async move {
+                close_flag.store(true, Ordering::SeqCst);
+                completed.send_replace(true);
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        let actor = tokio::spawn(std::future::pending::<()>());
+        registry
+            .register_v2(
+                &mut registry.begin_attachment().unwrap(),
+                token,
+                Arc::new(|| {}),
+                close,
+                actor.abort_handle(),
+                completion,
+            )
+            .unwrap();
+
+        let generation = registry
+            .inner
+            .state
+            .lock()
+            .expect("ACP session registry poisoned")
+            .generation;
+        let during_reset = registry.clone();
+        let closed_during_reset = Arc::clone(&closed);
+        let (reset, action) = registry
+            .reset_authentication_with(async move {
+                assert!(closed_during_reset.load(Ordering::SeqCst));
+                assert!(during_reset.begin_attachment().is_err());
+            })
+            .await;
+        assert!(reset);
+        assert_eq!(action, Some(()));
+
+        assert!(closed.load(Ordering::SeqCst));
+        assert_ne!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .generation,
+            generation
+        );
+        assert!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .accepting
+        );
+        actor.abort();
+        actor.await.unwrap_err();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_authentication_reset_stays_closed_until_the_action_finishes() {
+        let registry = SessionRegistry::new();
+        let started = Arc::new(Notify::new());
+        let action_started = Arc::clone(&started);
+        let (release, released) = oneshot::channel();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move {
+            bounded_authentication_reset(
+                resetting,
+                async move {
+                    action_started.notify_one();
+                    let _ = released.await;
+                },
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        started.notified().await;
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(matches!(
+            reset.await.unwrap(),
+            AuthenticationReset::TimedOut
+        ));
+        assert!(registry.begin_attachment().is_err());
+
+        release.send(()).unwrap();
+        for _ in 0..100 {
+            if registry.begin_attachment().is_ok() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("authentication reset did not reopen admission");
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_reset_cannot_reopen_on_retry() {
+        let registry = SessionRegistry::new();
+        let token = registry.next_token().unwrap();
+        let (_completed, completion) = watch::channel(false);
+        let actor = tokio::spawn(std::future::pending::<()>());
+        registry
+            .register_v2(
+                &mut registry.begin_attachment().unwrap(),
+                token,
+                Arc::new(|| {}),
+                Arc::new(|| Box::pin(std::future::pending())),
+                actor.abort_handle(),
+                completion,
+            )
+            .unwrap();
+
+        assert!(
+            !registry
+                .close_sessions_with_timeout(Duration::from_millis(10), true, || async {})
+                .await
+                .0
+        );
+        assert!(!registry.reset_authentication().await);
+        assert!(registry.begin_attachment().is_err());
+        actor.abort();
+        let _ = actor.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_bounded_while_an_authentication_reset_holds_the_lifecycle_lock() {
+        let registry = SessionRegistry::new();
+        let lifecycle = registry.inner.lifecycle.lock().await;
+
+        registry
+            .shutdown_with_timeout(Duration::from_secs(30))
+            .await;
+
+        assert!(registry.begin_attachment().is_err());
+        assert!(
+            registry
+                .inner
+                .state
+                .lock()
+                .expect("ACP session registry poisoned")
+                .permanently_closed
+        );
+        drop(lifecycle);
+    }
+
+    #[tokio::test]
+    async fn permanent_shutdown_cannot_be_reopened_by_authentication_reset() {
+        let registry = SessionRegistry::new();
+        let resetting = registry.clone();
+        let reset = tokio::spawn(async move { resetting.reset_authentication().await });
+
+        registry.shutdown().await;
+        let _ = reset.await.unwrap();
+
+        assert!(registry.begin_attachment().is_err());
     }
 
     #[tokio::test]
     async fn shutdown_aborts_actor_at_the_shared_deadline() {
         let registry = SessionRegistry::new();
-        let token = registry.next_token();
+        let token = registry.next_token().unwrap();
         let (commands, _received) = mpsc::channel(1);
         let (_completed, completion) = watch::channel(false);
         let actor = tokio::spawn(std::future::pending::<()>());
         registry
-            .register(RegisteredSession {
-                token,
-                session_id: agentkit_acp::SessionId::new("stuck"),
-                integration: shutdown_test_integration(),
-                background_jobs: BackgroundJobs::default(),
-                tasks: AsyncTaskManager::new().handle(),
-                commands: commands.downgrade(),
-                actor: actor.abort_handle(),
-                completed: completion,
-            })
+            .register(
+                &mut registry.begin_attachment().unwrap(),
+                RegisteredSession {
+                    token,
+                    session_id: agentkit_acp::SessionId::new("stuck"),
+                    integration: shutdown_test_integration(),
+                    background_jobs: BackgroundJobs::default(),
+                    tasks: AsyncTaskManager::new().handle(),
+                    commands: commands.downgrade(),
+                    actor: actor.abort_handle(),
+                    completed: completion,
+                },
+            )
             .unwrap();
         timeout(
             Duration::from_secs(1),
@@ -2322,6 +4804,52 @@ pub(super) mod tests {
                 .collect::<Vec<_>>(),
             ["compact"]
         );
+    }
+
+    #[test]
+    fn compose_title_replay_preserves_identity_and_trims_intent() {
+        let call = agentkit_core::ToolCallPart::new(
+            "call",
+            "compose",
+            json!({"script": "return 1", "intent": "  Checking files  "}),
+        );
+        let replay = transcript_replay(
+            &agentkit_acp::SessionId::new("session"),
+            &[Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+        );
+        assert_eq!(replay.len(), 2);
+        assert!(
+            matches!(&replay[0].update, SessionUpdate::ToolCall(call) if call.title == "compose")
+        );
+        assert!(
+            matches!(&replay[1].update, SessionUpdate::ToolCallUpdate(update)
+            if update.fields.title.as_deref() == Some("Checking files"))
+        );
+    }
+
+    #[test]
+    fn compose_title_falls_back_for_empty_intent_and_ignores_non_compose() {
+        for (name, input) in [
+            ("compose", json!({})),
+            ("compose", json!({"intent": "  "})),
+            ("compose", json!({"intent": 1})),
+            ("shell", json!({"intent": "Checking files"})),
+        ] {
+            let call = agentkit_core::ToolCallPart::new("call", name, input);
+            let update = compose_title_update(&call);
+            if name == "compose" {
+                let SessionUpdate::ToolCallUpdate(update) = update.unwrap() else {
+                    panic!("expected metadata patch");
+                };
+                assert_eq!(
+                    update.fields.title.as_deref(),
+                    Some("Running composed tools")
+                );
+                assert_eq!(update.fields.kind, Some(agentkit_acp::ToolKind::Execute));
+            } else {
+                assert!(update.is_none());
+            }
+        }
     }
 
     #[test]
@@ -2444,6 +4972,98 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn finalization_drains_inner_tool_completion_before_client_flush() {
+        let integration = AcpIntegration::builder()
+            .name("projection-fence")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("v1-projection-fence");
+        let loop_id = AgentkitSessionId::new("v1-projection-loop");
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let activity = legacy_activity(session_id.clone(), |_| Ok(()));
+        let observer = ResponseInterruptionNoticeObserver::new(
+            integration.clone(),
+            client,
+            session_id.clone(),
+            activity.clone(),
+        );
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: Arc::new(AtomicUsize::new(0)),
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::new(AtomicUsize::new(0)),
+            })
+            .observer(observer.clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id.clone()).without_cache())
+            .await
+            .unwrap();
+        observer.handle_event(ObservedEvent {
+            session_id: Arc::new(loop_id.clone()),
+            event: AgentEvent::ToolCallRequested(ToolCallPart::new(
+                "parent",
+                "compose",
+                json!({"script": "return 1"}),
+            )),
+        });
+        let request = ToolRequest::new(
+            ToolCallId::new("parent:compose:node"),
+            ToolName::new("shell"),
+            json!({}),
+            loop_id,
+            agentkit_core::TurnId::new("turn"),
+        );
+        tool_projection::Invocation::start(&request, None)
+            .unwrap()
+            .finish(true);
+        // The receiver observes the exact queue prefix covered by the protocol
+        // flush, not notifications that happen to arrive after its acknowledgement.
+        let (result, covered) = futures_util::future::join(
+            drive_finalized(
+                &session_id,
+                &integration,
+                &mut driver,
+                true,
+                None,
+                &activity,
+            ),
+            async {
+                let mut covered = Vec::new();
+                loop {
+                    match messages.recv().await.unwrap() {
+                        AcpClientMessage::SessionNotification(notification) => {
+                            covered.push(notification)
+                        }
+                        AcpClientMessage::Flush { response } => {
+                            response.send(()).unwrap();
+                            break covered;
+                        }
+                        _ => panic!("unexpected permission request"),
+                    }
+                }
+            },
+        )
+        .await;
+        result.unwrap();
+        assert!(
+            covered.iter().any(|notification| {
+                let value = serde_json::to_value(&notification.update).unwrap();
+                value["toolCallId"] == "parent:compose:node" && value["status"] == "completed"
+            }),
+            "the finalization flush must include the terminal inner-tool card"
+        );
+    }
+
+    #[tokio::test]
     async fn response_interruption_marker_becomes_v1_warning_before_replacement() {
         let integration = AcpIntegration::builder()
             .name("response-interruption-test")
@@ -2464,6 +5084,7 @@ pub(super) mod tests {
             integration.clone(),
             client,
             session_id.clone(),
+            test_activity(session_id.clone(), mpsc::unbounded_channel().0),
         );
         let emit = |event| {
             observer.handle_event(ObservedEvent {
@@ -2872,6 +5493,74 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn set_config_rejects_poisoned_session_map_without_queueing_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Server::new(
+            Runtime::new(root.path(), "gpt-5.4").unwrap(),
+            AcpIntegration::builder()
+                .name("poison-test")
+                .approval_resolver(AutoDenyResolver)
+                .build()
+                .unwrap(),
+            SessionRegistry::new(),
+        );
+        let session_id = agentkit_acp::SessionId::new("poisoned-session");
+        let (client, _messages) = AcpClientHandle::channel();
+        server
+            .integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                AgentkitSessionId::new("poisoned-session"),
+                client,
+            ))
+            .unwrap();
+        let (commands, mut received) = mpsc::channel(1);
+        server.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionHandle {
+                subagents: None,
+                voice_state: Default::default(),
+                token: 1,
+                commands,
+                background_jobs: BackgroundJobs::default(),
+                structured_completion: false,
+                tasks: AsyncTaskManager::new().handle(),
+            },
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = server.sessions.lock().unwrap();
+                panic!("poison session map");
+            }))
+            .is_err()
+        );
+
+        for id in [session_id, agentkit_acp::SessionId::new("missing-session")] {
+            let error = timeout(
+                Duration::from_secs(1),
+                server.set_config(SetSessionConfigOptionRequest::new(
+                    id,
+                    MODEL_CONFIG_ID,
+                    "openai-subscription:gpt-5.4-mini",
+                )),
+            )
+            .await
+            .expect("poison must return an error without waiting for the actor")
+            .unwrap_err();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::InternalError);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!(AcpRuntimeError::ClientClosed.to_string()))
+            );
+        }
+        assert!(server.sessions.is_poisoned());
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn depth_zero_cancel_leaves_detached_background_running() {
         let (jobs, tasks) = start_non_cooperative_background("root-call").await;
         let root = tempfile::tempdir().unwrap();
@@ -2895,6 +5584,8 @@ pub(super) mod tests {
         server.sessions.lock().unwrap().insert(
             session_id.clone(),
             SessionHandle {
+                subagents: None,
+                voice_state: Default::default(),
                 token: 1,
                 commands,
                 background_jobs: jobs.clone(),
@@ -2919,6 +5610,26 @@ pub(super) mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn settlement_wakes_on_activity_when_task_event_guard_is_disabled() {
+        let jobs = BackgroundJobs::default();
+        jobs.register_foreground_for_test("foreground-call");
+        let manager = AsyncTaskManager::new();
+        let tasks = manager.handle();
+        let mut settlement = std::pin::pin!(settle_background_jobs(&tasks, &jobs));
+        // There is active foreground work, but no background task or terminal
+        // debt. Only a fresh activity generation can wake this settlement.
+        assert!(futures_util::poll!(&mut settlement).is_pending());
+        jobs.finish_for_test("foreground-call");
+        assert!(
+            timeout(Duration::from_secs(1), settlement)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!jobs.activity().active);
     }
 
     #[tokio::test]
@@ -3027,11 +5738,15 @@ pub(super) mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let response = drive_prompt(
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let response = drive_runtime_prompt(
             &acp_session_id,
-            &[],
+            &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             PromptRequest::new(
                 acp_session_id.clone(),
@@ -3042,11 +5757,15 @@ pub(super) mod tests {
             &tasks,
             &background_jobs,
             false,
+            &legacy_activity(acp_session_id.clone(), |_| Ok(())),
         )
         .await
         .expect("cancellation must be an ACP response, not an RPC error");
 
-        assert_eq!(response.stop_reason, StopReason::Cancelled);
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::Cancelled
+        );
         drain.abort();
     }
 
@@ -3143,11 +5862,13 @@ pub(super) mod tests {
             .unwrap();
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let response = drive_runtime_prompt(
             &acp_session_id,
             &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             PromptRequest::new(
                 acp_session_id.clone(),
@@ -3158,10 +5879,11 @@ pub(super) mod tests {
             &tasks,
             &BackgroundJobs::default(),
             false,
+            &legacy_activity(acp_session_id.clone(), |_| Ok(())),
         )
         .await
         .unwrap();
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response, FinishReason::Completed);
         assert_eq!(notification_items_seen.load(Ordering::SeqCst), 1);
         drain.abort();
     }
@@ -3229,22 +5951,28 @@ pub(super) mod tests {
             .unwrap();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
         let request = PromptRequest::new(
             acp_session_id.clone(),
             vec![agentkit_acp::ContentBlock::Text(
                 agentkit_acp::TextContent::new("start one background call"),
             )],
         );
-        let prompt = drive_prompt(
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let activity = legacy_activity(acp_session_id.clone(), |_| Ok(()));
+        let prompt = drive_runtime_prompt(
             &acp_session_id,
-            &[],
+            &runtime,
             &integration,
             &mut skill_catalog,
+            &mut voice_monitor,
             &mut driver,
             request,
             &tasks,
             &background_jobs,
             true,
+            &activity,
         );
         tokio::pin!(prompt);
 
@@ -3255,12 +5983,12 @@ pub(super) mod tests {
                     while !entered.load(Ordering::SeqCst) {
                         tokio::task::yield_now().await;
                     }
+                    background_jobs.register_foreground_for_test("background-call");
                     assert!(detach_compose_call(
                         &tasks,
                         &background_jobs,
                         "background-call",
                     ).await);
-                    background_jobs.register_foreground_for_test("background-call");
                     while turns.load(Ordering::SeqCst) < 2 {
                         tokio::task::yield_now().await;
                     }
@@ -3289,8 +6017,147 @@ pub(super) mod tests {
             .await
             .expect("structured prompt did not synthesize the background result")
             .unwrap();
-        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::EndTurn
+        );
         assert_eq!(turns.load(Ordering::SeqCst), 3);
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_activity_ignores_empty_wakes_and_coalesces_real_continuations() {
+        let session_id = agentkit_acp::SessionId::new("legacy-activity");
+        let loop_id = AgentkitSessionId::new("legacy-activity-loop");
+        let integration = AcpIntegration::builder()
+            .name("legacy-activity-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let (client, mut messages) = AcpClientHandle::channel();
+        integration
+            .bind_session(AcpSessionBinding::new(
+                session_id.clone(),
+                loop_id.clone(),
+                client.clone(),
+            ))
+            .unwrap();
+        let drain = tokio::spawn(async move {
+            while let Some(message) = messages.recv().await {
+                if let AcpClientMessage::Flush { response } = message {
+                    let _ = response.send(());
+                }
+            }
+        });
+        let (notifications, mut states) = mpsc::unbounded_channel();
+        let activity = test_activity(session_id.clone(), notifications);
+        // Start the script at its plain content response, with no tool prerequisite.
+        let turns = Arc::new(AtomicUsize::new(2));
+        let mut driver = Agent::builder()
+            .model(ScriptAdapter {
+                turns: turns.clone(),
+                user_items_seen: Arc::new(AtomicUsize::new(0)),
+                notification_items_seen: Arc::new(AtomicUsize::new(0)),
+            })
+            .observer(ResponseInterruptionNoticeObserver::new(
+                integration.clone(),
+                client,
+                session_id.clone(),
+                activity.clone(),
+            ))
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(loop_id).without_cache())
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+                .await
+                .unwrap();
+        }
+        assert_eq!(turns.load(Ordering::SeqCst), 2);
+        assert!(states.try_recv().is_err());
+
+        driver
+            .submit_input(vec![Item::notification("background result")])
+            .unwrap();
+        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+            .await
+            .unwrap();
+        let started = states.try_recv().unwrap();
+        let ended = states.try_recv().unwrap();
+        assert!(started.active && !ended.active);
+        assert_eq!(started.turn_id, 1);
+        assert_eq!(started.turn_id, ended.turn_id);
+        assert!(ended.error.is_none());
+        drive_unsolicited(&session_id, &integration, &mut driver, &activity)
+            .await
+            .unwrap();
+        assert_eq!(turns.load(Ordering::SeqCst), 3);
+        assert!(states.try_recv().is_err());
+
+        // Foreground uses the very same reducer, but retains standard v1 response
+        // semantics without extension notifications (while sharing session activity IDs).
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "foreground")])
+            .unwrap();
+        let response = drive_finalized(
+            &session_id,
+            &integration,
+            &mut driver,
+            true,
+            None,
+            &activity,
+        )
+        .await
+        .unwrap();
+        activity.settle(None, None).unwrap();
+        assert_eq!(
+            agentkit_acp::finish_reason_to_stop_reason(&response).unwrap(),
+            StopReason::EndTurn
+        );
+        assert!(states.try_recv().is_err());
+
+        // Multiple logical turns drained within one autonomous interval do not
+        // publish an intermediate terminal state or allocate another turn ID.
+        let mut started = None;
+        activity
+            .execute(
+                activity::ExecutionOrigin::Autonomous,
+                async {
+                    for text in ["first continuation", "second continuation"] {
+                        driver.submit_input(vec![Item::notification(text)]).unwrap();
+                        drive_finalized(
+                            &session_id,
+                            &integration,
+                            &mut driver,
+                            false,
+                            None,
+                            &activity,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    let event = states.try_recv().unwrap();
+                    assert!(event.active);
+                    assert_eq!(event.turn_id, 3);
+                    assert!(states.try_recv().is_err());
+                    started = Some(event);
+                    Err::<(), _>(AcpRuntimeError::Loop("terminal error".into()))
+                },
+                |_| None,
+            )
+            .await
+            .unwrap_err();
+        let started = started.unwrap();
+        let ended = states.try_recv().unwrap();
+        assert!(!ended.active);
+        assert_eq!(ended.turn_id, started.turn_id);
+        assert!(ended.error.as_deref().unwrap().contains("terminal error"));
+        activity.settle(None, None).unwrap();
+        assert!(states.try_recv().is_err());
+        assert_eq!(turns.load(Ordering::SeqCst), 6);
         drain.abort();
     }
 
@@ -3352,6 +6219,8 @@ pub(super) mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
+        let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
+        let activity = test_activity(acp_session_id.clone(), turn_states_tx);
         let driver = Agent::builder()
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
@@ -3361,6 +6230,7 @@ pub(super) mod tests {
             .add_tool_source(tools)
             .task_manager(task_manager)
             .observer(integration.as_ref().clone())
+            .observer(activity.clone())
             .cancellation(cancellation.handle())
             .build()
             .unwrap()
@@ -3368,13 +6238,14 @@ pub(super) mod tests {
             .await
             .unwrap();
         let (commands_tx, commands_rx) = mpsc::channel(8);
-        let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
+
         let test_mcp = crate::tools::mcp::empty();
-        let mcp_events = test_mcp.subscribe(acp_session_id.to_string());
+        let mcp_events = test_mcp.subscribe(acp_session_id.to_string()).unwrap();
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
+            voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(false),
             session_id: acp_session_id.clone(),
             runtime,
             integration: Arc::clone(&integration),
@@ -3388,7 +6259,7 @@ pub(super) mod tests {
                 .unwrap(),
             catalog: Vec::new(),
             commands: commands_rx,
-            turn_states: turn_states_tx,
+            activity,
             mcp_events,
         }));
 
@@ -3408,8 +6279,8 @@ pub(super) mod tests {
         while !entered.load(Ordering::SeqCst) {
             tokio::task::yield_now().await;
         }
-        assert!(detach_compose_call(&tasks, &background_jobs, "background-call").await);
         background_jobs.register_foreground_for_test("background-call");
+        assert!(detach_compose_call(&tasks, &background_jobs, "background-call").await);
         assert!(background_jobs.is_detached_for_test("background-call"));
         timeout(Duration::from_secs(1), reply_rx)
             .await
@@ -3506,6 +6377,7 @@ pub(super) mod tests {
         let adapter =
             SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
         let catalog = vec![ModelGroup {
+            context_windows: Default::default(),
             provider: crate::ProviderKind::OpenAiSubscription,
             models: vec!["gpt-5.4".into(), "gpt-5.4-mini".into()],
         }];
@@ -3531,6 +6403,7 @@ pub(super) mod tests {
         let adapter =
             SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
         let catalog = vec![ModelGroup {
+            context_windows: Default::default(),
             provider: crate::ProviderKind::OpenAiSubscription,
             models: vec!["gpt-5.4".into()],
         }];
@@ -3893,6 +6766,203 @@ pub(super) mod tests {
             list_sessions_error(ListSessionsError::InvalidCursor).code,
             agent_client_protocol::ErrorCode::InvalidParams
         );
+    }
+
+    #[test]
+    fn fork_submission_keeps_cleanup_until_response_succeeds() {
+        for delivery in ["success", "failure", "unwind", "rejected"] {
+            let root = tempfile::tempdir().unwrap();
+            let id = crate::session::new_id();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(ItemKind::System, "system")],
+            )
+            .unwrap();
+            // A creation already owned by a prepared publication is rejected by
+            // normal APIs, just as poison/write fencing is rejected in session tests.
+            let held = if delivery == "rejected" {
+                Some(opened.observer.prepare_creation().unwrap())
+            } else {
+                None
+            };
+            let (activation, mut activated) = oneshot::channel();
+            let prepared = PreparedFork {
+                response: ForkSessionResponse::new(id.clone()),
+                activation,
+                creation: opened.observer.clone(),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                prepared.submit(|response| {
+                    if delivery == "rejected" {
+                        assert!(response.is_err(), "invalid creation cannot report success");
+                        return Ok(());
+                    }
+                    assert!(response.is_ok());
+                    // Response callbacks cannot invalidate the prepared writer.
+                    assert!(
+                        opened
+                            .observer
+                            .replace(&[Item::text(ItemKind::User, "reentry")])
+                            .is_err()
+                    );
+                    assert!(crate::session::load(root.path(), &id).is_ok());
+                    match delivery {
+                        "failure" => Err("response closed"),
+                        "unwind" => panic!("response interrupted"),
+                        _ => Ok(()),
+                    }
+                })
+            }));
+            match delivery {
+                "success" => {
+                    assert!(result.unwrap().unwrap().is_some());
+                    assert!(activated.try_recv().is_ok());
+                }
+                "failure" => assert_eq!(result.unwrap().unwrap_err(), "response closed"),
+                "unwind" => assert!(result.is_err()),
+                "rejected" => assert!(result.unwrap().unwrap().is_none()),
+                _ => unreachable!(),
+            }
+            if delivery != "success" {
+                assert!(matches!(
+                    activated.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+            }
+            drop(held);
+            drop(opened);
+            assert_eq!(
+                crate::session::load(root.path(), &id).is_ok(),
+                delivery == "success"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn client_mcp_servers_are_honored_by_new_load_and_fork() {
+        use agentkit_acp::{McpServer, McpServerHttp, McpServerStdio};
+
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let extra_path = std::fs::canonicalize(extra.path()).unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn(serve_transport(runtime, agent_transport));
+        agent_client_protocol::Client
+            .builder()
+            .on_receive_notification(
+                async move |_notification: SessionNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, async move |connection| {
+                let unsupported = vec![McpServer::Http(McpServerHttp::new(
+                    "kithub",
+                    "https://example.invalid/mcp",
+                ))];
+                // Missing executables remain discoverable connection failures; they
+                // must not prevent attachment or leak into another session.
+                let stdio = vec![McpServer::Stdio(McpServerStdio::new(
+                    "kithub",
+                    root.path().join("missing-bridge"),
+                ))];
+                connection
+                    .send_request(
+                        NewSessionRequest::new(root.path().to_path_buf())
+                            .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("new must validate client MCP servers");
+                let source = connection
+                    .send_request(
+                        NewSessionRequest::new(root.path().to_path_buf())
+                            .additional_directories(vec![extra_path.clone()])
+                            .mcp_servers(stdio.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                let listed = connection
+                    .send_request(ListSessionsRequest::new())
+                    .block_task()
+                    .await?;
+                let listed = listed
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.session_id == source.session_id)
+                    .unwrap();
+                assert_eq!(listed.additional_directories, vec![extra_path.clone()]);
+                connection
+                    .send_request(
+                        ForkSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(unsupported.clone()),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("fork must validate client MCP servers");
+                let fork = connection
+                    .send_request(
+                        ForkSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .additional_directories(vec![extra_path.clone()])
+                        .mcp_servers(stdio.clone()),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(fork.session_id))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(source.session_id.clone()))
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(
+                        LoadSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .mcp_servers(unsupported),
+                    )
+                    .block_task()
+                    .await
+                    .expect_err("load must validate client MCP servers");
+                connection
+                    .send_request(
+                        LoadSessionRequest::new(
+                            source.session_id.clone(),
+                            root.path().to_path_buf(),
+                        )
+                        .additional_directories(vec![extra_path.clone()])
+                        .mcp_servers(stdio),
+                    )
+                    .block_task()
+                    .await?;
+                connection
+                    .send_request(CloseSessionRequest::new(source.session_id))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

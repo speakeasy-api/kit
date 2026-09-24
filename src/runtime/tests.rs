@@ -1,3 +1,6 @@
+mod managed_background;
+mod managed_files;
+
 use std::{sync::Arc, time::Duration};
 
 use agentkit_core::{
@@ -11,8 +14,9 @@ use agentkit_tools_core::{
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool, Runtime,
-    SessionRequest, SessionSelection, background_route, load_initial_transcript,
+    BackgroundJobs, BackgroundableCompose, DetachRegistration, DynamicSkillTool,
+    LogoutAuthenticationError, Runtime, SessionRequest, SessionSelection, background_route,
+    load_initial_transcript,
 };
 
 #[tokio::test]
@@ -224,6 +228,263 @@ fn resolved_reasoning_effort_reaches_root_adapter_and_kit_children() {
     );
 }
 
+mod reasoning_effort_persistence {
+    use super::*;
+    use crate::ReasoningEffort;
+    use crate::runtime::{AcpDriver, AcpDriverContext, AcpForkState, SessionClaim};
+
+    #[derive(Clone)]
+    struct Observer;
+
+    impl agentkit_loop::LoopObserver for Observer {
+        fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+    }
+
+    fn runtime(root: &std::path::Path, effort: Option<ReasoningEffort>) -> Arc<Runtime> {
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        Runtime::new_with_provider_credentials_and_effort(
+            root,
+            "test-model",
+            crate::ProviderKind::OpenRouter,
+            credentials,
+            effort,
+        )
+        .unwrap()
+    }
+
+    async fn start(
+        runtime: &Arc<Runtime>,
+        mut claim: SessionClaim,
+        forked: Option<AcpForkState>,
+    ) -> (String, AcpDriver) {
+        let id = claim.request.id.clone();
+        let driver = runtime
+            .start_acp_driver_with_mcp(
+                AcpDriverContext {
+                    cwd: runtime.root().to_path_buf(),
+                    additional_directories: vec![],
+                    integration: Arc::new(Observer),
+                    cancellation: CancellationController::new().handle(),
+                    response_attempt_replacement: false,
+                },
+                &mut claim,
+                forked,
+                runtime.mcp.clone(),
+            )
+            .await
+            .unwrap();
+        claim.commit().unwrap();
+        (id, driver)
+    }
+
+    async fn load(runtime: &Arc<Runtime>, id: &str) -> AcpDriver {
+        start(runtime, runtime.claim_session_load(id).unwrap(), None)
+            .await
+            .1
+    }
+
+    #[tokio::test]
+    async fn new_session_effort_and_updates_survive_runtime_reconstruction() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), Some(ReasoningEffort::High));
+        let (id, driver) = start(&original, original.claim_session().unwrap(), None).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        drop(driver);
+        drop(original);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Low));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        driver
+            .adapter
+            .select_reasoning_effort(Some(ReasoningEffort::Medium))
+            .unwrap();
+        drop(driver);
+        drop(restarted);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Low));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(
+            driver.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Medium)
+        );
+        driver.adapter.select_reasoning_effort(None).unwrap();
+        drop(driver);
+        drop(restarted);
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::High));
+        let driver = load(&restarted, &id).await;
+        assert_eq!(driver.adapter.reasoning_effort().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_effort_falls_back_but_new_explicit_default_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy_id = crate::session::new_id();
+        // The historical session API writes no effort setting.
+        drop(
+            crate::session::open(
+                root.path(),
+                &legacy_id,
+                false,
+                false,
+                vec![agentkit_core::Item::text(ItemKind::System, "system")],
+            )
+            .unwrap(),
+        );
+        let defaults = runtime(root.path(), None);
+        let (default_id, driver) = start(&defaults, defaults.claim_session().unwrap(), None).await;
+        drop(driver);
+        drop(defaults);
+
+        // Loading a historical session must not turn its fallback into a saved preference.
+        for effort in [ReasoningEffort::High, ReasoningEffort::Low] {
+            let restarted = runtime(root.path(), Some(effort));
+            let legacy = load(&restarted, &legacy_id).await;
+            assert_eq!(legacy.adapter.reasoning_effort().unwrap(), Some(effort));
+            let explicit_default = load(&restarted, &default_id).await;
+            assert_eq!(explicit_default.adapter.reasoning_effort().unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_effort_is_persisted_and_reset_is_session_local() {
+        let root = tempfile::tempdir().unwrap();
+        let original = runtime(root.path(), Some(ReasoningEffort::Low));
+        let (parent_id, parent) = start(&original, original.claim_session().unwrap(), None).await;
+        parent
+            .adapter
+            .select_reasoning_effort(Some(ReasoningEffort::High))
+            .unwrap();
+        let forked = AcpForkState {
+            transcript: parent.canonical_transcript.clone(),
+            selection: parent.adapter.selection().unwrap(),
+            reasoning_effort: parent.adapter.reasoning_effort().unwrap(),
+            parent_context: None,
+        };
+        let (fork_id, fork) = start(
+            &original,
+            original.claim_session_fork().unwrap(),
+            Some(forked),
+        )
+        .await;
+        assert_eq!(
+            fork.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        let (sibling_id, sibling) = start(&original, original.claim_session().unwrap(), None).await;
+        assert_eq!(
+            sibling.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        drop(fork);
+
+        // Read the fork from disk before resetting it: inherited effort must be durable.
+        let fork = load(&original, &fork_id).await;
+        assert_eq!(
+            fork.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        fork.adapter.select_reasoning_effort(None).unwrap();
+        assert_eq!(
+            parent.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            sibling.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            original.adapter.reasoning_effort().unwrap(),
+            Some(ReasoningEffort::Low)
+        );
+        drop((parent, fork, sibling, original));
+
+        let restarted = runtime(root.path(), Some(ReasoningEffort::Medium));
+        for (id, expected) in [
+            (parent_id, Some(ReasoningEffort::High)),
+            (fork_id, None),
+            (sibling_id, Some(ReasoningEffort::Low)),
+        ] {
+            let driver = load(&restarted, &id).await;
+            assert_eq!(driver.adapter.reasoning_effort().unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn openrouter_keys_disable_openrouter_authentication_and_global_logout() {
+    for (explicit_key, ambient_key) in [(true, false), (false, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "gpt-5.4",
+            crate::ProviderKind::OpenAiSubscription,
+            crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+            None,
+            explicit_key.then(|| crate::provider::OpenRouterApiKey::new("unrelated")),
+        )
+        .unwrap();
+        Arc::get_mut(&mut runtime)
+            .unwrap()
+            .set_ambient_openrouter_api_key_for_test(ambient_key);
+
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription));
+        assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
+        assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
+        assert!(!runtime.supports_logout_authentication());
+        assert!(matches!(
+            runtime.logout_authentication(),
+            Err(LogoutAuthenticationError::CredentialStateUnchanged(_))
+        ));
+    }
+}
+
+#[test]
+fn logout_attempts_all_providers_after_a_credential_removal_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = tempfile::tempdir().unwrap();
+    let storage =
+        crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf());
+    storage.make_entry_undeletable_for_test("openrouter", "default");
+    storage
+        .entry("speakeasy", "default")
+        .save(b"removed")
+        .unwrap();
+    let mut runtime = Runtime::new_with_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::ProviderKind::OpenAiSubscription,
+        storage.clone(),
+    )
+    .unwrap();
+    Arc::get_mut(&mut runtime)
+        .unwrap()
+        .set_ambient_openrouter_api_key_for_test(false);
+
+    let error = runtime.logout_authentication().unwrap_err();
+
+    let LogoutAuthenticationError::CredentialStateMayHaveChanged(message) = error else {
+        panic!("credential removal failure must report possibly changed state");
+    };
+    assert!(message.contains("could not remove OpenRouter credentials"));
+    assert!(
+        storage
+            .entry("speakeasy", "default")
+            .load()
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 fn explicit_openrouter_key_reaches_runtime_adapter_and_kit_children() {
     let root = tempfile::tempdir().unwrap();
@@ -406,14 +667,14 @@ fn configured_session_is_consumed_only_after_successful_start() {
     let (first, configured) = selection.claim();
     assert_eq!(first.id, "selected");
     assert!(configured);
-    selection.finish_new(&first, configured, false, true);
+    selection.finish_new(&first, configured, false, true, false);
     let (retry, configured) = selection.claim();
     assert_eq!(retry.id, "selected");
     assert!(
         retry.resume,
         "a transcript opened before failure is resumed"
     );
-    selection.finish_new(&retry, configured, true, false);
+    selection.finish_new(&retry, configured, true, false, false);
     assert!(selection.configured.is_none());
 }
 
@@ -483,6 +744,121 @@ fn dropped_generated_session_claim_retries_opened_transcript_with_same_id() {
 }
 
 #[test]
+fn dropped_uncommitted_session_claim_retries_as_new() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+    drop(failed);
+
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+    assert!(!retry.request.resume);
+}
+
+#[test]
+fn rejected_creation_commit_recreates_configured_and_generated_claims_as_new() {
+    for configured in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = if configured {
+            Runtime::with_session(
+                root.path(),
+                "gpt-5.4",
+                SessionRequest {
+                    id: "selected".into(),
+                    resume: false,
+                    force: false,
+                },
+            )
+            .unwrap()
+        } else {
+            Runtime::new(root.path(), "gpt-5.4").unwrap()
+        };
+        let mut failed = runtime.claim_session().unwrap();
+        let id = failed.id().to_owned();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            &id,
+            false,
+            vec![agentkit_core::Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
+        failed.guard_uncommitted_transcript(&opened.observer);
+        // Abandon normal response publication: this removes the uncommitted
+        // file and freezes the writer, so its later creation commit must fail.
+        drop(opened.observer.prepare_creation().unwrap());
+        drop(opened);
+        assert!(failed.commit().is_err());
+        assert!(crate::session::load(root.path(), &id).is_err());
+        let mut retry = runtime.claim_session().unwrap();
+        assert_eq!(retry.id(), id);
+        assert!(!retry.request.resume);
+        let recreated = crate::session::open_uncommitted(
+            root.path(),
+            retry.id(),
+            false,
+            vec![agentkit_core::Item::text(ItemKind::System, "recreated")],
+        )
+        .unwrap();
+        retry.guard_uncommitted_transcript(&recreated.observer);
+        retry.commit().unwrap();
+        drop(recreated);
+        assert!(crate::session::load(root.path(), &id).is_ok());
+    }
+}
+
+#[test]
+fn uncommitted_claim_rolls_back_before_waiting_to_publish_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let mut failed = runtime.claim_session().unwrap();
+    let session_id = failed.id().to_owned();
+    let opened = crate::session::open_uncommitted(
+        root.path(),
+        &session_id,
+        false,
+        vec![agentkit_core::Item::text(ItemKind::System, "system")],
+    )
+    .unwrap();
+    failed.guard_uncommitted_transcript(&opened.observer);
+    drop(opened);
+
+    let selection = runtime.session.lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(failed);
+    });
+    started_rx.recv().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while crate::session::load(root.path(), &session_id).is_ok()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        crate::session::load(root.path(), &session_id).is_err(),
+        "uncommitted transcript must roll back before the retry mutex is available"
+    );
+
+    drop(selection);
+    dropping.join().unwrap();
+    let retry = runtime.claim_session().unwrap();
+    assert_eq!(retry.id(), session_id);
+}
+
+#[test]
 fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -492,10 +868,11 @@ fn dropped_fork_claim_removes_its_uncommitted_transcript() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    failed.guard_fork_transcript(&opened.observer);
+    failed.guard_uncommitted_transcript(&opened.observer);
     drop(opened);
     assert!(crate::session::load(root.path(), &session_id).is_ok());
 
@@ -514,10 +891,11 @@ fn dropped_deferred_fork_creation_removes_transcript_before_response() {
     let opened = crate::session::open_uncommitted(
         root.path(),
         &session_id,
+        false,
         vec![agentkit_core::Item::text(ItemKind::System, "system")],
     )
     .unwrap();
-    claim.guard_fork_transcript(&opened.observer);
+    claim.guard_uncommitted_transcript(&opened.observer);
     let creation = claim.defer_fork_commit();
     drop(opened);
     drop(creation);
@@ -639,6 +1017,37 @@ fn nonmatching_failed_load_does_not_touch_configured_or_generated_queues() {
     drop(runtime.claim_session_load("other").unwrap());
     let next = runtime.claim_session().unwrap();
     assert_eq!(next.id(), "selected");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agents_md_symlink_loads_and_rereads_target() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("instructions.md");
+    let link = root.path().join("AGENTS.md");
+    std::os::unix::fs::symlink("instructions.md", &link).unwrap();
+    for body in ["first guidance", "updated guidance"] {
+        std::fs::write(&target, body).unwrap();
+        let transcript = load_initial_transcript(root.path(), "system".into())
+            .await
+            .unwrap();
+        let context = transcript.last().unwrap();
+        assert_eq!(context.kind, ItemKind::Context);
+        let Part::Text(text) = &context.parts[0] else {
+            panic!("expected context text")
+        };
+        assert!(text.text.contains(body));
+        assert_eq!(
+            context.metadata["agentkit.context.path"],
+            serde_json::json!(link.display().to_string())
+        );
+    }
+    std::fs::remove_file(&target).unwrap();
+    assert!(
+        load_initial_transcript(root.path(), "system".into())
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -1066,6 +1475,24 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].name.0, "compose");
     assert_eq!(
+        specs[0].input_schema["properties"]["intent"]["type"],
+        "string"
+    );
+    assert!(
+        specs[0].input_schema["properties"]["intent"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("preferably 3–10 words")
+                    && description.contains("omit first-person language")
+                    && !description.contains("Example:")
+            })
+    );
+    assert!(
+        specs[0].input_schema["required"]
+            .as_array()
+            .is_none_or(|required| !required.contains(&json!("intent")))
+    );
+    assert_eq!(
         specs[0].input_schema["properties"]["background"]["oneOf"],
         json!([
             {"type": "boolean"},
@@ -1073,6 +1500,7 @@ fn compose_is_the_only_visible_tool_and_documents_mcp_meta_tools() {
         ])
     );
     assert!(specs[0].description.contains("`tool_search`"));
+    assert!(specs[0].description.contains("`tool_schema`"));
     assert!(specs[0].description.contains("`auth`"));
     assert!(specs[0].description.contains("`tool`"));
     assert!(!specs[0].description.contains("mcp_filesystem_read_file"));
@@ -1220,7 +1648,8 @@ async fn close_tool_can_cancel_a_detached_compose() {
 
     let job = compose
         .backgroundable
-        .begin_background(true, &call_id, &mut context);
+        .begin_background(true, &call_id, &mut context)
+        .unwrap();
     let cancellation = context.cancellation.clone().expect("job cancellation");
     assert!(!cancellation.is_cancelled());
     assert_eq!(
@@ -1280,7 +1709,8 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
     let mut context = owned.borrowed();
     let job = compose
         .backgroundable
-        .begin_background(false, &call_id, &mut context);
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
     let cancellation = context.cancellation.clone().expect("compose cancellation");
 
     assert_eq!(
@@ -1298,11 +1728,10 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
 
     let already_cancelled_id = ToolCallId::new("already-cancelled");
     let mut already_cancelled_context = owned.borrowed();
-    let already_cancelled_job = compose.backgroundable.begin_background(
-        false,
-        &already_cancelled_id,
-        &mut already_cancelled_context,
-    );
+    let already_cancelled_job = compose
+        .backgroundable
+        .begin_background(false, &already_cancelled_id, &mut already_cancelled_context)
+        .unwrap();
     assert!(
         already_cancelled_context
             .cancellation
@@ -1321,11 +1750,10 @@ async fn foreground_compose_can_detach_from_turn_cancellation_and_still_be_kille
     );
     let pending_detach_id = ToolCallId::new("pending-detach");
     let mut pending_detach_context = owned.borrowed();
-    let pending_detach_job = compose.backgroundable.begin_background(
-        false,
-        &pending_detach_id,
-        &mut pending_detach_context,
-    );
+    let pending_detach_job = compose
+        .backgroundable
+        .begin_background(false, &pending_detach_id, &mut pending_detach_context)
+        .unwrap();
     assert!(
         !pending_detach_context
             .cancellation
@@ -1466,19 +1894,171 @@ async fn compose_background_sanitization_rejects_invalid_and_strips_before_dispa
             ToolExecutionOutcome::Failed(_)
         ));
     }
+
+    let with_intent = |intent| {
+        ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("compose"),
+            json!({"script": "return 7", "intent": intent}),
+            SessionId::new("session"),
+            TurnId::new("turn"),
+        )
+    };
+    let sanitized =
+        BackgroundableCompose::sanitized(with_intent(json!("Check the runtime behavior.")))
+            .unwrap();
+    assert!(sanitized.input.get("intent").is_none());
+    for invalid in [json!(7), json!(true), json!(null), json!({})] {
+        assert!(BackgroundableCompose::sanitized(with_intent(invalid)).is_err());
+    }
 }
 
-#[test]
-fn pending_detach_is_applied_when_compose_registers() {
-    let jobs = BackgroundJobs::default();
+// Hold execution at the external script-engine boundary, after real compose registration.
+struct DelayedComposeBackend {
+    entered: tokio::sync::mpsc::UnboundedSender<agentkit_core::TurnCancellation>,
+    release: Arc<tokio::sync::Notify>,
+}
 
-    assert_eq!(
-        jobs.detach("pending-call"),
-        Some(DetachRegistration::Registered)
+#[async_trait::async_trait]
+impl agentkit_tool_compose::ComposeBackend for DelayedComposeBackend {
+    fn name(&self) -> &'static str {
+        "delayed"
+    }
+
+    fn description(&self, _: Option<&[agentkit_tools_core::ToolSpec]>) -> String {
+        "Controlled script execution".into()
+    }
+
+    fn script_description(&self) -> &'static str {
+        "Script held until released or cancelled"
+    }
+
+    async fn execute(
+        &self,
+        run: agentkit_tool_compose::BackendRun,
+    ) -> Result<Value, agentkit_tool_compose::ComposeOutcome> {
+        let cancellation = run.cancellation.expect("compose installs cancellation");
+        self.entered.send(cancellation.clone()).unwrap();
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(agentkit_tool_compose::ComposeOutcome::Failed(
+                agentkit_tools_core::ToolError::Cancelled,
+            )),
+            _ = self.release.notified() => Ok(json!(7)),
+        }
+    }
+}
+
+fn delayed_compose(
+    root: &std::path::Path,
+    jobs: BackgroundJobs,
+) -> (
+    Arc<BackgroundableCompose>,
+    tokio::sync::mpsc::UnboundedReceiver<agentkit_core::TurnCancellation>,
+    Arc<tokio::sync::Notify>,
+) {
+    let (entered, entries) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let inner = agentkit_tool_compose::ComposeTool::new(Default::default()).with_backend(
+        DelayedComposeBackend {
+            entered,
+            release: release.clone(),
+        },
     );
-    jobs.register_foreground_for_test("pending-call");
+    (
+        Arc::new(BackgroundableCompose::new(
+            inner,
+            jobs,
+            root.to_path_buf(),
+            agentkit_tools_core::ToolRegistry::new(),
+        )),
+        entries,
+        release,
+    )
+}
 
-    assert!(jobs.is_detached_for_test("pending-call"));
+fn invoke_delayed_compose(
+    compose: Arc<BackgroundableCompose>,
+    call_id: &'static str,
+    background: bool,
+) -> tokio::task::JoinHandle<ToolExecutionOutcome> {
+    tokio::spawn(async move {
+        let session_id = SessionId::new("registration-session");
+        let turn_id = TurnId::new("registration-turn");
+        let permissions = Arc::new(AllowAllPermissions);
+        let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+        let owned = OwnedToolContext {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            metadata: MetadataMap::new(),
+            permissions: permissions.clone(),
+            resources: resources.clone(),
+            cancellation: None,
+            execution_scope: Some(ToolExecutionScope {
+                executor: Arc::new(BasicToolExecutor::new(Vec::<Arc<dyn ToolSource>>::new())),
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                permissions,
+                resources,
+                cancellation: None,
+            }),
+            approved_request: None,
+        };
+        compose
+            .invoke_outcome(
+                ToolRequest::new(
+                    ToolCallId::new(call_id),
+                    ToolName::new("compose"),
+                    json!({"script": "return 7", "background": background}),
+                    session_id,
+                    turn_id,
+                ),
+                &mut owned.borrowed(),
+            )
+            .await
+    })
+}
+
+#[tokio::test]
+async fn pending_detach_is_applied_when_compose_registers() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let root = tempfile::tempdir().unwrap();
+        let jobs = BackgroundJobs::default();
+        let (compose, mut entries, release) = delayed_compose(root.path(), jobs.clone());
+        let initial = jobs.activity();
+        let call_id = ToolCallId::new("pending-call");
+        assert_eq!(
+            jobs.detach(&call_id.0),
+            Some(DetachRegistration::Registered)
+        );
+
+        let invocation = invoke_delayed_compose(compose, "pending-call", false);
+        let cancellation = entries.recv().await.unwrap();
+        assert!(!cancellation.is_cancelled());
+        // The old accessor also returned true for an unconsumed pending detach.
+        // Inspect the registered job so this cannot pass without applying policy.
+        {
+            let state = jobs.state.lock().unwrap();
+            let job = state.running.get(&call_id).expect("compose registered");
+            assert!(job.detached);
+            assert!(job.manual_detach);
+            assert!(!state.pending_detaches.contains(&call_id));
+        }
+        assert!(jobs.activity().active);
+        assert_eq!(
+            jobs.activity().background_started,
+            initial.background_started + 1
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            invocation.await.unwrap(),
+            ToolExecutionOutcome::Completed(_)
+        ));
+        assert!(!jobs.activity().active);
+        assert!(jobs.activity().unacknowledged_terminals);
+    })
+    .await
+    .expect("pending detach compose invocation did not finish");
 }
 
 #[test]
@@ -1526,28 +2106,520 @@ fn background_terminal_publication_is_acknowledged_by_call_id() {
     assert!(!jobs.activity().unacknowledged_terminals);
 }
 
-#[test]
-fn cancel_all_covers_running_and_late_background_registration() {
-    let jobs = BackgroundJobs::default();
-    let initial = jobs.activity();
-    jobs.register_foreground_for_test("running");
+#[tokio::test]
+async fn cancel_all_covers_running_and_late_background_registration() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for background in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let jobs = BackgroundJobs::default();
+            let initial = jobs.activity();
+            let (compose, mut entries, release) = delayed_compose(root.path(), jobs.clone());
+            let running = invoke_delayed_compose(compose.clone(), "running", background);
+            let cancellation = entries.recv().await.unwrap();
+            assert!(jobs.activity().active);
+            assert!(!cancellation.is_cancelled());
+
+            jobs.cancel_all();
+            assert!(cancellation.is_cancelled());
+            assert!(matches!(
+                running.await.unwrap(),
+                ToolExecutionOutcome::Failed(agentkit_tools_core::ToolError::Cancelled)
+            ));
+            // A late registration must be cancelled before the backend is entered.
+            let late = invoke_delayed_compose(compose.clone(), "late", background);
+            assert!(matches!(
+                late.await.unwrap(),
+                ToolExecutionOutcome::Failed(agentkit_tools_core::ToolError::Cancelled)
+            ));
+            assert!(entries.try_recv().is_err());
+            let quiescent = jobs.activity();
+            assert!(!quiescent.active);
+            assert!(quiescent.generation > initial.generation);
+
+            jobs.begin_turn();
+            let next = invoke_delayed_compose(compose, "next-turn", background);
+            let cancellation = entries.recv().await.unwrap();
+            assert!(!cancellation.is_cancelled());
+            release.notify_one();
+            assert!(matches!(
+                next.await.unwrap(),
+                ToolExecutionOutcome::Completed(_)
+            ));
+            assert!(!jobs.activity().active);
+        }
+    })
+    .await
+    .expect("cancel-all compose invocation did not finish");
+}
+
+fn background_job_test_context(
+    cancellation: Option<agentkit_core::TurnCancellation>,
+) -> OwnedToolContext {
+    OwnedToolContext {
+        session_id: SessionId::new("background-test"),
+        turn_id: TurnId::new("turn"),
+        metadata: MetadataMap::new(),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation,
+        execution_scope: None,
+        approved_request: None,
+    }
+}
+
+#[tokio::test]
+async fn background_jobs_poison_preserves_activity_cancellation_and_terminal_debt() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    jobs.register_foreground_for_test("active");
+    jobs.register_foreground_for_test("finished");
+    jobs.detach("finished").unwrap();
+    jobs.finish_for_test("finished");
+    let before = jobs.activity();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = jobs.state.lock().unwrap();
+            panic!("poison intact background bookkeeping");
+        }))
+        .is_err()
+    );
+    assert_eq!(jobs.activity(), before);
     assert!(jobs.activity().active);
-
+    assert!(jobs.activity().unacknowledged_terminals);
+    assert!(!jobs.state.is_poisoned());
     jobs.cancel_all();
-    assert!(jobs.is_cancelled_for_test("running"));
-    jobs.register_foreground_for_test("late");
+    assert!(jobs.is_cancelled_for_test("active"));
+    // Seed helpers do not apply policy: exercise late registration through compose.
+    let owned = background_job_test_context(None);
+    let late = compose
+        .backgroundable
+        .begin_background(false, &ToolCallId::new("late"), &mut owned.borrowed())
+        .unwrap();
     assert!(jobs.is_cancelled_for_test("late"));
+    jobs.acknowledge_terminal(&ToolCallId::new("finished"));
+    jobs.finish_for_test("active");
+    drop(late);
+    assert!(!jobs.activity().active);
+    assert!(!jobs.activity().unacknowledged_terminals);
+}
 
-    jobs.finish_for_test("running");
-    jobs.finish_for_test("late");
-    let quiescent = jobs.activity();
-    assert!(!quiescent.active);
-    assert!(quiescent.generation > initial.generation);
+#[tokio::test]
+async fn background_registration_waker_unwind_cleans_up_without_poison() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+    struct ReenterAndPanic(BackgroundJobs, AtomicBool);
+    impl Wake for ReenterAndPanic {
+        fn wake(self: Arc<Self>) {
+            assert!(
+                self.0.state.try_lock().is_ok(),
+                "activity wake held jobs lock"
+            );
+            let _ = self.0.activity();
+            if !self.1.swap(true, Ordering::SeqCst) {
+                panic!("activity waker");
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let wake = Arc::new(ReenterAndPanic(jobs.clone(), AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let owned = background_job_test_context(None);
+    let mut context = owned.borrowed();
+    let call_id = ToolCallId::new("wake-unwind");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _job = compose
+                .backgroundable
+                .begin_background(true, &call_id, &mut context)
+                .unwrap();
+        }))
+        .is_err()
+    );
+    assert!(wake.1.load(Ordering::SeqCst));
+    assert!(!jobs.state.is_poisoned());
+    assert!(
+        !jobs.activity().active,
+        "registration must establish cleanup before waking"
+    );
+    assert!(jobs.activity().unacknowledged_terminals);
+    jobs.acknowledge_terminal(&call_id);
+    assert!(!jobs.activity().unacknowledged_terminals);
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+    );
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    assert!(jobs.activity().active);
+    drop(guard);
+    assert!(!jobs.activity().active);
+}
 
-    jobs.begin_turn();
-    jobs.register_foreground_for_test("next-turn");
-    assert!(!jobs.is_cancelled_for_test("next-turn"));
-    jobs.finish_for_test("next-turn");
+#[tokio::test]
+async fn background_finish_and_acknowledgement_wake_with_committed_state() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+    struct ObserveDebt(BackgroundJobs, AtomicBool);
+    impl Wake for ObserveDebt {
+        fn wake(self: Arc<Self>) {
+            assert!(self.0.state.try_lock().is_ok());
+            self.1
+                .store(self.0.activity().unacknowledged_terminals, Ordering::SeqCst);
+        }
+    }
+    let jobs = BackgroundJobs::default();
+    jobs.register_foreground_for_test("terminal");
+    jobs.detach("terminal").unwrap();
+    let observe = Arc::new(ObserveDebt(jobs.clone(), AtomicBool::new(false)));
+    let waker = Waker::from(Arc::clone(&observe));
+    let mut context = Context::from_waker(&waker);
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    jobs.finish_for_test("terminal");
+    assert!(observe.1.load(Ordering::SeqCst));
+    assert!(waiting.as_mut().poll(&mut context).is_ready());
+    let mut waiting = Box::pin(jobs.activity_after(jobs.activity().generation));
+    assert!(waiting.as_mut().poll(&mut context).is_pending());
+    jobs.acknowledge_terminal(&ToolCallId::new("terminal"));
+    assert!(!observe.1.load(Ordering::SeqCst));
+    assert!(waiting.as_mut().poll(&mut context).is_ready());
+    assert!(!jobs.activity().active);
+    assert!(!jobs.state.is_poisoned());
+}
+
+#[tokio::test]
+async fn background_cancellation_rejects_detach_and_stale_relays_ignore_reused_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let parent = CancellationController::new();
+    let owned = background_job_test_context(Some(parent.handle().checkpoint()));
+    let mut context = owned.borrowed();
+    let call_id = ToolCallId::new("relay");
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    let old_registration = jobs.lock_jobs().running[&call_id].registration.clone();
+    let cancellation = context.cancellation.clone().unwrap();
+    parent.interrupt();
+    tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
+        .await
+        .unwrap();
+    assert_eq!(jobs.detach(&call_id.0), None);
+    assert!(jobs.cancel(&call_id.0));
+    assert!(jobs.cancel(&call_id.0));
+    assert_eq!(
+        cancellation.handle().generation(),
+        1,
+        "signal a job only once"
+    );
+    drop(guard);
+    let owned = background_job_test_context(None);
+    let mut context = owned.borrowed();
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut context)
+        .unwrap();
+    let cancellation = context.cancellation.clone().unwrap();
+    // The old relay can race abort after finish unlocks; exercise its real handlers.
+    assert!(!jobs.cancel_registration(&call_id.0, Some(&old_registration)));
+    jobs.propagate_foreground_cancellation(&call_id, &old_registration);
+    assert!(!cancellation.is_cancelled());
+    assert!(jobs.cancel(&call_id.0));
+    assert!(cancellation.is_cancelled());
+    drop(guard);
+}
+
+#[tokio::test]
+async fn background_registration_rejection_preserves_owner_and_unwind_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let compose = runtime.compose(0);
+    let jobs = &compose.backgroundable.background_jobs;
+    let owned = background_job_test_context(None);
+    let call_id = ToolCallId::new("duplicate");
+    let guard = compose
+        .backgroundable
+        .begin_background(false, &call_id, &mut owned.borrowed())
+        .unwrap();
+    let before = jobs.activity();
+    assert!(
+        compose
+            .backgroundable
+            .begin_background(false, &call_id, &mut owned.borrowed())
+            .is_err()
+    );
+    assert_eq!(jobs.activity(), before);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            let _state = jobs.state.lock().unwrap();
+            panic!("execution unwind with poisoned registry");
+        }))
+        .is_err()
+    );
+    assert!(!jobs.state.is_poisoned());
+    assert!(!jobs.activity().active);
+    let guard = compose
+        .backgroundable
+        .begin_background(true, &call_id, &mut owned.borrowed())
+        .unwrap();
+    drop(guard);
+    assert!(jobs.activity().unacknowledged_terminals);
+    assert!(
+        compose
+            .backgroundable
+            .begin_background(true, &call_id, &mut owned.borrowed())
+            .is_err()
+    );
+    jobs.acknowledge_terminal(&call_id);
+    assert!(!jobs.activity().unacknowledged_terminals);
+}
+
+#[tokio::test]
+async fn persistent_startup_failure_does_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+        root.path(),
+        "test/model",
+        crate::provider::ProviderKind::OpenRouter,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+        None,
+        Some(crate::provider::OpenRouterApiKey::new("")),
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(
+        error.contains("--openrouter-api-key cannot be empty"),
+        "{error}"
+    );
+    assert!(crate::session::load(root.path(), &session_id).is_err());
+}
+
+/// Run with a private HOME in a subprocess: fatal logs and durable sessions both
+/// use HOME, and changing it in this process would race unrelated tests.
+#[tokio::test]
+async fn persistent_provider_failure_retains_private_span_context() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::{Layer, layer::SubscriberExt as _, registry::LookupSpan};
+
+    const CHILD: &str = "KIT_TEST_PERSISTENT_ERROR_SPANS";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": {
+                    "message": "response-secret-sentinel",
+                    "type": "invalid_request_error",
+                    "code": 400
+                }})),
+            )
+        });
+        let server = tokio::spawn(
+            async move { axum::serve(listener, app).await.unwrap() }.with_current_subscriber(),
+        );
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "runtime::tests::persistent_provider_failure_retains_private_span_context",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env(
+                "OPENROUTER_BASE_URL",
+                format!("http://{address}/endpoint-secret-sentinel"),
+            )
+            .env("NO_PROXY", "127.0.0.1")
+            .env_remove("OPENROUTER_MAX_COMPLETION_TOKENS")
+            .env_remove("OPENROUTER_TEMPERATURE")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("isolated runtime test timed out")
+            .unwrap();
+        server.abort();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    struct ClosedBeforeLog {
+        directory: std::path::PathBuf,
+        names: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl<S> Layer<S> for ClosedBeforeLog
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let span = ctx.span(&id).unwrap();
+            let name = span.metadata().name();
+            if matches!(name, "chat" | "agent.turn") && !self.directory.exists() {
+                self.names.lock().unwrap().push(name);
+            }
+        }
+    }
+
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("AGENTS.md"), "context-secret-sentinel").unwrap();
+    let mut original_error = None;
+    for (session_id, capture, block_log) in [
+        ("span-enabled", true, false),
+        ("span-default-disabled", false, false),
+        ("span-write-failed", true, true),
+    ] {
+        let directory = home.join(".kit/errors").join(session_id);
+        if block_log {
+            // A file where the log directory belongs is a permanent write error.
+            std::fs::write(&directory, "not a directory").unwrap();
+        }
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut settings = crate::telemetry::Settings {
+            capture_message_content: true,
+            ..Default::default()
+        };
+        assert!(!settings.capture_error_spans);
+        settings.capture_error_spans = capture;
+        assert!(settings.endpoint.is_none());
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                settings
+                    .capture_error_spans
+                    .then_some(crate::telemetry::error_spans::ErrorSpanLayer),
+            )
+            .with(ClosedBeforeLog {
+                directory: directory.clone(),
+                names: closed.clone(),
+            });
+        let runtime = Runtime::with_session_provider_credentials_effort_and_openrouter_key(
+            root.path(),
+            "private/model-secret-sentinel",
+            crate::provider::ProviderKind::OpenRouter,
+            SessionRequest {
+                id: session_id.into(),
+                resume: false,
+                force: false,
+            },
+            crate::credentials::CredentialStorage::Memory,
+            None,
+            Some(crate::provider::OpenRouterApiKey::new(
+                "api-secret-sentinel",
+            )),
+        )
+        .unwrap();
+        let runtime = Runtime::with_telemetry(runtime, settings).unwrap();
+        let error = runtime
+            .run_persistent("prompt-secret-sentinel".into())
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        let rendered = error.split("; fatal log: ").next().unwrap();
+        assert!(rendered.starts_with("provider error:"), "{error}");
+        if let Some(original) = &original_error {
+            assert_eq!(rendered, original);
+        } else {
+            original_error = Some(rendered.to_owned());
+        }
+        if block_log {
+            assert!(!error.contains("; fatal log: "));
+            assert_eq!(
+                std::fs::read_to_string(&directory).unwrap(),
+                "not a directory"
+            );
+            continue;
+        }
+        let (_, path) = error.split_once("; fatal log: ").unwrap();
+        let encoded = std::fs::read_to_string(path).unwrap();
+        let record: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(record["session_id"], session_id);
+        assert_eq!(record["surface"], "prompt");
+        assert_eq!(record["kind"], "provider");
+        assert_eq!(record["code"], "provider_error");
+        assert_eq!(record["message"], "provider request failed");
+        assert!(!encoded.contains("secret-sentinel"), "{encoded}");
+        assert!(!encoded.contains(&root.path().display().to_string()));
+        assert!(!encoded.contains(&home.display().to_string()));
+        if capture {
+            let fragments = record["span_context"]["fragments"].as_array().unwrap();
+            assert_eq!(fragments[0]["name"], "kit.operation");
+            assert_eq!(fragments[0]["fields"]["surface"], "prompt");
+            for name in ["agent.turn", "chat"] {
+                assert!(
+                    closed.lock().unwrap().contains(&name),
+                    "{name} did not close before logging"
+                );
+                assert!(
+                    fragments.iter().any(|fragment| fragment["name"] == name),
+                    "{encoded}"
+                );
+            }
+        } else {
+            assert!(record.get("span_context").is_none(), "{encoded}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn persistent_missing_openai_credentials_do_not_commit_new_session() {
+    let root = tempfile::tempdir().unwrap();
+    let session_id = crate::session::new_id();
+    let runtime = Runtime::with_session_provider_and_credentials(
+        root.path(),
+        "gpt-5.4",
+        crate::provider::ProviderKind::OpenAiSubscription,
+        SessionRequest {
+            id: session_id.clone(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .unwrap();
+
+    let error = runtime.run_persistent("hello".into()).await.unwrap_err();
+    assert!(error.contains("openai_auth_required:"), "{error}");
+    assert!(crate::session::load(root.path(), &session_id).is_err());
 }
 
 #[tokio::test]
@@ -1582,12 +2654,17 @@ fn system_prompt_guides_compose_and_subagent_hygiene() {
     assert!(prompt.contains("Do not dump whole trees"));
     assert!(prompt.contains("Use compose as a dependency graph"));
     assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
-    assert!(prompt.contains("when it can run across a turn boundary"));
-    assert!(prompt.contains("it also suits one-shot triggers"));
+    assert!(prompt.contains("Background long-running compose work across turn boundaries"));
+    assert!(prompt.contains("monitors that wait or poll for EXTERNAL events or state changes"));
     assert!(prompt.contains("including launching more detached work"));
-    assert!(prompt.contains("When the remaining work depends on background results, yield"));
-    assert!(prompt.contains("yielding continues the task with those results"));
-    assert!(prompt.contains("the user's answer need not be completed first"));
+    assert!(prompt.contains("STOP: end your turn now."));
+    assert!(prompt.contains("Stopping is a valid intermediate response"));
+    assert!(prompt.contains("the harness automatically resumes you when it finishes"));
+    assert!(
+        prompt.contains(
+            "Do not issue additional tool calls to wait or poll for a background tool call to finish, or to keep the turn alive"
+        )
+    );
     assert!(prompt.contains("the next step needs its result in the current turn"));
     assert!(
         prompt.contains("Prefer one compose program whenever the remaining tool graph is known")

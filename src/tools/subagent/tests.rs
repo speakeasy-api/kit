@@ -46,10 +46,12 @@ impl Subagents {
                     output: Value::Null,
                     updates: None,
                     harness: crate::acp_child::BUILTIN_HARNESS.into(),
+                    vendor: events::HarnessVendor::Kit,
                     model: None,
                     kit: true,
                     root: self.config.root.clone(),
                     child: None,
+                    recovery: None,
                     forking: None,
                     permit: Some(self.reserve().unwrap()),
                 },
@@ -276,6 +278,7 @@ fn explicit_null_output_schema_is_rejected() {
 fn boolean_output_schema_is_supported() {
     let contract = OutputContract::new(Value::Bool(true)).unwrap();
     assert_eq!(contract.parse("[1, 2]").unwrap(), json!([1, 2]));
+    assert!(contract.prompt("respond".into()).ends_with("\ntrue"));
 }
 
 #[test]
@@ -307,6 +310,7 @@ fn manager_with_disconnected_session(
 ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.to_path_buf(),
             model: "test".into(),
             provider: Default::default(),
@@ -339,10 +343,12 @@ fn manager_with_disconnected_session(
         output: Value::String("done".into()),
         updates: None,
         harness: crate::acp_child::BUILTIN_HARNESS.into(),
+        vendor: events::HarnessVendor::Kit,
         model: None,
         kit: true,
         root: root.to_path_buf(),
         child: Some(ChildSession::disconnected_for_test()),
+        recovery: None,
         forking: None,
         permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
     }));
@@ -378,6 +384,7 @@ async fn close_does_not_block_listings_or_allow_stale_reuse() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -543,6 +550,7 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
     .unwrap();
     Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -622,7 +630,7 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
     );
     wait_for_logged(
         &requests,
-        |request| matches!(request, LoggedRequest::New { cwd } if cwd == &child_root),
+        |request| matches!(request, LoggedRequest::New { cwd, additional_directories } if cwd == &child_root && additional_directories.is_empty()),
     )
     .await;
 
@@ -647,7 +655,92 @@ async fn create_uses_requested_working_directory_without_changing_parent() {
     );
     wait_for_logged(
         &requests,
-        |request| matches!(request, LoggedRequest::Fork { cwd, .. } if cwd == &child_root),
+        |request| matches!(request, LoggedRequest::Fork { cwd, additional_directories, .. } if cwd == &child_root && additional_directories.is_empty()),
+    )
+    .await;
+
+    manager
+        .close(&branch.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    manager
+        .close(&source.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn additional_directories_reach_new_and_fork_without_changing_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let child_root = root.path().join("other-worktree");
+    std::fs::create_dir(&child_root).unwrap();
+    let child_root = child_root.canonicalize().unwrap();
+    let requests = root.path().join("requests.jsonl");
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec![fixture_path_arg("--request-log", &requests)],
+    );
+
+    let directories = vec![root.path().join("extra"), root.path().join("second")];
+    for path in &directories {
+        std::fs::create_dir(path).unwrap();
+    }
+    let parent = manager;
+    let manager = parent.fresh_for_workspace(directories.clone(), None);
+    assert!(parent.child_config().additional_directories.is_empty());
+    let sibling = parent.fresh_for_workspace(Vec::new(), None);
+    assert!(sibling.child_config().additional_directories.is_empty());
+
+    let source = manager
+        .create(
+            "MOCK_CWD".into(),
+            CreateOptions {
+                cwd: Some(PathBuf::from("other-worktree")),
+                ..Default::default()
+            },
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        source.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(manager.config.root, root.path());
+    assert_eq!(
+        manager.lookup(&source).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::New { cwd, additional_directories } if cwd == &child_root && additional_directories == &directories),
+    )
+    .await;
+
+    let branch = manager
+        .fork(
+            source.clone(),
+            "MOCK_CWD".into(),
+            None,
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        branch.output,
+        Value::String(child_root.display().to_string())
+    );
+    assert_eq!(
+        manager.lookup(&branch).unwrap().lock().await.root,
+        child_root
+    );
+    wait_for_logged(
+        &requests,
+        |request| matches!(request, LoggedRequest::Fork { cwd, additional_directories, .. } if cwd == &child_root && additional_directories == &directories),
     )
     .await;
 
@@ -716,12 +809,18 @@ fn fixture_path_arg(name: &str, path: &Path) -> String {
 #[serde(tag = "method")]
 enum LoggedRequest {
     #[serde(rename = "session/new")]
-    New { cwd: PathBuf },
+    New {
+        cwd: PathBuf,
+        #[serde(rename = "additionalDirectories")]
+        additional_directories: Vec<PathBuf>,
+    },
     #[serde(rename = "session/fork")]
     Fork {
         #[serde(rename = "sessionId")]
         session_id: String,
         cwd: PathBuf,
+        #[serde(rename = "additionalDirectories")]
+        additional_directories: Vec<PathBuf>,
     },
     #[serde(rename = "session/prompt")]
     Prompt {
@@ -778,8 +877,10 @@ async fn wait_for_available_permits(manager: &Subagents, expected: usize) {
 
 #[derive(Default)]
 struct ScenarioOptions {
+    fail_delete: bool,
     gate_new: bool,
     gate_fork: bool,
+    gate_close: bool,
     gate_prompt: Option<&'static str>,
     fail_close_session: Option<&'static str>,
 }
@@ -791,6 +892,7 @@ struct MockAcpScenario {
     new_release: std::path::PathBuf,
     fork_release: std::path::PathBuf,
     prompt_release: std::path::PathBuf,
+    close_release: std::path::PathBuf,
 }
 
 impl MockAcpScenario {
@@ -800,12 +902,19 @@ impl MockAcpScenario {
         let new_release = root.path().join("release-new");
         let fork_release = root.path().join("release-fork");
         let prompt_release = root.path().join("release-prompt");
+        let close_release = root.path().join("release-close");
         let mut args = vec![fixture_path_arg("--request-log", &requests)];
+        if options.fail_delete {
+            args.extend(["--delete".into(), "--fail-delete".into()]);
+        }
         if options.gate_new {
             args.push(fixture_path_arg("--new-release", &new_release));
         }
         if options.gate_fork {
             args.push(fixture_path_arg("--fork-release", &fork_release));
+        }
+        if options.gate_close {
+            args.push(fixture_path_arg("--close-release", &close_release));
         }
         if let Some(text) = options.gate_prompt {
             args.push(fixture_path_arg("--prompt-release", &prompt_release));
@@ -822,6 +931,7 @@ impl MockAcpScenario {
             new_release,
             fork_release,
             prompt_release,
+            close_release,
         }
     }
 
@@ -865,6 +975,46 @@ impl MockAcpScenario {
     fn release(path: &Path) {
         std::fs::write(path, b"release").unwrap();
     }
+}
+
+#[tokio::test]
+async fn output_contract_sends_serialized_schema_to_child() {
+    let scenario = MockAcpScenario::new(ScenarioOptions::default());
+    let schema = json!({
+        "type": "object",
+        "description": "A quoted \"decision\"\nwith Unicode: ✓",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"]
+    });
+    let contract = OutputContract::new(schema.clone()).unwrap();
+    let handle = scenario
+        .manager
+        .create(
+            "MOCK_STRUCTURED_OUTPUT".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            Some(&contract),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        handle.output,
+        json!({"approved": true, "reason": "mock approved"})
+    );
+    let expected = format!(
+        "MOCK_STRUCTURED_OUTPUT\n\nReturn only a JSON value matching this JSON Schema. Do not wrap it in Markdown or add commentary:\n{}",
+        serde_json::to_string(&schema).unwrap()
+    );
+    assert!(logged_requests(&scenario.requests).iter().any(|request| {
+        matches!(request, LoggedRequest::Prompt { text, .. } if text == &expected)
+    }));
+    scenario
+        .manager
+        .close(&handle.id, &TurnCancellation::default())
+        .await
+        .unwrap();
 }
 
 mod lifecycle_events {
@@ -970,7 +1120,6 @@ mod lifecycle_events {
                 (SubagentStatus::Removed, Some(GenerationOutcome::Failed)),
             ]
         );
-        assert!(emitted.iter().all(|event| event.parent_call().is_none()));
         let generations = emitted
             .iter()
             .filter_map(|event| match event {
@@ -1495,6 +1644,75 @@ async fn successful_fork_handoff_cleans_up_if_receipt_is_not_acknowledged() {
 }
 
 #[tokio::test]
+async fn close_streaming_child_retains_sealed_transcript() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_prompt: Some("late reply"),
+        gate_close: true,
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let manager = scenario.manager.clone();
+    let prior = source.clone();
+    let prompt = tokio::spawn(async move {
+        manager
+            .prompt(
+                prior,
+                "late reply".into(),
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+    });
+    scenario
+        .wait_for(
+            |request| matches!(request, LoggedRequest::Prompt { text, .. } if text == "late reply"),
+        )
+        .await;
+    let manager = scenario.manager.clone();
+    let id = source.id.clone();
+    let close = tokio::spawn(async move { manager.close(&id, &TurnCancellation::default()).await });
+    // The manager has emitted Removed and sealed history before sending close.
+    scenario
+        .wait_for(|request| matches!(request, LoggedRequest::Close { .. }))
+        .await;
+    let generation = source.generation + 1;
+    let retained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = scenario
+                .manager
+                .read_transcript(&source.id, generation, 0)
+                .await
+                .unwrap();
+            if page.caught_up {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!retained.updates.is_empty());
+
+    // Keep the child route live while its final streamed update arrives after seal.
+    MockAcpScenario::release(&scenario.prompt_release);
+    // Retirement is checked after the child consumes its successful response.
+    assert!(matches!(
+        prompt.await.unwrap(),
+        Err(ChildError::Failed(message)) if message == "subagent session is retired"
+    ));
+    MockAcpScenario::release(&scenario.close_release);
+    close.await.unwrap().unwrap();
+    let after = scenario
+        .manager
+        .read_transcript(&source.id, generation, 0)
+        .await
+        .unwrap();
+    assert!(after.caught_up);
+    assert_eq!(after.updates, retained.updates);
+    assert_eq!(after.next_cursor, retained.next_cursor);
+}
+
+#[tokio::test]
 async fn prompt_error_after_close_emits_no_ghost_idle_row() {
     let scenario = MockAcpScenario::new(ScenarioOptions {
         gate_prompt: Some("MOCK_REFUSAL"),
@@ -1563,6 +1781,7 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -1661,6 +1880,7 @@ async fn listing_includes_named_starting_and_idle_subagents() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -1814,6 +2034,7 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
     .unwrap();
     let manager = Subagents::new(
         ChildConfig {
+            additional_directories: Vec::new(),
             root: root.path().to_path_buf(),
             model: "unused".into(),
             provider: Default::default(),
@@ -1861,3 +2082,184 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         "ACP harness \"acp.generic\" does not advertise session/fork; transcript fallback is only available for Kit"
     );
 }
+
+#[tokio::test]
+async fn non_text_prompts_survive_create_continue_and_fork() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec!["--prompt-content".into(), "--echo-prompt-content".into()],
+    );
+    let blocks = json!([
+        {"type": "resource_link", "uri": "file:///context.txt", "name": "context", "_meta": {"contextId": "sample"}},
+        {"type": "text", "text": "Inspect the attached context"},
+        {"type": "resource", "resource": {"uri": "file:///context.txt", "text": "embedded context", "mimeType": "text/plain"}},
+        {"type": "resource", "resource": {"uri": "file:///binary", "blob": "YQ=="}},
+        {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}
+    ]);
+    let make_prompt = || serde_json::from_value::<ChildPrompt>(blocks.clone()).unwrap();
+    let created = manager
+        .create(
+            make_prompt(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(created.output.as_str().unwrap()).unwrap(),
+        blocks
+    );
+    let continued = manager
+        .prompt(created, make_prompt(), TurnCancellation::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(continued.output.as_str().unwrap()).unwrap(),
+        blocks
+    );
+    let contract = Arc::new(OutputContract::new(json!(true)).unwrap());
+    let forked = manager
+        .fork(
+            continued.clone(),
+            make_prompt(),
+            None,
+            0,
+            TurnCancellation::default(),
+            Some(Arc::clone(&contract)),
+        )
+        .await
+        .unwrap();
+    let mut expected = blocks.as_array().unwrap().clone();
+    expected.push(json!({"type": "text", "text": contract.prompt(String::new())}));
+    assert_eq!(forked.output, json!(expected));
+    manager
+        .close(&forked.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+    manager
+        .close(&continued.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_prompt_content_preserves_continuation_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager_with_generic_harness(root.path(), Vec::new());
+    let created = manager
+        .create(
+            "initial".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let image =
+        serde_json::from_value(json!([{"type": "image", "data": "YQ==", "mimeType": "image/png"}]))
+            .unwrap();
+    let error = manager
+        .prompt(created.clone(), image, TurnCancellation::default(), None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("promptCapabilities.image"));
+    let continued = manager
+        .prompt(
+            created,
+            "still usable".into(),
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.output, json!("still usable"));
+    manager
+        .close(&continued.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delete_failure_releases_closed_branch_capacity() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        fail_delete: true,
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let branch = scenario
+        .spawn_fork(source.clone(), "branch")
+        .await
+        .unwrap()
+        .unwrap();
+    let error = scenario
+        .manager
+        .close(&branch.id, &TurnCancellation::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("delete failed"));
+    wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS - 1).await;
+    let replacement = scenario
+        .spawn_fork(source, "replacement")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement.id, branch.id);
+    assert!(scenario.manager.lookup(&branch).is_err());
+}
+
+#[tokio::test]
+async fn additional_directories_reject_unsupported_harness_before_session_creation() {
+    let root = tempfile::tempdir().unwrap();
+    let requests = root.path().join("requests.jsonl");
+    let manager = manager_with_generic_harness(
+        root.path(),
+        vec![
+            fixture_path_arg("--request-log", &requests),
+            "--no-additional-directories".into(),
+        ],
+    );
+    let workspace = manager.fresh_for_workspace(vec![root.path().to_path_buf()], None);
+    let error = workspace
+        .create(
+            "unused".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not advertise additional project directory support"),
+        "{error}"
+    );
+    assert!(
+        !logged_requests(&requests)
+            .iter()
+            .any(|request| matches!(request, LoggedRequest::New { .. }))
+    );
+    // A single-root parent still works with this same unsupported harness.
+    let child = manager
+        .create(
+            "standard".into(),
+            CreateOptions::default(),
+            0,
+            TurnCancellation::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    manager
+        .close(&child.id, &TurnCancellation::default())
+        .await
+        .unwrap();
+}
+
+#[path = "recovery_tests.rs"]
+mod recovery_tests;

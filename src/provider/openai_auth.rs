@@ -1,22 +1,25 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio_util::sync::CancellationToken;
 
-use crate::credentials::{CredentialEntry, CredentialStorage};
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
+
+use crate::credentials::{CredentialEntry, CredentialFilesystemScope, CredentialStorage};
+use crate::resilient_fs as fs;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -36,6 +39,7 @@ pub(crate) struct Output {
 
 #[derive(Clone, Copy, Debug)]
 enum ClientErrorKind {
+    Cancelled,
     Invalid,
     Unavailable,
     Timeout,
@@ -95,6 +99,10 @@ pub(crate) struct AuthError {
 }
 
 impl AuthError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        matches!(self.kind, ClientErrorKind::Cancelled)
+    }
+
     fn invalid(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
@@ -156,33 +164,6 @@ impl TokenRecord {
             account_id: account_id.to_owned(),
             generation: self.generation.clone(),
         })
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn for_test(access_token: &str, account_id: &str) -> Self {
-        Self {
-            access_token: access_token.to_owned(),
-            refresh_token: "test-refresh-token".to_owned(),
-            id_token: "test-id-token".to_owned(),
-            expires_at: i64::MAX,
-            account_id: Some(account_id.to_owned()),
-            email: None,
-            plan_type: None,
-            generation: format!("test-{account_id}"),
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn for_test_generation(
-        access_token: &str,
-        account_id: &str,
-        generation: &str,
-    ) -> Self {
-        let mut record = Self::for_test(access_token, account_id);
-        record.generation = generation.to_owned();
-        record
     }
 }
 
@@ -269,6 +250,12 @@ trait CredentialStore: Send + Sync {
     fn load(&self) -> Result<Option<TokenRecord>, AuthError>;
     fn save(&self, record: &TokenRecord) -> Result<(), AuthError>;
     fn delete(&self) -> Result<bool, AuthError>;
+    fn lock_scope(&self) -> Option<&std::path::Path> {
+        None
+    }
+    fn require_disk(&self) -> Result<(), AuthError> {
+        Ok(())
+    }
 }
 
 struct BackendCredentialStore {
@@ -284,6 +271,16 @@ impl BackendCredentialStore {
 }
 
 impl CredentialStore for BackendCredentialStore {
+    fn lock_scope(&self) -> Option<&std::path::Path> {
+        self.entry.filesystem_path()
+    }
+
+    fn require_disk(&self) -> Result<(), AuthError> {
+        self.entry.require_disk().map_err(|value| {
+            AuthError::unavailable("credential_persistence_blocked", value.to_string())
+        })
+    }
+
     fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
         let mut bytes = match self.entry.load() {
             Ok(Some(bytes)) => bytes,
@@ -426,8 +423,9 @@ fn login(
                             TOKEN_URL,
                         )
                         .and_then(|record| {
-                            let _lock = process_lock(deadline)?;
+                            let _lock = process_lock_scoped(deadline, store.lock_scope(), None)?;
                             store.save(&record)?;
+                            store.require_disk()?;
                             Ok(record)
                         });
                         code.zeroize();
@@ -475,7 +473,7 @@ fn status(
     deadline: Instant,
 ) -> Result<Output, AuthError> {
     let record = match store.load()? {
-        Some(record) => Some(refresh_if_needed(store, record, deadline)?),
+        Some(record) => Some(refresh_if_needed(store, record, deadline, None)?),
         None => None,
     };
     render_status(record, format, false)
@@ -497,13 +495,14 @@ fn logout_at(
     local_only: bool,
     revoke_url: &str,
 ) -> Result<Output, AuthError> {
-    let _lock = process_lock(deadline)?;
+    let _lock = process_lock_scoped(deadline, store.lock_scope(), None)?;
     if let Some(record) = store.load()?
         && !local_only
     {
         revoke_at(&record, deadline, revoke_url)?;
     }
     let removed = store.delete()?;
+    store.require_disk()?;
     if format == OutputFormat::Human {
         Ok(human(if removed && local_only {
             "WARNING: local OpenAI credentials removed without remote revocation.\n"
@@ -514,7 +513,12 @@ fn logout_at(
         }))
     } else {
         render_exec_response(
-            json!({"provider":"openai","authenticated":false,"removed":removed,"local_only":local_only}),
+            Value::Object(Map::from_iter([
+                ("provider".into(), Value::from("openai")),
+                ("authenticated".into(), Value::from(false)),
+                ("removed".into(), Value::from(removed)),
+                ("local_only".into(), Value::from(local_only)),
+            ])),
             format,
         )
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
@@ -549,34 +553,84 @@ fn render_status(
             None => human("OpenAI: not authenticated with ChatGPT.\n"),
         });
     }
-    let value = json!({
-        "provider": "openai",
-        "authenticated": record.is_some(),
-        "account": record.as_ref().map(|record| json!({
-            "id": record.account_id,
-            "email": record.email,
-            "plan_type": record.plan_type,
-        })),
+    let authenticated = record.is_some();
+    let account = record.as_ref().map(|record| {
+        Value::Object(Map::from_iter([
+            ("id".into(), Value::from(record.account_id.as_deref())),
+            ("email".into(), Value::from(record.email.as_deref())),
+            ("plan_type".into(), Value::from(record.plan_type.as_deref())),
+        ]))
     });
+    let value = Value::Object(Map::from_iter([
+        ("provider".into(), Value::from("openai")),
+        ("authenticated".into(), Value::from(authenticated)),
+        ("account".into(), Value::from(account)),
+    ]));
     render_exec_response(value, format)
         .map_err(|error| AuthError::invalid("output_failed", error.to_string()))
+}
+
+pub(super) fn has_credentials(storage: &CredentialStorage) -> Result<bool, AuthError> {
+    BackendCredentialStore::new(storage)
+        .load()
+        .map(|record| record.is_some())
 }
 
 pub(crate) fn access_token(
     storage: &CredentialStorage,
     deadline: Instant,
 ) -> Result<TokenRecord, AuthError> {
-    let store = BackendCredentialStore::new(storage);
-    let mut record = store.load()?.ok_or_else(|| {
+    access_token_from_store(&BackendCredentialStore::new(storage), deadline, None)
+}
+
+pub(crate) fn access_token_cancellable(
+    storage: &CredentialStorage,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<TokenRecord, AuthError> {
+    access_token_from_store(
+        &BackendCredentialStore::new(storage),
+        deadline,
+        Some(cancellation),
+    )
+}
+
+fn check_auth_cancellation(cancellation: Option<&CancellationToken>) -> Result<(), AuthError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(AuthError {
+            code: "openai_auth_cancelled",
+            detail: "OpenAI authentication cancelled before refresh issuance".into(),
+            kind: ClientErrorKind::Cancelled,
+        });
+    }
+    Ok(())
+}
+
+fn load_for_auth(
+    store: &dyn CredentialStore,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<TokenRecord>, AuthError> {
+    check_auth_cancellation(cancellation)?;
+    let record = store.load();
+    check_auth_cancellation(cancellation)?;
+    record
+}
+
+fn access_token_from_store(
+    store: &dyn CredentialStore,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<TokenRecord, AuthError> {
+    let mut record = load_for_auth(store, cancellation)?.ok_or_else(|| {
         AuthError::invalid(
             "openai_auth_required",
             "run `kit auth login openai` before using openai-subscription",
         )
     })?;
     if !valid_generation(&record.generation) {
-        let _thread = refresh_guard(deadline)?;
-        let _process = process_lock(deadline)?;
-        record = store.load()?.ok_or_else(|| {
+        let _thread = refresh_guard(&REFRESH_LOCK, deadline, cancellation)?;
+        let _process = process_lock_scoped(deadline, store.lock_scope(), cancellation)?;
+        record = load_for_auth(store, cancellation)?.ok_or_else(|| {
             AuthError::invalid(
                 "openai_auth_required",
                 "OpenAI subscription credentials are missing",
@@ -584,10 +638,11 @@ pub(crate) fn access_token(
         })?;
         if !valid_generation(&record.generation) {
             record.generation = random_urlsafe::<32>()?;
+            check_auth_cancellation(cancellation)?;
             store.save(&record)?;
         }
     }
-    refresh_if_needed(&store, record, deadline)
+    refresh_if_needed(store, record, deadline, cancellation)
 }
 
 pub(crate) fn refresh_after_unauthorized(
@@ -596,18 +651,25 @@ pub(crate) fn refresh_after_unauthorized(
     deadline: Instant,
 ) -> Result<TokenRecord, AuthError> {
     let store = BackendCredentialStore::new(storage);
-    refresh_locked(&store, deadline, Some(rejected_access_token), TOKEN_URL)
+    refresh_locked(
+        &store,
+        deadline,
+        Some(rejected_access_token),
+        TOKEN_URL,
+        None,
+    )
 }
 
 fn refresh_if_needed(
     store: &dyn CredentialStore,
     record: TokenRecord,
     deadline: Instant,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
     if record.expires_at > unix_seconds() + REFRESH_WINDOW_SECONDS {
         Ok(record)
     } else {
-        refresh_locked(store, deadline, None, TOKEN_URL)
+        refresh_locked(store, deadline, None, TOKEN_URL, cancellation)
     }
 }
 
@@ -616,17 +678,37 @@ fn refresh_locked(
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
-    let _thread = refresh_guard(deadline)?;
-    let _process = process_lock(deadline)?;
-    refresh_current(store, deadline, rejected_access_token, token_url)
+    let _thread = refresh_guard(&REFRESH_LOCK, deadline, cancellation)?;
+    let _process = process_lock_scoped(deadline, store.lock_scope(), cancellation)?;
+    refresh_current(
+        store,
+        deadline,
+        rejected_access_token,
+        token_url,
+        cancellation,
+    )
 }
 
-fn refresh_guard(deadline: Instant) -> Result<std::sync::MutexGuard<'static, ()>, AuthError> {
+fn refresh_guard<'a>(
+    lock: &'a Mutex<()>,
+    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::sync::MutexGuard<'a, ()>, AuthError> {
     loop {
-        match REFRESH_LOCK.try_lock() {
+        check_auth_cancellation(cancellation)?;
+        match lock.try_lock() {
             Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            // This guard also covers backend calls and remote token rotation.
+            // After unwind, the unit value says nothing about whether those
+            // external effects committed; do not silently resume refreshing.
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(AuthError::unavailable(
+                    "credential_refresh_poisoned",
+                    "credential refresh state is unavailable after a panic; restart Kit",
+                ));
+            }
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -644,18 +726,30 @@ fn refresh_current(
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
-    refresh_current_at(store, deadline, rejected_access_token, token_url, JWKS_URL)
+    refresh_with_signing_keys(
+        store,
+        deadline,
+        rejected_access_token,
+        token_url,
+        &SigningKeys {
+            cache: &JWKS_CACHE,
+            source: &OpenAiSigningKeys,
+        },
+        cancellation,
+    )
 }
 
-fn refresh_current_at(
+fn refresh_with_signing_keys(
     store: &dyn CredentialStore,
     deadline: Instant,
     rejected_access_token: Option<&str>,
     token_url: &str,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<TokenRecord, AuthError> {
-    let current = store.load()?.ok_or_else(|| {
+    let current = load_for_auth(store, cancellation)?.ok_or_else(|| {
         AuthError::invalid(
             "openai_auth_required",
             "OpenAI subscription credentials are missing",
@@ -669,6 +763,9 @@ fn refresh_current_at(
         return Ok(current);
     }
     let client = http_client(deadline)?;
+    // Crossing this check commits to finishing validation/save under the lease.
+    // Cancellation racing after it is an in-flight owned transaction, not abort.
+    check_auth_cancellation(cancellation)?;
     let response = client
         .post(token_url)
         .form(&[
@@ -694,7 +791,7 @@ fn refresh_current_at(
             "token endpoint returned malformed JSON",
         )
     })?;
-    let next = token_record(response, None, Some(&current), deadline, jwks_url)?;
+    let next = token_record(response, None, Some(&current), deadline, signing_keys)?;
     store.save(&next)?;
     Ok(next)
 }
@@ -707,25 +804,28 @@ fn exchange_code(
     deadline: Instant,
     token_url: &str,
 ) -> Result<TokenRecord, AuthError> {
-    exchange_code_at(
+    exchange_with_signing_keys(
         code,
         redirect_uri,
         verifier,
         nonce,
         deadline,
         token_url,
-        JWKS_URL,
+        &SigningKeys {
+            cache: &JWKS_CACHE,
+            source: &OpenAiSigningKeys,
+        },
     )
 }
 
-fn exchange_code_at(
+fn exchange_with_signing_keys(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
     nonce: &str,
     deadline: Instant,
     token_url: &str,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<TokenRecord, AuthError> {
     if !matches!(
         redirect_uri,
@@ -763,7 +863,7 @@ fn exchange_code_at(
             "token endpoint returned malformed JSON",
         )
     })?;
-    token_record(response, Some(nonce), None, deadline, jwks_url)
+    token_record(response, Some(nonce), None, deadline, signing_keys)
 }
 
 fn token_record(
@@ -771,7 +871,7 @@ fn token_record(
     nonce: Option<&str>,
     previous: Option<&TokenRecord>,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<TokenRecord, AuthError> {
     if response.access_token.is_empty()
         || response
@@ -789,12 +889,12 @@ fn token_record(
         "https://api.openai.com/v1",
         None,
         deadline,
-        jwks_url,
+        signing_keys,
     )?;
     let access_account = extract_account_id(&access_claims)?;
     let (id_token, id_claims) = match response.id_token.take() {
         Some(id_token) => {
-            let claims = verify_claims(&id_token, CLIENT_ID, nonce, deadline, jwks_url)?;
+            let claims = verify_claims(&id_token, CLIENT_ID, nonce, deadline, signing_keys)?;
             (id_token, Some(claims))
         }
         None if nonce.is_some() => {
@@ -893,7 +993,7 @@ fn verify_claims(
     audience: &str,
     nonce: Option<&str>,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<JwtClaims, AuthError> {
     if token.len() > MAX_CREDENTIAL_BYTES {
         return Err(AuthError::invalid("token_invalid", "JWT exceeds 64 KiB"));
@@ -910,7 +1010,7 @@ fn verify_claims(
         .kid
         .filter(|value| !value.is_empty() && value.len() <= 256 && value.is_ascii())
         .ok_or_else(|| AuthError::invalid("token_invalid", "JWT omitted a valid key ID"))?;
-    let key = verification_key(&kid, deadline, jwks_url)?;
+    let key = verification_key(&kid, deadline, signing_keys)?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.leeway = CLOCK_SKEW_SECONDS as u64;
     validation.validate_nbf = true;
@@ -1001,10 +1101,10 @@ fn valid_email(value: &str) -> bool {
 fn verification_key(
     kid: &str,
     deadline: Instant,
-    jwks_url: &str,
+    signing_keys: &SigningKeys<'_>,
 ) -> Result<DecodingKey, AuthError> {
     for refresh in [false, true] {
-        let keys = jwks(deadline, jwks_url, refresh)?;
+        let keys = signing_keys.load(deadline, refresh)?;
         if let Some(jwk) = keys.find(kid) {
             if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256)
                 || !matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
@@ -1034,33 +1134,62 @@ fn verification_key(
     ))
 }
 
-fn jwks(deadline: Instant, jwks_url: &str, refresh: bool) -> Result<JwkSet, AuthError> {
-    if !cfg!(test) && jwks_url != JWKS_URL {
-        return Err(AuthError::invalid(
-            "jwks_invalid",
-            "only the pinned OpenAI JWKS endpoint is permitted",
-        ));
-    }
-    if !refresh {
-        let cache = JWKS_CACHE.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(cached) = cache.get(jwks_url)
-            && cached.fetched_at.elapsed() < JWKS_TTL
-        {
-            return Ok(cached.keys.clone());
+/// Fetches issuer-trusted JWKS documents from an external source.
+trait SigningKeySource {
+    fn fetch(&self, deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError>;
+}
+
+struct OpenAiSigningKeys;
+
+impl SigningKeySource for OpenAiSigningKeys {
+    fn fetch(&self, deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+        let response = http_client(deadline)?
+            .get(JWKS_URL)
+            .send()
+            .map_err(|_| AuthError::unavailable("jwks_fetch_failed", "JWKS fetch failed"))?;
+        if !response.status().is_success() {
+            return Err(AuthError::unavailable(
+                "jwks_fetch_failed",
+                "JWKS endpoint rejected the request",
+            ));
         }
+        bounded_body(response)
     }
-    let response = http_client(deadline)?
-        .get(jwks_url)
-        .send()
-        .map_err(|_| AuthError::unavailable("jwks_fetch_failed", "JWKS fetch failed"))?;
-    if !response.status().is_success() {
-        return Err(AuthError::unavailable(
-            "jwks_fetch_failed",
-            "JWKS endpoint rejected the request",
-        ));
+}
+
+struct SigningKeys<'a> {
+    cache: &'a Mutex<HashMap<String, CachedJwks>>,
+    source: &'a dyn SigningKeySource,
+}
+
+impl SigningKeys<'_> {
+    fn load(&self, deadline: Instant, refresh: bool) -> Result<JwkSet, AuthError> {
+        if !refresh {
+            let cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = cache.get(JWKS_URL)
+                && cached.fetched_at.elapsed() < JWKS_TTL
+            {
+                return Ok(cached.keys.clone());
+            }
+        }
+        let body = self.source.fetch(deadline)?;
+        let keys = parse_jwks(body.as_slice())?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                JWKS_URL.to_owned(),
+                CachedJwks {
+                    fetched_at: Instant::now(),
+                    keys: keys.clone(),
+                },
+            );
+        Ok(keys)
     }
-    let body = bounded_body(response)?;
-    let keys: JwkSet = serde_json::from_slice(body.as_slice())
+}
+
+fn parse_jwks(body: &[u8]) -> Result<JwkSet, AuthError> {
+    let keys: JwkSet = serde_json::from_slice(body)
         .map_err(|_| AuthError::invalid("jwks_invalid", "JWKS response is malformed"))?;
     if keys.keys.is_empty() || keys.keys.len() > 64 {
         return Err(AuthError::invalid(
@@ -1079,16 +1208,6 @@ fn jwks(deadline: Instant, jwks_url: &str, refresh: bool) -> Result<JwkSet, Auth
             ));
         }
     }
-    JWKS_CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            jwks_url.to_owned(),
-            CachedJwks {
-                fetched_at: Instant::now(),
-                keys: keys.clone(),
-            },
-        );
     Ok(keys)
 }
 
@@ -1270,8 +1389,8 @@ fn bind_callback() -> Result<TcpListener, AuthError> {
 }
 
 fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) -> String {
-    let mut url = url::Url::parse("https://auth.openai.com/oauth/authorize").expect("fixed URL");
-    url.query_pairs_mut()
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", redirect_uri)
@@ -1286,7 +1405,7 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str, nonce: &str) 
         .append_pair("state", state)
         .append_pair("nonce", nonce)
         .append_pair("originator", "kit");
-    url.into()
+    format!("https://auth.openai.com/oauth/authorize?{}", query.finish())
 }
 
 fn http_client(deadline: Instant) -> Result<reqwest::blocking::Client, AuthError> {
@@ -1363,97 +1482,72 @@ fn revoke_at(record: &TokenRecord, deadline: Instant, revoke_url: &str) -> Resul
     }
 }
 
-struct ProcessLock(fs::File);
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
+// No explicit unlock in Drop: queued credential mutations retain this real lease.
+struct ProcessLock {
+    _lease: fs::Lease,
+    _scope: Option<std::sync::Arc<CredentialFilesystemScope>>,
 }
 
-fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
+fn process_lock_scoped(
+    deadline: Instant,
+    credential_scope: Option<&std::path::Path>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ProcessLock, AuthError> {
+    check_auth_cancellation(cancellation)?;
     let path = auth_lock_path()?;
-    let parent = path.parent().expect("auth lock path has a parent");
-    fs::create_dir_all(parent).map_err(|_| {
-        AuthError::unavailable("auth_lock_failed", "could not create the state directory")
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let metadata = fs::symlink_metadata(parent).map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not inspect the auth lock directory",
-            )
-        })?;
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(AuthError::unavailable(
-                "auth_lock_failed",
-                "the auth lock directory is not owned by the current OS user",
-            ));
-        }
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not secure the auth lock directory",
-            )
-        })?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(&path).map_err(|_| {
-        AuthError::unavailable("auth_lock_failed", "could not open the authentication lock")
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| {
-                AuthError::unavailable(
-                    "auth_lock_failed",
-                    "could not secure the authentication lock",
-                )
-            })?;
-        let metadata = file.metadata().map_err(|_| {
-            AuthError::unavailable(
-                "auth_lock_failed",
-                "could not inspect the authentication lock",
-            )
-        })?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o600
-        {
-            return Err(AuthError::unavailable(
-                "auth_lock_failed",
-                "the authentication lock is not a secure user-owned regular file",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return Err(AuthError::unavailable(
+    let parent = path.parent().ok_or_else(|| {
+        AuthError::unavailable(
             "auth_lock_failed",
-            "the authentication lock is not a regular file",
-        ));
+            "authentication lock path has no parent directory",
+        )
+    })?;
+    fs::create_private_dir_all(parent).map_err(|_| {
+        AuthError::unavailable(
+            "auth_lock_failed",
+            "could not create the private state directory",
+        )
+    })?;
+    // A filesystem store can live outside the OS lock directory. Its pending writes
+    // must retain this same cross-process refresh authority, not a memory mutex.
+    let scope = credential_scope.unwrap_or(parent);
+    if credential_scope.is_some() {
+        let directory = scope.parent().ok_or_else(|| {
+            AuthError::unavailable("auth_lock_failed", "credential path has no directory")
+        })?;
+        fs::create_private_dir_all(directory).map_err(|_| {
+            AuthError::unavailable(
+                "auth_lock_failed",
+                "could not prepare the credential directory",
+            )
+        })?;
     }
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(ProcessLock(file)),
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+        check_auth_cancellation(cancellation)?;
+        match fs::global().acquire_lease(&path, scope, fs::LeaseMode::ExistingOrNew) {
+            Ok(lease) => {
+                let scope = credential_scope
+                    .map(|path| CredentialFilesystemScope::register(&lease, path))
+                    .transpose()
+                    .map_err(|value| {
+                        AuthError::unavailable("auth_lock_failed", value.to_string())
+                    })?;
+                return Ok(ProcessLock {
+                    _lease: lease,
+                    _scope: scope,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(AuthError::timeout(
+                        "timed out waiting for the authentication lock",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Err(_) => {
-                return Err(AuthError::timeout(
-                    "timed out waiting for the authentication lock",
+                return Err(AuthError::unavailable(
+                    "auth_lock_failed",
+                    "could not acquire a secure real authentication lock; check disk space, quota, ownership and permissions",
                 ));
             }
         }
@@ -1554,7 +1648,11 @@ fn emit_auth_url(url: &str, format: OutputFormat) -> Result<(), AuthError> {
         OutputFormat::Json => format!("Open this URL to authenticate: {url}\n"),
         OutputFormat::Jsonl => format!(
             "{}\n",
-            json!({"type":"authorization_url","provider":"openai","url":url})
+            Value::Object(Map::from_iter([
+                ("type".into(), Value::from("authorization_url")),
+                ("provider".into(), Value::from("openai")),
+                ("url".into(), Value::from(url)),
+            ]))
         ),
     };
     let result = if format == OutputFormat::Json {
@@ -1653,9 +1751,53 @@ fn human(stdout: impl Into<String>) -> Output {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+pub(crate) mod test_support {
+    use super::TokenRecord;
+
+    pub(crate) fn token_record(
+        access_token: &str,
+        account_id: &str,
+        generation: &str,
+    ) -> TokenRecord {
+        TokenRecord {
+            access_token: access_token.to_owned(),
+            refresh_token: "test-refresh-token".to_owned(),
+            id_token: "test-id-token".to_owned(),
+            expires_at: i64::MAX,
+            account_id: Some(account_id.to_owned()),
+            email: None,
+            plan_type: None,
+            generation: generation.to_owned(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
+
+    fn process_lock(deadline: Instant) -> Result<ProcessLock, AuthError> {
+        process_lock_scoped(deadline, None, None)
+    }
+
     use jsonwebtoken::{EncodingKey, Header, encode, jwk::Jwk};
+    use serde_json::json;
 
     const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC3UQBTeVjOtSY4\nHaZHjSpQPlIIUXSiIq+WRInLoWwYEXmloR41HMmwsCQVV1WFZ7z0wUj14vD3/Bl6\nJG2JTU8ur+RvJojm1gXxg/etp4DG2HVtXong4QE7BKqJufHITMVuEhojkTulHIbW\nXfQQjaxQpGsOIuWcRz3YVB7zpAL7yoeHhvFd7RV+IqG9i4fjN4pzlCTv/TQig+s7\n539MsNx1ZakBfeBhx62JUPhFe6pXdPS2hXVUiTQRPMBm3GimDzyuA3WkVKzPyNMB\n2h+BALRFLslqPaFpul7NIifX36KgUPaimntpvFRxahqyDvJ9ATtq6oMeHaRUMZf5\nkRxjLIXLAgMBAAECggEAAIIV+SVDTMINyrwHo6J4NTlnACTm/jK7FTSNbpC8/E1t\nbpBwGqpAw4pJdKcFqAADSGkSFbRnrJhN+HEKE1uxK3+gp3o43kLw80bFX1Lb4DE7\nahkyp/qXsUfbB9S0dIoEm2srbWElWYN8ZYhkeSNGEKx+q3mx9JPx+kaJa2159flh\nis34maBeEr97gwjAvMjLbdVEpoaEIRC/hmem2ckT5jsDd4HS7RKNXwk/S8O7/PQW\n42xKAvL0APk5J53CDoW4DT78y7t4Rj/dVeRZAhdjDUFP+idZ1r9k6PM8vs5tl1P0\njzcOMzUBFmhnb5MKFvBLc4MKJQYzTT06/qdfAV0M2QKBgQDsoUF+pNQuERUKCI9T\nZey7rFgsbBkK2t0XvgpLwwMbF548HgL+QJhAAONaLe5+2GlZSgb5OgoYYspiuzQT\noz2mqeN2MSMnUtntyUt+Y6IzPEEPg6bVGdoCP3FSvz1L/JDJuJq4cqb3OGPe4yEt\nZDymqUJCDTO52vT0GLdZ6S70twKBgQDGUoYrbButBHX5nwE5XnrjgENGT4RauI76\nQ158MuFmRmpgaWlc37ByVyzMG7x9qxcad4Ry19hsG5KYnL/PNs31a2i/BdfLZyFF\nY0dfNExz6tKf4PWxZhhFhX94f7qseSzXLx8eMQqdds4WQsA13JI9qQJ0pVSNyb/V\nXM/n9XMrjQKBgDsKgSz4M3jLClTWjexhIhAxkE6FKjprIX8rC6abocrAudqGInkN\n5O8TSabWjwtXM/HzZooI0TwEajr4OqYrtNZAzWBQIlVNdtK9xvhiI7Zk8lbMonPJ\nX3vwGHZtAP5Upkuuo+whr0c/6qtSQJTyza9HzCBu6tkUqMm+4QCuDelBAoGAax8S\nF4w6WrcJHj7Tg3BUAmQ6clTrEbGUkPsoov88nmi0dsUZQzAT93681La6lkp+nS4n\nXXzXCnXONh6cwElC8CgHGP8H83cOEpOwbm0qSoZxJCh3rU2PGKYmFyku5JBDNyvd\nrAojSLBuWrnNZopwd1u91tGinT93HcEXD5yVi9UCgYBq1sjl5jlliyHzPWMeV3dn\nkJWDLMpCwrpmQzrhkA02PaZO1BB7QgZeIKTYkzECHT44wHflalVOEEsVZpEn2Ivd\nJz6j2JwX7Ke23MA0MDaV6+7syAwPKx3+pOGwdun2uZNgvS74IWeBEfdMhGrGncX0\nQegKxe+skNhLjXJ5SUTdZg==\n-----END PRIVATE KEY-----\n";
 
@@ -1681,6 +1823,235 @@ mod tests {
         fn delete(&self) -> Result<bool, AuthError> {
             Ok(self.0.lock().unwrap().take().is_some())
         }
+    }
+
+    #[test]
+    fn cancellation_after_blocked_read_prevents_refresh_request_and_save() {
+        struct Store {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl CredentialStore for Store {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                let mut record =
+                    super::test_support::token_record("old", "account-one", "generation-one");
+                record.expires_at = 0;
+                Ok(Some(record))
+            }
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                panic!("cancelled pretransaction saved credentials")
+            }
+            fn delete(&self) -> Result<bool, AuthError> {
+                panic!("unexpected delete")
+            }
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            let store = Store {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            };
+            let keys = SigningKeyFixture::new(vec![]);
+            refresh_with_signing_keys(
+                &store,
+                Instant::now() + Duration::from_millis(500),
+                None,
+                &url,
+                &keys.signing_keys(),
+                Some(&worker_token),
+            )
+            .unwrap_err()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+        let error = worker.join().unwrap();
+        assert_eq!(error.code, "openai_auth_cancelled");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_refresh_lock_retry_before_deadline() {
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let held = lock.lock().unwrap();
+        let worker_lock = lock.clone();
+        let cancellation = CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            refresh_guard(
+                &worker_lock,
+                Instant::now() + Duration::from_millis(500),
+                Some(&worker_token),
+            )
+            .unwrap_err()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        cancellation.cancel();
+        let error = worker.join().unwrap();
+        drop(held);
+        assert_eq!(error.code, "openai_auth_cancelled");
+    }
+
+    #[test]
+    fn cancellation_after_refresh_issuance_preserves_validated_save() {
+        let kid = "cancel-refresh";
+        let store = MemoryStore::default();
+        let mut old = super::test_support::token_record("old", "account-one", "generation-one");
+        old.id_token = jwt(CLIENT_ID, None, kid, -3600, None);
+        old.expires_at = 0;
+        store.save(&old).unwrap();
+        let body = json!({"access_token": jwt("https://api.openai.com/v1", None, kid, 3600, None), "refresh_token":"rotated-refresh", "expires_in":3600,"token_type":"Bearer"}).to_string();
+        let cancellation = CancellationToken::new();
+        let server_token = cancellation.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            // Remote issuance already happened: cancellation must not discard
+            // this validated response or the token rotation it represents.
+            server_token.cancel();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let keys = SigningKeyFixture::new(vec![test_jwks(kid)]);
+        let result = refresh_with_signing_keys(
+            &store,
+            Instant::now() + Duration::from_secs(3),
+            None,
+            &url,
+            &keys.signing_keys(),
+            Some(&cancellation),
+        );
+        server.join().unwrap();
+        assert!(cancellation.is_cancelled());
+        let result = result.unwrap();
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.refresh_token, "rotated-refresh");
+        assert_eq!(saved.access_token(), result.access_token());
+    }
+
+    #[test]
+    fn dropped_auth_waiter_does_not_make_blocking_backend_quiescent() {
+        // Startup cancellation can drop an async waiter, but must not claim that
+        // credential work has stopped or abandon runtime ownership of it.
+        struct BlockingStore {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl CredentialStore for BlockingStore {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                // No token means refresh returns before any HTTP or signing-key
+                // lookup; this fake never reads or writes actual credentials.
+                Ok(None)
+            }
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                panic!("missing fake credentials cannot be saved");
+            }
+            fn delete(&self) -> Result<bool, AuthError> {
+                panic!("refresh cannot delete fake credentials");
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let waiter = tokio::task::spawn_blocking(move || {
+                    let store = BlockingStore {
+                        entered: entered_tx,
+                        release: Mutex::new(release_rx),
+                    };
+                    assert!(
+                        refresh_current(
+                            &store,
+                            Instant::now() + Duration::from_secs(3),
+                            None,
+                            "http://127.0.0.1:1/unused",
+                            None
+                        )
+                        .is_err()
+                    );
+                });
+                drop(waiter);
+            });
+            // Match main's ownership: do not use shutdown_timeout to abandon a
+            // blocking refresh that may need to persist a rotated token.
+            drop(runtime);
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let exited_while_blocked = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(!exited_while_blocked);
+    }
+
+    #[test]
+    fn refresh_guard_rejects_backend_unwind_without_retrying() {
+        struct PanickingStore(std::sync::atomic::AtomicUsize);
+
+        impl CredentialStore for PanickingStore {
+            fn load(&self) -> Result<Option<TokenRecord>, AuthError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("credential backend panicked");
+            }
+
+            fn save(&self, _: &TokenRecord) -> Result<(), AuthError> {
+                unreachable!()
+            }
+
+            fn delete(&self) -> Result<bool, AuthError> {
+                unreachable!()
+            }
+        }
+
+        // Isolate the coordinator so this test cannot poison other auth tests.
+        let lock = Mutex::new(());
+        let store = PanickingStore(std::sync::atomic::AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let attempt = || {
+            let _guard = refresh_guard(&lock, deadline, None)?;
+            store.load()
+        };
+        assert!(std::panic::catch_unwind(attempt).is_err());
+        assert!(lock.is_poisoned());
+        assert_eq!(attempt().unwrap_err().code, "credential_refresh_poisoned");
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     struct FailingStore;
@@ -1804,32 +2175,36 @@ mod tests {
         (format!("http://{address}/oauth/token"), handle)
     }
 
-    fn serve_jwks(bodies: Vec<String>) -> (String, std::thread::JoinHandle<usize>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let count = bodies.len();
-        let handle = std::thread::spawn(move || {
-            for body in bodies {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 1024];
-                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    let read = stream.read(&mut chunk).unwrap();
-                    request.extend_from_slice(&chunk[..read]);
-                }
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                )
-                .unwrap();
+    struct SigningKeyFixture {
+        bodies: Mutex<std::collections::VecDeque<String>>,
+        cache: Mutex<HashMap<String, CachedJwks>>,
+    }
+
+    impl SigningKeyFixture {
+        fn new(bodies: Vec<String>) -> Self {
+            Self {
+                bodies: Mutex::new(bodies.into()),
+                cache: Mutex::new(HashMap::new()),
             }
-            count
-        });
-        (format!("http://{address}/.well-known/jwks.json"), handle)
+        }
+
+        fn signing_keys(&self) -> SigningKeys<'_> {
+            SigningKeys {
+                cache: &self.cache,
+                source: self,
+            }
+        }
+    }
+
+    impl SigningKeySource for SigningKeyFixture {
+        fn fetch(&self, _deadline: Instant) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|body| Zeroizing::new(body.into_bytes()))
+                .ok_or_else(|| AuthError::unavailable("jwks_fetch_failed", "fixture is offline"))
+        }
     }
 
     #[test]
@@ -1867,6 +2242,34 @@ mod tests {
         assert!(secrets.verifier.is_empty());
         assert!(secrets.state.is_empty());
         assert!(secrets.nonce.is_empty());
+    }
+
+    #[test]
+    fn status_json_preserves_nulls_and_omits_credentials() {
+        for format in [OutputFormat::Json, OutputFormat::Jsonl] {
+            let output = render_status(None, format, false).unwrap();
+            let value: Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "provider": "openai", "authenticated": false, "account": null,
+                })
+            );
+
+            let mut record = test_support::token_record("ACCESS_CANARY", "account-1", "generation");
+            record.email = Some("user@example.com".into());
+            let output = render_status(Some(record), format, true).unwrap();
+            let value: Value = serde_json::from_str(&output.stdout).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "provider": "openai",
+                    "authenticated": true,
+                    "account": {"id": "account-1", "email": "user@example.com", "plan_type": null},
+                })
+            );
+            assert!(!output.stdout.contains("CANARY"));
+        }
     }
 
     #[test]
@@ -1917,7 +2320,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
         let store = BackendCredentialStore::new(&storage);
-        let record = TokenRecord::for_test("access", "account");
+        let record = test_support::token_record("access", "account", "test-account");
 
         store.save(&record).unwrap();
         let loaded = store.load().unwrap().unwrap();
@@ -1951,23 +2354,23 @@ mod tests {
         })
         .to_string();
         let (token_url, server) = serve_once(body);
-        let (jwks_url, jwks_server) = serve_once(test_jwks(kid));
-        let jwks_url = jwks_url.replace("/oauth/token", "/.well-known/jwks.json");
+        let signing_keys = std::sync::Arc::new(SigningKeyFixture::new(vec![test_jwks(kid)]));
         let mut workers = Vec::new();
         for _ in 0..8 {
             let store = std::sync::Arc::clone(&store);
             let token_url = token_url.clone();
-            let jwks_url = jwks_url.clone();
+            let signing_keys = std::sync::Arc::clone(&signing_keys);
             workers.push(std::thread::spawn(move || {
                 let _guard = REFRESH_LOCK
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                refresh_current_at(
+                refresh_with_signing_keys(
                     store.as_ref(),
                     Instant::now() + Duration::from_secs(5),
                     Some("rejected-access-token"),
                     &token_url,
-                    &jwks_url,
+                    &signing_keys.signing_keys(),
+                    None,
                 )
                 .unwrap()
                 .access_token()
@@ -1984,7 +2387,6 @@ mod tests {
         assert_eq!(refreshed.account_id.as_deref(), Some("account-one"));
         assert_eq!(refreshed.id_token, old_id_token);
         let request = server.join().unwrap();
-        jwks_server.join().unwrap();
         assert!(request.starts_with("POST /oauth/token HTTP/1.1\r\n"));
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("grant_type=refresh_token"));
@@ -1996,6 +2398,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             Some(tokens[0].as_str()),
             "http://127.0.0.1:1/oauth/token",
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "openai_auth_required");
@@ -2013,19 +2416,18 @@ mod tests {
         })
         .to_string();
         let (token_url, token_server) = serve_once(body);
-        let (jwks_url, jwks_server) = serve_once(test_jwks(kid));
-        let record = exchange_code_at(
+        let signing_keys = SigningKeyFixture::new(vec![test_jwks(kid)]);
+        let record = exchange_with_signing_keys(
             "authorization-code",
             "http://localhost:1455/auth/callback",
             "pkce-verifier",
             "expected-nonce",
             Instant::now() + Duration::from_secs(5),
             &token_url,
-            &jwks_url.replace("/oauth/token", "/.well-known/jwks.json"),
+            &signing_keys.signing_keys(),
         )
         .unwrap();
         let request = token_server.join().unwrap();
-        jwks_server.join().unwrap();
         assert!(request.contains("content-type: application/x-www-form-urlencoded"));
         assert!(request.contains("grant_type=authorization_code"));
         assert!(request.contains("code=authorization-code"));
@@ -2048,22 +2450,37 @@ mod tests {
 
     #[test]
     fn signed_jwt_rejects_bad_signatures_and_refreshes_unknown_kid_once() {
-        JWKS_CACHE.lock().unwrap().clear();
         let token = jwt("https://api.openai.com/v1", None, "rotated-key", 3600, None);
-        let (jwks_url, server) = serve_jwks(vec![test_jwks("old-key"), test_jwks("rotated-key")]);
+        let signing_keys =
+            SigningKeyFixture::new(vec![test_jwks("old-key"), test_jwks("rotated-key")]);
         let claims = verify_claims(
             &token,
             "https://api.openai.com/v1",
             None,
             Instant::now() + Duration::from_secs(5),
-            &jwks_url,
+            &signing_keys.signing_keys(),
         )
         .unwrap();
         assert_eq!(
             extract_account_id(&claims).unwrap().as_deref(),
             Some("account-one")
         );
-        assert_eq!(server.join().unwrap(), 2);
+        // The refresh must replace, not merge, the cached set. With the source
+        // now offline, another successful verification must use the published keys.
+        let cached = signing_keys
+            .signing_keys()
+            .load(Instant::now() + Duration::from_secs(1), false)
+            .unwrap();
+        assert!(cached.find("rotated-key").is_some());
+        assert!(cached.find("old-key").is_none());
+        verify_claims(
+            &token,
+            "https://api.openai.com/v1",
+            None,
+            Instant::now() + Duration::from_secs(1),
+            &signing_keys.signing_keys(),
+        )
+        .unwrap();
 
         let mut bad = token.into_bytes();
         let signature = bad.iter().rposition(|byte| *byte == b'.').unwrap() + 1;
@@ -2074,7 +2491,7 @@ mod tests {
             "https://api.openai.com/v1",
             None,
             Instant::now() + Duration::from_secs(1),
-            &jwks_url,
+            &signing_keys.signing_keys(),
         )
         .err()
         .unwrap();
@@ -2101,7 +2518,7 @@ mod tests {
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(1),
-                &jwks_url,
+                &signing_keys.signing_keys(),
             )
             .is_err()
         );
@@ -2116,10 +2533,46 @@ mod tests {
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(1),
-                &jwks_url,
+                &signing_keys.signing_keys(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unknown_signing_key_stops_after_one_refresh() {
+        let keys = SigningKeyFixture::new(vec![test_jwks("old-key"), test_jwks("other-key")]);
+        let error = verification_key(
+            "missing-key",
+            Instant::now() + Duration::from_secs(1),
+            &keys.signing_keys(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "token_invalid");
+        let cached = keys
+            .signing_keys()
+            .load(Instant::now() + Duration::from_secs(1), false)
+            .unwrap();
+        assert!(cached.find("other-key").is_some());
+        assert!(cached.find("old-key").is_none());
+    }
+
+    #[test]
+    fn jwks_parser_rejects_malformed_empty_oversized_and_duplicate_keys() {
+        let key: Value = serde_json::from_str(&test_jwks("valid-key")).unwrap();
+        for body in [
+            "not json".to_owned(),
+            json!({"keys": []}).to_string(),
+            json!({"keys": vec![key["keys"][0].clone(); 65]}).to_string(),
+            json!({"keys": [key["keys"][0].clone(), key["keys"][0].clone()]}).to_string(),
+            test_jwks(""),
+        ] {
+            assert_eq!(
+                parse_jwks(body.as_bytes()).unwrap_err().code,
+                "jwks_invalid"
+            );
+        }
     }
 
     #[test]
@@ -2133,16 +2586,15 @@ mod tests {
                 3600,
                 Some(not_before_in),
             );
-            let (jwks_url, server) = serve_once(test_jwks(&kid));
+            let signing_keys = SigningKeyFixture::new(vec![test_jwks(&kid)]);
             let result = verify_claims(
                 &token,
                 "https://api.openai.com/v1",
                 None,
                 Instant::now() + Duration::from_secs(5),
-                &jwks_url.replace("/oauth/token", "/.well-known/jwks.json"),
+                &signing_keys.signing_keys(),
             );
             assert_eq!(result.is_ok(), accepted);
-            server.join().unwrap();
         }
     }
 

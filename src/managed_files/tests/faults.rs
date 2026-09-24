@@ -1,0 +1,273 @@
+//! Faults at the existing filesystem backend boundary, isolated per process.
+use super::*;
+use crate::resilient_fs::{
+    Backend, BackendFile, BackendLease, DiskBackend, DiskEntry, DiskOpenOptions, FileIdentity, Fs,
+    LeaseRequest,
+};
+use std::{
+    io::{self, Read, Seek, SeekFrom, Write},
+    sync::Arc,
+};
+
+const MANIFEST_ENV: &str = "KIT_MANAGED_FILES_FAULT_TEST_MANIFEST";
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum Mode {
+    Write,
+    Sync,
+    NoSpace,
+}
+impl Mode {
+    fn expected_error(self) -> String {
+        match self {
+            Self::Write => "injected managed object write failure".into(),
+            Self::Sync => "injected managed object sync failure".into(),
+            Self::NoSpace => io::Error::from_raw_os_error(libc::ENOSPC).to_string(),
+        }
+    }
+}
+
+struct FaultBackend {
+    mode: Mode,
+    object_directory: PathBuf,
+}
+struct FaultFile {
+    disk: Box<dyn BackendFile>,
+    mode: Mode,
+}
+
+// No mutable fault switches or counters: every process owns one fixed policy.
+impl Read for FaultFile {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.disk.read(bytes)
+    }
+}
+impl Seek for FaultFile {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.disk.seek(from)
+    }
+}
+impl Write for FaultFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.mode {
+            Mode::Write => Err(io::Error::other(self.mode.expected_error())),
+            Mode::NoSpace => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+            Mode::Sync => self.disk.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.disk.flush()
+    }
+}
+impl FaultFile {
+    fn check_sync(&self) -> io::Result<()> {
+        // Permit empty-object creation; fail durability only after native data
+        // exists. Directory syncs and all non-object files remain real.
+        if matches!(self.mode, Mode::Sync) && self.disk.metadata()?.len() > 0 {
+            return Err(io::Error::other(self.mode.expected_error()));
+        }
+        Ok(())
+    }
+}
+impl BackendFile for FaultFile {
+    fn metadata(&self) -> io::Result<disk::Metadata> {
+        self.disk.metadata()
+    }
+    fn identity(&self) -> io::Result<Option<FileIdentity>> {
+        self.disk.identity()
+    }
+    fn set_len(&self, size: u64) -> io::Result<()> {
+        self.disk.set_len(size)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        self.check_sync()?;
+        self.disk.sync_data()
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.check_sync()?;
+        self.disk.sync_all()
+    }
+    fn set_permissions(&self, p: disk::Permissions) -> io::Result<()> {
+        self.disk.set_permissions(p)
+    }
+}
+impl FaultBackend {
+    fn wrap(&self, path: &Path, disk: Box<dyn BackendFile>) -> Box<dyn BackendFile> {
+        // Fs persists objects through sibling atomic-replacement files, not by
+        // writing the final file_ basename. Scope faults to this session's file
+        // contents so staged writes are covered without faulting directory work.
+        if path.parent() == Some(self.object_directory.as_path()) {
+            Box::new(FaultFile {
+                disk,
+                mode: self.mode,
+            })
+        } else {
+            disk
+        }
+    }
+}
+impl Backend for FaultBackend {
+    fn open(&self, path: &Path, options: &DiskOpenOptions) -> io::Result<Box<dyn BackendFile>> {
+        Ok(self.wrap(path, DiskBackend.open(path, options)?))
+    }
+    fn metadata(&self, path: &Path, follow: bool) -> io::Result<disk::Metadata> {
+        DiskBackend.metadata(path, follow)
+    }
+    fn identity(&self, path: &Path, follow: bool) -> io::Result<Option<FileIdentity>> {
+        DiskBackend.identity(path, follow)
+    }
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<DiskEntry>> {
+        DiskBackend.read_dir(path)
+    }
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        DiskBackend.read_link(path)
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        DiskBackend.canonicalize(path)
+    }
+    fn create_dir(&self, path: &Path, private: bool) -> io::Result<()> {
+        DiskBackend.create_dir(path, private)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        DiskBackend.remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        DiskBackend.remove_dir(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        DiskBackend.rename(from, to)
+    }
+    fn set_permissions(&self, path: &Path, p: disk::Permissions) -> io::Result<()> {
+        DiskBackend.set_permissions(path, p)
+    }
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        DiskBackend.sync_directory(path)
+    }
+    fn acquire_lease(&self, request: &LeaseRequest) -> io::Result<Box<dyn BackendLease>> {
+        DiskBackend.acquire_lease(request)
+    }
+    fn open_beneath(&self, root: &Path, relative: &Path) -> io::Result<Box<dyn BackendFile>> {
+        Ok(self.wrap(
+            &root.join(relative),
+            DiskBackend.open_beneath(root, relative)?,
+        ))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    base: PathBuf,
+    source: PathBuf,
+    mode: Mode,
+    parent_pid: u32,
+}
+
+#[test]
+fn write_sync_and_pending_recovery_fail_without_publishing_a_descriptor() {
+    for mode in [Mode::Write, Mode::Sync, Mode::NoSpace] {
+        let f = Fixture::new();
+        let source = f.source("fault.png", ImageFormat::Png, 3, 2);
+        let manifest = Manifest {
+            base: f.store.base.clone(),
+            source,
+            mode,
+            parent_pid: std::process::id(),
+        };
+        let path = f.dir.path().join("fault-manifest.json");
+        disk::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "managed_files::tests::faults::fault_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(MANIFEST_ENV, &path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{mode:?} child failed: {}\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("managed_files::tests::faults::fault_child ... ok"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+        let error: String =
+            serde_json::from_slice(&disk::read(path.with_extension("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(error, mode.expected_error());
+    }
+}
+
+#[test]
+#[ignore = "invoked by the parent in an isolated process with one immutable fault mode"]
+fn fault_child() {
+    let path = PathBuf::from(std::env::var_os(MANIFEST_ENV).expect("fault manifest path"));
+    let manifest: Manifest = serde_json::from_slice(&disk::read(&path).unwrap()).unwrap();
+    assert_ne!(std::process::id(), manifest.parent_pid);
+    let store = FileStore {
+        base: manifest.base,
+    };
+    assert!(
+        fs::initialize_global(Fs::new(Arc::new(FaultBackend {
+            mode: manifest.mode,
+            object_directory: store.session_directory("session"),
+        })))
+        .is_ok(),
+        "filesystem must be initialized only in this child"
+    );
+    // Err is the publication contract: unreachable partial objects may remain,
+    // but the caller must never receive a FileReference after any barrier fails.
+    let error = store.import("session", &manifest.source, None).unwrap_err();
+    assert_eq!(error, manifest.mode.expected_error());
+    let directory = store.session_directory("session");
+    let object = disk::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("file_")
+        })
+        .expect("native managed object was created before the fault");
+    match manifest.mode {
+        Mode::Write => assert!(disk::read(&object).unwrap().is_empty()),
+        Mode::Sync => {
+            // The native payload was written before the injected sync error.
+            // Fs then abandons the unpublished replacement, retaining only the
+            // previously durable empty object, not unsynced payload contents.
+            assert!(disk::read(&object).unwrap().is_empty());
+        }
+        Mode::NoSpace => {
+            // Show that writes were accepted as a complete memory-backed envelope
+            // while native storage cannot retain it. This is real Fs behavior,
+            // not a callback asserting which implementation method was called.
+            let accepted = fs::read(&object).unwrap();
+            assert!(accepted.starts_with(MAGIC));
+            let header_len = u32::from_le_bytes(accepted[8..12].try_into().unwrap()) as usize;
+            let header: Header = serde_json::from_slice(&accepted[12..12 + header_len]).unwrap();
+            let payload = &accepted[12 + header_len..];
+            assert_eq!(payload, disk::read(&manifest.source).unwrap());
+            assert_eq!(payload.len() as u64, header.file.size_bytes);
+            assert_eq!(blake3::hash(payload).to_hex().as_str(), header.digest);
+            assert!(disk::metadata(&object).unwrap().len() < accepted.len() as u64);
+            assert!(fs::global().status().pending_operations > 0);
+            assert_eq!(
+                fs::require_disk(&object).unwrap_err().raw_os_error(),
+                Some(libc::ENOSPC)
+            );
+        }
+    }
+    disk::write(
+        path.with_extension("result.json"),
+        serde_json::to_vec(&error).unwrap(),
+    )
+    .unwrap();
+}

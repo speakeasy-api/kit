@@ -1,5 +1,7 @@
 mod auth;
 mod credentials;
+mod schema;
+pub use schema::ToolSchema;
 
 pub use crate::credentials::CredentialStorage;
 
@@ -8,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -27,7 +29,7 @@ use agentkit_tools_core::{
 use async_trait::async_trait;
 use rmcp::transport::auth::AuthorizationManager;
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 use tokio::sync::{
     Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, mpsc, oneshot,
 };
@@ -130,6 +132,7 @@ pub struct McpRuntime {
 }
 
 struct Inner {
+    healthy: Arc<AtomicBool>,
     manager: Mutex<McpServerManager>,
     catalog: CatalogReader,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
@@ -174,6 +177,8 @@ pub(crate) struct ConfigSource {
     path: PathBuf,
     required: bool,
     default_stdio_cwd: Option<PathBuf>,
+    // Immutable request configuration; never read from or written to disk.
+    session_bytes: Option<Arc<[u8]>>,
 }
 
 impl ConfigSource {
@@ -182,6 +187,7 @@ impl ConfigSource {
             path,
             required: true,
             default_stdio_cwd: None,
+            session_bytes: None,
         }
     }
 
@@ -190,6 +196,7 @@ impl ConfigSource {
             path,
             required: false,
             default_stdio_cwd: Some(cwd),
+            session_bytes: None,
         }
     }
 }
@@ -229,24 +236,94 @@ enum ServerStatus {
     Uninitialized,
     Connected,
     AuthenticationRequired,
-    Pending,
+    Pending(Arc<AuthFlowState>),
     Error(String),
 }
 
 impl ServerStatus {
-    const fn as_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Uninitialized => "available",
             Self::Connected => "authenticated",
             Self::AuthenticationRequired => "authentication_required",
-            Self::Pending => "pending",
+            Self::Pending(flow) if flow.abandoned.load(Ordering::Acquire) => "error",
+            Self::Pending(_) => "pending",
             Self::Error(_) => "error",
+        }
+    }
+}
+
+struct AuthFlowState {
+    abandoned: AtomicBool,
+}
+
+impl AuthFlowState {
+    fn new() -> Self {
+        Self {
+            abandoned: AtomicBool::new(false),
+        }
+    }
+    fn check(&self) -> Result<(), String> {
+        if self.abandoned.load(Ordering::Acquire) {
+            Err(
+                "MCP authentication flow lost its worker; replace its configuration before reuse"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct AuthFlowObligation(Option<Arc<AuthFlowState>>);
+impl AuthFlowObligation {
+    fn complete(mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for AuthFlowObligation {
+    fn drop(&mut self) {
+        if let Some(flow) = &self.0 {
+            flow.abandoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct AuthorizationAttempt {
+    server: String,
+    fingerprint: Vec<u8>,
+    request: AuthRequest,
+    pending: auth::PendingAuthorization,
+    session_id: String,
+    event_generation: Option<u64>,
+    identity: Arc<AuthFlowState>,
+    expected: Option<Arc<OAuthSession>>,
+}
+
+impl ServerStatus {
+    fn check_available(&self) -> Result<(), String> {
+        match self {
+            Self::Pending(flow) => {
+                flow.check()?;
+                Err("MCP interactive authentication is pending".into())
+            }
+            _ => Ok(()),
+        }
+    }
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Error(error) => Some(error),
+            Self::Pending(flow) if flow.abandoned.load(Ordering::Acquire) => Some(
+                "MCP authentication flow lost its worker; replace its configuration before reuse",
+            ),
+            _ => None,
         }
     }
 }
 
 #[derive(Clone)]
 struct PendingRecord {
+    identity: Arc<AuthFlowState>,
     url: String,
     expires: Instant,
     fingerprint: Vec<u8>,
@@ -256,22 +333,213 @@ struct PendingRecord {
 struct OAuthSession {
     manager: Mutex<AuthorizationManager>,
     tokens: std::sync::Mutex<OAuthSessionTokens>,
+    // Cleanup identity survives token poisoning. Only a new reservation advances it,
+    // while holding tokens; an isolated owner never admits another reservation.
+    generation: AtomicU64,
+    refresh_settled: tokio::sync::Notify,
 }
 
 struct OAuthSessionTokens {
     applied: String,
     pending: Option<PendingRefresh>,
-    next_generation: u64,
 }
 
 enum PendingRefresh {
     Refreshing { generation: u64, cancelled: bool },
     Ready { generation: u64, token: String },
+    Failed { generation: u64 },
 }
 
 enum OpportunisticRefresh {
     Apply { token: String, generation: u64 },
     Coalesced,
+}
+
+// Own abnormal-exit isolation in the work itself, not in a JoinHandle waiter:
+// detached refreshes can outlive the caller that would otherwise observe a panic.
+struct RefreshCompletionGuard(Option<(Arc<OAuthSession>, u64)>);
+
+impl RefreshCompletionGuard {
+    fn complete(mut self) {
+        if let Some((session, _)) = self.0.take() {
+            // The backend lease and token guards have already been released.
+            session.refresh_settled.notify_waiters();
+        }
+    }
+}
+
+impl Drop for RefreshCompletionGuard {
+    fn drop(&mut self) {
+        if let Some((session, generation)) = &self.0 {
+            let mut current = session.generation.load(Ordering::Acquire);
+            while current & OAuthSession::GENERATION == *generation {
+                match session.generation.compare_exchange(
+                    current,
+                    current | OAuthSession::ISOLATED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+            session.refresh_settled.notify_waiters();
+        }
+    }
+}
+
+// Coordinates backend mutations with registry publication. The shared terminal
+// fence remains observable even when the runtime containing this future is gone.
+struct BackendPublication<'a> {
+    manager: Option<tokio::sync::MutexGuard<'a, McpServerManager>>,
+    healthy: Arc<AtomicBool>,
+    armed: bool,
+}
+impl BackendPublication<'_> {
+    fn backend(&mut self) -> Result<&mut McpServerManager, String> {
+        self.manager
+            .as_deref_mut()
+            .ok_or_else(|| "MCP backend publication already released its manager".into())
+    }
+    fn release_backend(&mut self) {
+        drop(self.manager.take());
+    }
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for BackendPublication<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.healthy.store(false, Ordering::Release);
+        }
+        // Any still-owned manager guard unlocks only after this terminal fence.
+    }
+}
+
+struct BackendLease<'a> {
+    manager: tokio::sync::MutexGuard<'a, AuthorizationManager>,
+    session: &'a OAuthSession,
+    armed: bool,
+}
+
+impl BackendLease<'_> {
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackendLease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // The manager field is still locked here. A waiter cannot enter the
+            // interrupted backend before the terminal fence is visible.
+            self.session.isolate();
+        }
+    }
+}
+
+// This owner survives in the session phase until exact-generation acknowledgment.
+// Its destructor runs even if the spawned cleanup future is never first-polled.
+struct CleanupObligation {
+    session: Arc<OAuthSession>,
+    expected: u64,
+    armed: bool,
+}
+
+impl CleanupObligation {
+    fn claim(session: &Arc<OAuthSession>) -> Result<Self, OAuthSessionError> {
+        let mut current = session.generation.load(Ordering::Acquire);
+        loop {
+            // This is cleanup ownership, not admission: even isolated sessions
+            // need registry removal. Preserve isolation and reject duplicate owners.
+            if current & OAuthSession::CLEANUP != 0 {
+                return Err(OAuthSessionError::CleanupPending);
+            }
+            let pending = current | OAuthSession::CLEANUP;
+            match session.generation.compare_exchange(
+                current,
+                pending,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(Self {
+                        session: Arc::clone(session),
+                        expected: pending,
+                        armed: true,
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.expected & OAuthSession::GENERATION
+    }
+
+    fn acknowledge(mut self) -> Result<(), OAuthSessionError> {
+        let result = self.session.generation.compare_exchange(
+            self.expected,
+            self.expected & !OAuthSession::CLEANUP,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.armed = false;
+        match result {
+            Ok(_) => Ok(()),
+            Err(actual) if actual & OAuthSession::ISOLATED != 0 => Err(OAuthSessionError::Isolated),
+            Err(_) => Err(OAuthSessionError::GenerationRetired),
+        }
+    }
+}
+
+impl Drop for CleanupObligation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.session.generation.compare_exchange(
+                self.expected,
+                self.generation() | OAuthSession::ISOLATED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum OAuthSessionError {
+    Refresh(String),
+    RefreshFailed { generation: u64, error: String },
+    Isolated,
+    CleanupPending,
+    GenerationRetired,
+}
+
+impl std::fmt::Display for OAuthSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refresh(error) | Self::RefreshFailed { error, .. } => formatter.write_str(error),
+            Self::CleanupPending => formatter.write_str("MCP OAuth session cleanup is pending; retry after the owning generation settles"),
+            Self::GenerationRetired => formatter.write_str("MCP OAuth generation was cancelled or superseded; retry the operation"),
+            Self::Isolated => formatter.write_str(
+                "MCP OAuth session is isolated after an interrupted token transition; replace its configuration before reuse",
+            ),
+        }
+    }
+}
+
+impl From<String> for OAuthSessionError {
+    fn from(error: String) -> Self {
+        Self::Refresh(error)
+    }
+}
+
+impl From<&str> for OAuthSessionError {
+    fn from(error: &str) -> Self {
+        Self::Refresh(error.into())
+    }
 }
 
 impl OAuthSession {
@@ -281,46 +549,132 @@ impl OAuthSession {
             tokens: std::sync::Mutex::new(OAuthSessionTokens {
                 applied: access_token,
                 pending: None,
-                next_generation: 0,
             }),
+            generation: AtomicU64::new(0),
+            refresh_settled: tokio::sync::Notify::new(),
         }
     }
 
-    async fn refresh(&self, credential_storage: &CredentialStorage) -> Result<String, String> {
-        let rejected_token = self
-            .tokens
-            .lock()
-            .expect("OAuth session tokens are poisoned")
-            .applied
-            .clone();
-        let mut manager = self.manager.lock().await;
-        let token = auth::refresh(&mut manager, credential_storage, &rejected_token)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut tokens = self
-            .tokens
-            .lock()
-            .expect("OAuth session tokens are poisoned");
-        tokens.applied = token.clone();
-        tokens.pending = None;
-        Ok(token)
+    // Generation and terminal state share one atomic word: reservation CAS cannot
+    // erase isolation, and cleanup can identify the frozen generation without tokens.
+    const ISOLATED: u64 = 1 << 63;
+    const CLEANUP: u64 = 1 << 62;
+    const GENERATION: u64 = Self::CLEANUP - 1;
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire) & Self::GENERATION
+    }
+
+    fn isolate(&self) -> OAuthSessionError {
+        self.generation.fetch_or(Self::ISOLATED, Ordering::AcqRel);
+        OAuthSessionError::Isolated
+    }
+
+    fn check_phase(&self, phase: u64) -> Result<(), OAuthSessionError> {
+        // Classify one observation: CLEANUP may become ISOLATED without an
+        // intervening usable state. Poison remains an independent terminal check.
+        if self.tokens.is_poisoned() {
+            Err(self.isolate())
+        } else if phase & Self::ISOLATED != 0 {
+            Err(OAuthSessionError::Isolated)
+        } else if phase & Self::CLEANUP != 0 {
+            Err(OAuthSessionError::CleanupPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_usable(&self) -> Result<(), OAuthSessionError> {
+        self.check_phase(self.generation.load(Ordering::Acquire))
+    }
+
+    fn check_completion(&self, generation: u64) -> Result<(), OAuthSessionError> {
+        let phase = self.generation.load(Ordering::Acquire);
+        // The exact generation may complete while cleanup owns settlement.
+        self.check_phase(phase & !Self::CLEANUP)?;
+        if phase & Self::GENERATION != generation {
+            return Err(OAuthSessionError::GenerationRetired);
+        }
+        Ok(())
+    }
+
+    // The caller holds tokens and has not published a pending refresh yet.
+    // Cleanup claims deliberately do not need that lock, so both the initial
+    // observation and a failed reservation CAS must be classified without mutation.
+    fn reserve_generation(&self, previous: u64) -> Result<u64, OAuthSessionError> {
+        self.check_phase(previous)?;
+        let generation = previous
+            .checked_add(1)
+            .filter(|generation| *generation < Self::CLEANUP)
+            .ok_or_else(|| self.isolate())?;
+        self.generation
+            .compare_exchange(previous, generation, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|actual| match self.check_phase(actual) {
+                Err(error) => error,
+                Ok(()) => OAuthSessionError::GenerationRetired,
+            })?;
+        Ok(generation)
+    }
+
+    fn lock_completion_tokens(
+        &self,
+        generation: u64,
+    ) -> Result<std::sync::MutexGuard<'_, OAuthSessionTokens>, OAuthSessionError> {
+        self.check_completion(generation)?;
+        let tokens = self.tokens.lock().map_err(|_| self.isolate())?;
+        self.check_completion(generation)?;
+        Ok(tokens)
+    }
+
+    fn lock_tokens(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, OAuthSessionTokens>, OAuthSessionError> {
+        self.check_usable()?;
+        let tokens = self.tokens.lock().map_err(|_| self.isolate())?;
+        self.check_usable()?;
+        Ok(tokens)
+    }
+
+    async fn refresh(
+        self: &Arc<Self>,
+        credential_storage: &CredentialStorage,
+    ) -> Result<String, OAuthSessionError> {
+        let rejected_token = self.lock_tokens()?.applied.clone();
+        let manager = self.manager.lock().await;
+        self.check_usable()?;
+        let mut backend = BackendLease {
+            manager,
+            session: self,
+            armed: true,
+        };
+        let result = async {
+            let refreshed =
+                auth::refresh(&mut backend.manager, credential_storage, &rejected_token)
+                    .await
+                    .map_err(|error| error.to_string());
+            let mut tokens = self.lock_tokens()?;
+            let token = refreshed?;
+            tokens.applied = token.clone();
+            tokens.pending = None;
+            Ok(token)
+        }
+        .await;
+        backend.complete();
+        result
     }
 
     async fn opportunistic_refresh(
         self: &Arc<Self>,
         credential_storage: &CredentialStorage,
-    ) -> Result<OpportunisticRefresh, String> {
+    ) -> Result<OpportunisticRefresh, OAuthSessionError> {
         let (observed_token, generation) = {
-            let mut tokens = self
-                .tokens
-                .lock()
-                .expect("OAuth session tokens are poisoned");
+            let mut tokens = self.lock_tokens()?;
             if tokens.pending.is_some() {
                 return Ok(OpportunisticRefresh::Coalesced);
             }
-            tokens.next_generation = tokens.next_generation.wrapping_add(1);
-            let generation = tokens.next_generation;
             let observed_token = tokens.applied.clone();
+            let previous = self.generation.load(Ordering::Acquire);
+            let generation = self.reserve_generation(previous)?;
             tokens.pending = Some(PendingRefresh::Refreshing {
                 generation,
                 cancelled: false,
@@ -329,66 +683,104 @@ impl OAuthSession {
         };
         let session = Arc::clone(self);
         let credential_storage = credential_storage.clone();
+        let completion = RefreshCompletionGuard(Some((Arc::clone(self), generation)));
         tokio::spawn(async move {
-            let result = {
-                let mut manager = session.manager.lock().await;
-                auth::refresh(&mut manager, &credential_storage, &observed_token)
-                    .await
-                    .map_err(|error| error.to_string())
-            };
-            let mut tokens = session
-                .tokens
-                .lock()
-                .expect("OAuth session tokens are poisoned");
-            let cancelled = match tokens.pending {
-                Some(PendingRefresh::Refreshing {
-                    generation: current,
-                    cancelled,
-                }) if current == generation => cancelled,
-                _ => return Err("MCP credential refresh was superseded".into()),
-            };
-            if cancelled {
-                tokens.pending = None;
-                return Err("MCP credential refresh was cancelled".into());
-            }
-            match result {
-                Ok(token) => {
-                    tokens.pending = Some(PendingRefresh::Ready {
-                        generation,
-                        token: token.clone(),
-                    });
-                    Ok(OpportunisticRefresh::Apply { token, generation })
+            let result = async {
+                let manager = session.manager.lock().await;
+                session.check_completion(generation)?;
+                let mut backend = BackendLease {
+                    manager,
+                    session: &session,
+                    armed: true,
+                };
+                let result = async {
+                    let refreshed =
+                        auth::refresh(&mut backend.manager, &credential_storage, &observed_token)
+                            .await
+                            .map_err(|error| error.to_string());
+                    let mut tokens = session.lock_completion_tokens(generation)?;
+                    let cancelled = match tokens.pending {
+                        Some(PendingRefresh::Refreshing {
+                            generation: current,
+                            cancelled,
+                        }) if current == generation => cancelled,
+                        _ => return Err(OAuthSessionError::GenerationRetired),
+                    };
+                    if cancelled {
+                        tokens.pending = None;
+                        return Err(OAuthSessionError::GenerationRetired);
+                    }
+                    match refreshed {
+                        Ok(token) => {
+                            tokens.pending = Some(PendingRefresh::Ready {
+                                generation,
+                                token: token.clone(),
+                            });
+                            Ok(OpportunisticRefresh::Apply { token, generation })
+                        }
+                        Err(error) => {
+                            tokens.pending = Some(PendingRefresh::Failed { generation });
+                            Err(OAuthSessionError::RefreshFailed { generation, error })
+                        }
+                    }
                 }
-                Err(error) => {
-                    tokens.pending = None;
-                    Err(error)
-                }
+                .await;
+                backend.complete();
+                result
             }
+            .await;
+            completion.complete();
+            result
         })
         .await
-        .map_err(|error| format!("MCP credential refresh task failed: {error}"))?
+        .map_err(|_| self.isolate())?
     }
 
-    fn finish_replay(&self, commit: bool) -> Option<u64> {
-        let mut tokens = self
-            .tokens
-            .lock()
-            .expect("OAuth session tokens are poisoned");
-        match tokens.pending.take()? {
+    async fn wait_for_refresh_settlement(&self, generation: u64) -> Result<(), OAuthSessionError> {
+        loop {
+            let notified = self.refresh_settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let waiting = match self.lock_completion_tokens(generation) {
+                Ok(tokens) => {
+                    matches!(&tokens.pending, Some(PendingRefresh::Refreshing { generation: current, .. }) if *current == generation)
+                }
+                Err(OAuthSessionError::Isolated) => false,
+                Err(error) => return Err(error),
+            };
+            if !waiting {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    fn finish_replay(
+        &self,
+        generation: u64,
+        commit: bool,
+    ) -> Result<Option<u64>, OAuthSessionError> {
+        let mut tokens = self.lock_completion_tokens(generation)?;
+        let Some(pending) = tokens.pending.take() else {
+            return Ok(None);
+        };
+        let generation = match pending {
+            PendingRefresh::Failed { generation } => generation,
             PendingRefresh::Ready { generation, token } => {
                 if commit {
                     tokens.applied = token;
                 }
-                Some(generation)
+                generation
             }
             PendingRefresh::Refreshing { generation, .. } => {
                 tokens.pending = Some(PendingRefresh::Refreshing {
                     generation,
                     cancelled: true,
                 });
-                Some(generation)
+                generation
             }
-        }
+        };
+        Ok(Some(generation))
     }
 }
 
@@ -412,17 +804,26 @@ impl McpSubscription {
 
 impl Drop for McpSubscription {
     fn drop(&mut self) {
-        if let Ok(mut routes) = self.routes.lock()
-            && routes
+        // Poison isolates the registry: neither cleanup nor delivery may trust it.
+        // Remove only our generation, and retire the key/sender after unlocking.
+        let retired = if let Ok(mut routes) = self.routes.lock() {
+            if routes
                 .get(&self.session_id)
                 .is_some_and(|(generation, _)| *generation == self.generation)
-        {
-            routes.remove(&self.session_id);
-        }
+            {
+                routes.remove_entry(&self.session_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(retired);
     }
 }
 
 struct AuthRecorder {
+    healthy: Arc<AtomicBool>,
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
     oauth_sessions: OAuthSessions,
@@ -430,107 +831,161 @@ struct AuthRecorder {
     credential_storage: CredentialStorage,
 }
 
+fn same_oauth_owner(
+    current: Option<&Arc<OAuthSession>>,
+    expected: Option<&Arc<OAuthSession>>,
+) -> bool {
+    match (current, expected) {
+        (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl McpAuthResponder for AuthRecorder {
     async fn resolve(&self, request: AuthRequest) -> Result<AuthResolution, McpError> {
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(McpError::AuthResolution("MCP runtime backend publication was interrupted; create a new runtime before reuse".into()));
+        }
         let server = request.server_id().unwrap_or("unknown").to_string();
         let record = self.servers.read().await.get(&server).cloned();
+        if let Some(record) = &record {
+            record
+                .status
+                .check_available()
+                .map_err(McpError::AuthResolution)?;
+        }
+        let session = self.oauth_sessions.lock().await.get(&server).cloned();
+        if let Some(session) = &session {
+            session
+                .check_usable()
+                .map_err(|error| McpError::AuthResolution(error.to_string()))?;
+        }
         let refreshable = record
             .as_ref()
             .is_some_and(|record| can_opportunistically_refresh(&request, record));
-
-        let session = if refreshable {
-            self.oauth_sessions.lock().await.get(&server).cloned()
+        let mut failed_generation = None;
+        if let Some(session) = session.as_ref().filter(|_| refreshable) {
+            match session
+                .opportunistic_refresh(&self.credential_storage)
+                .await
+            {
+                Err(
+                    error @ (OAuthSessionError::Isolated
+                    | OAuthSessionError::CleanupPending
+                    | OAuthSessionError::GenerationRetired),
+                ) => {
+                    return Err(McpError::AuthResolution(error.to_string()));
+                }
+                Ok(OpportunisticRefresh::Coalesced) => {
+                    return Err(McpError::AuthResolution(format!(
+                        "MCP credentials for {server} were refreshed by another request; retry the tool call"
+                    )));
+                }
+                Ok(OpportunisticRefresh::Apply { token, generation }) => {
+                    // Prepare the returned credential object before publishing ownership.
+                    let mut credentials = MetadataMap::new();
+                    credentials.insert("access_token".into(), Value::String(token));
+                    let response = AuthResolution::provided(request.clone(), credentials);
+                    let mut challenges = self.challenges.lock().await;
+                    let sessions = self.oauth_sessions.lock().await;
+                    let mut active = self.active_replays.lock().await;
+                    let servers = self.servers.read().await;
+                    if !self.healthy.load(Ordering::Acquire) {
+                        return Err(McpError::AuthResolution("MCP runtime is isolated".into()));
+                    }
+                    if let Some(record) = servers.get(&server) {
+                        record
+                            .status
+                            .check_available()
+                            .map_err(McpError::AuthResolution)?;
+                    }
+                    let tokens = session
+                        .lock_tokens()
+                        .map_err(|error| McpError::AuthResolution(error.to_string()))?;
+                    if !same_oauth_owner(sessions.get(&server), Some(session))
+                        || !servers.get(&server).is_some_and(|current| {
+                            record
+                                .as_ref()
+                                .is_some_and(|prior| current.fingerprint == prior.fingerprint)
+                        })
+                        || session.current_generation() != generation
+                        || !matches!(&tokens.pending, Some(PendingRefresh::Ready { generation: current, .. }) if *current == generation)
+                    {
+                        return Err(McpError::AuthResolution(
+                            "MCP authentication ownership changed before publication".into(),
+                        ));
+                    }
+                    // Allocation affects only prepared maps. The commit itself is
+                    // await-free, allocation-free, and visible under all guards.
+                    let mut next_challenges = challenges.clone();
+                    let mut next_active = active.clone();
+                    next_challenges.insert(server.clone(), request);
+                    next_active.insert(server, generation);
+                    let retired_challenges = std::mem::replace(&mut *challenges, next_challenges);
+                    let retired_active = std::mem::replace(&mut *active, next_active);
+                    drop(tokens);
+                    drop(servers);
+                    drop(active);
+                    drop(sessions);
+                    drop(challenges);
+                    drop((retired_challenges, retired_active));
+                    return Ok(response);
+                }
+                Err(OAuthSessionError::RefreshFailed { generation, .. }) => {
+                    failed_generation = Some(generation);
+                }
+                Err(error @ OAuthSessionError::Refresh(_)) => {
+                    return Err(McpError::AuthResolution(error.to_string()));
+                }
+            }
+        }
+        let mut challenges = self.challenges.lock().await;
+        let sessions = self.oauth_sessions.lock().await;
+        let mut servers = self.servers.write().await;
+        if !same_oauth_owner(sessions.get(&server), session.as_ref()) {
+            return Err(McpError::AuthResolution(
+                "MCP authentication owner changed before challenge publication".into(),
+            ));
+        }
+        if !self.healthy.load(Ordering::Acquire) {
+            return Err(McpError::AuthResolution("MCP runtime is isolated".into()));
+        }
+        let tokens = session
+            .as_ref()
+            .map(|session| session.lock_tokens())
+            .transpose()
+            .map_err(|error| McpError::AuthResolution(error.to_string()))?;
+        if let Some(generation) = failed_generation
+            && !tokens.as_ref().is_some_and(|tokens| matches!(&tokens.pending, Some(PendingRefresh::Failed { generation: current }) if *current == generation)) {
+            return Err(McpError::AuthResolution(OAuthSessionError::GenerationRetired.to_string()));
+        }
+        if let Some(record) = servers.get(&server) {
+            record
+                .status
+                .check_available()
+                .map_err(McpError::AuthResolution)?;
+        }
+        let retired = if let Some(current) = servers.get_mut(&server)
+            && record
+                .as_ref()
+                .is_some_and(|prior| current.fingerprint == prior.fingerprint)
+        {
+            let mut next = challenges.clone();
+            next.insert(server.clone(), request);
+            Some((
+                std::mem::replace(&mut *challenges, next),
+                std::mem::replace(&mut current.status, ServerStatus::AuthenticationRequired),
+            ))
         } else {
             None
         };
-        if let Some(session) = session {
-            let refresh = session
-                .opportunistic_refresh(&self.credential_storage)
-                .await;
-            if matches!(refresh, Ok(OpportunisticRefresh::Coalesced)) {
-                return Err(McpError::AuthResolution(format!(
-                    "MCP credentials for {server} were refreshed by another request; retry the tool call"
-                )));
-            }
-            if let Ok(OpportunisticRefresh::Apply { token, generation }) = refresh {
-                let current_session = self
-                    .oauth_sessions
-                    .lock()
-                    .await
-                    .get(&server)
-                    .is_some_and(|current| Arc::ptr_eq(current, &session));
-                let current_server = match record.as_ref() {
-                    Some(record) => self
-                        .servers
-                        .read()
-                        .await
-                        .get(&server)
-                        .is_some_and(|current| current.fingerprint == record.fingerprint),
-                    None => false,
-                };
-                if current_session && current_server {
-                    self.challenges
-                        .lock()
-                        .await
-                        .insert(server.clone(), request.clone());
-                    let still_current =
-                        self.servers
-                            .read()
-                            .await
-                            .get(&server)
-                            .is_some_and(|current| {
-                                record
-                                    .as_ref()
-                                    .is_some_and(|record| current.fingerprint == record.fingerprint)
-                            });
-                    if still_current {
-                        self.active_replays
-                            .lock()
-                            .await
-                            .insert(server.clone(), generation);
-                        let mut credentials = MetadataMap::new();
-                        credentials.insert("access_token".into(), Value::String(token));
-                        return Ok(AuthResolution::provided(request, credentials));
-                    }
-                    let mut challenges = self.challenges.lock().await;
-                    if challenges.get(&server) == Some(&request) {
-                        challenges.remove(&server);
-                    }
-                }
-            }
-        }
-
-        let current_server = match record.as_ref() {
-            Some(record) => self
-                .servers
-                .read()
-                .await
-                .get(&server)
-                .is_some_and(|current| current.fingerprint == record.fingerprint),
-            None => false,
-        };
-        if current_server {
-            self.challenges
-                .lock()
-                .await
-                .insert(server.clone(), request.clone());
-            let updated = if let (Some(original), Some(current)) =
-                (record.as_ref(), self.servers.write().await.get_mut(&server))
-                && current.fingerprint == original.fingerprint
-            {
-                current.status = ServerStatus::AuthenticationRequired;
-                true
-            } else {
-                false
-            };
-            if !updated {
-                let mut challenges = self.challenges.lock().await;
-                if challenges.get(&server) == Some(&request) {
-                    challenges.remove(&server);
-                }
-            }
-        }
+        drop(tokens);
+        drop(servers);
+        drop(sessions);
+        drop(challenges);
+        drop(retired);
         Err(McpError::AuthResolution(format!(
             "authentication required for MCP server {server}; call auth with that server name"
         )))
@@ -600,22 +1055,31 @@ fn prepare_config(
     let raw_entries = value
         .get("mcpServers")
         .and_then(Value::as_object)
-        .expect("strict Config parsing guarantees an mcpServers object");
+        .ok_or_else(|| {
+            format!(
+                "invalid MCP config {}: mcpServers must be an object",
+                path.display()
+            )
+        })?;
     let mut entries = raw_entries
         .iter()
         .map(|(name, value)| {
-            (
-                name.clone(),
-                serde_json::to_vec(value).expect("JSON re-encodes"),
-            )
+            serde_json::to_vec(value)
+                .map(|bytes| (name.clone(), bytes))
+                .map_err(|error| format!("could not encode MCP server {name:?}: {error}"))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut prepared = BTreeMap::new();
     for (id, server) in config.mcp_servers {
         if id.trim().is_empty() {
             return Err("MCP server names must not be empty".into());
         }
-        let mut fingerprint = entries[&id].clone();
+        let mut fingerprint = entries.get(&id).cloned().ok_or_else(|| {
+            format!(
+                "invalid MCP config {}: missing server {id:?}",
+                path.display()
+            )
+        })?;
         let effective_cwd = match &server {
             Server::Stdio(server) => resolve_stdio_cwd(server.cwd.as_deref(), default_stdio_cwd),
             Server::Http(_) => None,
@@ -755,7 +1219,7 @@ fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<Pa
     let mut ancestor = path.clone();
     let mut suffix = Vec::new();
     loop {
-        match std::fs::symlink_metadata(&ancestor) {
+        match crate::resilient_fs::symlink_metadata(&ancestor) {
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let component = ancestor
@@ -772,7 +1236,7 @@ fn contained_plugin_path(path: PathBuf, root: &Path, context: &str) -> Result<Pa
             }
         }
     }
-    let mut resolved = ancestor.canonicalize().map_err(|error| {
+    let mut resolved = crate::resilient_fs::canonicalize(&ancestor).map_err(|error| {
         format!(
             "could not resolve plugin MCP {context} path {}: {error}",
             ancestor.display()
@@ -800,12 +1264,6 @@ fn prepare_plugins(
         let root = plugin_text(&plugin.root, "root", &plugin.alias)?;
         let data = plugin_text(&plugin.data_dir, "data", &plugin.alias)?;
         for server in &plugin.servers {
-            if matches!(server.transport, PluginMcpTransport::Sse { .. }) {
-                return Err(format!(
-                    "plugin {}: MCP server {:?} uses unsupported SSE transport",
-                    plugin.alias, server.name
-                ));
-            }
             if let Some(owner) = owners.insert(server.name.clone(), plugin.alias.clone()) {
                 return Err(format!(
                     "MCP server {:?} is declared by both plugins {owner:?} and {:?}",
@@ -861,13 +1319,13 @@ fn prepare_plugins(
                                 &plugin.data_dir,
                                 "data cwd",
                             )?;
-                            std::fs::create_dir_all(&directory).map_err(|error| {
+                            crate::resilient_fs::create_dir_all(&directory).map_err(|error| {
                                 format!(
                                     "could not create cwd for plugin {:?} MCP server {:?} at {}: {error}",
                                     plugin.alias, server.name, directory.display()
                                 )
                             })?;
-                            Some(directory.canonicalize().map_err(|error| {
+                            Some(crate::resilient_fs::canonicalize(&directory).map_err(|error| {
                                 format!(
                                     "could not resolve cwd for plugin {:?} MCP server {:?}: {error}",
                                     plugin.alias, server.name
@@ -887,6 +1345,16 @@ fn prepare_plugins(
                         }
                         None => None,
                     };
+                    crate::resilient_fs::global()
+                        .require_disk(&plugin.root)
+                        .map_err(|error| {
+                            format!("plugin MCP files are not available on disk: {error}")
+                        })?;
+                    crate::resilient_fs::global()
+                        .require_disk(&plugin.data_dir)
+                        .map_err(|error| {
+                            format!("plugin MCP data directory is not available on disk: {error}")
+                        })?;
                     (McpTransportBinding::Stdio(transport), None, false)
                 }
                 PluginMcpTransport::StreamableHttp { url, headers } => {
@@ -906,7 +1374,12 @@ fn prepare_plugins(
                             .any(|name| name.eq_ignore_ascii_case("authorization")),
                     )
                 }
-                PluginMcpTransport::Sse { .. } => unreachable!("SSE was rejected above"),
+                PluginMcpTransport::Sse { .. } => {
+                    return Err(format!(
+                        "plugin {}: MCP server {:?} uses unsupported SSE transport",
+                        plugin.alias, server.name
+                    ));
+                }
             };
             let fingerprint = format!(
                 "plugin:v2:{:?}:{:?}:{:?}:{:?}:{binding:?}:{url:?}:{static_authorization}",
@@ -935,7 +1408,14 @@ fn prepare_plugins(
 }
 
 async fn read_source(source: &ConfigSource) -> Result<Option<Vec<u8>>, String> {
-    match tokio::fs::read(&source.path).await {
+    if let Some(bytes) = &source.session_bytes {
+        return Ok(Some(bytes.to_vec()));
+    }
+    let path = source.path.clone();
+    match tokio::task::spawn_blocking(move || crate::config_files::read(&path))
+        .await
+        .map_err(|error| format!("MCP config read task failed: {error}"))?
+    {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if !source.required && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
@@ -952,6 +1432,7 @@ fn prepare_sources(
 ) -> Result<PreparedConfiguration, String> {
     let mut prepared = plugin_prepared.clone();
     let mut entries = plugin_entries.clone();
+    let mut session_names = BTreeSet::new();
     for state in sources {
         let Some(bytes) = &state.raw else {
             continue;
@@ -961,6 +1442,18 @@ fn prepare_sources(
             &state.source.path,
             state.source.default_stdio_cwd.as_deref(),
         )?;
+        for name in source_prepared.keys() {
+            if session_names.contains(name)
+                || (state.source.session_bytes.is_some() && prepared.contains_key(name))
+            {
+                return Err(format!(
+                    "session MCP server {name:?} conflicts with an existing server"
+                ));
+            }
+        }
+        if state.source.session_bytes.is_some() {
+            session_names.extend(source_prepared.keys().cloned());
+        }
         prepared.extend(source_prepared);
         entries.extend(source_entries);
     }
@@ -1007,12 +1500,36 @@ async fn connect_inner(
     interactive_oauth_enabled: bool,
     credential_storage: CredentialStorage,
 ) -> Result<McpRuntime, String> {
-    let (plugin_prepared, plugin_entries) = prepare_plugins(plugins)?;
+    let plugins = plugins.to_vec();
+    let (plugin_prepared, plugin_entries) =
+        tokio::task::spawn_blocking(move || prepare_plugins(&plugins))
+            .await
+            .map_err(|error| error.to_string())??;
     let mut source_states = Vec::with_capacity(sources.len());
     for source in sources {
         let raw = read_source(&source).await?;
         source_states.push(SourceState { source, raw });
     }
+    let runtime = build_runtime(
+        source_states,
+        plugin_prepared,
+        plugin_entries,
+        plugin_source,
+        interactive_oauth_enabled,
+        credential_storage,
+    )?;
+    runtime.spawn_eager_initialization();
+    Ok(runtime)
+}
+
+fn build_runtime(
+    source_states: Vec<SourceState>,
+    plugin_prepared: PreparedServers,
+    plugin_entries: ServerFingerprints,
+    plugin_source: Option<crate::plugins::PluginRuntime>,
+    interactive_oauth_enabled: bool,
+    credential_storage: CredentialStorage,
+) -> Result<McpRuntime, String> {
     let (prepared, entries) = prepare_sources(&source_states, &plugin_prepared, &plugin_entries)?;
     validate_server_names(prepared.keys())?;
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
@@ -1029,10 +1546,12 @@ async fn connect_inner(
     }
 
     let servers = Arc::new(RwLock::new(records));
+    let healthy = Arc::new(AtomicBool::new(true));
     let oauth_sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let active_replays = Arc::new(Mutex::new(BTreeMap::new()));
     manager.set_handler_config(McpHandlerConfig::new().with_auth_responder(Arc::new(
         AuthRecorder {
+            healthy: Arc::clone(&healthy),
             challenges: Arc::clone(&challenges),
             servers: Arc::clone(&servers),
             oauth_sessions: Arc::clone(&oauth_sessions),
@@ -1044,7 +1563,7 @@ async fn connect_inner(
         manager,
         servers,
         challenges,
-        (oauth_sessions, active_replays),
+        (oauth_sessions, active_replays, healthy),
         credential_storage,
         ReloadState {
             sources: source_states,
@@ -1055,25 +1574,139 @@ async fn connect_inner(
         },
         interactive_oauth_enabled,
     );
-    runtime.spawn_eager_initialization();
     Ok(runtime)
 }
 
 impl McpRuntime {
+    /// Build an isolated runtime with request-scoped stdio servers. Credentials
+    /// supplied in the request remain in an immutable in-memory config source.
+    /// Initialization is lazy: rejected or cancelled attachment must not leave
+    /// a detached initializer owning this runtime or starting its processes.
+    pub(crate) async fn with_session_servers(
+        &self,
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<McpRuntime, String> {
+        self.ensure_healthy()?;
+        let mut entries = BTreeMap::new();
+        for server in servers {
+            let agentkit_acp::McpServer::Stdio(server) = server else {
+                return Err("session MCP servers support only stdio transport".into());
+            };
+            if entries.contains_key(&server.name) {
+                return Err(format!("duplicate session MCP server {:?}", server.name));
+            }
+            let mut env = BTreeMap::new();
+            for variable in server.env {
+                if env.insert(variable.name, variable.value).is_some() {
+                    return Err(format!(
+                        "duplicate environment variable for session MCP server {:?}",
+                        server.name
+                    ));
+                }
+            }
+            let command = server.command.to_str().ok_or_else(|| {
+                format!("session MCP server {:?} command is not UTF-8", server.name)
+            })?;
+            entries.insert(
+                server.name,
+                Value::Object(serde_json::Map::from_iter([
+                    ("type".into(), Value::String("stdio".into())),
+                    ("command".into(), Value::String(command.into())),
+                    (
+                        "args".into(),
+                        Value::Array(server.args.into_iter().map(Value::String).collect()),
+                    ),
+                    (
+                        "env".into(),
+                        Value::Object(
+                            env.into_iter()
+                                .map(|(name, value)| (name, Value::String(value)))
+                                .collect(),
+                        ),
+                    ),
+                ])),
+            );
+        }
+        let config = Value::Object(serde_json::Map::from_iter([(
+            "mcpServers".into(),
+            Value::Object(entries.into_iter().collect()),
+        )]));
+        let bytes = serde_json::to_vec(&config)
+            .map_err(|error| format!("could not encode session MCP config: {error}"))?;
+        // Clone a consistent source/plugin generation. Release the reload lock
+        // before reads, validation, backend work, or initialization.
+        let (sources, plugins, plugin_entries, plugin_source) = {
+            let state = self.inner.reload.lock().await;
+            self.ensure_healthy()?;
+            (
+                state
+                    .sources
+                    .iter()
+                    .map(|state| state.source.clone())
+                    .collect::<Vec<_>>(),
+                state.plugins.clone(),
+                state.plugin_entries.clone(),
+                state.plugin_source.clone(),
+            )
+        };
+        let mut source_states = Vec::with_capacity(sources.len() + 1);
+        for source in sources {
+            let raw = read_source(&source).await?;
+            source_states.push(SourceState { source, raw });
+        }
+        source_states.push(SourceState {
+            source: ConfigSource {
+                path: PathBuf::from("<session MCP servers>"),
+                required: true,
+                default_stdio_cwd: Some(cwd.to_path_buf()),
+                session_bytes: Some(Arc::from(bytes.clone())),
+            },
+            raw: Some(bytes),
+        });
+        build_runtime(
+            source_states,
+            plugins,
+            plugin_entries,
+            plugin_source,
+            self.inner.interactive_oauth_enabled,
+            self.inner.credential_storage.clone(),
+        )
+    }
+
+    fn ensure_healthy(&self) -> Result<(), String> {
+        if self.inner.healthy.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err("MCP runtime backend publication was interrupted; create a new runtime before reuse".into())
+        }
+    }
+
+    async fn begin_backend_publication(&self) -> Result<BackendPublication<'_>, String> {
+        let manager = self.inner.manager.lock().await;
+        self.ensure_healthy()?;
+        Ok(BackendPublication {
+            manager: Some(manager),
+            healthy: Arc::clone(&self.inner.healthy),
+            armed: true,
+        })
+    }
+
     fn new(
         manager: McpServerManager,
         servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
         challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
-        oauth: (OAuthSessions, ActiveReplays),
+        oauth: (OAuthSessions, ActiveReplays, Arc<AtomicBool>),
         credential_storage: CredentialStorage,
         reload: ReloadState,
         interactive_oauth_enabled: bool,
     ) -> Self {
         let catalog = manager.source();
-        let (oauth_sessions, active_replays) = oauth;
+        let (oauth_sessions, active_replays, healthy) = oauth;
         let plugin_source = reload.plugin_source.clone();
         Self {
             inner: Arc::new(Inner {
+                healthy,
                 manager: Mutex::new(manager),
                 catalog,
                 servers,
@@ -1130,6 +1763,7 @@ impl McpRuntime {
     }
 
     async fn acquire_invocation(&self, tool: &str) -> Result<McpInvocationLease, ToolError> {
+        self.ensure_healthy().map_err(ToolError::Unavailable)?;
         let Some((server, fingerprint, serializes, plugin_owned)) =
             self.server_for_tool(tool).await
         else {
@@ -1155,6 +1789,13 @@ impl McpRuntime {
                 "MCP configuration changed while the tool was waiting; retry the call".into(),
             ));
         }
+        if let Some(record) = self.inner.servers.read().await.get(&server) {
+            record
+                .status
+                .check_available()
+                .map_err(ToolError::Unavailable)?;
+        }
+        self.ensure_healthy().map_err(ToolError::Unavailable)?;
         Ok(McpInvocationLease {
             server,
             fingerprint,
@@ -1170,62 +1811,93 @@ impl McpRuntime {
         generation: u64,
         authenticated: bool,
         force_interactive: bool,
-    ) {
-        let current_replay = {
-            let mut active_replays = self.inner.active_replays.lock().await;
-            if active_replays.get(server) == Some(&generation) {
-                active_replays.remove(server);
-                true
-            } else {
-                false
-            }
-        };
-        if !current_replay {
-            return;
-        }
-        let challenged = self.inner.challenges.lock().await.contains_key(server);
-        if !challenged {
-            return;
-        }
+        expected: Option<&Arc<OAuthSession>>,
+    ) -> bool {
+        let mut challenges = self.inner.challenges.lock().await;
+        let sessions = self.inner.oauth_sessions.lock().await;
+        let mut active = self.inner.active_replays.lock().await;
         let mut servers = self.inner.servers.write().await;
+        if !same_oauth_owner(sessions.get(server), expected) {
+            return false;
+        }
+        if active.get(server) != Some(&generation) {
+            return true;
+        }
         let Some(record) = servers
             .get_mut(server)
             .filter(|record| record.fingerprint == fingerprint)
         else {
-            return;
+            return false;
         };
-        record.status = if authenticated {
-            ServerStatus::Connected
-        } else {
-            ServerStatus::AuthenticationRequired
-        };
-        drop(servers);
-        let mut challenges = self.inner.challenges.lock().await;
-        if authenticated {
-            challenges.remove(server);
-        } else if force_interactive && let Some(challenge) = challenges.get_mut(server) {
+        let token_result = expected
+            .map(|session| session.lock_completion_tokens(generation))
+            .transpose();
+        let isolated = token_result.is_err() || !self.inner.healthy.load(Ordering::Acquire);
+        let mut next_challenges = challenges.clone();
+        let mut next_active = active.clone();
+        next_active.remove(server);
+        if isolated || authenticated {
+            next_challenges.remove(server);
+        } else if force_interactive && let Some(challenge) = next_challenges.get_mut(server) {
             challenge
                 .challenge
                 .insert("insufficient_scope".into(), Value::Bool(true));
         }
+        let next_status = if isolated || !challenges.contains_key(server) {
+            None
+        } else if authenticated {
+            Some(ServerStatus::Connected)
+        } else {
+            Some(ServerStatus::AuthenticationRequired)
+        };
+        let retired_status =
+            next_status.map(|status| std::mem::replace(&mut record.status, status));
+        let retired_challenges = std::mem::replace(&mut *challenges, next_challenges);
+        let retired_active = std::mem::replace(&mut *active, next_active);
+        drop(token_result);
+        drop(servers);
+        drop(active);
+        drop(sessions);
+        drop(challenges);
+        drop((retired_status, retired_challenges, retired_active));
+        true
     }
 
-    pub(crate) fn subscribe(&self, session_id: String) -> McpSubscription {
-        let generation = self.inner.next_event_route.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn subscribe(&self, session_id: String) -> Result<McpSubscription, String> {
+        // Prepare owned values before the commit. Generations are never reused,
+        // even when admission fails, so a stale callback cannot target a new route.
+        let route_key = session_id.clone();
+        let routes = Arc::clone(&self.inner.event_routes);
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.inner
-            .event_routes
-            .lock()
-            .expect("MCP event routes are poisoned")
-            .insert(session_id.clone(), (generation, sender));
-        McpSubscription {
+        let generation = self
+            .inner
+            .next_event_route
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| "MCP event route generation space exhausted".to_string())?;
+        // Construct the owner before publication so a retired receiver's waker
+        // unwinding also removes our newly committed route.
+        let subscription = McpSubscription {
             session_id,
             generation,
-            routes: Arc::clone(&self.inner.event_routes),
+            routes,
             receiver,
-        }
+        };
+        let retired = {
+            let mut routes = subscription
+                .routes
+                .lock()
+                .map_err(|_| "MCP event routes are poisoned".to_string())?;
+            routes.insert(route_key, (generation, sender))
+        };
+        // Dropping a sender can wake a receiver. Never do it under the map lock.
+        drop(retired);
+        Ok(subscription)
     }
 
+    // Poison fences event delivery as well as admission; it is not recovered.
+    // Missing generations intentionally suppress callbacks with no live owner.
     fn event_generation(&self, session_id: &str) -> Option<u64> {
         self.inner
             .event_routes
@@ -1248,34 +1920,12 @@ impl McpRuntime {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish(&self, session_id: &str, event: McpEvent) {
-        self.publish_to(session_id, self.event_generation(session_id), event);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn config_source_states(&self) -> Vec<(PathBuf, bool, bool)> {
-        self.inner
-            .reload
-            .lock()
-            .await
-            .sources
-            .iter()
-            .map(|state| {
-                (
-                    state.source.path.clone(),
-                    state.source.required,
-                    state.raw.is_some(),
-                )
-            })
-            .collect()
-    }
-
     pub(crate) async fn refresh(&self) -> Result<(), String> {
         self.reload_config().await
     }
 
     async fn reload_config(&self) -> Result<(), String> {
+        self.ensure_healthy()?;
         let permit = Arc::clone(&self.inner.reload_flight)
             .acquire_owned()
             .await
@@ -1327,7 +1977,12 @@ impl McpRuntime {
                 None => None,
             };
             let (plugin_prepared, plugin_entries) = match &staged_plugins {
-                Some(staged) => prepare_plugins(&staged.resolved.mcp_plugins)?,
+                Some(staged) => {
+                    let plugins = staged.resolved.mcp_plugins.clone();
+                    tokio::task::spawn_blocking(move || prepare_plugins(&plugins))
+                        .await
+                        .map_err(|error| error.to_string())??
+                }
                 None => (current_plugins, current_plugin_entries),
             };
             let mut next_sources = Vec::with_capacity(current_sources.len());
@@ -1349,11 +2004,6 @@ impl McpRuntime {
                 .filter(|name| current_entries.get(*name) != entries.get(*name))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            let deleted = current_entries
-                .keys()
-                .filter(|name| !entries.contains_key(*name))
-                .cloned()
-                .collect::<Vec<_>>();
 
             let gates = if changed.is_empty() {
                 Vec::new()
@@ -1387,8 +2037,13 @@ impl McpRuntime {
             if !changed.is_empty() {
                 initialization_guard = Some(self.inner.initialization.lock().await);
             }
-            if !changed.is_empty() {
-                let mut manager = self.inner.manager.lock().await;
+            let mut backend_publication = if changed.is_empty() {
+                None
+            } else {
+                Some(self.begin_backend_publication().await?)
+            };
+            if let Some(transaction) = &mut backend_publication {
+                let manager = transaction.backend()?;
                 for name in &changed {
                     let _ = manager.unregister_server(&McpServerId::new(name)).await;
                 }
@@ -1400,6 +2055,7 @@ impl McpRuntime {
                         );
                     }
                 }
+                transaction.release_backend();
             }
 
             // The generation writer only covers publication. Staging and MCP
@@ -1410,29 +2066,53 @@ impl McpRuntime {
                 None => None,
             };
             if !changed.is_empty() {
-                {
-                    let mut servers = self.inner.servers.write().await;
-                    for name in &changed {
-                        servers.remove(name);
-                        if let Some(server) = prepared.remove(name) {
-                            servers.insert(name.clone(), server.record);
-                        }
+                let mut challenges = self.inner.challenges.lock().await;
+                let mut pending = self.inner.pending.lock().await;
+                let mut sessions = self.inner.oauth_sessions.lock().await;
+                let mut active = self.inner.active_replays.lock().await;
+                let mut servers = self.inner.servers.write().await;
+                self.ensure_healthy()?;
+                let mut next_challenges = challenges.clone();
+                let mut next_pending = pending.clone();
+                let mut next_sessions = sessions.clone();
+                let mut next_active = active.clone();
+                let mut next_servers = servers.clone();
+                let mut retired_workers = Vec::new();
+                for name in &changed {
+                    next_challenges.remove(name);
+                    if let Some(worker) = next_pending.remove(name) {
+                        retired_workers.push(worker);
+                    }
+                    next_sessions.remove(name);
+                    next_active.remove(name);
+                    next_servers.remove(name);
+                    if let Some(server) = prepared.remove(name) {
+                        next_servers.insert(name.clone(), server.record);
                     }
                 }
-                {
-                    let mut challenges = self.inner.challenges.lock().await;
-                    let mut pending = self.inner.pending.lock().await;
-                    let mut oauth_sessions = self.inner.oauth_sessions.lock().await;
-                    let mut active_replays = self.inner.active_replays.lock().await;
-                    for name in &changed {
-                        challenges.remove(name);
-                        if let Some(pending) = pending.remove(name) {
-                            pending.abort.abort();
-                        }
-                        oauth_sessions.remove(name);
-                        active_replays.remove(name);
+                self.ensure_healthy()?;
+                // Only a validated changed configuration authorizes replacing an old owner.
+                for name in &changed {
+                    if let Some(session) = sessions.get(name) {
+                        session.isolate();
                     }
                 }
+                let retired = (
+                    std::mem::replace(&mut *challenges, next_challenges),
+                    std::mem::replace(&mut *pending, next_pending),
+                    std::mem::replace(&mut *sessions, next_sessions),
+                    std::mem::replace(&mut *active, next_active),
+                    std::mem::replace(&mut *servers, next_servers),
+                );
+                drop(servers);
+                drop(active);
+                drop(sessions);
+                drop(pending);
+                drop(challenges);
+                for worker in retired_workers {
+                    worker.abort.abort();
+                }
+                drop(retired);
             }
 
             {
@@ -1445,27 +2125,31 @@ impl McpRuntime {
                     source.publish(staged);
                 }
             }
+            if let Some(transaction) = backend_publication {
+                transaction.complete();
+            }
             drop(generation_writer);
             drop(initialization_guard);
-            if !deleted.is_empty() {
-                let mut operations = self.inner.operations.lock().await;
-                for name in deleted {
-                    operations.remove(&name);
-                }
-            }
             drop(operation_guards);
-            return Ok(());
+            drop(gates);
+            // A deleted name can still have callers holding or waiting on its
+            // gate. Keep that identity until its last owner leaves, including
+            // across deletion and re-addition of the same server name.
+            self.inner
+                .operations
+                .lock()
+                .await
+                .retain(|_, gate| gate.strong_count() > 0);
+            return self.ensure_healthy();
         }
     }
 
     fn spawn_eager_initialization(&self) {
         let runtime = self.clone();
-        tokio::spawn(async move {
-            runtime.initialize_uninitialized().await;
-        });
+        tokio::spawn(async move { runtime.initialize_uninitialized().await });
     }
 
-    async fn initialize_uninitialized(&self) {
+    async fn initialize_uninitialized(&self) -> Result<(), String> {
         let names = self
             .inner
             .servers
@@ -1474,13 +2158,14 @@ impl McpRuntime {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        self.initialize_servers(&names).await;
+        self.initialize_servers(&names).await
     }
 
     /// Connects every named server that is still `Uninitialized`: stored
     /// OAuth credentials are restored in parallel, then all connections
     /// settle concurrently. Never starts interactive authorization.
-    async fn initialize_servers(&self, names: &[String]) {
+    async fn initialize_servers(&self, names: &[String]) -> Result<(), String> {
+        self.ensure_healthy()?;
         let _initialization = self.inner.initialization.lock().await;
         let records = {
             let servers = self.inner.servers.read().await;
@@ -1495,8 +2180,20 @@ impl McpRuntime {
                 .collect::<Vec<_>>()
         };
         if records.is_empty() {
-            return;
+            return Ok(());
         }
+        let expected_owners = {
+            let sessions = self.inner.oauth_sessions.lock().await;
+            let mut owners = BTreeMap::new();
+            for (name, _) in &records {
+                let owner = sessions.get(name).cloned();
+                if let Some(owner) = &owner {
+                    owner.check_usable().map_err(|error| error.to_string())?;
+                }
+                owners.insert(name.clone(), owner);
+            }
+            owners
+        };
         let restores = futures_util::future::join_all(records.iter().map(|(name, record)| {
             let credential_storage = self.inner.credential_storage.clone();
             async move {
@@ -1528,8 +2225,9 @@ impl McpRuntime {
             }
         }
 
+        let mut publication = self.begin_backend_publication().await?;
         let settled = {
-            let mut manager = self.inner.manager.lock().await;
+            let manager = publication.backend()?;
             let mut to_connect = Vec::new();
             for name in connectable {
                 if let Some((token, _)) = restored.get(&name) {
@@ -1555,91 +2253,105 @@ impl McpRuntime {
             manager.connect_servers_settled(to_connect).await
         };
 
+        publication.release_backend();
         let restored_names = restored.keys().cloned().collect::<BTreeSet<_>>();
-        {
-            let mut sessions = self.inner.oauth_sessions.lock().await;
-            for (name, (token, oauth_manager)) in restored {
-                sessions.insert(name, Arc::new(OAuthSession::new(oauth_manager, token)));
-            }
-        }
-
-        let fingerprints = records
-            .iter()
-            .map(|(name, record)| (name.clone(), record.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let mut outcomes = BTreeMap::new();
         let (connected, failed) = settled.into_parts();
         for handle in connected {
-            let name = handle.server_id().to_string();
-            if let Some(record) = fingerprints.get(&name) {
-                self.set_status_checked(&name, &record.fingerprint, ServerStatus::Connected)
-                    .await;
-            }
+            outcomes.insert(
+                handle.server_id().to_string(),
+                (ServerStatus::Connected, Some(None)),
+            );
         }
         for failure in failed {
             let name = failure.server_id.to_string();
-            let Some(record) = fingerprints.get(&name) else {
+            let Some((_, record)) = records.iter().find(|(current, _)| current == &name) else {
                 continue;
             };
-            match failure.error {
-                McpError::AuthRequired(_) if record.static_authorization => {
-                    self.set_status_checked(
-                        &name,
-                        &record.fingerprint,
-                        ServerStatus::Error(format!(
-                            "MCP server {name} rejected its configured static authorization"
-                        )),
-                    )
-                    .await;
-                }
+            let outcome = match failure.error {
+                McpError::AuthRequired(_) if record.static_authorization => (
+                    ServerStatus::Error(format!(
+                        "MCP server {name} rejected its configured static authorization"
+                    )),
+                    None,
+                ),
                 McpError::AuthRequired(request) => {
-                    self.inner
-                        .challenges
-                        .lock()
-                        .await
-                        .insert(name.clone(), *request);
-                    self.set_status_checked(
-                        &name,
-                        &record.fingerprint,
-                        ServerStatus::AuthenticationRequired,
-                    )
-                    .await;
+                    (ServerStatus::AuthenticationRequired, Some(Some(*request)))
                 }
-                error if restored_names.contains(&name) => {
-                    self.set_status_checked(
-                        &name,
-                        &record.fingerprint,
-                        ServerStatus::Error(format!(
-                            "could not connect MCP server {name} with stored credentials: {error}"
-                        )),
-                    )
-                    .await;
-                }
-                error => {
-                    self.set_status_checked(
-                        &name,
-                        &record.fingerprint,
-                        ServerStatus::Error(format!(
-                            "could not connect MCP server {name}: {error}"
-                        )),
-                    )
-                    .await;
-                }
-            }
+                error if restored_names.contains(&name) => (
+                    ServerStatus::Error(format!(
+                        "could not connect MCP server {name} with stored credentials: {error}"
+                    )),
+                    None,
+                ),
+                error => (
+                    ServerStatus::Error(format!("could not connect MCP server {name}: {error}")),
+                    None,
+                ),
+            };
+            outcomes.insert(name, outcome);
         }
         for (name, error) in failures {
-            if let Some(record) = fingerprints.get(&name) {
-                self.set_status_checked(&name, &record.fingerprint, ServerStatus::Error(error))
-                    .await;
+            outcomes.insert(name, (ServerStatus::Error(error), None));
+        }
+        for (name, record) in records {
+            if let Some((status, challenge)) = outcomes.remove(&name) {
+                let replacement = restored
+                    .remove(&name)
+                    .map(|(token, manager)| Arc::new(OAuthSession::new(manager, token)));
+                let expected = expected_owners.get(&name).and_then(Option::as_ref);
+                self.commit_auth_state(
+                    &name,
+                    &record.fingerprint,
+                    expected,
+                    challenge,
+                    status,
+                    replacement,
+                )
+                .await?;
             }
         }
+        publication.complete();
+        Ok(())
     }
 
+    #[cfg(test)]
     async fn search(&self, query: &str) -> Result<Value, ToolError> {
+        self.search_scoped(query, schema::DiscoveryScope::testing())
+            .await
+    }
+
+    async fn search_scoped(
+        &self,
+        query: &str,
+        scope: schema::DiscoveryScope,
+    ) -> Result<Value, ToolError> {
         let prepared = PreparedQuery::new(query).ok_or_else(|| {
             ToolError::InvalidInput("query must contain a letter or number".into())
         })?;
+        let (records, available) = self.discovery_catalog().await?;
+        tokio::task::spawn_blocking(move || {
+            render_search_scoped(&prepared, &records, &available, &scope)
+        })
+        .await
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+    }
+
+    // Read-only snapshot: preserve existing lock order (servers released before manager),
+    // and never retain guards across rendering, artifact I/O, or an await.
+    async fn discovery_catalog(
+        &self,
+    ) -> Result<
+        (
+            BTreeMap<String, ServerRecord>,
+            BTreeMap<String, Vec<ToolSpec>>,
+        ),
+        ToolError,
+    > {
         self.reload_config().await.map_err(ToolError::Unavailable)?;
-        self.initialize_uninitialized().await;
+        self.initialize_uninitialized()
+            .await
+            .map_err(ToolError::Unavailable)?;
         let records = self.inner.servers.read().await.clone();
         let manager = self.inner.manager.lock().await;
         let available = records
@@ -1649,14 +2361,16 @@ impl McpRuntime {
                     .connected_server(&McpServerId::new(name))
                     .map(|handle| (name.clone(), handle.tool_registry().specs()))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect();
         drop(manager);
-        Ok(render_search(&prepared, &records, &available))
+        Ok((records, available))
     }
 
     async fn authorize(&self, name: &str, session_id: String) -> Result<Value, ToolError> {
         self.reload_config().await.map_err(ToolError::Unavailable)?;
-        self.initialize_uninitialized().await;
+        self.initialize_uninitialized()
+            .await
+            .map_err(ToolError::Unavailable)?;
         let operation = self.operation_gate(name).await;
         let _operation = tokio::time::timeout(CONNECT_TIMEOUT, operation.write())
             .await
@@ -1665,24 +2379,45 @@ impl McpRuntime {
                     "timed out waiting for an in-flight MCP operation on {name}"
                 ))
             })?;
+        let expected_owner = self.inner.oauth_sessions.lock().await.get(name).cloned();
+        if let Some(session) = &expected_owner {
+            session
+                .check_usable()
+                .map_err(|error| ToolError::Unavailable(error.to_string()))?;
+        }
         if !self.inner.interactive_oauth_enabled {
             return Err(ToolError::Unavailable(
                 "interactive MCP authentication requires the tui, serve, or acp command".into(),
             ));
         }
-        self.initialize_servers(&[name.to_string()]).await;
+        self.initialize_servers(&[name.to_string()])
+            .await
+            .map_err(ToolError::Unavailable)?;
         let _setup = self.inner.auth_setup.lock().await;
         if let Some(pending) = self.inner.pending.lock().await.get(name).cloned() {
+            self.ensure_healthy().map_err(ToolError::Unavailable)?;
+            pending.identity.check().map_err(ToolError::Unavailable)?;
+            if let Some(owner) = &expected_owner {
+                owner
+                    .check_usable()
+                    .map_err(|error| ToolError::Unavailable(error.to_string()))?;
+            }
+            if pending.expires <= Instant::now() {
+                return Err(ToolError::Unavailable(
+                    "MCP authentication flow expired; replace its configuration before reuse"
+                        .into(),
+                ));
+            }
             let remaining = pending
                 .expires
                 .saturating_duration_since(Instant::now())
                 .as_secs();
-            return Ok(json!({
-                "server": name,
-                "status": "pending",
-                "url": pending.url,
-                "expires_in_seconds": remaining
-            }));
+            return Ok(Value::Object(Map::from_iter([
+                ("server".into(), Value::from(name.to_owned())),
+                ("status".into(), Value::from("pending")),
+                ("url".into(), Value::from(pending.url.clone())),
+                ("expires_in_seconds".into(), Value::from(remaining)),
+            ])));
         }
         let record = self
             .inner
@@ -1707,17 +2442,44 @@ impl McpRuntime {
         let request = match challenge {
             Some(request) => request,
             None => {
-                let mut manager = self.inner.manager.lock().await;
-                if manager.connected_server(&McpServerId::new(name)).is_some() {
-                    return Ok(json!({"server":name,"status":"authenticated"}));
-                }
-                match manager.connect_server(&McpServerId::new(name)).await {
-                    Ok(_) => {
-                        self.set_status(name, ServerStatus::Connected).await;
-                        return Ok(json!({"server":name,"status":"authenticated"}));
+                let mut publication = self
+                    .begin_backend_publication()
+                    .await
+                    .map_err(ToolError::Unavailable)?;
+                let manager = publication.backend().map_err(ToolError::Unavailable)?;
+                let connected = if manager.connected_server(&McpServerId::new(name)).is_some() {
+                    Ok(())
+                } else {
+                    manager
+                        .connect_server(&McpServerId::new(name))
+                        .await
+                        .map(|_| ())
+                };
+                publication.release_backend();
+                match connected {
+                    Ok(()) => {
+                        self.commit_auth_state(
+                            name,
+                            &record.fingerprint,
+                            expected_owner.as_ref(),
+                            Some(None),
+                            ServerStatus::Connected,
+                            None,
+                        )
+                        .await
+                        .map_err(ToolError::Unavailable)?;
+                        publication.complete();
+                        return Ok(Value::Object(Map::from_iter([
+                            ("server".into(), Value::from(name)),
+                            ("status".into(), Value::from("authenticated")),
+                        ])));
                     }
-                    Err(McpError::AuthRequired(request)) => *request,
+                    Err(McpError::AuthRequired(request)) => {
+                        publication.complete();
+                        *request
+                    }
                     Err(error) => {
+                        publication.complete();
                         return Err(ToolError::Unavailable(format!(
                             "could not contact MCP server {name}: {error}"
                         )));
@@ -1725,11 +2487,16 @@ impl McpRuntime {
                 }
             }
         };
-        self.inner
-            .challenges
-            .lock()
-            .await
-            .insert(name.to_string(), request.clone());
+        self.commit_auth_state(
+            name,
+            &record.fingerprint,
+            expected_owner.as_ref(),
+            Some(Some(request.clone())),
+            ServerStatus::AuthenticationRequired,
+            None,
+        )
+        .await
+        .map_err(ToolError::Unavailable)?;
         let required_scope = request
             .challenge
             .get("required_scope")
@@ -1745,16 +2512,49 @@ impl McpRuntime {
         } else {
             self.inner.oauth_sessions.lock().await.get(name).cloned()
         };
-        if let Some(session) = oauth_session
-            && let Ok(token) = session.refresh(&self.inner.credential_storage).await
-            && self
-                .apply_credentials(name, request.clone(), token)
-                .await
-                .is_ok()
-        {
-            self.inner.challenges.lock().await.remove(name);
-            self.set_status(name, ServerStatus::Connected).await;
-            return Ok(json!({"server":name,"status":"authenticated"}));
+        let refreshed = match oauth_session {
+            Some(session) => match session.refresh(&self.inner.credential_storage).await {
+                Ok(token) => Some(token),
+                Err(OAuthSessionError::Refresh(_)) => None,
+                Err(error @ OAuthSessionError::RefreshFailed { .. }) => {
+                    return Err(ToolError::Unavailable(error.to_string()));
+                }
+                Err(
+                    error @ (OAuthSessionError::Isolated
+                    | OAuthSessionError::CleanupPending
+                    | OAuthSessionError::GenerationRetired),
+                ) => {
+                    return Err(ToolError::Unavailable(error.to_string()));
+                }
+            },
+            None => None,
+        };
+        let applied = match refreshed {
+            Some(token) => Some(self.apply_credentials(name, request.clone(), token).await),
+            None => None,
+        };
+        if let Some(Ok(publication)) = applied {
+            self.commit_auth_state(
+                name,
+                &record.fingerprint,
+                expected_owner.as_ref(),
+                Some(None),
+                ServerStatus::Connected,
+                None,
+            )
+            .await
+            .map_err(ToolError::Unavailable)?;
+            publication.complete();
+            return Ok(Value::Object(Map::from_iter([
+                ("server".into(), Value::from(name.to_owned())),
+                ("status".into(), Value::from("authenticated")),
+            ])));
+        }
+        self.ensure_healthy().map_err(ToolError::Unavailable)?;
+        if let Some(owner) = &expected_owner {
+            owner
+                .check_usable()
+                .map_err(|error| ToolError::Unavailable(error.to_string()))?;
         }
         let pending = auth::begin(
             &resource_url,
@@ -1765,125 +2565,241 @@ impl McpRuntime {
         )
         .await
         .map_err(ToolError::Unavailable)?;
-        let url = pending.url.clone();
-        self.set_status(name, ServerStatus::Pending).await;
-        let runtime = self.clone();
-        let server = name.to_string();
-        let fingerprint = record.fingerprint.clone();
-        let event_generation = self.event_generation(&session_id);
-        let (start, started) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            if started.await.is_ok() {
-                runtime
-                    .complete_authorization(
-                        server,
-                        fingerprint,
-                        request,
-                        pending,
-                        session_id,
-                        event_generation,
-                    )
-                    .await;
-            }
-        });
-        self.inner.pending.lock().await.insert(
+        self.start_authorization(
             name.to_string(),
-            PendingRecord {
-                url: url.clone(),
-                expires: Instant::now() + auth::FLOW_TIMEOUT,
-                fingerprint: record.fingerprint,
-                abort: task.abort_handle(),
-            },
-        );
-        let _ = start.send(());
-        Ok(json!({
-            "server": name,
-            "status": "pending",
-            "url": url,
-            "expires_in_seconds": auth::FLOW_TIMEOUT.as_secs()
-        }))
+            record.fingerprint,
+            request,
+            pending,
+            session_id,
+        )
+        .await
     }
 
-    async fn complete_authorization(
+    async fn start_authorization(
         &self,
-        server: String,
+        name: String,
         fingerprint: Vec<u8>,
         request: AuthRequest,
         pending: auth::PendingAuthorization,
         session_id: String,
-        event_generation: Option<u64>,
-    ) {
+    ) -> Result<Value, ToolError> {
+        let expected = self.inner.oauth_sessions.lock().await.get(&name).cloned();
+        let identity = Arc::new(AuthFlowState::new());
+        let url = pending.url.clone();
+        let response = Value::Object(Map::from_iter([
+            ("server".into(), Value::from(name.clone())),
+            ("status".into(), Value::from("pending")),
+            ("url".into(), Value::from(url.clone())),
+            (
+                "expires_in_seconds".into(),
+                Value::from(auth::FLOW_TIMEOUT.as_secs()),
+            ),
+        ]));
+        let mut registrations = self.inner.pending.lock().await;
+        let sessions = self.inner.oauth_sessions.lock().await;
+        let mut servers = self.inner.servers.write().await;
+        self.ensure_healthy().map_err(ToolError::Unavailable)?;
+        if registrations.contains_key(&name)
+            || !same_oauth_owner(sessions.get(&name), expected.as_ref())
+        {
+            return Err(ToolError::Unavailable(
+                "MCP authentication ownership changed during setup".into(),
+            ));
+        }
+        let tokens = expected
+            .as_ref()
+            .map(|session| session.lock_tokens())
+            .transpose()
+            .map_err(|error| ToolError::Unavailable(error.to_string()))?;
+        let record = servers
+            .get_mut(&name)
+            .filter(|record| record.fingerprint == fingerprint)
+            .ok_or_else(|| {
+                ToolError::Unavailable(
+                    "MCP configuration changed during authentication setup; retry auth".into(),
+                )
+            })?;
+        let runtime = self.clone();
+        let server = name.clone();
+        let task_fingerprint = fingerprint.clone();
+        let task_identity = Arc::clone(&identity);
+        let task_expected = expected.clone();
+        let event_generation = self.event_generation(&session_id);
+        let (start, started) = oneshot::channel();
+        let flow_obligation = AuthFlowObligation(Some(Arc::clone(&identity)));
+        let attempt = AuthorizationAttempt {
+            server,
+            fingerprint: task_fingerprint,
+            request,
+            pending,
+            session_id,
+            event_generation,
+            identity: task_identity,
+            expected: task_expected,
+        };
+        let task = tokio::spawn(async move {
+            if started.await.is_ok() && runtime.complete_authorization(attempt).await {
+                flow_obligation.complete();
+            }
+        });
+        let mut next = registrations.clone();
+        next.insert(
+            name,
+            PendingRecord {
+                identity: Arc::clone(&identity),
+                url,
+                expires: Instant::now() + auth::FLOW_TIMEOUT,
+                fingerprint,
+                abort: task.abort_handle(),
+            },
+        );
+        self.ensure_healthy().map_err(ToolError::Unavailable)?;
+        let retired_registrations = std::mem::replace(&mut *registrations, next);
+        let retired_status = std::mem::replace(
+            &mut record.status,
+            ServerStatus::Pending(Arc::clone(&identity)),
+        );
+        drop(tokens);
+        drop(servers);
+        drop(sessions);
+        drop(registrations);
+        drop((retired_registrations, retired_status));
+        let _ = start.send(());
+        Ok(response)
+    }
+
+    async fn complete_authorization(&self, attempt: AuthorizationAttempt) -> bool {
+        let AuthorizationAttempt {
+            server,
+            fingerprint,
+            request,
+            pending,
+            session_id,
+            event_generation,
+            identity,
+            expected,
+        } = attempt;
         let finished = auth::finish(pending).await;
         let operation = self.operation_gate(&server).await;
         let _operation = operation.write().await;
         let _reload = self.inner.reload.lock().await;
-        let current = self
-            .inner
-            .servers
-            .read()
-            .await
-            .get(&server)
-            .is_some_and(|record| record.fingerprint == fingerprint);
-        if !current {
-            return;
-        }
         let result = async {
-            let (token, oauth_manager) = finished?;
-            self.apply_credentials(&server, request, token.clone())
-                .await?;
-            Ok::<_, String>((oauth_manager, token))
-        }
-        .await;
-        let mut pending = self.inner.pending.lock().await;
-        if pending
-            .get(&server)
-            .is_some_and(|record| record.fingerprint == fingerprint)
-        {
-            pending.remove(&server);
-        }
-        drop(pending);
-        if result.is_ok() {
-            self.inner.challenges.lock().await.remove(&server);
-        }
-        self.set_status(
-            &server,
-            if result.is_ok() {
+            {
+                let registrations = self.inner.pending.lock().await;
+                let sessions = self.inner.oauth_sessions.lock().await;
+                let servers = self.inner.servers.read().await;
+                if !registrations.get(&server).is_some_and(|flow| {
+                    Arc::ptr_eq(&flow.identity, &identity) && flow.fingerprint == fingerprint
+                }) || !same_oauth_owner(sessions.get(&server), expected.as_ref())
+                    || servers
+                        .get(&server)
+                        .is_none_or(|record| record.fingerprint != fingerprint)
+                {
+                    return Err("MCP authentication flow was superseded".to_string());
+                }
+                if let Some(session) = &expected {
+                    session.check_usable().map_err(|error| error.to_string())?;
+                }
+            }
+            let completed = async {
+                let (token, manager) = finished?;
+                let publication = self
+                    .apply_credentials(&server, request, token.clone())
+                    .await?;
+                Ok::<_, String>((Arc::new(OAuthSession::new(manager, token)), publication))
+            }
+            .await;
+            let mut challenges = self.inner.challenges.lock().await;
+            let mut registrations = self.inner.pending.lock().await;
+            let mut sessions = self.inner.oauth_sessions.lock().await;
+            let mut servers = self.inner.servers.write().await;
+            if !registrations.get(&server).is_some_and(|flow| {
+                Arc::ptr_eq(&flow.identity, &identity) && flow.fingerprint == fingerprint
+            }) || !same_oauth_owner(sessions.get(&server), expected.as_ref())
+            {
+                return Err("MCP authentication flow changed before commit".into());
+            }
+            self.ensure_healthy()?;
+            let tokens = expected
+                .as_ref()
+                .map(|session| session.lock_tokens())
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let record = servers
+                .get_mut(&server)
+                .filter(|record| record.fingerprint == fingerprint)
+                .ok_or_else(|| {
+                    "MCP configuration changed before authentication commit".to_string()
+                })?;
+            let mut next_challenges = challenges.clone();
+            let mut next_registrations = registrations.clone();
+            let mut next_sessions = sessions.clone();
+            next_registrations.remove(&server);
+            if let Ok((session, _)) = &completed {
+                next_challenges.remove(&server);
+                next_sessions.insert(server.clone(), Arc::clone(session));
+            }
+            let status = if completed.is_ok() {
                 ServerStatus::Connected
             } else {
                 ServerStatus::AuthenticationRequired
-            },
-        )
-        .await;
-        match result {
-            Ok((manager, token)) => {
-                self.inner
-                    .oauth_sessions
-                    .lock()
-                    .await
-                    .insert(server.clone(), Arc::new(OAuthSession::new(manager, token)));
-                self.publish_to(
-                    &session_id,
-                    event_generation,
-                    McpEvent {
-                        message: format!(
-                            "MCP server {server} connected. Its tools are available now; continue the task using tool_search and tool as needed."
-                        ),
-                    },
-                );
+            };
+            if completed.is_ok()
+                && let Some(owner) = &expected
+            {
+                let state = owner.generation.load(Ordering::Acquire);
+                owner
+                    .check_phase(state)
+                    .map_err(|error| error.to_string())?;
+                owner
+                    .generation
+                    .compare_exchange(
+                        state,
+                        state | OAuthSession::ISOLATED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|_| "MCP OAuth owner changed at authentication commit".to_string())?;
             }
-            Err(error) => {
-                eprintln!("MCP authentication for {server} failed: {error}");
-                self.publish_to(
-                    &session_id,
-                    event_generation,
-                    McpEvent {
-                        message: format!(
-                            "MCP server {server} failed to connect after authentication: {error}"
-                        ),
-                    },
-                );
-            }
+            let retired = (
+                std::mem::replace(&mut *challenges, next_challenges),
+                std::mem::replace(&mut *registrations, next_registrations),
+                std::mem::replace(&mut *sessions, next_sessions),
+                std::mem::replace(&mut record.status, status),
+            );
+            drop(tokens);
+            drop(servers);
+            drop(sessions);
+            drop(registrations);
+            drop(challenges);
+            drop(retired);
+            Ok(match completed {
+                Ok((_, publication)) => {
+                    publication.complete();
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            })
         }
+        .await;
+        let (settled, message) = match result {
+            Ok(Ok(())) => (
+                true,
+                format!(
+                    "MCP server {server} connected. Its tools are available now; continue the task using tool_search and tool as needed."
+                ),
+            ),
+            Ok(Err(error)) => (
+                true,
+                format!("MCP server {server} failed to connect after authentication: {error}"),
+            ),
+            Err(error) => (
+                false,
+                format!("MCP server {server} failed to commit authentication: {error}"),
+            ),
+        };
+        self.publish_to(&session_id, event_generation, McpEvent { message });
+        settled
     }
 
     async fn apply_credentials(
@@ -1891,82 +2807,274 @@ impl McpRuntime {
         server: &str,
         request: AuthRequest,
         token: String,
-    ) -> Result<(), String> {
+    ) -> Result<BackendPublication<'_>, String> {
         let mut credentials = MetadataMap::new();
         credentials.insert("access_token".into(), Value::String(token));
-        let mut manager = self.inner.manager.lock().await;
-        manager
-            .resolve_auth(AuthResolution::provided(request, credentials))
-            .await
-            .map_err(|error| format!("could not apply MCP credentials: {error}"))?;
-        let id = McpServerId::new(server);
-        if manager.connected_server(&id).is_none() {
+        let mut publication = self.begin_backend_publication().await?;
+        let result = async {
+            let manager = publication.backend()?;
             manager
-                .connect_server(&id)
+                .resolve_auth(AuthResolution::provided(request, credentials))
                 .await
-                .map_err(|error| format!("could not connect authenticated MCP server: {error}"))?;
+                .map_err(|error| format!("could not apply MCP credentials: {error}"))?;
+            let id = McpServerId::new(server);
+            if manager.connected_server(&id).is_none() {
+                manager.connect_server(&id).await.map_err(|error| {
+                    format!("could not connect authenticated MCP server: {error}")
+                })?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        match result {
+            Ok(()) => {
+                publication.release_backend();
+                Ok(publication)
+            }
+            Err(error) => {
+                publication.complete();
+                Err(error)
+            }
+        }
     }
 
-    async fn set_status(&self, name: &str, status: ServerStatus) {
-        if let Some(record) = self.inner.servers.write().await.get_mut(name) {
-            record.status = status;
+    async fn commit_auth_state(
+        &self,
+        name: &str,
+        fingerprint: &[u8],
+        expected: Option<&Arc<OAuthSession>>,
+        challenge: Option<Option<AuthRequest>>,
+        status: ServerStatus,
+        replacement: Option<Arc<OAuthSession>>,
+    ) -> Result<(), String> {
+        let mut challenges = self.inner.challenges.lock().await;
+        let mut sessions = self.inner.oauth_sessions.lock().await;
+        let mut servers = self.inner.servers.write().await;
+        self.ensure_healthy()?;
+        if !same_oauth_owner(sessions.get(name), expected) {
+            return Err("MCP OAuth owner changed before authentication commit".into());
         }
-    }
-
-    async fn set_status_checked(&self, name: &str, fingerprint: &[u8], status: ServerStatus) {
-        if let Some(record) = self.inner.servers.write().await.get_mut(name)
-            && record.fingerprint == fingerprint
+        let tokens = expected
+            .map(|session| session.lock_tokens())
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let record = servers
+            .get_mut(name)
+            .filter(|record| record.fingerprint == fingerprint)
+            .ok_or_else(|| "MCP configuration changed before authentication commit".to_string())?;
+        record.status.check_available()?;
+        let mut next_challenges = challenges.clone();
+        let mut next_sessions = sessions.clone();
+        if let Some(challenge) = challenge {
+            match challenge {
+                Some(request) => {
+                    next_challenges.insert(name.to_string(), request);
+                }
+                None => {
+                    next_challenges.remove(name);
+                }
+            }
+        }
+        if let Some(session) = &replacement {
+            next_sessions.insert(name.to_string(), Arc::clone(session));
+        }
+        if replacement.is_some()
+            && let Some(owner) = expected
         {
-            record.status = status;
+            let state = owner.generation.load(Ordering::Acquire);
+            owner
+                .check_phase(state)
+                .map_err(|error| error.to_string())?;
+            owner
+                .generation
+                .compare_exchange(
+                    state,
+                    state | OAuthSession::ISOLATED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| "MCP OAuth owner changed at replacement commit".to_string())?;
         }
+        let retired_challenges = std::mem::replace(&mut *challenges, next_challenges);
+        let retired_sessions = std::mem::replace(&mut *sessions, next_sessions);
+        let retired_status = std::mem::replace(&mut record.status, status);
+        drop(tokens);
+        drop(servers);
+        drop(sessions);
+        drop(challenges);
+        drop((retired_challenges, retired_sessions, retired_status));
+        Ok(())
     }
 }
 
 #[derive(Clone)]
 pub struct ToolSearch {
     runtime: McpRuntime,
+    artifact_root: PathBuf,
     spec: ToolSpec,
 }
 
 impl ToolSearch {
-    pub fn new(runtime: McpRuntime) -> Self {
+    pub fn new(runtime: McpRuntime, artifact_root: PathBuf) -> Self {
         Self {
             runtime,
+            artifact_root,
             spec: ToolSpec::new(
                 ToolName::new("tool_search"),
-                "Reload the MCP config, finish connecting any servers still initializing, then rank every connected server's tools globally and return at most 5 precise matches with input schemas, grouped by server with match counts. Strongly matching servers that need authentication or failed to connect are listed without tools. The exact query `mcp` instead returns a compact status list, with omission counts if the response cap excludes tail entries.",
-                json!({"type":"object","properties":{"query":{"type":"string","description":"Capability, product, server, or tool keywords. The exact query `mcp` lists configured server statuses, subject to the reported response cap."}},"required":["query"],"additionalProperties":false}),
+                "Reload the MCP config, finish connecting any servers still initializing, then rank every connected server's tools globally and return at most 5 precise matches, grouped by server with match counts. Oversized definitions return schema_incomplete and a session-scoped schema_ref; use tool_schema to walk their canonical input schema. Long descriptions have bounded previews and description_artifact references readable with artifact. Strongly matching servers that need authentication or failed to connect are listed without tools. The exact query `mcp` instead returns a compact status list, with omission counts if the response cap excludes tail entries.",
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from_iter([(
+                            "query".into(),
+                            Value::Object(Map::from_iter([
+                                ("type".into(), Value::from("string")),
+                                (
+                                    "description".into(),
+                                    Value::from(
+                                        "Capability, product, server, or tool keywords. The exact query `mcp` lists configured server statuses, subject to the reported response cap.",
+                                    ),
+                                ),
+                            ])),
+                        )])),
+                    ),
+                    ("required".into(), Value::Array(vec![Value::from("query")])),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
             )
-            .with_output_schema(json!({
-                "type":"object",
-                "properties":{
-                    "servers":{"type":"array","items":{
-                        "type":"object",
-                        "properties":{
-                            "name":{"type":"string"},
-                            "description":{"type":"string"},
-                            "status":{"type":"string"},
-                            "error":{"type":"string"},
-                            "available_tool_count":{"type":["integer","null"]},
-                            "matched_tool_count":{"type":"integer"},
-                            "returned_tool_count":{"type":"integer"},
-                            "truncated":{"type":"boolean"},
-                            "tools":{"type":"array","items":{"type":"object"}}
-                        },
-                        "required":["name","description","status","available_tool_count"],
-                        "additionalProperties":false
-                    }},
-                    "total_matched":{"type":"integer"},
-                    "total_returned":{"type":"integer"},
-                    "total_servers":{"type":"integer"},
-                    "returned_servers":{"type":"integer"},
-                    "truncated":{"type":"boolean"}
-                },
-                "required":["servers"],
-                "additionalProperties":false
-            })),
+            .with_output_schema(Value::Object(Map::from_iter([
+                ("type".into(), Value::from("object")),
+                (
+                    "properties".into(),
+                    Value::Object(Map::from_iter([
+                        (
+                            "servers".into(),
+                            Value::Object(Map::from_iter([
+                                ("type".into(), Value::from("array")),
+                                (
+                                    "items".into(),
+                                    Value::Object(Map::from_iter([
+                                        ("type".into(), Value::from("object")),
+                                        (
+                                            "properties".into(),
+                                            Value::Object(Map::from_iter([
+                                                (
+                                                    "name".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("string"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "description".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("string"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "status".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("string"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "error".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("string"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "available_tool_count".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::Array(vec![
+                                                            Value::from("integer"),
+                                                            Value::from("null"),
+                                                        ]),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "matched_tool_count".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("integer"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "returned_tool_count".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("integer"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "truncated".into(),
+                                                    Value::Object(Map::from_iter([(
+                                                        "type".into(),
+                                                        Value::from("boolean"),
+                                                    )])),
+                                                ),
+                                                (
+                                                    "tools".into(),
+                                                    Value::Object(Map::from_iter([
+                                                        ("type".into(), Value::from("array")),
+                                                        (
+                                                            "items".into(),
+                                                            Value::Object(Map::from_iter([(
+                                                                "type".into(),
+                                                                Value::from("object"),
+                                                            )])),
+                                                        ),
+                                                    ])),
+                                                ),
+                                            ])),
+                                        ),
+                                        (
+                                            "required".into(),
+                                            Value::Array(vec![
+                                                Value::from("name"),
+                                                Value::from("description"),
+                                                Value::from("status"),
+                                                Value::from("available_tool_count"),
+                                            ]),
+                                        ),
+                                        ("additionalProperties".into(), Value::from(false)),
+                                    ])),
+                                ),
+                            ])),
+                        ),
+                        (
+                            "total_matched".into(),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                        ),
+                        (
+                            "total_returned".into(),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                        ),
+                        (
+                            "total_servers".into(),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                        ),
+                        (
+                            "returned_servers".into(),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("integer"))])),
+                        ),
+                        (
+                            "truncated".into(),
+                            Value::Object(Map::from_iter([("type".into(), Value::from("boolean"))])),
+                        ),
+                    ])),
+                ),
+                (
+                    "required".into(),
+                    Value::Array(vec![Value::from("servers")]),
+                ),
+                ("additionalProperties".into(), Value::from(false)),
+            ]))),
         }
     }
 }
@@ -1988,9 +3096,10 @@ impl Tool for ToolSearch {
         request: ToolRequest,
         _: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        let scope = schema::DiscoveryScope::new(&self.artifact_root, &request);
         let input: SearchInput = serde_json::from_value(request.input)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-        let matches = self.runtime.search(&input.query).await?;
+        let matches = self.runtime.search_scoped(&input.query, scope).await?;
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::structured(matches),
@@ -2011,9 +3120,26 @@ impl AuthTool {
             spec: ToolSpec::new(
                 ToolName::new("auth"),
                 "Reload the MCP config and start OAuth for a configured remote server. Return the URL to the user. Browser completion connects the server and notifies the originating ACP session automatically.",
-                json!({"type":"object","properties":{"name":{"type":"string","description":"Exact server name returned by tool_search."}},"required":["name"],"additionalProperties":false}),
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from_iter([(
+                            "name".into(),
+                            Value::Object(Map::from_iter([
+                                ("type".into(), Value::from("string")),
+                                (
+                                    "description".into(),
+                                    Value::from("Exact server name returned by tool_search."),
+                                ),
+                            ])),
+                        )])),
+                    ),
+                    ("required".into(), Value::Array(vec![Value::from("name")])),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
             )
-            .with_output_schema(json!({"type":"object"})),
+            .with_output_schema(Value::Object(Map::from_iter([("type".into(), Value::from("object"))]))),
         }
     }
 }
@@ -2050,43 +3176,132 @@ impl Tool for AuthTool {
 
 struct ReplayCleanup {
     session: Option<Arc<OAuthSession>>,
-    target: Option<(McpRuntime, String, Vec<u8>)>,
+    target: Option<(McpRuntime, String, Vec<u8>, tokio::runtime::Handle)>,
+    obligation: Option<CleanupObligation>,
 }
 
 impl ReplayCleanup {
+    fn empty() -> Self {
+        Self {
+            session: None,
+            target: None,
+            obligation: None,
+        }
+    }
+
     fn new(
         session: Option<Arc<OAuthSession>>,
         runtime: McpRuntime,
         target: Option<(String, Vec<u8>)>,
-    ) -> Self {
-        Self {
-            session,
-            target: target.map(|(server, fingerprint)| (runtime, server, fingerprint)),
+    ) -> Result<Self, ToolError> {
+        if let Some(session) = &session {
+            session
+                .check_usable()
+                .map_err(|error| ToolError::Unavailable(error.to_string()))?;
         }
+        let target = target
+            .map(|(server, fingerprint)| {
+                tokio::runtime::Handle::try_current()
+                    .map(|handle| (runtime, server, fingerprint, handle))
+                    .map_err(|error| {
+                        ToolError::Unavailable(format!(
+                            "MCP replay cleanup executor unavailable: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(Self {
+            session,
+            target,
+            obligation: None,
+        })
     }
 
-    fn finish(mut self, commit: bool) -> Option<u64> {
+    async fn finish(
+        mut self,
+        commit: bool,
+        authenticated: bool,
+        force_interactive: bool,
+    ) -> Result<Option<u64>, OAuthSessionError> {
+        let Some(session) = &self.session else {
+            return Ok(None);
+        };
+        let obligation = CleanupObligation::claim(session)?;
+        let generation = obligation.generation();
+        self.obligation = Some(obligation);
+        let result = session.finish_replay(generation, commit);
+        if let Some(obligation) = &self.obligation
+            && let Some((runtime, server, fingerprint, _)) = &self.target
+        {
+            let matched = runtime
+                .finish_tool_call(
+                    server,
+                    fingerprint,
+                    obligation.generation(),
+                    authenticated,
+                    force_interactive,
+                    Some(session),
+                )
+                .await;
+            if !matched {
+                // Dropping this exact obligation retires only the old owner.
+                self.target = None;
+                self.session = None;
+                return Err(OAuthSessionError::Isolated);
+            }
+        }
+        session.wait_for_refresh_settlement(generation).await?;
+        let acknowledgement = match self.obligation.take() {
+            Some(obligation) => obligation.acknowledge(),
+            None => Ok(()),
+        };
         self.target = None;
-        self.session
-            .take()
-            .and_then(|session| session.finish_replay(commit))
+        self.session = None;
+        acknowledgement?;
+        result
     }
 }
 
 impl Drop for ReplayCleanup {
     fn drop(&mut self) {
-        let generation = self
-            .session
-            .take()
-            .and_then(|session| session.finish_replay(false));
-        if let Some(generation) = generation
-            && let Some((runtime, server, fingerprint)) = self.target.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let obligation = match self.obligation.take() {
+            Some(obligation) => obligation,
+            None => match CleanupObligation::claim(&session) {
+                Ok(obligation) => obligation,
+                // Another exact-generation obligation already owns settlement.
+                // It remains recorded in the surviving owner; do not steal it.
+                Err(OAuthSessionError::CleanupPending) => return,
+                Err(_) => {
+                    session.isolate();
+                    return;
+                }
+            },
+        };
+        let _completion = session.finish_replay(obligation.generation(), false);
+        if let Some((runtime, server, fingerprint, handle)) = self.target.take() {
+            // Capture the armed obligation itself, not only its identifiers.
+            // Runtime destruction before first poll drops it and fences reuse.
             handle.spawn(async move {
-                runtime
-                    .finish_tool_call(&server, &fingerprint, generation, true, false)
-                    .await;
+                if runtime
+                    .finish_tool_call(
+                        &server,
+                        &fingerprint,
+                        obligation.generation(),
+                        true,
+                        false,
+                        Some(&session),
+                    )
+                    .await
+                    && session
+                        .wait_for_refresh_settlement(obligation.generation())
+                        .await
+                        .is_ok()
+                {
+                    let _acknowledgement = obligation.acknowledge();
+                }
             });
         }
     }
@@ -2116,7 +3331,6 @@ struct McpInvocationLease {
 struct ExecutedMcpCall {
     outcome: ToolExecutionOutcome,
     replay: ReplayCleanup,
-    server: Option<(String, Vec<u8>)>,
     _invocation: Option<McpInvocationLease>,
 }
 
@@ -2131,21 +3345,47 @@ impl McpTool {
             spec: ToolSpec::new(
                 ToolName::new("tool"),
                 "Invoke an authenticated MCP tool returned by tool_search.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "args": {"type": "object"},
-                        "timeout_seconds": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": MAX_TOOL_TIMEOUT_SECONDS,
-                            "description": "Overrides the default 60-second deadline for this call. Omit unless the tool is expected to return after the default timeout."
-                        }
-                    },
-                    "required": ["name", "args"],
-                    "additionalProperties": false
-                }),
+                Value::Object(Map::from_iter([
+                    ("type".into(), Value::from("object")),
+                    (
+                        "properties".into(),
+                        Value::Object(Map::from_iter([
+                            (
+                                "name".into(),
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("string"),
+                                )])),
+                            ),
+                            (
+                                "args".into(),
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("object"),
+                                )])),
+                            ),
+                            (
+                                "timeout_seconds".into(),
+                                Value::Object(Map::from_iter([
+                                    ("type".into(), Value::from("integer")),
+                                    ("minimum".into(), Value::from(1)),
+                                    ("maximum".into(), Value::from(MAX_TOOL_TIMEOUT_SECONDS)),
+                                    (
+                                        "description".into(),
+                                        Value::from(
+                                            "Overrides the default 60-second deadline for this call. Omit unless the tool is expected to return after the default timeout.",
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                        ])),
+                    ),
+                    (
+                        "required".into(),
+                        Value::Array(vec![Value::from("name"), Value::from("args")]),
+                    ),
+                    ("additionalProperties".into(), Value::from(false)),
+                ])),
             ),
         }
     }
@@ -2206,34 +3446,51 @@ impl McpTool {
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
         let tool_name = ToolName::new(name.clone());
-        if self.catalog.get(&tool_name).is_none() {
-            return ToolExecutionOutcome::Failed(ToolError::InvalidInput(format!(
-                "unknown MCP tool: {}",
-                tool_name.0
-            )));
-        }
         let Some(scope) = context.execution_scope.clone() else {
             return ToolExecutionOutcome::Failed(ToolError::Unavailable(
                 "tool requires an execution scope".into(),
             ));
         };
         let timeout_name = name.clone();
-        let call = tokio::time::timeout(
-            timeout,
-            self.dispatch_call(request, scope, name, tool_name, args),
-        );
+        let call = tokio::time::timeout(timeout, async {
+            // A resumed conversation can invoke a previously discovered tool
+            // without searching this attachment's fresh, lazily populated catalog.
+            if self.catalog.get(&tool_name).is_none() {
+                if let Some((server, _, _, _)) = self.runtime.server_for_tool(&name).await {
+                    self.runtime
+                        .initialize_servers(&[server])
+                        .await
+                        .map_err(ToolError::Unavailable)?;
+                }
+                if self.catalog.get(&tool_name).is_none() {
+                    return Err(ToolError::InvalidInput(format!(
+                        "unknown MCP tool: {}",
+                        tool_name.0
+                    )));
+                }
+            }
+            Ok(self
+                .dispatch_call(request, scope, name, tool_name, args)
+                .await)
+        });
         let result = if let Some(cancellation) = context.cancellation.clone() {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
+            // A ready cancellation wins a simultaneous ready result. Cancellation
+            // drops dispatch (including its process/ownership guards), but cannot
+            // prove a remote side effect did not happen; do not replay the loser.
+            let cancelled = std::pin::pin!(cancellation.cancelled());
+            let call = std::pin::pin!(call);
+            match futures_util::future::select(cancelled, call).await {
+                futures_util::future::Either::Left(((), _)) => {
                     return ToolExecutionOutcome::Failed(ToolError::Cancelled);
                 }
-                result = call => result,
+                futures_util::future::Either::Right((result, _)) => result,
             }
         } else {
             call.await
         };
         match result {
-            Ok(call) => self.finish_dispatch(call).await,
+            Ok(Ok(call)) => self.finish_dispatch(call).await,
+            Ok(Err(error)) => ToolExecutionOutcome::FailedBeforeInvocation(error),
             Err(_) => ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(format!(
                 "MCP tool {timeout_name} timed out after {} seconds; inspect remote state before retrying side effects",
                 timeout.as_secs()
@@ -2254,14 +3511,13 @@ impl McpTool {
             Err(error) => {
                 return ExecutedMcpCall {
                     outcome: ToolExecutionOutcome::FailedBeforeInvocation(error),
-                    replay: ReplayCleanup::new(None, self.runtime.clone(), None),
-                    server: None,
+                    replay: ReplayCleanup::empty(),
                     _invocation: None,
                 };
             }
         };
         let server = Some((invocation.server.clone(), invocation.fingerprint.clone()));
-        let replay = ReplayCleanup::new(
+        let replay = match ReplayCleanup::new(
             match server.as_ref() {
                 Some((server, _)) => self
                     .runtime
@@ -2275,7 +3531,16 @@ impl McpTool {
             },
             self.runtime.clone(),
             server.clone(),
-        );
+        ) {
+            Ok(replay) => replay,
+            Err(error) => {
+                return ExecutedMcpCall {
+                    outcome: ToolExecutionOutcome::FailedBeforeInvocation(error),
+                    replay: ReplayCleanup::empty(),
+                    _invocation: Some(invocation),
+                };
+            }
+        };
         let scope = ToolExecutionScope {
             executor: Arc::clone(&self.executor),
             ..scope
@@ -2295,7 +3560,6 @@ impl McpTool {
         ExecutedMcpCall {
             outcome,
             replay,
-            server,
             _invocation: Some(invocation),
         }
     }
@@ -2304,7 +3568,6 @@ impl McpTool {
         let ExecutedMcpCall {
             outcome,
             replay,
-            server,
             _invocation,
         } = call;
         let succeeded = matches!(outcome, ToolExecutionOutcome::Completed(_));
@@ -2317,19 +3580,15 @@ impl McpTool {
         let auth_not_applied = error.as_deref().is_some_and(agentkit_auth_not_applied);
         let reached_server = succeeded || error.is_some() && !auth_not_applied;
         let interrupted = matches!(outcome, ToolExecutionOutcome::Interrupted(_));
-        let replay_generation = replay.finish(reached_server);
-        if let Some(generation) = replay_generation
-            && let Some((server, fingerprint)) = server
+        if let Err(error) = replay
+            .finish(
+                reached_server,
+                interrupted || reached_server && !replay_rejected,
+                replay_rejected,
+            )
+            .await
         {
-            self.runtime
-                .finish_tool_call(
-                    &server,
-                    &fingerprint,
-                    generation,
-                    interrupted || reached_server && !replay_rejected,
-                    replay_rejected,
-                )
-                .await;
+            return ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(error.to_string()));
         }
         if replay_rejected {
             ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(
@@ -2375,11 +3634,13 @@ impl Tool for McpTool {
 pub fn empty() -> McpRuntime {
     let challenges = Arc::new(Mutex::new(BTreeMap::new()));
     let servers = Arc::new(RwLock::new(BTreeMap::new()));
+    let healthy = Arc::new(AtomicBool::new(true));
     let oauth_sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let active_replays = Arc::new(Mutex::new(BTreeMap::new()));
     let credential_storage = CredentialStorage::Memory;
     let manager = McpServerManager::new().with_handler_config(
         McpHandlerConfig::new().with_auth_responder(Arc::new(AuthRecorder {
+            healthy: Arc::clone(&healthy),
             challenges: Arc::clone(&challenges),
             servers: Arc::clone(&servers),
             oauth_sessions: Arc::clone(&oauth_sessions),
@@ -2391,7 +3652,7 @@ pub fn empty() -> McpRuntime {
         manager,
         servers,
         challenges,
-        (oauth_sessions, active_replays),
+        (oauth_sessions, active_replays, healthy),
         credential_storage,
         ReloadState {
             sources: Vec::new(),
@@ -2607,46 +3868,78 @@ fn bounded_server_text(value: &str) -> &str {
 /// connected tools globally and returns at most `SEARCH_RESULT_LIMIT` of
 /// them. Both modes drop tail results until the serialized response fits
 /// `SEARCH_RESULT_BYTE_CAP`.
+#[cfg(test)]
 fn render_search(
     query: &PreparedQuery,
     records: &BTreeMap<String, ServerRecord>,
     available: &BTreeMap<String, Vec<ToolSpec>>,
-) -> Value {
+) -> Result<Value, ToolError> {
+    render_search_scoped(
+        query,
+        records,
+        available,
+        &schema::DiscoveryScope::testing(),
+    )
+}
+
+fn render_search_scoped(
+    query: &PreparedQuery,
+    records: &BTreeMap<String, ServerRecord>,
+    available: &BTreeMap<String, Vec<ToolSpec>>,
+    scope: &schema::DiscoveryScope,
+) -> Result<Value, ToolError> {
     if query.0.normalized == "mcp" {
         let total_servers = records.len();
         let mut servers = records
             .iter()
             .map(|(name, record)| {
-                let mut entry = json!({
-                    "name": name,
-                    "description": bounded_server_text(&record.description),
-                    "status": record.status.as_str(),
-                    "available_tool_count": available.get(name).map(Vec::len),
-                });
-                if let ServerStatus::Error(error) = &record.status {
+                let mut entry = Value::Object(Map::from_iter([
+                    ("name".into(), Value::from(name.to_owned())),
+                    (
+                        "description".into(),
+                        Value::from(bounded_server_text(&record.description)),
+                    ),
+                    ("status".into(), Value::from(record.status.as_str())),
+                    (
+                        "available_tool_count".into(),
+                        available
+                            .get(name)
+                            .map(|tools| Value::from(tools.len()))
+                            .unwrap_or(Value::Null),
+                    ),
+                ]));
+                if let Some(error) = record.status.error() {
                     entry["error"] = Value::String(bounded_server_text(error).into());
                 }
                 entry
             })
             .collect::<Vec<_>>();
         loop {
-            let response = json!({
-                "returned_servers": servers.len(),
-                "servers": servers,
-                "total_servers": total_servers,
-                "truncated": servers.len() < total_servers,
-            });
+            let response = Value::Object(Map::from_iter([
+                ("returned_servers".into(), Value::from(servers.len())),
+                ("servers".into(), Value::Array(servers.clone())),
+                ("total_servers".into(), Value::from(total_servers)),
+                (
+                    "truncated".into(),
+                    Value::from(servers.len() < total_servers),
+                ),
+            ]));
             if serde_json::to_vec(&response)
-                .expect("search results serialize")
+                .map_err(|error| {
+                    ToolError::ExecutionFailed(format!(
+                        "could not encode MCP search results: {error}"
+                    ))
+                })?
                 .len()
                 <= SEARCH_RESULT_BYTE_CAP
             {
-                return response;
+                return Ok(response);
             }
-            assert!(
-                servers.pop().is_some(),
-                "empty compact search response exceeds byte cap"
-            );
+            if servers.pop().is_none() {
+                return Err(ToolError::ExecutionFailed(
+                    "empty compact MCP search response exceeds byte cap".into(),
+                ));
+            }
         }
     }
 
@@ -2698,7 +3991,7 @@ fn render_search(
             let spec = PreparedSpec::new(ToolSpec::new(
                 ToolName::new(name.as_str()),
                 &record.description,
-                json!({"type":"object"}),
+                Value::Object(Map::from_iter([("type".into(), Value::from("object"))])),
             ));
             name_matched(query, &spec).then(|| {
                 let score = score_spec(query, &spec, &vec![false; query.0.tokens.len()]);
@@ -2713,17 +4006,26 @@ fn render_search(
     let group_for = |name: &str, tools: Vec<Value>| {
         let record = &records[name];
         let matched_count = matched.get(name).copied().unwrap_or(0);
-        let mut group = json!({
-            "name": name,
-            "description": bounded_server_text(&record.description),
-            "status": record.status.as_str(),
-            "available_tool_count": available.get(name).map(Vec::len),
-            "matched_tool_count": matched_count,
-            "returned_tool_count": tools.len(),
-            "truncated": tools.len() < matched_count,
-            "tools": tools,
-        });
-        if let ServerStatus::Error(error) = &record.status {
+        let mut group = Value::Object(Map::from_iter([
+            ("name".into(), Value::from(name.to_owned())),
+            (
+                "description".into(),
+                Value::from(bounded_server_text(&record.description)),
+            ),
+            ("status".into(), Value::from(record.status.as_str())),
+            (
+                "available_tool_count".into(),
+                available
+                    .get(name)
+                    .map(|tools| Value::from(tools.len()))
+                    .unwrap_or(Value::Null),
+            ),
+            ("matched_tool_count".into(), Value::from(matched_count)),
+            ("returned_tool_count".into(), Value::from(tools.len())),
+            ("truncated".into(), Value::from(tools.len() < matched_count)),
+            ("tools".into(), Value::Array(tools)),
+        ]));
+        if let Some(error) = record.status.error() {
             group["error"] = Value::String(bounded_server_text(error).into());
         }
         group
@@ -2735,12 +4037,25 @@ fn render_search(
         .collect::<Vec<_>>();
     let total_strong_servers = strong_servers.len();
     let mut returned_strong_servers = total_strong_servers;
+    // Build each projection once: retries of the byte-budget grouping must not
+    // duplicate large prose artifacts.
+    let entries = returned
+        .iter()
+        .map(|(server, spec, _)| {
+            schema::search_entry(
+                scope,
+                server,
+                &records[server.as_str()].fingerprint,
+                &spec.spec,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     loop {
         // Group the currently returned tools by server, ordered by each
         // server's best globally ranked returned candidate.
         let mut server_order = Vec::<&str>::new();
         let mut returned_by_server = BTreeMap::<&str, Vec<Value>>::new();
-        for (server, spec, _) in &returned {
+        for ((server, _, _), entry) in returned.iter().zip(&entries) {
             let tools = match returned_by_server.entry(server.as_str()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     server_order.push(server.as_str());
@@ -2748,11 +4063,7 @@ fn render_search(
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             };
-            tools.push(json!({
-                "name": spec.spec.name.0,
-                "description": spec.spec.description,
-                "input_schema": spec.spec.input_schema,
-            }));
+            tools.push(entry.clone());
         }
         let groups = server_order
             .iter()
@@ -2766,31 +4077,89 @@ fn render_search(
                     .map(|(name, _)| group_for(name, Vec::new())),
             )
             .collect::<Vec<_>>();
-        let response = json!({
-            "servers": groups,
-            "total_matched": candidates.len(),
-            "total_returned": returned.len(),
-            "truncated": returned.len() < candidates.len()
-                || returned_strong_servers < total_strong_servers,
-        });
+        let response = Value::Object(Map::from_iter([
+            ("servers".into(), Value::Array(groups)),
+            ("total_matched".into(), Value::from(candidates.len())),
+            ("total_returned".into(), Value::from(returned.len())),
+            (
+                "truncated".into(),
+                Value::from(
+                    returned.len() < candidates.len()
+                        || returned_strong_servers < total_strong_servers,
+                ),
+            ),
+        ]));
         let serialized = serde_json::to_vec(&response)
-            .expect("search results serialize")
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("could not encode MCP search results: {error}"))
+            })?
             .len();
         if serialized <= SEARCH_RESULT_BYTE_CAP {
-            return response;
+            return Ok(response);
         }
         if returned_strong_servers > 0 {
             returned_strong_servers -= 1;
-        } else {
-            assert!(
-                returned.pop().is_some(),
-                "empty search response exceeds byte cap"
-            );
+        } else if returned.pop().is_none() {
+            return Err(ToolError::ExecutionFailed(
+                "empty MCP search response exceeds byte cap".into(),
+            ));
         }
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod test_support {
+    use super::*;
+
+    impl McpRuntime {
+        pub(crate) fn event_route_counter(&self) -> &AtomicU64 {
+            &self.inner.next_event_route
+        }
+
+        pub(crate) fn event_route_registry(&self) -> &EventRoutes {
+            &self.inner.event_routes
+        }
+
+        pub(crate) fn publish(&self, session_id: &str, event: McpEvent) {
+            self.publish_to(session_id, self.event_generation(session_id), event);
+        }
+
+        pub(crate) async fn config_source_states(&self) -> Vec<(PathBuf, bool, bool)> {
+            self.inner
+                .reload
+                .lock()
+                .await
+                .sources
+                .iter()
+                .map(|state| {
+                    (
+                        state.source.path.clone(),
+                        state.source.required,
+                        state.raw.is_some(),
+                    )
+                })
+                .collect()
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{
         collections::BTreeMap,
@@ -2804,7 +4173,7 @@ mod tests {
         AuthOperation, AuthRequest, AuthResolution, McpAuthResponder, McpTransportBinding,
     };
     use agentkit_plugins::{PluginMcpServer, PluginMcpTransport};
-    use agentkit_tools_core::{ToolName, ToolSpec};
+    use agentkit_tools_core::{ToolName, ToolSource, ToolSpec};
     use rmcp::transport::auth::{
         AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
         OAuthTokenResponse, StoredCredentials,
@@ -2817,13 +4186,154 @@ mod tests {
 
     use super::{
         AuthRecorder, Config, ConfigSource, CredentialStorage, McpTool, OAuthSession,
-        OpportunisticRefresh, PreparedQuery, PreparedSpec, ReplayCleanup, ServerRecord,
-        ServerStatus, agentkit_auth_not_applied, agentkit_replay_rejected,
+        OAuthSessionError, OpportunisticRefresh, PreparedQuery, PreparedSpec, ReplayCleanup,
+        ServerRecord, ServerStatus, agentkit_auth_not_applied, agentkit_replay_rejected,
         can_opportunistically_refresh, challenge_requires_interactive_authorization, matched_score,
         prepare_config, prepare_plugins, regular_term_score, serializes_tool_calls,
         validate_server_names,
     };
     use crate::plugins::{PluginRuntime, ResolvedPluginMcp, ResolvedPlugins};
+
+    #[cfg(unix)]
+    mod config_capacity {
+        use crate as kit;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/capacity.rs"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_reads_memory_only_target() {
+        use config_capacity::{Capacity, CapacityDisk};
+        use std::sync::atomic::AtomicBool;
+        let directory = tempfile::tempdir().unwrap();
+        let capacity = Arc::new(Capacity {
+            exhausted: AtomicBool::new(true),
+            exhaust_on_write: AtomicBool::new(false),
+            repaired: directory.path().join("repaired"),
+        });
+        let filesystem = crate::resilient_fs::Fs::new(Arc::new(CapacityDisk(capacity)));
+        let project = directory.path().join("project");
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir_all(elsewhere.join("nested")).unwrap();
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        std::os::unix::fs::symlink("config.json", &link).unwrap();
+        filesystem.write(&target, b"pending").unwrap();
+        let parent_link = project.join(".mcp.json");
+        std::os::unix::fs::symlink("../config.json", &parent_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &parent_link).unwrap(),
+            b"pending"
+        );
+
+        // `..` must follow directory symlinks before selecting the parent.
+        std::os::unix::fs::symlink(elsewhere.join("nested"), project.join("directory-link"))
+            .unwrap();
+        let indirect = project.join("indirect.json");
+        std::os::unix::fs::symlink("directory-link/../config.json", &indirect).unwrap();
+        filesystem
+            .write(elsewhere.join("config.json"), b"resolved parent")
+            .unwrap();
+        filesystem
+            .write(project.join("config.json"), b"wrong lexical parent")
+            .unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &indirect).unwrap(),
+            b"resolved parent"
+        );
+
+        // Traversal also works through an accepted, memory-only directory.
+        filesystem
+            .create_dir(directory.path().join("virtual"))
+            .unwrap();
+        let virtual_link = project.join("virtual.json");
+        std::os::unix::fs::symlink("../virtual/../config.json", &virtual_link).unwrap();
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &virtual_link).unwrap(),
+            b"pending"
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("missing/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &project.join("config.json/../config.json"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            crate::config_files::read_in(&filesystem, &link).unwrap(),
+            b"pending"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_sources_follow_symlinks_and_reload_targets() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.json");
+        let link = directory.path().join(".mcp.json");
+        let chained = directory.path().join("explicit.json");
+        std::fs::write(&target, b"first").unwrap();
+        symlink("config.json", &link).unwrap();
+        symlink(&link, &chained).unwrap();
+        for source in [
+            ConfigSource::required(chained),
+            ConfigSource::optional_project(link.clone(), directory.path().to_path_buf()),
+        ] {
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"first".to_vec())
+            );
+            crate::resilient_fs::write(&target, b"second").unwrap();
+            assert_eq!(
+                super::read_source(&source).await.unwrap(),
+                Some(b"second".to_vec())
+            );
+            std::fs::write(&target, b"first").unwrap();
+        }
+        // Security-sensitive managed reads still reject final symlinks.
+        assert_eq!(
+            crate::resilient_fs::read(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(
+            super::read_source(&ConfigSource::optional_project(
+                link.clone(),
+                directory.path().to_path_buf()
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::read_source(&ConfigSource::required(link))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_source_rejects_symlink_cycles() {
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("loop.json");
+        std::os::unix::fs::symlink("loop.json", &link).unwrap();
+        let error = super::read_source(&ConfigSource::required(link))
+            .await
+            .unwrap_err();
+        assert!(error.contains("too many symbolic links"), "{error}");
+    }
 
     fn spec(name: &str, description: &str) -> ToolSpec {
         ToolSpec::new(ToolName::new(name), description, json!({"type": "object"}))
@@ -2930,6 +4440,174 @@ mod tests {
         )
     }
 
+    async fn pending_authorization() -> super::auth::PendingAuthorization {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..read]).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let body = if path == "/resource-metadata" {
+                    json!({
+                        "resource": format!("{server_base}/mcp"),
+                        "authorization_servers": [server_base]
+                    })
+                } else {
+                    json!({
+                        "issuer": server_base,
+                        "authorization_endpoint": format!("{server_base}/authorize"),
+                        "token_endpoint": format!("{server_base}/token"),
+                        "response_types_supported": ["code"],
+                        "code_challenge_methods_supported": ["S256"]
+                    })
+                }
+                .to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let config = serde_json::from_value(json!({
+            "type": "oauth", "clientId": "kit-client"
+        }))
+        .unwrap();
+        let challenge = format!(r#"Bearer resource_metadata="{base}/resource-metadata""#);
+        let pending = super::auth::begin(
+            &format!("{base}/mcp"),
+            &config,
+            &CredentialStorage::Memory,
+            None,
+            Some(&challenge),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        pending
+    }
+
+    #[tokio::test]
+    async fn cancelled_authorization_registration_leaves_no_pending_status_or_listener() {
+        for block_pending in [true, false] {
+            let runtime = super::empty();
+            let mut record = connected_oauth_record();
+            record.status = ServerStatus::AuthenticationRequired;
+            let fingerprint = record.fingerprint.clone();
+            runtime
+                .inner
+                .servers
+                .write()
+                .await
+                .insert("remote".into(), record);
+            let pending = pending_authorization().await;
+            let url = url::Url::parse(&pending.url).unwrap();
+            let callback = url
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_uri")
+                .unwrap()
+                .1;
+            let callback = url::Url::parse(&callback).unwrap();
+            let pending_guard = if block_pending {
+                Some(runtime.inner.pending.lock().await)
+            } else {
+                None
+            };
+            let servers_guard = if block_pending {
+                None
+            } else {
+                Some(runtime.inner.servers.write().await)
+            };
+            let mut registration = Box::pin(runtime.start_authorization(
+                "remote".into(),
+                fingerprint.clone(),
+                tool_auth_request(),
+                pending,
+                "session".into(),
+            ));
+            // Poll at the real registry boundary, then cancel the caller while
+            // the selected lock is unavailable. No sleeps or production hooks.
+            assert!(futures_util::poll!(registration.as_mut()).is_pending());
+            drop(registration);
+            drop(servers_guard);
+            drop(pending_guard);
+            let records = runtime.inner.servers.read().await;
+            assert!(matches!(
+                records["remote"].status,
+                ServerStatus::AuthenticationRequired
+            ));
+            assert_eq!(records["remote"].fingerprint, fingerprint);
+            drop(records);
+            assert!(runtime.inner.pending.lock().await.is_empty());
+            assert!(
+                tokio::net::TcpStream::connect((
+                    callback.host_str().unwrap(),
+                    callback.port().unwrap()
+                ))
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_registration_rejects_stale_generation_before_publication() {
+        let runtime = super::empty();
+        let mut record = connected_oauth_record();
+        let stale = record.fingerprint.clone();
+        record.fingerprint.push(1);
+        let current = record.fingerprint.clone();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), record);
+        let result = runtime
+            .start_authorization(
+                "remote".into(),
+                stale,
+                tool_auth_request(),
+                pending_authorization().await,
+                "session".into(),
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("configuration changed")
+        );
+        assert!(runtime.inner.pending.lock().await.is_empty());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+
+        let result = runtime
+            .start_authorization(
+                "remote".into(),
+                current.clone(),
+                tool_auth_request(),
+                pending_authorization().await,
+                "session".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "pending");
+        let registrations = runtime.inner.pending.lock().await;
+        assert_eq!(registrations["remote"].fingerprint, current);
+        assert_eq!(registrations["remote"].url, result["url"].as_str().unwrap());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Pending(_)
+        ));
+        registrations["remote"].abort.abort();
+    }
+
     #[test]
     fn mcp_tool_timeout_schema_is_optional_and_has_no_schema_default() {
         let tool = McpTool::new(super::empty());
@@ -3019,16 +4697,17 @@ mod tests {
     #[tokio::test]
     async fn concurrent_tool_challenges_trigger_one_refresh_and_one_replay() {
         let challenges = Arc::new(Mutex::new(BTreeMap::new()));
-        let servers = Arc::new(RwLock::new(BTreeMap::from([(
+        let servers = Arc::new(RwLock::new(BTreeMap::from_iter([(
             "remote".into(),
             connected_oauth_record(),
         )])));
         let (session, refresh_server, _request_seen) = refreshable_oauth_session().await;
-        let oauth_sessions = Arc::new(Mutex::new(BTreeMap::from([(
+        let oauth_sessions = Arc::new(Mutex::new(BTreeMap::from_iter([(
             "remote".into(),
             Arc::clone(&session),
         )])));
         let recorder = AuthRecorder {
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             challenges: Arc::clone(&challenges),
             servers: Arc::clone(&servers),
             oauth_sessions,
@@ -3063,7 +4742,12 @@ mod tests {
             ServerStatus::Connected
         ));
         assert!(challenges.lock().await.contains_key("remote"));
-        assert!(session.finish_replay(true).is_some());
+        assert!(
+            session
+                .finish_replay(session.current_generation(), true)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3082,6 +4766,12 @@ mod tests {
             .await
             .insert("remote".into(), tool_auth_request());
         let (session, refresh_server, _request_seen) = refreshable_oauth_session().await;
+        runtime
+            .inner
+            .oauth_sessions
+            .lock()
+            .await
+            .insert("remote".into(), Arc::clone(&session));
         let refresh = session
             .opportunistic_refresh(&CredentialStorage::Memory)
             .await
@@ -3098,11 +4788,14 @@ mod tests {
             .await
             .insert("remote".into(), generation);
 
-        drop(ReplayCleanup::new(
-            Some(Arc::clone(&session)),
-            runtime.clone(),
-            Some(("remote".into(), vec![1])),
-        ));
+        drop(
+            ReplayCleanup::new(
+                Some(Arc::clone(&session)),
+                runtime.clone(),
+                Some(("remote".into(), vec![1])),
+            )
+            .unwrap(),
+        );
         tokio::task::yield_now().await;
 
         assert!(matches!(
@@ -3114,6 +4807,909 @@ mod tests {
             session.refresh(&CredentialStorage::Memory).await.unwrap(),
             "new-access"
         );
+    }
+
+    fn poison_oauth_tokens(session: &OAuthSession) {
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _tokens = session.tokens.lock().unwrap();
+            panic!("interrupted token transition");
+        }));
+        assert!(unwind.is_err());
+        assert!(session.tokens.is_poisoned());
+    }
+
+    async fn oauth_runtime(session: &Arc<OAuthSession>) -> super::McpRuntime {
+        let runtime = super::empty();
+        runtime
+            .inner
+            .servers
+            .write()
+            .await
+            .insert("remote".into(), connected_oauth_record());
+        runtime
+            .inner
+            .oauth_sessions
+            .lock()
+            .await
+            .insert("remote".into(), Arc::clone(session));
+        runtime
+    }
+
+    fn recorder_for(runtime: &super::McpRuntime) -> AuthRecorder {
+        AuthRecorder {
+            healthy: Arc::clone(&runtime.inner.healthy),
+            challenges: Arc::clone(&runtime.inner.challenges),
+            servers: Arc::clone(&runtime.inner.servers),
+            oauth_sessions: Arc::clone(&runtime.inner.oauth_sessions),
+            active_replays: Arc::clone(&runtime.inner.active_replays),
+            credential_storage: CredentialStorage::Memory,
+        }
+    }
+
+    struct PanickingCredentialStore {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        inner: InMemoryCredentialStore,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for PanickingCredentialStore {
+        async fn load(
+            &self,
+        ) -> Result<Option<StoredCredentials>, rmcp::transport::auth::AuthError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            panic!("credential backend interrupted its load");
+        }
+        async fn save(
+            &self,
+            credentials: StoredCredentials,
+        ) -> Result<(), rmcp::transport::auth::AuthError> {
+            self.inner.save(credentials).await
+        }
+        async fn clear(&self) -> Result<(), rmcp::transport::auth::AuthError> {
+            self.inner.clear().await
+        }
+    }
+
+    struct SuspendedFailingCredentialStore {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl CredentialStore for SuspendedFailingCredentialStore {
+        async fn load(
+            &self,
+        ) -> Result<Option<StoredCredentials>, rmcp::transport::auth::AuthError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(rmcp::transport::auth::AuthError::CredentialStoreError(
+                "credential backend unavailable".into(),
+            ))
+        }
+        async fn save(&self, _: StoredCredentials) -> Result<(), rmcp::transport::auth::AuthError> {
+            Err(rmcp::transport::auth::AuthError::CredentialStoreError(
+                "credential backend unavailable".into(),
+            ))
+        }
+        async fn clear(&self) -> Result<(), rmcp::transport::auth::AuthError> {
+            Err(rmcp::transport::auth::AuthError::CredentialStoreError(
+                "credential backend unavailable".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_blocks_admission_until_backend_and_cleanup_settle() {
+        let (session, unused_backend, _) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        session
+            .manager
+            .lock()
+            .await
+            .set_credential_store(SuspendedFailingCredentialStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            });
+        let replay = ReplayCleanup::new(
+            Some(Arc::clone(&session)),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        )
+        .unwrap();
+        let resolving = {
+            let recorder = recorder_for(&runtime);
+            tokio::spawn(async move { recorder.resolve(tool_auth_request()).await })
+        };
+        entered.notified().await;
+        drop(replay);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            session.check_usable(),
+            Err(OAuthSessionError::CleanupPending)
+        ));
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cleanup is pending")
+        );
+        release.notify_one();
+        assert!(
+            resolving
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled or superseded")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while matches!(
+                session.check_usable(),
+                Err(OAuthSessionError::CleanupPending)
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.check_usable().is_ok());
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(runtime.inner.active_replays.lock().await.is_empty());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+        unused_backend.abort();
+        assert!(unused_backend.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn detached_backend_panic_isolates_after_resolver_cancellation() {
+        let (session, backend, _) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        session
+            .manager
+            .lock()
+            .await
+            .set_credential_store(PanickingCredentialStore {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                inner: InMemoryCredentialStore::new(),
+            });
+        let replay = ReplayCleanup::new(
+            Some(Arc::clone(&session)),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        )
+        .unwrap();
+        let resolving = {
+            let recorder = recorder_for(&runtime);
+            tokio::spawn(async move { recorder.resolve(tool_auth_request()).await })
+        };
+        entered.notified().await;
+        resolving.abort();
+        assert!(resolving.await.unwrap_err().is_cancelled());
+        drop(replay);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(session.check_usable(), Err(OAuthSessionError::Isolated)) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !session.tokens.is_poisoned(),
+            "terminal state must not rely on sync-mutex poisoning"
+        );
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("isolated")
+        );
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(runtime.inner.active_replays.lock().await.is_empty());
+        backend.abort();
+        assert!(backend.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn isolated_resolver_rejects_without_publishing_authentication() {
+        let (session, refresh_server, mut request_seen) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let recorder = Arc::new(recorder_for(&runtime));
+        let manager = session.manager.lock().await;
+        let resolving = {
+            let recorder = Arc::clone(&recorder);
+            tokio::spawn(async move { recorder.resolve(tool_auth_request()).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.current_generation() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        poison_oauth_tokens(&session);
+        drop(manager);
+        let error = resolving.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("isolated"));
+        assert!(matches!(
+            request_seen.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        refresh_server.abort();
+        assert!(refresh_server.await.unwrap_err().is_cancelled());
+        let mut interactive = tool_auth_request();
+        interactive
+            .challenge
+            .insert("insufficient_scope".into(), Value::Bool(true));
+        assert!(
+            recorder
+                .resolve(interactive)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("isolated")
+        );
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(runtime.inner.active_replays.lock().await.is_empty());
+        assert!(matches!(
+            runtime.inner.servers.read().await["remote"].status,
+            ServerStatus::Connected
+        ));
+
+        // Exercise production dispatch admission with the real execution scope.
+        // An isolated owner must fail before reaching the nested executor.
+        use agentkit_core::{SessionId, ToolCallId, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+        };
+        let tool = McpTool::new(runtime.clone());
+        let scope = ToolExecutionScope {
+            executor: Arc::clone(&tool.executor),
+            session_id: SessionId::new("isolation"),
+            turn_id: TurnId::new("turn"),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        };
+        let request = ToolRequest::new(
+            ToolCallId::new("call"),
+            ToolName::new("tool"),
+            json!({}),
+            scope.session_id.clone(),
+            scope.turn_id.clone(),
+        );
+        let call = tool
+            .dispatch_call(
+                request,
+                scope,
+                "mcp_remote_write".into(),
+                ToolName::new("mcp_remote_write"),
+                json!({}),
+            )
+            .await;
+        assert!(matches!(tool.finish_dispatch(call).await,
+            ToolExecutionOutcome::FailedBeforeInvocation(error) if error.to_string().contains("isolated")));
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(runtime.inner.active_replays.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolated_replay_completion_and_drop_clean_only_the_owned_generation() {
+        for drop_cleanup in [false, true] {
+            let (session, refresh_server, _) = refreshable_oauth_session().await;
+            let runtime = oauth_runtime(&session).await;
+            let replay = ReplayCleanup::new(
+                Some(Arc::clone(&session)),
+                runtime.clone(),
+                Some(("remote".into(), vec![1])),
+            )
+            .unwrap();
+            assert!(matches!(
+                recorder_for(&runtime)
+                    .resolve(tool_auth_request())
+                    .await
+                    .unwrap(),
+                AuthResolution::Provided { .. }
+            ));
+            refresh_server.await.unwrap();
+            let generation = session.current_generation();
+            assert_eq!(
+                runtime.inner.active_replays.lock().await.get("remote"),
+                Some(&generation)
+            );
+            poison_oauth_tokens(&session);
+            if drop_cleanup {
+                // Drop must work without a current Tokio context and must not unwind.
+                std::thread::spawn(move || drop(replay)).join().unwrap();
+            } else {
+                assert!(matches!(
+                    replay.finish(true, true, false).await,
+                    Err(OAuthSessionError::Isolated)
+                ));
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if !runtime
+                        .inner
+                        .active_replays
+                        .lock()
+                        .await
+                        .contains_key("remote")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(runtime.inner.challenges.lock().await.is_empty());
+            assert!(matches!(
+                session.finish_replay(session.current_generation(), true),
+                Err(OAuthSessionError::Isolated)
+            ));
+            assert!(
+                recorder_for(&runtime)
+                    .resolve(tool_auth_request())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("isolated")
+            );
+            assert!(runtime.inner.challenges.lock().await.is_empty());
+            assert!(Arc::ptr_eq(
+                &runtime.inner.oauth_sessions.lock().await["remote"],
+                &session
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_isolated_cleanup_keeps_generation_owned_by_drop() {
+        let (session, backend, _) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let replay = ReplayCleanup::new(
+            Some(Arc::clone(&session)),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        )
+        .unwrap();
+        recorder_for(&runtime)
+            .resolve(tool_auth_request())
+            .await
+            .unwrap();
+        backend.await.unwrap();
+        poison_oauth_tokens(&session);
+        let challenges = runtime.inner.challenges.lock().await;
+        let mut finishing = Box::pin(replay.finish(true, true, false));
+        assert!(futures_util::poll!(finishing.as_mut()).is_pending());
+        drop(finishing);
+        drop(challenges);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.inner.active_replays.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("isolated")
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_cleanup_preserves_replacement_session_with_same_generation() {
+        let (old, old_backend, _) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&old).await;
+        let replay = ReplayCleanup::new(
+            Some(Arc::clone(&old)),
+            runtime.clone(),
+            Some(("remote".into(), vec![1])),
+        )
+        .unwrap();
+        recorder_for(&runtime)
+            .resolve(tool_auth_request())
+            .await
+            .unwrap();
+        old_backend.await.unwrap();
+        poison_oauth_tokens(&old);
+        let (replacement, replacement_backend, _) = refreshable_oauth_session().await;
+        runtime
+            .inner
+            .oauth_sessions
+            .lock()
+            .await
+            .insert("remote".into(), Arc::clone(&replacement));
+        recorder_for(&runtime)
+            .resolve(tool_auth_request())
+            .await
+            .unwrap();
+        replacement_backend.await.unwrap();
+        assert_eq!(old.current_generation(), replacement.current_generation());
+        assert!(matches!(
+            replay.finish(false, true, false).await,
+            Err(OAuthSessionError::Isolated)
+        ));
+        assert_eq!(
+            runtime.inner.active_replays.lock().await.get("remote"),
+            Some(&replacement.current_generation())
+        );
+        assert!(runtime.inner.challenges.lock().await.contains_key("remote"));
+        assert!(replacement.check_usable().is_ok());
+    }
+
+    #[tokio::test]
+    async fn poisoned_oauth_tokens_reject_refresh_without_contacting_backend() {
+        let (session, refresh_server, mut request_seen) = refreshable_oauth_session().await;
+        poison_oauth_tokens(&session);
+        assert_eq!(
+            session
+                .refresh(&CredentialStorage::Memory)
+                .await
+                .unwrap_err()
+                .to_string(),
+            OAuthSessionError::Isolated.to_string()
+        );
+        assert!(matches!(
+            session
+                .opportunistic_refresh(&CredentialStorage::Memory)
+                .await,
+            Err(OAuthSessionError::Isolated)
+        ));
+        assert!(matches!(
+            request_seen.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        refresh_server.abort();
+        assert!(refresh_server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn poisoned_oauth_waiters_never_contact_backend() {
+        for detached in [false, true] {
+            let (session, backend, mut request_seen) = refreshable_oauth_session().await;
+            let manager = session.manager.lock().await;
+            let waiting = {
+                let session = Arc::clone(&session);
+                tokio::spawn(async move {
+                    if detached {
+                        session
+                            .opportunistic_refresh(&CredentialStorage::Memory)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        session
+                            .refresh(&CredentialStorage::Memory)
+                            .await
+                            .map(|_| ())
+                    }
+                })
+            };
+            if detached {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while session.current_generation() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                tokio::task::yield_now().await;
+            }
+            poison_oauth_tokens(&session);
+            drop(manager);
+            assert!(matches!(
+                waiting.await.unwrap(),
+                Err(OAuthSessionError::Isolated)
+            ));
+            assert!(matches!(
+                request_seen.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            backend.abort();
+            assert!(backend.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_backend_is_fenced_before_queued_waiter_acquires_manager() {
+        for (detached_predecessor, detached_waiter, cancel_predecessor) in [
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+        ] {
+            let (session, unused_backend, _) = refreshable_oauth_session().await;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            session
+                .manager
+                .lock()
+                .await
+                .set_credential_store(PanickingCredentialStore {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    inner: InMemoryCredentialStore::new(),
+                });
+            let predecessor = {
+                let session = Arc::clone(&session);
+                tokio::spawn(async move {
+                    if detached_predecessor {
+                        session
+                            .opportunistic_refresh(&CredentialStorage::Memory)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        session
+                            .refresh(&CredentialStorage::Memory)
+                            .await
+                            .map(|_| ())
+                    }
+                })
+            };
+            entered.notified().await;
+            let waiter = async {
+                if detached_waiter {
+                    session
+                        .opportunistic_refresh(&CredentialStorage::Memory)
+                        .await
+                        .map(|_| ())
+                } else {
+                    session
+                        .refresh(&CredentialStorage::Memory)
+                        .await
+                        .map(|_| ())
+                }
+            };
+            tokio::pin!(waiter);
+            assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+            if cancel_predecessor || detached_predecessor {
+                predecessor.abort();
+                assert!(predecessor.await.unwrap_err().is_cancelled());
+                if detached_predecessor {
+                    release.notify_one();
+                }
+            } else {
+                release.notify_one();
+                assert!(predecessor.await.unwrap_err().is_panic());
+            }
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), waiter)
+                    .await
+                    .unwrap(),
+                Err(OAuthSessionError::Isolated)
+            ));
+            use futures_util::FutureExt;
+            assert!(
+                entered.notified().now_or_never().is_none(),
+                "queued waiter reentered interrupted credential backend"
+            );
+            unused_backend.abort();
+            assert!(unused_backend.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_lock_wait_cannot_partially_publish_a_challenge() {
+        for cancel in [false, true] {
+            let (session, backend, _) = refreshable_oauth_session().await;
+            let runtime = oauth_runtime(&session).await;
+            let active = runtime.inner.active_replays.lock().await;
+            let resolving = {
+                let recorder = recorder_for(&runtime);
+                tokio::spawn(async move { recorder.resolve(tool_auth_request()).await })
+            };
+            backend.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while runtime.inner.challenges.try_lock().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                resolving.abort();
+                assert!(resolving.await.unwrap_err().is_cancelled());
+                drop(active);
+            } else {
+                session.isolate();
+                drop(active);
+                assert!(
+                    resolving
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("isolated")
+                );
+            }
+            assert!(runtime.inner.challenges.lock().await.is_empty());
+            assert!(runtime.inner.active_replays.lock().await.is_empty());
+            assert!(matches!(
+                runtime.inner.servers.read().await["remote"].status,
+                ServerStatus::Connected
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_drop_admission_remains_terminal() {
+        let (session, backend, _) = refreshable_oauth_session().await;
+        let runtime = oauth_runtime(&session).await;
+        let obligation = super::CleanupObligation::claim(&session).unwrap();
+        assert!(matches!(
+            session.check_usable(),
+            Err(OAuthSessionError::CleanupPending)
+        ));
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cleanup is pending")
+        );
+        // Exercise the actual lock-free cleanup destructor, not a copied phase transition.
+        std::thread::spawn(move || drop(obligation)).join().unwrap();
+        assert!(matches!(
+            session.check_usable(),
+            Err(OAuthSessionError::Isolated)
+        ));
+        assert!(matches!(
+            session.check_completion(session.current_generation()),
+            Err(OAuthSessionError::Isolated)
+        ));
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("isolated")
+        );
+        // Cleanup can still own registry removal for an isolated session; admission
+        // must classify isolation ahead of its simultaneously set cleanup flag.
+        let terminal_cleanup = super::CleanupObligation::claim(&session).unwrap();
+        assert!(matches!(
+            session.check_usable(),
+            Err(OAuthSessionError::Isolated)
+        ));
+        drop(terminal_cleanup);
+        assert!(runtime.inner.challenges.lock().await.is_empty());
+        assert!(runtime.inner.active_replays.lock().await.is_empty());
+        backend.abort();
+        assert!(backend.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cleanup_claim_contends_with_reservation_without_isolating() {
+        for claim_before_snapshot in [false, true] {
+            let (session, backend, _) = refreshable_oauth_session().await;
+            let runtime = oauth_runtime(&session).await;
+            let obligation = {
+                // Reproduce the production reservation boundary: admission passed
+                // and tokens are held, but cleanup claims are independent of tokens.
+                let tokens = session.lock_tokens().unwrap();
+                let before = session
+                    .generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let owner = Arc::clone(&session);
+                let obligation =
+                    std::thread::spawn(move || super::CleanupObligation::claim(&owner))
+                        .join()
+                        .unwrap()
+                        .unwrap();
+                let observed = if claim_before_snapshot {
+                    session
+                        .generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                } else {
+                    before
+                };
+                // The two schedules exercise pre-CAS classification and CAS rejection.
+                assert!(matches!(
+                    session.reserve_generation(observed),
+                    Err(OAuthSessionError::CleanupPending)
+                ));
+                assert!(tokens.pending.is_none());
+                assert!(matches!(
+                    session.check_usable(),
+                    Err(OAuthSessionError::CleanupPending)
+                ));
+                drop(tokens);
+                obligation
+            };
+            assert!(
+                recorder_for(&runtime)
+                    .resolve(tool_auth_request())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cleanup is pending")
+            );
+            assert!(runtime.inner.challenges.lock().await.is_empty());
+            assert!(runtime.inner.active_replays.lock().await.is_empty());
+            obligation.acknowledge().unwrap();
+            assert!(session.check_usable().is_ok());
+            // Retry through the real callback: contention did not terminally fence
+            // the owner or publish an interactive fallback.
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap();
+            backend.await.unwrap();
+            assert!(session.check_usable().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_reservation_and_refresh_guard_preserve_new_generation() {
+        let (session, backend, _) = refreshable_oauth_session().await;
+        {
+            let tokens = session.lock_tokens().unwrap();
+            let first = session
+                .reserve_generation(session.current_generation())
+                .unwrap();
+            let stale = super::RefreshCompletionGuard(Some((Arc::clone(&session), first)));
+            let next = session.reserve_generation(first).unwrap();
+            assert!(matches!(
+                session.reserve_generation(first),
+                Err(OAuthSessionError::GenerationRetired)
+            ));
+            assert!(matches!(
+                session.check_completion(first),
+                Err(OAuthSessionError::GenerationRetired)
+            ));
+            drop(stale);
+            assert_eq!(session.current_generation(), next);
+            assert!(session.check_completion(next).is_ok());
+            assert!(session.check_usable().is_ok());
+            assert!(tokens.pending.is_none());
+        }
+        // The same failed CAS must classify an interrupted owner as isolated,
+        // rather than stale or ordinary contention.
+        let tokens = session.lock_tokens().unwrap();
+        let previous = session
+            .generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cleanup = super::CleanupObligation::claim(&session).unwrap();
+        drop(cleanup);
+        assert!(matches!(
+            session.reserve_generation(previous),
+            Err(OAuthSessionError::Isolated)
+        ));
+        drop(tokens);
+        backend.abort();
+        assert!(backend.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn cleanup_executor_shutdown_fences_a_surviving_mcp_owner() {
+        for wait_on_lock in [false, true] {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (runtime, session, held) = executor.block_on(async {
+                let (session, backend, _) = refreshable_oauth_session().await;
+                let runtime = oauth_runtime(&session).await;
+                let replay = ReplayCleanup::new(
+                    Some(Arc::clone(&session)),
+                    runtime.clone(),
+                    Some(("remote".into(), vec![1])),
+                )
+                .unwrap();
+                recorder_for(&runtime)
+                    .resolve(tool_auth_request())
+                    .await
+                    .unwrap();
+                backend.await.unwrap();
+                let held = if wait_on_lock {
+                    Some(Arc::clone(&runtime.inner.challenges).lock_owned().await)
+                } else {
+                    None
+                };
+                drop(replay);
+                if wait_on_lock {
+                    tokio::task::yield_now().await;
+                }
+                assert!(matches!(
+                    session.check_usable(),
+                    Err(OAuthSessionError::CleanupPending)
+                ));
+                // No suspension in the false branch: the cleanup future is unpolled.
+                (runtime, session, held)
+            });
+            drop(executor);
+            drop(held);
+            assert!(matches!(
+                session.check_usable(),
+                Err(OAuthSessionError::Isolated)
+            ));
+            let replacement_executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            replacement_executor.block_on(async {
+                let before = runtime.inner.challenges.lock().await.clone();
+                assert!(
+                    recorder_for(&runtime)
+                        .resolve(tool_auth_request())
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("isolated")
+                );
+                assert_eq!(*runtime.inner.challenges.lock().await, before);
+                assert!(matches!(
+                    session.refresh(&CredentialStorage::Memory).await,
+                    Err(OAuthSessionError::Isolated)
+                ));
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn obsolete_cleanup_ack_and_drop_do_not_change_replacement_owner() {
+        for acknowledge in [false, true] {
+            let (old, old_backend, _) = refreshable_oauth_session().await;
+            let runtime = oauth_runtime(&old).await;
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap();
+            old_backend.await.unwrap();
+            let obligation = super::CleanupObligation::claim(&old).unwrap();
+            let (replacement, backend, _) = refreshable_oauth_session().await;
+            runtime
+                .inner
+                .oauth_sessions
+                .lock()
+                .await
+                .insert("remote".into(), Arc::clone(&replacement));
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap();
+            backend.await.unwrap();
+            assert_eq!(old.current_generation(), replacement.current_generation());
+            if acknowledge {
+                obligation.acknowledge().unwrap();
+            } else {
+                drop(obligation);
+            }
+            assert!(replacement.check_usable().is_ok());
+            assert!(
+                runtime
+                    .inner
+                    .active_replays
+                    .lock()
+                    .await
+                    .contains_key("remote")
+            );
+            assert!(runtime.inner.challenges.lock().await.contains_key("remote"));
+        }
     }
 
     #[tokio::test]
@@ -3133,7 +5729,12 @@ mod tests {
             Err(error) => assert!(error.is_cancelled()),
             Ok(_) => panic!("refresh caller was not cancelled"),
         }
-        assert!(session.finish_replay(false).is_some());
+        assert!(
+            session
+                .finish_replay(session.current_generation(), false)
+                .unwrap()
+                .is_some()
+        );
         refresh_server.await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -3194,11 +5795,14 @@ mod tests {
             .await
             .insert("remote".into(), generation.wrapping_add(1));
 
-        drop(ReplayCleanup::new(
-            Some(session),
-            runtime.clone(),
-            Some(("remote".into(), vec![1])),
-        ));
+        drop(
+            ReplayCleanup::new(
+                Some(session),
+                runtime.clone(),
+                Some(("remote".into(), vec![1])),
+            )
+            .unwrap(),
+        );
         tokio::task::yield_now().await;
 
         assert!(matches!(
@@ -3311,7 +5915,7 @@ mod tests {
             .insert("remote".into(), 1);
 
         runtime
-            .finish_tool_call("remote", &[1], 1, false, true)
+            .finish_tool_call("remote", &[1], 1, false, true, None)
             .await;
 
         assert!(matches!(
@@ -3519,6 +6123,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_reload_publication_fences_the_surviving_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let pending = runtime.inner.pending.lock().await;
+        std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"unused"}}}"#).unwrap();
+        let worker = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.reload_config_inner().await })
+        };
+        // Backend registration precedes this genuine publication lock boundary.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.inner.challenges.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(pending);
+        assert!(runtime.ensure_healthy().is_err());
+        assert!(runtime.inner.servers.read().await.is_empty());
+        assert!(
+            runtime
+                .reload_config()
+                .await
+                .unwrap_err()
+                .contains("interrupted")
+        );
+        assert!(
+            runtime
+                .search("mcp")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted")
+        );
+        assert!(
+            recorder_for(&runtime)
+                .resolve(tool_auth_request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted")
+        );
+    }
+
+    #[test]
+    fn abandoned_authorization_worker_is_terminal_across_executors() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let runtime = executor.block_on(async {
+            let runtime = super::empty();
+            let mut record = connected_oauth_record();
+            record.status = ServerStatus::AuthenticationRequired;
+            runtime
+                .inner
+                .servers
+                .write()
+                .await
+                .insert("remote".into(), record);
+            let pending = pending_authorization().await;
+            runtime
+                .start_authorization(
+                    "remote".into(),
+                    vec![1],
+                    tool_auth_request(),
+                    pending,
+                    "session".into(),
+                )
+                .await
+                .unwrap();
+            // No subsequent await: the registered worker need not have been polled.
+            runtime
+        });
+        drop(executor);
+        let replacement = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        replacement.block_on(async {
+            assert!(
+                runtime
+                    .authorize("remote", "session".into())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lost its worker")
+            );
+            assert!(
+                recorder_for(&runtime)
+                    .resolve(tool_auth_request())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lost its worker")
+            );
+            let response = runtime.search("mcp").await.unwrap();
+            assert_eq!(response["servers"][0]["status"], "error");
+            assert!(
+                response["servers"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lost its worker")
+            );
+            assert!(runtime.inner.challenges.lock().await.is_empty());
+        });
+    }
+
+    #[tokio::test]
     async fn cancelled_reload_caller_does_not_strand_completion() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp.json");
@@ -3558,7 +6278,7 @@ mod tests {
 
     #[test]
     fn overlapping_server_names_are_rejected() {
-        let names = BTreeMap::from([("foo".to_string(), ()), ("foo_bar".to_string(), ())]);
+        let names = BTreeMap::from_iter([("foo".to_string(), ()), ("foo_bar".to_string(), ())]);
         assert!(
             validate_server_names(names.keys())
                 .unwrap_err()
@@ -3616,7 +6336,7 @@ mod tests {
 
     #[test]
     fn unconnected_servers_appear_only_on_a_name_match() {
-        let records = BTreeMap::from([(
+        let records = BTreeMap::from_iter([(
             "linear".to_string(),
             search_record(
                 "Issues and project management",
@@ -3628,11 +6348,12 @@ mod tests {
         // Full description coverage is not enough for a server without
         // returned tools.
         let response =
-            super::render_search(&query("issues project management"), &records, &available);
+            super::render_search(&query("issues project management"), &records, &available)
+                .unwrap();
         assert_eq!(response["servers"], json!([]));
         assert_eq!(response["total_matched"], 0);
 
-        let response = super::render_search(&query("linear"), &records, &available);
+        let response = super::render_search(&query("linear"), &records, &available).unwrap();
         assert_eq!(response["servers"][0]["name"], "linear");
         assert_eq!(response["servers"][0]["status"], "authentication_required");
         assert_eq!(response["servers"][0]["available_tool_count"], Value::Null);
@@ -3641,7 +6362,7 @@ mod tests {
 
     #[test]
     fn search_returns_at_most_five_tools_globally_with_counts() {
-        let records = BTreeMap::from([(
+        let records = BTreeMap::from_iter([(
             "issues".to_string(),
             search_record("Issue tracker", ServerStatus::Connected),
         )]);
@@ -3654,9 +6375,9 @@ mod tests {
                 .with_output_schema(json!({"type": "object"}))
             })
             .collect::<Vec<_>>();
-        let available = BTreeMap::from([("issues".to_string(), specs)]);
+        let available = BTreeMap::from_iter([("issues".to_string(), specs)]);
 
-        let response = super::render_search(&query("linear issues"), &records, &available);
+        let response = super::render_search(&query("linear issues"), &records, &available).unwrap();
         assert_eq!(response["total_matched"], 8);
         assert_eq!(response["total_returned"], 5);
         assert_eq!(response["truncated"], true);
@@ -3677,7 +6398,7 @@ mod tests {
 
     #[test]
     fn server_groups_follow_global_rank_and_require_a_returned_tool() {
-        let records = BTreeMap::from([
+        let records = BTreeMap::from_iter([
             (
                 "alpha".to_string(),
                 search_record("File helpers", ServerStatus::Connected),
@@ -3695,7 +6416,7 @@ mod tests {
                 search_record("Remote files", ServerStatus::AuthenticationRequired),
             ),
         ]);
-        let available = BTreeMap::from([
+        let available = BTreeMap::from_iter([
             (
                 "alpha".to_string(),
                 (1..=5)
@@ -3712,7 +6433,7 @@ mod tests {
             ),
         ]);
 
-        let response = super::render_search(&query("files"), &records, &available);
+        let response = super::render_search(&query("files"), &records, &available).unwrap();
         let names = response["servers"]
             .as_array()
             .unwrap()
@@ -3736,12 +6457,12 @@ mod tests {
     }
 
     #[test]
-    fn oversized_results_drop_the_lowest_ranked_tools() {
-        let records = BTreeMap::from([(
+    fn oversized_results_retain_lower_ranked_tools_as_schema_stubs() {
+        let records = BTreeMap::from_iter([(
             "files".to_string(),
             search_record("File tools", ServerStatus::Connected),
         )]);
-        let available = BTreeMap::from([(
+        let available = BTreeMap::from_iter([(
             "files".to_string(),
             vec![
                 spec("mcp_files_read", "Read files"),
@@ -3753,18 +6474,20 @@ mod tests {
             ],
         )]);
 
-        let response = super::render_search(&query("files"), &records, &available);
+        let response = super::render_search(&query("files"), &records, &available).unwrap();
         assert!(
             serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP,
             "the serialized response respects the byte cap"
         );
         assert_eq!(response["total_matched"], 2);
-        assert_eq!(response["total_returned"], 1);
-        assert_eq!(response["truncated"], true);
+        assert_eq!(response["total_returned"], 2);
+        assert_eq!(response["truncated"], false);
         let group = &response["servers"][0];
-        assert_eq!(group["returned_tool_count"], 1);
-        assert_eq!(group["truncated"], true);
+        assert_eq!(group["returned_tool_count"], 2);
+        assert_eq!(group["truncated"], false);
         assert_eq!(group["tools"][0]["name"], "mcp_files_read");
+        assert_eq!(group["tools"][1]["schema_incomplete"], true);
+        assert!(group["tools"][1]["schema_ref"].is_string());
     }
 
     #[test]
@@ -3774,7 +6497,7 @@ mod tests {
             "x".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP - 1),
             "y".repeat(super::SEARCH_SERVER_TEXT_BYTE_CAP)
         );
-        let mut records = BTreeMap::from([(
+        let mut records = BTreeMap::from_iter([(
             "files".to_string(),
             search_record("File tools", ServerStatus::Connected),
         )]);
@@ -3784,12 +6507,12 @@ mod tests {
                 search_record(&huge_text, ServerStatus::Error(huge_text.clone())),
             );
         }
-        let available = BTreeMap::from([(
+        let available = BTreeMap::from_iter([(
             "files".to_string(),
             vec![spec("mcp_files_read", "Read files")],
         )]);
 
-        let response = super::render_search(&query("files"), &records, &available);
+        let response = super::render_search(&query("files"), &records, &available).unwrap();
         assert!(serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP);
         assert_eq!(response["total_matched"], 1);
         assert_eq!(response["total_returned"], 1);
@@ -3824,7 +6547,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
-        let response = super::render_search(&query("McP"), &records, &BTreeMap::new());
+        let response = super::render_search(&query("McP"), &records, &BTreeMap::new()).unwrap();
         assert!(serde_json::to_vec(&response).unwrap().len() <= super::SEARCH_RESULT_BYTE_CAP);
         assert_eq!(response["total_servers"], records.len());
         let returned = response["returned_servers"].as_u64().unwrap() as usize;
@@ -3988,7 +6711,7 @@ mod tests {
                 transport: PluginMcpTransport::Stdio {
                     command: "./bin/server".into(),
                     args: vec!["${PLUGIN_DATA}/db".into()],
-                    env: std::collections::BTreeMap::from([(
+                    env: std::collections::BTreeMap::from_iter([(
                         "ROOT_COPY".into(),
                         "${PLUGIN_ROOT}".into(),
                     )]),
@@ -4064,7 +6787,7 @@ mod tests {
                     name: "remote".into(),
                     transport: PluginMcpTransport::StreamableHttp {
                         url: "https://example.com/mcp".into(),
-                        headers: std::collections::BTreeMap::from([(
+                        headers: std::collections::BTreeMap::from_iter([(
                             "x-path".into(),
                             "${PLUGIN_ROOT}".into(),
                         )]),
@@ -4174,6 +6897,756 @@ mod tests {
         assert_eq!(
             runtime.inner.servers.read().await["shared"].description,
             "tools-manifest plugin MCP server"
+        );
+    }
+
+    fn session_server(name: &str) -> agentkit_acp::McpServer {
+        serde_json::from_value(json!({
+            "name": name, "command": "/kit-test-missing-session-command",
+            "args": ["session-argument"],
+            "env": [{"name": "SESSION_SECRET", "value": "memory-only-secret"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_overlay_is_isolated_and_survives_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let original = r#"{"mcpServers":{"configured":{"command":"kit-test-missing-command"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let first = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let second = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let empty = base
+            .with_session_servers(vec![], directory.path())
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&base.inner, &first.inner));
+        assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+        assert!(!Arc::ptr_eq(&base.inner, &empty.inner));
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+        assert!(!empty.inner.servers.read().await.contains_key("local"));
+        first.reload_config().await.unwrap();
+        let state = first.inner.reload.lock().await;
+        let (prepared, _) =
+            super::prepare_sources(&state.sources, &state.plugins, &state.plugin_entries).unwrap();
+        assert!(prepared.contains_key("configured"));
+        let McpTransportBinding::Stdio(stdio) = &prepared["local"].config.transport else {
+            panic!("expected stdio");
+        };
+        assert_eq!(stdio.cwd.as_deref(), Some(directory.path()));
+        assert_eq!(stdio.args, ["session-argument"]);
+        assert_eq!(
+            stdio
+                .env
+                .iter()
+                .find(|(name, _)| name == "SESSION_SECRET")
+                .map(|(_, value)| value.as_str()),
+            Some("memory-only-secret")
+        );
+        drop(state);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_overlay_rejects_invalid_requests_without_mutating_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = super::connect(None::<&Path>, &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        let duplicate_env = serde_json::from_value(json!({
+            "name": "local", "command": "/missing", "args": [],
+            "env": [{"name": "KEY", "value": "secret-one"}, {"name": "KEY", "value": "secret-two"}]
+        }))
+        .unwrap();
+        let http = serde_json::from_value(json!({"type": "http", "name": "http", "url": "https://example.invalid/mcp", "headers": []})).unwrap();
+        let sse = serde_json::from_value(json!({"type": "sse", "name": "sse", "url": "https://example.invalid/sse", "headers": []})).unwrap();
+        for servers in [
+            vec![session_server("local"), session_server("local")],
+            vec![duplicate_env],
+            vec![http],
+            vec![sse],
+            vec![session_server("")],
+        ] {
+            let error = match base.with_session_servers(servers, directory.path()).await {
+                Ok(_) => panic!("invalid session servers accepted"),
+                Err(error) => error,
+            };
+            assert!(!error.contains("secret-one"));
+            assert!(!error.contains("secret-two"));
+        }
+        assert!(base.inner.servers.read().await.is_empty());
+        base.with_session_servers(vec![session_server("valid")], directory.path())
+            .await
+            .unwrap();
+    }
+
+    // Real MCP discovery transport; application calls are deliberately rejected.
+    #[cfg(unix)]
+    async fn schema_api_fixture(
+        directory: &Path,
+        schema: &Value,
+        description: &str,
+    ) -> (super::McpRuntime, Value) {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        with open(sys.argv[1]) as catalog:
+            result = {'tools': json.load(catalog)}
+    else:
+        raise RuntimeError('Unexpected application call: ' + method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        std::fs::write(
+            directory.join("catalog.json"),
+            json!([
+                {"name":"inspect", "description":description, "inputSchema":schema}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let config = json!({"mcpServers":{"local":{"command":"/usr/bin/env",
+            "args":["python3","-u","-c",script,directory.join("catalog.json")]}}});
+        let path = directory.join("mcp.json");
+        std::fs::write(&path, config.to_string()).unwrap();
+        let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        (runtime, config)
+    }
+
+    #[cfg(unix)]
+    async fn schema_api_invoke(
+        tool: &dyn agentkit_tools_core::Tool,
+        session: &str,
+        input: Value,
+    ) -> Result<Value, agentkit_tools_core::ToolError> {
+        use agentkit_core::{SessionId, ToolOutput, TurnId};
+        use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext, ToolRequest};
+        let context = OwnedToolContext {
+            session_id: SessionId::new(session),
+            turn_id: TurnId::new("turn"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+            execution_scope: None,
+            approved_request: None,
+        };
+        let result = tool
+            .invoke(
+                ToolRequest::new(
+                    "discovery",
+                    tool.spec().name.clone(),
+                    input,
+                    session,
+                    "turn",
+                ),
+                &mut context.borrowed(),
+            )
+            .await?;
+        assert!(!result.result.is_error);
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("expected structured discovery output");
+        };
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 32 * 1024);
+        Ok(value)
+    }
+
+    #[cfg(unix)]
+    async fn schema_api_read_text(
+        tool: &crate::tools::artifact::ArtifactTool,
+        path: &Value,
+    ) -> String {
+        let mut offset = 0;
+        let mut text = String::new();
+        loop {
+            let page = schema_api_invoke(
+                tool,
+                "owner",
+                json!({"path":path,"offset":offset,"limit":1023}),
+            )
+            .await
+            .unwrap();
+            text.push_str(page["content"].as_str().unwrap());
+            let next = page["next_offset"].as_u64().unwrap();
+            assert!(next > offset);
+            assert_eq!(next as usize, text.len());
+            if page["eof"] == true {
+                assert_eq!(page["total_bytes"].as_u64().unwrap(), next);
+                break;
+            }
+            offset = next;
+        }
+        text
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_api_oversized_utf8_descriptions_are_lossless_and_session_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = "🦀é東京\"\\\n".repeat(5000);
+        let schema = json!({"type":"object","properties":{"nested":{"type":"object",
+            "properties":{"leaf":{"type":"string","description":text}}}}});
+        assert!(schema.to_string().len() > 32 * 1024);
+        let (runtime, _) = schema_api_fixture(directory.path(), &schema, &text).await;
+        let search = super::ToolSearch::new(runtime.clone(), directory.path().into());
+        let walker = super::ToolSchema::new(runtime.clone(), directory.path().into());
+        let reader = crate::tools::artifact::ArtifactTool::new(directory.path().into());
+        let found = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        assert_eq!(found["total_returned"], 1);
+        let entry = &found["servers"][0]["tools"][0];
+        assert_eq!(entry["schema_incomplete"], true);
+        assert!(entry.get("input_schema").is_none());
+        let reference = entry["schema_ref"].as_str().unwrap();
+        assert_eq!(entry["description_truncated"], true);
+        assert!(text.starts_with(entry["description"].as_str().unwrap()));
+        let leaf = schema_api_invoke(
+            &walker,
+            "owner",
+            json!({"schema_ref":reference,"pointer":"/properties/nested/properties/leaf"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(leaf["node"]["description_truncated"], true);
+        for artifact in [
+            &entry["description_artifact"],
+            &leaf["node"]["description_artifact"],
+        ] {
+            assert_eq!(artifact["total_bytes"], text.len());
+            assert_eq!(schema_api_read_text(&reader, &artifact["path"]).await, text);
+            assert!(
+                schema_api_invoke(&reader, "foreign", json!({"path":artifact["path"]}))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            schema_api_invoke(&walker, "foreign", json!({"schema_ref":reference}))
+                .await
+                .is_err()
+        );
+        let foreign = schema_api_invoke(&search, "foreign", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let foreign_ref = &foreign["servers"][0]["tools"][0]["schema_ref"];
+        assert_ne!(foreign_ref, reference);
+        schema_api_invoke(&walker, "foreign", json!({"schema_ref":foreign_ref}))
+            .await
+            .unwrap();
+        assert!(
+            schema_api_invoke(&walker, "owner", json!({"schema_ref":foreign_ref}))
+                .await
+                .is_err()
+        );
+        let canonical = runtime
+            .catalog()
+            .get(&ToolName::new("mcp_local_inspect"))
+            .unwrap();
+        assert_eq!(canonical.spec().input_schema, schema);
+        assert_eq!(canonical.spec().description, text);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn schema_api_walks_canonical_keywords_and_pages_wide_nodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let properties: serde_json::Map<String, Value> = (0..97)
+            .map(|index| {
+                (
+                    format!("field-{index:03}"),
+                    json!({"description":"é🦀".repeat(400),"type":"string"}),
+                )
+            })
+            .collect();
+        let schema = json!({"type":"object","properties":properties,
+            "$defs":{"a/b~c":{"anyOf":[{"type":"string"},{"type":"null"}]}},
+            "allOf":[{"$ref":"#/$defs/a~1b~0c"}],
+            "oneOf":[{"const":true},{"const":false}],
+            "enum":["é",7,null,false],"x-unknown":{"a/b~c":{"$dynamicRef":"#node"}}});
+        let (runtime, mut config) =
+            schema_api_fixture(directory.path(), &schema, "Inspect schema").await;
+        let search = super::ToolSearch::new(runtime.clone(), directory.path().into());
+        let walker = super::ToolSchema::new(runtime.clone(), directory.path().into());
+        let found = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let reference = &found["servers"][0]["tools"][0]["schema_ref"];
+        for (pointer, expected) in [
+            ("/allOf/0/$ref", json!("#/$defs/a~1b~0c")),
+            ("/$defs/a~1b~0c/anyOf/1/type", json!("null")),
+            ("/oneOf/0/const", json!(true)),
+            ("/enum/0", json!("é")),
+            ("/enum/1", json!(7)),
+            ("/enum/2", Value::Null),
+            ("/enum/3", json!(false)),
+            ("/x-unknown/a~1b~0c/$dynamicRef", json!("#node")),
+        ] {
+            let node = schema_api_invoke(
+                &walker,
+                "owner",
+                json!({"schema_ref":reference,"pointer":pointer}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(node["node"]["value"], expected, "{pointer}");
+            assert_eq!(node["children"], json!([]));
+            assert_eq!(node["incomplete"], false);
+        }
+        let root = schema_api_invoke(&walker, "owner", json!({"schema_ref":reference}))
+            .await
+            .unwrap();
+        assert!(
+            root["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|child| child["pointer"] == "/x-unknown")
+        );
+        let mut offset = 0;
+        let mut pointers = Vec::new();
+        loop {
+            let page = schema_api_invoke(
+                &walker,
+                "owner",
+                json!({"schema_ref":reference,"pointer":"/properties","offset":offset,"limit":32}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page["total_children"], 97);
+            let children = page["children"].as_array().unwrap();
+            assert!(!children.is_empty());
+            assert!(children.len() <= 32);
+            pointers.extend(
+                children
+                    .iter()
+                    .map(|child| child["pointer"].as_str().unwrap().to_owned()),
+            );
+            if let Some(next) = page["next_offset"].as_u64() {
+                assert_eq!(page["children_incomplete"], true);
+                assert_eq!(next, offset + children.len() as u64);
+                offset = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            pointers,
+            (0..97)
+                .map(|index| format!("/properties/field-{index:03}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runtime
+                .catalog()
+                .get(&ToolName::new("mcp_local_inspect"))
+                .unwrap()
+                .spec()
+                .input_schema,
+            schema
+        );
+        // Reload a changed real catalog and configured server identity.
+        config["mcpServers"]["local"]["args"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("revision-two"));
+        std::fs::write(directory.path().join("catalog.json"), json!([{"name":"inspect","description":"Changed schema","inputSchema":{"type":"object","description":"changed".repeat(6000)}}]).to_string()).unwrap();
+        std::fs::write(directory.path().join("mcp.json"), config.to_string()).unwrap();
+        let refreshed = schema_api_invoke(&search, "owner", json!({"query":"inspect"}))
+            .await
+            .unwrap();
+        let new_ref = &refreshed["servers"][0]["tools"][0]["schema_ref"];
+        assert!(new_ref.is_string());
+        assert_ne!(reference, new_ref);
+        assert!(
+            schema_api_invoke(&walker, "owner", json!({"schema_ref":reference}))
+                .await
+                .is_err()
+        );
+        schema_api_invoke(&walker, "owner", json!({"schema_ref":new_ref}))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn session_stdio_fixture(directory: &Path, value: &str) -> agentkit_acp::McpServer {
+        // A real line-delimited JSON-RPC stdio server. Its marker is an external
+        // process effect, not instrumentation in the production runtime.
+        let script = r#"
+import json, os, sys
+with open(os.environ['MARKER'], 'w') as marker:
+    marker.write('started')
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'inspect', 'description': 'Inspect session environment', 'inputSchema': {'type': 'object'}}]}
+    elif method == 'tools/call':
+        data = {'value': os.environ['SESSION_VALUE'], 'cwd': os.getcwd(), 'pid': os.getpid()}
+        result = {'content': [{'type': 'text', 'text': json.dumps(data)}], 'structuredContent': data, 'isError': False}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        serde_json::from_value(json!({
+            "name": "local", "command": "/usr/bin/env", "args": ["python3", "-u", "-c", script],
+            "env": [
+                {"name": "SESSION_VALUE", "value": value},
+                {"name": "MARKER", "value": directory.join(format!("{value}.started"))}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn call_session_stdio(runtime: &super::McpRuntime) -> Value {
+        use agentkit_core::{SessionId, ToolOutput, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, Tool, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+        };
+        let tool = McpTool::new(runtime.clone());
+        let scope = ToolExecutionScope {
+            executor: Arc::clone(&tool.executor),
+            session_id: SessionId::new("fixture"),
+            turn_id: TurnId::new("turn"),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        };
+        let context = scope.nested_context(MetadataMap::new());
+        let request = ToolRequest::new(
+            "call",
+            "tool",
+            json!({"name": "mcp_local_inspect", "args": {}}),
+            "fixture",
+            "turn",
+        );
+        let outcome = tool.invoke_outcome(request, &mut context.borrowed()).await;
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("stdio call did not complete: {outcome:?}");
+        };
+        assert!(!result.result.is_error);
+        let ToolOutput::Structured(value) = result.result.output else {
+            panic!("expected structured MCP response");
+        };
+        value
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_stdio_is_lazy_and_executes_in_isolation() {
+        use agentkit_tools_core::ToolSource;
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let path = cwd.join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+
+        let abandoned = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "abandoned")], &cwd)
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&abandoned.inner);
+        drop(abandoned);
+        // A detached initializer would retain the runtime even before polling.
+        assert!(weak.upgrade().is_none());
+        assert!(!cwd.join("abandoned.started").exists());
+        assert!(
+            base.with_session_servers(
+                vec![
+                    session_stdio_fixture(&cwd, "rejected"),
+                    session_stdio_fixture(&cwd, "duplicate")
+                ],
+                &cwd
+            )
+            .await
+            .is_err()
+        );
+        assert!(!cwd.join("rejected.started").exists());
+        assert!(!cwd.join("duplicate.started").exists());
+
+        let first = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "first")], &cwd)
+            .await
+            .unwrap();
+        let second = base
+            .with_session_servers(vec![session_stdio_fixture(&cwd, "second")], &cwd)
+            .await
+            .unwrap();
+        assert!(!cwd.join("first.started").exists());
+        assert!(!cwd.join("second.started").exists());
+        let found = first.search("inspect").await.unwrap();
+        assert_eq!(found["servers"][0]["status"], "authenticated");
+        assert!(cwd.join("first.started").exists());
+        assert!(!cwd.join("second.started").exists());
+        // Reattachment has a fresh catalog, but remembers the discovered name.
+        // Direct invocation must initialize only this attachment's server.
+        let first_result = call_session_stdio(&first).await;
+        let second_result = call_session_stdio(&second).await;
+        assert_eq!(first_result["value"], "first");
+        assert_eq!(second_result["value"], "second");
+        assert_eq!(first_result["cwd"], cwd.to_str().unwrap());
+        assert_eq!(second_result["cwd"], cwd.to_str().unwrap());
+        assert_ne!(first_result["pid"], second_result["pid"]);
+
+        // Only the refreshed overlay observes a configured-source addition.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"added":{"command":"kit-test-missing-command"}}}"#,
+        )
+        .unwrap();
+        first.reload_config().await.unwrap();
+        assert!(first.inner.servers.read().await.contains_key("added"));
+        assert!(!second.inner.servers.read().await.contains_key("added"));
+        assert!(base.inner.servers.read().await.is_empty());
+        assert_eq!(call_session_stdio(&first).await, first_result);
+        assert_eq!(call_session_stdio(&second).await, second_result);
+        assert!(
+            base.catalog()
+                .get(&agentkit_tools_core::ToolName::new("mcp_local_inspect"))
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_lazy_invocation_interrupts_initialization() {
+        use agentkit_core::{CancellationController, SessionId, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, Tool, ToolError, ToolExecutionOutcome, ToolExecutionScope,
+            ToolRequest,
+        };
+
+        for cancel in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().canonicalize().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let agentkit_acp::McpServer::Stdio(mut server) = session_stdio_fixture(&cwd, "blocked")
+            else {
+                unreachable!();
+            };
+            // Signal at the actual initialize request, then withhold the response.
+            // This exercises cancellation/timeout at the external stdio boundary.
+            server.args[3] = server.args[3].replace(
+                "if method == 'initialize':",
+                &format!(
+                    "if method == 'initialize':\n        import socket\n        signal = socket.create_connection(('127.0.0.1', {}))\n        sys.stdin.read()\n        sys.exit(0)",
+                    listener.local_addr().unwrap().port()
+                ),
+            );
+            let runtime = super::empty()
+                .with_session_servers(vec![agentkit_acp::McpServer::Stdio(server)], &cwd)
+                .await
+                .unwrap();
+            let tool = McpTool::new(runtime.clone());
+            let controller = CancellationController::new();
+            let scope = ToolExecutionScope {
+                executor: Arc::clone(&tool.executor),
+                session_id: SessionId::new("fixture"),
+                turn_id: TurnId::new("turn"),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+            };
+            let mut context = scope.nested_context(MetadataMap::new());
+            context.cancellation = Some(controller.handle().checkpoint());
+            let request = ToolRequest::new(
+                "call",
+                "tool",
+                json!({"name": "mcp_local_inspect", "args": {}, "timeout_seconds": 1}),
+                "fixture",
+                "turn",
+            );
+            let mut borrowed = context.borrowed();
+            let (outcome, ()) =
+                tokio::join!(tool.invoke_outcome(request.clone(), &mut borrowed), async {
+                    let _connection =
+                        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    if cancel {
+                        controller.interrupt();
+                    }
+                });
+            if cancel {
+                assert!(matches!(
+                    outcome,
+                    ToolExecutionOutcome::Failed(ToolError::Cancelled)
+                ));
+            } else {
+                assert!(
+                    matches!(outcome, ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(ref error)) if error.contains("timed out"))
+                );
+            }
+            // Incomplete backend publication must fence subsequent real calls.
+            let context = scope.nested_context(MetadataMap::new());
+            assert!(matches!(
+                tool.invoke(request, &mut context.borrowed()).await,
+                Err(ToolError::Unavailable(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_overlay_direct_invocation_initializes_configured_server_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let path = cwd.join("mcp.json");
+        let agentkit_acp::McpServer::Stdio(configured) = session_stdio_fixture(&cwd, "configured")
+        else {
+            unreachable!();
+        };
+        let env = configured
+            .env
+            .into_iter()
+            .map(|variable| (variable.name, Value::String(variable.value)))
+            .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"mcpServers": {"local": {
+                "command": configured.command, "args": configured.args, "env": env
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        base.search("inspect").await.unwrap();
+        let original = call_session_stdio(&base).await;
+        std::fs::remove_file(cwd.join("configured.started")).unwrap();
+
+        let agentkit_acp::McpServer::Stdio(mut unrelated) =
+            session_stdio_fixture(&cwd, "unrelated")
+        else {
+            unreachable!();
+        };
+        unrelated.name = "other".into();
+        let attached = base
+            .with_session_servers(vec![agentkit_acp::McpServer::Stdio(unrelated)], &cwd)
+            .await
+            .unwrap();
+        assert!(!cwd.join("configured.started").exists());
+        assert!(!cwd.join("unrelated.started").exists());
+        let result = call_session_stdio(&attached).await;
+        assert_eq!(result["value"], "configured");
+        assert_ne!(result["pid"], original["pid"]);
+        assert!(cwd.join("configured.started").exists());
+        assert!(!cwd.join("unrelated.started").exists());
+    }
+
+    #[tokio::test]
+    async fn session_overlay_preserves_plugin_snapshot_and_rejects_plugin_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let plugin = plugin(
+            "tools",
+            directory.path(),
+            vec![PluginMcpServer {
+                name: "plugin-local".into(),
+                transport: PluginMcpTransport::Stdio {
+                    command: "kit-test-missing-plugin".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    cwd: None,
+                },
+            }],
+        );
+        let base = super::connect(None::<&Path>, &[plugin], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert!(
+            base.with_session_servers(vec![session_server("plugin-local")], directory.path())
+                .await
+                .is_err()
+        );
+        let overlay = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        overlay.reload_config().await.unwrap();
+        let records = overlay.inner.servers.read().await;
+        assert!(records["plugin-local"].plugin_owned);
+        assert!(!records["local"].plugin_owned);
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+    }
+
+    #[tokio::test]
+    async fn session_overlay_collision_rejects_refresh_without_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"configured":{"command":"missing"}}}"#,
+        )
+        .unwrap();
+        let base = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        assert!(
+            base.with_session_servers(vec![session_server("configured")], directory.path())
+                .await
+                .is_err()
+        );
+        let overlay = base
+            .with_session_servers(vec![session_server("local")], directory.path())
+            .await
+            .unwrap();
+        let before = overlay.inner.reload.lock().await.entries.clone();
+        std::fs::write(&path, r#"{"mcpServers":{"local":{"command":"missing"}}}"#).unwrap();
+        assert!(
+            overlay
+                .reload_config()
+                .await
+                .unwrap_err()
+                .contains("conflicts")
+        );
+        assert_eq!(overlay.inner.reload.lock().await.entries, before);
+        assert!(
+            overlay
+                .inner
+                .servers
+                .read()
+                .await
+                .contains_key("configured")
+        );
+        assert!(!base.inner.servers.read().await.contains_key("local"));
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        overlay.reload_config().await.unwrap();
+        assert!(overlay.inner.servers.read().await.contains_key("local"));
+        assert!(
+            !overlay
+                .inner
+                .servers
+                .read()
+                .await
+                .contains_key("configured")
         );
     }
 
@@ -4355,6 +7828,33 @@ mod tests {
         let record = runtime.inner.servers.read().await["shared"].clone();
         assert_eq!(record.description, "tools-manifest plugin MCP server");
         assert_eq!(record.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    #[tokio::test]
+    async fn removed_server_operation_gate_remains_shared_with_existing_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mcp.json");
+        let config = r#"{"mcpServers":{"removed":{"command":"unused"}}}"#;
+        std::fs::write(&path, config).unwrap();
+        let runtime = super::connect(Some(&path), &[], true, CredentialStorage::Memory)
+            .await
+            .unwrap();
+        // Model a caller that fetched the gate but has not acquired it yet.
+        let existing = runtime.operation_gate("removed").await;
+
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        runtime.reload_config().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &existing,
+            &runtime.operation_gate("removed").await
+        ));
+
+        std::fs::write(&path, config).unwrap();
+        runtime.reload_config().await.unwrap();
+        let replacement = runtime.operation_gate("removed").await;
+        assert!(Arc::ptr_eq(&existing, &replacement));
+        let _held = existing.read().await;
+        assert!(replacement.try_write().is_err());
     }
 
     #[tokio::test]
@@ -4624,10 +8124,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_cancellation_tie_and_pending_loser_release_invocation() {
+        use agentkit_core::{
+            CancellationController, SessionId, ToolOutput, ToolResultPart, TurnId,
+        };
+        use agentkit_tools_core::{
+            AllowAllPermissions, BasicToolExecutor, Tool, ToolContext, ToolError,
+            ToolExecutionOutcome, ToolExecutionScope, ToolRequest, ToolResult, ToolSource,
+            dynamic_catalog,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        // Fake only the external tool boundary. Its effect is intentionally not
+        // rolled back when the caller drops a pending response.
+        struct EffectTool {
+            spec: ToolSpec,
+            applied: Arc<AtomicBool>,
+            pending: bool,
+        }
+        #[async_trait::async_trait]
+        impl Tool for EffectTool {
+            fn spec(&self) -> &ToolSpec {
+                &self.spec
+            }
+            async fn invoke(
+                &self,
+                request: ToolRequest,
+                _: &mut ToolContext<'_>,
+            ) -> Result<ToolResult, ToolError> {
+                self.applied.store(true, Ordering::Relaxed);
+                if self.pending {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ToolResult::new(ToolResultPart::success(
+                    request.call_id,
+                    ToolOutput::text("applied"),
+                )))
+            }
+        }
+
+        for (pre_cancelled, pending) in [(true, false), (false, true), (false, false)] {
+            let runtime = super::empty();
+            runtime
+                .inner
+                .servers
+                .write()
+                .await
+                .insert("remote".into(), connected_oauth_record());
+            let applied = Arc::new(AtomicBool::new(false));
+            let (writer, catalog) = dynamic_catalog("test-remote");
+            writer.upsert(Arc::new(EffectTool {
+                spec: spec("mcp_remote_write", "write"),
+                applied: Arc::clone(&applied),
+                pending,
+            }));
+            let mut tool = McpTool::new(runtime.clone());
+            tool.catalog = catalog.clone();
+            tool.executor = Arc::new(BasicToolExecutor::new([
+                Arc::new(catalog) as Arc<dyn ToolSource>
+            ]));
+            let controller = CancellationController::new();
+            let cancellation = controller.handle().checkpoint();
+            let scope = ToolExecutionScope {
+                executor: Arc::clone(&tool.executor),
+                session_id: SessionId::new("session"),
+                turn_id: TurnId::new("turn"),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+            };
+            let mut context = scope.nested_context(MetadataMap::new());
+            context.cancellation = Some(cancellation);
+            let request = ToolRequest::new(
+                "call",
+                "tool",
+                json!({"name":"mcp_remote_write", "args":{}}),
+                "session",
+                "turn",
+            );
+            let gate = runtime.operation_gate("remote").await;
+            if pre_cancelled {
+                controller.interrupt();
+            }
+            let mut borrowed = context.borrowed();
+            let mut dispatch = std::pin::pin!(tool.dispatch(request, &mut borrowed));
+            if pending {
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(std::future::Future::poll(dispatch.as_mut(), &mut cx).is_pending());
+                assert!(applied.load(Ordering::Relaxed));
+                assert!(
+                    gate.try_write().is_err(),
+                    "in-flight dispatch must own the invocation gate"
+                );
+                controller.interrupt();
+            }
+            let outcome = if pending {
+                dispatch.await
+            } else {
+                // Both the uncancelled control and cancellation winner must be
+                // ready on their first poll, not merely complete eventually.
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                match std::future::Future::poll(dispatch.as_mut(), &mut cx) {
+                    std::task::Poll::Ready(outcome) => outcome,
+                    std::task::Poll::Pending => panic!("ready dispatch unexpectedly suspended"),
+                }
+            };
+            if pre_cancelled || pending {
+                assert!(matches!(
+                    outcome,
+                    ToolExecutionOutcome::Failed(ToolError::Cancelled)
+                ));
+            } else {
+                assert!(matches!(outcome, ToolExecutionOutcome::Completed(_)));
+            }
+            assert_eq!(applied.load(Ordering::Relaxed), !pre_cancelled);
+            assert!(
+                gate.try_write().is_ok(),
+                "the dispatch loser retained its invocation lease"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn event_route_exhaustion_preserves_the_last_owner() {
+        let runtime = super::empty();
+        runtime
+            .event_route_counter()
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        let mut owner = runtime.subscribe("session".into()).unwrap();
+        let generation = runtime.event_generation("session");
+        assert_eq!(generation, Some(u64::MAX - 1));
+        for id in ["session", "another"] {
+            assert!(matches!(runtime.subscribe(id.into()), Err(error)
+                if error == "MCP event route generation space exhausted"));
+            assert_eq!(
+                runtime.event_route_counter().load(Ordering::Relaxed),
+                u64::MAX
+            );
+            assert_eq!(runtime.event_generation("session"), generation);
+            assert_eq!(runtime.event_generation("another"), None);
+        }
+        runtime.publish_to(
+            "session",
+            generation,
+            super::McpEvent {
+                message: "still owned".into(),
+            },
+        );
+        assert_eq!(owner.recv().await.unwrap().message, "still owned");
+        drop(owner);
+        assert!(runtime.event_route_registry().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn event_route_poison_fences_admission_delivery_and_cleanup() {
+        let runtime = super::empty();
+        let mut owner = runtime.subscribe("session".into()).unwrap();
+        let generation = owner.generation;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _routes = runtime.event_route_registry().lock().unwrap();
+                panic!("interrupted route transition");
+            }))
+            .is_err()
+        );
+        assert!(matches!(runtime.subscribe("session".into()), Err(error)
+            if error == "MCP event routes are poisoned"));
+        assert_eq!(runtime.event_generation("session"), None);
+        runtime.publish_to(
+            "session",
+            Some(generation),
+            super::McpEvent {
+                message: "fenced".into(),
+            },
+        );
+        assert!(matches!(
+            owner.receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(owner);
+        assert!(runtime.event_route_registry().is_poisoned());
+        // Inspection only: production never recovers or changes this isolated map.
+        let routes = runtime
+            .event_route_registry()
+            .lock()
+            .unwrap_err()
+            .into_inner();
+        assert_eq!(routes["session"].0, generation);
+        assert!(routes["session"].1.is_closed());
+    }
+
+    #[test]
+    fn event_route_replacement_waker_unwind_releases_new_owner() {
+        struct PanickingWake;
+        impl std::task::Wake for PanickingWake {
+            fn wake(self: Arc<Self>) {
+                panic!("receiver waker failed");
+            }
+        }
+        let runtime = super::empty();
+        let mut old = runtime.subscribe("session".into()).unwrap();
+        let waker = std::task::Waker::from(Arc::new(PanickingWake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(old.receiver.poll_recv(&mut context).is_pending());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _replacement = runtime.subscribe("session".into()).unwrap();
+            }))
+            .is_err()
+        );
+        assert!(!runtime.event_route_registry().is_poisoned());
+        assert!(runtime.event_route_registry().lock().unwrap().is_empty());
+        let replacement = runtime.subscribe("session".into()).unwrap();
+        drop(old);
+        assert_eq!(
+            runtime.event_generation("session"),
+            Some(replacement.generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_event_route_wakes_outside_lock_and_stale_drop_preserves_owner() {
+        struct RouteWake {
+            routes: super::EventRoutes,
+            unlocked: std::sync::atomic::AtomicBool,
+        }
+        impl std::task::Wake for RouteWake {
+            fn wake(self: Arc<Self>) {
+                self.unlocked
+                    .store(self.routes.try_lock().is_ok(), Ordering::Relaxed);
+            }
+        }
+        let runtime = super::empty();
+        let mut old = runtime.subscribe("session".into()).unwrap();
+        let stale = Some(old.generation);
+        let wake = Arc::new(RouteWake {
+            routes: Arc::clone(runtime.event_route_registry()),
+            unlocked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(old.receiver.poll_recv(&mut context).is_pending());
+        let mut replacement = runtime.subscribe("session".into()).unwrap();
+        assert!(wake.unlocked.load(Ordering::Relaxed));
+        assert!(old.recv().await.is_none());
+        drop(old);
+        runtime.publish_to(
+            "session",
+            stale,
+            super::McpEvent {
+                message: "stale".into(),
+            },
+        );
+        assert!(matches!(
+            replacement.receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        runtime.publish_to(
+            "session",
+            runtime.event_generation("session"),
+            super::McpEvent {
+                message: "replacement".into(),
+            },
+        );
+        assert_eq!(replacement.recv().await.unwrap().message, "replacement");
+        drop(replacement);
+        assert!(runtime.event_route_registry().lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn completion_events_are_routed_to_one_session() {
         let runtime = super::empty();
-        let mut first = runtime.subscribe("first".into());
-        let mut second = runtime.subscribe("second".into());
+        let mut first = runtime.subscribe("first".into()).unwrap();
+        let mut second = runtime.subscribe("second".into()).unwrap();
         runtime.publish_to(
             "first",
             runtime.event_generation("first"),
@@ -4644,7 +8413,7 @@ mod tests {
 
         let generation = runtime.event_generation("first");
         drop(first);
-        let mut replacement = runtime.subscribe("first".into());
+        let mut replacement = runtime.subscribe("first".into()).unwrap();
         runtime.publish_to(
             "first",
             generation,
@@ -4732,7 +8501,7 @@ mod tests {
                 name: "plugin-header".into(),
                 transport: PluginMcpTransport::StreamableHttp {
                     url: format!("http://{address}/plugin"),
-                    headers: std::collections::BTreeMap::from([(
+                    headers: std::collections::BTreeMap::from_iter([(
                         "Authorization".into(),
                         "Bearer static".into(),
                     )]),

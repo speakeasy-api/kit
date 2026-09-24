@@ -37,6 +37,7 @@ fork_release = option("--fork-release")
 prompt_release = option("--prompt-release")
 prompt_release_text = option("--prompt-release-text")
 inject_release = option("--inject-release")
+inject_ack_release = option("--inject-ack-release")
 close_release = option("--close-release")
 close_release_session = option("--close-release-session")
 fail_close_session = option("--fail-close-session")
@@ -293,12 +294,20 @@ def inject(request):
     global next_injection
     params = request["params"]
     text = next((block.get("text", "") for block in params["content"] if block.get("type") == "text"), "")
+    if "MOCK_AUTH_INJECT" in text:
+        send({"jsonrpc": "2.0", "id": request["id"], "error": {
+            "code": -32000, "message": "remote-secret-message",
+            "data": {"methodId": "selected-login", "token": "remote-secret-data"},
+        }})
+        return
     if "MOCK_REJECT_INJECT" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "injection rejected"}})
         return
     with state_lock:
         message_id = f"injected-{next_injection}"
         next_injection += 1
+    while inject_ack_release is not None and not os.path.exists(inject_ack_release):
+        time.sleep(0.01)
     respond(request["id"], {"messageId": message_id})
     while inject_release is not None and not os.path.exists(inject_release):
         time.sleep(0.01)
@@ -346,6 +355,7 @@ for line in sys.stdin:
         respond(request["id"], {
             "protocolVersion": int(option("--protocol-version") or "2"),
             "info": {"name": "mock-acp", "version": "2.0.0"},
+            "authMethods": [{"type": "agent", "methodId": "browser-login", "name": "secret-name", "description": "secret-description"}],
             "capabilities": {"session": {
                 "prompt": {name: {} for name in prompt_capability_names if name},
                 **({"inject": {"modes": ["steer"], "steerInStream": ["finish"]}} if supports_steer else {}),

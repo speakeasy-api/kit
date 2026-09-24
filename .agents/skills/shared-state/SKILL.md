@@ -1,0 +1,14 @@
+---
+name: shared-state
+description: MUST use whenever adding or editing shared state protected by a Mutex, RwLock, or async lock, including guarded transitions, lock acquisition, poison recovery, and coordinated registries or counters.
+---
+
+# Shared state
+
+1. Before editing, list the guarded invariants and ALL writers: normal methods, callbacks, destructors, unwind cleanup, cancellation, and coordinated objects or registries. Inspect lock ordering and every await while a guard or ownership claim is live. Keep a bounded inventory of owners, guarantees, findings, and unresolved blockers.
+2. Design each transition to leave valid state on success, rejection, error, unwind, and cancellation. Prepare fallible or panicking work before the commit where feasible. Commit complete valid state without exposing intermediate invalid combinations. Use private ownership, rollback, repair, or typed-error isolation when justified; rollback must itself be safe during unwind and must account for external effects.
+3. Release guards before dropping replaced values or invoking arbitrary callbacks when those operations can panic, reenter, or acquire other locks. Include implicit drops, trait implementations, backend calls, and wakeups in the analysis. Mutex exclusion and a single assignment do not prove consistency across objects or external effects. Memory safety is not logical consistency.
+4. Recover a poisoned lock with `into_inner` ONLY beside an explicit invariant argument covering EVERY guarded transition and any external state it coordinates. Standard-library poisoning is advisory, not a correctness mechanism; async locks may not poison at all. Preserve invariants across unwind and cancellation for both. If they cannot survive failure, redesign, repair, or isolate the owner with a typed error; never assert that recovery is safe without evidence.
+5. Do not blanket-replace `expect` with poison recovery or defaults, use production `catch_unwind`, introduce a generic recovery wrapper, or switch to a non-poisoning lock crate to conceal inconsistent state. Do not enable global panic lints as part of a shared-state fix.
+6. Add failure-path tests for changed invariants: rejected and failed commits, unwind at real callback/backend boundaries, poison behavior, cancellation at suspension points, stale generations, and cleanup/drop ordering as applicable. Assert subsequent state and cross-owner effects, not just absence of panic. Use test-only modules and fakes at real boundaries; no test-specific production branches, counters, or hooks. Test-only `catch_unwind` may observe unwinding.
+7. Run focused tests and formatting/lint checks. Get an independent review of the invariant arguments, code, and failure tests. Report audited coverage and residual blockers honestly; do not claim a repository-wide guarantee from a bounded audit.

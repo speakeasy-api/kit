@@ -32,7 +32,7 @@ Retries repeat the body. Do not retry a write unless repeating it is safe or the
 
 Background calls no longer hold their originating turn open, and interrupting that turn does not stop them. When a call detaches, the model receives its tool-call ID and can stop it with `close({ call_id: "call_..." })`. Cancellation is delivered through the same result lifecycle as completion, as a failed result reporting that tool execution was cancelled.
 
-The TUI keeps every running call visible. A running compose card shows its Runlet source inline, with live call states, binding resolution, and loop or retry counts. Completion replaces the source with the compose output. Unless the user explicitly opened or closed it, the output collapses when a later tool call or model message arrives and remains available from the tool card. Completion or failure is delivered back to the owning session and wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
+The TUI keeps every running call visible. A running compose card groups its canonical ACP child tool calls. Its Runlet source is available as a bounded, neutral view; the display does not infer binding, loop, or retry state. Completion replaces the source with the compose output. Unless the user explicitly opened or closed it, the output collapses when a later tool call or model message arrives and remains available from the tool card. Completion or failure is delivered back to the owning session and wakes the session loop directly without inserting synthetic user content. Background work is process- and session-scoped rather than a durable operating-system job, so closing Kit ends its inspectable lifetime.
 
 ## Ordering, dependencies, and concurrency
 
@@ -84,6 +84,52 @@ Only the final compose return value crosses the model-context boundary. When its
 
 Kit's working directory is project context, not an operating-system security boundary. A shell command can use absolute paths, `..`, the network, and any credentials or files allowed to the Kit process. Quote untrusted values, inspect destructive commands before running them, and avoid putting secrets into command text or returned output. There is no automatic rollback for shell side effects.
 
+## Read spilled output with `artifact`
+
+Large compose results include an `artifact` path. Read it through `artifact`, which sees both persisted files and output temporarily held in Kit's memory filesystem. Shell commands only see real disk files.
+
+```text
+chunk = artifact({ path: output.artifact, offset: 0, limit: 1024 })
+return chunk
+```
+
+The result contains `content`, `next_offset`, `total_bytes`, and `eof`. Continue from `next_offset` to read another chunk. Reads preserve UTF-8 character boundaries and are limited to 1,024 bytes per call. Only artifacts in the calling session's namespace are accepted; traversal and symlinks are rejected.
+
+An artifact-storage error does not turn an already-completed tool into a failed tool call. Kit returns a bounded preview with `artifact_error` when output cannot be retained. Do not repeat a side-effecting tool merely to obtain its output again.
+
+## Return images with `read_file`
+
+`read_file` is a hidden compose callable, not another model-exposed tool. It imports a local image into Kit-managed storage and returns a small JSON **File reference**, not a base64 string. Its `path` field is the full absolute path to the original standalone image bytes, ready for `shell` commands such as `mv`:
+
+```text
+image = read_file({ path: "screenshot.png" })
+return { screenshot: image }
+```
+
+Only File references reachable from the final return deliver pixels to the parent model. A reference used only in an intermediate binding does not attach its image. Arrays and nested objects work; repeated references deliver one image, labeled with its first position as an escaped JSON Pointer. Every occurrence must have valid metadata, including duplicates. The whole selection is validated before any image is delivered.
+
+The initial reader supports **nonanimated PNG and JPEG**. It sniffs content rather than trusting the extension, rejects corrupt images and nonregular files, and reads at most 8 MiB. An image can have at most 8,192 pixels on either axis, 16 megapixels, and a 64 MiB decoder allocation. GIF, WebP, animated PNG, SVG, PDF, URLs, and text files are unsupported. Use `shell` for ordinary text reads. Relative paths resolve from Kit's working directory; absolute paths follow the Kit process's filesystem access, not a new project sandbox.
+
+Imports preserve the original bytes, metadata, and orientation. Width and height describe the encoded raster. There is no automatic transformation or export, and importing never overwrites the source.
+
+### Delivery limits and provider support
+
+A final compose return can select at most 8 distinct images, 16 MiB of encoded image bytes, and 32 megapixels in total. Selection traversal is bounded to 100,000 JSON nodes, depth 64, and 64 reference occurrences, with position labels bounded to 2 KiB each and 4 KiB in total. These limits are separate from the **8 KiB text-output budget**. Large returned JSON spills to a text artifact without hiding the selected image parts or their labels; media bytes do not enter the text artifact.
+
+Kit retains typed image tool results in the canonical transcript. The verified `openai-subscription:gpt-5.4` route sends native image tool output. Other subscription models (including `gpt-6-astra`) and the OpenRouter/Speakeasy adapters use their ordinary user-image input encoding: the tool result keeps its text and points to a following user-role image message, placed after the complete tool-result batch. This message exists only in the outgoing provider request, not as a synthetic user turn in session history. Replay and provider switching project the retained images again without rerunning compose. This transport fallback does not imply that every model supports vision; select a model with image input support. Provider image limits and normalization still apply. Do not rerun a side-effecting compose program merely because output delivery failed.
+
+The canonical tool result retains typed images. Supported terminal graphics render them in expanded tool cards using the existing bounded image cache; disabled graphics or decoding failures leave a text fallback. Displaying a tool image does not create a synthetic user message.
+
+### File identity, durability, and lifetime
+
+File descriptors reserve `"$kit": "file"` and use schema version 1. New references contain an opaque ID, a bounded display name, MIME type, encoded byte count, image dimensions, and an absolute `path` to a regular PNG/JPEG file. For imports, this is the canonical source path (the display name still comes from the supplied source). For generated images, it is a separate export under the session’s `exports/` directory, not the private binary envelope. You can move or delete this file with `shell` without affecting durable resolution; the recorded path then becomes stale. The path is informational, not an authorization capability or snapshot identity. Historical version-1 references without `path` remain valid, including edit inputs; they have no local export and are not rewritten or exported on read. A missing legacy path normalizes to `null` internally. Unknown fields, unknown versions, altered metadata, missing objects, and inaccessible IDs fail rather than appearing as successful text-only image delivery. Do not edit descriptors or invent IDs.
+
+Kit stores immutable snapshots under `~/.kit/files/<session-namespace>/` (or `<root>/.kit/files` when HOME is unavailable). A descriptor is returned only after the binary object and directory entries cross the disk durability barrier. Storage failure returns no usable descriptor. Each versioned binary envelope has a bounded metadata header and a digest-verified payload; truncated or corrupted objects are rejected.
+
+References survive process restart and source modification or deletion. Authorization comes from the calling session, not from possession of a marker or an arbitrary filesystem path. Copying a descriptor to a fork or another session does **not** grant access. Cross-session grants are not part of this reader.
+
+There is no automatic managed-file garbage collection in this phase. Calls, cancellation, session close, and process exit do not delete these objects. Cancelled or failed imports can leave unreachable objects. Explicit removal of a session's managed-file directory invalidates its references; do not remove retained objects that you need after resume. Finalization can repeat against the same immutable references without importing again. A delivery error states that the compose program already completed and side effects may have occurred; it is not a rollback or an invitation to retry blindly.
+
 ## Make exact file changes with `edit`
 
 `edit` operates on one file path with `op: "add"`, `"edit"`, or `"delete"`. Relative paths are resolved from Kit's working directory. Absolute paths, `..`, and paths through symlinks are accepted, so `edit` can change files outside the root when the Kit process has permission. Paths must be non-empty.
@@ -131,3 +177,24 @@ Start with the smallest failing Runlet and identify its failure stage:
 - **Interrupted turn:** cancellation propagates to running `shell` and `a2a` calls. Re-inspect project state before retrying because earlier effectful calls may already have completed.
 
 For a Kit-specific error, ask the agent to search the bundled version-matched docs with the exact error text. For command-line syntax, use `kit --help` or `kit <command> --help`.
+
+## Generate and edit subscription images with `image_gen`
+
+`image_gen` is a native compose callable. Sign in with `kit auth login openai --credential-store keychain` first, and select the same persistent credential store when running Kit. The default in-memory store does not support standalone login. It uses your ChatGPT subscription credentials and image quota, **not OpenAI API-key billing**; it never falls back to an API key. Availability and quota depend on your subscription. The server selects the image capability, as it does for Codex; Kit does not offer a model selector or promise a particular model identity.
+
+```text
+image = image_gen({ prompt: "A watercolor illustration of a lighthouse" })
+return image
+```
+
+To edit an image, supply one to four File references authorized in the current session. References from `read_file` and earlier `image_gen` results both work:
+
+```text
+source = read_file({ path: "lighthouse.png" })
+edited = image_gen({ prompt: "Change the scene to sunset", images: [source] })
+return edited
+```
+
+Each call requests one image with automatic size, quality, and background. Prompts are limited to 32,000 UTF-8 bytes. Edit inputs must meet the managed PNG/JPEG limits above and total at most 16 MiB. Output must be a valid nonanimated PNG at most 8 MiB, 8,192 pixels per axis, and 16 megapixels. Kit bounds the HTTP response to 12 MiB and the overall invocation to 180 seconds. Generated images use the same durable, session-scoped storage and final-return delivery rules as `read_file`. Their `path` points to standalone image bytes that you can relocate with `shell` (`mv -- <path> <destination>`); Kit retains a separate immutable snapshot for delivery and edits even after that export is moved, changed, or deleted.
+
+This is an **effectful, quota-consuming** tool. Kit refreshes subscription credentials before submission when needed but does not retry image submissions, including authentication failures. A timeout, cancellation, interrupted response, or storage/delivery failure can occur after the server generates an image and charges quota. Do not put `image_gen` inside an automatic retry boundary or rerun it just because delivery failed. Cancellation stops waiting; it does not guarantee server-side cancellation or a quota refund. Independent calls run concurrently in compose; use data dependencies to order edits.

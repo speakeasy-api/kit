@@ -8,6 +8,9 @@ pub(crate) fn isolate_process_tree(command: &mut Command) {
 
         command.process_group(0);
     }
+    // Other platforms do not configure a process group before spawning.
+    #[cfg(not(unix))]
+    let _ = command;
 }
 
 /// Terminates a synchronous child and the process tree rooted at it.

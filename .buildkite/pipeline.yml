@@ -1,8 +1,10 @@
 steps:
   - label: ":rust: Tests"
     if: build.branch == "main" || build.pull_request.base_branch == "main"
-    command: cargo test --locked
+    command: mise trust && mise run test
     plugins:
       - docker#v5.13.0:
-          image: rust:1.94.0
+          image: jdxcode/mise:latest
           always-pull: true
+          entrypoint: ""
+          shell: ["/bin/bash", "-e", "-c"]

@@ -191,6 +191,7 @@ fn normalize_system_messages(body: &mut Map<String, Value>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use agentkit_adapter_completions::CompletionsAdapter;

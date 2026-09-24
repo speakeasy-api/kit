@@ -7,6 +7,7 @@ use std::ops::Range;
 
 #[derive(Clone, Copy)]
 enum Kind {
+    Usage,
     New,
     Resume,
     Sessions,
@@ -14,6 +15,9 @@ enum Kind {
     Model,
     Effort,
     Agents,
+    Login,
+
+    Voice,
 }
 
 struct Spec {
@@ -47,6 +51,11 @@ impl From<&str> for Command {
 // Agent-advertised commands remain ordinary prompts. Only these commands are
 // interpreted by the client itself.
 const LOCAL_COMMANDS: &[Spec] = &[
+    Spec {
+        token: "/voice",
+        description: "Voice: on connects/listens (billable subscription); mute pauses; off ends (headphones)",
+        kind: Kind::Voice,
+    },
     Spec {
         token: "/new",
         description: "Start a new session",
@@ -82,10 +91,21 @@ const LOCAL_COMMANDS: &[Spec] = &[
         description: "Show the agent roster",
         kind: Kind::Agents,
     },
+    Spec {
+        token: "/login",
+        description: "Authenticate with the agent",
+        kind: Kind::Login,
+    },
+    Spec {
+        token: "/usage",
+        description: "Show provider usage and quota",
+        kind: Kind::Usage,
+    },
 ];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed<'a> {
+    Usage { provider: Option<&'a str> },
     New { prompt: Option<&'a str> },
     Resume { session_id: Option<&'a str> },
     Sessions,
@@ -93,6 +113,9 @@ pub enum Parsed<'a> {
     Model { query: Option<&'a str> },
     Effort { value: Option<&'a str> },
     Agents,
+    Login { method_id: Option<&'a str> },
+
+    Voice { control: Option<&'a str> },
     Prompt(&'a str),
 }
 
@@ -104,21 +127,28 @@ fn token(input: &str) -> (&str, usize) {
     (&input[..token_end], token_end)
 }
 
-fn recognized_local(input: &str) -> Option<(&Spec, usize)> {
+fn recognized_local(input: &str, login_available: bool) -> Option<(&Spec, usize)> {
     let (token, token_end) = token(input);
     LOCAL_COMMANDS
         .iter()
+        .filter(|spec| login_available || !matches!(spec.kind, Kind::Login))
         .find(|spec| spec.token == token)
         .map(|spec| (spec, token_end))
 }
 
-pub fn parse(input: &str) -> Parsed<'_> {
-    let Some((spec, token_end)) = recognized_local(input) else {
+pub fn parse(input: &str, login_available: bool) -> Parsed<'_> {
+    let Some((spec, token_end)) = recognized_local(input, login_available) else {
         return Parsed::Prompt(input);
     };
     let remainder = input[token_end..].trim_start();
     let prompt = (!remainder.is_empty()).then_some(remainder);
     match spec.kind {
+        Kind::Usage => Parsed::Usage {
+            provider: prompt.map(str::trim),
+        },
+        Kind::Voice => Parsed::Voice {
+            control: prompt.map(str::trim),
+        },
         Kind::New => Parsed::New { prompt },
         Kind::Resume => Parsed::Resume { session_id: prompt },
         Kind::Sessions => Parsed::Sessions,
@@ -127,12 +157,19 @@ pub fn parse(input: &str) -> Parsed<'_> {
         Kind::Effort => Parsed::Effort { value: prompt },
         Kind::Agents if prompt.is_none() => Parsed::Agents,
         Kind::Agents => Parsed::Prompt(input),
+        Kind::Login => Parsed::Login {
+            method_id: prompt.map(str::trim),
+        },
     }
 }
 
 /// Byte range of a local or agent-advertised command token.
-pub fn known_token(input: &str, advertised: &[Command]) -> Option<Range<usize>> {
-    if let Some((spec, token_end)) = recognized_local(input) {
+pub fn known_token(
+    input: &str,
+    advertised: &[Command],
+    login_available: bool,
+) -> Option<Range<usize>> {
+    if let Some((spec, token_end)) = recognized_local(input, login_available) {
         if matches!(spec.kind, Kind::Agents) && !input[token_end..].trim().is_empty() {
             return None;
         }
@@ -165,19 +202,27 @@ pub fn completion_prefix(input: &str, cursor: usize) -> Option<&str> {
     prefix.starts_with('/').then_some(prefix)
 }
 
-pub fn completions(input: &str, cursor: usize, advertised: &[Command]) -> Vec<Command> {
+pub fn completions(
+    input: &str,
+    cursor: usize,
+    advertised: &[Command],
+    login_available: bool,
+    voice_enabled: bool,
+) -> Vec<Command> {
     let Some(prefix) = completion_prefix(input, cursor) else {
         return Vec::new();
     };
 
     let mut matches: Vec<Command> = LOCAL_COMMANDS
         .iter()
+        .filter(|spec| login_available || !matches!(spec.kind, Kind::Login))
+        .filter(|spec| voice_enabled || !matches!(spec.kind, Kind::Voice))
         .filter(|spec| spec.token.starts_with(prefix))
         .map(|spec| Command::new(spec.token, spec.description))
         .collect();
     for command in advertised {
         let name = command.name.strip_prefix('/').unwrap_or(&command.name);
-        if name.is_empty() {
+        if name.is_empty() || (!voice_enabled && name == "voice") {
             continue;
         }
         let token = format!("/{name}");
@@ -189,8 +234,72 @@ pub fn completions(input: &str, cursor: usize, advertised: &[Command]) -> Vec<Co
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
-    use super::{Command, Parsed, completions, known_token, parse};
+    use super::{
+        Command, Parsed, completions as complete_commands, known_token as find_known_token,
+        parse as parse_command,
+    };
+
+    fn parse(input: &str) -> Parsed<'_> {
+        parse_command(input, false)
+    }
+
+    fn known_token(input: &str, advertised: &[Command]) -> Option<std::ops::Range<usize>> {
+        find_known_token(input, advertised, false)
+    }
+
+    fn completions(input: &str, cursor: usize, advertised: &[Command]) -> Vec<Command> {
+        complete_commands(input, cursor, advertised, false, true)
+    }
+
+    #[test]
+    fn disabled_voice_is_hidden_even_when_advertised_by_agent() {
+        let advertised = [Command::new("voice", "remote voice")];
+        assert!(complete_commands("/voi", 4, &advertised, false, false).is_empty());
+        assert_eq!(
+            complete_commands("/voi", 4, &advertised, false, true).len(),
+            1
+        );
+        // Still reserve the local command so it cannot become an agent prompt.
+        assert!(matches!(parse("/voice on"), Parsed::Voice { .. }));
+    }
+
+    #[test]
+    fn usage_is_local_and_requires_an_exact_token() {
+        assert_eq!(parse("/usage"), Parsed::Usage { provider: None });
+        assert_eq!(
+            parse("/usage  openrouter  "),
+            Parsed::Usage {
+                provider: Some("openrouter")
+            }
+        );
+        assert_eq!(parse("/usages"), Parsed::Prompt("/usages"));
+        assert_eq!(completions("/usa", 4, &[])[0].name, "/usage");
+    }
+
+    #[test]
+    fn voice_controls_are_local_and_require_an_exact_token() {
+        for control in ["on", "off", "mute"] {
+            let input = format!("/voice {control}");
+            assert_eq!(
+                parse(&input),
+                Parsed::Voice {
+                    control: Some(control)
+                }
+            );
+        }
+        assert_eq!(parse("/voice"), Parsed::Voice { control: None });
+        assert_eq!(parse("/voices on"), Parsed::Prompt("/voices on"));
+        assert_eq!(completions("/voi", 4, &[])[0].name, "/voice");
+    }
 
     #[test]
     fn parses_commands_with_or_without_a_following_prompt() {
@@ -270,6 +379,33 @@ mod tests {
     }
 
     #[test]
+    fn login_is_local_only_when_terminal_auth_is_available() {
+        assert_eq!(parse("/login"), Parsed::Prompt("/login"));
+        assert_eq!(known_token("/login", &[]), None);
+        assert!(completions("/log", 4, &[]).is_empty());
+
+        for input in ["/login openai", "/login openai ", "/login openai\t"] {
+            assert_eq!(
+                parse_command(input, true),
+                Parsed::Login {
+                    method_id: Some("openai")
+                }
+            );
+        }
+        assert_eq!(
+            parse_command("/new keep trailing ", true),
+            Parsed::New {
+                prompt: Some("keep trailing ")
+            }
+        );
+        assert_eq!(find_known_token("/login", &[], true), Some(0..6));
+        assert_eq!(
+            complete_commands("/log", 4, &[], true, false),
+            [Command::new("/login", "Authenticate with the agent")]
+        );
+    }
+
+    #[test]
     fn completes_local_and_advertised_commands_with_local_precedence() {
         let advertised = vec![
             Command::new("compact", "Compact context"),
@@ -283,6 +419,7 @@ mod tests {
                 .map(|command| command.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "/voice",
                 "/new",
                 "/resume",
                 "/sessions",
@@ -290,10 +427,18 @@ mod tests {
                 "/model",
                 "/effort",
                 "/agents",
+                "/usage",
                 "/compact",
             ]
         );
-        assert_eq!(matches[0].description, "Start a new session");
+        assert_eq!(
+            matches
+                .iter()
+                .find(|command| command.name == "/new")
+                .unwrap()
+                .description,
+            "Start a new session"
+        );
         assert_eq!(matches.last().unwrap().description, "Compact context");
     }
 

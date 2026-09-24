@@ -1,32 +1,56 @@
 [package]
 name = "kit"
-version = "0.1.124"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.94.0"
 publish = false
 
+[features]
+default = ["tui"]
+# The terminal client and its opt-in voice session. Headless (container) builds
+# use --no-default-features and drop the audio and terminal dependency trees.
+tui = [
+    "dep:arboard",
+    "dep:cpal",
+    "dep:crossterm",
+    "dep:cubeb",
+    "dep:cubeb-sys",
+    "dep:opus-pure",
+    "dep:ratatui",
+    "dep:ratatui-image",
+    "dep:shlex",
+    "dep:str0m",
+    "dep:tokio-tungstenite",
+    "dep:unicode-segmentation",
+    "dep:unicode-width",
+]
+
 [dependencies]
-a2a-protocol-client = "=0.10.0"
-a2a-protocol-server = { version = "=0.10.0", default-features = false }
-a2a-protocol-types = "=0.10.0"
+opus-pure = { version = "=0.2.1", default-features = false, optional = true }
+str0m = { version = "=0.23.1", default-features = false, features = ["aws-lc-rs"], optional = true }
+tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
+a2a-protocol-client = "=0.11.0"
+a2a-protocol-server = { version = "=0.11.0", default-features = false }
+a2a-protocol-types = "=0.11.0"
 agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork", "unstable_session_inject"] }
-agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices"] }
+agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices", "unstable_session_compaction", "unstable_tool_call_name"] }
 agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server"] }
 agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
-agentkit-adapter-completions = "=0.10.8"
+agentkit-adapter-completions = "=0.10.9"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
-agentkit-loop = { version = "=0.10.11", features = ["otel"] }
-agentkit-mcp = "=0.10.6"
-agentkit-http = "=0.10.6"
+agentkit-loop = { version = "=0.10.12", features = ["otel"] }
+agentkit-mcp = "=0.10.7"
+agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
-agentkit-provider-openai = "=0.10.6"
+agentkit-provider-openai = "=0.10.12"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
-agentkit-tool-compose = { version = "=0.10.10", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.11", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
+arboard = { version = "=3.6.1", default-features = false, features = ["image-data"], optional = true }
 async-trait = "=0.1.92"
 atomicwrites = "=0.4.4"
 axum = "=0.8.9"
@@ -34,44 +58,57 @@ base64 = "=0.23.1"
 blake3 = "=1.8.7"
 bytes = "=1.12.1"
 clap = { version = "=4.6.6", features = ["derive"] }
-crossterm = { version = "=0.29.0", features = ["event-stream"] }
+crossterm = { version = "=0.29.0", features = ["event-stream"], optional = true }
 flate2 = "=1.1.10"
-fff-search = { version = "=0.10.6", default-features = false, features = ["ripgrep"] }
+ignore = "=0.4.33"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
 hyper = "=1.11.1"
 hyper-util = { version = "=0.1.20", features = ["server", "http1", "http2", "tokio"] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
-keyring = { version = "=4.1.6", default-features = false, features = ["v1"] }
-jsonschema = { version = "=0.52.0", default-features = false, features = ["idna"] }
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
+jsonschema = { version = "=0.52.1", default-features = false, features = ["idna"] }
+neo_frizbee = "=0.11.0"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "tls-webpki-roots", "trace"] }
-opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
-ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
-ratatui-image = { version = "=11.0.6", default-features = false, features = ["crossterm"] }
-reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
-rmcp = { version = "=3.1.4", default-features = false, features = ["auth", "client"] }
-runlet = "=0.5.0"
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
+ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"], optional = true }
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
+rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
+rpassword = "=7.5.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-shlex = "=2.0.1"
+shlex = { version = "=2.0.1", optional = true }
+runlet = "=0.6.0"
 sha2 = "=0.11.0"
 subtle = "=2.6.1"
 tar = { version = "=0.4.46", default-features = false }
-toml = "=1.1.4"
+tempfile = "=3.27.0"
+toml = "=1.1.5"
+toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["compat"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tracing = "=0.1.44"
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
-unicode-segmentation = "=1.13.3"
-unicode-width = "=0.2.2"
+unicode-segmentation = { version = "=1.13.3", optional = true }
+unicode-width = { version = "=0.2.2", optional = true }
 url = "=2.5.8"
 uuid = { version = "=1.26.0", features = ["v5"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = { version = "=0.18.2", default-features = false, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cubeb = { version = "=0.38.0", default-features = false, optional = true }
+# In 0.38.0 this selects production C backends, not test implementations.
+# Avoid the Rust backends' independent, unlocked Cargo build; re-audit on upgrade.
+cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
@@ -85,12 +122,12 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "7604f6c2ba1eed1de83fe3d9a0058192b5623bb4" }
-agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "7604f6c2ba1eed1de83fe3d9a0058192b5623bb4" }
+agentkit-provider-openai = { git = "https://git@github.com/danielkov/agentkit.git", rev = "04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58" }
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
+agentkit-acp = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 
@@ -99,3 +136,24 @@ agentkit-capabilities = "=0.10.5"
 agentkit-core = "=0.10.5"
 agentkit-task-manager = "=0.10.7"
 agentkit-tools-core = "=0.10.5"
+
+# Keep the provider fix on a distinct public HTTPS source so its workspace
+# dependencies reuse the existing registry packages and reviewed loop pin.
+# The git username distinguishes Cargo source IDs; anonymous fetch still works.
+[patch."https://git@github.com/danielkov/agentkit.git"]
+agentkit-adapter-completions = "=0.10.9"
+agentkit-core = "=0.10.5"
+agentkit-http = "=0.10.7"
+agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
+
+# Deny also in test builds; only test-only scopes may relax ergonomics. Crate
+# roots additionally forbid these in production so local allows cannot evade it.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_methods = "deny"
+disallowed_macros = "deny"

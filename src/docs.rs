@@ -303,6 +303,14 @@ fn truncate(value: &str, limit: usize) -> (String, bool) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
 
@@ -409,9 +417,12 @@ mod tests {
                 "docs/user/agent-plugins.md",
                 "docs/user/cerebras.md",
                 "docs/user/compose-and-local-tools.md",
+                "docs/user/evaluations.md",
                 "docs/user/getting-started-and-configuration.md",
                 "docs/user/mcp.md",
                 "docs/user/migrating-from-claude-code-and-codex.md",
+                "docs/user/native-voice.md",
+                "docs/user/provider-usage.md",
                 "docs/user/reporting-kit-issues.md",
                 "docs/user/security-limits-and-troubleshooting.md",
                 "docs/user/subagents-and-acp-harnesses.md",

@@ -2,10 +2,16 @@ mod adapter;
 mod cerebras;
 mod cerebras_auth;
 pub mod chatgpt;
-mod openai_auth;
+pub(crate) mod openai_auth;
 mod openrouter_auth;
 mod speakeasy_auth;
+pub(crate) mod typesafe_auth;
+pub mod usage;
 
+#[doc(hidden)]
+pub use typesafe_auth::{TypeSafeAuthCommand, execute_typesafe_auth};
+
+pub(crate) use adapter::authentication_method_id;
 pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
@@ -161,10 +167,33 @@ pub fn execute_openrouter_auth(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn store_openrouter_test_credentials(storage: &crate::credentials::CredentialStorage) {
-    openrouter_auth::store_test_credentials(storage);
+#[doc(hidden)]
+pub fn execute_provider_logout(
+    provider: ProviderKind,
+    storage: &crate::credentials::CredentialStorage,
+    local_only: bool,
+    active_openrouter_key: Option<(&OpenRouterApiKey, OpenRouterApiKeySource)>,
+) -> Result<String, String> {
+    match provider {
+        ProviderKind::Cerebras => {
+            execute_cerebras_auth(CerebrasAuthCommand::Logout { local_only }, storage, None)
+        }
+        ProviderKind::OpenAiSubscription => {
+            execute_openai_auth(OpenAiAuthCommand::Logout { local_only }, storage)
+        }
+        ProviderKind::OpenRouter => execute_openrouter_auth(
+            OpenRouterAuthCommand::Logout { local_only },
+            storage,
+            active_openrouter_key,
+        ),
+        ProviderKind::Speakeasy => {
+            execute_speakeasy_auth(SpeakeasyAuthCommand::Logout { local_only }, storage)
+        }
+    }
 }
+
+#[cfg(test)]
+pub(crate) use openrouter_auth::test_support::store_openrouter_test_credentials;
 
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

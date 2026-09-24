@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    io::Cursor,
+    sync::Arc,
+    time::Duration,
+};
 
 use agentkit_core::{DataRef, ItemKind, MetadataMap, Modality, Part, ToolOutput};
 use agentkit_http::{
@@ -9,8 +15,8 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use agentkit_provider_openai::{
-    OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesLimits, OpenAIResponsesProfile,
-    OpenAIResponsesSession, OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
+    OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesLimits, OpenAIResponsesSession,
+    OpenAIResponsesTransport, OpenAIResponsesTurn as UpstreamOpenAIResponsesTurn,
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -29,7 +35,7 @@ use super::{
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
-const MODEL_CATALOG_CLIENT_VERSION: &str = "0.144.0";
+const MODEL_CATALOG_CLIENT_VERSION: &str = "0.153.3";
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 1_000;
 const MAX_CATALOG_MODEL_ID_BYTES: usize = 128;
@@ -40,15 +46,81 @@ const MAX_ITEMS: usize = 10_000;
 const MAX_FIELD_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DECODED_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_IMAGE_PIXELS: u64 = 10_000_000;
+// Match managed-file import limits; retain the independent decoded-byte bound.
+const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_TOOL_RESULT_DEPTH: usize = 8;
 const JPEG_DATA_URL_PREFIX: &str = "data:image/jpeg;base64,";
 const MAX_NORMALIZED_IMAGE_BYTES: usize = ((MAX_FIELD_BYTES - JPEG_DATA_URL_PREFIX.len()) / 4) * 3;
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_CATALOG_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
+
+#[derive(Clone, Default)]
+pub(crate) struct SubscriptionModelCatalogCache {
+    entry: Arc<tokio::sync::Mutex<Option<SubscriptionModelCatalogCacheEntry>>>,
+}
+
+struct SubscriptionModelCatalogCacheEntry {
+    binding: auth::CredentialBinding,
+    catalog: Arc<tokio::sync::OnceCell<Arc<SubscriptionModelCatalog>>>,
+}
+
+impl SubscriptionModelCatalogCache {
+    async fn get_or_try_init<F, Fut>(
+        &self,
+        binding: &auth::CredentialBinding,
+        init: F,
+    ) -> Result<Arc<SubscriptionModelCatalog>, LoopError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<SubscriptionModelCatalog, LoopError>>,
+    {
+        // This is the only entry writer. Construct the complete replacement
+        // before publishing it; initialization and retired-value drops run
+        // outside the guard. Cancellation leaves either binding's complete
+        // cell, and OnceCell retries failed or cancelled initialization.
+        let (catalog, retired) = {
+            let mut entry = self.entry.lock().await;
+            match entry.as_ref() {
+                Some(current) if current.binding == *binding => {
+                    (Arc::clone(&current.catalog), None)
+                }
+                _ => {
+                    let catalog = Arc::new(tokio::sync::OnceCell::new());
+                    let replacement = SubscriptionModelCatalogCacheEntry {
+                        binding: binding.clone(),
+                        catalog: Arc::clone(&catalog),
+                    };
+                    (catalog, entry.replace(replacement))
+                }
+            }
+        };
+        drop(retired);
+        catalog
+            .get_or_try_init(|| async { init().await.map(Arc::new) })
+            .await
+            .cloned()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SubscriptionModelCatalog {
+    context_windows: HashMap<String, u64>,
+    visible_models: Vec<String>,
+}
+
+impl SubscriptionModelCatalog {
+    pub(crate) fn context_windows(&self) -> &HashMap<String, u64> {
+        &self.context_windows
+    }
+
+    pub(crate) fn visible_models(&self) -> &[String] {
+        &self.visible_models
+    }
+}
 
 fn subscription_resilience() -> ResilienceConfig {
     ResilienceConfig {
@@ -65,8 +137,6 @@ fn subscription_resilience() -> ResilienceConfig {
 pub struct SubscriptionConfig {
     pub model: String,
     pub credential_storage: crate::credentials::CredentialStorage,
-    #[cfg(test)]
-    endpoint: Option<String>,
 }
 
 impl SubscriptionConfig {
@@ -77,8 +147,6 @@ impl SubscriptionConfig {
         Ok(Self {
             model,
             credential_storage: Default::default(),
-            #[cfg(test)]
-            endpoint: None,
         })
     }
 
@@ -89,14 +157,6 @@ impl SubscriptionConfig {
         self.credential_storage = storage;
         self
     }
-
-    fn endpoint(&self) -> &str {
-        #[cfg(test)]
-        if let Some(endpoint) = &self.endpoint {
-            return endpoint;
-        }
-        ENDPOINT
-    }
 }
 
 #[derive(Clone)]
@@ -105,7 +165,7 @@ pub struct OpenAiSubscriptionAdapter {
     reasoning_effort: Option<super::adapter::ReasoningEffort>,
     catalog_client: reqwest::Client,
     responses_client: agentkit_http::Http,
-    context_windows: Arc<tokio::sync::OnceCell<Arc<HashMap<String, u64>>>>,
+    model_catalog: SubscriptionModelCatalogCache,
 }
 
 impl OpenAiSubscriptionAdapter {
@@ -116,6 +176,18 @@ impl OpenAiSubscriptionAdapter {
     pub(crate) fn new_with_reasoning_effort(
         config: SubscriptionConfig,
         reasoning_effort: Option<super::adapter::ReasoningEffort>,
+    ) -> Result<Self, String> {
+        Self::new_with_reasoning_effort_and_catalog(
+            config,
+            reasoning_effort,
+            SubscriptionModelCatalogCache::default(),
+        )
+    }
+
+    pub(crate) fn new_with_reasoning_effort_and_catalog(
+        config: SubscriptionConfig,
+        reasoning_effort: Option<super::adapter::ReasoningEffort>,
+        model_catalog: SubscriptionModelCatalogCache,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -131,8 +203,38 @@ impl OpenAiSubscriptionAdapter {
             reasoning_effort,
             catalog_client,
             responses_client,
-            context_windows: Arc::new(tokio::sync::OnceCell::new()),
+            model_catalog,
         })
+    }
+
+    async fn catalog_with_credentials(
+        &self,
+        credentials: &auth::TokenRecord,
+        binding: &auth::CredentialBinding,
+    ) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
+        self.model_catalog
+            .get_or_try_init(binding, || {
+                fetch_model_catalog(&self.catalog_client, credentials)
+            })
+            .await
+    }
+
+    pub(crate) async fn model_catalog(&self) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
+        let credentials = tokio::time::timeout(
+            MODEL_CATALOG_AUTH_TIMEOUT,
+            load_credentials(
+                self.config.credential_storage.clone(),
+                MODEL_CATALOG_AUTH_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            LoopError::Provider("OpenAI model catalog credential load timed out".into())
+        })??;
+        let binding = credentials
+            .binding()
+            .map_err(|error| LoopError::Provider(error.to_string()))?;
+        self.catalog_with_credentials(&credentials, &binding).await
     }
 }
 
@@ -155,46 +257,31 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
         let authentication_binding = binding_string(&binding);
-        // Catalog discovery stays independent and best-effort.
-        let context_windows = self
-            .context_windows
-            .get_or_try_init(|| async {
-                fetch_context_windows(&self.catalog_client, &credentials)
-                    .await
-                    .map(Arc::new)
-            })
+        // Catalog discovery stays independent and best-effort. A failed fetch is not cached.
+        let model_catalog = self
+            .catalog_with_credentials(&credentials, &binding)
             .await
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| Arc::new(SubscriptionModelCatalog::default()));
         let authentication = Authentication::new(OpenAiAuthenticationProvider {
             credential_storage: self.config.credential_storage.clone(),
             binding,
             timeout: auth_timeout(&resilience),
         });
-        let mut config =
-            OpenAIResponsesConfig::chatgpt_private(self.config.model.clone(), authentication)
-                .with_endpoint(self.config.endpoint())
-                .with_originator("kit")
-                .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
-                .with_limits(OpenAIResponsesLimits {
-                    max_request_bytes: MAX_REQUEST_BYTES,
-                    max_attempt_bytes: MAX_ATTEMPT_BYTES,
-                    max_wire_bytes: MAX_WIRE_BYTES,
-                    max_items: MAX_ITEMS,
-                    max_text_bytes: MAX_FIELD_BYTES,
-                })
-                .with_resilience(resilience);
-        debug_assert_eq!(config.profile, OpenAIResponsesProfile::ChatGptPrivate);
-        if let Some(effort) = self.reasoning_effort {
-            config = config.with_reasoning_effort(effort.as_str());
-        }
+        let config = subscription_responses_config(
+            self.config.model.clone(),
+            authentication,
+            resilience,
+            self.reasoning_effort,
+        );
         let inner = OpenAIResponsesAdapter::with_client(config, self.responses_client.clone())
             .start_session(session)
             .await?;
         Ok(OpenAiSubscriptionSession {
             inner,
-            context_window: context_windows.get(&self.config.model).copied(),
-            model: self.config.model.clone(),
+            context_window: model_catalog
+                .context_windows
+                .get(&self.config.model)
+                .copied(),
             authentication_binding,
         })
     }
@@ -204,10 +291,36 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
     }
 }
 
+// Keep subscription transport policy private; other providers retain their defaults.
+fn subscription_responses_config(
+    model: String,
+    authentication: Authentication,
+    resilience: ResilienceConfig,
+    reasoning_effort: Option<super::adapter::ReasoningEffort>,
+) -> OpenAIResponsesConfig {
+    let mut config = OpenAIResponsesConfig::chatgpt_private(model, authentication)
+        .with_endpoint(ENDPOINT)
+        .with_transport(OpenAIResponsesTransport::Auto)
+        .with_websocket_no_proxy(true)
+        .with_originator("kit")
+        .with_user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
+        .with_limits(OpenAIResponsesLimits {
+            max_request_bytes: MAX_REQUEST_BYTES,
+            max_attempt_bytes: MAX_ATTEMPT_BYTES,
+            max_wire_bytes: MAX_WIRE_BYTES,
+            max_items: MAX_ITEMS,
+            max_text_bytes: MAX_FIELD_BYTES,
+        })
+        .with_resilience(resilience);
+    if let Some(effort) = reasoning_effort {
+        config = config.with_reasoning_effort(effort.as_str());
+    }
+    config
+}
+
 pub struct OpenAiSubscriptionSession {
     inner: OpenAIResponsesSession,
     context_window: Option<u64>,
-    model: String,
     authentication_binding: String,
 }
 
@@ -219,13 +332,20 @@ impl ModelSession for OpenAiSubscriptionSession {
         mut request: TurnRequest,
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        migrate_legacy_continuations(&mut request, &self.model, &self.authentication_binding)?;
+        let model = self.inner.model_name().unwrap_or("unknown");
+        request = super::adapter::project_tool_output_images(
+            request,
+            supports_tool_output_images(model),
+        )?;
+        migrate_legacy_continuations(&mut request, &self.authentication_binding)?;
         let normalization_cancellation = cancellation.clone();
         let request = tokio::task::spawn_blocking(move || {
             normalize_openai_images(request, normalization_cancellation.as_ref())
         })
         .await
-        .map_err(|_| protocol("Responses image normalization task failed"))??;
+        .map_err(|_| {
+            tool_image_normalization_error(protocol("Responses image normalization task failed"))
+        })??;
         self.inner
             .begin_turn(request, cancellation)
             .await
@@ -242,6 +362,13 @@ impl ModelSession for OpenAiSubscriptionSession {
     }
 }
 
+// Keep the verified native tool-output route. Other models use the ordinary
+// user-image request path; this is a transport choice, not a vision allowlist.
+// The pinned private Responses encoder supplies native image tool-output blocks.
+fn supports_tool_output_images(model: &str) -> bool {
+    model == "gpt-5.4"
+}
+
 fn normalize_openai_images(
     mut request: TurnRequest,
     cancellation: Option<&agentkit_core::TurnCancellation>,
@@ -252,7 +379,12 @@ fn normalize_openai_images(
             item.kind,
             ItemKind::User | ItemKind::Context | ItemKind::Tool
         ) {
-            normalize_openai_parts(&mut item.parts, cancellation, 0)?;
+            let result = normalize_openai_parts(&mut item.parts, cancellation, 0);
+            if item.metadata.get("kit.projected_tool_images") == Some(&Value::Bool(true)) {
+                result.map_err(tool_image_normalization_error)?;
+            } else {
+                result?;
+            }
         }
     }
     Ok(request)
@@ -282,13 +414,24 @@ fn normalize_openai_parts(
             }
             Part::ToolResult(result) => {
                 if let ToolOutput::Parts(parts) = &mut result.output {
-                    normalize_openai_parts(parts, cancellation, depth + 1)?;
+                    normalize_openai_parts(parts, cancellation, depth + 1)
+                        .map_err(tool_image_normalization_error)?;
                 }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn tool_image_normalization_error(error: LoopError) -> LoopError {
+    match error {
+        // Preserve cancellation and avoid wrapping an already contextualized error.
+        LoopError::Cancelled | LoopError::InvalidState(_) => error,
+        _ => LoopError::InvalidState(format!(
+            "selected-images-not-delivered: {error}. The program may already have completed; do not retry or rerun the program. The retained images could not be prepared for delivery."
+        )),
+    }
 }
 
 fn check_image_cancellation(
@@ -313,20 +456,18 @@ fn serialized_image_bytes(data: &DataRef, mime_type: &str) -> Option<usize> {
 }
 
 fn inline_image_bytes(data: &DataRef, mime_type: &str) -> Result<Option<Vec<u8>>, LoopError> {
-    if let DataRef::InlineBytes(bytes) = data {
-        if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
-            return Err(protocol("Responses image exceeds the 10 MiB source limit"));
-        }
-        return Ok(Some(bytes.clone()));
-    }
-
     let text = match data {
         DataRef::InlineText(text) | DataRef::Uri(text) if text.starts_with("data:") => text
             .strip_prefix(&format!("data:{mime_type};base64,"))
             .ok_or_else(|| protocol("Responses image data URL is not canonical base64"))?,
         DataRef::InlineText(text) => text,
         DataRef::Uri(_) | DataRef::Handle(_) => return Ok(None),
-        DataRef::InlineBytes(_) => unreachable!("handled above"),
+        DataRef::InlineBytes(bytes) => {
+            if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+                return Err(protocol("Responses image exceeds the 10 MiB source limit"));
+            }
+            return Ok(Some(bytes.clone()));
+        }
     };
     let max_base64_bytes = MAX_SOURCE_IMAGE_BYTES.div_ceil(3) * 4;
     if text.len() > max_base64_bytes {
@@ -433,6 +574,10 @@ pub struct OpenAiSubscriptionTurn {
 
 #[async_trait]
 impl ModelTurn for OpenAiSubscriptionTurn {
+    fn on_cancelled(&mut self) {
+        self.inner.on_cancelled();
+    }
+
     async fn next_event(
         &mut self,
         cancellation: Option<agentkit_core::TurnCancellation>,
@@ -457,11 +602,11 @@ impl HttpClient for ChatGptRetryHintsClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
         HttpClient::execute(&self.0, request)
             .await
-            .map(normalize_server_delay)
+            .and_then(normalize_server_delay)
     }
 }
 
-fn normalize_server_delay(response: HttpResponse) -> HttpResponse {
+fn normalize_server_delay(response: HttpResponse) -> Result<HttpResponse, HttpError> {
     let generic = agentkit_http::retry_hint(response.headers());
     let chatgpt = (response.status() == agentkit_http::StatusCode::TOO_MANY_REQUESTS)
         .then(|| {
@@ -493,11 +638,16 @@ fn normalize_server_delay(response: HttpResponse) -> HttpResponse {
             headers.remove(name);
         }
         let value = HeaderValue::from_str(&delay.as_secs_f64().to_string())
-            .expect("bounded retry delay is a valid header value");
+            .map_err(|_| HttpError::InvalidHeader("retry-after".into()))?;
         headers.insert("retry-after", value);
-        return HttpResponse::new(status, headers, final_url, response.bytes_stream());
+        return Ok(HttpResponse::new(
+            status,
+            headers,
+            final_url,
+            response.bytes_stream(),
+        ));
     }
-    response
+    Ok(response)
 }
 
 fn parse_chatgpt_reset(value: &str) -> Option<Duration> {
@@ -617,7 +767,6 @@ fn legacy_continuation_matches_authentication(
 
 fn migrate_legacy_continuations(
     request: &mut TurnRequest,
-    model: &str,
     authentication_binding: &str,
 ) -> Result<(), LoopError> {
     let session_id = request.session_id.to_string();
@@ -630,7 +779,6 @@ fn migrate_legacy_continuations(
             };
             migrate_legacy_continuation(
                 metadata,
-                model,
                 &session_id,
                 authentication_binding,
                 expected_kind,
@@ -652,7 +800,6 @@ fn continuation_metadata_mut(part: &mut Part) -> Option<(&mut MetadataMap, &'sta
 
 fn migrate_legacy_continuation(
     metadata: &mut MetadataMap,
-    model: &str,
     session_id: &str,
     authentication_binding: &str,
     expected_kind: &str,
@@ -672,7 +819,6 @@ fn migrate_legacy_continuation(
     if object.len() != expected_len
         || object.get("schema_version").and_then(Value::as_u64) != Some(1)
         || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(model)
         || object.get("session_id").and_then(Value::as_str) != Some(session_id)
         || object.get("output_index").and_then(Value::as_u64).is_none()
     {
@@ -680,6 +826,7 @@ fn migrate_legacy_continuation(
             "legacy Responses continuation metadata binding is invalid",
         ));
     }
+    let model = bounded_legacy_string(object.get("model"), "legacy model")?;
     let account_binding = object
         .get("account_binding")
         .and_then(Value::as_object)
@@ -716,18 +863,21 @@ fn migrate_legacy_continuation(
     if !legacy_continuation_matches_authentication(&account_binding, authentication_binding) {
         return Ok(());
     }
-    let mut migrated = serde_json::json!({
-        "schema_version": 3,
-        "authentication_binding": authentication_binding,
-        "model": model,
-        "session_id": session_id,
-        "item_id": item_id,
-        "kind": expected_kind,
-    });
+    let mut migrated = serde_json::Map::from_iter([
+        ("schema_version".into(), Value::from(3)),
+        (
+            "authentication_binding".into(),
+            Value::from(authentication_binding),
+        ),
+        ("model".into(), Value::from(model)),
+        ("session_id".into(), Value::from(session_id)),
+        ("item_id".into(), Value::from(item_id)),
+        ("kind".into(), Value::from(expected_kind)),
+    ]);
     if let Some(encrypted_content) = encrypted_content {
-        migrated["encrypted_content"] = Value::String(encrypted_content.to_owned());
+        migrated.insert("encrypted_content".into(), Value::from(encrypted_content));
     }
-    metadata.insert(CONTINUATION_METADATA.into(), migrated);
+    metadata.insert(CONTINUATION_METADATA.into(), Value::Object(migrated));
     Ok(())
 }
 
@@ -742,13 +892,21 @@ async fn load_credentials(
     storage: crate::credentials::CredentialStorage,
     timeout: Duration,
 ) -> Result<auth::TokenRecord, LoopError> {
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
         let deadline = auth::checked_deadline(timeout)?;
-        auth::access_token(&storage, deadline)
+        auth::access_token_cancellable(&storage, deadline, &cancellation)
     })
     .await
     .map_err(|_| LoopError::Provider("OpenAI authentication worker failed".into()))?
-    .map_err(|error| LoopError::Provider(error.to_string()))
+    .map_err(|error| {
+        if error.is_cancelled() {
+            LoopError::Cancelled
+        } else {
+            LoopError::Provider(error.to_string())
+        }
+    })
 }
 
 fn ensure_credential_binding(
@@ -786,10 +944,10 @@ fn binding_string(binding: &auth::CredentialBinding) -> String {
     format!("openai-chatgpt-v1:{account_digest}:{}", binding.generation)
 }
 
-async fn fetch_context_windows(
+async fn fetch_model_catalog(
     client: &reqwest::Client,
     credentials: &auth::TokenRecord,
-) -> Result<HashMap<String, u64>, LoopError> {
+) -> Result<SubscriptionModelCatalog, LoopError> {
     let endpoint = format!("{MODELS_ENDPOINT}?client_version={MODEL_CATALOG_CLIENT_VERSION}");
     let mut request = client
         .get(endpoint)
@@ -827,16 +985,17 @@ async fn fetch_context_windows(
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| protocol("model catalog is not valid JSON"))?;
-    parse_context_windows(&value)
+    parse_model_catalog(&value)
 }
 
-fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopError> {
+fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopError> {
     let models = value
         .get("models")
         .and_then(Value::as_array)
         .filter(|models| models.len() <= MAX_MODELS)
         .ok_or_else(|| protocol("model catalog omitted a bounded models list"))?;
-    let mut windows = HashMap::new();
+    let mut context_windows = HashMap::new();
+    let mut visible_models = Vec::new();
     for model in models {
         let Some(slug) = model
             .get("slug")
@@ -845,18 +1004,32 @@ fn parse_context_windows(value: &Value) -> Result<HashMap<String, u64>, LoopErro
         else {
             continue;
         };
-        let Some(window) = model
+        if let Some(window) = model
             .get("context_window")
-            .filter(|window| !window.is_null())
-        else {
-            continue;
-        };
-        let Some(window) = window.as_u64().filter(|window| *window > 0) else {
-            continue;
-        };
-        windows.entry(slug.to_owned()).or_insert(window);
+            .and_then(Value::as_u64)
+            .filter(|window| *window > 0)
+        {
+            context_windows.entry(slug.to_owned()).or_insert(window);
+        }
+        if model.get("visibility").and_then(Value::as_str) == Some("list") {
+            let priority = model
+                .get("priority")
+                .and_then(Value::as_i64)
+                .unwrap_or(i64::MAX);
+            visible_models.push((priority, slug.to_owned()));
+        }
     }
-    Ok(windows)
+    visible_models.sort_by_key(|(priority, _)| *priority);
+    let mut seen = HashSet::new();
+    let visible_models = visible_models
+        .into_iter()
+        .map(|(_, slug)| slug)
+        .filter(|slug| seen.insert(slug.clone()))
+        .collect();
+    Ok(SubscriptionModelCatalog {
+        context_windows,
+        visible_models,
+    })
 }
 
 fn protocol(message: &str) -> LoopError {
@@ -864,9 +1037,150 @@ fn protocol(message: &str) -> LoopError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn image_tool_request() -> TurnRequest {
+        use agentkit_core::{Item, SessionId, ToolResultPart, TurnId};
+        TurnRequest {
+            session_id: SessionId::new("image-session"),
+            turn_id: TurnId::new("image-turn"),
+            transcript: vec![Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "image-call",
+                    ToolOutput::Parts(vec![
+                        Part::text("Selected screenshot"),
+                        Part::media(
+                            Modality::Image,
+                            "image/png",
+                            DataRef::InlineBytes(vec![1, 2, 3]),
+                        ),
+                    ]),
+                ))],
+            )],
+            available_tools: Vec::new(),
+            cache: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn selected_images_use_native_private_responses_wire_content() {
+        let request = image_tool_request();
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        assert!(supports_tool_output_images("gpt-5.4"));
+        let request = super::super::adapter::project_tool_output_images(
+            request,
+            supports_tool_output_images("gpt-5.4"),
+        )
+        .unwrap();
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"));
+        let wire = config.encode_request(&request).unwrap();
+        assert_eq!(
+            wire["input"][0],
+            json!({
+                "type": "function_call_output",
+                "call_id": "image-call",
+                "output": [
+                    {"type": "input_text", "text": "Selected screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AQID", "detail": "high"}
+                ]
+            })
+        );
+        assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
+    }
+
+    #[test]
+    fn selected_image_guard_leaves_user_images_and_text_wire_unchanged() {
+        use agentkit_core::{Item, ToolResultPart};
+        let mut request = image_tool_request();
+        request.transcript = vec![
+            Item::new(
+                ItemKind::User,
+                vec![
+                    Part::text("Look at this"),
+                    Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::InlineBytes(vec![1, 2, 3]),
+                    ),
+                ],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "text-call",
+                    ToolOutput::Text("done".into()),
+                ))],
+            ),
+        ];
+        // An unverified model is not blocked for ordinary user images or text.
+        let request = super::super::adapter::project_tool_output_images(request, false).unwrap();
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-future",
+            Authentication::bearer("test-key"),
+        );
+        let wire = config.encode_request(&request).unwrap();
+        assert_eq!(
+            wire["input"][0]["content"][0],
+            json!({"type": "input_text", "text": "Look at this"})
+        );
+        assert_eq!(wire["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(wire["input"][1]["output"], "done");
+    }
+
+    #[test]
+    fn unlisted_subscription_model_projects_images_on_each_request_only() {
+        let request = image_tool_request();
+        let original = serde_json::to_value(&request.transcript).unwrap();
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-6-astra",
+            Authentication::bearer("test-key"),
+        );
+        assert!(!supports_tool_output_images("gpt-6-astra"));
+        let mut previous_wire = None;
+        // A resumed or continued turn starts from the same canonical typed data.
+        for _ in 0..2 {
+            let projected = super::super::adapter::project_tool_output_images(
+                request.clone(),
+                supports_tool_output_images("gpt-6-astra"),
+            )
+            .unwrap();
+            let projected = normalize_openai_images(projected, None).unwrap();
+            let wire = config.encode_request(&projected).unwrap();
+            assert_eq!(wire["input"].as_array().unwrap().len(), 2);
+            assert_eq!(wire["input"][0]["type"], "function_call_output");
+            assert_eq!(wire["input"][0]["call_id"], "image-call");
+            let output = wire["input"][0]["output"].to_string();
+            assert!(output.contains("Selected screenshot"));
+            assert!(!output.contains("AQID"));
+            assert_eq!(wire["input"][1]["role"], "user");
+            let images: Vec<_> = wire["input"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|part| part["type"] == "input_image")
+                .collect();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0]["image_url"], "data:image/png;base64,AQID");
+            if let Some(previous) = previous_wire {
+                assert_eq!(wire, previous);
+            }
+            previous_wire = Some(wire);
+            assert_eq!(serde_json::to_value(&request.transcript).unwrap(), original);
+        }
+    }
 
     #[test]
     fn subscription_config_accepts_models_without_a_client_release() {
@@ -915,6 +1229,162 @@ mod tests {
     }
 
     #[test]
+    fn projected_image_failure_retains_no_rerun_guidance() {
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![0; MAX_FIELD_BYTES]),
+        )]);
+        let projected = super::super::adapter::project_tool_output_images(request, false).unwrap();
+        let error = normalize_openai_images(projected, None).unwrap_err();
+        assert!(error.to_string().contains("selected-images-not-delivered"));
+        assert!(error.to_string().contains("do not retry or rerun"));
+    }
+
+    #[test]
+    fn projected_tool_images_use_user_image_normalization_limits() {
+        let png = noisy_png(600, 600);
+        assert!(png.len() > MAX_NORMALIZED_IMAGE_BYTES);
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![
+            Part::text("Retained diagnostic and label"),
+            Part::media(Modality::Image, "image/png", DataRef::InlineBytes(png)),
+        ]);
+        let projected = super::super::adapter::project_tool_output_images(request, false).unwrap();
+        let normalized = normalize_openai_images(projected, None).unwrap();
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-6-astra",
+            Authentication::bearer("test-key"),
+        )
+        .with_limits(OpenAIResponsesLimits {
+            max_request_bytes: MAX_REQUEST_BYTES,
+            max_attempt_bytes: MAX_ATTEMPT_BYTES,
+            max_wire_bytes: MAX_WIRE_BYTES,
+            max_items: MAX_ITEMS,
+            max_text_bytes: MAX_FIELD_BYTES,
+        });
+        let wire = config.encode_request(&normalized).unwrap();
+        let image = wire["input"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| part["type"] == "input_image")
+            .unwrap();
+        let url = image["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(url.len() <= MAX_FIELD_BYTES);
+        assert!(
+            wire["input"][0]["output"]
+                .to_string()
+                .contains("Retained diagnostic and label")
+        );
+    }
+
+    #[test]
+    fn selected_twelve_megapixel_jpeg_normalizes_to_native_wire_budget() {
+        // Keep a high-detail region in an otherwise flat 12MP image: the valid
+        // source exceeds the wire field limit but fits the managed-file limits.
+        let image = RgbImage::from_fn(4000, 3000, |x, y| {
+            if x >= 800 || y >= 800 {
+                return Rgb([255, 255, 255]);
+            }
+            let mut value = x
+                .wrapping_mul(747_796_405)
+                .wrapping_add(y.wrapping_mul(2_891_336_453));
+            value = (value ^ (value >> 16)).wrapping_mul(2_246_822_519);
+            value ^= value >> 13;
+            Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .unwrap();
+        assert!(jpeg.len() > MAX_NORMALIZED_IMAGE_BYTES);
+        assert!(jpeg.len() <= 8 * 1024 * 1024);
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![
+            Part::text("Selected 12MP JPEG"),
+            Part::media(Modality::Image, "image/jpeg", DataRef::InlineBytes(jpeg)),
+        ]);
+        // Exercise the full normalizer used by begin_turn, not just byte decoding.
+        let normalized = normalize_openai_images(request, None).unwrap();
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"))
+                .with_limits(OpenAIResponsesLimits {
+                    max_request_bytes: MAX_REQUEST_BYTES,
+                    max_attempt_bytes: MAX_ATTEMPT_BYTES,
+                    max_wire_bytes: MAX_WIRE_BYTES,
+                    max_items: MAX_ITEMS,
+                    max_text_bytes: MAX_FIELD_BYTES,
+                });
+        let wire = config.encode_request(&normalized).unwrap();
+        let output = &wire["input"][0]["output"];
+        assert_eq!(wire["input"][0]["call_id"], "image-call");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        let url = output[1]["image_url"].as_str().unwrap();
+        assert!(url.len() <= MAX_FIELD_BYTES);
+        let bytes = BASE64
+            .decode(url.strip_prefix(JPEG_DATA_URL_PREFIX).unwrap())
+            .unwrap();
+        assert!(
+            ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .unwrap()
+                .decode()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_image_normalization_failure_does_not_invite_program_retry() {
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-5.4", Authentication::bearer("test-key"));
+        let inner = OpenAIResponsesAdapter::new(config)
+            .unwrap()
+            .start_session(SessionConfig::new("image-session"))
+            .await
+            .unwrap();
+        let mut session = OpenAiSubscriptionSession {
+            inner,
+            context_window: None,
+            authentication_binding: "unused".into(),
+        };
+        let mut request = image_tool_request();
+        let Part::ToolResult(result) = &mut request.transcript[0].parts[0] else {
+            panic!("expected tool result");
+        };
+        result.output = ToolOutput::Parts(vec![Part::media(
+            Modality::Image,
+            "image/jpeg",
+            DataRef::InlineBytes(vec![0; MAX_FIELD_BYTES]),
+        )]);
+        let error = match session.begin_turn(request, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid image reached provider"),
+        };
+        assert!(matches!(error, LoopError::InvalidState(_)));
+        let message = error.to_string();
+        assert!(message.contains("selected-images-not-delivered"));
+        assert!(message.contains("program may already have completed"));
+        assert!(message.contains("do not retry or rerun the program"));
+        assert!(matches!(
+            tool_image_normalization_error(LoopError::Cancelled),
+            LoopError::Cancelled
+        ));
+    }
+
+    #[test]
     fn image_normalization_observes_turn_cancellation() {
         let controller = agentkit_core::CancellationController::new();
         let cancellation = controller.handle().checkpoint();
@@ -958,7 +1428,7 @@ mod tests {
             "https://chatgpt.com".into(),
             Box::pin(futures_util::stream::empty()),
         );
-        let response = normalize_server_delay(response);
+        let response = normalize_server_delay(response).unwrap();
         assert_eq!(
             agentkit_http::retry_hint(response.headers()),
             Some(Duration::from_secs(10 * 60))
@@ -982,7 +1452,7 @@ mod tests {
             "https://chatgpt.com".into(),
             Box::pin(futures_util::stream::empty()),
         );
-        let response = normalize_server_delay(response);
+        let response = normalize_server_delay(response).unwrap();
         assert_eq!(
             agentkit_http::retry_hint(response.headers()),
             Some(Duration::from_secs(6 * 60 + 30))
@@ -1002,6 +1472,7 @@ mod tests {
         assert_eq!(config.initial_backoff, Duration::from_secs(1));
         assert_eq!(config.max_backoff, Duration::from_secs(60));
         assert_eq!(MAX_SERVER_DELAY, Duration::from_secs(10 * 60));
+        assert_eq!(MODEL_CATALOG_AUTH_TIMEOUT, Duration::from_secs(5));
     }
 
     #[test]
@@ -1057,17 +1528,30 @@ mod tests {
             "output_index": 0,
             "kind": "function_call",
         });
+        for (field, value) in [
+            ("model", json!(null)),
+            ("model", json!("")),
+            ("session_id", json!("other-session")),
+        ] {
+            let mut malformed = legacy.clone();
+            malformed[field] = value;
+            let mut metadata =
+                MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), malformed)]);
+            assert!(
+                migrate_legacy_continuation(
+                    &mut metadata,
+                    "session-1",
+                    &binding,
+                    "function_call",
+                    false,
+                )
+                .is_err()
+            );
+        }
         let mut metadata = MetadataMap::from([(LEGACY_CONTINUATION_METADATA.into(), legacy)]);
 
-        migrate_legacy_continuation(
-            &mut metadata,
-            "gpt-5.4",
-            "session-1",
-            &binding,
-            "function_call",
-            false,
-        )
-        .unwrap();
+        migrate_legacy_continuation(&mut metadata, "session-1", &binding, "function_call", false)
+            .unwrap();
 
         assert!(!metadata.contains_key(LEGACY_CONTINUATION_METADATA));
         assert_eq!(metadata[CONTINUATION_METADATA]["schema_version"], 3);
@@ -1076,12 +1560,12 @@ mod tests {
             binding
         );
         assert_eq!(metadata[CONTINUATION_METADATA]["item_id"], "item-1");
+        assert_eq!(metadata[CONTINUATION_METADATA]["model"], "gpt-5.4");
     }
 
     #[test]
     fn authentication_attempt_is_bound_and_redacted() {
-        let record =
-            auth::TokenRecord::for_test_generation("secret-token", "account-1", "generation-1");
+        let record = auth::test_support::token_record("secret-token", "account-1", "generation-1");
         let attempt = authentication_attempt(record).unwrap();
         assert_eq!(
             attempt.headers()["ChatGPT-Account-ID"],
@@ -1098,35 +1582,247 @@ mod tests {
 
     #[test]
     fn session_binding_rejects_generation_change() {
-        let expected = auth::TokenRecord::for_test_generation("a", "account", "one")
+        let expected = auth::test_support::token_record("a", "account", "one")
             .binding()
             .unwrap();
         assert!(
             ensure_credential_binding(
                 &expected,
-                &auth::TokenRecord::for_test_generation("b", "account", "one")
+                &auth::test_support::token_record("b", "account", "one")
             )
             .is_ok()
         );
         assert!(
             ensure_credential_binding(
                 &expected,
-                &auth::TokenRecord::for_test_generation("c", "account", "two")
+                &auth::test_support::token_record("c", "account", "two")
             )
             .is_err()
         );
     }
 
+    #[tokio::test]
+    async fn model_catalog_cache_is_scoped_to_account_and_generation() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let first_binding = auth::test_support::token_record("token", "account-1", "generation-1")
+            .binding()
+            .unwrap();
+        let next_generation =
+            auth::test_support::token_record("token", "account-1", "generation-2")
+                .binding()
+                .unwrap();
+        let next_account = auth::test_support::token_record("token", "account-2", "generation-1")
+            .binding()
+            .unwrap();
+
+        let first = cache
+            .get_or_try_init(&first_binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("first".into(), 100)]),
+                    visible_models: vec!["first".into()],
+                })
+            })
+            .await
+            .unwrap();
+        let same = cache
+            .get_or_try_init(&first_binding, || async {
+                Err(protocol("cached catalog was unexpectedly reloaded"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+
+        let second = cache
+            .get_or_try_init(&next_generation, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("second".into(), 200)]),
+                    visible_models: vec!["second".into()],
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.visible_models, ["second"]);
+        assert_eq!(second.context_windows.get("first"), None);
+        assert_eq!(second.context_windows.get("second"), Some(&200));
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        let third = cache
+            .get_or_try_init(&next_account, || async {
+                Ok(SubscriptionModelCatalog {
+                    context_windows: HashMap::from([("third".into(), 300)]),
+                    visible_models: vec!["third".into()],
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(third.visible_models, ["third"]);
+        assert_eq!(third.context_windows.get("second"), None);
+        assert_eq!(third.context_windows.get("third"), Some(&300));
+        assert!(!Arc::ptr_eq(&second, &third));
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_failure() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::test_support::token_record("token", "account", "generation")
+            .binding()
+            .unwrap();
+
+        let first = cache
+            .get_or_try_init(&binding, || async { Err(protocol("temporary failure")) })
+            .await;
+        assert!(first.is_err());
+
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["recovered".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.visible_models, ["recovered"]);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_cancelled_initializer() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::test_support::token_record("token", "account", "generation")
+            .binding()
+            .unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let pending_cache = cache.clone();
+        let pending_binding = binding.clone();
+        let pending = tokio::spawn(async move {
+            pending_cache
+                .get_or_try_init(&pending_binding, || async {
+                    started.send(()).unwrap();
+                    std::future::pending::<Result<SubscriptionModelCatalog, LoopError>>().await
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["retry".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        let reused = cache
+            .get_or_try_init(&binding, || async {
+                Err(protocol("cached initialization must not run"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&retry, &reused));
+        assert_eq!(reused.visible_models, ["retry"]);
+    }
+
+    #[tokio::test]
+    async fn model_catalog_cache_retries_after_initializer_unwind() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let binding = auth::test_support::token_record("token", "account", "generation")
+            .binding()
+            .unwrap();
+        let failed_cache = cache.clone();
+        let failed_binding = binding.clone();
+        let failed = tokio::spawn(async move {
+            failed_cache
+                .get_or_try_init(&failed_binding, || async {
+                    panic!("catalog initializer interrupted");
+                })
+                .await
+        });
+        assert!(failed.await.unwrap_err().is_panic());
+        let retry = cache
+            .get_or_try_init(&binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["retry".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(retry.visible_models, ["retry"]);
+    }
+
+    #[tokio::test]
+    async fn late_catalog_initialization_cannot_replace_a_new_binding() {
+        let cache = SubscriptionModelCatalogCache::default();
+        let old_binding = auth::test_support::token_record("old", "account", "old")
+            .binding()
+            .unwrap();
+        let new_binding = auth::test_support::token_record("new", "account", "new")
+            .binding()
+            .unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let old_cache = cache.clone();
+        let old = tokio::spawn(async move {
+            old_cache
+                .get_or_try_init(&old_binding, || async {
+                    started.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(SubscriptionModelCatalog {
+                        visible_models: vec!["old".into()],
+                        ..Default::default()
+                    })
+                })
+                .await
+                .unwrap()
+        });
+        waiting.await.unwrap();
+        let new = cache
+            .get_or_try_init(&new_binding, || async {
+                Ok(SubscriptionModelCatalog {
+                    visible_models: vec!["new".into()],
+                    ..Default::default()
+                })
+            })
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(old.await.unwrap().visible_models, ["old"]);
+        let reused = cache
+            .get_or_try_init(&new_binding, || async {
+                Err(protocol("new binding must retain its initialized catalog"))
+            })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&new, &reused));
+        assert_eq!(reused.visible_models, ["new"]);
+    }
+
     #[test]
-    fn catalog_parser_preserves_valid_models() {
+    fn catalog_parser_filters_orders_and_deduplicates_visible_models() {
         let too_long = format!("g{}", "x".repeat(MAX_CATALOG_MODEL_ID_BYTES));
-        let windows = parse_context_windows(&json!({"models": [
-            {"slug": "gpt-5.4", "context_window": 200000},
-            {"slug": "bad slug", "context_window": 1},
-            {"slug": too_long, "context_window": 1}
+        let catalog = parse_model_catalog(&json!({"models": [
+            {"slug": "hidden", "visibility": "hide", "priority": 0, "context_window": 300000},
+            {"slug": "later", "visibility": "list", "priority": 20, "context_window": 200000},
+            {"slug": "first", "visibility": "list", "priority": 10, "supported_in_api": false},
+            {"slug": "same-priority", "visibility": "list", "priority": 10},
+            {"slug": "later", "visibility": "list", "priority": 30},
+            {"slug": "bad slug", "visibility": "list", "priority": 1, "context_window": 1},
+            {"slug": too_long, "visibility": "list", "priority": 1, "context_window": 1}
         ]}))
         .unwrap();
-        assert_eq!(windows.get("gpt-5.4"), Some(&200000));
-        assert_eq!(windows.len(), 1);
+
+        assert_eq!(catalog.visible_models, ["first", "same-priority", "later"]);
+        assert_eq!(catalog.context_windows.get("hidden"), Some(&300000));
+        assert_eq!(catalog.context_windows.get("later"), Some(&200000));
+        assert_eq!(catalog.context_windows.len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "chatgpt_image_tests.rs"]
+mod image_tests;
+
+#[cfg(all(test, feature = "tui"))]
+mod websocket_tests;

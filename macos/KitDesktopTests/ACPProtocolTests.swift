@@ -161,17 +161,35 @@ final class ACPProtocolTests: XCTestCase {
         let tool = ConversationController.toolPresentation([
             "title": "Run program", "status": "pending",
             "rawInput": [
+                "intent": "  Check the workspace  ",
                 "script": "return shell({ command: \"pwd\" })",
                 "input": ["root": "/tmp"], "background": 5,
             ],
             "rawOutput": ["text": "done"],
         ])
-        XCTAssertEqual(tool.title, "Run program")
+        XCTAssertEqual(tool.title, "Check the workspace")
         XCTAssertEqual(tool.status, .pending)
+        XCTAssertEqual(tool.compose?.intent, "Check the workspace")
         XCTAssertEqual(tool.compose?.script, "return shell({ command: \"pwd\" })")
         XCTAssertEqual(tool.compose?.input, .object(["root": .string("/tmp")]))
         XCTAssertEqual(tool.compose?.background, .delay(seconds: 5))
         XCTAssertEqual(tool.compose?.output, .object(["text": .string("done")]))
+
+        let untitled = ConversationController.toolPresentation([
+            "title": "compose",
+            "rawInput": ["intent": " \n\t ", "script": "return 1"],
+            "content": [["content": ["type": "text", "text": "fallback result"]]],
+            "rawOutput": ["machine": true],
+        ])
+        XCTAssertNil(untitled.compose?.intent)
+        XCTAssertEqual(untitled.title, "Running tools.")
+        XCTAssertEqual(untitled.compose?.output, .string("fallback result"))
+
+        XCTAssertNil(ConversationController.toolPresentation([
+            "name": "other-tool",
+            "rawInput": ["intent": "Not compose", "script": "return 1"],
+        ]).compose)
+
         XCTAssertNil(ConversationController.toolPresentation([
             "rawInput": ["script": "not compose", "command": "other schema"],
         ]).compose)
@@ -189,6 +207,14 @@ final class ACPProtocolTests: XCTestCase {
             "name": "diagram", "uri": "file:///tmp/diagram.webp",
         ])
         XCTAssertEqual(linked.media.first?.url, URL(fileURLWithPath: "/tmp/diagram.webp"))
+    }
+
+    func testComposeChildToolSummaryGroupsSortsAndCapsNames() {
+        let summary = ComposePresentation.childToolSummary([
+            "shell", "edit", "shell", "tool", "edit", "docs", "auth", "docs", "a2a",
+        ])
+
+        XCTAssertEqual(summary, "docs x 2, edit x 2, shell x 2, a2a")
     }
 
     func testLargeInlineUserMediaSurvivesTransportCapping() {

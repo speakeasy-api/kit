@@ -13,6 +13,7 @@ use a2a_protocol_types::{
 };
 
 use sha2::{Digest as _, Sha256};
+use tracing::Instrument as _;
 
 use crate::runtime::Runtime;
 
@@ -24,67 +25,70 @@ impl AgentExecutor for KitAgent {
         context: &'a RequestContext,
         queue: &'a dyn EventQueueWriter,
     ) -> Pin<Box<dyn Future<Output = A2aResult<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let emit = EventEmitter::new(context, queue);
-            emit.status(TaskState::Working).await?;
-            let prompt = context
-                .message
-                .parts
-                .iter()
-                .filter_map(Part::text_content)
-                .collect::<Vec<_>>()
-                .join("\n");
-            if prompt.trim().is_empty() {
-                emit.artifact(
-                    "error",
-                    vec![Part::text("A2A request must contain a text part")],
-                    None,
-                    Some(true),
-                )
-                .await?;
-                emit.status(TaskState::Failed).await?;
-                return Ok(());
-            }
-            match self
-                .0
-                .run_cancelled(prompt, 0, Some(context.cancellation_token.clone()))
-                .await
-            {
-                Ok(output) => {
-                    emit.artifact("result", vec![Part::text(output)], None, Some(true))
-                        .await?;
-                    emit.status(TaskState::Completed).await?;
-                }
-                Err(error) => {
-                    let session_id = a2a_session_id(context);
-                    let rendered = crate::fatal::render_loop_error(&error);
-                    let rendered = match crate::fatal::record_loop_error(
-                        &session_id,
-                        crate::fatal::Surface::A2a,
-                        &error,
-                    ) {
-                        Ok(Some(path)) => {
-                            eprintln!(
-                                "stored fatal error log for {session_id}: {}",
-                                path.display()
-                            );
-                            rendered
-                        }
-                        Ok(None) => rendered,
-                        Err(log_error) => {
-                            eprintln!(
-                                "could not store fatal error log for {session_id}: {log_error}"
-                            );
-                            rendered
-                        }
-                    };
-                    emit.artifact("error", vec![Part::text(rendered)], None, Some(true))
-                        .await?;
+        Box::pin(
+            async move {
+                let emit = EventEmitter::new(context, queue);
+                emit.status(TaskState::Working).await?;
+                let prompt = context
+                    .message
+                    .parts
+                    .iter()
+                    .filter_map(Part::text_content)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if prompt.trim().is_empty() {
+                    emit.artifact(
+                        "error",
+                        vec![Part::text("A2A request must contain a text part")],
+                        None,
+                        Some(true),
+                    )
+                    .await?;
                     emit.status(TaskState::Failed).await?;
+                    return Ok(());
                 }
+                match self
+                    .0
+                    .run_cancelled(prompt, 0, Some(context.cancellation_token.clone()))
+                    .await
+                {
+                    Ok(output) => {
+                        emit.artifact("result", vec![Part::text(output)], None, Some(true))
+                            .await?;
+                        emit.status(TaskState::Completed).await?;
+                    }
+                    Err(error) => {
+                        let session_id = a2a_session_id(context);
+                        let rendered = crate::fatal::render_loop_error(&error);
+                        let rendered = match crate::fatal::record_loop_error(
+                            &session_id,
+                            crate::fatal::Surface::A2a,
+                            &error,
+                        ) {
+                            Ok(Some(path)) => {
+                                eprintln!(
+                                    "stored fatal error log for {session_id}: {}",
+                                    path.display()
+                                );
+                                rendered
+                            }
+                            Ok(None) => rendered,
+                            Err(log_error) => {
+                                eprintln!(
+                                    "could not store fatal error log for {session_id}: {log_error}"
+                                );
+                                rendered
+                            }
+                        };
+                        emit.artifact("error", vec![Part::text(rendered)], None, Some(true))
+                            .await?;
+                        emit.status(TaskState::Failed).await?;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        })
+            .instrument(crate::telemetry::error_spans::operation("a2a")),
+        )
     }
 }
 

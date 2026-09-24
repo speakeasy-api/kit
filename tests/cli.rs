@@ -1,6 +1,43 @@
+// Integration crate and its helpers are test-only. Placeholders stay denied.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+
 use std::{fs, path::Path, process::Command};
 
 use agentkit_core::{Item, ItemKind};
+
+#[test]
+fn typesafe_auth_environment_status_and_logout() {
+    let home = tempfile::tempdir().unwrap();
+    for (action, key, expected) in [
+        (
+            "status",
+            "test-secret",
+            "TypeSafe: configured via TYPESAFE_API_KEY.",
+        ),
+        ("status", "", "TypeSafe: not configured."),
+        ("logout", "test-secret", "TYPESAFE_API_KEY remains active"),
+        ("logout", "", "no saved key"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .env("TYPESAFE_API_KEY", key)
+            .args(["auth", action, "typesafe", "--credential-store", "memory"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(expected), "{stdout}");
+        assert!(!stdout.contains("test-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("test-secret"));
+    }
+}
 
 fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
     let root = root.canonicalize().unwrap();
@@ -22,6 +59,66 @@ fn write_session(home: &Path, root: &Path, id: &str) -> std::path::PathBuf {
     )
     .unwrap();
     directory.join(format!("{id}.metadata.json"))
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn tui_resume_picker_empty_workspace_exits_without_starting_a_session() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
+    command
+        .env("HOME", home.path())
+        .args(["tui", "--resume", "--root"])
+        .arg(root.path())
+        .args(["--credential-store", "memory"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no resumable sessions for workspace"),
+        "{output:?}"
+    );
+    assert!(!home.path().join(".kit/sessions").exists());
+}
+
+#[cfg(feature = "tui")]
+#[test]
+fn tui_resume_picker_uses_configured_root_and_reports_catalog_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = home.path().join(".kit");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("root = {:?}\n", root.path()),
+    )
+    .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .args(["tui", "--resume", "--credential-store", "memory"])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains(root.path().canonicalize().unwrap().to_str().unwrap()),
+        "{output:?}"
+    );
+    assert!(!config_dir.join("sessions").exists());
+    fs::write(config_dir.join("sessions"), "not a directory").unwrap();
+    let output = run();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not list sessions for"),
+        "{output:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(config_dir.join("sessions")).unwrap(),
+        "not a directory"
+    );
 }
 
 #[test]
@@ -201,4 +298,44 @@ fn sessions_rename_sets_replaces_lists_and_clears_a_display_name() {
         "Cleared name for session s-abc123\n"
     );
     assert_eq!(fs::read_to_string(metadata).unwrap(), "{}\n");
+}
+
+#[test]
+fn config_commands_report_disk_errors_and_preserve_missing_unsets() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join(".kit/config.toml");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env("HOME", home.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["config", "unset", "missing"]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stdout.is_empty());
+    assert!(!home.path().join(".kit").exists());
+
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# keep formatting\r\nmodel = 'old'\r\n";
+    fs::write(&path, original).unwrap();
+    let output = run(&["config", "unset", "missing"]);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    // A directory at the config path is a real filesystem failure, not a
+    // parse or argument error. Both mutating commands must exit unsuccessfully.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    for args in [
+        vec!["config", "set", "model", "new"],
+        vec!["config", "unset", "model"],
+    ] {
+        let output = run(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(path.is_dir());
+    }
 }

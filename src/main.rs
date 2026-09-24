@@ -1,36 +1,53 @@
+// Production policy is deliberately non-overridable. Test-only scopes below
+// retain assertions and unwrap ergonomics; placeholder lints remain denied.
+#![cfg_attr(
+    not(test),
+    forbid(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::disallowed_methods,
+        clippy::disallowed_macros
+    )
+)]
+
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
     future::Future,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+mod update;
+
+use clap::ValueEnum;
+use futures_util::future::{Either, select};
+use kit::resilient_fs as fs;
 use kit::tools::CredentialStorage;
 use serde::Deserialize;
 
-#[derive(Parser)]
-#[command(version, about = "Coding agent runtime and terminal client")]
 struct Cli {
-    #[command(flatten)]
+    request_budget_seconds: Option<kit::request_budget::RequestBudget>,
     telemetry: TelemetryArgs,
-    #[command(flatten)]
+
     openrouter: OpenRouterArgs,
-    #[command(flatten)]
     cerebras: CerebrasArgs,
-    #[command(subcommand)]
+
     command: Command,
 }
 
 const OTEL_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+const OTEL_PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+const OTEL_TRACES_PROTOCOL_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 const OTEL_CAPTURE_MESSAGE_CONTENT_ENV: &str = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT";
 const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
-#[derive(Args)]
 struct OpenRouterArgs {
     /// OpenRouter API key (prefer the environment or stored credentials to keep it out of argv).
-    #[arg(long, global = true, value_name = "KEY")]
     openrouter_api_key: Option<kit::provider::OpenRouterApiKey>,
 }
 
@@ -51,10 +68,8 @@ fn resolve_openrouter_api_key(
 
 const CEREBRAS_API_KEY_ENV: &str = "CEREBRAS_API_KEY";
 
-#[derive(Args)]
 struct CerebrasArgs {
     /// Cerebras API key (prefer the environment or stored credentials to keep it out of argv).
-    #[arg(long, global = true, value_name = "KEY")]
     cerebras_api_key: Option<kit::provider::CerebrasApiKey>,
 }
 
@@ -73,29 +88,25 @@ fn resolve_cerebras_api_key(
         })
 }
 
-#[derive(Args)]
 struct TelemetryArgs {
-    /// OTLP/gRPC collector endpoint for OpenTelemetry trace export.
-    #[arg(long, global = true)]
+    /// Resolved local diagnostic setting inherited by built-in Kit children.
+    internal_capture_error_spans: Option<bool>,
+    /// OTLP collector endpoint for OpenTelemetry trace export.
     otel_endpoint: Option<String>,
+    /// OTLP trace transport: grpc, http/protobuf, or http/json.
+    otel_protocol: Option<kit::telemetry::Protocol>,
     /// Capture structured GenAI input and output messages in exported spans.
-    #[arg(long, global = true, value_name = "BOOL", action = clap::ArgAction::Set)]
     otel_capture_message_content: Option<bool>,
     /// Maximum captured messages per GenAI input or output attribute.
-    #[arg(long, global = true)]
     otel_message_content_max_messages: Option<usize>,
     /// Maximum captured UTF-8 bytes per GenAI input or output attribute.
-    #[arg(long, global = true)]
     otel_message_content_max_bytes: Option<usize>,
 }
 
-#[derive(Args)]
 struct CredentialArgs {
     /// Credential storage backend (defaults to config or memory).
-    #[arg(long, value_enum, global = true)]
     credential_store: Option<CredentialStoreKind>,
     /// Private directory for file-backed credentials.
-    #[arg(long, global = true)]
     credential_dir: Option<PathBuf>,
 }
 
@@ -130,21 +141,16 @@ impl CredentialArgs {
     }
 }
 
-#[derive(Args)]
 struct McpArgs {
     /// Highest-precedence MCP server configuration.
-    #[arg(long)]
     mcp_config: Option<PathBuf>,
     /// Resolved config.toml MCP path inherited by built-in Kit children.
-    #[arg(long = "internal-mcp-config", hide = true)]
     configured_mcp_config: Option<PathBuf>,
     /// Preserve inherited layered configuration without a configured source.
-    #[arg(long = "internal-no-mcp-config", hide = true)]
     no_configured_mcp_config: bool,
     /// Preserve legacy single-file MCP behavior in built-in Kit children.
-    #[arg(long = "internal-mcp-legacy", hide = true)]
     legacy_mcp_config: bool,
-    #[command(flatten)]
+
     credentials: CredentialArgs,
 }
 
@@ -180,7 +186,7 @@ impl McpArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum CredentialStoreKind {
     Memory,
@@ -188,7 +194,7 @@ enum CredentialStoreKind {
     File,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ReasoningEffortArg {
     Default,
     Low,
@@ -207,6 +213,1111 @@ impl ReasoningEffortArg {
     }
 }
 
+// Keep Clap's public builder and fallible accessors here: derive-generated lint
+// allowances conflict with this binary's non-overridable production policy.
+fn optional_arg<T: Clone + Send + Sync + 'static>(
+    matches: &clap::ArgMatches,
+    name: &str,
+) -> Result<Option<T>, clap::Error> {
+    matches
+        .try_get_one::<T>(name)
+        .map(|value| value.cloned())
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::InvalidValue, error))
+}
+
+fn required_arg<T: Clone + Send + Sync + 'static>(
+    matches: &clap::ArgMatches,
+    name: &str,
+) -> Result<T, clap::Error> {
+    optional_arg(matches, name)?.ok_or_else(|| {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            format!("missing required argument {name}"),
+        )
+    })
+}
+
+fn required_subcommand(
+    matches: &clap::ArgMatches,
+) -> Result<(&str, &clap::ArgMatches), clap::Error> {
+    matches.subcommand().ok_or_else(|| {
+        clap::Error::raw(
+            clap::error::ErrorKind::MissingSubcommand,
+            "missing required subcommand",
+        )
+    })
+}
+
+impl Cli {
+    fn command() -> clap::Command {
+        let command = clap::Command::new(env!("CARGO_PKG_NAME"))
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("Coding agent runtime and terminal client");
+        let command = command.group(clap::ArgGroup::new("Cli").multiple(true));
+        let command = command.arg(
+            clap::Arg::new("request_budget_seconds")
+                .long("request-budget-seconds")
+                .global(true)
+                .value_parser(clap::value_parser!(kit::request_budget::RequestBudget))
+                .help("Total provider logical-request budget in seconds (1-3600; default 60)"),
+        );
+        let command = TelemetryArgs::augment_command(command);
+        let command = OpenRouterArgs::augment_command(command);
+        let command = CerebrasArgs::augment_command(command);
+        Command::augment_command(command)
+            .subcommand_required(true)
+            .arg_required_else_help(true)
+    }
+
+    fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut command = Self::command();
+        let matches = command.try_get_matches_from_mut(args)?;
+        Self::from_matches(&matches).map_err(|error| error.format(&mut command))
+    }
+
+    fn parse() -> Self {
+        Self::try_parse_from(env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            request_budget_seconds: optional_arg(matches, "request_budget_seconds")?,
+            telemetry: TelemetryArgs::from_matches(matches)?,
+            openrouter: OpenRouterArgs::from_matches(matches)?,
+            cerebras: CerebrasArgs::from_matches(matches)?,
+            command: Command::from_matches(matches)?,
+        })
+    }
+}
+
+impl OpenRouterArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(
+            clap::ArgGroup::new("OpenRouterArgs")
+                .multiple(true)
+                .args(["openrouter_api_key"]),
+        );
+        command.arg(clap::Arg::new("openrouter_api_key").long("openrouter-api-key").value_name("KEY").value_parser(clap::value_parser!(kit::provider::OpenRouterApiKey)).action(clap::ArgAction::Set).help("OpenRouter API key (prefer the environment or stored credentials to keep it out of argv)").global(true))
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            openrouter_api_key: optional_arg(matches, "openrouter_api_key")?,
+        })
+    }
+}
+
+impl CerebrasArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(
+            clap::ArgGroup::new("CerebrasArgs")
+                .multiple(true)
+                .args(["cerebras_api_key"]),
+        );
+        command.arg(clap::Arg::new("cerebras_api_key").long("cerebras-api-key").value_name("KEY").value_parser(clap::value_parser!(kit::provider::CerebrasApiKey)).action(clap::ArgAction::Set).help("Cerebras API key (prefer the environment or stored credentials to keep it out of argv)").global(true))
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            cerebras_api_key: optional_arg(matches, "cerebras_api_key")?,
+        })
+    }
+}
+
+impl TelemetryArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(clap::ArgGroup::new("TelemetryArgs").multiple(true).args([
+            "internal_capture_error_spans",
+            "otel_endpoint",
+            "otel_protocol",
+            "otel_capture_message_content",
+            "otel_message_content_max_messages",
+            "otel_message_content_max_bytes",
+        ]));
+        let command = command.arg(
+            clap::Arg::new("internal_capture_error_spans")
+                .long("internal-capture-error-spans")
+                .value_name("BOOL")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::Set)
+                .help("Resolved local diagnostic setting inherited by built-in Kit children")
+                .hide(true)
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_endpoint")
+                .long("otel-endpoint")
+                .value_name("OTEL_ENDPOINT")
+                .value_parser(clap::value_parser!(String))
+                .action(clap::ArgAction::Set)
+                .help("OTLP collector endpoint for OpenTelemetry trace export")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_protocol")
+                .long("otel-protocol")
+                .value_name("OTEL_PROTOCOL")
+                .value_parser(clap::value_parser!(kit::telemetry::Protocol))
+                .action(clap::ArgAction::Set)
+                .help("OTLP trace transport: grpc, http/protobuf, or http/json")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_capture_message_content")
+                .long("otel-capture-message-content")
+                .value_name("BOOL")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::Set)
+                .help("Capture structured GenAI input and output messages in exported spans")
+                .global(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("otel_message_content_max_messages")
+                .long("otel-message-content-max-messages")
+                .value_name("OTEL_MESSAGE_CONTENT_MAX_MESSAGES")
+                .value_parser(clap::value_parser!(usize))
+                .action(clap::ArgAction::Set)
+                .help("Maximum captured messages per GenAI input or output attribute")
+                .global(true),
+        );
+        command.arg(
+            clap::Arg::new("otel_message_content_max_bytes")
+                .long("otel-message-content-max-bytes")
+                .value_name("OTEL_MESSAGE_CONTENT_MAX_BYTES")
+                .value_parser(clap::value_parser!(usize))
+                .action(clap::ArgAction::Set)
+                .help("Maximum captured UTF-8 bytes per GenAI input or output attribute")
+                .global(true),
+        )
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            internal_capture_error_spans: optional_arg(matches, "internal_capture_error_spans")?,
+            otel_endpoint: optional_arg(matches, "otel_endpoint")?,
+            otel_protocol: optional_arg(matches, "otel_protocol")?,
+            otel_capture_message_content: optional_arg(matches, "otel_capture_message_content")?,
+            otel_message_content_max_messages: optional_arg(
+                matches,
+                "otel_message_content_max_messages",
+            )?,
+            otel_message_content_max_bytes: optional_arg(
+                matches,
+                "otel_message_content_max_bytes",
+            )?,
+        })
+    }
+}
+
+impl CredentialArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(
+            clap::ArgGroup::new("CredentialArgs")
+                .multiple(true)
+                .args(["credential_store", "credential_dir"]),
+        );
+        let command = command.arg(
+            clap::Arg::new("credential_store")
+                .long("credential-store")
+                .value_name("CREDENTIAL_STORE")
+                .value_parser(clap::value_parser!(CredentialStoreKind))
+                .action(clap::ArgAction::Set)
+                .help("Credential storage backend (defaults to config or memory)")
+                .global(true),
+        );
+        command.arg(
+            clap::Arg::new("credential_dir")
+                .long("credential-dir")
+                .value_name("CREDENTIAL_DIR")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Private directory for file-backed credentials")
+                .global(true),
+        )
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            credential_store: optional_arg(matches, "credential_store")?,
+            credential_dir: optional_arg(matches, "credential_dir")?,
+        })
+    }
+}
+
+impl McpArgs {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.group(clap::ArgGroup::new("McpArgs").multiple(true));
+        let command = command.arg(
+            clap::Arg::new("mcp_config")
+                .long("mcp-config")
+                .value_name("MCP_CONFIG")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Highest-precedence MCP server configuration"),
+        );
+        let command = command.arg(
+            clap::Arg::new("configured_mcp_config")
+                .long("internal-mcp-config")
+                .value_name("CONFIGURED_MCP_CONFIG")
+                .value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Set)
+                .help("Resolved config.toml MCP path inherited by built-in Kit children")
+                .hide(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("no_configured_mcp_config")
+                .long("internal-no-mcp-config")
+                .value_name("NO_CONFIGURED_MCP_CONFIG")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::SetTrue)
+                .help("Preserve inherited layered configuration without a configured source")
+                .hide(true),
+        );
+        let command = command.arg(
+            clap::Arg::new("legacy_mcp_config")
+                .long("internal-mcp-legacy")
+                .value_name("LEGACY_MCP_CONFIG")
+                .value_parser(clap::value_parser!(bool))
+                .action(clap::ArgAction::SetTrue)
+                .help("Preserve legacy single-file MCP behavior in built-in Kit children")
+                .hide(true),
+        );
+        CredentialArgs::augment_command(command)
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            mcp_config: optional_arg(matches, "mcp_config")?,
+            configured_mcp_config: optional_arg(matches, "configured_mcp_config")?,
+            no_configured_mcp_config: required_arg(matches, "no_configured_mcp_config")?,
+            legacy_mcp_config: required_arg(matches, "legacy_mcp_config")?,
+            credentials: CredentialArgs::from_matches(matches)?,
+        })
+    }
+}
+
+impl AuthAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand({
+            let command = clap::Command::new("login")
+                .about("Authenticate a service in the configured credential store");
+            let command = command.group(
+                clap::ArgGroup::new("Login")
+                    .multiple(true)
+                    .args(["provider"]),
+            );
+            command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            )
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("status").about("Show service authentication status");
+            let command = command.group(
+                clap::ArgGroup::new("Status")
+                    .multiple(true)
+                    .args(["provider"]),
+            );
+            command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            )
+        });
+        command.subcommand({
+            let command = clap::Command::new("logout")
+                .about("Remove service credentials, revoking them when supported");
+            let command = command.group(
+                clap::ArgGroup::new("Logout")
+                    .multiple(true)
+                    .args(["provider", "local_only"]),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .required(true),
+            );
+            command.arg(
+                clap::Arg::new("local_only")
+                    .long("local-only")
+                    .value_name("LOCAL_ONLY")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Remove local credentials without attempting remote revocation"),
+            )
+        })
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "login" => Ok(Self::Login {
+                provider: required_arg(matches, "provider")?,
+            }),
+            "status" => Ok(Self::Status {
+                provider: required_arg(matches, "provider")?,
+            }),
+            "logout" => Ok(Self::Logout {
+                provider: required_arg(matches, "provider")?,
+                local_only: required_arg(matches, "local_only")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl SessionsAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        command.subcommand({
+            let command =
+                clap::Command::new("rename").about("Set or clear a session's custom display name");
+            let command = command.group(clap::ArgGroup::new("Rename").multiple(true).args([
+                "session_id",
+                "name",
+                "clear",
+            ]));
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .required(true)
+                    .help("Durable session ID"),
+            );
+            let command = command.arg(
+                clap::Arg::new("name")
+                    .value_name("NAME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("New display name")
+                    .required_unless_present("clear")
+                    .conflicts_with("clear"),
+            );
+            command.arg(
+                clap::Arg::new("clear")
+                    .long("clear")
+                    .value_name("CLEAR")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Clear the custom name and restore the generated title"),
+            )
+        })
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "rename" => Ok(Self::Rename {
+                session_id: required_arg(matches, "session_id")?,
+                name: optional_arg(matches, "name")?,
+                clear: required_arg(matches, "clear")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+const CONFIG_HELP: &str =
+    "Keys use TOML dotted paths; quote components containing dots, for example
+plugins.\"my.plugin\".source. Unknown and future settings are supported.
+Get fails when KEY is missing; unset leaves absent settings unchanged.
+Values accept plain strings or TOML values (booleans, numbers, arrays, inline
+tables, and quoted strings). Use --string to force literal string input.
+
+Root settings:
+  root                              Working directory and project context
+  model                             Default model ID
+  provider                          Model provider: openai-subscription, openrouter, speakeasy
+  reasoning_effort                  Reasoning effort: low, medium, high; unset for provider default
+  a2a                               A2A listener bind address (e.g. 127.0.0.1:7331)
+  mcp_config                        MCP server configuration path
+  credential_store                  Credential backend: memory, keychain, file
+  credential_dir                    Directory for the file credential backend
+  capture_error_spans                Capture error spans
+  otel_endpoint                     OTLP trace export endpoint URL
+  otel_protocol                     OTLP transport: grpc, http/protobuf, http/json
+  otel_capture_message_content      Capture message contents in telemetry
+  otel_message_content_max_messages  Maximum captured message count
+  otel_message_content_max_bytes     Maximum captured message bytes
+
+Dynamic settings:
+  plugins.<name>.source              path, archive, or git
+  plugins.<name>.path                Local plugin directory (path source)
+  plugins.<name>.url                 Archive or Git URL
+  plugins.<name>.sha256              Required SHA-256 checksum (archive source)
+  plugins.<name>.rev                 Optional Git revision (git source)
+  plugins.<name>.subdir              Optional archive or Git subdirectory
+  acp.<name>.command                 ACP harness executable
+  acp.<name>.args                    ACP harness argument array
+  acp.<name>.permissions             Permission policy: deny or cancel
+  subagent.harness                   Default subagent harness
+  subagent.harnesses.<name>.models.<alias>
+                                    Model alias mapping
+  subagent.harnesses.<name>.allow_model_overrides
+                                    Allowed explicit model override array
+  subagent.harnesses.<name>.config_options.<id>
+                                    Initial ACP select string or boolean
+
+These commands edit the file directly without authentication, networking,
+runtime validation, configuration loading, or migrations.";
+
+enum ConfigAction {
+    Get {
+        key: Option<String>,
+    },
+    Set {
+        key: String,
+        value: String,
+        string: bool,
+    },
+    Unset {
+        key: String,
+    },
+}
+
+impl ConfigAction {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let key = || {
+            clap::Arg::new("key")
+                .value_name("KEY")
+                .help("TOML dotted or quoted key path")
+        };
+        command
+            .subcommand(
+                clap::Command::new("get")
+                    .about("Print a setting, or the whole config when KEY is omitted")
+                    .after_help(CONFIG_HELP)
+                    .arg(key()),
+            )
+            .subcommand(
+                clap::Command::new("set")
+                    .about("Set a setting to a plain string or TOML value")
+                    .after_help(CONFIG_HELP)
+                    .arg(key().required(true))
+                    .arg(
+                        clap::Arg::new("value")
+                            .value_name("VALUE")
+                            .required(true)
+                            .allow_hyphen_values(true)
+                            .help("Plain string or TOML value"),
+                    )
+                    .arg(
+                        clap::Arg::new("string")
+                            .long("string")
+                            .action(clap::ArgAction::SetTrue)
+                            .help("Store VALUE as a literal string, even if it looks like TOML"),
+                    ),
+            )
+            .subcommand(
+                clap::Command::new("unset")
+                    .about("Remove a setting; absent settings are a no-op")
+                    .after_help(CONFIG_HELP)
+                    .arg(key().required(true)),
+            )
+    }
+
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "get" => Ok(Self::Get {
+                key: optional_arg(matches, "key")?,
+            }),
+            "set" => Ok(Self::Set {
+                key: required_arg(matches, "key")?,
+                value: required_arg(matches, "value")?,
+                string: required_arg(matches, "string")?,
+            }),
+            "unset" => Ok(Self::Unset {
+                key: required_arg(matches, "key")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl Command {
+    fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand(
+            clap::Command::new("update")
+                .about("Update Kit using its detected installation method")
+                .arg(
+                    clap::Arg::new("dry_run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Show the update plan without downloading or changing files"),
+                ),
+        );
+        let command = command.subcommand({
+            clap::Command::new("init")
+                .about("Write the recommended configuration to ~/.kit/config.toml")
+        });
+        let command = command.subcommand(ConfigAction::augment_command(
+            clap::Command::new("config")
+                .about("Get, set, or unset settings in ~/.kit/config.toml")
+                .after_help(CONFIG_HELP)
+                .subcommand_required(true)
+                .arg_required_else_help(true),
+        ));
+        let command = command.subcommand(CredentialArgs::augment_command(
+            clap::Command::new("usage")
+                .about("Show provider usage and quota without starting a model prompt")
+                .arg(
+                    clap::Arg::new("provider")
+                        .value_name("PROVIDER")
+                        .value_parser(["openai", "openai-subscription", "openrouter"]),
+                ),
+        ));
+        let command = command.subcommand({
+            let command = clap::Command::new("auth")
+                .about("Manage provider authentication without starting a runtime");
+            let command = command.group(clap::ArgGroup::new("Auth").multiple(true));
+            let command = AuthAction::augment_command(command)
+                .subcommand_required(true)
+                .arg_required_else_help(true);
+            CredentialArgs::augment_command(command)
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("sessions")
+                .about("List or rename durable sessions for a workspace");
+            let command = command.group(
+                clap::ArgGroup::new("Sessions")
+                    .multiple(true)
+                    .args(["root"]),
+            );
+            let command = SessionsAction::augment_command(command);
+            command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)")
+                    .global(true),
+            )
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("serve")
+                .about("Serve ACP on stdio with A2A, remote ACP, or both over HTTP");
+            let command = command.group(clap::ArgGroup::new("Serve").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set)
+                    .help("Reasoning effort (defaults to config or provider default)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("a2a")
+                    .long("a2a")
+                    .value_name("A2A")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help(
+                        "HTTP listen address. An available loopback port is selected when omitted",
+                    )
+                    .visible_alias("http"),
+            );
+            let command = command.arg(
+                clap::Arg::new("remote_acp")
+                    .long("remote-acp")
+                    .value_name("REMOTE_ACP")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Expose ACP over HTTP/SSE and WebSocket at `/acp`"),
+            );
+            let command = command.arg(
+                clap::Arg::new("no_a2a")
+                    .long("no-a2a")
+                    .value_name("NO_A2A")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Do not expose A2A on the HTTP listener")
+                    .requires("remote_acp"),
+            );
+            let command = command.arg(
+                clap::Arg::new("no_stdio")
+                    .long("no-stdio")
+                    .value_name("NO_STDIO")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Do not serve ACP on stdio. Requires remote ACP over HTTP")
+                    .requires("remote_acp"),
+            );
+            let command = command.arg(
+                clap::Arg::new("stdio_protocol_version")
+                    .long("stdio-protocol-version")
+                    .value_name("STDIO_PROTOCOL_VERSION")
+                    .value_parser(clap::value_parser!(AcpProtocolVersion))
+                    .action(clap::ArgAction::Set)
+                    .help("ACP wire version for stdio (defaults to v1 for compatibility)")
+                    .default_value("1")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("server_credential_file")
+                    .long("server-credential-file")
+                    .value_name("PATH")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Require this file's bearer token on every HTTP request"),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("terminal_auth_login")
+                    .long("terminal-auth-login")
+                    .value_name("TERMINAL_AUTH_LOGIN")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .help("Provider login requested by ACP terminal authentication")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .long("session-id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Persistent session id selected by the hosting client"),
+            );
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Load session_id instead of creating it")
+                    .requires("session_id"),
+            );
+            command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override a stale session lock")
+                    .requires("resume"),
+            )
+        });
+        let command = command.subcommand({
+            let command =
+                clap::Command::new("acp").about("Serve only the Agent Client Protocol on stdio");
+            let command = command.group(clap::ArgGroup::new("Acp").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("protocol_version")
+                    .long("protocol-version")
+                    .value_name("PROTOCOL_VERSION")
+                    .value_parser(clap::value_parser!(AcpProtocolVersion))
+                    .action(clap::ArgAction::Set)
+                    .help("ACP wire protocol version")
+                    .default_value("1"),
+            );
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("session_id")
+                    .long("session-id")
+                    .value_name("SESSION_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("terminal_auth_login")
+                    .long("terminal-auth-login")
+                    .value_name("TERMINAL_AUTH_LOGIN")
+                    .value_parser(clap::value_parser!(AuthProvider))
+                    .action(clap::ArgAction::Set)
+                    .help("Provider login requested by ACP terminal authentication")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("session_id"),
+            );
+            let command = command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .requires("resume"),
+            );
+            let command = command.arg(
+                clap::Arg::new("subagent_depth")
+                    .long("subagent-depth")
+                    .value_name("SUBAGENT_DEPTH")
+                    .value_parser(clap::value_parser!(usize))
+                    .action(clap::ArgAction::Set)
+                    .default_value("0")
+                    .hide(true),
+            );
+            let command = command.arg(
+                clap::Arg::new("subagent_parent_id")
+                    .long("subagent-parent-id")
+                    .value_name("SUBAGENT_PARENT_ID")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .hide(true)
+                    .requires("subagent_parent_name"),
+            );
+            command.arg(
+                clap::Arg::new("subagent_parent_name")
+                    .long("subagent-parent-name")
+                    .value_name("SUBAGENT_PARENT_NAME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .hide(true)
+                    .requires("subagent_parent_id"),
+            )
+        });
+        let command = command.subcommand({
+            let command = clap::Command::new("prompt")
+                .about("Run one persisted prompt, print its answer and session id, then exit");
+            let command = command.group(clap::ArgGroup::new("Prompt").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Resume this persisted session id"),
+            );
+            let command = command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override the resumed session's stale lock")
+                    .requires("resume"),
+            );
+            command.arg(
+                clap::Arg::new("prompt")
+                    .value_name("PROMPT")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .required(true)
+                    .help("Prompt text; quote it when it contains spaces"),
+            )
+        });
+        #[cfg(feature = "tui")]
+        let command = command.subcommand({
+            let command = clap::Command::new("tui").about("Start the ACP-backed terminal client");
+            let command = command.group(clap::ArgGroup::new("Tui").multiple(true));
+            let command = command.arg(
+                clap::Arg::new("root")
+                    .long("root")
+                    .value_name("ROOT")
+                    .value_parser(clap::value_parser!(PathBuf))
+                    .action(clap::ArgAction::Set)
+                    .help("Working directory and project context (defaults to config or `.`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("model")
+                    .long("model")
+                    .value_name("MODEL")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help("Model name (defaults to config or `gpt-5.4`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("provider")
+                    .long("provider")
+                    .value_name("PROVIDER")
+                    .value_parser(clap::value_parser!(kit::ProviderKind))
+                    .action(clap::ArgAction::Set)
+                    .help("Model provider (defaults to config or `openai-subscription`)"),
+            );
+            let command = command.arg(
+                clap::Arg::new("reasoning_effort")
+                    .long("reasoning-effort")
+                    .value_name("REASONING_EFFORT")
+                    .value_parser(clap::value_parser!(ReasoningEffortArg))
+                    .action(clap::ArgAction::Set),
+            );
+            let command = command.arg(
+                clap::Arg::new("a2a")
+                    .long("a2a")
+                    .value_name("A2A")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .help(
+                        "A2A listen address. An available loopback port is selected when omitted",
+                    ),
+            );
+            let command = McpArgs::augment_command(command);
+            let command = command.arg(
+                clap::Arg::new("resume")
+                    .long("resume")
+                    .value_name("RESUME")
+                    .value_parser(clap::value_parser!(String))
+                    .action(clap::ArgAction::Set)
+                    .num_args(0..=1)
+                    .help("Resume a persisted session by ID, or open the session picker without an ID"),
+            );
+            command.arg(
+                clap::Arg::new("force")
+                    .long("force")
+                    .value_name("FORCE")
+                    .value_parser(clap::value_parser!(bool))
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Override the resumed session's stale lock")
+                    .requires("resume"),
+            )
+        });
+        command
+    }
+    fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let (name, matches) = required_subcommand(matches)?;
+        match name {
+            "init" => Ok(Self::Init),
+            "update" => Ok(Self::Update {
+                dry_run: required_arg(matches, "dry_run")?,
+            }),
+            "config" => Ok(Self::Config {
+                action: ConfigAction::from_matches(matches)?,
+            }),
+            "usage" => Ok(Self::Usage {
+                provider: matches.get_one::<String>("provider").cloned(),
+                credentials: CredentialArgs::from_matches(matches)?,
+            }),
+            "auth" => Ok(Self::Auth {
+                action: AuthAction::from_matches(matches)?,
+                credentials: CredentialArgs::from_matches(matches)?,
+            }),
+            "sessions" => Ok(Self::Sessions {
+                action: if matches.subcommand().is_some() {
+                    Some(SessionsAction::from_matches(matches)?)
+                } else {
+                    None
+                },
+                root: optional_arg(matches, "root")?,
+            }),
+            "serve" => Ok(Self::Serve {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                a2a: optional_arg(matches, "a2a")?,
+                remote_acp: required_arg(matches, "remote_acp")?,
+                no_a2a: required_arg(matches, "no_a2a")?,
+                no_stdio: required_arg(matches, "no_stdio")?,
+                stdio_protocol_version: required_arg(matches, "stdio_protocol_version")?,
+                server_credential_file: optional_arg(matches, "server_credential_file")?,
+                mcp: McpArgs::from_matches(matches)?,
+                terminal_auth_login: optional_arg(matches, "terminal_auth_login")?,
+                session_id: optional_arg(matches, "session_id")?,
+                resume: required_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+            }),
+            "acp" => Ok(Self::Acp {
+                protocol_version: required_arg(matches, "protocol_version")?,
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                mcp: McpArgs::from_matches(matches)?,
+                session_id: optional_arg(matches, "session_id")?,
+                terminal_auth_login: optional_arg(matches, "terminal_auth_login")?,
+                resume: required_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+                subagent_depth: required_arg(matches, "subagent_depth")?,
+                subagent_parent_id: optional_arg(matches, "subagent_parent_id")?,
+                subagent_parent_name: optional_arg(matches, "subagent_parent_name")?,
+            }),
+            "prompt" => Ok(Self::Prompt {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                mcp: McpArgs::from_matches(matches)?,
+                resume: optional_arg(matches, "resume")?,
+                force: required_arg(matches, "force")?,
+                prompt: required_arg(matches, "prompt")?,
+            }),
+            #[cfg(feature = "tui")]
+            "tui" => Ok(Self::Tui {
+                root: optional_arg(matches, "root")?,
+                model: optional_arg(matches, "model")?,
+                provider: optional_arg(matches, "provider")?,
+                reasoning_effort: optional_arg(matches, "reasoning_effort")?,
+                a2a: optional_arg(matches, "a2a")?,
+                mcp: McpArgs::from_matches(matches)?,
+                resume: matches
+                    .contains_id("resume")
+                    .then(|| optional_arg(matches, "resume"))
+                    .transpose()?,
+                force: required_arg(matches, "force")?,
+            }),
+            _ => Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!("unknown subcommand {name}"),
+            )),
+        }
+    }
+}
+
+impl ValueEnum for CredentialStoreKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Memory, Self::Keychain, Self::File]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Memory => "memory",
+            Self::Keychain => "keychain",
+            Self::File => "file",
+        }))
+    }
+}
+
+impl ValueEnum for ReasoningEffortArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Default, Self::Low, Self::Medium, Self::High]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Default => "default",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }))
+    }
+}
+
+impl ValueEnum for AcpProtocolVersion {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::V1, Self::V2]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::V1 => "1",
+            Self::V2 => "2",
+        }))
+    }
+}
+
+impl ValueEnum for AuthProvider {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self::Openai,
+            Self::Openrouter,
+            Self::Cerebras,
+            Self::Speakeasy,
+            Self::Typesafe,
+        ]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Self::Openai => "openai",
+            Self::Openrouter => "openrouter",
+            Self::Cerebras => "cerebras",
+            Self::Speakeasy => "speakeasy",
+            Self::Typesafe => "typesafe",
+        }))
+    }
+}
+
 struct ConfigMigration {
     apply: fn(&mut toml::Table),
 }
@@ -214,9 +1325,26 @@ struct ConfigMigration {
 // Migrations are shape-driven and must be idempotent because hand-written config
 // files do not carry a schema version. Add one migration for every schema change
 // so typed deserialization only ever sees the latest config shape.
-const CONFIG_MIGRATIONS: &[ConfigMigration] = &[ConfigMigration {
-    apply: migrate_credentials_to_shared_store,
-}];
+const CONFIG_MIGRATIONS: &[ConfigMigration] = &[
+    ConfigMigration {
+        apply: migrate_credentials_to_shared_store,
+    },
+    ConfigMigration {
+        apply: migrate_experimental_voice,
+    },
+];
+
+fn migrate_experimental_voice(config: &mut toml::Table) {
+    let experimental = config
+        .entry("experimental")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    // Leave malformed shapes intact for strict typed deserialization.
+    if let Some(experimental) = experimental.as_table_mut() {
+        experimental
+            .entry("voice")
+            .or_insert(toml::Value::Boolean(false));
+    }
+}
 
 fn migrate_credentials_to_shared_store(config: &mut toml::Table) {
     for (old, new) in [
@@ -247,12 +1375,17 @@ fn migrate_config(mut config: toml::Table) -> toml::Table {
 
 #[derive(Debug, Default, Deserialize)]
 struct Config {
+    #[serde(default, deserialize_with = "deserialize_experimental_config")]
+    experimental: ExperimentalConfig,
+    request_budget_seconds: Option<kit::request_budget::RequestBudget>,
     root: Option<PathBuf>,
     model: Option<String>,
     provider: Option<kit::ProviderKind>,
     reasoning_effort: Option<kit::ReasoningEffort>,
     a2a: Option<String>,
+    capture_error_spans: Option<bool>,
     otel_endpoint: Option<String>,
+    otel_protocol: Option<kit::telemetry::Protocol>,
     otel_capture_message_content: Option<bool>,
     otel_message_content_max_messages: Option<usize>,
     otel_message_content_max_bytes: Option<usize>,
@@ -269,6 +1402,23 @@ struct Config {
     config_dir: PathBuf,
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+fn deserialize_experimental_config<'de, D>(deserializer: D) -> Result<ExperimentalConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let table = toml::Table::deserialize(deserializer)?;
+    table.try_into().map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ExperimentalConfig {
+    #[serde(default)]
+    eval: bool,
+    #[cfg(feature = "tui")]
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,7 +1443,7 @@ impl Config {
             env::current_dir()?.join(path)
         };
         let config_dir = absolute_parent(&config_path)?;
-        let contents = match fs::read_to_string(path) {
+        let contents = match kit::config_files::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(Self {
@@ -391,7 +1541,18 @@ impl Config {
         args: &TelemetryArgs,
         endpoint_environment: Option<String>,
         capture_environment: Option<String>,
+        traces_protocol_environment: Option<String>,
+        protocol_environment: Option<String>,
     ) -> io::Result<kit::telemetry::Settings> {
+        let protocol = if let Some(value) = args.otel_protocol.or(self.otel_protocol) {
+            value
+        } else if let Some(value) = traces_protocol_environment {
+            parse_otel_protocol(OTEL_TRACES_PROTOCOL_ENV, &value)?
+        } else if let Some(value) = protocol_environment {
+            parse_otel_protocol(OTEL_PROTOCOL_ENV, &value)?
+        } else {
+            kit::telemetry::Protocol::default()
+        };
         let capture_message_content = if let Some(value) = args.otel_capture_message_content {
             value
         } else if let Some(value) = self.otel_capture_message_content {
@@ -410,12 +1571,20 @@ impl Config {
             .otel_message_content_max_bytes
             .or(self.otel_message_content_max_bytes)
             .unwrap_or(kit::telemetry::DEFAULT_MESSAGE_CONTENT_MAX_BYTES);
-        kit::telemetry::Settings::try_new(
+        kit::telemetry::Settings::try_new_with_protocol(
             self.otel_endpoint(args.otel_endpoint.clone(), endpoint_environment),
+            protocol,
             capture_message_content,
             max_messages,
             max_bytes,
         )
+        .map(|mut settings| {
+            settings.capture_error_spans = args
+                .internal_capture_error_spans
+                .or(self.capture_error_spans)
+                .unwrap_or(false);
+            settings
+        })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
     }
 
@@ -438,6 +1607,15 @@ impl Config {
     }
 }
 
+fn parse_otel_protocol(name: &str, value: &str) -> io::Result<kit::telemetry::Protocol> {
+    value.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {name}: {error}"),
+        )
+    })
+}
+
 fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" => Ok(true),
@@ -449,197 +1627,172 @@ fn parse_otel_boolean(name: &str, value: &str) -> io::Result<bool> {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum AcpProtocolVersion {
-    #[value(name = "1")]
     V1,
-    #[value(name = "2")]
+
     V2,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum AuthProvider {
     Openai,
     Openrouter,
     Cerebras,
     Speakeasy,
+    Typesafe,
 }
 
-#[derive(Subcommand)]
 enum AuthAction {
-    /// Authenticate a model provider in the configured credential store.
+    /// Authenticate a service in the configured credential store.
     Login { provider: AuthProvider },
-    /// Show model-provider authentication status.
+    /// Show service authentication status.
     Status { provider: AuthProvider },
-    /// Remove model-provider credentials, revoking them when supported.
+    /// Remove service credentials, revoking them when supported.
     Logout {
         provider: AuthProvider,
         /// Remove local credentials without attempting remote revocation.
-        #[arg(long)]
         local_only: bool,
     },
 }
 
-#[derive(Subcommand)]
 enum SessionsAction {
     /// Set or clear a session's custom display name.
     Rename {
         /// Durable session ID.
         session_id: String,
         /// New display name.
-        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
         name: Option<String>,
         /// Clear the custom name and restore the generated title.
-        #[arg(long)]
         clear: bool,
     },
 }
 
-#[derive(Subcommand)]
 enum Command {
+    Usage {
+        provider: Option<String>,
+        credentials: CredentialArgs,
+    },
+    Update {
+        dry_run: bool,
+    },
     /// Write the recommended configuration to ~/.kit/config.toml.
     Init,
+    /// Edit global configuration without loading runtime settings.
+    Config {
+        action: ConfigAction,
+    },
     /// Manage provider authentication without starting a runtime.
     Auth {
-        #[command(subcommand)]
         action: AuthAction,
-        #[command(flatten)]
+
         credentials: CredentialArgs,
     },
     /// List or rename durable sessions for a workspace.
     Sessions {
-        #[command(subcommand)]
         action: Option<SessionsAction>,
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long, global = true)]
         root: Option<PathBuf>,
     },
     /// Serve ACP on stdio with A2A, remote ACP, or both over HTTP.
     Serve {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
         /// Reasoning effort (defaults to config or provider default).
-        #[arg(long, value_enum)]
         reasoning_effort: Option<ReasoningEffortArg>,
         /// HTTP listen address. An available loopback port is selected when omitted.
-        #[arg(long, visible_alias = "http")]
         a2a: Option<String>,
         /// Expose ACP over HTTP/SSE and WebSocket at `/acp`.
-        #[arg(long)]
         remote_acp: bool,
         /// Do not expose A2A on the HTTP listener.
-        #[arg(long, requires = "remote_acp")]
         no_a2a: bool,
         /// Do not serve ACP on stdio. Requires remote ACP over HTTP.
-        #[arg(long, requires = "remote_acp")]
         no_stdio: bool,
         /// ACP wire version for stdio (defaults to v1 for compatibility).
-        #[arg(long, value_enum, default_value = "1", hide = true)]
         stdio_protocol_version: AcpProtocolVersion,
         /// Require this file's bearer token on every HTTP request.
-        #[arg(long, value_name = "PATH")]
         server_credential_file: Option<PathBuf>,
-        #[command(flatten)]
+
         mcp: McpArgs,
         /// Provider login requested by ACP terminal authentication.
-        #[arg(long, value_enum, hide = true)]
         terminal_auth_login: Option<AuthProvider>,
         /// Persistent session id selected by the hosting client.
-        #[arg(long)]
         session_id: Option<String>,
         /// Load session_id instead of creating it.
-        #[arg(long, requires = "session_id")]
         resume: bool,
         /// Override a stale session lock.
-        #[arg(long, requires = "resume")]
         force: bool,
     },
     /// Serve only the Agent Client Protocol on stdio.
     Acp {
         /// ACP wire protocol version.
-        #[arg(long, value_enum, default_value = "1")]
         protocol_version: AcpProtocolVersion,
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
-        #[arg(long)]
+
         model: Option<String>,
-        #[arg(long, value_enum)]
+
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
-        #[command(flatten)]
+
         mcp: McpArgs,
-        #[arg(long)]
+
         session_id: Option<String>,
         /// Provider login requested by ACP terminal authentication.
-        #[arg(long, value_enum, hide = true)]
         terminal_auth_login: Option<AuthProvider>,
-        #[arg(long, requires = "session_id")]
+
         resume: bool,
-        #[arg(long, requires = "resume")]
+
         force: bool,
-        #[arg(long, default_value_t = 0, hide = true)]
+
         subagent_depth: usize,
-        #[arg(long, hide = true, requires = "subagent_parent_name")]
+
         subagent_parent_id: Option<String>,
-        #[arg(long, hide = true, requires = "subagent_parent_id")]
+
         subagent_parent_name: Option<String>,
     },
     /// Run one persisted prompt, print its answer and session id, then exit.
     Prompt {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
-        #[command(flatten)]
+
         mcp: McpArgs,
         /// Resume this persisted session id.
-        #[arg(long)]
         resume: Option<String>,
         /// Override the resumed session's stale lock.
-        #[arg(long, requires = "resume")]
         force: bool,
         /// Prompt text; quote it when it contains spaces.
         prompt: String,
     },
     /// Start the ACP-backed terminal client.
+    #[cfg(feature = "tui")]
     Tui {
         /// Working directory and project context (defaults to config or `.`).
-        #[arg(long)]
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
-        #[arg(long)]
         model: Option<String>,
         /// Model provider (defaults to config or `openai-subscription`).
-        #[arg(long, value_enum)]
         provider: Option<kit::ProviderKind>,
-        #[arg(long, value_enum)]
+
         reasoning_effort: Option<ReasoningEffortArg>,
         /// A2A listen address. An available loopback port is selected when omitted.
-        #[arg(long)]
         a2a: Option<String>,
-        #[command(flatten)]
+
         mcp: McpArgs,
-        /// Resume this persisted session id.
-        #[arg(long)]
-        resume: Option<String>,
+        /// Resume by ID, or open the workspace session picker without an ID.
+        resume: Option<Option<String>>,
         /// Override the resumed session's stale lock.
-        #[arg(long, requires = "resume")]
         force: bool,
     },
 }
@@ -740,6 +1893,8 @@ async fn execute_auth(
         OpenAi(kit::provider::OpenAiAuthCommand),
         OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
+        TypeSafe(kit::provider::TypeSafeAuthCommand),
+        Logout(kit::ProviderKind, bool),
     }
     let command = match action {
         AuthAction::Login { provider } => match provider {
@@ -753,6 +1908,9 @@ async fn execute_auth(
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Login)
             }
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Login)
+            }
         },
         AuthAction::Status { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
@@ -765,26 +1923,28 @@ async fn execute_auth(
             AuthProvider::Speakeasy => {
                 Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Status)
             }
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Status)
+            }
         },
         AuthAction::Logout {
             provider,
             local_only,
         } => match provider {
-            AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Logout {
-                local_only: *local_only,
-            }),
             AuthProvider::Cerebras => {
                 Execution::Cerebras(kit::provider::CerebrasAuthCommand::Logout {
                     local_only: *local_only,
                 })
             }
-            AuthProvider::Openrouter => {
-                Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Logout {
-                    local_only: *local_only,
-                })
+            AuthProvider::Openai => {
+                Execution::Logout(kit::ProviderKind::OpenAiSubscription, *local_only)
             }
-            AuthProvider::Speakeasy => {
-                Execution::Speakeasy(kit::provider::SpeakeasyAuthCommand::Logout {
+            AuthProvider::Openrouter => {
+                Execution::Logout(kit::ProviderKind::OpenRouter, *local_only)
+            }
+            AuthProvider::Speakeasy => Execution::Logout(kit::ProviderKind::Speakeasy, *local_only),
+            AuthProvider::Typesafe => {
+                Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Logout {
                     local_only: *local_only,
                 })
             }
@@ -807,6 +1967,15 @@ async fn execute_auth(
                 .map(|(key, source)| (key, *source)),
         ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
+        Execution::TypeSafe(command) => kit::provider::execute_typesafe_auth(command, &storage),
+        Execution::Logout(provider, local_only) => kit::provider::execute_provider_logout(
+            provider,
+            &storage,
+            local_only,
+            openrouter_api_key
+                .as_ref()
+                .map(|(key, source)| (key, *source)),
+        ),
     })
     .await
     .map_err(io::Error::other)?
@@ -820,9 +1989,16 @@ async fn termination_signal() -> io::Result<()> {
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+        // This race runs once: either signal may end supervision when both
+        // are ready, and there is no repeated polling order to cause starvation.
+        match select(
+            std::pin::pin!(tokio::signal::ctrl_c()),
+            std::pin::pin!(terminate.recv()),
+        )
+        .await
+        {
+            Either::Left((result, _)) => result,
+            Either::Right((_, _)) => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -879,12 +2055,27 @@ async fn supervise_serve_with_trigger(
                 }
             }
         };
-        tokio::pin!(stdio);
-        tokio::pin!(termination);
-        tokio::select! {
-            result = &mut stdio => Exit::Stdio(result),
-            result = http.join() => Exit::Http(result),
-            result = &mut termination => Exit::Signal(result),
+        let shutdown = fs::shutdown_token();
+        // This is a one-shot exit decision, not a work-dispatch loop. Any ready
+        // exit may win; fixed polling order cannot starve another iteration.
+        // All losing futures (including the borrow of http) are dropped at the
+        // end of this scope, before session retirement and HTTP cleanup.
+        match select(
+            std::pin::pin!(select(
+                std::pin::pin!(shutdown.cancelled()),
+                std::pin::pin!(stdio),
+            )),
+            std::pin::pin!(select(
+                std::pin::pin!(http.join()),
+                std::pin::pin!(termination),
+            )),
+        )
+        .await
+        {
+            Either::Left((Either::Left(((), _)), _)) => Exit::Signal(Ok(())),
+            Either::Left((Either::Right((result, _)), _)) => Exit::Stdio(result),
+            Either::Right((Either::Left((result, _)), _)) => Exit::Http(result),
+            Either::Right((Either::Right((result, _)), _)) => Exit::Signal(result),
         }
     };
 
@@ -913,85 +2104,167 @@ async fn supervise_serve_with_trigger(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    if matches!(&cli.command, Command::Init) {
-        init_default_config()?;
-        println!(
-            "Kit {}\n\nlog in with your OpenAI, OpenRouter, Cerebras, or Speakeasy account, or set OPENROUTER_API_KEY or CEREBRAS_API_KEY to get started",
-            env!("CARGO_PKG_VERSION")
-        );
-        return Ok(());
-    }
-    let config = Config::load_default()?;
-    if let Command::Sessions { action, root } = &cli.command {
-        let root = config.root(root.clone());
-        match action {
-            None => print!("{}", format_sessions(&kit::session::catalog(&root)?)),
-            Some(SessionsAction::Rename {
-                session_id,
-                name,
-                clear,
-            }) => {
-                let display_name = if *clear { None } else { name.as_deref() };
-                kit::session::set_display_name(&root, session_id, display_name)?;
-                if *clear {
-                    println!("Cleared name for session {session_id}");
-                } else if let Some(name) = name {
-                    println!("Renamed session {session_id} to \"{}\"", name.trim());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            kit::resilient_fs::start_recovery_worker();
+            let result = run().await;
+            // Finish synchronously: a detached task can be terminated with the process,
+            // and timing out spawn_blocking would still make runtime teardown wait.
+            kit::resilient_fs::finish_best_effort_recovery(kit::resilient_fs::best_effort_global());
+            let recovery = kit::resilient_fs::finish_recovery(kit::resilient_fs::global());
+            // Always attempt recovery, but preserve the original command error. The
+            // recovery helper separately warns if accepted data remains undurable.
+            result?;
+            recovery?;
+            Ok(())
+        })
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    run_cli(Cli::parse()).await
+}
+
+async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Only auth and runtime commands poll this future. Init must not load the
+    // config. Config commands edit TOML directly; sessions must not resolve
+    // credentials or initialize telemetry.
+    let initialize = async {
+        let config = tokio::task::spawn_blocking(Config::load_default).await??;
+        cli.request_budget_seconds
+            .or(config.request_budget_seconds)
+            .unwrap_or_default()
+            .initialize()?;
+        let openrouter_api_key =
+            resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
+                env::var(name).ok()
+            });
+        let cerebras_api_key =
+            resolve_cerebras_api_key(cli.cerebras.cerebras_api_key.clone(), |name| {
+                env::var(name).ok()
+            });
+        let telemetry_settings = config.telemetry_settings(
+            &cli.telemetry,
+            env::var(OTEL_ENDPOINT_ENV).ok(),
+            env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
+            env::var(OTEL_TRACES_PROTOCOL_ENV).ok(),
+            env::var(OTEL_PROTOCOL_ENV).ok(),
+        )?;
+        let _telemetry = kit::telemetry::init(&telemetry_settings)?;
+        Ok::<_, Box<dyn std::error::Error>>((
+            config,
+            telemetry_settings,
+            _telemetry,
+            openrouter_api_key,
+            cerebras_api_key,
+        ))
+    };
+    let terminal_auth_provider = cli
+        .command
+        .terminal_auth_login()
+        .map(|(provider, _)| provider);
+    match cli.command {
+        Command::Update { dry_run } => update::run(dry_run)?,
+        Command::Init => {
+            tokio::task::spawn_blocking(init_default_config).await??;
+            if fs::global().status().pending_operations > 0 {
+                eprintln!(
+                    "Config initialized in memory only; persistence is pending and will not survive process termination."
+                );
+            }
+            println!(
+                "Kit {}\n\nlog in with your OpenAI, OpenRouter, Cerebras, or Speakeasy account, or set OPENROUTER_API_KEY or CEREBRAS_API_KEY to get started",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        Command::Config { action } => {
+            let output = tokio::task::spawn_blocking(move || {
+                let home = env::var_os("HOME")
+                    .filter(|home| !home.is_empty())
+                    .ok_or_else(|| {
+                        io::Error::other("HOME is not set; cannot access global config")
+                    })?;
+                let path = PathBuf::from(home).join(".kit/config.toml");
+                match action {
+                    ConfigAction::Get { key } => {
+                        kit::config_editor::get(&path, key.as_deref()).map(Some)
+                    }
+                    ConfigAction::Set { key, value, string } => {
+                        let value = if string {
+                            toml::Value::String(value).to_string()
+                        } else {
+                            value
+                        };
+                        kit::config_editor::set(&path, &key, &value)?;
+                        // One-shot edits cannot succeed with only an in-memory copy.
+                        fs::finish_recovery(fs::global())?;
+                        Ok(None)
+                    }
+                    ConfigAction::Unset { key } => {
+                        kit::config_editor::unset(&path, &key)?;
+                        fs::finish_recovery(fs::global())?;
+                        Ok(None)
+                    }
+                }
+            })
+            .await??;
+            if let Some(output) = output {
+                print!("{output}");
+                if !output.ends_with('\n') && !output.is_empty() {
+                    println!();
                 }
             }
         }
-        return Ok(());
-    }
-    let openrouter_api_key =
-        resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
-            env::var(name).ok()
-        });
-    let cerebras_api_key =
-        resolve_cerebras_api_key(cli.cerebras.cerebras_api_key.clone(), |name| {
-            env::var(name).ok()
-        });
-    let telemetry_settings = config.telemetry_settings(
-        &cli.telemetry,
-        env::var(OTEL_ENDPOINT_ENV).ok(),
-        env::var(OTEL_CAPTURE_MESSAGE_CONTENT_ENV).ok(),
-    )?;
-    let _telemetry = kit::telemetry::init(&telemetry_settings)?;
-    if let Command::Auth {
-        action,
-        credentials,
-    } = &cli.command
-    {
-        let storage = credentials.storage(&config)?;
-        validate_auth_storage(action, &storage)?;
-        execute_auth(
+        Command::Sessions { action, root } => {
+            let config = tokio::task::spawn_blocking(Config::load_default).await??;
+            let root = config.root(root);
+            match action {
+                None => print!("{}", format_sessions(&kit::session::catalog(&root)?)),
+                Some(SessionsAction::Rename {
+                    session_id,
+                    name,
+                    clear,
+                }) => {
+                    let display_name = if clear { None } else { name.as_deref() };
+                    kit::session::set_display_name(&root, &session_id, display_name)?;
+                    if clear {
+                        println!("Cleared name for session {session_id}");
+                    } else if let Some(name) = name {
+                        println!("Renamed session {session_id} to \"{}\"", name.trim());
+                    }
+                }
+            }
+        }
+        Command::Usage {
+            provider,
+            credentials,
+        } => {
+            let (config, _settings, _telemetry, openrouter_api_key, _cerebras_api_key) =
+                initialize.await?;
+            let storage = credentials.storage(&config)?;
+            let output = tokio::task::spawn_blocking(move || {
+                kit::provider::usage::fetch_usage(
+                    provider.as_deref(),
+                    &storage,
+                    openrouter_api_key.as_ref().map(|(key, _)| key),
+                )
+            })
+            .await?
+            .map_err(io::Error::other)?;
+            println!("{output}");
+        }
+        Command::Auth {
             action,
-            storage,
-            openrouter_api_key.clone(),
-            cerebras_api_key.clone(),
-        )
-        .await?;
-        return Ok(());
-    }
-    if let Some((provider, credentials)) = cli.command.terminal_auth_login() {
-        let action = AuthAction::Login { provider };
-        let storage = credentials.storage(&config)?;
-        validate_auth_storage(&action, &storage)?;
-        execute_auth(
-            &action,
-            storage,
-            openrouter_api_key.clone(),
-            cerebras_api_key.clone(),
-        )
-        .await?;
-        return Ok(());
-    }
-    match cli.command {
-        Command::Init => unreachable!("init returns before loading runtime config"),
-        Command::Auth { .. } => unreachable!("auth commands return before loading runtime config"),
-        Command::Sessions { .. } => unreachable!("sessions returns before starting a runtime"),
+            credentials,
+        } => {
+            let (config, _settings, _telemetry, openrouter_api_key, cerebras_api_key) =
+                initialize.await?;
+            let storage = credentials.storage(&config)?;
+            validate_auth_storage(&action, &storage)?;
+            execute_auth(&action, storage, openrouter_api_key, cerebras_api_key).await?;
+        }
         Command::Serve {
             root,
             model,
@@ -1009,6 +2282,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key, cerebras_api_key) =
+                initialize.await?;
+            if let Some(provider) = terminal_auth_provider {
+                let action = AuthAction::Login { provider };
+                let storage = mcp.credentials.storage(&config)?;
+                validate_auth_storage(&action, &storage)?;
+                execute_auth(&action, storage, openrouter_api_key, cerebras_api_key).await?;
+                return Ok(());
+            }
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1038,6 +2320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -1099,6 +2382,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             subagent_parent_id,
             subagent_parent_name,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key, cerebras_api_key) =
+                initialize.await?;
+            if let Some(provider) = terminal_auth_provider {
+                let action = AuthAction::Login { provider };
+                let storage = mcp.credentials.storage(&config)?;
+                validate_auth_storage(&action, &storage)?;
+                execute_auth(&action, storage, openrouter_api_key, cerebras_api_key).await?;
+                return Ok(());
+            }
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1127,6 +2419,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
@@ -1171,6 +2464,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force,
             prompt,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key, cerebras_api_key) =
+                initialize.await?;
             let root = config.root(root);
             let model = config.model(model);
             let provider = config.provider(provider);
@@ -1193,6 +2488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
             )?;
+            let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -1217,10 +2513,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?
             };
-            let output = runtime.run_persistent(prompt).await?;
+            let cancellation = agentkit_core::CancellationController::new();
+            let run = std::pin::pin!(
+                runtime.run_persistent_interruptible(prompt, Some(cancellation.handle()),)
+            );
+            // Install the existing platform-specific signal listener only for
+            // this CLI operation. Keep polling the owner through its cleanup.
+            let signal = std::pin::pin!(termination_signal());
+            let output = match select(signal, run).await {
+                Either::Left((signal, run)) => {
+                    cancellation.interrupt();
+                    if signal.is_ok() {
+                        eprintln!(
+                            "Cancellation requested; waiting for owned work and credential/storage cleanup."
+                        );
+                    }
+                    let result = run.await;
+                    signal?;
+                    result?
+                }
+                Either::Right((result, _)) => result?,
+            };
             println!("{output}");
             println!("session_id: {session_id}");
         }
+        #[cfg(feature = "tui")]
         Command::Tui {
             root,
             model,
@@ -1231,17 +2548,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            let (config, telemetry_settings, _telemetry, openrouter_api_key, cerebras_api_key) =
+                initialize.await?;
             // The TUI child reloads this config, but validate profile names and
             // the selected reference before starting that subprocess.
             let _ = config.harnesses()?;
             let root = config.root(root);
+            let mut stop = kit::tui::Stop::new()?;
+            let resume = match resume {
+                Some(None) => match kit::tui::pick_session(&root, &mut stop).await? {
+                    Some(id) => Some(id),
+                    None => return Ok(()),
+                },
+                Some(Some(id)) => Some(id),
+                None => None,
+            };
             let model = config.model(model);
             let provider = config.provider(provider);
             let reasoning_effort = config.reasoning_effort(reasoning_effort);
             let a2a = config.a2a(a2a);
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
-            let _ = config.plugin_runtime(&root).await?;
+            let voice_enabled = config.experimental.voice;
+            let prepared = stop
+                .until(async {
+                    let _ = config.plugin_runtime(&root).await?;
+                    let config_path = config.config_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(path) = config_path {
+                            fs::global().require_disk(path)?;
+                        }
+                        Ok::<_, io::Error>(())
+                    })
+                    .await??;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })
+                .await;
+            let Some(prepared) = prepared else {
+                return Ok(());
+            };
+            prepared?;
             kit::tui::run_with_reasoning_effort_and_api_keys(
                 &root,
                 &model,
@@ -1255,6 +2601,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cerebras_api_key.as_ref().map(|(key, _)| key),
                 resume.as_deref(),
                 force,
+                voice_enabled,
+                &mut stop,
             )
             .await?
         }
@@ -1262,19 +2610,370 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Real disk fault boundary, compiled only for tests.
 #[cfg(test)]
+#[path = "../tests/support/capacity.rs"]
+mod capacity;
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
-    use clap::Parser as _;
     use kit::tools::CredentialStorage;
 
     use super::{
         AuthAction, AuthProvider, Cli, Command, Config, CredentialArgs, CredentialStoreKind,
-        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, ReasoningEffortArg, SessionsAction,
-        format_sessions, init_config, resolve_openrouter_api_key, supervise_serve_with_trigger,
-        validate_auth_storage,
+        McpArgs, OTEL_CAPTURE_MESSAGE_CONTENT_ENV, OTEL_TRACES_PROTOCOL_ENV, ReasoningEffortArg,
+        SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
+        supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn usage_command_accepts_optional_provider_and_credential_overrides() {
+        for provider in [
+            None,
+            Some("openai"),
+            Some("openrouter"),
+            Some("openai-subscription"),
+        ] {
+            let mut args = vec!["kit", "usage"];
+            if let Some(provider) = provider {
+                args.push(provider);
+            }
+            args.extend([
+                "--credential-store",
+                "file",
+                "--credential-dir",
+                "/tmp/usage-credentials",
+            ]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Usage {
+                provider: parsed,
+                credentials,
+            } = cli.command
+            else {
+                panic!("expected usage command");
+            };
+            assert_eq!(parsed.as_deref(), provider);
+            assert!(matches!(
+                credentials.storage(&Config::default()).unwrap(),
+                CredentialStorage::Filesystem(path) if path == std::path::Path::new("/tmp/usage-credentials")
+            ));
+        }
+        assert!(Cli::try_parse_from(["kit", "usage", "openai", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "usage", "typesafe"]).is_err());
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn tui_resume_forms_preserve_direct_and_normal_startup() {
+        for (args, expected, expected_force) in [
+            (vec!["kit", "tui"], None, false),
+            (vec!["kit", "tui", "--resume"], Some(None), false),
+            (vec!["kit", "tui", "--resume", "--force"], Some(None), true),
+            (
+                vec!["kit", "tui", "--resume", "s-example"],
+                Some(Some("s-example".to_string())),
+                false,
+            ),
+            (
+                vec!["kit", "tui", "--resume", "s-example", "--force"],
+                Some(Some("s-example".to_string())),
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Tui { resume, force, .. } = cli.command else {
+                panic!("expected TUI")
+            };
+            assert_eq!(resume, expected);
+            assert_eq!(force, expected_force);
+        }
+        assert!(Cli::try_parse_from(["kit", "tui", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kit", "prompt", "hello", "--resume"]).is_err());
+        let help = Cli::try_parse_from(["kit", "tui", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("--resume [<RESUME>]"));
+        assert!(help.contains("session picker without an ID"));
+    }
+
+    #[test]
+    fn config_experimental_eval_defaults_strict_and_writer() {
+        assert!(!Config::default().experimental.eval);
+        for (text, expected) in [
+            ("", false),
+            ("[experimental]", false),
+            ("[experimental]\neval = true", true),
+            ("[experimental]\neval = false", false),
+            ("[experimental]\nfuture = true", false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(Config::load(&path).unwrap().experimental.eval, expected);
+            kit::config_editor::set(&path, "experimental.eval", "true").unwrap();
+            assert!(Config::load(&path).unwrap().experimental.eval);
+            kit::config_editor::unset(&path, "experimental.eval").unwrap();
+            assert!(!Config::load(&path).unwrap().experimental.eval);
+        }
+        for value in ["'true'", "1", "[]", "{}"] {
+            let text = format!("[experimental]\neval = {value}");
+            assert!(toml::from_str::<Config>(&text).is_err());
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn config_experimental_voice_defaults_and_strict_boolean() {
+        assert!(!Config::default().experimental.voice);
+        for (text, expected) in [
+            ("", false),
+            ("[experimental]", false),
+            ("[experimental]\nvoice = true", true),
+            ("[experimental]\nvoice = false", false),
+            ("[experimental]\nfuture = true", false),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert_eq!(config.experimental.voice, expected);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert_eq!(Config::load(&path).unwrap().experimental.voice, expected);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            let migrated = super::migrate_config(toml::from_str(text).unwrap());
+            assert_eq!(super::migrate_config(migrated.clone()), migrated);
+        }
+        for text in [
+            "[experimental]\nvoice = 'true'",
+            "[experimental]\nvoice = 1",
+            "[experimental]\nvoice = 0.0",
+            "[experimental]\nvoice = []",
+            "[experimental]\nvoice = {}",
+            "experimental = true",
+            "experimental = []",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err(), "{text}");
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            fs::write(&path, text).unwrap();
+            assert!(Config::load(&path).is_err(), "{text}");
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn config_experimental_voice_writer_preserves_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original =
+            "# preserved\nmodel = 'old'\n[experimental]\nvoice = true # opt in\nfuture = 'keep'\n";
+        fs::write(&path, original).unwrap();
+        kit::config_editor::set(&path, "model", "'new'").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("voice = true # opt in"));
+        assert!(updated.contains("future = 'keep'"));
+        assert!(updated.starts_with("# preserved\n"));
+        assert!(Config::load(&path).unwrap().experimental.voice);
+        kit::config_editor::set(&path, "experimental.voice", "false").unwrap();
+        assert!(!Config::load(&path).unwrap().experimental.voice);
+        kit::config_editor::unset(&path, "experimental.voice").unwrap();
+        assert!(!Config::load(&path).unwrap().experimental.voice);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("future = 'keep'")
+        );
+    }
+
+    #[test]
+    fn request_budget_cli_and_config() {
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "hello"])
+                .unwrap()
+                .request_budget_seconds
+                .is_none()
+        );
+        let cli =
+            Cli::try_parse_from(["kit", "prompt", "--request-budget-seconds", "300", "hello"])
+                .unwrap();
+        assert_eq!(cli.request_budget_seconds.unwrap().seconds(), 300);
+        for invalid in ["0", "3601", "-1", "abc", "1.5"] {
+            assert!(
+                Cli::try_parse_from([
+                    "kit",
+                    "prompt",
+                    "--request-budget-seconds",
+                    invalid,
+                    "hello"
+                ])
+                .is_err()
+            );
+            assert!(
+                toml::from_str::<Config>(&format!("request_budget_seconds = {invalid}")).is_err()
+            );
+        }
+        let config: Config = toml::from_str("request_budget_seconds = 300").unwrap();
+        assert_eq!(config.request_budget_seconds.unwrap().seconds(), 300);
+        assert!(Config::default().request_budget_seconds.is_none());
+    }
+
+    #[test]
+    fn cli_builder_preserves_help_version_and_hidden_flags() {
+        for path in [
+            vec![],
+            vec!["init"],
+            vec!["config"],
+            vec!["config", "get"],
+            vec!["config", "set"],
+            vec!["config", "unset"],
+            vec!["auth"],
+            vec!["auth", "login"],
+            vec!["auth", "status"],
+            vec!["auth", "logout"],
+            vec!["sessions"],
+            vec!["sessions", "rename"],
+            vec!["serve"],
+            vec!["acp"],
+            vec!["prompt"],
+            #[cfg(feature = "tui")]
+            vec!["tui"],
+        ] {
+            for flag in ["--help", "-h"] {
+                let args = std::iter::once("kit")
+                    .chain(path.iter().copied())
+                    .chain([flag]);
+                let error = Cli::try_parse_from(args).err().unwrap();
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                let help = error.to_string();
+                assert!(!help.contains("--internal-"));
+                assert!(!help.contains("--terminal-auth-login"));
+                assert!(!help.contains("--subagent-"));
+                assert!(!help.contains("--stdio-protocol-version"));
+            }
+        }
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["kit", flag]).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("kit {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["kit", "--invalid-flag"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::UnknownArgument,
+        );
+    }
+
+    #[test]
+    fn cli_builder_preserves_defaults_and_alias_values() {
+        let cli = Cli::try_parse_from(["kit", "serve", "--http", "127.0.0.1:0"]).unwrap();
+        let Command::Serve {
+            a2a,
+            stdio_protocol_version,
+            remote_acp,
+            no_a2a,
+            no_stdio,
+            resume,
+            force,
+            mcp,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(a2a.as_deref(), Some("127.0.0.1:0"));
+        assert!(matches!(
+            stdio_protocol_version,
+            super::AcpProtocolVersion::V1
+        ));
+        assert!(!remote_acp && !no_a2a && !no_stdio && !resume && !force);
+        assert!(!mcp.no_configured_mcp_config && !mcp.legacy_mcp_config);
+        assert!(mcp.credentials.credential_store.is_none());
+        let cli = Cli::try_parse_from(["kit", "acp"]).unwrap();
+        let Command::Acp {
+            protocol_version,
+            subagent_depth,
+            ..
+        } = cli.command
+        else {
+            panic!("expected acp command");
+        };
+        assert!(matches!(protocol_version, super::AcpProtocolVersion::V1));
+        assert_eq!(subagent_depth, 0);
+    }
+
+    #[test]
+    fn cli_extraction_rejects_missing_required_values() {
+        let command = Cli::command();
+        let mut matches = command
+            .try_get_matches_from(["kit", "prompt", "hello"])
+            .unwrap();
+        let (_, mut prompt) = matches.remove_subcommand().unwrap();
+        assert_eq!(
+            prompt
+                .try_remove_one::<String>("prompt")
+                .unwrap()
+                .as_deref(),
+            Some("hello")
+        );
+        let error = super::required_arg::<String>(&prompt, "prompt").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            Command::from_matches(&matches).err().unwrap().kind(),
+            clap::error::ErrorKind::MissingSubcommand,
+        );
+        assert!(error.to_string().contains("prompt"));
+
+        let matches = clap::Command::new("kit")
+            .arg(clap::Arg::new("prompt").value_parser(clap::value_parser!(usize)))
+            .try_get_matches_from(["kit", "1"])
+            .unwrap();
+        assert_eq!(
+            super::required_arg::<String>(&matches, "prompt")
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::InvalidValue
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_symlink_loads_and_initializes_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&target, "model = \"gpt-5.6-sol\"\n[plugins]\n").unwrap();
+        std::os::unix::fs::symlink("settings.toml", &link).unwrap();
+        let config = Config::load(&link).unwrap();
+        assert_eq!(config.config_path.as_deref(), Some(link.as_path()));
+        assert!(
+            config
+                .plugin_runtime(directory.path())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&target, "invalid TOML [").unwrap();
+        assert!(Config::load(&link).is_err());
+        assert!(config.plugin_runtime(directory.path()).await.is_err());
+    }
 
     #[test]
     fn subagent_names_are_rejected_as_unknown_configuration() {
@@ -1317,6 +3016,7 @@ provider = "openrouter"
 reasoning_effort = "medium"
 a2a = "127.0.0.1:7331"
 otel_endpoint = "http://configured:4317"
+otel_protocol = "http/protobuf"
 otel_capture_message_content = true
 otel_message_content_max_messages = 20
 otel_message_content_max_bytes = 200
@@ -1367,6 +3067,8 @@ credential_dir = "/configured/credentials"
         let cli = Cli::try_parse_from([
             "kit",
             "prompt",
+            "--otel-protocol",
+            "http/json",
             "--otel-capture-message-content",
             "false",
             "--otel-message-content-max-messages",
@@ -1381,12 +3083,15 @@ credential_dir = "/configured/credentials"
                 &cli.telemetry,
                 Some("http://environment:4317".into()),
                 Some("invalid-but-overridden".into()),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(
             telemetry.endpoint.as_deref(),
-            Some("http://configured:4317")
+            Some("http://configured:4317/v1/traces")
         );
+        assert_eq!(telemetry.protocol, kit::telemetry::Protocol::HttpJson);
         assert!(!telemetry.capture_message_content);
         assert_eq!(telemetry.message_content_max_messages, 5);
         assert_eq!(telemetry.message_content_max_bytes, 100);
@@ -1564,7 +3269,13 @@ credential_store = "keychain"
             Cli::try_parse_from(["kit", "--otel-endpoint", "", "prompt", "hello"]).unwrap();
         assert_eq!(
             configured
-                .telemetry_settings(&disabled_cli.telemetry, environment.clone(), None)
+                .telemetry_settings(
+                    &disabled_cli.telemetry,
+                    environment.clone(),
+                    None,
+                    None,
+                    None,
+                )
                 .unwrap()
                 .endpoint,
             None
@@ -1576,15 +3287,144 @@ credential_store = "keychain"
     }
 
     #[test]
+    fn protocol_precedence_is_cli_then_toml_then_trace_env_then_generic_env() {
+        let default_cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
+        let defaults = Config::default();
+        assert_eq!(
+            defaults
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    None,
+                    Some("http/json".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpJson
+        );
+        assert_eq!(
+            defaults
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    Some("http/protobuf".into()),
+                    Some("http/json".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpProtobuf
+        );
+
+        let configured: Config = toml::from_str("otel_protocol = 'grpc'").unwrap();
+        assert_eq!(
+            configured
+                .telemetry_settings(
+                    &default_cli.telemetry,
+                    None,
+                    None,
+                    Some("invalid".into()),
+                    Some("invalid".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::Grpc
+        );
+        let cli = Cli::try_parse_from(["kit", "prompt", "--otel-protocol", "http/json", "hello"])
+            .unwrap();
+        assert_eq!(
+            configured
+                .telemetry_settings(
+                    &cli.telemetry,
+                    None,
+                    None,
+                    Some("invalid".into()),
+                    Some("invalid".into()),
+                )
+                .unwrap()
+                .protocol,
+            kit::telemetry::Protocol::HttpJson
+        );
+
+        let error = defaults
+            .telemetry_settings(
+                &default_cli.telemetry,
+                None,
+                None,
+                Some("http".into()),
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(OTEL_TRACES_PROTOCOL_ENV));
+        assert!(toml::from_str::<Config>("otel_protocol = 'http'").is_err());
+    }
+
+    #[test]
+    fn inherited_error_capture_overrides_config_without_rewriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        for inherited in [false, true] {
+            let text = format!(
+                "# User-owned settings\ncapture_error_spans = {}\n",
+                !inherited
+            );
+            fs::write(&path, &text).unwrap();
+            let config = Config::load(&path).unwrap();
+            let cli = Cli::try_parse_from([
+                "kit",
+                "prompt",
+                "--internal-capture-error-spans",
+                &inherited.to_string(),
+                "hello",
+            ])
+            .unwrap();
+            let settings = config
+                .telemetry_settings(&cli.telemetry, None, None, None, None)
+                .unwrap();
+            assert_eq!(settings.capture_error_spans, inherited);
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn error_span_capture_defaults_off_and_is_independent_of_export() {
+        let cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
+        for (text, expected) in [
+            ("", false),
+            ("capture_error_spans = false", false),
+            ("capture_error_spans = true", true),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            for endpoint in [None, Some("http://localhost:4317".to_owned())] {
+                let settings = config
+                    .telemetry_settings(
+                        &cli.telemetry,
+                        endpoint.clone(),
+                        Some("true".into()),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(settings.capture_error_spans, expected);
+                assert_eq!(settings.endpoint, endpoint);
+                assert!(settings.capture_message_content);
+            }
+        }
+        assert!(toml::from_str::<Config>("capture_error_spans = 'true'").is_err());
+        assert!(toml::from_str::<Config>("capture_error_spans = 1").is_err());
+    }
+
+    #[test]
     fn telemetry_environment_is_strict_and_settings_are_bounded() {
         let config = Config::default();
         let cli = Cli::try_parse_from(["kit", "prompt", "hello"]).unwrap();
         let enabled = config
-            .telemetry_settings(&cli.telemetry, None, Some("TrUe".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("TrUe".into()), None, None)
             .unwrap();
         assert!(enabled.capture_message_content);
         let error = config
-            .telemetry_settings(&cli.telemetry, None, Some("yes".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("yes".into()), None, None)
             .unwrap_err();
         assert!(error.to_string().contains(OTEL_CAPTURE_MESSAGE_CONTENT_ENV));
 
@@ -1598,14 +3438,14 @@ credential_store = "keychain"
         .unwrap();
         assert!(
             config
-                .telemetry_settings(&invalid.telemetry, None, None)
+                .telemetry_settings(&invalid.telemetry, None, None, None, None)
                 .is_err()
         );
 
         let configured_false: Config =
             toml::from_str("otel_capture_message_content = false").unwrap();
         let disabled = configured_false
-            .telemetry_settings(&cli.telemetry, None, Some("true".into()))
+            .telemetry_settings(&cli.telemetry, None, Some("true".into()), None, None)
             .unwrap();
         assert!(!disabled.capture_message_content);
         assert!(
@@ -1733,12 +3573,12 @@ future_option = true
         );
         assert_eq!(
             config.acp["beta"].permissions,
-            kit::AcpPermissionPolicy::Deny
+            kit::AcpPermissionPolicy::Allow
         );
 
         fs::write(
             &path,
-            "[acp.bad]\ncommand = 'agent'\npermissions = 'allow'\n",
+            "[acp.bad]\ncommand = 'agent'\npermissions = 'invalid'\n",
         )
         .unwrap();
         assert!(Config::load(&path).is_err());
@@ -1754,6 +3594,7 @@ future_option = true
         ));
 
         let output = format_sessions(&[kit::session::CatalogEntry {
+            additional_directories: Vec::new(),
             id: "session-1".into(),
             title: Some("OAuth token bug".into()),
             preview: Some("Fix tests in the catalog".into()),
@@ -1823,12 +3664,14 @@ future_option = true
     }
 
     #[test]
-    fn otel_endpoint_is_a_global_command_line_option() {
+    fn otel_trace_settings_are_global_command_line_options() {
         let cli = Cli::try_parse_from([
             "kit",
             "prompt",
             "--otel-endpoint",
             "http://collector:4317",
+            "--otel-protocol",
+            "http/protobuf",
             "--otel-capture-message-content",
             "true",
             "--otel-message-content-max-messages",
@@ -1842,9 +3685,16 @@ future_option = true
             cli.telemetry.otel_endpoint.as_deref(),
             Some("http://collector:4317")
         );
+        assert_eq!(
+            cli.telemetry.otel_protocol,
+            Some(kit::telemetry::Protocol::HttpProtobuf)
+        );
         assert_eq!(cli.telemetry.otel_capture_message_content, Some(true));
         assert_eq!(cli.telemetry.otel_message_content_max_messages, Some(12));
         assert_eq!(cli.telemetry.otel_message_content_max_bytes, Some(4096));
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "--otel-protocol", "http", "hello",]).is_err()
+        );
     }
 
     #[test]
@@ -1873,7 +3723,12 @@ future_option = true
         );
         assert!(resolve_openrouter_api_key(None, |_| Some(String::new())).is_none());
 
-        for command in ["serve", "acp", "tui"] {
+        for command in [
+            "serve",
+            "acp",
+            #[cfg(feature = "tui")]
+            "tui",
+        ] {
             assert!(
                 Cli::try_parse_from(["kit", command, "--openrouter-api-key", "secret"]).is_ok()
             );
@@ -1935,8 +3790,15 @@ future_option = true
         );
         assert!(super::resolve_cerebras_api_key(None, |_| Some(String::new())).is_none());
 
-        for command in ["serve", "acp", "tui"] {
-            assert!(Cli::try_parse_from(["kit", command, "--cerebras-api-key", "secret"]).is_ok());
+        for command in [
+            "serve",
+            "acp",
+            #[cfg(feature = "tui")]
+            "tui",
+        ] {
+            let cli =
+                Cli::try_parse_from(["kit", command, "--cerebras-api-key", "secret"]).unwrap();
+            assert_eq!(cli.cerebras.cerebras_api_key.unwrap().as_str(), "secret");
         }
         assert!(
             Cli::try_parse_from([
@@ -1949,6 +3811,87 @@ future_option = true
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn cerebras_key_parses_before_subcommand_alongside_openrouter_key() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "--cerebras-api-key",
+            "cerebras-secret",
+            "--openrouter-api-key",
+            "openrouter-secret",
+            "prompt",
+            "--provider",
+            "cerebras",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.cerebras.cerebras_api_key.unwrap().as_str(),
+            "cerebras-secret"
+        );
+        assert_eq!(
+            cli.openrouter.openrouter_api_key.unwrap().as_str(),
+            "openrouter-secret"
+        );
+        assert!(matches!(
+            cli.command,
+            Command::Prompt {
+                provider: Some(kit::ProviderKind::Cerebras),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cerebras_auth_actions_and_terminal_login_parse() {
+        for action in ["login", "status", "logout"] {
+            let cli = Cli::try_parse_from(["kit", "auth", action, "cerebras"]).unwrap();
+            let Command::Auth { action: parsed, .. } = cli.command else {
+                panic!("expected auth command");
+            };
+            assert!(matches!(
+                (action, parsed),
+                (
+                    "login",
+                    AuthAction::Login {
+                        provider: AuthProvider::Cerebras
+                    }
+                ) | (
+                    "status",
+                    AuthAction::Status {
+                        provider: AuthProvider::Cerebras
+                    }
+                ) | (
+                    "logout",
+                    AuthAction::Logout {
+                        provider: AuthProvider::Cerebras,
+                        local_only: false
+                    }
+                )
+            ));
+        }
+        let cli =
+            Cli::try_parse_from(["kit", "auth", "logout", "cerebras", "--local-only"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                action: AuthAction::Logout {
+                    provider: AuthProvider::Cerebras,
+                    local_only: true
+                },
+                ..
+            }
+        ));
+        for command in ["serve", "acp"] {
+            let cli =
+                Cli::try_parse_from(["kit", command, "--terminal-auth-login", "cerebras"]).unwrap();
+            assert!(matches!(
+                cli.command.terminal_auth_login(),
+                Some((AuthProvider::Cerebras, _))
+            ));
+        }
     }
 
     #[test]
@@ -1982,7 +3925,279 @@ future_option = true
     }
 
     #[test]
+    fn config_cli_parses_paths_values_and_required_arguments() {
+        use super::ConfigAction;
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "get"])
+                .unwrap()
+                .command,
+            Command::Config {
+                action: ConfigAction::Get { key: None }
+            }
+        ));
+        let key = r#"plugins."my.plugin".source"#;
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "get", key]).unwrap().command,
+            Command::Config { action: ConfigAction::Get { key: Some(value) } } if value == key
+        ));
+        for value in ["vendor/model", "true", "-42", "[1, 2]", "{ x = true }"] {
+            assert!(matches!(
+                Cli::try_parse_from(["kit", "config", "set", key, value]).unwrap().command,
+                Command::Config { action: ConfigAction::Set { key: parsed, value: actual, string: false } }
+                    if parsed == key && actual == value
+            ));
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "set", "--string", "model", "true"])
+                .unwrap()
+                .command,
+            Command::Config {
+                action: ConfigAction::Set { string: true, .. }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["kit", "config", "unset", key]).unwrap().command,
+            Command::Config { action: ConfigAction::Unset { key: parsed } } if parsed == key
+        ));
+        for args in [
+            vec!["kit", "config"],
+            vec!["kit", "config", "set"],
+            vec!["kit", "config", "set", "model"],
+            vec!["kit", "config", "unset"],
+            vec!["kit", "default-model", "old"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for action in ["get", "set", "unset"] {
+            let help = Cli::try_parse_from(["kit", "config", action, "--help"])
+                .err()
+                .unwrap();
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+            for setting in [
+                "Default model ID",
+                "Model provider: openai-subscription, openrouter, speakeasy",
+                "Reasoning effort: low, medium, high; unset for provider default",
+                "A2A listener bind address (e.g. 127.0.0.1:7331)",
+                "Credential backend: memory, keychain, file",
+                "Directory for the file credential backend",
+                "OTLP trace export endpoint URL",
+                "OTLP transport: grpc, http/protobuf, http/json",
+                "plugins.<name>",
+                "acp.<name>",
+                "subagent.harnesses",
+            ] {
+                assert!(help.to_string().contains(setting), "{setting}: {help}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn config_edits_require_disk_before_success() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "KIT_TEST_CONFIG_DISK_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["set", "unset", "missing-key", "missing-file"] {
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join(".kit/config.toml");
+                let original = "# preserved\r\nmodel = 'old'\r\n";
+                if case != "missing-file" {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, original).unwrap();
+                }
+                let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::config_edits_require_disk_before_success",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("HOME", home.path())
+                    .output()
+                    .await
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(
+                    output.status.success(),
+                    case.starts_with("missing-"),
+                    "{case}: {stderr}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                if !case.starts_with("missing-") {
+                    assert!(
+                        stderr.contains("could not be persisted before exit"),
+                        "{stderr}"
+                    );
+                }
+                assert!(!stderr.contains("Config updated in memory only"));
+                if case == "missing-file" {
+                    assert!(!home.path().join(".kit").exists());
+                } else {
+                    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+                }
+            }
+            return Ok(());
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let backend = std::sync::Arc::new(crate::capacity::Capacity {
+            exhausted: std::sync::atomic::AtomicBool::new(true),
+            exhaust_on_write: std::sync::atomic::AtomicBool::new(false),
+            repaired: home.join("capacity-repaired"),
+        });
+        super::fs::initialize_global(super::fs::Fs::new(std::sync::Arc::new(
+            crate::capacity::CapacityDisk(backend),
+        )))
+        .unwrap();
+        let args = match case.as_str() {
+            "set" => vec!["kit", "config", "set", "model", "new"],
+            "unset" => vec!["kit", "config", "unset", "model"],
+            _ => vec!["kit", "config", "unset", "absent"],
+        };
+        // Return the real dispatch error to the subprocess test runner: an
+        // accepted memory-only edit must be an unsuccessful process result.
+        super::run_cli(Cli::try_parse_from(args).unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn command_dispatch_preserves_initialization_boundaries() {
+        const CHILD: &str = "KIT_TEST_COMMAND_DISPATCH_CHILD";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["bypass", "login"] {
+                let home = tempfile::tempdir().unwrap();
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::command_dispatch_preserves_initialization_boundaries",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, case)
+                    .env("HOME", home.path())
+                    .env_remove(super::OTEL_ENDPOINT_ENV)
+                    .env_remove(super::OTEL_TRACES_PROTOCOL_ENV)
+                    .env_remove(super::OTEL_CAPTURE_MESSAGE_CONTENT_ENV)
+                    .env_remove(super::OTEL_PROTOCOL_ENV)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                if case == "bypass" {
+                    command.env(super::OTEL_PROTOCOL_ENV, "invalid-protocol");
+                }
+                let output = command.output().await.unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let config_path = home.join(".kit/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        if case == "bypass" {
+            fs::write(&config_path, "invalid TOML [").unwrap();
+            super::run_cli(Cli::try_parse_from(["kit", "init"]).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), "invalid TOML [");
+            let error = super::run_cli(Cli::try_parse_from(["kit", "sessions"]).unwrap())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("invalid config"), "{error}");
+        }
+        // Runtime setup would reject this harness. Sessions and provider login
+        // must finish before runtime configuration is validated.
+        fs::write(&config_path, "[subagent]\nharness = \"missing-harness\"\n").unwrap();
+        if case == "bypass" {
+            // Invalid typed settings and legacy keys must not trigger loading or migration.
+            fs::write(&config_path, "model = 42\ncredential_storage = 'file'\n[subagent]\nharness = 'missing-harness'\n").unwrap();
+            for args in [
+                vec!["kit", "config", "get"],
+                vec!["kit", "config", "get", "model"],
+                vec!["kit", "config", "set", "model", "vendor/future"],
+                vec!["kit", "config", "set", "capture_error_spans", "true"],
+                vec!["kit", "config", "set", "--string", "future.literal", "true"],
+                vec!["kit", "config", "set", r#"future."dotted.key""#, "[1, 2]"],
+                vec!["kit", "config", "get"],
+                vec!["kit", "config", "get", "model"],
+                vec!["kit", "config", "unset", "absent.key"],
+                vec!["kit", "config", "unset", "capture_error_spans"],
+            ] {
+                super::run_cli(Cli::try_parse_from(args).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let contents = fs::read_to_string(&config_path).unwrap();
+            let values: toml::Value = toml::from_str(&contents).unwrap();
+            assert_eq!(values["model"].as_str(), Some("vendor/future"));
+            assert_eq!(values["future"]["literal"].as_str(), Some("true"));
+            assert_eq!(values["future"]["dotted.key"].as_array().unwrap().len(), 2);
+            assert!(values.get("capture_error_spans").is_none());
+            assert!(values.get("credential_storage").is_some());
+            assert!(values.get("credential_store").is_none());
+            let error = super::run_cli(
+                Cli::try_parse_from(["kit", "config", "get", "absent.key"]).unwrap(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::NotFound
+            );
+            super::run_cli(
+                Cli::try_parse_from(["kit", "sessions", "--root", home.to_str().unwrap()]).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        for args in [
+            vec![
+                "kit",
+                "auth",
+                "login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+            vec![
+                "kit",
+                "acp",
+                "--terminal-auth-login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+            vec![
+                "kit",
+                "serve",
+                "--terminal-auth-login",
+                "openai",
+                "--credential-store",
+                "memory",
+            ],
+        ] {
+            let error = super::run_cli(Cli::try_parse_from(args).unwrap())
+                .await
+                .unwrap_err();
+            let expected = if case == "bypass" {
+                "invalid OTEL_EXPORTER_OTLP_PROTOCOL"
+            } else {
+                "provider login cannot use memory credential storage"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn auth_commands_parse_without_runtime_arguments() {
+        for action in ["login", "status", "logout"] {
+            assert!(Cli::try_parse_from(["kit", "auth", action, "typesafe"]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["kit", "auth", "logout", "typesafe", "--local-only"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kit", "auth", "login", "typesafe", "--api-key", "secret"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["kit", "prompt", "--provider", "typesafe", "hello"]).is_err());
         assert!(Cli::try_parse_from(["kit", "auth", "login", "openai"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -2012,8 +4227,13 @@ future_option = true
                 Some((AuthProvider::Openai, _))
             ));
         }
-        assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
-        assert!(Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err());
+        #[cfg(feature = "tui")]
+        {
+            assert!(Cli::try_parse_from(["kit", "tui", "--credential-store", "memory"]).is_ok());
+            assert!(
+                Cli::try_parse_from(["kit", "tui", "--mcp-credential-store", "memory"]).is_err()
+            );
+        }
     }
 
     #[test]
@@ -2023,6 +4243,7 @@ future_option = true
             AuthProvider::Openrouter,
             AuthProvider::Cerebras,
             AuthProvider::Speakeasy,
+            AuthProvider::Typesafe,
         ] {
             let login = AuthAction::Login { provider };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());
@@ -2041,7 +4262,12 @@ future_option = true
         assert!(Cli::try_parse_from(["kit", "acp", "--provider", "unknown"]).is_err());
         assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "2"]).is_ok());
         assert!(Cli::try_parse_from(["kit", "acp", "--protocol-version", "3"]).is_err());
-        for command in ["serve", "acp", "tui"] {
+        for command in [
+            "serve",
+            "acp",
+            #[cfg(feature = "tui")]
+            "tui",
+        ] {
             assert!(Cli::try_parse_from(["kit", command, "--reasoning-effort", "high"]).is_ok());
         }
         assert!(
@@ -2071,6 +4297,65 @@ future_option = true
         assert!(
             Cli::try_parse_from(["kit", "serve", "--server-credential-file", "token.txt",]).is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn stdio_eof_stops_a2a_and_completes_supervision() {
+        const CHILD: &str = "KIT_TEST_STDIO_EOF_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for version in ["1", "2"] {
+                let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "tests::stdio_eof_stops_a2a_and_completes_supervision",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, version)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+                    .await
+                    .expect("ACP EOF must stop serve even with an A2A listener")
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let address = http.address();
+        supervise_serve_with_trigger(
+            runtime,
+            sessions,
+            false,
+            if std::env::var(CHILD).unwrap() == "1" {
+                super::AcpProtocolVersion::V1
+            } else {
+                super::AcpProtocolVersion::V2
+            },
+            http,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+        // The final recovery in main can now run; no listener keeps serve alive.
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
     }
 
     #[tokio::test]
@@ -2109,6 +4394,40 @@ future_option = true
         .await
         .expect("supervisor shutdown timed out")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_shutdown_error_still_releases_http_listener() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = kit::Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let sessions = kit::protocols::acp::SessionRegistry::new();
+        let http = kit::protocols::http::start_with_registry(
+            Arc::clone(&runtime),
+            "127.0.0.1:0".into(),
+            true,
+            false,
+            None,
+            sessions.clone(),
+        )
+        .await
+        .unwrap();
+        let address = http.address();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise_serve_with_trigger(
+                runtime,
+                sessions,
+                true,
+                super::AcpProtocolVersion::V1,
+                http,
+                std::future::ready(Err(io::Error::other("termination signal failed"))),
+            ),
+        )
+        .await
+        .expect("supervisor shutdown timed out")
+        .unwrap_err();
+        assert_eq!(error.to_string(), "termination signal failed");
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
     }
 
     #[test]

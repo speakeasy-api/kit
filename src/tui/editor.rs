@@ -68,6 +68,22 @@ impl Editor {
         (rows, cursor)
     }
 
+    /// Display row and column for a byte offset in the prompt.
+    /// Returns `None` if the offset is out of bounds or splits a character.
+    pub fn display_position(&self, offset: usize, width: usize) -> Option<(usize, usize)> {
+        let prefix = self.text.get(..offset)?;
+        let width = width.max(1);
+        let ranges = self.rows(width);
+        let index = self.offset_row(&ranges, offset);
+        let (start, _) = ranges[index];
+        let column = prefix[start..].width();
+        Some(if column >= width {
+            (index + 1, 0)
+        } else {
+            (index, column)
+        })
+    }
+
     /// Display rows the prompt needs at `width` columns.
     pub fn display_rows(&self, width: usize) -> usize {
         self.wrapped(width).0.len()
@@ -120,9 +136,13 @@ impl Editor {
     /// The display row holding the cursor. A cursor resting exactly on a soft
     /// break belongs to the row that follows it.
     fn cursor_row(&self, ranges: &[(usize, usize)]) -> usize {
+        self.offset_row(ranges, self.cursor)
+    }
+
+    fn offset_row(&self, ranges: &[(usize, usize)], offset: usize) -> usize {
         ranges
             .iter()
-            .position(|(_, end)| self.cursor < *end || (self.cursor == *end && self.ends_row(*end)))
+            .position(|(_, end)| offset < *end || (offset == *end && self.ends_row(*end)))
             .unwrap_or_else(|| ranges.len() - 1)
     }
 
@@ -216,9 +236,14 @@ impl Editor {
         self.text.replace_range(self.cursor..target, "");
     }
 
-    /// `ctrl+u` / `cmd+backspace`: erase from the cursor to the line start.
+    /// `ctrl+u` / `cmd+backspace`: erase from the cursor to the line start,
+    /// or erase the preceding newline when already at the line start.
     pub fn delete_to_line_start(&mut self) {
         let (start, _) = self.line_bounds(self.cursor);
+        if start == self.cursor {
+            self.backspace();
+            return;
+        }
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
@@ -396,6 +421,14 @@ fn char_offset(line: &str, column: usize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use super::Editor;
 
@@ -417,6 +450,28 @@ mod tests {
         let mut editor = editor("first\nsecond");
         editor.delete_to_line_start();
         assert_eq!(editor.text(), "first\n");
+    }
+
+    #[test]
+    fn deleting_to_line_start_can_continue_through_previous_lines() {
+        let mut editor = editor("café\n\nsecond");
+        for expected in ["café\n\n", "café\n", "café", "", ""] {
+            editor.delete_to_line_start();
+            assert_eq!(editor.text(), expected);
+            assert_eq!(editor.cursor(), expected.len());
+        }
+    }
+
+    #[test]
+    fn deleting_at_line_start_preserves_text_after_the_cursor() {
+        let mut editor = editor("café\nsecond");
+        editor.move_line_start();
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "cafésecond");
+        assert_eq!(editor.cursor(), "café".len());
+        editor.delete_to_line_start();
+        assert_eq!(editor.text(), "second");
+        assert_eq!(editor.cursor(), 0);
     }
 
     #[test]
@@ -485,6 +540,32 @@ mod tests {
         let editor = editor("one two three four five");
         assert_eq!(editor.display_rows(10), 3);
         assert_eq!(editor.display_rows(80), 1);
+    }
+
+    #[test]
+    fn locates_an_offset_across_wrapped_unicode_rows() {
+        let editor = editor("ok\n界e\u{301} @src");
+        let offset = editor.text().find('@').unwrap();
+        assert_eq!(editor.display_position(offset, 20), Some((1, 4)));
+        assert_eq!(editor.display_position(offset, 4), Some((2, 0)));
+    }
+
+    #[test]
+    fn display_position_rejects_invalid_byte_offsets() {
+        let editor = editor("界");
+        assert_eq!(editor.display_position(1, 4), None);
+        assert_eq!(editor.display_position(2, 4), None);
+        assert_eq!(editor.display_position(4, 4), None);
+        assert_eq!(editor.display_position(usize::MAX, 4), None);
+        assert_eq!(editor.display_position(0, 4), Some((0, 0)));
+        assert_eq!(editor.display_position(3, 4), Some((0, 2)));
+        assert_eq!(editor.display_position(3, 2), Some((1, 0)));
+    }
+
+    #[test]
+    fn display_position_accepts_empty_prompt_and_zero_width() {
+        assert_eq!(editor("").display_position(0, 0), Some((0, 0)));
+        assert_eq!(editor("a").display_position(1, 0), Some((1, 0)));
     }
 
     #[test]

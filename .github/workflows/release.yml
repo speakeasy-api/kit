@@ -8,6 +8,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_NOTES_MODEL: openai/gpt-5.6-terra
 
 concurrency:
   group: release
@@ -31,10 +32,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          components: rustfmt, clippy
+      - uses: jdx/mise-action@v4
       - name: Prepare release candidate
         id: release
         shell: bash
@@ -161,9 +159,9 @@ jobs:
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "prerelease=false" >> "$GITHUB_OUTPUT"
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo test --locked
+      - run: mise run setup:linux
+      - run: mise run lint
+      - run: mise run test
       - uses: actions/upload-artifact@v4
         with:
           name: release-candidate
@@ -184,19 +182,23 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: x86_64-unknown-linux-gnu
+      - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
       - name: Build and package
         shell: bash
         run: |
           version=$RELEASE_VERSION
-          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          KIT_RELEASE_BINARY=1 mise run build:release -- --target x86_64-unknown-linux-gnu
           mkdir -p stage dist
           cp target/x86_64-unknown-linux-gnu/release/kit stage/kit
+          mise run test:linux-no-audio -- stage/kit
           stage/kit --version
-          tar -C stage -czf "dist/kit-v${version}-x86_64-unknown-linux-gnu.tar.gz" kit
+          cp LICENSE THIRD_PARTY_NOTICES.md stage/
+          mkdir -p stage/third_party
+          cp -R third_party/licenses stage/third_party/licenses
+          stage/kit --version
+          tar -C stage -czf "dist/kit-v${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            kit LICENSE THIRD_PARTY_NOTICES.md third_party/licenses
       - uses: actions/upload-artifact@v4
         with:
           name: kit-linux-x64
@@ -223,10 +225,7 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
+      - uses: jdx/mise-action@v4
       - name: Check optional signing credentials
         id: signing
         shell: bash
@@ -275,9 +274,12 @@ jobs:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
         run: |
           version=${{ needs.verify.outputs.version }}
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          KIT_RELEASE_BINARY=1 mise run build:release -- --target aarch64-apple-darwin
           mkdir -p stage dist
           cp target/aarch64-apple-darwin/release/kit stage/kit
+          cp LICENSE THIRD_PARTY_NOTICES.md stage/
+          mkdir -p stage/third_party
+          cp -R third_party/licenses stage/third_party/licenses
           if [[ $SIGN_RELEASE == true ]]; then
             codesign --force --options runtime --timestamp \
               --identifier com.speakeasy.kit \
@@ -300,7 +302,8 @@ jobs:
             }
           fi
           stage/kit --version
-          tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" kit
+          tar -C stage -czf "dist/kit-v${version}-aarch64-apple-darwin.tar.gz" \
+            kit LICENSE THIRD_PARTY_NOTICES.md third_party/licenses
       - uses: actions/upload-artifact@v4
         with:
           name: kit-macos-cli-arm64
@@ -308,7 +311,7 @@ jobs:
           if-no-files-found: error
 
   macos-app-arm64:
-    needs: verify
+    needs: [verify, macos-cli-arm64]
     runs-on: blacksmith-6vcpu-macos-15
     outputs:
       signed: ${{ steps.signing.outputs.enabled }}
@@ -327,10 +330,19 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/download-artifact@v4
         with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
+          name: kit-macos-cli-arm64
+          path: ${{ runner.temp }}/macos-cli
+      - name: Install shared release helper
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          mkdir -p target/aarch64-apple-darwin/release
+          tar -xzf "$RUNNER_TEMP/macos-cli/kit-v${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz" \
+            -C target/aarch64-apple-darwin/release kit
+          test -x target/aarch64-apple-darwin/release/kit
       - name: Check optional signing credentials
         id: signing
         shell: bash
@@ -373,30 +385,16 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$MACOS_CERTIFICATE_PASSWORD" "$keychain"
           security list-keychains -d user -s "$keychain" login.keychain-db
-      - name: Install pinned XcodeGen
-        shell: bash
-        run: |
-          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Build, archive, sign, notarize, and package app
+      - uses: jdx/mise-action@v4
+      - name: Archive, sign, notarize, and package app
         shell: bash
         env:
           SIGN_RELEASE: ${{ steps.signing.outputs.enabled }}
+          KIT_ARCHIVE_PATH: ${{ runner.temp }}/Kit.xcarchive
         run: |
-          version=${{ needs.verify.outputs.version }}
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
-          scripts/generate-macos-project.sh
-          archive="$RUNNER_TEMP/Kit.xcarchive"
-          xcodebuild archive -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Release \
-            -archivePath "$archive" \
-            -destination 'generic/platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO
-          mkdir -p dist
-          scripts/package-macos-app.sh \
-            "$archive/Products/Applications/Kit.app" dist "$version"
+          mise run macos:archive
+          mise run macos:package -- \
+            "$KIT_ARCHIVE_PATH/Products/Applications/Kit.app" dist "${{ needs.verify.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
           name: kit-macos-app-arm64
@@ -436,7 +434,7 @@ jobs:
           release-kit/kit prompt \
             --root "$GITHUB_WORKSPACE" \
             --provider openrouter \
-            --model z-ai/glm-5.3 \
+            --model "$RELEASE_NOTES_MODEL" \
             "use release-notes skill for ${{ needs.verify.outputs.previous_tag }}..${{ needs.verify.outputs.release_sha }}; respond only with release notes" \
             > kit-output.txt
           sed '$ { /^session_id: /d; }' kit-output.txt > release-notes.md
@@ -551,6 +549,111 @@ jobs:
           fi
           gh release edit "${edit_args[@]}"
 
+  announce-release:
+    name: Announce release in Slack (Kit MCP smoke test)
+    needs: [verify, publish, containers]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      PREVIOUS_TAG: ${{ needs.verify.outputs.previous_tag }}
+      SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+      SLACK_MCP_URL: ${{ vars.SLACK_MCP_URL }}
+      GRAM_ENVIRONMENT: ${{ vars.GRAM_ENVIRONMENT }}
+    steps:
+      - uses: useblacksmith/checkout@v1
+        with:
+          ref: ${{ needs.verify.outputs.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kit-linux-x64
+          path: dist
+      - name: Post and verify announcement with the released Kit CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GRAM_API_KEY: ${{ secrets.GRAM_API_KEY }}
+        shell: bash
+        run: |
+          for name in OPENROUTER_API_KEY SLACK_CHANNEL_ID SLACK_MCP_URL GRAM_ENVIRONMENT GRAM_API_KEY; do
+            if [[ -z ${!name} ]]; then
+              echo "::error::Missing required $name for the Slack release smoke test."
+              exit 1
+            fi
+          done
+
+          if [[ ! $SLACK_CHANNEL_ID =~ ^[CG][A-Z0-9]+$ ]]; then
+            echo "::error::SLACK_CHANNEL_ID must be a Slack channel ID, not a channel name."
+            exit 1
+          fi
+
+          # HTTP headers are literal config values, not environment placeholders.
+          # Keep the credential-bearing config private and outside the checkout.
+          umask 077
+          mcp_dir=$(mktemp -d "$RUNNER_TEMP/kit-slack.XXXXXX")
+          trap 'rm -rf "$mcp_dir"' EXIT
+          export SLACK_MCP_CONFIG="$mcp_dir/mcp.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          url = os.environ["SLACK_MCP_URL"]
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("SLACK_MCP_URL must be an HTTPS MCP endpoint without URL credentials")
+          config = {
+              "mcpServers": {
+                  "slack": {
+                      "type": "http",
+                      "description": "Slack: post release announcements and retrieve message permalinks",
+                      "url": url,
+                      "headers": {
+                          "Authorization": "Bearer " + os.environ["GRAM_API_KEY"],
+                          "Gram-Environment": os.environ["GRAM_ENVIRONMENT"],
+                      },
+                  }
+              }
+          }
+          Path(os.environ["SLACK_MCP_CONFIG"]).write_text(json.dumps(config))
+          PY
+          unset GRAM_API_KEY
+
+          mkdir -p release-kit
+          tar -xzf "dist/kit-v${RELEASE_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C release-kit
+          release-kit/kit --version
+          prompt="Use the announce-kit-release skill to post release notes for ${PREVIOUS_TAG}..${RELEASE_TAG} to Slack channel ID ${SLACK_CHANNEL_ID}, supplied by the SLACK_CHANNEL_ID environment variable. The checkout is the published release.
+          Load the skill with the skill tool, discover the configured slack MCP tools with tool_search, and use only those MCP tools for Slack operations. Do not use shell, curl, or a direct Slack API client as a fallback. Use the supplied channel ID directly; do not search, list, or resolve channels by name.
+          This is a noninteractive release smoke test: post directly, do not draft or request confirmation. The bot can post messages but has no channel-history access. Use the skill's restricted-bot verification: inspect the actual message returned by the successful send response, verify its channel matches ${SLACK_CHANNEL_ID}, timestamp and formatting, then retrieve its permalink through MCP. Do not call history tools or message search.
+          Do not expose credentials or read the MCP config. If any step fails, report the failing step and exact error without credentials, and do not return a success link. Only after successful posting and verification, respond with just the Slack message permalink on its own line."
+          kit_status=0
+          release-kit/kit prompt \
+            --root "$GITHUB_WORKSPACE" \
+            --provider openrouter \
+            --model "$RELEASE_NOTES_MODEL" \
+            --mcp-config "$SLACK_MCP_CONFIG" \
+            "$prompt" \
+            > "$mcp_dir/output.txt" || kit_status=$?
+          announcement=$(sed '$ { /^session_id: /d; }' "$mcp_dir/output.txt")
+          if (( kit_status != 0 )) || [[ ! $announcement =~ ^https://[a-zA-Z0-9-]+\.slack\.com/archives/${SLACK_CHANNEL_ID}/p[0-9]+$ ]]; then
+            echo "::error::Kit did not confirm a posted and verified Slack announcement with a permalink (CLI exit code: $kit_status)."
+            # Disable both modern and legacy workflow commands in model-controlled output.
+            command_token=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+            printf '::stop-commands::%s\n' "$command_token"
+            head -c 8192 <<< "$announcement" | sed 's/^/Kit: /'
+            # Truncation can remove the last newline; resume on a separate line.
+            printf '\n::%s::\n' "$command_token"
+            exit 1
+          fi
+          printf 'Slack release announcement: %s\n' "$announcement" >> "$GITHUB_STEP_SUMMARY"
+
   container-build:
     name: Build container images (${{ matrix.arch }}, ${{ matrix.family }})
     needs: verify
@@ -583,6 +686,8 @@ jobs:
             family: musl
     env:
       IMAGE: ghcr.io/${{ github.repository }}
+      # Container jobs only need the docker tasks; skip the Rust toolchain install.
+      MISE_DISABLE_TOOLS: rust
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -592,10 +697,6 @@ jobs:
       - uses: ./.github/actions/checkout-release-candidate
         with:
           release-sha: ${{ needs.verify.outputs.release_sha }}
-      - name: Read container version
-        id: version
-        shell: bash
-        run: echo "version=${{ needs.verify.outputs.version }}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Log in to GitHub Container Registry
@@ -604,65 +705,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push slim image by digest
-        if: matrix.family == 'gnu'
-        id: slim
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: slim
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Build and push Bookworm image by digest
-        if: matrix.family == 'gnu'
-        id: bookworm
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: bookworm
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Build and push Alpine image by digest
-        if: matrix.family == 'musl'
-        id: alpine
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          target: alpine
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.version }}
-            REVISION=${{ needs.verify.outputs.release_sha }}
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }},mode=max,ignore-error=true
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Export GNU image digests
-        if: matrix.family == 'gnu'
-        env:
-          SLIM_DIGEST: ${{ steps.slim.outputs.digest }}
-          BOOKWORM_DIGEST: ${{ steps.bookworm.outputs.digest }}
+      - uses: jdx/mise-action@v4
+      - name: Build and push images by digest
         shell: bash
-        run: |
-          mkdir -p /tmp/digests/{slim,bookworm}
-          touch "/tmp/digests/slim/${SLIM_DIGEST#sha256:}"
-          touch "/tmp/digests/bookworm/${BOOKWORM_DIGEST#sha256:}"
-      - name: Export Alpine image digest
-        if: matrix.family == 'musl'
         env:
-          ALPINE_DIGEST: ${{ steps.alpine.outputs.digest }}
-        shell: bash
+          # Tags are applied later by docker:tag from the pushed digests.
+          KIT_IMAGE: ""
+          CACHE: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.family }}
         run: |
-          mkdir -p /tmp/digests/alpine
-          touch "/tmp/digests/alpine/${ALPINE_DIGEST#sha256:}"
+          case ${{ matrix.family }} in
+            gnu) flavors=(slim bookworm) ;;
+            musl) flavors=(alpine) ;;
+          esac
+          for flavor in "${flavors[@]}"; do
+            metadata=$RUNNER_TEMP/$flavor-metadata.json
+            cache_to=()
+            # slim aliases the bookworm build, whose run also refreshes the cache.
+            if [[ $flavor != slim ]]; then
+              cache_to=(--cache-to "$CACHE,mode=max,ignore-error=true")
+            fi
+            mise run docker:build "$flavor" -- \
+              --platform ${{ matrix.platform }} \
+              --cache-from "$CACHE" ${cache_to[@]+"${cache_to[@]}"} \
+              --output type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true \
+              --provenance "mode=max,builder-id=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+              --metadata-file "$metadata"
+            digest=$(jq -r '."containerimage.digest"' "$metadata")
+            [[ $digest == sha256:* ]] || { echo "no image digest for $flavor" >&2; exit 1; }
+            mkdir -p "/tmp/digests/$flavor"
+            touch "/tmp/digests/$flavor/${digest#sha256:}"
+          done
       - name: Upload image digests
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -681,7 +753,16 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      KIT_IMAGE: ghcr.io/${{ github.repository }}
+      KIT_RELEASE_TAG: ${{ needs.verify.outputs.tag }}
+      MISE_DISABLE_TOOLS: rust
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
       - name: Download image digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -715,67 +796,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate slim image metadata
-        id: slim-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}
-            type=raw,value=${{ needs.verify.outputs.tag }}-slim
-            type=raw,value=latest,enable=${{ steps.release.outputs.floating == 'true' }}
-            type=raw,value=slim,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish slim manifest
-        env:
-          METADATA: ${{ steps.slim-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/slim -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag slim -- "${digests[@]}"
 
-      - name: Generate Bookworm image metadata
-        id: bookworm-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}-bookworm
-            type=raw,value=bookworm,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Bookworm manifest
-        env:
-          METADATA: ${{ steps.bookworm-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/bookworm -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag bookworm -- "${digests[@]}"
 
-      - name: Generate Alpine image metadata
-        id: alpine-meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.tag }}-alpine
-            type=raw,value=alpine,enable=${{ steps.release.outputs.floating == 'true' }}
       - name: Publish Alpine manifest
-        env:
-          METADATA: ${{ steps.alpine-meta.outputs.json }}
         shell: bash
+        env:
+          KIT_FLOATING_TAGS: ${{ steps.release.outputs.floating }}
         run: |
-          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
           mapfile -t digests < <(find /tmp/digests/alpine -type f -printf "${IMAGE}@sha256:%f\n")
-          args=()
-          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          mise run docker:tag alpine -- "${digests[@]}"
 
       - name: Verify container package is public
         env:

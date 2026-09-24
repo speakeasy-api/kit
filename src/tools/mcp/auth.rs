@@ -177,7 +177,7 @@ async fn manager(
     super::credentials::configure(
         credential_storage,
         &mut manager,
-        &credential_identity(resource_url, config),
+        &credential_identity(resource_url, config)?,
     );
     Ok(manager)
 }
@@ -190,7 +190,7 @@ async fn migrate_credentials(
     super::credentials::migrate_legacy(
         credential_storage,
         &legacy_credential_identity(resource_url, config),
-        &credential_identity(resource_url, config),
+        &credential_identity(resource_url, config)?,
     )
     .await
     .map_err(|error| format!("could not migrate OAuth credentials: {error}"))
@@ -204,13 +204,14 @@ fn legacy_credential_identity(resource_url: &str, config: &Config) -> String {
     )
 }
 
-fn credential_identity(resource_url: &str, config: &Config) -> String {
-    format!(
+fn credential_identity(resource_url: &str, config: &Config) -> Result<String, String> {
+    Ok(format!(
         "{resource_url}\0{}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
         config.client_metadata_url.as_deref().unwrap_or_default(),
-        serde_json::to_string(&config.scopes).expect("OAuth scopes encode as JSON")
-    )
+        serde_json::to_string(&config.scopes)
+            .map_err(|error| format!("could not encode OAuth scopes: {error}"))?
+    ))
 }
 
 pub async fn finish(
@@ -253,14 +254,23 @@ async fn wait_for_callback(
                 target
             }
             _ => {
-                respond(&mut stream, false).await;
+                respond(&mut stream, false, None).await;
                 continue;
             }
         };
         let explicit_error = has_query_param(&target, "error");
         let callback_url = format!("http://{address}{target}");
         let result = session.handle_callback_url(&callback_url).await;
-        respond(&mut stream, result.is_ok()).await;
+        let description = if explicit_error && result.is_err() {
+            url::Url::parse(&callback_url).ok().and_then(|url| {
+                url.query_pairs()
+                    .find(|(key, _)| key == "error_description")
+                    .map(|(_, value)| value.into_owned())
+            })
+        } else {
+            None
+        };
+        respond(&mut stream, result.is_ok(), description.as_deref()).await;
         if result.is_err() && !explicit_error {
             continue;
         }
@@ -321,20 +331,52 @@ fn parse_request_target(bytes: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "OAuth callback omitted its target".into())
 }
 
-async fn respond(stream: &mut TcpStream, success: bool) {
-    let (status, body) = if success {
+fn callback_page(success: bool, description: Option<&str>) -> String {
+    let (state, badge, title, heading, message) = if success {
         (
-            "200 OK",
-            "MCP authentication complete. You can return to Kit.",
+            "",
+            "Success",
+            "Authentication successful",
+            "Authentication successful.",
+            "You can close this tab and return to Kit.",
         )
     } else {
         (
-            "400 Bad Request",
-            "MCP authentication failed. You can return to Kit and retry.",
+            "failed",
+            "Failed",
+            "Authentication failed",
+            "Let’s try that again.",
+            "Return to Kit to restart authentication. You can close this tab.",
         )
     };
+    let detail = description
+        .filter(|text| !success && !text.trim().is_empty())
+        .map(|text| {
+            // Provider text is untrusted. Bound it before escaping, and insert it last.
+            let text: String = text.trim().chars().take(512).collect();
+            let escaped = text
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&#39;");
+            format!("<p class=\"error-detail\">{escaped}</p>")
+        })
+        .unwrap_or_default();
+    include_str!("auth-page.html")
+        .replace("{title}", title)
+        .replace("{state}", state)
+        .replace("{badge}", badge)
+        .replace("{heading}", heading)
+        .replace("{message}", message)
+        .replace("{detail}", &detail)
+}
+
+async fn respond(stream: &mut TcpStream, success: bool, description: Option<&str>) {
+    let status = if success { "200 OK" } else { "400 Bad Request" };
+    let body = callback_page(success, description);
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
@@ -342,6 +384,14 @@ async fn respond(stream: &mut TcpStream, success: bool) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests {
     use rmcp::transport::auth::{
         AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
@@ -354,6 +404,32 @@ mod tests {
         Config, begin, credential_identity, has_query_param, parse_request_target, refresh,
     };
     use crate::tools::mcp::CredentialStorage;
+
+    #[tokio::test]
+    async fn callback_serves_html_for_success_and_failure() {
+        for (success, status, heading) in [
+            (true, "200 OK", "Authentication successful."),
+            (false, "400 Bad Request", "Let’s try that again."),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            super::respond(&mut server, success, Some("Denied <script> & {heading}")).await;
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+            assert!(response.contains("Content-Type: text/html; charset=utf-8"));
+            assert!(response.contains(heading));
+            assert_eq!(
+                response.contains("Denied &lt;script&gt; &amp; {heading}"),
+                !success
+            );
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.contains(&format!("Content-Length: {}", body.len())));
+        }
+    }
 
     #[test]
     fn callback_accepts_only_get_requests_with_targets() {
@@ -373,6 +449,22 @@ mod tests {
         assert_eq!(
             credential_identity("https://mcp.example/mcp", &Config::default()),
             credential_identity("https://mcp.example/mcp", &explicit)
+        );
+    }
+
+    #[test]
+    fn credential_identity_preserves_json_scope_encoding() {
+        let config: Config = serde_json::from_value(json!({
+            "type": "oauth", "scopes": ["read", "quoted\"scope", "line\nbreak"]
+        }))
+        .unwrap();
+        let expected = format!(
+            "https://mcp.example/mcp\0\0\0{}",
+            serde_json::to_string(&config.scopes).unwrap()
+        );
+        assert_eq!(
+            credential_identity("https://mcp.example/mcp", &config).unwrap(),
+            expected
         );
     }
 

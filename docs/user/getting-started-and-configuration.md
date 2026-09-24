@@ -4,6 +4,8 @@ Kit is a coding agent runtime and terminal client. Choose a project working dire
 
 Run `kit init` to write the recommended `~/.kit/config.toml` and an empty `~/.kit/mcp.json` when those files do not exist. It selects `gpt-5.6-sol` and file-backed credentials in `~/.kit/credentials`. The command leaves existing files unchanged.
 
+Use `kit config get`, `kit config set`, and `kit config unset` to inspect and edit `~/.kit/config.toml`. For example, `kit config set model gpt-6-astra` saves a plain-string model ID without changing the provider or checking model availability. Choose a model supported by your provider; a per-command `--model` still overrides the saved value.
+
 ## Install and verify the `kit` binary
 
 Install the latest packaged release with mise, then verify that the executable is on `PATH`:
@@ -15,6 +17,26 @@ kit --help
 ```
 
 A version can be pinned with a mise package such as `github:speakeasy-api/kit@0.1.83`. The examples below invoke the installed binary directly; they do not use `cargo run`.
+
+### Linux runtime libraries
+
+Linux builds load ALSA/PulseAudio libraries only when voice is started. Ordinary
+Kit commands and the TUI do not require audio libraries or devices. The GNU
+binary needs the standard C/C++ runtime libraries (`libstdc++6` on Debian/Ubuntu).
+
+For voice, install `libpulse0` for PulseAudio (including PipeWire's PulseAudio
+compatibility service), or `libasound2` on Debian 12 / `libasound2t64` on Ubuntu
+24.04 for ALSA. A working audio service/device and microphone and speaker access
+are also required. If audio libraries or usable devices are missing, `/voice on`
+fails locally before creating a subscription call. See [Native voice](native-voice.md)
+for setup and controls; using the packaged binary does not require build tools.
+
+The container images are headless builds without the `tui` Cargo feature: they
+omit the terminal client, voice, and the audio libraries. Debian flavors include
+`libstdc++6`; Alpine includes `libstdc++`. The Alpine container is a separate
+dynamically linked musl build, not a fully static binary for arbitrary
+distributions or `scratch`. The release workflow publishes an x86-64 GNU Linux
+tarball with the full feature set, not a static musl tarball.
 
 ## Choose a provider and authenticate
 
@@ -37,16 +59,13 @@ OpenAI and MCP use one selected credential backend. The default is process-local
 `memory`, but standalone OpenAI login rejects it; select persistent `keychain` or
 `file` storage, including `--credential-dir` when selecting `file`.
 
-Kit refreshes credentials within five minutes of expiry. Refreshes are synchronized
-across threads and processes, preserve the authenticated account and credential
-generation, and are forced once after a 401 response. OpenAI subscription turns can
-retry up to 25 times within a 10-minute budget with deterministic full-jitter
-exponential backoff capped at 30 seconds. Retries cover selected transient HTTP
-statuses, request transport failures, explicit transient provider events, and stream
-failures before the first model event. Kit reuses the request body, idempotency key,
-and available turn state. Authentication, invalid requests, quota/billing failures,
-unsupported responses, and failures after observable model output remain terminal.
+Kit refreshes your credentials automatically. Subscription connections are managed
+automatically and require no additional configuration. Kit retries temporary failures
+when it is safe to do so; if a request fails, it reports the error rather than risk
+silently repeating an accepted request.
+
 Use `kit auth status openai` to check the credential.
+
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
 skips revocation and prints a warning.
@@ -74,6 +93,36 @@ kit prompt --provider openrouter \
 ```
 
 Kit uses the CLI or TOML `model`; `OPENROUTER_MODEL` does not override that selection. The adapter also accepts `OPENROUTER_BASE_URL`, `OPENROUTER_APP_NAME`, `OPENROUTER_SITE_URL`, `OPENROUTER_MAX_COMPLETION_TOKENS`, `OPENROUTER_TEMPERATURE`, and `OPENROUTER_REASONING_EFFORT`. Its model-catalog lookup for the selected model's context length is best-effort, so a catalog failure does not by itself prevent normal provider usage.
+
+### TypeSafe API key
+
+TypeSafe authentication is BYOK (bring your own key). Create a key at
+<https://console.typesafe.ai/keys>, then enter it at the hidden terminal prompt:
+
+```sh
+kit auth login typesafe --credential-store keychain
+kit auth status typesafe --credential-store keychain
+kit auth logout typesafe --credential-store keychain
+```
+
+Use the same storage option for all three commands. You can instead
+use `--credential-store file --credential-dir /path/to/private-directory`.
+Login requires `keychain` or `file` to save your key. Enter the key only at the
+hidden prompt, not in command-line arguments or `config.toml`.
+
+Status gives a nonempty `TYPESAFE_API_KEY` environment variable precedence over a
+stored key; an empty variable does not override stored credentials. Login still
+prompts and saves a key when the variable is set, and warns about this precedence.
+Login checks the key with TypeSafe before saving it, without running inference
+or incurring inference charges. If authentication fails, your previously saved
+key is unchanged. Successful login confirms authentication. Status reports
+whether a key is configured; it does not check whether that key is still valid.
+
+Logout removes only the stored key and warns if `TYPESAFE_API_KEY` remains active.
+Revoke the key separately at <https://console.typesafe.ai/keys>; `--local-only`
+suppresses that reminder. These commands manage credentials only: TypeSafe is not
+a model provider, and this does not enable Jev inference, compaction, filtering,
+or behavior configuration.
 
 ### Speakeasy AI Control Plane
 
@@ -110,13 +159,18 @@ Start the ACP-backed terminal client at a project root:
 kit tui --root /path/to/project
 ```
 
-Resume a persisted conversation by its displayed session ID:
+Choose a persisted conversation in the startup picker, or resume directly by ID:
 
 ```sh
+kit tui --root /path/to/project --resume
 kit tui --root /path/to/project --resume <session-id>
 ```
 
-If a dead process left a stale session lock, `--force` can accompany `--resume`. It is not a general overwrite option and Clap rejects it without a resume argument.
+Without an ID, `--resume` opens the same workspace-scoped, newest-first picker as `/sessions`, including session names and inline rename. Workspace selection honors `--root` and configured root defaults as in normal startup. No new persisted session is created just to show the picker. Plain `kit tui` is unchanged.
+
+`Esc` at the top level or `Ctrl+C` cancels startup successfully without creating or resuming a session; `Esc` while renaming only cancels the rename. An empty catalog reports no resumable sessions and exits successfully. Catalog read failures exit unsuccessfully with an actionable error; a selected session that cannot be resumed reports its resume error instead of starting a new session.
+
+If a dead process left a stale session lock, `--force` can accompany either form of `--resume`. With the picker, it applies only to the selected session and never takes over a lock held by a live process. It is not a general overwrite option and Clap rejects it without `--resume`. See [session locks and recovery](tui-and-sessions.md#session-locks---resume-and---force).
 
 ### One-shot automation with `kit prompt`
 
@@ -146,7 +200,7 @@ kit serve --root /path/to/project --http 127.0.0.1:7331
 kit serve --remote-acp --no-a2a --no-stdio --http 0.0.0.0:8081 # daemon
 ```
 
-Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection remains ACP v1. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
+Without `--a2a` (or its `--http` alias), `serve` binds an available loopback port. Remote ACP v1 and v2 negotiate on the standard `/acp` endpoint; `/acp/v2` is an explicit v2-only alias. Both routes use the same HTTP listener, bearer-token policy, and HTTP/SSE or WebSocket transports. The `kit serve` stdio connection defaults to ACP v1; the hidden `--stdio-protocol-version 2` flag selects v2 for that connection only. Stdout remains reserved for ACP, so local stdio and remote ACP can run together. Add `--no-stdio` for a foreground daemon that does not depend on stdin; this option requires `--remote-acp`. SIGINT and, on Unix, SIGTERM stop accepts, interrupt active ACP sessions, and allow about five seconds for concurrent cleanup before remaining session actors are aborted.
 
 Add `--server-credential-file /private/token` to require the file's single bearer token for every request on the HTTP listener. A non-loopback daemon must not be exposed without authentication and suitable network controls. Use `kit acp` when the host needs only ACP on stdio and no HTTP listener. Select the wire version explicitly with `--protocol-version 1|2`; omitting it defaults to ACP v1:
 
@@ -155,9 +209,35 @@ kit acp --root /path/to/project --protocol-version 1
 kit acp --root /path/to/project --protocol-version 2
 ```
 
+ACP clients can supply additional stdio MCP servers per session: use `mcpServers` on v1 `session/new`, `session/load`, or `session/fork`, or on v2 `session/new` or `session/resume`. V2 stdio entries require `type: "stdio"`. These servers are attachment-scoped, preserve configured servers, and must be supplied again when reattaching; Kit does not persist their launch configuration.
+
 ## Configure `~/.kit/config.toml`
 
 At startup, every runtime and authentication command attempts to load `$HOME/.kit/config.toml`. An absent file is allowed. If `HOME` is unset or empty, Kit uses built-in defaults without loading a home config. Unknown keys are ignored so configurations remain compatible across Kit versions. Invalid values, an unreadable file, and invalid TOML syntax are errors.
+
+### Edit configuration from the command line
+
+Use these noninteractive commands as the recommended way to edit the saved configuration:
+
+```sh
+kit config get                         # print the whole TOML document
+kit config get model                   # read one value
+kit config set model gpt-6-astra        # a plain string needs no TOML quotes
+kit config unset model                 # remove the saved value
+kit config set capture_error_spans true
+kit config set 'plugins.local-plugin' '{ source = "path", path = "./plugins/local-plugin" }'
+kit config get 'plugins.local-plugin.path'
+```
+
+Paths use generic TOML dotted-key syntax, not a fixed list of Kit settings. Quote a TOML path segment when a key contains a literal dot: `kit config set 'custom."key.with.dots"' value`. The outer single quotes in these shell examples preserve the inner TOML quotes.
+
+`set` parses valid TOML values, including booleans, numbers, arrays, and inline tables. Plain text such as `gpt-6-astra` is accepted as a string. To force a literal string rather than a typed value, pass a quoted TOML string: `kit config set custom.value '"true"'` stores the string `true`, not the boolean. Use `--string` to pass literal text without TOML quoting, for example `kit config set --string custom.value true`. Malformed quoted, structured, or numeric-looking input (such as `123abc`) is rejected rather than silently stored as text; use `--string` for these strings.
+
+If the config file is missing, `set` creates it, `get` reports an error, and `unset` is a no-op. `get` without a key prints the original document unchanged, not the runtime's merged defaults. With a key, `get` prints a TOML value that can be passed directly to `set`: tables become inline tables and arrays of tables become arrays of inline tables, retaining nested contents. Keyed output need not preserve formatting or comments. Edits preserve comments, unrelated settings and unknown keys, an existing UTF-8 BOM, and symlinks (updating the target without replacing the link). The TOML editor may normalize CRLF line endings to LF when changing the document; unsetting an absent key leaves the file untouched.
+
+These commands only inspect or edit the local configuration: they do not run migrations, authenticate, or access the network. They do not open an interactive dialog. Use standard help such as `kit config --help` or `kit config set --help` for command syntax. Runtime commands still validate the settings they consume.
+
+### Configuration example
 
 A representative configuration is:
 
@@ -167,7 +247,9 @@ provider = "openai-subscription" # or "openrouter", "cerebras", or "speakeasy"
 model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
+capture_error_spans = false # optional local context in fatal error logs
 otel_endpoint = "http://localhost:4317"
+otel_protocol = "grpc" # grpc, http/protobuf, or http/json
 otel_capture_message_content = false
 otel_message_content_max_messages = 64
 otel_message_content_max_bytes = 16384
@@ -177,10 +259,13 @@ mcp_config = "/path/to/mcp.json"
 credential_store = "file" # "memory", "keychain", or "file"
 credential_dir = "/path/to/private/credentials"
 
+[experimental]
+voice = false # opt in to native TUI voice with true
+
 [acp.review]
 command = "review-agent"
 args = ["acp"]
-permissions = "deny" # "deny" or "cancel"
+permissions = "allow" # default; legacy "deny" and "cancel" also allow
 
 [subagent]
 harness = "acp.review"
@@ -207,9 +292,11 @@ rev = "main"
 subdir = "agent-plugins/example"
 ```
 
+`experimental.voice` enables experimental native voice in the TUI. It defaults to `false` when the table or key is absent and accepts only TOML booleans (`true` or `false`), not strings or numbers. Enable it with `kit config set experimental.voice true`; disable it with `kit config set experimental.voice false` or remove it with `kit config unset experimental.voice`. The TUI snapshots this setting at startup; restart the TUI after changing it. Enabling the setting only makes the controls available: it does not connect a paid session or start microphone capture. Use `/voice on` explicitly to connect or resume capture, `/voice mute` to pause capture, and `/voice off` to end the call. When disabled, voice completion/help is hidden and local `/voice` commands are rejected. See [Native Voice](native-voice.md) for requirements and usage.
+
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 
-`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP/gRPC export of AgentKit's GenAI trace spans. Use a collector endpoint such as `http://localhost:4317` without a `/v1/traces` suffix. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP export of AgentKit's GenAI trace spans. `otel_protocol` accepts exactly `grpc`, `http/protobuf`, or `http/json`; gRPC is the default. For either HTTP protocol, Kit appends `/v1/traces` to a base endpoint unless it already ends with that path. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 ### Configuration precedence and built-in defaults
 
@@ -219,10 +306,22 @@ For settings exposed by a command, precedence is:
 2. values in `~/.kit/config.toml`;
 3. built-in defaults.
 
+Set `capture_error_spans = true` when troubleshooting unexpected failures or
+preparing a bug report. Kit adds diagnostic context about recent operations to
+error logs in `~/.kit/errors/<session-id>/`, which can help explain a failure.
+
+It is disabled by default to avoid additional collection overhead and does not
+require OpenTelemetry. The extra context excludes prompts and tool inputs and
+outputs; it is not a complete execution history.
+
 The OpenTelemetry endpoint follows the same CLI-over-TOML precedence, then falls
 back to the standard `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. If none
-is set, trace export is disabled. Message capture is disabled by default because
-structured prompts, tool arguments, outputs, file content, and compaction summaries
+is set, trace export is disabled. The trace protocol precedence is
+`--otel-protocol`, `otel_protocol`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc`. Kit passes
+`OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TRACES_HEADERS` to the upstream
+exporter. Message capture is disabled by default because structured prompts, tool
+arguments, outputs, file content, and compaction summaries
 can contain secrets. Kit resolves `--otel-capture-message-content BOOL`, the TOML
 `otel_capture_message_content` value, and
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` in that order. The environment
@@ -243,6 +342,7 @@ target, and span busy/idle metadata are omitted. For example:
 ```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 kit prompt "Summarize this project"
 kit prompt --otel-endpoint http://localhost:4317 "Summarize this project"
+kit prompt --otel-protocol http/protobuf --otel-endpoint https://otel.example.com/ingest "Summarize this project"
 kit prompt --otel-capture-message-content true --otel-message-content-max-messages 32 "Summarize this project"
 ```
 
@@ -290,3 +390,31 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.
 - **Unexpected project or model**: check the command line first, then `~/.kit/config.toml`, then the built-in defaults. Use `kit <command> --help` to confirm which options that command accepts.
 - **Provider authentication failure**: for `openai-subscription`, use the same persistent `--credential-store keychain` or `--credential-store file --credential-dir ...` for login, status, and runtime commands; standalone login rejects `memory`. Also check that callback ports 1455 or 1457 are free. For `openrouter`, check `OPENROUTER_API_KEY` and the selected OpenRouter model identifier. For `speakeasy`, use the same persistent credential store for login and runtime commands, and confirm that the stored project can access the selected model.
+
+### Provider request budget
+
+`kit prompt --request-budget-seconds 300 "..."` gives each logical provider
+request a total 300-second budget, including retries, backoff, and streamed
+response reads. The global CLI option overrides `request_budget_seconds = 300`
+in the existing Kit TOML configuration. Accepted values are integer seconds
+from 1 through 3600; omission preserves the 60-second default. Stream idle
+and attempt timeouts remain 30 seconds, and retry/backoff policy is unchanged.
+This applies to the resilient OpenRouter and Speakeasy completions paths, not
+the OpenAI subscription transport. It does not extend an external container
+or task deadline.
+
+The setting is resolved once per Kit process. Native Kit ACP children and the
+TUI's Kit server receive the exact resolved value as a CLI argument, for both
+new and resumed sessions; their local TOML cannot override it.
+
+### Experimental evaluations
+
+`experimental.eval` defaults to `false`. Enable it in your user configuration to
+ask named classification, scoring, and yes/no questions with TypeSafe. A TypeSafe
+key is also required. Each call shares its supplied content with TypeSafe and
+uses your quota. See [Evaluations](evaluations.md) for setup, examples, and limits.
+
+## Provider usage
+
+See [Provider usage](provider-usage.md) for account quotas, key spend, and the
+`kit usage` and `/usage` commands.

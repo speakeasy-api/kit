@@ -5,94 +5,99 @@ on:
     branches:
       - main
   pull_request:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
 
 jobs:
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - name: Validate Conventional Commit title
-        if: github.event_name == 'pull_request'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        shell: bash
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
+      - run: mise run test:scripts
+      - run: mise run lint
+      - run: mise run test
+      - run: mise run build
+      - run: mise run test:linux-no-audio -- target/debug/kit
+
+  # The container images build without the tui feature.
+  test-headless:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
+      - run: mise run setup:linux
+      - run: mise run test:headless
+      - run: mise run build:headless
+      - name: Check the headless binary
         run: |
-          pattern='^[a-z][a-z0-9-]*(\([^()]+\))?(!)?: .+'
-          if [[ ! $PR_TITLE =~ $pattern ]]; then
-            echo "Pull request titles must use Conventional Commit syntax." >&2
-            echo "Examples: feat: add a feature, fix(api): correct behavior, feat!: break compatibility" >&2
+          mise run check:linux-audio-linkage -- target/debug/kit
+          target/debug/kit --version
+          if target/debug/kit --help | grep -qw tui; then
+            echo "headless build must not expose the tui command" >&2
             exit 1
           fi
-      - uses: useblacksmith/checkout@v1
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          components: rustfmt, clippy
-      - run: scripts/tests/test_next_release_version.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --locked
 
-  macos-desktop:
+  macos-rust:
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: useblacksmith/checkout@v1
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: aarch64-apple-darwin
+      - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: macos-desktop
-      - name: Install pinned XcodeGen
+          shared-key: macos-rust
+      - name: Build shared Kit helper
         shell: bash
         run: |
-          scripts/install-xcodegen.sh "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          mise run build:release -- --target aarch64-apple-darwin
+          tar -czf "$RUNNER_TEMP/kit.tar.gz" -C target/aarch64-apple-darwin/release kit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-kit-helper
+          path: ${{ runner.temp }}/kit.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-desktop:
+    needs: macos-rust
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: useblacksmith/checkout@v1
+      - uses: jdx/mise-action@v4
       - name: Check generated Xcode project drift
+        run: mise run macos:check
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-kit-helper
+          path: ${{ runner.temp }}/macos-kit-helper
+      - name: Install shared Kit helper
         shell: bash
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_generate_acp_swift.py
-          scripts/generate-acp-swift.py --check
-          PATH="$RUNNER_TEMP/bin:$PATH" scripts/generate-macos-project.sh
-          git diff --exit-code -- macos/KitDesktop/Generated macos/KitDesktop.xcodeproj
-      # Reuse one release helper for the Debug smoke test and the Release archive.
-      - name: Build real Kit helper
-        shell: bash
-        run: |
-          cargo build --locked --release --target aarch64-apple-darwin --bin kit
+          mkdir -p target/aarch64-apple-darwin/release target/debug
+          tar -xzf "$RUNNER_TEMP/macos-kit-helper/kit.tar.gz" -C target/aarch64-apple-darwin/release
+          test -x target/aarch64-apple-darwin/release/kit
           # The lifecycle XCTest discovers a local development helper at this path.
-          mkdir -p target/debug
           ln -sf ../aarch64-apple-darwin/release/kit target/debug/kit
       - name: Run Swift tests and real Kit lifecycle smoke
         shell: bash
+        env:
+          KIT_DERIVED_DATA: ${{ runner.temp }}/DesktopDerivedData
+          KIT_BINARY: ${{ github.workspace }}/target/aarch64-apple-darwin/release/kit
         run: |
-          derived="$RUNNER_TEMP/DesktopDerivedData"
-          stale="$derived/Build/Products/Debug/Kit.app/Contents/Helpers/kit"
+          stale="$KIT_DERIVED_DATA/Build/Products/Debug/Kit.app/Contents/Helpers/kit"
           mkdir -p "$(dirname "$stale")"
           printf stale > "$stale"
           chmod +x "$stale"
-          xcodebuild test -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath "$derived" \
-            KIT_BINARY="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/kit" \
-            CODE_SIGNING_ALLOWED=NO
+          # The helper was downloaded above; skip the debug cargo build the task normally depends on.
+          mise run --no-deps macos:test
           cmp target/aarch64-apple-darwin/release/kit "$stale"
       - name: Validate Release archive and bundled helper
         shell: bash
+        env:
+          KIT_ARCHIVE_PATH: ${{ runner.temp }}/Kit.xcarchive
         run: |
-          archive="$RUNNER_TEMP/Kit.xcarchive"
-          xcodebuild archive -quiet \
-            -project macos/KitDesktop.xcodeproj \
-            -scheme KitDesktop \
-            -configuration Release \
-            -archivePath "$archive" \
-            -destination 'generic/platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO
-          app="$archive/Products/Applications/Kit.app"
+          mise run macos:archive
+          app="$KIT_ARCHIVE_PATH/Products/Applications/Kit.app"
           helper="$app/Contents/Helpers/kit"
           test "$(lipo -archs "$app/Contents/MacOS/Kit")" = arm64
           test "$(lipo -archs "$helper")" = arm64

@@ -1119,18 +1119,46 @@ private struct ThoughtCard: View {
 }
 
 private struct ComposePresentationView: View {
+    private enum Tab: Hashable { case script, output }
+
     let compose: ComposePresentation
+    @State private var selectedTab: Tab
+
+    init(compose: ComposePresentation) {
+        self.compose = compose
+        _selectedTab = State(initialValue: compose.output == nil ? .script : .output)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            section("Program", text: compose.script)
-            if let input = compose.input { section("Input", text: input.formatted) }
-            if let background = compose.background {
-                Label(backgroundLabel(background), systemImage: "clock.arrow.circlepath")
-                    .font(.caption).foregroundStyle(.secondary)
+            Picker("Compose details", selection: $selectedTab) {
+                Text("Script").tag(Tab.script)
+                Text("Output").tag(Tab.output)
             }
-            if let output = compose.output { section("Output", text: output.formatted) }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            switch selectedTab {
+            case .script:
+                section("Program", text: compose.script)
+                if let input = compose.input { section("Input", text: input.formatted) }
+                if let background = compose.background {
+                    Label(backgroundLabel(background), systemImage: "clock.arrow.circlepath")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            case .output:
+                if let output = compose.output {
+                    section("Output", text: outputText(output))
+                } else {
+                    Text("No output yet.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
+    }
+
+    private func outputText(_ output: PresentationJSON) -> String {
+        if case .string(let text) = output { return text }
+        return output.formatted
     }
 
     private func backgroundLabel(_ background: ComposeBackgroundRequest) -> String {
@@ -1180,7 +1208,12 @@ private struct ToolCard: View {
                     Text(tool.status.label)
                         .brandMicroLabel().foregroundStyle(.secondary)
                     Spacer()
-                    if !entry.children.isEmpty { Text("\(entry.children.count) calls").brandMeta().foregroundStyle(.tertiary) }
+                    if !entry.children.isEmpty {
+                        let summary = tool.compose != nil && !entry.isStreaming
+                            ? ComposePresentation.childToolSummary(entry.children.map(\.tool))
+                            : "\(entry.children.count) calls"
+                        Text(summary).brandMeta().foregroundStyle(.tertiary).lineLimit(1)
+                    }
                     Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.caption2).foregroundStyle(.tertiary)
                 }.contentShape(Rectangle())
             }.buttonStyle(.plain).pointingHandCursor().padding(.horizontal, 14).padding(.vertical, 12)

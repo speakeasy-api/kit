@@ -10,7 +10,6 @@ use std::{
 };
 
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
-use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, MetadataMap, Part,
     ToolOutput, ToolResultPart,
@@ -28,9 +27,11 @@ use agentkit_tools_core::{
     ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use futures_util::future::{Either, select};
+use serde_json::{Map, Value};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
@@ -38,13 +39,217 @@ use crate::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
     tools::{
-        A2aTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool, Observed, PromptTool,
-        ShellTool, SubagentTool, Subagents, SubagentsTool, ToolSearch, observe_shared,
+        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
+        Observed, PromptTool, ReadFileTool, ShellTool, SteerTool, SubagentTool, Subagents,
+        SubagentsTool, ToolSchema, ToolSearch, observe_shared,
     },
 };
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod test_support {
+    use super::*;
+
+    #[tokio::test]
+    async fn storage_bridge_relays_external_cancellation_and_reasserts_for_new_generations() {
+        let external = CancellationController::new();
+        let controller = CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        let bridge = StorageCancellationBridge::new(controller.clone(), Some(external.handle()));
+        // Make the external branch ready before the spawned bridge first polls.
+        external.interrupt();
+        tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
+            .await
+            .unwrap();
+        let next_generation = controller.handle().checkpoint();
+        tokio::time::timeout(Duration::from_secs(2), next_generation.cancelled())
+            .await
+            .unwrap();
+        drop(bridge);
+    }
+
+    #[test]
+    fn fork_deferral_retains_transcript_until_the_transferred_observer_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+        let mut claim = runtime.claim_session_fork().unwrap();
+        let id = claim.id().to_owned();
+        let opened = crate::session::open_uncommitted(
+            root.path(),
+            &id,
+            false,
+            vec![Item::text(agentkit_core::ItemKind::System, "system")],
+        )
+        .unwrap();
+        claim.guard_uncommitted_transcript(&opened.observer);
+        let creation = claim.defer_fork_commit().unwrap();
+        drop(opened);
+        assert!(crate::session::load(root.path(), &id).is_ok());
+        drop(creation);
+        assert!(crate::session::load(root.path(), &id).is_err());
+    }
+
+    #[test]
+    fn rejected_fork_deferral_cleans_transcripts_before_releasing_identity_for_retry() {
+        for kind in ["configured", "generated", "load"] {
+            let root = tempfile::tempdir().unwrap();
+            let runtime = if kind == "generated" {
+                Runtime::new(root.path(), "gpt-5.4").unwrap()
+            } else {
+                Runtime::with_session(
+                    root.path(),
+                    "gpt-5.4",
+                    SessionRequest {
+                        id: "selected".into(),
+                        resume: false,
+                        force: false,
+                    },
+                )
+                .unwrap()
+            };
+            let mut claim = if kind == "load" {
+                runtime.claim_session_load("selected").unwrap()
+            } else {
+                runtime.claim_session().unwrap()
+            };
+            let id = claim.id().to_owned();
+            let opened = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(agentkit_core::ItemKind::System, "system")],
+            )
+            .unwrap();
+            claim.guard_uncommitted_transcript(&opened.observer);
+            drop(opened);
+            assert!(crate::session::load(root.path(), &id).is_ok());
+            assert!(claim.defer_fork_commit().is_err());
+            assert!(crate::session::load(root.path(), &id).is_err());
+            let mut retry = runtime.claim_session().unwrap();
+            assert_eq!(retry.id(), id);
+            assert!(!retry.request.resume);
+            let recreated = crate::session::open_uncommitted(
+                root.path(),
+                &id,
+                false,
+                vec![Item::text(agentkit_core::ItemKind::System, "recreated")],
+            )
+            .unwrap();
+            retry.guard_uncommitted_transcript(&recreated.observer);
+            retry.commit().unwrap();
+            drop(recreated);
+            assert!(crate::session::load(root.path(), &id).is_ok());
+        }
+    }
+
+    #[test]
+    fn cerebras_keys_disable_cerebras_authentication_and_global_logout() {
+        for (explicit_key, ambient_key) in [(true, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let credentials = tempfile::tempdir().unwrap();
+            let mut runtime = Runtime::new_with_provider_credentials_effort_and_api_keys(
+                root.path(),
+                "gpt-5.4",
+                crate::ProviderKind::OpenAiSubscription,
+                crate::credentials::CredentialStorage::Filesystem(credentials.path().to_path_buf()),
+                None,
+                None,
+                explicit_key.then(|| crate::provider::CerebrasApiKey::new("unrelated")),
+            )
+            .unwrap();
+            let state = Arc::get_mut(&mut runtime).unwrap();
+            state.ambient_openrouter_api_key = false;
+            state.ambient_cerebras_api_key = ambient_key;
+
+            assert!(
+                runtime.supports_terminal_authentication(crate::ProviderKind::OpenAiSubscription)
+            );
+            assert!(runtime.supports_terminal_authentication(crate::ProviderKind::OpenRouter));
+            assert!(runtime.supports_terminal_authentication(crate::ProviderKind::Speakeasy));
+            assert!(!runtime.supports_terminal_authentication(crate::ProviderKind::Cerebras));
+            assert!(!runtime.supports_logout_authentication());
+            assert!(matches!(
+                runtime.logout_authentication(),
+                Err(super::LogoutAuthenticationError::CredentialStateUnchanged(
+                    _
+                ))
+            ));
+        }
+    }
+
+    impl Runtime {
+        pub(crate) fn mcp_for_test(&self) -> &crate::tools::mcp::McpRuntime {
+            &self.mcp
+        }
+
+        pub(crate) fn set_ambient_openrouter_api_key_for_test(&mut self, present: bool) {
+            self.ambient_openrouter_api_key = present;
+        }
+    }
+
+    impl BackgroundJobs {
+        /// Seeds a foreground job for lifecycle tests, without applying registration policy.
+        /// Registration-policy tests must invoke `BackgroundableCompose` instead.
+        pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
+            let mut jobs = self.lock_jobs();
+            let previous = jobs.running.insert(
+                agentkit_core::ToolCallId::new(call_id),
+                BackgroundJob {
+                    registration: Arc::new(()),
+                    controller: CancellationController::new(),
+                    cancellation_requested: false,
+                    foreground_cancellation: None,
+                    cancellation_relay: None,
+                    detached: false,
+                    manual_detach: false,
+                    terminal_published: false,
+                },
+            );
+            let generation = jobs.changed();
+            drop(jobs);
+            drop(previous);
+            self.notify_changed(generation);
+        }
+
+        pub(crate) fn finish_for_test(&self, call_id: &str) {
+            self.finish(&agentkit_core::ToolCallId::new(call_id));
+        }
+
+        pub(crate) fn is_cancelled_for_test(&self, call_id: &str) -> bool {
+            self.lock_jobs()
+                .running
+                .get(&agentkit_core::ToolCallId::new(call_id))
+                .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
+        }
+
+        pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
+            let call_id = agentkit_core::ToolCallId::new(call_id);
+            let jobs = self.lock_jobs();
+            jobs.running.get(&call_id).is_some_and(|job| job.detached)
+                || jobs.pending_detaches.contains(&call_id)
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod tests;
+
+pub(crate) mod voice_state;
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 const MAX_BACKGROUND_AFTER_SECONDS: u64 = 86_400;
@@ -109,6 +314,7 @@ impl SessionSelection {
         configured: bool,
         succeeded: bool,
         opened_new: bool,
+        opened_uncommitted: bool,
     ) {
         if configured {
             if succeeded {
@@ -119,9 +325,9 @@ impl SessionSelection {
                 request.resume = true;
             }
             self.configured_claimed = false;
-        } else if !succeeded && (request.resume || opened_new) {
+        } else if !succeeded && (request.resume || opened_new || opened_uncommitted) {
             let mut request = request.clone();
-            request.resume = true;
+            request.resume = request.resume || opened_new;
             self.generated_retries.push_back(request);
         }
     }
@@ -167,7 +373,11 @@ pub(crate) struct SessionClaim {
     runtime: Arc<Runtime>,
     request: SessionRequest,
     kind: SessionClaimKind,
-    fork_observer: Option<crate::session::SessionObserver>,
+    uncommitted_observer: Option<crate::session::SessionObserver>,
+    // Existing transcripts must not change when preparation or admission fails.
+    // This private staged snapshot is written only in the publication commit;
+    // no actor can run before activation and no guard is held during preparation.
+    pending_workspace: Option<(crate::session::SessionObserver, Vec<Item>)>,
     committed: bool,
 }
 
@@ -191,53 +401,84 @@ impl SessionClaim {
         }
     }
 
-    fn guard_fork_transcript(&mut self, observer: &crate::session::SessionObserver) {
-        if matches!(self.kind, SessionClaimKind::Fork) {
-            self.fork_observer = Some(observer.clone());
-        }
+    fn guard_uncommitted_transcript(&mut self, observer: &crate::session::SessionObserver) {
+        self.uncommitted_observer = Some(observer.clone());
+    }
+
+    pub(crate) fn is_resumed(&self) -> bool {
+        self.request.resume
     }
 
     pub(crate) fn is_fork(&self) -> bool {
         matches!(self.kind, SessionClaimKind::Fork)
     }
 
-    pub(crate) fn defer_fork_commit(mut self) -> crate::session::SessionObserver {
-        debug_assert!(self.is_fork());
+    pub(crate) fn defer_fork_commit(
+        mut self,
+    ) -> Result<crate::session::SessionObserver, AcpRuntimeError> {
+        if !self.is_fork() {
+            return Err(AcpRuntimeError::Loop(
+                "only a fork claim can defer transcript creation".into(),
+            ));
+        }
+        let observer = self.uncommitted_observer.take().ok_or_else(|| {
+            AcpRuntimeError::Loop("fork claim has no uncommitted transcript observer".into())
+        })?;
         self.committed = true;
-        self.fork_observer
-            .take()
-            .expect("an opened fork claim must retain its transcript observer")
+        Ok(observer)
     }
 
     pub(crate) fn commit(mut self) -> Result<(), AcpRuntimeError> {
         if matches!(self.kind, SessionClaimKind::Fork) {
-            if let Some(observer) = self.fork_observer.take() {
-                observer.commit_creation();
+            if let Some(observer) = &self.uncommitted_observer {
+                observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
             }
             self.committed = true;
             return Ok(());
         }
-        let mut selection =
-            self.runtime.session.lock().map_err(|_| {
-                AcpRuntimeError::Loop("runtime session selection is poisoned".into())
-            })?;
-        match self.kind {
-            SessionClaimKind::New {
-                configured,
-                opened_new,
-            } => selection.finish_new(&self.request, configured, true, opened_new),
-            SessionClaimKind::Load { configured } => {
-                selection.finish_load(&self.request, configured, true)
-            }
-            SessionClaimKind::Fork => unreachable!("fork claims commit before locking selection"),
+        // Already-committed transcripts survive rejection. A guarded creation
+        // does not: its cleanup still owns the file until commit succeeds.
+        if self.uncommitted_observer.is_none() {
+            self.mark_opened();
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let mut selection = runtime
+            .session
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("runtime session selection is poisoned".into()))?;
+        // Validate transcript publication before consuming the reserved identity.
+        // Retain the observer until success so rejected commits still run the
+        // claim's normal uncommitted-transcript cleanup and retry bookkeeping.
+        if let Some(observer) = &self.uncommitted_observer {
+            observer.commit_creation().map_err(AcpRuntimeError::Loop)?;
+            self.mark_opened();
+        }
+        if let Some((observer, transcript)) = &self.pending_workspace {
+            observer
+                .replace(transcript)
+                .map_err(AcpRuntimeError::Loop)?;
+        }
+        // Fork claims returned above; the remaining claims either create or load.
+        if let SessionClaimKind::New {
+            configured,
+            opened_new,
+        } = self.kind
+        {
+            selection.finish_new(&self.request, configured, true, opened_new, false);
+        } else {
+            selection.finish_load(&self.request, self.is_configured(), true);
         }
         self.committed = true;
+        drop(selection);
         Ok(())
     }
 }
 
 impl Drop for SessionClaim {
     fn drop(&mut self) {
+        let opened_uncommitted = self.uncommitted_observer.is_some();
+        drop(self.uncommitted_observer.take());
+        drop(self.pending_workspace.take());
         if !self.committed
             && let Ok(mut selection) = self.runtime.session.lock()
         {
@@ -245,7 +486,13 @@ impl Drop for SessionClaim {
                 SessionClaimKind::New {
                     configured,
                     opened_new,
-                } => selection.finish_new(&self.request, configured, false, opened_new),
+                } => selection.finish_new(
+                    &self.request,
+                    configured,
+                    false,
+                    opened_new,
+                    opened_uncommitted,
+                ),
                 SessionClaimKind::Load { configured } => {
                     selection.finish_load(&self.request, configured, false)
                 }
@@ -256,6 +503,7 @@ impl Drop for SessionClaim {
 }
 
 pub(crate) struct AcpDriver {
+    pub subagents: Subagents,
     pub driver: LoopDriver<SelectableSession>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
@@ -276,7 +524,23 @@ struct McpInstallSources {
 pub(crate) const SUBAGENT_SYSTEM_PROMPT_MARKER: &str =
     "This task was delegated to you by the primary agent.";
 
+#[derive(Debug)]
+pub(crate) enum LogoutAuthenticationError {
+    CredentialStateUnchanged(String),
+    CredentialStateMayHaveChanged(String),
+}
+
+impl std::fmt::Display for LogoutAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CredentialStateUnchanged(message)
+            | Self::CredentialStateMayHaveChanged(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub struct Runtime {
+    eval: Option<crate::tools::EvalTool>,
     root: PathBuf,
     adapter: SelectableAdapter,
     provider: ProviderKind,
@@ -285,7 +549,9 @@ pub struct Runtime {
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
-    telemetry: crate::telemetry::Settings,
+    ambient_openrouter_api_key: bool,
+    ambient_cerebras_api_key: bool,
+    telemetry: agentkit_loop::TelemetryConfig,
     max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
@@ -392,11 +658,10 @@ impl Runtime {
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
         cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
     ) -> Result<Arc<Self>, String> {
-        let root = root
-            .as_ref()
-            .canonicalize()
+        crate::resilient_fs::start_recovery_worker();
+        let root = crate::resilient_fs::canonicalize(root.as_ref())
             .map_err(|error| format!("could not open working directory: {error}"))?;
-        if !root.is_dir() {
+        if !crate::resilient_fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
             return Err(format!(
                 "working directory is not a directory: {}",
                 root.display()
@@ -419,6 +684,7 @@ impl Runtime {
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
             ChildConfig {
+                additional_directories: Vec::new(),
                 root: root.clone(),
                 model: model.clone(),
                 provider,
@@ -439,6 +705,7 @@ impl Runtime {
             max_subagent_depth,
         );
         Ok(Arc::new(Self {
+            eval: None,
             root,
             adapter,
             provider,
@@ -447,6 +714,10 @@ impl Runtime {
             credential_storage,
             openrouter_api_key,
             cerebras_api_key,
+            ambient_openrouter_api_key: std::env::var_os("OPENROUTER_API_KEY")
+                .is_some_and(|value| !value.is_empty()),
+            ambient_cerebras_api_key: std::env::var_os("CEREBRAS_API_KEY")
+                .is_some_and(|value| !value.is_empty()),
             telemetry: Default::default(),
             max_subagent_depth,
             base_depth: 0,
@@ -588,8 +859,66 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Enables evaluation only after explicit user opt-in and credential resolution.
+    pub fn with_eval(runtime: Arc<Self>, enabled: bool) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure evaluation after runtime was shared".to_string())?;
+        runtime.eval = if crate::tools::EvalTool::available(enabled, &runtime.credential_storage) {
+            Some(crate::tools::EvalTool::new(
+                runtime.credential_storage.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(Arc::new(runtime))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
+        self.credential_storage.is_persistent()
+            && (provider != ProviderKind::OpenRouter
+                || (self.openrouter_api_key.is_none() && !self.ambient_openrouter_api_key))
+            && (provider != ProviderKind::Cerebras
+                || (self.cerebras_api_key.is_none() && !self.ambient_cerebras_api_key))
+    }
+
+    pub(crate) fn supports_logout_authentication(&self) -> bool {
+        self.supports_terminal_authentication(ProviderKind::OpenRouter)
+            && self.supports_terminal_authentication(ProviderKind::Cerebras)
+    }
+
+    pub(crate) fn logout_authentication(&self) -> Result<(), LogoutAuthenticationError> {
+        if !self.supports_logout_authentication() {
+            return Err(LogoutAuthenticationError::CredentialStateUnchanged(
+                "authentication cannot be logged out while credentials are ephemeral or explicitly configured"
+                    .into(),
+            ));
+        }
+        let failures = [
+            ProviderKind::OpenAiSubscription,
+            ProviderKind::OpenRouter,
+            ProviderKind::Speakeasy,
+            ProviderKind::Cerebras,
+        ]
+        .into_iter()
+        .filter_map(|provider| {
+            crate::provider::execute_provider_logout(provider, &self.credential_storage, true, None)
+                .err()
+        })
+        .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(LogoutAuthenticationError::CredentialStateMayHaveChanged(
+                format!(
+                    "could not remove all provider credentials: {}",
+                    failures.join("; ")
+                ),
+            ))
+        }
     }
 
     /// Sets private immediate-parent context inherited by this runtime's direct children.
@@ -638,10 +967,10 @@ impl Runtime {
         runtime: Arc<Self>,
         telemetry: crate::telemetry::Settings,
     ) -> Result<Arc<Self>, String> {
-        telemetry.agentkit_config()?;
+        let config = telemetry.agentkit_config()?;
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure telemetry after runtime was shared".to_string())?;
-        runtime.telemetry = telemetry.clone();
+        runtime.telemetry = config;
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
@@ -833,6 +1162,7 @@ impl Runtime {
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(
             ChildConfig {
+                additional_directories: Vec::new(),
                 root: runtime.root.clone(),
                 model: runtime.model.clone(),
                 provider: runtime.provider,
@@ -855,8 +1185,58 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
-    pub(crate) fn subscribe_mcp(&self, session_id: String) -> crate::tools::mcp::McpSubscription {
-        self.mcp.subscribe(session_id)
+    /// Additional roots are project context, not a filesystem allowlist. The
+    /// primary root continues to own cwd, configuration, and durable identity.
+    pub(crate) fn additional_directories(
+        &self,
+        requested: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, AcpRuntimeError> {
+        let mut directories = Vec::new();
+        for path in requested {
+            if !path.is_absolute() {
+                return Err(AcpRuntimeError::Loop(
+                    "additional directories must be absolute".into(),
+                ));
+            }
+            let path = crate::resilient_fs::canonicalize(path).map_err(|error| {
+                AcpRuntimeError::Loop(format!("invalid additional directories: {error}"))
+            })?;
+            if !crate::resilient_fs::best_effort_global()
+                .metadata(&path)
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+                .is_dir()
+            {
+                return Err(AcpRuntimeError::Loop(
+                    "additional directories must be directories".into(),
+                ));
+            }
+            if path != self.root && !directories.contains(&path) {
+                directories.push(path);
+            }
+        }
+        Ok(directories)
+    }
+
+    pub(crate) async fn session_mcp(
+        &self,
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<crate::tools::mcp::McpRuntime, AcpRuntimeError> {
+        let cwd = crate::resilient_fs::canonicalize(cwd)
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        if cwd != self.root {
+            return Err(AcpRuntimeError::Loop(format!(
+                "this Kit runtime is fixed to {}",
+                self.root.display()
+            )));
+        }
+        if servers.is_empty() {
+            return Ok(self.mcp.clone());
+        }
+        self.mcp
+            .with_session_servers(servers, &cwd)
+            .await
+            .map_err(AcpRuntimeError::Loop)
     }
 
     pub const fn max_subagent_depth(&self) -> usize {
@@ -870,8 +1250,6 @@ impl Runtime {
 
     fn agentkit_telemetry(&self) -> agentkit_loop::TelemetryConfig {
         self.telemetry
-            .agentkit_config()
-            .expect("runtime telemetry settings are validated before storage")
     }
 
     pub fn compose(self: &Arc<Self>, depth: usize) -> ComposeOnly {
@@ -947,10 +1325,32 @@ impl Runtime {
         background_jobs: BackgroundJobs,
         skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
+        self.compose_with_jobs_and_mcp(depth, subagents, background_jobs, skills, self.mcp.clone())
+    }
+
+    fn compose_with_jobs_and_mcp(
+        &self,
+        depth: usize,
+        subagents: Subagents,
+        background_jobs: BackgroundJobs,
+        skills: Arc<SkillRegistry>,
+        mcp: crate::tools::mcp::McpRuntime,
+    ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
+            .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
+                &self.root,
+            ))))
+            .with(Observed::new(ReadFileTool::new(self.root.clone())).with_root(self.root.clone()))
+            .with(Observed::new(crate::tools::ImageGenTool::new(
+                self.root.clone(),
+                self.credential_storage.clone(),
+            )))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
-            .with(Observed::new(EditTool::new(self.root.clone())));
+            .with(Observed::new(EditTool::new(self.root.clone())).with_root(self.root.clone()));
+        if let Some(eval) = &self.eval {
+            children.register(Observed::new(eval.clone()));
+        }
         if depth < self.max_subagent_depth {
             children
                 .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
@@ -958,6 +1358,7 @@ impl Runtime {
         }
         children
             .register(Observed::new(PromptTool::new(subagents.clone())))
+            .register(Observed::new(SteerTool::new(subagents.clone())))
             .register(Observed::new(SubagentsTool::new(subagents.clone())))
             .register(Observed::new(CloseTool::new(subagents, {
                 let background_jobs = background_jobs.clone();
@@ -970,9 +1371,16 @@ impl Runtime {
                 }
             })))
             .register(Observed::new(A2aTool::new()))
-            .register(Observed::new(ToolSearch::new(self.mcp.clone())))
-            .register(Observed::new(AuthTool::new(self.mcp.clone())))
-            .register(Observed::new(McpTool::new(self.mcp.clone())));
+            .register(Observed::new(ToolSearch::new(
+                mcp.clone(),
+                crate::artifacts::base(&self.root),
+            )))
+            .register(Observed::new(ToolSchema::new(
+                mcp.clone(),
+                crate::artifacts::base(&self.root),
+            )))
+            .register(Observed::new(AuthTool::new(mcp.clone())))
+            .register(Observed::new(McpTool::new(mcp)));
         if let Some(skill_tool) = &self.dynamic_skill_tool {
             children.register(observe_shared(Arc::clone(skill_tool)));
         } else {
@@ -1001,11 +1409,36 @@ impl Runtime {
     }
 
     pub async fn run(self: &Arc<Self>, prompt: String, depth: usize) -> Result<String, LoopError> {
-        self.run_interruptible(prompt, depth, None).await
+        self.run_interruptible(prompt, depth, None)
+            .instrument(crate::telemetry::error_spans::operation("prompt"))
+            .await
     }
 
     /// Runs one prompt in the configured durable session.
     pub async fn run_persistent(self: &Arc<Self>, prompt: String) -> Result<String, String> {
+        self.run_persistent_interruptible(prompt, None).await
+    }
+
+    /// Runs a durable prompt with cancellation owned by its caller.
+    pub async fn run_persistent_interruptible(
+        self: &Arc<Self>,
+        prompt: String,
+        cancellation: Option<CancellationHandle>,
+    ) -> Result<String, String> {
+        // Keep the operation current through startup and the existing fatal writes.
+        self.run_persistent_inner(prompt, cancellation)
+            .instrument(crate::telemetry::error_spans::operation("prompt"))
+            .await
+    }
+
+    async fn run_persistent_inner(
+        self: &Arc<Self>,
+        prompt: String,
+        cancellation: Option<CancellationHandle>,
+    ) -> Result<String, String> {
+        let controller = CancellationController::new();
+        let cancelled = controller.handle().checkpoint();
+        let _shutdown_bridge = StorageCancellationBridge::new(controller.clone(), cancellation);
         let request = self
             .session
             .lock()
@@ -1014,96 +1447,159 @@ impl Runtime {
             .clone()
             .ok_or_else(|| "persistent run requires a configured session".to_string())?;
         let session_id = request.id.clone();
-        if self.plugin_runtime.is_some() {
-            self.mcp.refresh().await.map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "plugin_refresh",
-                    error,
-                )
-            })?;
-        }
-        let initial = if request.resume {
-            vec![Item::text(ItemKind::System, self.system_prompt(0))]
-        } else {
-            self.initial_transcript(0).await.map_err(|error| {
-                record_runtime_failure(
-                    &session_id,
-                    crate::fatal::Surface::Prompt,
-                    "initial_transcript",
-                    error,
-                )
-            })?
-        };
-        let opened = crate::session::open(
-            &self.root,
-            &request.id,
-            request.resume,
-            request.force,
-            initial,
-        )
-        .map_err(|error| {
-            record_runtime_failure(
-                &session_id,
-                crate::fatal::Surface::Prompt,
-                "session_open",
-                error,
-            )
-        })?;
-        let skills = self.fresh_skills();
-        let compactor = crate::compaction::automatic(
-            self.adapter.clone(),
-            self.agentkit_telemetry(),
-            Some(opened.observer.clone()),
-            format!("compaction-{}", crate::session::new_id()),
-        )
-        .map_err(|error| {
-            record_runtime_failure(
-                &session_id,
-                crate::fatal::Surface::Prompt,
-                "compactor_build",
-                error,
-            )
-        })?;
-        let subagents = self.subagents.fresh();
-        let agent = Agent::builder()
-            .model(self.adapter.clone())
-            .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
-                0,
-                subagents,
-                BackgroundJobs::default(),
-                skills,
-            ))
-            .task_manager(background_task_manager())
-            .mutator(compactor)
-            .transcript_observer(opened.observer)
-            .transcript(opened.transcript)
-            .input(vec![Item::text(ItemKind::User, prompt)])
-            .build()
+        let task_manager = background_task_manager();
+        let tasks = task_manager.handle();
+        let background_jobs = BackgroundJobs::default();
+        let startup = async {
+            if self.plugin_runtime.is_some() {
+                self.mcp.refresh().await.map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "plugin_refresh",
+                        error,
+                    )
+                })?;
+            }
+            let initial = if request.resume {
+                vec![Item::text(ItemKind::System, self.system_prompt(0))]
+            } else {
+                self.initial_transcript(0).await.map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "initial_transcript",
+                        error,
+                    )
+                })?
+            };
+            let opened = if request.resume {
+                crate::session::open(&self.root, &request.id, true, request.force, initial)
+            } else {
+                crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
+            }
             .map_err(|error| {
                 record_runtime_failure(
                     &session_id,
                     crate::fatal::Surface::Prompt,
-                    "agent_build",
-                    error.to_string(),
+                    "session_open",
+                    error,
                 )
             })?;
-        let mut driver = match agent
-            .start(SessionConfig::new(session_id.clone()).without_cache())
-            .await
-        {
-            Ok(driver) => driver,
-            Err(error) => {
-                return Err(record_loop_failure(
+            let selection = self.adapter.selection()?;
+            let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
+                selection.provider,
+                selection.model,
+                self.credential_storage.clone(),
+                opened
+                    .reasoning_effort
+                    .unwrap_or(self.adapter.reasoning_effort()?),
+                self.openrouter_api_key.clone(),
+                self.cerebras_api_key.clone(),
+            )?
+            .with_session_observer(opened.observer.clone(), !request.resume)?;
+            let pending_creation = (!request.resume).then(|| opened.observer.clone());
+            let skills = self.fresh_skills();
+            let compactor = crate::compaction::automatic(
+                adapter.clone(),
+                self.agentkit_telemetry(),
+                Some(opened.observer.clone()),
+                format!("compaction-{}", crate::session::new_id()),
+            )
+            .map_err(|error| {
+                record_runtime_failure(
                     &session_id,
                     crate::fatal::Surface::Prompt,
-                    &error,
-                ));
+                    "compactor_build",
+                    error,
+                )
+            })?;
+            let subagents = self
+                .subagents
+                .fresh()
+                .with_observer(opened.observer.clone(), opened.children)
+                .map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "subagent_restore",
+                        error,
+                    )
+                })?;
+            let agent = Agent::builder()
+                .cancellation(controller.handle())
+                .model(adapter.clone())
+                .telemetry(self.agentkit_telemetry())
+                .add_tool_source(self.compose_with_jobs(
+                    0,
+                    subagents,
+                    background_jobs.clone(),
+                    skills,
+                ))
+                .task_manager(task_manager)
+                .mutator(compactor)
+                .transcript_observer(opened.observer)
+                .transcript(opened.transcript)
+                .input(vec![Item::text(ItemKind::User, prompt)])
+                .build()
+                .map_err(|error| {
+                    record_runtime_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        "agent_build",
+                        error.to_string(),
+                    )
+                })?;
+            let driver = match agent
+                .start(SessionConfig::new(session_id.clone()).without_cache())
+                .await
+            {
+                Ok(driver) => driver,
+                Err(error) => {
+                    return Err(record_loop_failure(
+                        &session_id,
+                        crate::fatal::Surface::Prompt,
+                        &error,
+                    ));
+                }
+            };
+            Ok::<_, String>((driver, pending_creation))
+        };
+        // No model tool work is launched until drive_with_tasks below. Dropping
+        // async startup here must never replace the execution cleanup path.
+        // Provider-owned blocking credential workers still retain their existing
+        // deadline and runtime-shutdown ownership; this is not their quiescence.
+        let (mut driver, pending_creation) = {
+            let startup = std::pin::pin!(startup);
+            let cancellation = std::pin::pin!(cancelled.cancelled());
+            match select(cancellation, startup).await {
+                Either::Left(((), _)) => return Err("prompt cancelled during startup".into()),
+                Either::Right((result, _)) => result?,
             }
         };
-        match drive(&mut driver).await {
+        if let Some(observer) = pending_creation {
+            observer.commit_creation()?;
+        }
+        let result = {
+            let cancellation = std::pin::pin!(cancelled.cancelled());
+            let run = std::pin::pin!(drive_with_tasks(&mut driver, Some(&tasks)));
+            // Idle prompts must observe cancellation too, not just model turns.
+            match select(cancellation, run).await {
+                Either::Left(((), _)) => Err(LoopError::Cancelled),
+                Either::Right((result, _)) => result,
+            }
+        };
+        // Cancel owned compose work cooperatively before aborting task handles.
+        background_jobs.cancel_all();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            background_jobs.wait_for_quiescence(),
+        )
+        .await;
+        for task in tasks.list_running().await {
+            let _ = tasks.cancel(task.id).await;
+        }
+        match result {
             Ok(output) => Ok(output),
             Err(error) => Err(record_loop_failure(
                 &session_id,
@@ -1144,6 +1640,13 @@ impl Runtime {
         depth: usize,
         cancellation: Option<CancellationHandle>,
     ) -> Result<String, LoopError> {
+        if crate::resilient_fs::shutdown_token().is_cancelled() {
+            return Err(LoopError::InvalidState(
+                "storage shutdown in progress".into(),
+            ));
+        }
+        let controller = CancellationController::new();
+        let _shutdown_bridge = StorageCancellationBridge::new(controller.clone(), cancellation);
         if self.plugin_runtime.is_some() {
             self.mcp.refresh().await.map_err(LoopError::InvalidState)?;
         }
@@ -1161,7 +1664,7 @@ impl Runtime {
         )
         .map_err(LoopError::InvalidState)?;
         let subagents = self.subagents.fresh();
-        let mut builder = Agent::builder()
+        let builder = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(
@@ -1174,9 +1677,7 @@ impl Runtime {
             .mutator(compactor)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
-        if let Some(cancellation) = cancellation {
-            builder = builder.cancellation(cancellation);
-        }
+        let builder = builder.cancellation(controller.handle());
         let mut driver = builder
             .build()?
             .start(SessionConfig::new(session).without_cache())
@@ -1197,7 +1698,8 @@ impl Runtime {
                 configured,
                 opened_new: false,
             },
-            fork_observer: None,
+            uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
@@ -1211,7 +1713,8 @@ impl Runtime {
                 force: false,
             },
             kind: SessionClaimKind::Fork,
-            fork_observer: None,
+            uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
@@ -1229,43 +1732,33 @@ impl Runtime {
             runtime: Arc::clone(self),
             request,
             kind: SessionClaimKind::Load { configured },
-            fork_observer: None,
+            uncommitted_observer: None,
+            pending_workspace: None,
             committed: false,
         })
     }
 
-    pub(crate) async fn start_acp_driver<I>(
-        self: &Arc<Self>,
-        context: AcpDriverContext<I>,
-        claim: &mut SessionClaim,
-    ) -> Result<AcpDriver, AcpRuntimeError>
-    where
-        I: LoopObserver + Clone + 'static,
-    {
-        self.start_acp_driver_with_initial(context, claim, None)
-            .await
-    }
-
-    pub(crate) async fn start_acp_driver_with_initial<I>(
+    pub(crate) async fn start_acp_driver_with_mcp<I>(
         self: &Arc<Self>,
         context: AcpDriverContext<I>,
         claim: &mut SessionClaim,
         forked: Option<AcpForkState>,
+        mcp: crate::tools::mcp::McpRuntime,
     ) -> Result<AcpDriver, AcpRuntimeError>
     where
         I: LoopObserver + Clone + 'static,
     {
-        let cwd = context
-            .cwd
-            .canonicalize()
+        let cwd = crate::resilient_fs::canonicalize(&context.cwd)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
-        if cwd != self.root || !context.additional_directories.is_empty() {
+        if cwd != self.root {
             return Err(AcpRuntimeError::Loop(format!(
-                "this Kit runtime is fixed to {} and does not accept additional directories",
+                "this Kit runtime is fixed to {}",
                 self.root.display()
             )));
         }
-        let request = &claim.request;
+        let additional_directories =
+            self.additional_directories(&context.additional_directories)?;
+        let request = claim.request.clone();
         let session_id = request.id.clone();
         let (forked_transcript, selected, parent_context) = match forked {
             Some(forked) => (
@@ -1293,28 +1786,39 @@ impl Runtime {
                 .await
                 .map_err(AcpRuntimeError::Loop)?
         };
-        let opened = if is_fork {
-            crate::session::open_uncommitted(&self.root, &request.id, initial)
+        let mut opened = if is_fork {
+            crate::session::open_uncommitted(&self.root, &request.id, false, initial)
+        } else if request.resume {
+            crate::session::open(&self.root, &request.id, true, request.force, initial)
         } else {
-            crate::session::open(
-                &self.root,
-                &request.id,
-                request.resume,
-                request.force,
-                initial,
-            )
+            crate::session::open_uncommitted(&self.root, &request.id, request.force, initial)
         }
         .map_err(AcpRuntimeError::Loop)?;
-        claim.mark_opened();
-        if is_fork {
-            claim.guard_fork_transcript(&opened.observer);
+        if is_fork || !request.resume {
+            claim.guard_uncommitted_transcript(&opened.observer);
+        }
+        // The workspace context is session-owned, not runtime-global. Refresh it
+        // for load/resume/fork too; an empty request removes previous extra roots.
+        if refresh_workspace_context(&mut opened.transcript, &additional_directories)
+            .await
+            .map_err(AcpRuntimeError::Loop)?
+        {
+            if claim.uncommitted_observer.is_some() {
+                opened
+                    .observer
+                    .replace(&opened.transcript)
+                    .map_err(AcpRuntimeError::Loop)?;
+            } else {
+                claim.pending_workspace =
+                    Some((opened.observer.clone(), opened.transcript.clone()));
+            }
         }
         // Every ACP route owns its model selection. Changing one session
         // cannot redirect another session served by the same runtime.
         let (selection, reasoning_effort) = selected.unwrap_or_else(|| {
             (
                 ModelSelection::new(self.provider, self.model.clone()),
-                self.reasoning_effort,
+                opened.reasoning_effort.unwrap_or(self.reasoning_effort),
             )
         });
         let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
@@ -1325,6 +1829,9 @@ impl Runtime {
             self.openrouter_api_key.clone(),
             self.cerebras_api_key.clone(),
         )
+        .and_then(|adapter| {
+            adapter.with_session_observer(opened.observer.clone(), is_fork || !request.resume)
+        })
         .map_err(AcpRuntimeError::Loop)?;
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
@@ -1336,10 +1843,11 @@ impl Runtime {
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
-        let subagents = match parent_context {
-            Some((id, name)) => self.subagents.fresh_with_parent(id, name),
-            None => self.subagents.fresh(),
-        };
+        let subagents = self
+            .subagents
+            .fresh_for_workspace(additional_directories, parent_context)
+            .with_observer(opened.observer.clone(), opened.children)
+            .map_err(AcpRuntimeError::Loop)?;
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
@@ -1351,11 +1859,12 @@ impl Runtime {
         let driver = Agent::builder()
             .model(adapter.clone())
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
+            .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
-                subagents,
+                subagents.clone(),
                 background_jobs.clone(),
                 skills,
+                mcp,
             ))
             .task_manager(task_manager)
             .mutator(compactor)
@@ -1369,6 +1878,7 @@ impl Runtime {
             .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
         let driver = AcpDriver {
+            subagents,
             driver,
             skills: skill_catalog,
             tasks,
@@ -1408,9 +1918,11 @@ impl Runtime {
                 "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
                 "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
                 "Parallelize independent work deliberately. Prefer one compose program whenever the remaining tool graph is known: keep intermediate results inside it when they can directly drive downstream work, and return only the bare minimum information necessary to plan the next turn or provide the final answer. ",
-                "Background long-running compose work when it can run across a turn boundary; it also suits one-shot triggers. ",
+                "Background long-running compose work across turn boundaries, including monitors that wait or poll for EXTERNAL events or state changes. ",
                 "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
-                "After detaching, continue any independent work, including launching more detached work. When the remaining work depends on background results, yield; yielding continues the task with those results, so the user's answer need not be completed first. ",
+                "After detaching, continue any independent work, including launching more detached work. When no independent work remains and you need background results, STOP: end your turn now. ",
+                "Stopping is a valid intermediate response, not completion or abandonment of the user's task. ",
+                "Do not issue additional tool calls to wait or poll for a background tool call to finish, or to keep the turn alive; the harness automatically resumes you when it finishes. ",
                 "Keep work foregrounded when the next step needs its result in the current turn, and do not treat backgrounding as durable job execution.\n\n",
                 "{}"
             ),
@@ -1589,20 +2101,23 @@ fn build_skill_registry(
     let default_roots = default_skill_roots(root);
     let canonical_defaults = default_roots
         .iter()
-        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .map(|path| crate::resilient_fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect::<Vec<_>>();
     let canonical_package_roots = package_roots
         .iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| crate::resilient_fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     let canonical_plugin_skills = skill_directories
         .iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| crate::resilient_fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     let mut roots = default_roots;
     roots.extend(skill_directories.iter().cloned());
+    // This dependency is a native path reader. Do not hand it stale disk paths
+    // for a pending generation; it can be discovered on a later refresh.
+    roots.retain(|path| crate::resilient_fs::global().require_disk(path).is_ok());
     SkillRegistry::from_paths(roots).with_filter(move |skill: &agentkit_tool_skills::Skill| {
-        let Ok(base) = skill.base_dir.canonicalize() else {
+        let Ok(base) = crate::resilient_fs::canonicalize(&skill.base_dir) else {
             return false;
         };
         if canonical_defaults
@@ -1611,7 +2126,7 @@ fn build_skill_registry(
         {
             return true;
         }
-        let Ok(location) = skill.location.canonicalize() else {
+        let Ok(location) = crate::resilient_fs::canonicalize(&skill.location) else {
             return false;
         };
         canonical_plugin_skills.contains(&base)
@@ -1659,7 +2174,9 @@ impl ToolSource for ComposeOnly {
 }
 
 struct BackgroundJob {
+    registration: Arc<()>,
     controller: CancellationController,
+    cancellation_requested: bool,
     foreground_cancellation: Option<agentkit_core::TurnCancellation>,
     cancellation_relay: Option<tokio::task::AbortHandle>,
     detached: bool,
@@ -1708,27 +2225,62 @@ impl Default for BackgroundJobs {
     }
 }
 
+impl BackgroundJob {
+    fn request_cancellation(&mut self) -> Option<CancellationController> {
+        // This private controller is signalled only once. In agentkit-core 0.10.5
+        // interrupt is an atomic generation increment (waiters poll); selecting
+        // at most one signal also prevents overflow before the out-of-lock effect.
+        if std::mem::replace(&mut self.cancellation_requested, true) {
+            None
+        } else {
+            Some(self.controller.clone())
+        }
+    }
+}
+
+impl BackgroundJobState {
+    fn changed(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+}
+
 impl BackgroundJobs {
-    fn changed(&self, jobs: &mut BackgroundJobState) {
-        jobs.generation = jobs.generation.wrapping_add(1);
-        self.activity.send_replace(jobs.generation);
+    fn lock_jobs(&self) -> std::sync::MutexGuard<'_, BackgroundJobState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            // Every writer commits only owned maps/sets, booleans and wrapping
+            // counters here. Registration rejects live IDs before changing state;
+            // finish moves the job out and records its terminal debt atomically;
+            // acknowledgement handles both sides of that transition. Relay handles,
+            // removed jobs, aborts, cancellation signals and watch wakeups all leave
+            // this lock before running/dropping. No await or user code runs guarded.
+            // Cancellation decisions are sticky per job, so detach cannot overtake
+            // a signal selected under this lock; cancel_all also covers later jobs.
+            // Signals target cloned controllers; relays also check registration
+            // identity, so an old relay racing its abort cannot cancel a reused ID.
+            // Registration establishes RAII cleanup before any wakeup can unwind.
+            // Thus poison cannot mean a partly published job or lost terminal debt;
+            // recover the actual activity, never substitute a fictitious idle state.
+            let jobs = poisoned.into_inner();
+            self.state.clear_poison();
+            jobs
+        })
+    }
+
+    fn notify_changed(&self, generation: u64) {
+        // Notifications may arrive out of commit order after unlocking. The watch
+        // value is only a wakeup hint; activity_after always reads authoritative state.
+        self.activity.send_replace(generation);
     }
 
     pub(crate) fn activity(&self) -> BackgroundActivity {
-        self.state.lock().map_or(
-            BackgroundActivity {
-                generation: *self.activity.borrow(),
-                active: false,
-                background_started: 0,
-                unacknowledged_terminals: false,
-            },
-            |jobs| BackgroundActivity {
-                generation: jobs.generation,
-                active: !jobs.running.is_empty(),
-                background_started: jobs.background_started,
-                unacknowledged_terminals: !jobs.unacknowledged_terminals.is_empty(),
-            },
-        )
+        let jobs = self.lock_jobs();
+        BackgroundActivity {
+            generation: jobs.generation,
+            active: !jobs.running.is_empty(),
+            background_started: jobs.background_started,
+            unacknowledged_terminals: !jobs.unacknowledged_terminals.is_empty(),
+        }
     }
 
     pub(crate) async fn activity_after(&self, generation: u64) -> BackgroundActivity {
@@ -1755,86 +2307,106 @@ impl BackgroundJobs {
     }
 
     pub(crate) fn acknowledge_terminal(&self, call_id: &agentkit_core::ToolCallId) {
-        if let Ok(mut jobs) = self.state.lock() {
-            let changed = if let Some(job) = jobs.running.get_mut(call_id) {
-                !std::mem::replace(&mut job.terminal_published, true)
-            } else {
-                jobs.unacknowledged_terminals.remove(call_id)
-            };
-            if changed {
-                self.changed(&mut jobs);
-            }
+        let mut jobs = self.lock_jobs();
+        let changed = if let Some(job) = jobs.running.get_mut(call_id) {
+            !std::mem::replace(&mut job.terminal_published, true)
+        } else {
+            jobs.unacknowledged_terminals.remove(call_id)
+        };
+        let generation = changed.then(|| jobs.changed());
+        drop(jobs);
+        if let Some(generation) = generation {
+            self.notify_changed(generation);
         }
     }
 
     pub(crate) fn begin_turn(&self) {
-        if let Ok(mut jobs) = self.state.lock() {
-            jobs.cancel_all = false;
-        }
+        self.lock_jobs().cancel_all = false;
     }
 
     pub(crate) fn cancel_all(&self) {
-        if let Ok(mut jobs) = self.state.lock() {
-            jobs.cancel_all = true;
-            for job in jobs.running.values() {
-                job.controller.interrupt();
-            }
+        let mut jobs = self.lock_jobs();
+        jobs.cancel_all = true;
+        let controllers: Vec<_> = jobs
+            .running
+            .values_mut()
+            .filter_map(BackgroundJob::request_cancellation)
+            .collect();
+        drop(jobs);
+        for controller in controllers {
+            controller.interrupt();
         }
     }
 
     fn cancel_running(&self, call_id: &str) -> bool {
+        self.cancel_registration(call_id, None)
+    }
+
+    fn cancel_registration(&self, call_id: &str, registration: Option<&Arc<()>>) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(jobs) = self.state.lock() else {
+        let mut jobs = self.lock_jobs();
+        let Some(job) = jobs.running.get_mut(&call_id).filter(|job| {
+            registration.is_none_or(|registration| Arc::ptr_eq(&job.registration, registration))
+        }) else {
             return false;
         };
-        let Some(job) = jobs.running.get(&call_id) else {
-            return false;
-        };
-        job.controller.interrupt();
+        let controller = job.request_cancellation();
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
+        }
         true
     }
 
     pub fn cancel(&self, call_id: &str) -> bool {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return false;
-        };
-        if let Some(job) = jobs.running.get(&call_id) {
-            job.controller.interrupt();
+        let mut jobs = self.lock_jobs();
+        let controller = if let Some(job) = jobs.running.get_mut(&call_id) {
+            job.request_cancellation()
         } else {
-            // ACP can expose the call just before its execution future registers.
-            // Remember the request so registration and cancellation are atomic
-            // from the user's perspective.
+            // Registration consumes the pending request in the same state commit.
             jobs.pending_cancellations.insert(call_id);
+            None
+        };
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
         true
     }
 
     pub(crate) fn detach(&self, call_id: &str) -> Option<DetachRegistration> {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return None;
-        };
+        let mut jobs = self.lock_jobs();
         if let Some(job) = jobs.running.get_mut(&call_id) {
             if job.manual_detach {
                 return Some(DetachRegistration::AlreadyDetached);
             }
+            if job.cancellation_requested
+                || job
+                    .foreground_cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+            {
+                let controller = job.request_cancellation();
+                drop(jobs);
+                if let Some(controller) = controller {
+                    controller.interrupt();
+                }
+                return None;
+            }
             let newly_detached = !job.detached;
             job.detached = true;
             job.manual_detach = true;
-            if job
-                .foreground_cancellation
-                .as_ref()
-                .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
-            {
-                job.detached = false;
-                job.manual_detach = false;
-                job.controller.interrupt();
-                return None;
-            }
-            if newly_detached {
+            let generation = if newly_detached {
                 jobs.background_started = jobs.background_started.wrapping_add(1);
-                self.changed(&mut jobs);
+                Some(jobs.changed())
+            } else {
+                None
+            };
+            drop(jobs);
+            if let Some(generation) = generation {
+                self.notify_changed(generation);
             }
             return Some(DetachRegistration::Registered);
         }
@@ -1847,9 +2419,7 @@ impl BackgroundJobs {
 
     pub(crate) fn restore_foreground(&self, call_id: &str) {
         let call_id = agentkit_core::ToolCallId::new(call_id);
-        let Ok(mut jobs) = self.state.lock() else {
-            return;
-        };
+        let mut jobs = self.lock_jobs();
         let Some(job) = jobs.running.get_mut(&call_id) else {
             jobs.pending_detaches.remove(&call_id);
             return;
@@ -1858,91 +2428,58 @@ impl BackgroundJobs {
         if job.foreground_cancellation.is_some() {
             job.detached = false;
         }
-        if job
+        let controller = if job
             .foreground_cancellation
             .as_ref()
             .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
         {
-            job.controller.interrupt();
+            job.request_cancellation()
+        } else {
+            None
+        };
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
     }
 
-    fn propagate_foreground_cancellation(&self, call_id: &agentkit_core::ToolCallId) {
-        let Ok(jobs) = self.state.lock() else {
-            return;
-        };
-        if let Some(job) = jobs.running.get(call_id)
-            && !job.detached
-        {
-            job.controller.interrupt();
+    fn propagate_foreground_cancellation(
+        &self,
+        call_id: &agentkit_core::ToolCallId,
+        registration: &Arc<()>,
+    ) {
+        let mut jobs = self.lock_jobs();
+        let controller = jobs
+            .running
+            .get_mut(call_id)
+            .filter(|job| !job.detached && Arc::ptr_eq(&job.registration, registration))
+            .and_then(BackgroundJob::request_cancellation);
+        drop(jobs);
+        if let Some(controller) = controller {
+            controller.interrupt();
         }
     }
 
     fn finish(&self, call_id: &agentkit_core::ToolCallId) {
-        if let Ok(mut jobs) = self.state.lock() {
-            if let Some(job) = jobs.running.remove(call_id) {
-                if job.detached && !job.terminal_published {
-                    jobs.unacknowledged_terminals.insert(call_id.clone());
-                }
-                if let Some(relay) = job.cancellation_relay {
-                    relay.abort();
-                }
-            }
-            jobs.pending_cancellations.remove(call_id);
-            jobs.pending_detaches.remove(call_id);
-            self.changed(&mut jobs);
+        let mut jobs = self.lock_jobs();
+        let job = jobs.running.remove(call_id);
+        if job
+            .as_ref()
+            .is_some_and(|job| job.detached && !job.terminal_published)
+        {
+            jobs.unacknowledged_terminals.insert(call_id.clone());
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_foreground_for_test(&self, call_id: &str) {
-        if let Ok(mut jobs) = self.state.lock() {
-            let call_id = agentkit_core::ToolCallId::new(call_id);
-            let manual_detach = jobs.pending_detaches.remove(&call_id);
-            let controller = CancellationController::new();
-            if jobs.cancel_all {
-                controller.interrupt();
-            }
-            jobs.running.insert(
-                call_id,
-                BackgroundJob {
-                    controller,
-                    foreground_cancellation: None,
-                    cancellation_relay: None,
-                    detached: manual_detach,
-                    manual_detach,
-                    terminal_published: false,
-                },
-            );
-            if manual_detach {
-                jobs.background_started = jobs.background_started.wrapping_add(1);
-            }
-            self.changed(&mut jobs);
+        jobs.pending_cancellations.remove(call_id);
+        jobs.pending_detaches.remove(call_id);
+        let generation = jobs.changed();
+        drop(jobs);
+        if let Some(job) = &job
+            && let Some(relay) = &job.cancellation_relay
+        {
+            relay.abort();
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_for_test(&self, call_id: &str) {
-        self.finish(&agentkit_core::ToolCallId::new(call_id));
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_cancelled_for_test(&self, call_id: &str) -> bool {
-        let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running
-                .get(&call_id)
-                .is_some_and(|job| job.controller.handle().is_cancelled_since(0))
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_detached_for_test(&self, call_id: &str) -> bool {
-        let call_id = agentkit_core::ToolCallId::new(call_id);
-        self.state.lock().is_ok_and(|jobs| {
-            jobs.running.get(&call_id).is_some_and(|job| job.detached)
-                || jobs.pending_detaches.contains(&call_id)
-        })
+        drop(job);
+        self.notify_changed(generation);
     }
 }
 
@@ -1998,6 +2535,12 @@ impl BackgroundableCompose {
                 )));
             }
         }
+        if object
+            .remove("intent")
+            .is_some_and(|intent| !intent.is_string())
+        {
+            return Err(ToolError::InvalidInput("intent must be a string".into()));
+        }
         Ok(request)
     }
 }
@@ -2032,11 +2575,19 @@ impl Tool for BackgroundableCompose {
         let call_id = request.call_id.clone();
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
+        let session = request.session_id.0.clone();
         let request = Self::sanitized(request)?;
-        let _job = self.begin_background(background, &call_id, ctx);
+        let _job = self.begin_background(background, &call_id, ctx)?;
         match self.inner.invoke(request, ctx).await {
             Ok(mut result) => {
-                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                match crate::compose_output::finalize(
+                    &self.root,
+                    &session,
+                    &artifact_directory,
+                    result.result.output,
+                    ctx.cancellation.clone(),
+                )
+                .await
                 {
                     Ok(output) => {
                         result.result.output = output;
@@ -2058,14 +2609,25 @@ impl Tool for BackgroundableCompose {
         let call_id = request.call_id.clone();
         let artifact_directory =
             crate::artifacts::directory(&self.root, &request.session_id.0, &call_id.0);
+        let session = request.session_id.0.clone();
         let request = match Self::sanitized(request) {
             Ok(request) => request,
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
-        let _job = self.begin_background(background, &call_id, ctx);
+        let _job = match self.begin_background(background, &call_id, ctx) {
+            Ok(job) => job,
+            Err(error) => return ToolExecutionOutcome::FailedBeforeInvocation(error),
+        };
         match self.inner.invoke_outcome(request, ctx).await {
             ToolExecutionOutcome::Completed(mut result) => {
-                match crate::compose_output::guard(&artifact_directory, result.result.output).await
+                match crate::compose_output::finalize(
+                    &self.root,
+                    &session,
+                    &artifact_directory,
+                    result.result.output,
+                    ctx.cancellation.clone(),
+                )
+                .await
                 {
                     Ok(output) => {
                         result.result.output = output;
@@ -2085,61 +2647,98 @@ impl BackgroundableCompose {
         background: bool,
         call_id: &agentkit_core::ToolCallId,
         ctx: &mut ToolContext<'_>,
-    ) -> BackgroundJobGuard {
+    ) -> Result<BackgroundJobGuard, ToolError> {
         let foreground_cancellation = (!background).then(|| ctx.cancellation.clone()).flatten();
+        let registration = Arc::new(());
         let controller = CancellationController::new();
         let cancellation = controller.handle().checkpoint();
+        let mut jobs = self.background_jobs.lock_jobs();
+        if jobs.running.contains_key(call_id) || jobs.unacknowledged_terminals.contains(call_id) {
+            drop(jobs);
+            return Err(ToolError::InvalidInput(
+                "compose call ID is already registered".into(),
+            ));
+        }
+        let manual_detach = jobs.pending_detaches.remove(call_id);
+        let detached = background || manual_detach;
+        let cancelled = jobs.pending_cancellations.remove(call_id)
+            || jobs.cancel_all
+            || (!detached
+                && foreground_cancellation
+                    .as_ref()
+                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled));
+        jobs.running.insert(
+            call_id.clone(),
+            BackgroundJob {
+                registration: Arc::clone(&registration),
+                controller: controller.clone(),
+                cancellation_requested: cancelled,
+                foreground_cancellation: foreground_cancellation.clone(),
+                cancellation_relay: None,
+                detached,
+                manual_detach,
+                terminal_published: false,
+            },
+        );
+        if detached {
+            jobs.background_started = jobs.background_started.wrapping_add(1);
+        }
+        let generation = jobs.changed();
+        drop(jobs);
+        // The guard must exist before notification, spawning, or context drops can
+        // unwind. It owns this unique registration until execution completes/cancels.
+        let guard = BackgroundJobGuard {
+            jobs: self.background_jobs.clone(),
+            call_id: call_id.clone(),
+        };
+        if cancelled {
+            controller.interrupt();
+        }
         ctx.cancellation = Some(cancellation.clone());
         if let Some(scope) = &mut ctx.execution_scope {
             scope.cancellation = Some(cancellation);
         }
-        if let Ok(mut jobs) = self.background_jobs.state.lock() {
-            if jobs.pending_cancellations.remove(call_id) || jobs.cancel_all {
-                controller.interrupt();
+        self.background_jobs.notify_changed(generation);
+        let shutdown = crate::resilient_fs::shutdown_token().child_token();
+        let relay_jobs = self.background_jobs.clone();
+        let relay_call_id = call_id.clone();
+        let relay = tokio::spawn(async move {
+            // This one-shot race needs no fairness. If both signals are ready,
+            // deterministically prefer shutdown over foreground cancellation.
+            let shutting_down = {
+                let shutdown = std::pin::pin!(shutdown.cancelled());
+                let foreground = std::pin::pin!(async {
+                    if let Some(cancellation) = foreground_cancellation {
+                        cancellation.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                });
+                match select(shutdown, foreground).await {
+                    Either::Left(((), _pending)) => true,
+                    Either::Right(((), _pending)) => false,
+                }
+            };
+            if shutting_down {
+                relay_jobs.cancel_registration(&relay_call_id.0, Some(&registration));
+            } else {
+                relay_jobs.propagate_foreground_cancellation(&relay_call_id, &registration);
             }
-            let manual_detach = jobs.pending_detaches.remove(call_id);
-            let detached = background || manual_detach;
-            if !detached
-                && foreground_cancellation
-                    .as_ref()
-                    .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
-            {
-                controller.interrupt();
-            }
-            jobs.running.insert(
-                call_id.clone(),
-                BackgroundJob {
-                    controller,
-                    foreground_cancellation: foreground_cancellation.clone(),
-                    cancellation_relay: None,
-                    detached,
-                    manual_detach,
-                    terminal_published: false,
-                },
-            );
-            if detached {
-                jobs.background_started = jobs.background_started.wrapping_add(1);
-            }
-            self.background_jobs.changed(&mut jobs);
+        })
+        .abort_handle();
+        let mut jobs = self.background_jobs.lock_jobs();
+        // This guard is the sole removal owner and has not yet left this function.
+        let old_relay = jobs
+            .running
+            .get_mut(call_id)
+            .map(|job| job.cancellation_relay.replace(relay.clone()));
+        drop(jobs);
+        match old_relay {
+            Some(Some(old_relay)) => old_relay.abort(),
+            None => relay.abort(),
+            Some(None) => {}
         }
-        if let Some(cancellation) = foreground_cancellation {
-            let jobs = self.background_jobs.clone();
-            let relay_call_id = call_id.clone();
-            let relay = tokio::spawn(async move {
-                cancellation.cancelled().await;
-                jobs.propagate_foreground_cancellation(&relay_call_id);
-            })
-            .abort_handle();
-            if let Ok(mut jobs) = self.background_jobs.state.lock()
-                && let Some(job) = jobs.running.get_mut(call_id)
-            {
-                job.cancellation_relay = Some(relay);
-            }
-        }
-        BackgroundJobGuard {
-            jobs: self.background_jobs.clone(),
-            call_id: call_id.clone(),
-        }
+        Ok(guard)
     }
 }
 
@@ -2157,18 +2756,27 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
         .and_then(Value::as_object_mut)
     {
         properties.insert(
+            "intent".into(),
+            Value::Object(Map::from_iter([
+                ("type".into(), Value::String("string".into())),
+                ("description".into(), Value::String("A brief user-facing status sentence, preferably 3–10 words. Start with an -ing verb; omit first-person language, rationale, and implementation details.".into())),
+            ])),
+        );
+        properties.insert(
             "background".into(),
-            json!({
-                "description": "Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.",
-                "oneOf": [
-                    { "type": "boolean" },
-                    {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_BACKGROUND_AFTER_SECONDS
-                    }
-                ]
-            }),
+            Value::Object(Map::from_iter([
+                ("description".into(), Value::String("Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.".into())),
+                ("oneOf".into(), Value::Array(vec![
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::String("boolean".into())),
+                    ])),
+                    Value::Object(Map::from_iter([
+                        ("type".into(), Value::String("integer".into())),
+                        ("minimum".into(), Value::Number(1.into())),
+                        ("maximum".into(), Value::Number(MAX_BACKGROUND_AFTER_SECONDS.into())),
+                    ])),
+                ])),
+            ])),
         );
     }
     spec
@@ -2257,15 +2865,101 @@ impl ComposeBackend for HiddenRunletBackend {
     }
 }
 
+async fn refresh_workspace_context(
+    transcript: &mut Vec<Item>,
+    additional_directories: &[PathBuf],
+) -> Result<bool, String> {
+    if additional_directories.is_empty()
+        && !transcript
+            .iter()
+            .any(|item| item.metadata.contains_key("acp.additional_directories"))
+    {
+        return Ok(false);
+    }
+    let mut additions = Vec::new();
+    for root in additional_directories {
+        let context = load_initial_transcript(root, String::new()).await?;
+        for mut item in context.into_iter().skip(1) {
+            let path = item.metadata.get("agentkit.context.path");
+            if transcript
+                .iter()
+                .filter(|item| {
+                    item.metadata.get("acp.workspace_context") != Some(&Value::Bool(true))
+                })
+                .chain(&additions)
+                .any(|existing: &Item| {
+                    path.is_some() && existing.metadata.get("agentkit.context.path") == path
+                })
+            {
+                continue;
+            }
+            item.metadata
+                .insert("acp.workspace_context".into(), Value::Bool(true));
+            additions.push(item);
+        }
+    }
+    let directories =
+        serde_json::to_value(additional_directories).map_err(|error| error.to_string())?;
+    let mut context = Item::text(
+        ItemKind::Context,
+        format!(
+            "[Session workspace]\nAdditional project directories: {directories}. These are project context, not filesystem access boundaries. The primary cwd is unchanged."
+        ),
+    );
+    context
+        .metadata
+        .insert("acp.additional_directories".into(), directories);
+    context
+        .metadata
+        .insert("acp.workspace_context".into(), Value::Bool(true));
+    transcript
+        .retain(|item| item.metadata.get("acp.workspace_context") != Some(&Value::Bool(true)));
+    transcript.push(context);
+    transcript.extend(additions);
+    Ok(true)
+}
+
 async fn load_initial_transcript(root: &Path, system_prompt: String) -> Result<Vec<Item>, String> {
-    let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
-    let context = ContextLoader::new()
-        .with_source(AgentsMd::discover_all(root))
-        .load()
-        .await
-        .map_err(|error| format!("could not load AGENTS.md context: {error}"))?;
-    transcript.extend(context);
-    Ok(transcript)
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut transcript = vec![Item::text(ItemKind::System, system_prompt)];
+        // Preserve agentkit-context's outermost-to-innermost ordering and item
+        // metadata, while reading through the same view as other internal IO.
+        let ancestors = root.ancestors().collect::<Vec<_>>();
+        for directory in ancestors.into_iter().rev() {
+            let path = directory.join("AGENTS.md");
+            let body = match crate::config_files::read_to_string(&path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not load AGENTS.md context: could not read {}: {error}",
+                        path.display()
+                    ));
+                }
+            };
+            let mut item = Item::text(
+                ItemKind::Context,
+                format!(
+                    "[Loaded AGENTS]\nPath: {}\n\n{}",
+                    path.display(),
+                    body.trim_end()
+                ),
+            );
+            item.metadata.insert(
+                "agentkit.context.source".into(),
+                Value::String("agents_md".into()),
+            );
+            item.metadata.insert(
+                "agentkit.context.path".into(),
+                Value::String(path.display().to_string()),
+            );
+            transcript.push(item);
+        }
+        Ok(transcript)
+    })
+    .await
+    .map_err(|error| format!("could not load AGENTS.md context: {error}"))?
 }
 
 fn record_runtime_failure(
@@ -2300,13 +2994,28 @@ fn record_loop_failure(
 }
 
 async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
+    drive_with_tasks(driver, None).await
+}
+
+async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
+    driver: &mut LoopDriver<S>,
+    tasks: Option<&TaskManagerHandle>,
+) -> Result<String, LoopError> {
+    let mut output = String::new();
     loop {
+        // Read running state BEFORE probing the loop: completion publishes its
+        // loop update atomically with clearing running. The probe therefore
+        // cannot miss the last completion and mistake it for quiescence.
+        let running = match tasks {
+            Some(tasks) => !tasks.list_running().await.is_empty(),
+            None => false,
+        };
         match driver.next().await? {
             LoopStep::Finished(result) => {
                 if result.finish_reason == FinishReason::Cancelled {
                     return Err(LoopError::Cancelled);
                 }
-                return Ok(result
+                output = result
                     .items
                     .iter()
                     .flat_map(|item| &item.parts)
@@ -2315,7 +3024,22 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
                         _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join(""));
+                    .join("");
+                if tasks.is_none() {
+                    return Ok(output);
+                }
+            }
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) if tasks.is_some() => {
+                if !running {
+                    return Ok(output);
+                }
+                if let Some(tasks) = tasks {
+                    // Events are queued during model turns, including failure
+                    // and cancellation; no check-to-wait notification is lost.
+                    if tasks.next_event().await.is_none() {
+                        return Err(LoopError::InvalidState("task event stream closed".into()));
+                    }
+                }
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(_) => {
@@ -2326,3 +3050,212 @@ async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, Loo
         }
     }
 }
+
+/// Relays process shutdown into agentkit's generation-based cancellation.
+pub(crate) struct StorageCancellationBridge(tokio::task::JoinHandle<()>);
+
+impl StorageCancellationBridge {
+    pub(crate) fn new(
+        controller: CancellationController,
+        external: Option<CancellationHandle>,
+    ) -> Self {
+        let shutdown = crate::resilient_fs::shutdown_token().child_token();
+        let external = external.map(|handle| handle.checkpoint());
+        Self(tokio::spawn(async move {
+            {
+                // Both handlers are identical and this race runs only once:
+                // deterministic shutdown-first ties need no fairness rotation.
+                let shutdown = std::pin::pin!(shutdown.cancelled());
+                let external = std::pin::pin!(async {
+                    if let Some(external) = external {
+                        external.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                });
+                match select(shutdown, external).await {
+                    Either::Left(((), _pending)) => {}
+                    Either::Right(((), _pending)) => {}
+                }
+            }
+            // A generation snapshot can be created during async startup after
+            // the first interrupt. Keep shutdown asserted until the owner closes.
+            loop {
+                controller.interrupt();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }))
+    }
+}
+
+impl Drop for StorageCancellationBridge {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+mod additional_directory_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workspace_context_refreshes_roots_and_deduplicates_instructions() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = root.path().join("extra");
+        let nested = extra.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "primary instructions").unwrap();
+        std::fs::write(extra.join("AGENTS.md"), "extra instructions").unwrap();
+        let mut transcript = load_initial_transcript(root.path(), "system".into())
+            .await
+            .unwrap();
+        let initial = transcript.clone();
+        assert!(
+            !refresh_workspace_context(&mut transcript, &[])
+                .await
+                .unwrap()
+        );
+        refresh_workspace_context(&mut transcript, &[extra.clone(), nested])
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|item| item.metadata.get("agentkit.context.path")
+                    == Some(&Value::String(
+                        extra.join("AGENTS.md").display().to_string()
+                    )))
+                .count(),
+            1
+        );
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|item| item.metadata.get("agentkit.context.path")
+                    == Some(&Value::String(
+                        root.path().join("AGENTS.md").display().to_string()
+                    )))
+                .count(),
+            1
+        );
+        refresh_workspace_context(&mut transcript, &[])
+            .await
+            .unwrap();
+        assert_eq!(transcript.len(), initial.len() + 1);
+        assert_eq!(
+            transcript.last().unwrap().metadata["acp.additional_directories"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_resume_workspace_is_persisted_only_when_claim_commits() {
+        #[derive(Clone)]
+        struct Observer;
+        impl LoopObserver for Observer {
+            fn handle_event(&self, _event: agentkit_loop::ObservedEvent) {}
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::CredentialStorage::Memory;
+        crate::provider::store_openrouter_test_credentials(&credentials);
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            credentials,
+        )
+        .unwrap();
+        let id = crate::session::new_id();
+        let mut original = vec![Item::text(ItemKind::System, "system")];
+        refresh_workspace_context(&mut original, &[extra.path().to_path_buf()])
+            .await
+            .unwrap();
+        let saved = crate::session::open(root.path(), &id, false, false, original.clone()).unwrap();
+        drop(saved);
+        for commit in [false, true] {
+            let mut claim = runtime.claim_session_load(&id).unwrap();
+            let driver = runtime
+                .start_acp_driver_with_mcp(
+                    AcpDriverContext {
+                        cwd: root.path().to_path_buf(),
+                        additional_directories: vec![],
+                        integration: Arc::new(Observer),
+                        cancellation: CancellationController::new().handle(),
+                        response_attempt_replacement: false,
+                    },
+                    &mut claim,
+                    None,
+                    runtime.mcp.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                driver.canonical_transcript.last().unwrap().metadata["acp.additional_directories"],
+                serde_json::json!([])
+            );
+            if commit {
+                claim.commit().unwrap();
+            } else {
+                drop(claim);
+            }
+            drop(driver);
+            let persisted = crate::session::load(root.path(), &id).unwrap();
+            let expected = if commit {
+                serde_json::json!([])
+            } else {
+                serde_json::json!([extra.path()])
+            };
+            assert_eq!(
+                persisted.last().unwrap().metadata["acp.additional_directories"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn additional_roots_validate_and_normalize_without_changing_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new_with_provider_and_credentials(
+            root.path(),
+            "test-model",
+            ProviderKind::OpenRouter,
+            crate::credentials::CredentialStorage::Memory,
+        )
+        .unwrap();
+        let extra_path = crate::resilient_fs::canonicalize(extra.path()).unwrap();
+        assert_eq!(
+            runtime
+                .additional_directories(&[
+                    extra.path().to_path_buf(),
+                    extra_path.clone(),
+                    root.path().to_path_buf()
+                ])
+                .unwrap(),
+            vec![extra_path]
+        );
+        assert!(
+            runtime
+                .additional_directories(&[PathBuf::from("relative")])
+                .is_err()
+        );
+        assert!(
+            runtime
+                .additional_directories(&[root.path().join("missing")])
+                .is_err()
+        );
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        assert!(runtime.additional_directories(&[file]).is_err());
+        assert_eq!(
+            runtime.root(),
+            crate::resilient_fs::canonicalize(root.path()).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests;
