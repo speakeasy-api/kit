@@ -1,5 +1,6 @@
 mod adapter;
 mod cerebras;
+mod cerebras_auth;
 pub mod chatgpt;
 mod openai_auth;
 mod openrouter_auth;
@@ -9,6 +10,39 @@ pub use adapter::{
     KitAdapter, KitSession, ModelGroup, ModelSelection, ProviderKind, ReasoningEffort,
     SelectableAdapter, SelectableSession, model_catalog,
 };
+
+/// An Cerebras API key that is redacted in diagnostics and zeroized on drop.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct CerebrasApiKey(String);
+
+impl CerebrasApiKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn non_empty(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        (!value.is_empty()).then(|| Self::new(value))
+    }
+}
+
+impl std::str::FromStr for CerebrasApiKey {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::non_empty(value.to_owned()).ok_or("Cerebras API key cannot be empty")
+    }
+}
+
+impl std::fmt::Debug for CerebrasApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CerebrasApiKey([REDACTED])")
+    }
+}
 
 /// An OpenRouter API key that is redacted in diagnostics and zeroized on drop.
 #[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
@@ -159,4 +193,46 @@ pub fn execute_speakeasy_auth(
         }
     };
     speakeasy_auth::execute(command, storage, timeout)
+}
+
+/// Origin of an explicitly supplied Cerebras API key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CerebrasApiKeySource {
+    Flag,
+    Environment,
+}
+
+impl CerebrasApiKeySource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Flag => "--cerebras-api-key",
+            Self::Environment => "CEREBRAS_API_KEY",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CerebrasAuthCommand {
+    Login,
+    Status,
+    Logout { local_only: bool },
+}
+
+/// Load the stored Cerebras key without consulting process environment variables.
+pub fn cerebras_api_key(
+    storage: &crate::credentials::CredentialStorage,
+) -> Result<Option<CerebrasApiKey>, String> {
+    cerebras_auth::load(storage)
+}
+
+/// Manage a stored key. Login requires an explicitly supplied key; it does not
+/// perform remote validation. Logout removes only the local credential.
+#[doc(hidden)]
+pub fn execute_cerebras_auth(
+    command: CerebrasAuthCommand,
+    storage: &crate::credentials::CredentialStorage,
+    active_key: Option<(&CerebrasApiKey, CerebrasApiKeySource)>,
+) -> Result<String, String> {
+    cerebras_auth::execute(command, storage, active_key)
 }

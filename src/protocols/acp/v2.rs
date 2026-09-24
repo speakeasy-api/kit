@@ -1493,6 +1493,7 @@ fn v2_config_options(
                 crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
+                crate::ProviderKind::Cerebras => "Cerebras",
             };
             let options = group
                 .models

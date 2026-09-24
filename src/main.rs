@@ -17,6 +17,8 @@ struct Cli {
     telemetry: TelemetryArgs,
     #[command(flatten)]
     openrouter: OpenRouterArgs,
+    #[command(flatten)]
+    cerebras: CerebrasArgs,
     #[command(subcommand)]
     command: Command,
 }
@@ -44,6 +46,30 @@ fn resolve_openrouter_api_key(
             env(OPENROUTER_API_KEY_ENV)
                 .and_then(kit::provider::OpenRouterApiKey::non_empty)
                 .map(|key| (key, kit::provider::OpenRouterApiKeySource::Environment))
+        })
+}
+
+const CEREBRAS_API_KEY_ENV: &str = "CEREBRAS_API_KEY";
+
+#[derive(Args)]
+struct CerebrasArgs {
+    /// Cerebras API key (prefer the environment or stored credentials to keep it out of argv).
+    #[arg(long, global = true, value_name = "KEY")]
+    cerebras_api_key: Option<kit::provider::CerebrasApiKey>,
+}
+
+fn resolve_cerebras_api_key(
+    cli: Option<kit::provider::CerebrasApiKey>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<(
+    kit::provider::CerebrasApiKey,
+    kit::provider::CerebrasApiKeySource,
+)> {
+    cli.map(|key| (key, kit::provider::CerebrasApiKeySource::Flag))
+        .or_else(|| {
+            env(CEREBRAS_API_KEY_ENV)
+                .and_then(kit::provider::CerebrasApiKey::non_empty)
+                .map(|key| (key, kit::provider::CerebrasApiKeySource::Environment))
         })
 }
 
@@ -435,6 +461,7 @@ enum AcpProtocolVersion {
 enum AuthProvider {
     Openai,
     Openrouter,
+    Cerebras,
     Speakeasy,
 }
 
@@ -703,8 +730,13 @@ async fn execute_auth(
         kit::provider::OpenRouterApiKey,
         kit::provider::OpenRouterApiKeySource,
     )>,
+    cerebras_api_key: Option<(
+        kit::provider::CerebrasApiKey,
+        kit::provider::CerebrasApiKeySource,
+    )>,
 ) -> Result<(), io::Error> {
     enum Execution {
+        Cerebras(kit::provider::CerebrasAuthCommand),
         OpenAi(kit::provider::OpenAiAuthCommand),
         OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
@@ -712,6 +744,9 @@ async fn execute_auth(
     let command = match action {
         AuthAction::Login { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Login),
+            AuthProvider::Cerebras => {
+                Execution::Cerebras(kit::provider::CerebrasAuthCommand::Login)
+            }
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Login)
             }
@@ -721,6 +756,9 @@ async fn execute_auth(
         },
         AuthAction::Status { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
+            AuthProvider::Cerebras => {
+                Execution::Cerebras(kit::provider::CerebrasAuthCommand::Status)
+            }
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Status)
             }
@@ -735,6 +773,11 @@ async fn execute_auth(
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Logout {
                 local_only: *local_only,
             }),
+            AuthProvider::Cerebras => {
+                Execution::Cerebras(kit::provider::CerebrasAuthCommand::Logout {
+                    local_only: *local_only,
+                })
+            }
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Logout {
                     local_only: *local_only,
@@ -748,6 +791,13 @@ async fn execute_auth(
         },
     };
     let output = tokio::task::spawn_blocking(move || match command {
+        Execution::Cerebras(command) => kit::provider::execute_cerebras_auth(
+            command,
+            &storage,
+            cerebras_api_key
+                .as_ref()
+                .map(|(key, source)| (key, *source)),
+        ),
         Execution::OpenAi(command) => kit::provider::execute_openai_auth(command, &storage),
         Execution::OpenRouter(command) => kit::provider::execute_openrouter_auth(
             command,
@@ -869,7 +919,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(&cli.command, Command::Init) {
         init_default_config()?;
         println!(
-            "Kit {}\n\nlog in with your OpenAI, OpenRouter, or Speakeasy account, or set OPENROUTER_API_KEY to get started",
+            "Kit {}\n\nlog in with your OpenAI, OpenRouter, Cerebras, or Speakeasy account, or set OPENROUTER_API_KEY or CEREBRAS_API_KEY to get started",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(());
@@ -899,6 +949,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resolve_openrouter_api_key(cli.openrouter.openrouter_api_key.clone(), |name| {
             env::var(name).ok()
         });
+    let cerebras_api_key =
+        resolve_cerebras_api_key(cli.cerebras.cerebras_api_key.clone(), |name| {
+            env::var(name).ok()
+        });
     let telemetry_settings = config.telemetry_settings(
         &cli.telemetry,
         env::var(OTEL_ENDPOINT_ENV).ok(),
@@ -912,14 +966,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let storage = credentials.storage(&config)?;
         validate_auth_storage(action, &storage)?;
-        execute_auth(action, storage, openrouter_api_key.clone()).await?;
+        execute_auth(
+            action,
+            storage,
+            openrouter_api_key.clone(),
+            cerebras_api_key.clone(),
+        )
+        .await?;
         return Ok(());
     }
     if let Some((provider, credentials)) = cli.command.terminal_auth_login() {
         let action = AuthAction::Login { provider };
         let storage = credentials.storage(&config)?;
         validate_auth_storage(&action, &storage)?;
-        execute_auth(&action, storage, openrouter_api_key.clone()).await?;
+        execute_auth(
+            &action,
+            storage,
+            openrouter_api_key.clone(),
+            cerebras_api_key.clone(),
+        )
+        .await?;
         return Ok(());
     }
     match cli.command {
@@ -952,24 +1018,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.plugin_runtime(&root).await?;
             let runtime = match session_id {
-                Some(id) => {
-                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
-                        &root,
-                        model,
-                        provider,
-                        kit::runtime::SessionRequest { id, resume, force },
-                        credential_storage.clone(),
-                        reasoning_effort,
-                        openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    )?
-                }
-                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+                Some(id) => kit::Runtime::with_session_provider_credentials_effort_and_api_keys(
+                    &root,
+                    model,
+                    provider,
+                    kit::runtime::SessionRequest { id, resume, force },
+                    credential_storage.clone(),
+                    reasoning_effort,
+                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
+                )?,
+                None => kit::Runtime::new_with_provider_credentials_effort_and_api_keys(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
@@ -1041,24 +1107,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.plugin_runtime(&root).await?;
             let runtime = match session_id {
-                Some(id) => {
-                    kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
-                        &root,
-                        model,
-                        provider,
-                        kit::runtime::SessionRequest { id, resume, force },
-                        credential_storage.clone(),
-                        reasoning_effort,
-                        openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                    )?
-                }
-                None => kit::Runtime::new_with_provider_credentials_effort_and_openrouter_key(
+                Some(id) => kit::Runtime::with_session_provider_credentials_effort_and_api_keys(
+                    &root,
+                    model,
+                    provider,
+                    kit::runtime::SessionRequest { id, resume, force },
+                    credential_storage.clone(),
+                    reasoning_effort,
+                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
+                )?,
+                None => kit::Runtime::new_with_provider_credentials_effort_and_api_keys(
                     &root,
                     model,
                     provider,
                     credential_storage.clone(),
                     reasoning_effort,
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                    cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?,
             };
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
@@ -1113,20 +1179,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (configured_mcp, explicit_mcp) = mcp.config_paths(&config)?;
             let plugins = config.plugin_runtime(&root).await?;
             let session_id = resume.clone().unwrap_or_else(kit::session::new_id);
-            let runtime =
-                kit::Runtime::with_session_provider_credentials_effort_and_openrouter_key(
-                    &root,
-                    model,
-                    provider,
-                    kit::runtime::SessionRequest {
-                        id: session_id.clone(),
-                        resume: resume.is_some(),
-                        force,
-                    },
-                    credential_storage.clone(),
-                    reasoning_effort,
-                    openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
-                )?;
+            let runtime = kit::Runtime::with_session_provider_credentials_effort_and_api_keys(
+                &root,
+                model,
+                provider,
+                kit::runtime::SessionRequest {
+                    id: session_id.clone(),
+                    resume: resume.is_some(),
+                    force,
+                },
+                credential_storage.clone(),
+                reasoning_effort,
+                openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
+                cerebras_api_key.as_ref().map(|(key, _)| key.clone()),
+            )?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -1176,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let credential_storage = mcp.credentials.storage(&config)?;
             let (_, explicit_mcp) = mcp.config_paths(&config)?;
             let _ = config.plugin_runtime(&root).await?;
-            kit::tui::run_with_reasoning_effort_and_openrouter_key(
+            kit::tui::run_with_reasoning_effort_and_api_keys(
                 &root,
                 &model,
                 provider,
@@ -1186,6 +1252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &credential_storage,
                 &telemetry_settings,
                 openrouter_api_key.as_ref().map(|(key, _)| key),
+                cerebras_api_key.as_ref().map(|(key, _)| key),
                 resume.as_deref(),
                 force,
             )
@@ -1825,6 +1892,66 @@ future_option = true
     }
 
     #[test]
+    fn cerebras_provider_config_has_no_persisted_secret() {
+        let config: Config = toml::from_str(
+            "provider = 'cerebras'\nmodel = 'gpt-oss-120b'\ncerebras_api_key = 'ignored-secret'\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider(None), kit::ProviderKind::Cerebras);
+        assert_eq!(config.model(None), "gpt-oss-120b");
+        assert!(!format!("{config:?}").contains("ignored-secret"));
+        let resolved = super::resolve_cerebras_api_key(None, |name| {
+            assert_eq!(name, "CEREBRAS_API_KEY");
+            Some("environment-secret".into())
+        })
+        .unwrap();
+        assert_eq!(resolved.0.as_str(), "environment-secret");
+        assert_eq!(resolved.1, kit::provider::CerebrasApiKeySource::Environment);
+    }
+
+    #[test]
+    fn cerebras_key_is_global_redacted_and_uses_cli_then_environment_precedence() {
+        let cli = Cli::try_parse_from([
+            "kit",
+            "prompt",
+            "hello",
+            "--cerebras-api-key",
+            "flag-secret",
+        ])
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", cli.cerebras.cerebras_api_key),
+            "Some(CerebrasApiKey([REDACTED]))"
+        );
+        let (key, source) = super::resolve_cerebras_api_key(cli.cerebras.cerebras_api_key, |_| {
+            Some("environment-secret".into())
+        })
+        .unwrap();
+        assert_eq!(key.as_str(), "flag-secret");
+        assert_eq!(source, kit::provider::CerebrasApiKeySource::Flag);
+
+        assert!(
+            Cli::try_parse_from(["kit", "prompt", "hello", "--cerebras-api-key", "",]).is_err()
+        );
+        assert!(super::resolve_cerebras_api_key(None, |_| Some(String::new())).is_none());
+
+        for command in ["serve", "acp", "tui"] {
+            assert!(Cli::try_parse_from(["kit", command, "--cerebras-api-key", "secret"]).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "auth",
+                "status",
+                "cerebras",
+                "--cerebras-api-key",
+                "secret",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn init_writes_recommended_global_config() {
         let home = tempfile::tempdir().unwrap();
         let path = init_config(home.path()).unwrap();
@@ -1894,6 +2021,7 @@ future_option = true
         for provider in [
             AuthProvider::Openai,
             AuthProvider::Openrouter,
+            AuthProvider::Cerebras,
             AuthProvider::Speakeasy,
         ] {
             let login = AuthAction::Login { provider };

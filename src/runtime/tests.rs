@@ -263,6 +263,134 @@ fn explicit_openrouter_key_reaches_runtime_adapter_and_kit_children() {
 }
 
 #[test]
+fn explicit_cerebras_key_reaches_runtime_adapter_and_kit_children() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new_with_provider_credentials_effort_and_api_keys(
+        root.path(),
+        "test-model",
+        crate::ProviderKind::Cerebras,
+        crate::credentials::CredentialStorage::Memory,
+        None,
+        Some(crate::provider::OpenRouterApiKey::new(
+            "separate-openrouter-secret",
+        )),
+        Some(crate::provider::CerebrasApiKey::new("runtime-secret")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        runtime.cerebras_api_key.as_ref().map(|key| key.as_str()),
+        Some("runtime-secret")
+    );
+    assert_eq!(
+        runtime
+            .subagents
+            .child_config()
+            .cerebras_api_key
+            .as_ref()
+            .map(|key| key.as_str()),
+        Some("runtime-secret")
+    );
+    runtime
+        .adapter
+        .select(crate::provider::ModelSelection::new(
+            crate::ProviderKind::Cerebras,
+            "next/model",
+        ))
+        .unwrap();
+    let debug = format!("{:?}", runtime.cerebras_api_key);
+    assert!(debug.contains("[REDACTED]"));
+    assert!(!debug.contains("runtime-secret"));
+}
+
+#[test]
+fn stored_memory_cerebras_key_reaches_children_with_explicit_and_env_precedence() {
+    use crate::provider::{CerebrasApiKey, CerebrasApiKeySource, CerebrasAuthCommand};
+    let storage = crate::credentials::CredentialStorage::Memory;
+    let stored = CerebrasApiKey::new("stored-memory-cerebras-secret");
+    crate::provider::execute_cerebras_auth(
+        CerebrasAuthCommand::Login,
+        &storage,
+        Some((&stored, CerebrasApiKeySource::Flag)),
+    )
+    .unwrap();
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = crate::provider::execute_cerebras_auth(
+                CerebrasAuthCommand::Logout { local_only: true },
+                &crate::credentials::CredentialStorage::Memory,
+                None,
+            );
+        }
+    }
+    let _cleanup = Cleanup;
+    // Inject the environment to test stored-only resolution without mutating
+    // process-global environment or relying on the developer's credentials.
+    let resolved = super::resolve_cerebras_child_key(None, &storage, || None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.as_str(), stored.as_str());
+    let environment =
+        super::resolve_cerebras_child_key(None, &storage, || Some("environment-secret".into()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(environment.as_str(), "environment-secret");
+    let explicit = super::resolve_cerebras_child_key(
+        Some(CerebrasApiKey::new("explicit-secret")),
+        &storage,
+        || panic!("explicit key must win"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(explicit.as_str(), "explicit-secret");
+    let blank_env = super::resolve_cerebras_child_key(None, &storage, || Some(" ".into()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(blank_env.as_str(), stored.as_str());
+
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new_with_provider_and_credentials(
+        root.path(),
+        "gpt-oss-120b",
+        crate::ProviderKind::Cerebras,
+        storage,
+    )
+    .unwrap();
+    let child = runtime.subagents.child_config();
+    let key = child
+        .cerebras_api_key
+        .as_ref()
+        .expect("memory credentials must reach children");
+    let expected = std::env::var("CEREBRAS_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .map(CerebrasApiKey::new)
+        .unwrap_or(stored);
+    assert!(key.as_str() == expected.as_str());
+    assert!(child.openrouter_api_key.is_none());
+    let command = crate::acp_child::serve_command(
+        &child.root,
+        &child.model,
+        child.provider,
+        child.reasoning_effort,
+        child.openrouter_api_key.as_ref(),
+        child.cerebras_api_key.as_ref(),
+        "memory-test",
+        false,
+    )
+    .unwrap();
+    assert!(
+        command
+            .as_std()
+            .get_envs()
+            .any(|(name, value)| name == "CEREBRAS_API_KEY"
+                && value == Some(std::ffi::OsStr::new(key.as_str())))
+    );
+    assert!(command.as_std().get_args().all(|arg| arg != key.as_str()));
+}
+
+#[test]
 fn configured_session_is_consumed_only_after_successful_start() {
     let request = SessionRequest {
         id: "selected".into(),

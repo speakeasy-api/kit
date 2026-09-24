@@ -18,7 +18,7 @@ A version can be pinned with a mise package such as `github:speakeasy-api/kit@0.
 
 ## Choose a provider and authenticate
 
-Kit supports `openai-subscription`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
+Kit supports `openai-subscription`, `openrouter`, `cerebras`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
 
 ### ChatGPT subscription with native OpenAI login
 
@@ -50,6 +50,16 @@ Use `kit auth status openai` to check the credential.
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
 skips revocation and prints a warning.
+
+### Cerebras API key and model
+
+Set `CEREBRAS_API_KEY` through your secret manager or shell, then select the dedicated provider:
+
+```sh
+kit prompt --provider cerebras --model qwen-3.8-27b 'Explain this repository'
+```
+
+Cerebras uses its own credentials and endpoint; OpenRouter environment overrides do not apply. Select a Cerebras model explicitly when changing providers. See [Cerebras](cerebras.md) for stored-key authentication, supported models, request options, and context limits.
 
 ### OpenRouter API key and model
 
@@ -153,7 +163,7 @@ A representative configuration is:
 
 ```toml
 root = "/path/to/project"
-provider = "openai-subscription" # or "openrouter" or "speakeasy"
+provider = "openai-subscription" # or "openrouter", "cerebras", or "speakeasy"
 model = "gpt-5.4"
 reasoning_effort = "medium" # low, medium, or high
 a2a = "127.0.0.1:7331"
@@ -274,7 +284,7 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 
 ## Troubleshoot startup and configuration
 
-- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
+- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `openrouter`, `cerebras`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
 - **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.

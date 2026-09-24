@@ -284,6 +284,7 @@ pub struct Runtime {
     reasoning_effort: Option<crate::provider::ReasoningEffort>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+    cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
     telemetry: crate::telemetry::Settings,
     max_subagent_depth: usize,
     base_depth: usize,
@@ -297,6 +298,23 @@ pub struct Runtime {
     skills: Arc<SkillRegistry>,
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
+}
+
+// A child process cannot access its parent's in-memory credential store. Resolve
+// only that backend here, retaining provider-specific flag > environment > stored
+// precedence, so built-in children can inherit the same key through their env.
+fn resolve_cerebras_child_key(
+    explicit: Option<crate::provider::CerebrasApiKey>,
+    storage: &crate::credentials::CredentialStorage,
+    env: impl FnOnce() -> Option<String>,
+) -> Result<Option<crate::provider::CerebrasApiKey>, String> {
+    if explicit.is_some() || !matches!(storage, crate::credentials::CredentialStorage::Memory) {
+        return Ok(explicit);
+    }
+    if let Some(key) = env().filter(|key| !key.trim().is_empty()) {
+        return Ok(Some(crate::provider::CerebrasApiKey::new(key)));
+    }
+    crate::provider::cerebras_api_key(storage)
 }
 
 impl Runtime {
@@ -353,6 +371,27 @@ impl Runtime {
         reasoning_effort: Option<crate::provider::ReasoningEffort>,
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ) -> Result<Arc<Self>, String> {
+        Self::new_with_provider_credentials_effort_and_api_keys(
+            root,
+            model,
+            provider,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_provider_credentials_effort_and_api_keys(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<crate::provider::ReasoningEffort>,
+        openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+        cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
+    ) -> Result<Arc<Self>, String> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -365,12 +404,17 @@ impl Runtime {
         }
         let skills = build_skill_tools(&root, &[], &[]);
         let model = model.into();
-        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+        let cerebras_api_key =
+            resolve_cerebras_child_key(cerebras_api_key, &credential_storage, || {
+                std::env::var("CEREBRAS_API_KEY").ok()
+            })?;
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
             provider,
             model.clone(),
             credential_storage.clone(),
             reasoning_effort,
             openrouter_api_key.clone(),
+            cerebras_api_key.clone(),
         )?;
         let max_subagent_depth = 2;
         let subagents = Subagents::new(
@@ -380,6 +424,7 @@ impl Runtime {
                 provider,
                 reasoning_effort,
                 openrouter_api_key: openrouter_api_key.clone(),
+                cerebras_api_key: cerebras_api_key.clone(),
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: true,
@@ -401,6 +446,7 @@ impl Runtime {
             reasoning_effort,
             credential_storage,
             openrouter_api_key,
+            cerebras_api_key,
             telemetry: Default::default(),
             max_subagent_depth,
             base_depth: 0,
@@ -486,16 +532,39 @@ impl Runtime {
         reasoning_effort: Option<crate::provider::ReasoningEffort>,
         openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ) -> Result<Arc<Self>, String> {
-        let mut runtime = Arc::try_unwrap(
-            Self::new_with_provider_credentials_effort_and_openrouter_key(
-                root,
-                model,
-                provider,
-                credential_storage,
-                reasoning_effort,
-                openrouter_api_key,
-            )?,
+        Self::with_session_provider_credentials_effort_and_api_keys(
+            root,
+            model,
+            provider,
+            session,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            None,
         )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_session_provider_credentials_effort_and_api_keys(
+        root: impl AsRef<Path>,
+        model: impl Into<String>,
+        provider: ProviderKind,
+        session: SessionRequest,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<crate::provider::ReasoningEffort>,
+        openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+        cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(Self::new_with_provider_credentials_effort_and_api_keys(
+            root,
+            model,
+            provider,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            cerebras_api_key,
+        )?)
         .map_err(|_| "could not configure runtime session".to_string())?;
         runtime
             .session
@@ -769,6 +838,7 @@ impl Runtime {
                 provider: runtime.provider,
                 reasoning_effort: runtime.reasoning_effort,
                 openrouter_api_key: runtime.openrouter_api_key.clone(),
+                cerebras_api_key: runtime.cerebras_api_key.clone(),
                 configured_mcp_config: install.configured_path,
                 configured_mcp_config_inherited: install.configured_inherited,
                 legacy_mcp_config: install.legacy,
@@ -1247,12 +1317,13 @@ impl Runtime {
                 self.reasoning_effort,
             )
         });
-        let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
             selection.provider,
             selection.model,
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.clone(),
+            self.cerebras_api_key.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;

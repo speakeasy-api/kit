@@ -81,6 +81,11 @@ fn terminal_auth_methods(capabilities: &agentkit_acp::ClientCapabilities) -> Vec
                 .description("Authenticate Kit with OpenRouter")
                 .args(vec!["--terminal-auth-login".into(), "openrouter".into()]),
         ),
+        AuthMethod::Terminal(
+            AuthMethodTerminal::new("cerebras", "Sign in with Cerebras")
+                .description("Authenticate Kit with Cerebras")
+                .args(vec!["--terminal-auth-login".into(), "cerebras".into()]),
+        ),
     ]
 }
 
@@ -1358,6 +1363,7 @@ pub(super) fn config_options(
                 crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
+                crate::ProviderKind::Cerebras => "Cerebras",
             };
             let options = group
                 .models
@@ -2165,7 +2171,7 @@ pub(super) mod tests {
         let capabilities = agentkit_acp::ClientCapabilities::new()
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
         let methods = terminal_auth_methods(&capabilities);
-        assert_eq!(methods.len(), 2);
+        assert_eq!(methods.len(), 3);
         assert!(matches!(
             &methods[0],
             AuthMethod::Terminal(method)
@@ -2186,7 +2192,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities).len(), 2);
+        assert_eq!(terminal_auth_methods(&capabilities).len(), 3);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);
