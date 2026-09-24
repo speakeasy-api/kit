@@ -11,8 +11,8 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use agentkit_provider_openrouter::{
-    OpenRouterAdapter, OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig,
-    OpenRouterSession, OpenRouterTurn, ReasoningEffort as OpenRouterReasoningEffort,
+    OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig, OpenRouterTurn,
+    ReasoningEffort as OpenRouterReasoningEffort,
 };
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn, OpenRouterApiKey,
-    SubscriptionConfig, speakeasy_auth,
+    SubscriptionConfig, cerebras::CerebrasCompatibleOpenRouter, speakeasy_auth,
 };
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
@@ -390,7 +390,7 @@ pub enum KitAdapter {
 
 #[derive(Clone)]
 pub struct OpenRouterKitAdapter {
-    inner: OpenRouterAdapter,
+    inner: CompletionsAdapter<CerebrasCompatibleOpenRouter>,
     client: reqwest::Client,
     models_url: Option<String>,
     model: String,
@@ -513,7 +513,7 @@ impl KitAdapter {
                 )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
-                let inner = OpenRouterAdapter::new(config)
+                let inner = CompletionsAdapter::new(CerebrasCompatibleOpenRouter::from(config))
                     .map_err(|error| error.to_string())?
                     .with_resilience(agentkit_http::ResilienceConfig::default());
                 let client = reqwest::Client::builder()
@@ -723,7 +723,7 @@ pub enum KitSession {
 }
 
 pub struct OpenRouterKitSession {
-    inner: OpenRouterSession,
+    inner: CompletionsSession<CerebrasCompatibleOpenRouter>,
     context_window: Option<u64>,
 }
 
@@ -1111,7 +1111,7 @@ mod tests {
         TurnRequest,
     };
     use agentkit_provider_openrouter::{
-        OpenRouterAdapter, OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
+        OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
     };
     use serde_json::json;
 
@@ -1505,7 +1505,10 @@ mod tests {
     }
 
     async fn openrouter_session(model: &str) -> KitSession {
-        let adapter = OpenRouterAdapter::new(OpenRouterConfig::new("test-key", model)).unwrap();
+        let adapter = agentkit_adapter_completions::CompletionsAdapter::new(
+            super::CerebrasCompatibleOpenRouter::from(OpenRouterConfig::new("test-key", model)),
+        )
+        .unwrap();
         let inner = adapter
             .start_session(SessionConfig::new("provider-identity-test"))
             .await

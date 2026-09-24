@@ -1,4 +1,5 @@
 mod adapter;
+mod cerebras;
 pub mod chatgpt;
 mod openai_auth;
 mod openrouter_auth;
