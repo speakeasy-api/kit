@@ -270,6 +270,7 @@ impl AcpHarnesses {
             let mut command = Command::new(&profile.command);
             command.args(&profile.args);
             command.env_remove("OPENROUTER_API_KEY");
+            command.env_remove("CEREBRAS_API_KEY");
             command
         };
         // Every trusted profile is spawned directly (never through a shell)
@@ -340,6 +341,9 @@ impl AcpHarnesses {
         }
         config.credential_storage.append_cli_args(&mut command);
         config.telemetry.append_cli_args(&mut command);
+        if let Some(api_key) = &config.cerebras_api_key {
+            command.env("CEREBRAS_API_KEY", api_key.as_str());
+        }
         if let Some(api_key) = &config.openrouter_api_key {
             command.env("OPENROUTER_API_KEY", api_key.as_str());
         }
@@ -364,12 +368,14 @@ impl LaunchContext {
 
 /// The combined `kit serve` command used by the TUI.
 #[cfg(any(test, feature = "tui"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_command(
     root: &std::path::Path,
     model: &str,
     provider: crate::ProviderKind,
     reasoning_effort: Option<crate::ReasoningEffort>,
     openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    cerebras_api_key: Option<&crate::provider::CerebrasApiKey>,
     session_id: &str,
     resume: bool,
 ) -> std::io::Result<Command> {
@@ -397,6 +403,9 @@ pub(crate) fn serve_command(
     if resume {
         command.arg("--resume");
     }
+    if let Some(api_key) = cerebras_api_key {
+        command.env("CEREBRAS_API_KEY", api_key.as_str());
+    }
     if let Some(api_key) = openrouter_api_key {
         command.env("OPENROUTER_API_KEY", api_key.as_str());
     }
@@ -411,6 +420,7 @@ pub(crate) struct ChildConfig {
     pub provider: crate::ProviderKind,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     pub openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
+    pub cerebras_api_key: Option<crate::provider::CerebrasApiKey>,
     pub configured_mcp_config: Option<PathBuf>,
     pub configured_mcp_config_inherited: bool,
     pub legacy_mcp_config: bool,
@@ -2730,6 +2740,7 @@ mod tests {
             provider: crate::ProviderKind::OpenRouter,
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -2762,6 +2773,7 @@ mod tests {
                 crate::ProviderKind::OpenRouter,
                 None,
                 None,
+                None,
                 "session",
                 resume,
             )
@@ -2787,6 +2799,7 @@ mod tests {
             crate::ProviderKind::OpenRouter,
             Some(crate::ReasoningEffort::Medium),
             Some(&crate::provider::OpenRouterApiKey::new("tui-secret")),
+            Some(&crate::provider::CerebrasApiKey::new("tui-cerebras-secret")),
             "session",
             true,
         )
@@ -2808,10 +2821,14 @@ mod tests {
         assert!(command.as_std().get_envs().any(|(name, value)| {
             name == "OPENROUTER_API_KEY" && value == Some(std::ffi::OsStr::new("tui-secret"))
         }));
+        assert!(args.iter().all(|arg| !arg.contains("cerebras-secret")));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "CEREBRAS_API_KEY" && value == Some(std::ffi::OsStr::new("tui-cerebras-secret"))
+        }));
     }
 
     #[test]
-    fn openrouter_key_is_removed_from_external_acp_profiles() {
+    fn provider_keys_are_removed_from_external_acp_profiles() {
         let root = tempfile::tempdir().unwrap();
         let harnesses = AcpHarnesses::new(BTreeMap::from([(
             "external".into(),
@@ -2833,6 +2850,7 @@ mod tests {
                 provider: crate::ProviderKind::OpenRouter,
                 reasoning_effort: None,
                 openrouter_api_key,
+                cerebras_api_key: Some(crate::provider::CerebrasApiKey::new("external-secret")),
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
@@ -2845,6 +2863,12 @@ mod tests {
                 parent_name: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
+            assert!(
+                command
+                    .as_std()
+                    .get_envs()
+                    .any(|(name, value)| name == "CEREBRAS_API_KEY" && value.is_none())
+            );
             assert!(
                 command
                     .as_std()
@@ -3211,6 +3235,7 @@ for line in sys.stdin:
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
@@ -3297,6 +3322,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -3361,6 +3387,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -3420,6 +3447,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -3467,6 +3495,9 @@ for line in sys.stdin:
             provider: crate::ProviderKind::OpenRouter,
             reasoning_effort: Some(crate::ReasoningEffort::High),
             openrouter_api_key: Some(crate::provider::OpenRouterApiKey::new("child-secret")),
+            cerebras_api_key: Some(crate::provider::CerebrasApiKey::new(
+                "child-cerebras-secret",
+            )),
             configured_mcp_config: Some(configured_mcp.clone()),
             configured_mcp_config_inherited: true,
             legacy_mcp_config: false,
@@ -3554,6 +3585,10 @@ for line in sys.stdin:
         assert!(command.as_std().get_envs().any(|(name, value)| {
             name == "OPENROUTER_API_KEY" && value == Some(std::ffi::OsStr::new("child-secret"))
         }));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == "CEREBRAS_API_KEY"
+                && value == Some(std::ffi::OsStr::new("child-cerebras-secret"))
+        }));
 
         let mut no_configured = config.clone();
         no_configured.configured_mcp_config = None;
@@ -3608,6 +3643,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -3676,6 +3712,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -3755,6 +3792,7 @@ for line in sys.stdin:
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
@@ -3919,6 +3957,7 @@ for line in sys.stdin:
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
@@ -4240,6 +4279,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -4508,6 +4548,7 @@ for line in sys.stdin:
             provider: Default::default(),
             reasoning_effort: None,
             openrouter_api_key: None,
+            cerebras_api_key: None,
             configured_mcp_config: None,
             configured_mcp_config_inherited: false,
             legacy_mcp_config: false,
@@ -4638,6 +4679,7 @@ for line in sys.stdin:
                     provider: Default::default(),
                     reasoning_effort: None,
                     openrouter_api_key: None,
+                    cerebras_api_key: None,
                     configured_mcp_config: None,
                     configured_mcp_config_inherited: false,
                     legacy_mcp_config: false,
@@ -4779,6 +4821,7 @@ for line in sys.stdin:
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
@@ -5235,6 +5278,7 @@ for line in sys.stdin:
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,

@@ -933,6 +933,7 @@ fn agent_command_for_launch(
     provider: crate::ProviderKind,
     reasoning_effort: Option<crate::ReasoningEffort>,
     openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    cerebras_api_key: Option<&crate::provider::CerebrasApiKey>,
     a2a: Option<&str>,
     mcp_config: Option<&Path>,
     telemetry: &crate::telemetry::Settings,
@@ -947,6 +948,7 @@ fn agent_command_for_launch(
         provider,
         reasoning_effort,
         openrouter_api_key,
+        cerebras_api_key,
         session_id,
         resume,
     )?;
@@ -1363,6 +1365,43 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     voice_enabled: bool,
     stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_reasoning_effort_and_api_keys(
+        root,
+        model,
+        provider,
+        reasoning_effort,
+        a2a,
+        mcp_config,
+        credential_storage,
+        telemetry,
+        openrouter_api_key,
+        None,
+        resume,
+        force,
+        voice_enabled,
+        stop,
+    )
+    .await
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reasoning_effort_and_api_keys(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    cerebras_api_key: Option<&crate::provider::CerebrasApiKey>,
+    resume: Option<&str>,
+    force: bool,
+    voice_enabled: bool,
+    stop: &mut Stop,
+) -> Result<(), Box<dyn std::error::Error>> {
     // The agent fixes itself to the canonical root, so the client resolves it
     // up front: the header names a real directory and the ACP session opens on
     // the same path the agent accepts.
@@ -1396,6 +1435,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             provider,
             reasoning_effort,
             openrouter_api_key,
+            cerebras_api_key,
             a2a_address.as_deref(),
             mcp_config.as_deref(),
             telemetry,
@@ -4499,6 +4539,7 @@ mod tests {
             crate::ProviderKind::Speakeasy,
             None,
             None,
+            None,
             Some("127.0.0.1:0"),
             Some(&mcp_config),
             &telemetry,
@@ -4534,6 +4575,7 @@ mod tests {
             root.path(),
             "test",
             crate::ProviderKind::Speakeasy,
+            None,
             None,
             None,
             Some("127.0.0.1:0"),

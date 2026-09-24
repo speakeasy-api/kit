@@ -11,8 +11,8 @@ use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use agentkit_provider_openrouter::{
-    OpenRouterAdapter, OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig,
-    OpenRouterSession, OpenRouterTurn, ReasoningEffort as OpenRouterReasoningEffort,
+    OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig, OpenRouterTurn,
+    ReasoningEffort as OpenRouterReasoningEffort,
 };
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -21,8 +21,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn, OpenRouterApiKey,
-    SubscriptionConfig, chatgpt::SubscriptionModelCatalogCache, speakeasy_auth,
+    CerebrasApiKey, OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn,
+    OpenRouterApiKey, SubscriptionConfig, cerebras::CerebrasCompatibleOpenRouter,
+    chatgpt::SubscriptionModelCatalogCache, speakeasy_auth,
 };
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
@@ -36,6 +37,7 @@ pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
     [
         ("openai_auth_required:", "openai"),
         ("openrouter_auth_required:", "openrouter"),
+        ("cerebras_auth_required:", "cerebras"),
         ("speakeasy_auth_required:", "speakeasy"),
     ]
     .into_iter()
@@ -51,11 +53,18 @@ pub enum ProviderKind {
     OpenRouter,
     #[serde(rename = "speakeasy")]
     Speakeasy,
+    #[serde(rename = "cerebras")]
+    Cerebras,
 }
 
 impl ValueEnum for ProviderKind {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::OpenAiSubscription, Self::OpenRouter, Self::Speakeasy]
+        &[
+            Self::OpenAiSubscription,
+            Self::OpenRouter,
+            Self::Speakeasy,
+            Self::Cerebras,
+        ]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -63,6 +72,7 @@ impl ValueEnum for ProviderKind {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
             Self::Speakeasy => "speakeasy",
+            Self::Cerebras => "cerebras",
         }))
     }
 }
@@ -75,6 +85,7 @@ impl std::str::FromStr for ProviderKind {
             "openai-subscription" => Ok(Self::OpenAiSubscription),
             "openrouter" => Ok(Self::OpenRouter),
             "speakeasy" => Ok(Self::Speakeasy),
+            "cerebras" => Ok(Self::Cerebras),
             _ => Err(format!("unknown model provider {value:?}")),
         }
     }
@@ -86,6 +97,7 @@ impl ProviderKind {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
             Self::Speakeasy => "speakeasy",
+            Self::Cerebras => "cerebras",
         }
     }
 }
@@ -192,6 +204,7 @@ pub struct SelectableAdapter {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
+    cerebras_api_key: Option<CerebrasApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
 }
 
@@ -230,6 +243,24 @@ impl SelectableAdapter {
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<OpenRouterApiKey>,
     ) -> Result<Self, String> {
+        Self::new_with_credentials_effort_and_api_keys(
+            provider,
+            model,
+            credential_storage,
+            reasoning_effort,
+            openrouter_api_key,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_credentials_effort_and_api_keys(
+        provider: ProviderKind,
+        model: impl Into<String>,
+        credential_storage: crate::credentials::CredentialStorage,
+        reasoning_effort: Option<ReasoningEffort>,
+        openrouter_api_key: Option<OpenRouterApiKey>,
+        cerebras_api_key: Option<CerebrasApiKey>,
+    ) -> Result<Self, String> {
         let selection = ModelSelection::new(provider, model);
         if !valid_model_id(&selection.model) {
             return Err("model name is outside canonical bounds".into());
@@ -243,6 +274,7 @@ impl SelectableAdapter {
             })),
             credential_storage,
             openrouter_api_key,
+            cerebras_api_key,
             openai_model_catalog: SubscriptionModelCatalogCache::default(),
         })
     }
@@ -312,6 +344,7 @@ impl SelectableAdapter {
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.cerebras_api_key.as_ref(),
         )?;
         let mut current = self
             .selection
@@ -333,6 +366,7 @@ impl SelectableAdapter {
             self.credential_storage.clone(),
             reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.cerebras_api_key.as_ref(),
         )?;
         let mut current = self
             .selection
@@ -355,6 +389,7 @@ pub struct SelectableSession {
     selection: Arc<Mutex<SessionSelection>>,
     credential_storage: crate::credentials::CredentialStorage,
     openrouter_api_key: Option<OpenRouterApiKey>,
+    cerebras_api_key: Option<CerebrasApiKey>,
     openai_model_catalog: SubscriptionModelCatalogCache,
     config: SessionConfig,
     active: SessionSelection,
@@ -377,6 +412,7 @@ impl ModelAdapter for SelectableAdapter {
             self.credential_storage.clone(),
             active.reasoning_effort,
             self.openrouter_api_key.as_ref(),
+            self.cerebras_api_key.as_ref(),
             self.openai_model_catalog.clone(),
         )
         .map_err(LoopError::InvalidState)?
@@ -386,6 +422,7 @@ impl ModelAdapter for SelectableAdapter {
             selection: Arc::clone(&self.selection),
             credential_storage: self.credential_storage.clone(),
             openrouter_api_key: self.openrouter_api_key.clone(),
+            cerebras_api_key: self.cerebras_api_key.clone(),
             openai_model_catalog: self.openai_model_catalog.clone(),
             config,
             active,
@@ -442,6 +479,7 @@ impl ModelSession for SelectableSession {
                 self.credential_storage.clone(),
                 selected.reasoning_effort,
                 self.openrouter_api_key.as_ref(),
+                self.cerebras_api_key.as_ref(),
                 self.openai_model_catalog.clone(),
             )
             .map_err(LoopError::InvalidState)?
@@ -479,12 +517,13 @@ impl SelectableSession {
 pub enum KitAdapter {
     OpenAiSubscription(OpenAiSubscriptionAdapter),
     OpenRouter(OpenRouterKitAdapter),
+    Cerebras(OpenRouterKitAdapter),
     Speakeasy(Box<SpeakeasyKitAdapter>),
 }
 
 #[derive(Clone)]
 pub struct OpenRouterKitAdapter {
-    inner: OpenRouterAdapter,
+    inner: CompletionsAdapter<CerebrasCompatibleOpenRouter>,
     client: reqwest::Client,
     models_url: Option<String>,
     model: String,
@@ -581,7 +620,7 @@ impl KitAdapter {
         model: String,
         credential_storage: crate::credentials::CredentialStorage,
     ) -> Result<Self, String> {
-        Self::new_with_credentials_and_effort(provider, model, credential_storage, None, None)
+        Self::new_with_credentials_and_effort(provider, model, credential_storage, None, None, None)
     }
 
     fn new_with_credentials_and_effort(
@@ -590,6 +629,7 @@ impl KitAdapter {
         credential_storage: crate::credentials::CredentialStorage,
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<&OpenRouterApiKey>,
+        cerebras_api_key: Option<&CerebrasApiKey>,
     ) -> Result<Self, String> {
         Self::new_with_credentials_effort_and_catalog(
             provider,
@@ -597,6 +637,7 @@ impl KitAdapter {
             credential_storage,
             reasoning_effort,
             openrouter_api_key,
+            cerebras_api_key,
             SubscriptionModelCatalogCache::default(),
         )
     }
@@ -607,6 +648,7 @@ impl KitAdapter {
         credential_storage: crate::credentials::CredentialStorage,
         reasoning_effort: Option<ReasoningEffort>,
         openrouter_api_key: Option<&OpenRouterApiKey>,
+        cerebras_api_key: Option<&CerebrasApiKey>,
         openai_model_catalog: SubscriptionModelCatalogCache,
     ) -> Result<Self, String> {
         match provider {
@@ -629,7 +671,7 @@ impl KitAdapter {
                 )?;
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let models_url = models_url(&config.base_url);
-                let inner = OpenRouterAdapter::new(config)
+                let inner = CompletionsAdapter::new(CerebrasCompatibleOpenRouter::from(config))
                     .map_err(|error| error.to_string())?
                     .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 let client = reqwest::Client::builder()
@@ -643,6 +685,53 @@ impl KitAdapter {
                     inner,
                     client,
                     models_url,
+                    model,
+                    context_window: Arc::new(tokio::sync::OnceCell::new()),
+                }))
+            }
+            ProviderKind::Cerebras => {
+                let key = match cerebras_api_key {
+                    Some(key) => key.clone(),
+                    None => match std::env::var("CEREBRAS_API_KEY") {
+                        Ok(key) if !key.trim().is_empty() => CerebrasApiKey::new(key),
+                        _ => super::cerebras_api_key(&credential_storage)?
+                            .ok_or("cerebras_auth_required: set CEREBRAS_API_KEY or run `kit auth login cerebras` before using Cerebras")?,
+                    },
+                };
+                if key.as_str().trim().is_empty() {
+                    return Err("--cerebras-api-key cannot be empty".into());
+                }
+                // Never inherit OpenRouter endpoint overrides, headers, or credentials.
+                let mut config = OpenRouterConfig::new(key.as_str(), model.clone())
+                    .with_base_url(super::cerebras::COMPLETIONS_URL);
+                if let Some(effort) = reasoning_effort {
+                    config.extra_body.insert(
+                        "reasoning_effort".into(),
+                        Value::String(
+                            match effort {
+                                ReasoningEffort::Low => "low",
+                                ReasoningEffort::Medium => "medium",
+                                ReasoningEffort::High => "high",
+                            }
+                            .into(),
+                        ),
+                    );
+                }
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .map_err(|_| "could not build Cerebras client")?;
+                let inner = CompletionsAdapter::with_client(
+                    CerebrasCompatibleOpenRouter::dedicated(config),
+                    agentkit_http::Http::new(client.clone()),
+                )
+                .with_resilience(agentkit_http::ResilienceConfig::default());
+                Ok(Self::Cerebras(OpenRouterKitAdapter {
+                    inner,
+                    client,
+                    models_url: None,
                     model,
                     context_window: Arc::new(tokio::sync::OnceCell::new()),
                 }))
@@ -798,7 +887,7 @@ impl ModelAdapter for KitAdapter {
                 .start_session(config)
                 .await
                 .map(KitSession::OpenAiSubscription),
-            Self::OpenRouter(adapter) => {
+            Self::OpenRouter(adapter) | Self::Cerebras(adapter) => {
                 let session = adapter.inner.start_session(config).await?;
                 let context_window = match &adapter.models_url {
                     Some(url) => adapter
@@ -811,10 +900,20 @@ impl ModelAdapter for KitAdapter {
                         .copied(),
                     None => None,
                 };
-                Ok(KitSession::OpenRouter(OpenRouterKitSession {
+                let context_window = if matches!(self, Self::Cerebras(_)) {
+                    super::cerebras::context_window(&adapter.model)
+                } else {
+                    context_window
+                };
+                let session = OpenRouterKitSession {
                     inner: session,
                     context_window,
-                }))
+                };
+                Ok(if matches!(self, Self::Cerebras(_)) {
+                    KitSession::Cerebras(session)
+                } else {
+                    KitSession::OpenRouter(session)
+                })
             }
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
@@ -835,6 +934,7 @@ impl ModelAdapter for KitAdapter {
         Some(match self {
             Self::OpenAiSubscription(_) => "openai-subscription",
             Self::OpenRouter(_) => "openrouter",
+            Self::Cerebras(_) => "cerebras",
             Self::Speakeasy(_) => "speakeasy",
         })
     }
@@ -843,11 +943,12 @@ impl ModelAdapter for KitAdapter {
 pub enum KitSession {
     OpenAiSubscription(OpenAiSubscriptionSession),
     OpenRouter(OpenRouterKitSession),
+    Cerebras(OpenRouterKitSession),
     Speakeasy(SpeakeasyKitSession),
 }
 
 pub struct OpenRouterKitSession {
-    inner: OpenRouterSession,
+    inner: CompletionsSession<CerebrasCompatibleOpenRouter>,
     context_window: Option<u64>,
 }
 
@@ -1130,6 +1231,17 @@ impl ModelSession for KitSession {
                     next_media: 0,
                 })
                 .map(KitTurn::OpenRouter),
+            Self::Cerebras(session) => session
+                .inner
+                .begin_turn(request, cancellation)
+                .await
+                .map(|inner| OpenRouterKitTurn {
+                    inner,
+                    context_window: session.context_window,
+                    media_part: None,
+                    next_media: 0,
+                })
+                .map(KitTurn::Cerebras),
             Self::Speakeasy(session) => session
                 .inner
                 .begin_turn(request, cancellation)
@@ -1147,7 +1259,7 @@ impl ModelSession for KitSession {
     fn model_name(&self) -> Option<&str> {
         match self {
             Self::OpenAiSubscription(session) => session.model_name(),
-            Self::OpenRouter(session) => session.inner.model_name(),
+            Self::OpenRouter(session) | Self::Cerebras(session) => session.inner.model_name(),
             Self::Speakeasy(session) => session.inner.model_name(),
         }
     }
@@ -1157,6 +1269,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.provider_name(),
             Self::OpenRouter(session) => session.inner.provider_name(),
             Self::Speakeasy(_) => Some("speakeasy"),
+            Self::Cerebras(_) => Some("cerebras"),
         }
     }
 }
@@ -1164,7 +1277,20 @@ impl ModelSession for KitSession {
 pub enum KitTurn {
     OpenAiSubscription(Box<OpenAiSubscriptionTurn>),
     OpenRouter(OpenRouterKitTurn),
+    Cerebras(OpenRouterKitTurn),
     Speakeasy(OpenRouterKitTurn),
+}
+
+#[cfg(test)]
+impl KitTurn {
+    pub(super) fn cerebras_for_test(inner: OpenRouterTurn, model: &str) -> Self {
+        Self::Cerebras(OpenRouterKitTurn {
+            inner,
+            context_window: super::cerebras::context_window(model),
+            media_part: None,
+            next_media: 0,
+        })
+    }
 }
 
 pub struct OpenRouterKitTurn {
@@ -1179,7 +1305,9 @@ impl ModelTurn for KitTurn {
     fn on_cancelled(&mut self) {
         match self {
             Self::OpenAiSubscription(turn) => turn.on_cancelled(),
-            Self::OpenRouter(turn) | Self::Speakeasy(turn) => turn.inner.on_cancelled(),
+            Self::OpenRouter(turn) | Self::Speakeasy(turn) | Self::Cerebras(turn) => {
+                turn.inner.on_cancelled()
+            }
         }
     }
 
@@ -1189,6 +1317,22 @@ impl ModelTurn for KitTurn {
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         match self {
             Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
+            Self::Cerebras(turn) => {
+                let mut event =
+                    turn.inner
+                        .next_event(cancellation)
+                        .await
+                        .map_err(|error| match error {
+                            LoopError::Provider(_) => {
+                                LoopError::Provider("Cerebras stream failed".into())
+                            }
+                            error => error,
+                        })?;
+                if let Some(context_window) = turn.context_window {
+                    stamp_context_window(&mut event, context_window, "cerebras.context_length");
+                }
+                Ok(event)
+            }
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
                 if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
@@ -1459,7 +1603,26 @@ async fn model_catalog_with_openai(
         }
         speakeasy.push(current.model.clone());
     }
+    // Cerebras model discovery requires authentication. Keep the selector available
+    // without prompting for credentials; always retain custom/current model IDs.
+    let mut cerebras: Vec<String> = super::cerebras::MODELS
+        .iter()
+        .map(|(id, _)| (*id).to_owned())
+        .collect();
+    if current.provider == ProviderKind::Cerebras && !cerebras.contains(&current.model) {
+        cerebras.push(current.model.clone());
+    }
     vec![
+        ModelGroup {
+            provider: ProviderKind::Cerebras,
+            context_windows: cerebras
+                .iter()
+                .filter_map(|model| {
+                    super::cerebras::context_window(model).map(|window| (model.clone(), window))
+                })
+                .collect(),
+            models: cerebras,
+        },
         ModelGroup {
             provider: ProviderKind::OpenAiSubscription,
             models: openai,
@@ -1594,7 +1757,7 @@ mod tests {
         TurnRequest,
     };
     use agentkit_provider_openrouter::{
-        OpenRouterAdapter, OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
+        OpenRouterConfig, ReasoningEffort as OpenRouterReasoningEffort,
     };
     use serde_json::json;
 
@@ -2038,7 +2201,10 @@ mod tests {
     }
 
     async fn openrouter_session(model: &str) -> KitSession {
-        let adapter = OpenRouterAdapter::new(OpenRouterConfig::new("test-key", model)).unwrap();
+        let adapter = agentkit_adapter_completions::CompletionsAdapter::new(
+            super::CerebrasCompatibleOpenRouter::from(OpenRouterConfig::new("test-key", model)),
+        )
+        .unwrap();
         let inner = adapter
             .start_session(SessionConfig::new("provider-identity-test"))
             .await
@@ -2059,6 +2225,7 @@ mod tests {
             selection: Arc::new(Mutex::new(active.clone())),
             credential_storage: Default::default(),
             openrouter_api_key: None,
+            cerebras_api_key: None,
             openai_model_catalog: Default::default(),
             config: SessionConfig::new("provider-identity-test"),
             active,
@@ -2206,6 +2373,87 @@ mod tests {
 
         assert_eq!(session.provider_name(), Some("openrouter"));
         assert_eq!(session.model_name(), Some("test/initial"));
+    }
+
+    #[tokio::test]
+    async fn cerebras_key_survives_selection_effort_and_session_lifecycle() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
+            ProviderKind::Cerebras,
+            "qwen-3.8-27b",
+            Default::default(),
+            None,
+            Some(OpenRouterApiKey::new("unrelated-openrouter-key")),
+            Some(super::CerebrasApiKey::new("synthetic-cerebras-key")),
+        )
+        .unwrap();
+        adapter
+            .select_reasoning_effort(Some(ReasoningEffort::Low))
+            .unwrap();
+        adapter
+            .select(ModelSelection::new(
+                ProviderKind::OpenAiSubscription,
+                "gpt-5.4",
+            ))
+            .unwrap();
+        adapter
+            .select(ModelSelection::from_id("cerebras:gpt-oss-120b").unwrap())
+            .unwrap();
+        let session = adapter
+            .start_session(SessionConfig::new("cerebras-lifecycle"))
+            .await
+            .unwrap();
+        assert_eq!(session.provider_name(), Some("cerebras"));
+        assert_eq!(session.model_name(), Some("gpt-oss-120b"));
+        assert!(
+            matches!(&session.inner, KitSession::Cerebras(inner) if inner.context_window == Some(65_000))
+        );
+        assert!(!format!("{:?}", adapter.cerebras_api_key).contains("synthetic-cerebras-key"));
+    }
+
+    #[tokio::test]
+    async fn cerebras_custom_model_keeps_unknown_context_limit() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
+            ProviderKind::Cerebras,
+            "custom-model",
+            Default::default(),
+            None,
+            None,
+            Some(super::CerebrasApiKey::new("synthetic-key")),
+        )
+        .unwrap();
+        let session = adapter
+            .start_session(SessionConfig::new("custom-model"))
+            .await
+            .unwrap();
+        assert_eq!(session.model_name(), Some("custom-model"));
+        assert!(
+            matches!(&session.inner, KitSession::Cerebras(inner) if inner.context_window.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn cerebras_explicit_empty_key_does_not_fall_back() {
+        let adapter = SelectableAdapter::new_with_credentials_effort_and_api_keys(
+            ProviderKind::Cerebras,
+            "gpt-oss-120b",
+            Default::default(),
+            None,
+            Some(OpenRouterApiKey::new("not-a-cerebras-key")),
+            Some(super::CerebrasApiKey::new("")),
+        )
+        .unwrap();
+        let error = match adapter
+            .start_session(SessionConfig::new("empty-cerebras-key"))
+            .await
+        {
+            Ok(_) => panic!("expected empty key rejection"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("--cerebras-api-key cannot be empty")
+        );
     }
 
     #[test]

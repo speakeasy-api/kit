@@ -150,6 +150,62 @@ fn terminal_auth_arguments_run_login_from_acp_server_invocations() {
 }
 
 #[test]
+fn cerebras_auth_file_lifecycle_is_isolated_and_does_not_print_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let credentials = home.path().join("credentials");
+    let key = "cerebras-integration-test-key-not-a-real-secret";
+    let invoke = |action: &str, provider: &str, supplied_key: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kit"));
+        command
+            .env_clear()
+            .env("HOME", home.path())
+            .args([
+                "auth",
+                action,
+                provider,
+                "--credential-store",
+                "file",
+                "--credential-dir",
+            ])
+            .arg(&credentials);
+        if let Some(value) = supplied_key {
+            command.env("CEREBRAS_API_KEY", value);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stdout.contains(key));
+        assert!(!stderr.contains(key));
+        assert!(output.status.success(), "{action} {provider}: {stderr}");
+        stdout
+    };
+
+    let before = invoke("status", "cerebras", None);
+    invoke("login", "cerebras", Some(key));
+    let stored = invoke("status", "cerebras", None);
+    assert_ne!(before, stored, "login must persist a credential");
+    let openrouter = invoke("status", "openrouter", None);
+    assert!(openrouter.to_lowercase().contains("not authenticated"));
+    invoke("logout", "cerebras", None);
+    assert_eq!(invoke("status", "cerebras", None), before);
+}
+
+#[test]
+fn cerebras_is_available_in_all_runtime_command_help() {
+    for command in ["prompt", "tui", "acp", "serve"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kit"))
+            .env_clear()
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains("cerebras"), "{command}: {help}");
+        assert!(help.contains("--cerebras-api-key"), "{command}: {help}");
+    }
+}
+
+#[test]
 fn sessions_rejects_missing_and_non_directory_roots() {
     let home = tempfile::tempdir().unwrap();
     let missing = home.path().join("missing");

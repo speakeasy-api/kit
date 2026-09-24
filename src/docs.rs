@@ -415,6 +415,7 @@ mod tests {
             paths,
             vec![
                 "docs/user/agent-plugins.md",
+                "docs/user/cerebras.md",
                 "docs/user/compose-and-local-tools.md",
                 "docs/user/evaluations.md",
                 "docs/user/getting-started-and-configuration.md",

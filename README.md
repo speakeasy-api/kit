@@ -38,7 +38,7 @@ Fewer model round trips repeat less context and complete more work in each reque
 - **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
 - **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
 - **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
-- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
+- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports models through Cerebras, OpenRouter, and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
 - **Small runtime.** Kit has no permissions framework, sandbox, or web UI. The `--root` option sets the working directory. Kit is a runtime, not a security boundary. Run Kit inside a security boundary that you trust. See the [trust model](docs/user/security-limits-and-troubleshooting.md).
 
 ## Install
@@ -244,6 +244,7 @@ While the agent works, press `Enter` to add a message to the *current* turn thro
 | --- | --- | --- |
 | `openai-subscription` | `kit auth login openai` | Native ChatGPT OAuth uses PKCE, state, nonce, and RS256 tokens validated against OpenAI's JWKS. The callback uses loopback only. Kit refreshes tokens five minutes before expiry and synchronizes refreshes across processes. |
 | `openrouter` | `kit auth login openrouter` or `OPENROUTER_API_KEY` | Kit loads a live model catalog. It uses context-window data for the gauge and compaction. |
+| `cerebras` | `CEREBRAS_API_KEY` | Direct Cerebras inference with isolated credentials, streaming, and tools. See [Cerebras](docs/user/cerebras.md) for models and authentication. |
 | `speakeasy` | `kit auth login speakeasy` | Kit uses the Speakeasy AI Control Plane. Kit maps its session ID to the Gram chat ID so that a resumed conversation stays in one thread. |
 
 `/model sonnet` switches the live session at the next safe turn boundary. Press `Tab` in the picker to also update `~/.kit/config.toml`. Use `/effort low|medium|high|default` to change the reasoning effort. See [Getting started and configuration](docs/user/getting-started-and-configuration.md#choose-a-provider-and-authenticate).

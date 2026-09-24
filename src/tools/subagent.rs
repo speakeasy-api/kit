@@ -2325,6 +2325,7 @@ mod steer_tests {
                 provider: Default::default(),
                 reasoning_effort: None,
                 openrouter_api_key: None,
+                cerebras_api_key: None,
                 configured_mcp_config: None,
                 configured_mcp_config_inherited: false,
                 legacy_mcp_config: false,
