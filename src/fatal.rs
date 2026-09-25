@@ -177,6 +177,7 @@ enum IoClassification {
 
 pub(crate) fn render_loop_error(error: &LoopError) -> String {
     match error {
+        LoopError::ProviderFailure(failure) => provider_failure_message(failure),
         LoopError::Provider(message) => {
             let (message, _) = split_diagnostics(message);
             format!("provider error: {message}")
@@ -291,10 +292,10 @@ fn classify(
         {
             None
         }
-        LoopError::ProviderFailure(_) => Some((
+        LoopError::ProviderFailure(failure) => Some((
             "provider",
-            "provider_error",
-            "provider request failed".into(),
+            provider_failure_code(failure.reason),
+            provider_failure_message(failure),
             None,
         )),
         LoopError::Provider(message) => {
@@ -337,6 +338,61 @@ fn classify(
             None,
         )),
     }
+}
+
+fn provider_failure_code(reason: agentkit_loop::ProviderFailureReason) -> &'static str {
+    use agentkit_loop::ProviderFailureReason as Reason;
+    match reason {
+        Reason::HttpStatus => "http_status",
+        Reason::Transport => "transport",
+        Reason::ResponseFailed => "response_failed",
+        Reason::Protocol => "protocol_error",
+        Reason::InvalidRequest => "invalid_request",
+        Reason::Authentication => "authentication",
+        Reason::AttemptTimeout => "attempt_timeout",
+        Reason::IdleTimeout => "stream_idle_timeout",
+        Reason::RetryExhausted => "retry_exhausted",
+        Reason::RetryBudget => "retry_budget",
+        Reason::RetryDisabled => "retry_disabled",
+        Reason::ReplayUnsafe => "replay_unsafe",
+        Reason::Cancelled => "cancelled",
+        _ => "provider_error",
+    }
+}
+
+fn upstream_kind_label(kind: agentkit_loop::UpstreamErrorKind) -> Option<String> {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(label)) if label != "unknown" => Some(label),
+        _ => None,
+    }
+}
+
+fn provider_failure_message(failure: &agentkit_loop::ProviderFailure) -> String {
+    let mut message = format!(
+        "provider request failed: {}",
+        provider_failure_code(failure.reason)
+    );
+    if let Some(last) = failure
+        .last_attempt_reason
+        .filter(|last| *last != failure.reason)
+    {
+        message.push_str(" after ");
+        message.push_str(provider_failure_code(last));
+    }
+    let mut details = Vec::new();
+    if let Some(status) = failure.upstream.http_status {
+        details.push(format!("HTTP {status}"));
+    }
+    let upstream = [failure.upstream.error_type, failure.upstream.code]
+        .into_iter()
+        .filter_map(upstream_kind_label)
+        .collect::<Vec<_>>();
+    if !upstream.is_empty() {
+        details.push(upstream.join("/"));
+    }
+    details.push(format!("attempts: {}", failure.accounting.attempts));
+    message.push_str(&format!(" ({})", details.join(", ")));
+    message
 }
 
 fn provider_code(message: &str) -> &'static str {
@@ -889,35 +945,82 @@ mod tests {
     }
 
     #[test]
-    fn typed_provider_failures_preserve_fatal_and_cancellation_behavior() {
-        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+    fn typed_provider_failures_expose_sanitized_classification() {
+        use agentkit_loop::{
+            ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRoute,
+            RetryAccounting, UpstreamErrorKind,
+        };
 
-        for reason in [
-            ProviderFailureReason::RetryExhausted,
-            ProviderFailureReason::Authentication,
-            ProviderFailureReason::Cancelled,
-        ] {
-            let error = LoopError::ProviderFailure(Box::new(ProviderFailure {
-                route: ProviderRoute::OpenAiResponses,
+        let failure = |reason, last_attempt_reason, upstream, attempts| {
+            LoopError::ProviderFailure(Box::new(ProviderFailure {
+                route: ProviderRoute::OpenAiChatGptResponses,
                 reason,
-                last_attempt_reason: None,
-                upstream: Default::default(),
-                accounting: Default::default(),
-            }));
-            if reason == ProviderFailureReason::Cancelled {
-                assert!(
-                    record_loop_error("session-1", Surface::Acp, &error)
-                        .unwrap()
-                        .is_none()
-                );
-            } else {
-                let (kind, code, message, diagnostics) = classify(&error).unwrap();
-                assert_eq!(kind, "provider");
-                assert_eq!(code, "provider_error");
-                assert_eq!(message, "provider request failed");
-                assert!(diagnostics.is_none());
-            }
+                last_attempt_reason,
+                upstream,
+                accounting: RetryAccounting {
+                    attempts,
+                    ..Default::default()
+                },
+            }))
+        };
+        for (error, expected_code, expected_message) in [
+            (
+                failure(
+                    ProviderFailureReason::HttpStatus,
+                    Some(ProviderFailureReason::HttpStatus),
+                    ProviderClassification {
+                        error_type: UpstreamErrorKind::InvalidRequestError,
+                        code: UpstreamErrorKind::InvalidApiKey,
+                        http_status: Some(401),
+                    },
+                    2,
+                ),
+                "http_status",
+                "provider request failed: http_status (HTTP 401, invalid_request_error/invalid_api_key, attempts: 2)",
+            ),
+            (
+                failure(
+                    ProviderFailureReason::RetryExhausted,
+                    Some(ProviderFailureReason::HttpStatus),
+                    ProviderClassification {
+                        http_status: Some(503),
+                        ..Default::default()
+                    },
+                    12,
+                ),
+                "retry_exhausted",
+                "provider request failed: retry_exhausted after http_status (HTTP 503, attempts: 12)",
+            ),
+            (
+                failure(
+                    ProviderFailureReason::Authentication,
+                    None,
+                    Default::default(),
+                    0,
+                ),
+                "authentication",
+                "provider request failed: authentication (attempts: 0)",
+            ),
+        ] {
+            let (kind, code, message, diagnostics) = classify(&error).unwrap();
+            assert_eq!(kind, "provider");
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+            assert_eq!(render_loop_error(&error), expected_message);
+            assert!(diagnostics.is_none());
         }
+
+        let cancelled = failure(
+            ProviderFailureReason::Cancelled,
+            None,
+            Default::default(),
+            1,
+        );
+        assert!(
+            record_loop_error("session-1", Surface::Acp, &cancelled)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
