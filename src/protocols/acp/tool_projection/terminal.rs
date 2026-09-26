@@ -1,5 +1,5 @@
 //! Agent-owned terminals are v2 only. Frames share the bounded invocation bus.
-use super::{MAX_ID, Update, publish, v2_bus};
+use super::{MAX_ID, Update, publish, routes};
 
 pub(super) const MAX_COMMAND_BYTES: usize = 64 * 1024;
 use agentkit_tools_core::ToolRequest;
@@ -61,7 +61,9 @@ pub(crate) struct Terminal(Option<Output>);
 
 impl Terminal {
     pub(crate) fn start(request: &ToolRequest, command: &str, cwd: &Path) -> Self {
-        if v2_bus().receiver_count() == 0
+        if routes()
+            .senders(&request.session_id.0)
+            .is_none_or(|(_, v2)| v2.receiver_count() == 0)
             || request.session_id.0.len() > MAX_ID
             || request.call_id.0.len() > MAX_ID
             || !request.call_id.0.contains(":compose:")

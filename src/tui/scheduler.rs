@@ -649,7 +649,7 @@ mod tests {
         let mut app = app();
         let clipboard_route = app.clipboard_route();
         let mut pastes = ClipboardPastes::default();
-        pastes.queued(7, clipboard_route.clone());
+        pastes.queued(&mut app, 7, clipboard_route.clone());
         let (sender, mut completed) = mpsc::channel(2);
         let applied = apply_completions(
             &mut app,
@@ -666,7 +666,7 @@ mod tests {
         assert!(!applied.dirty);
         assert!(!applied.submit_after_paste);
         assert!(!applied.urgent);
-        assert_eq!(app.editor.text(), "");
+        assert_eq!(app.editor.text(), "[Pasting… #1]");
         assert!(pastes.pending.is_some());
         // Stale results cannot finish the current paste or request a frame.
         sender
@@ -814,7 +814,7 @@ mod tests {
         let mut app = app();
         let clipboard_route = app.clipboard_route();
         let mut pastes = ClipboardPastes::default();
-        pastes.queued(7, clipboard_route.clone());
+        pastes.queued(&mut app, 7, clipboard_route.clone());
         let (sender, mut completed) = mpsc::channel(2);
         sender
             .try_send(completion(7, Update::Log("after paste".into())))
@@ -849,7 +849,7 @@ mod tests {
         let mut app = app();
         let clipboard_route = app.clipboard_route();
         let mut pastes = ClipboardPastes::default();
-        pastes.queued(7, clipboard_route.clone());
+        pastes.queued(&mut app, 7, clipboard_route.clone());
         pastes.pending.as_mut().unwrap().submit = true;
         let (sender, mut completed) = mpsc::channel(2);
         sender
@@ -880,7 +880,7 @@ mod tests {
         let mut app = app();
         let clipboard_route = app.clipboard_route();
         let mut pastes = ClipboardPastes::default();
-        pastes.queued(7, clipboard_route.clone());
+        pastes.queued(&mut app, 7, clipboard_route.clone());
         pastes.pending.as_mut().unwrap().submit = true;
         let (sender, mut completed) = mpsc::channel(2);
         sender

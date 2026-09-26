@@ -2,7 +2,11 @@
 //! No execution waits or accumulated source/input/output retention. The compose
 //! budget bounds cards per run; the bus and receiver bound queued/active cards.
 //! Rich-content patches carry bounded payloads only for the lifetime of delivery.
-use std::{collections::HashMap, path::Path, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+};
 
 use agentkit_tools_core::ToolRequest;
 use serde_json::{Map, Value};
@@ -41,8 +45,91 @@ pub(crate) struct Update {
     ok: bool,
 }
 
-fn subscribers() -> usize {
-    bus().receiver_count() + v2_bus().receiver_count()
+fn subscribers(session: &str) -> usize {
+    routes()
+        .senders(session)
+        .map_or(0, |(v1, v2)| v1.receiver_count() + v2.receiver_count())
+}
+
+// Registration counts are changed only under the registry lock. Publication
+// clones senders and does not keep an otherwise unused route registered.
+#[derive(Default)]
+struct Routes(Mutex<HashMap<String, Route>>);
+
+struct Route {
+    buses: Arc<Buses>,
+    registrations: usize,
+}
+
+impl Routes {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Route>> {
+        // Every writer inserts or removes one complete route. No callbacks,
+        // sends, awaits, or channel destruction happen under this lock, so an
+        // unwind cannot leave a partially committed route or ownership count.
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn register(&'static self, session: String) -> Registration {
+        let fresh = Arc::new(Buses::new());
+        let buses = {
+            let mut routes = self.lock();
+            let route = routes.entry(session.clone()).or_insert_with(|| Route {
+                buses: fresh.clone(),
+                registrations: 0,
+            });
+            route.registrations += 1;
+            route.buses.clone()
+        };
+        Registration {
+            routes: self,
+            session,
+            buses,
+        }
+    }
+
+    fn senders(
+        &self,
+        session: &str,
+    ) -> Option<(broadcast::Sender<Update>, broadcast::Sender<Update>)> {
+        self.lock()
+            .get(session)
+            .map(|route| (route.buses.v1.clone(), route.buses.v2.clone()))
+    }
+}
+
+struct Registration {
+    routes: &'static Routes,
+    session: String,
+    buses: Arc<Buses>,
+}
+
+impl Registration {
+    fn buses(&self) -> &Buses {
+        &self.buses
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let removed = {
+            let mut routes = self.routes.lock();
+            let Some(route) = routes.get_mut(&self.session) else {
+                return;
+            };
+            route.registrations -= 1;
+            if route.registrations == 0 {
+                routes.remove(&self.session)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+    }
+}
+
+fn routes() -> &'static Routes {
+    static ROUTES: OnceLock<Routes> = OnceLock::new();
+    ROUTES.get_or_init(Routes::default)
 }
 
 // Separate ingress queues: v1 must never lag because of v2-only traffic,
@@ -59,28 +146,15 @@ impl Buses {
             v2: broadcast::channel(CAPACITY).0,
         }
     }
-
-    fn publish(&self, update: Update) {
-        if !update.v2_only() {
-            let _ = self.v1.send(update.clone());
-        }
-        let _ = self.v2.send(update);
-    }
 }
 
-fn buses() -> &'static Buses {
-    static BUSES: OnceLock<Buses> = OnceLock::new();
-    BUSES.get_or_init(Buses::new)
-}
-
-fn v2_bus() -> &'static broadcast::Sender<Update> {
-    &buses().v2
-}
-fn bus() -> &'static broadcast::Sender<Update> {
-    &buses().v1
-}
 fn publish(update: Update) {
-    buses().publish(update);
+    if let Some((v1, v2)) = routes().senders(&update.session) {
+        if !update.v2_only() {
+            let _ = v1.send(update.clone());
+        }
+        let _ = v2.send(update);
+    }
 }
 
 /// An invocation owns its terminal update, including cancellation/unwind.
@@ -88,7 +162,7 @@ pub(crate) struct Invocation(Update);
 
 impl Invocation {
     pub(crate) fn start(request: &ToolRequest, root: Option<&Path>) -> Option<Self> {
-        if subscribers() == 0
+        if subscribers(&request.session_id.0) == 0
             || request.session_id.0.len() > MAX_ID
             || request.call_id.0.len() > MAX_ID
         {
@@ -168,7 +242,7 @@ impl Drop for Invocation {
 
 /// Publish a location established by the tool itself, not a guessed source line.
 pub(crate) fn location(request: &ToolRequest, path: &Path, line: u32) {
-    if subscribers() == 0
+    if subscribers(&request.session_id.0) == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -197,9 +271,9 @@ const MAX_DIFF_TEXT: usize = 16 * 1024;
 
 /// Capture a deletion without making unreadable, binary, or large files fail an
 /// otherwise valid delete. Reads stop at the bound even if the file grows.
-pub(crate) fn deletion_text(path: &Path) -> Option<String> {
+pub(crate) fn deletion_text(request: &ToolRequest, path: &Path) -> Option<String> {
     use std::io::Read;
-    if subscribers() == 0 {
+    if subscribers(&request.session_id.0) == 0 {
         return None;
     }
     let metadata = std::fs::symlink_metadata(path).ok()?;
@@ -219,7 +293,7 @@ pub(crate) fn deletion_text(path: &Path) -> Option<String> {
 /// text. The patch contains both wire shapes; each protocol's typed decoder
 /// retains only its own fields. No renderable v2 git patch is synthesized.
 pub(crate) fn diff(request: &ToolRequest, path: &Path, old: Option<&str>, new: Option<&str>) {
-    if subscribers() == 0
+    if subscribers(&request.session_id.0) == 0
         || request.session_id.0.len() > MAX_ID
         || request.call_id.0.len() > MAX_ID
         || !request.call_id.0.contains(":compose:")
@@ -335,24 +409,32 @@ type Drain = tokio::sync::oneshot::Sender<Result<(), agentkit_acp::AcpRuntimeErr
 
 impl Subscription {
     pub(super) fn start(session: String, send: impl Fn(Update) -> bool + Send + 'static) -> Self {
-        Self::with_receiver(bus().subscribe(), session, send)
+        let registration = routes().register(session.clone());
+        let receiver = registration.buses().v1.subscribe();
+        Self::with_receiver(receiver, registration, session, send)
     }
 
     pub(super) fn start_v2(
         session: String,
         send: impl Fn(Update) -> bool + Send + 'static,
     ) -> Self {
-        Self::with_receiver(v2_bus().subscribe(), session, send)
+        let registration = routes().register(session.clone());
+        let receiver = registration.buses().v2.subscribe();
+        Self::with_receiver(receiver, registration, session, send)
     }
 
     fn with_receiver(
         receiver: broadcast::Receiver<Update>,
+        registration: Registration,
         session: String,
         send: impl Fn(Update) -> bool + Send + 'static,
     ) -> Self {
         let (drains, commands) = tokio::sync::mpsc::channel(1);
         Self {
-            task: tokio::spawn(forward(receiver, session, send, commands)),
+            task: tokio::spawn(async move {
+                let _registration = registration;
+                forward(receiver, session, send, commands).await;
+            }),
             drains,
         }
     }

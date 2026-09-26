@@ -3299,12 +3299,19 @@ mod tests {
             .unwrap();
     }
 
-    async fn receive_wire(channel: &mut agent_client_protocol::Channel) -> serde_json::Value {
+    async fn receive_wire(
+        channel: &mut agent_client_protocol::Channel,
+        expected: &str,
+    ) -> serde_json::Value {
         use futures_util::StreamExt;
-        let frame = timeout(Duration::from_secs(2), channel.rx.next())
+        // Real session creation includes best-effort model discovery with a 10-second
+        // HTTP timeout. Allow that fallback plus CI scheduling headroom; this is a
+        // deadlock guard, not a latency assertion. Always inspect the very next frame.
+        let wait = Duration::from_secs(30);
+        let frame = timeout(wait, channel.rx.next())
             .await
-            .expect("ACP frame timed out")
-            .expect("ACP transport closed");
+            .unwrap_or_else(|_| panic!("ACP frame timed out after {wait:?} waiting for {expected}"))
+            .unwrap_or_else(|| panic!("ACP transport closed waiting for {expected}"));
         let agent_client_protocol::TransportFrame::Single(message) = frame else {
             panic!("expected a single ACP message, got {frame:?}");
         };
@@ -3337,7 +3344,10 @@ mod tests {
             ))
             .unwrap(),
         );
-        assert_eq!(receive_wire(&mut client).await["id"], 1);
+        assert_eq!(
+            receive_wire(&mut client, "initialize response (id 1)").await["id"],
+            1
+        );
         send_wire(
             &client,
             "session/new",
@@ -3345,14 +3355,14 @@ mod tests {
             serde_json::to_value(wire::NewSessionRequest::new(root.path().to_path_buf())).unwrap(),
         );
 
-        let response = receive_wire(&mut client).await;
+        let response = receive_wire(&mut client, "session/new response (id 2)").await;
         assert_eq!(
             response["id"], 2,
             "session response must be the first frame: {response}"
         );
         let response: wire::NewSessionResponse =
             serde_json::from_value(response["result"].clone()).unwrap();
-        let notification = receive_wire(&mut client).await;
+        let notification = receive_wire(&mut client, "available commands notification").await;
         assert_eq!(notification["method"], "session/update");
         let notification: wire::UpdateSessionNotification =
             serde_json::from_value(notification["params"].clone()).unwrap();
@@ -3369,7 +3379,7 @@ mod tests {
             3,
             serde_json::to_value(wire::CloseSessionRequest::new(response.session_id)).unwrap(),
         );
-        let closed = receive_wire(&mut client).await;
+        let closed = receive_wire(&mut client, "session/close response (id 3)").await;
         assert_eq!(closed["id"], 3);
         assert!(closed.get("result").is_some(), "close failed: {closed}");
         server.abort();
@@ -3815,7 +3825,12 @@ mod tests {
             ))
             .unwrap(),
         );
-        assert!(receive_wire(&mut client).await.get("result").is_some());
+        assert!(
+            receive_wire(&mut client, "initialize response (id 1)")
+                .await
+                .get("result")
+                .is_some()
+        );
         send_wire(
             &client,
             "session/inject",
@@ -3829,7 +3844,7 @@ mod tests {
             ))
             .unwrap(),
         );
-        let response = receive_wire(&mut client).await;
+        let response = receive_wire(&mut client, "session/inject response (id 2)").await;
         assert!(
             response.get("result").is_some(),
             "injection failed: {response}"

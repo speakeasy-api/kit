@@ -144,7 +144,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp"
 version = "0.10.11"
-source = "git+https://github.com/danielkov/agentkit.git?rev=bec9dcc45ee0f436d538286bc220b16dc19fd5f3#bec9dcc45ee0f436d538286bc220b16dc19fd5f3"
+source = "git+https://github.com/daviddanialy/agentkit.git?rev=6d519ed1e93e28e54ba1cc18889534e2e8337181#6d519ed1e93e28e54ba1cc18889534e2e8337181"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",

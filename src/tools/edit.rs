@@ -304,7 +304,8 @@ impl Tool for EditTool {
                 "edited"
             }
             EditInput::Delete { .. } => {
-                let original = crate::protocols::acp::tool_projection::deletion_text(&path);
+                let original =
+                    crate::protocols::acp::tool_projection::deletion_text(&request, &path);
                 fs::remove_file(&path).map_err(io_error)?;
                 if let Some(original) = original {
                     crate::protocols::acp::tool_projection::diff(
