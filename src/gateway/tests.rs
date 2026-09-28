@@ -168,6 +168,84 @@ for line in sys.stdin:
     }
 }
 #[tokio::test]
+async fn completed_actor_reclamation_keeps_live_replacement() {
+    let harness = Harness::new().await;
+    let source = "import sys; sys.stdin.read()";
+    harness.child_source("resident", source, &[]).await;
+    let mut old = harness.gateway.sessions.lock().await["resident"].clone();
+    harness.child_source("resident", source, &[]).await;
+    let mut replacement = harness.gateway.sessions.lock().await["resident"].clone();
+    let (reply, _) = oneshot::channel();
+    old.sender
+        .send(Envelope {
+            request: Request::Shutdown,
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), old.stopped.changed())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    // The old generation completed after replacement. Listing/repeated sweeps
+    // must select the current entry, not remove a captured session ID.
+    for _ in 0..2 {
+        let rows = harness.call(json!({"op":"list"})).await;
+        assert_eq!(rows["sessions"][0]["state"], "resident");
+        assert!(
+            harness.gateway.sessions.lock().await["resident"]
+                .sender
+                .same_channel(&replacement.sender)
+        );
+    }
+    let (reply, _) = oneshot::channel();
+    replacement
+        .sender
+        .send(Envelope {
+            request: Request::Shutdown,
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), replacement.stopped.changed())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    for _ in 0..2 {
+        let rows = harness.call(json!({"op":"list"})).await;
+        assert_eq!(rows["sessions"], json!([]));
+        assert!(harness.gateway.sessions.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn closed_command_receiver_does_not_reclaim_unfinished_actor() {
+    let harness = Harness::new().await;
+    let (sender, receiver) = mpsc::channel(1);
+    let (completion, stopped) = watch::channel(());
+    drop(receiver);
+    harness.gateway.sessions.lock().await.insert(
+        "stopping".into(),
+        Entry {
+            root: harness.gateway.roots[0].clone(),
+            sender,
+            stopped,
+        },
+    );
+    let rows = harness.call(json!({"op":"list"})).await;
+    assert_eq!(rows["sessions"][0]["state"], "exited");
+    assert_eq!(harness.gateway.sessions.lock().await.len(), 1);
+    drop(completion);
+    let rows = harness.call(json!({"op":"list"})).await;
+    assert_eq!(rows["sessions"], json!([]));
+    assert!(harness.gateway.sessions.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn auth_precedes_parsing_and_registration_precedes_spawn() {
     let harness = Harness::new().await;
     for token in [None, Some("wrong")] {
@@ -216,6 +294,8 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
     harness
         .call(json!({"op":"detach","session":"resident","attachment":first}))
         .await;
+    let listed = harness.call(json!({"op":"list"})).await;
+    assert_eq!(listed["sessions"][0]["state"], "resident");
     let second = harness.attach().await;
     harness.handshake(&second).await;
     let replay = harness.events(&second, |_| true).await;

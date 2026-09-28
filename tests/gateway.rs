@@ -438,6 +438,120 @@ async fn standard_sdk_creates_lists_resumes_and_restores() {
     stop_gateway(&mut gateway).await;
 }
 
+// Discover only direct children of this fixture's still-running gateway. No
+// global process-name matching: parallel tests and unrelated Kit users are safe.
+async fn gateway_child_pids(gateway: &mut Child) -> Vec<u32> {
+    assert!(gateway.try_wait().unwrap().is_none(), "gateway exited");
+    let parent = gateway.id().unwrap();
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let ppid = fields.next()?.parse::<u32>().ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn exited_sessions_release_capacity_and_preserve_history_without_restart() {
+    const ANSWER: &str = "History survives resident reclamation.";
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut catalog = SdkClient::connect(&url).await;
+    let mut saved = None;
+
+    // The production resident limit is 64. Every successful admission after
+    // that many exits must reuse capacity in this SAME gateway process.
+    for index in 0..65 {
+        let mut client = SdkClient::connect(&url).await;
+        let created = client
+            .request(2, "session/new", json!({"cwd":fixture.root}))
+            .await;
+        assert!(created.get("error").is_none(), "session {index}: {created}");
+        let id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+        if index == 0 {
+            client.start_prompt(3, &id, "Save this history").await;
+            let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+            release.send(ANSWER).unwrap();
+            client.wait_idle().await;
+            saved = Some(id.clone());
+        }
+        client.detach().await;
+
+        let children = gateway_child_pids(&mut gateway).await;
+        assert_eq!(
+            children.len(),
+            1,
+            "expected only the current resident child"
+        );
+        let status = Command::new("/bin/kill")
+            .args(["-KILL", &children[0].to_string()])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        // Wait for actual OS reaping, not a fixed sleep. Do not list here:
+        // each next Create must reclaim capacity without relying on List.
+        timeout(WAIT, async {
+            while !gateway_child_pids(&mut gateway).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resident child was not reaped");
+    }
+
+    let saved = saved.unwrap();
+    let listed = catalog.request(3, "session/list", json!({})).await;
+    let row = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sessionId"] == saved)
+        .expect("reclamation removed durable catalog history");
+    assert_eq!(row["_meta"]["kit.gateway.state"], "restorable", "{row}");
+    // Abrupt child exit leaves a stale durable lock, and HTTP resume has no
+    // force option. This test is about registry reclamation, not stale-lock
+    // recovery: remove only this fixture session's lock AFTER its child has
+    // been reaped. Keep the transcript itself untouched for gateway restore.
+    let lock_name = format!("{saved}.lock");
+    let locks: Vec<_> = fs::read_dir(fixture.home.path().join(".kit/sessions"))
+        .unwrap()
+        .map(|workspace| workspace.unwrap().path().join(&lock_name))
+        .filter(|path| path.exists())
+        .collect();
+    assert_eq!(locks.len(), 1, "expected the exited session's stale lock");
+    fs::remove_file(&locks[0]).unwrap();
+    let mut restored = SdkClient::connect(&url).await;
+    let response = restored
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":saved,"cwd":fixture.root,"replayFrom":{"type":"start"}}),
+        )
+        .await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert_replayed_answer(&restored.updates, ANSWER);
+    assert!(restored.updates.iter().any(|update| {
+        update["sessionUpdate"] == "user_message"
+            && update["content"].to_string().contains("Save this history")
+    }));
+    restored.detach().await;
+    catalog.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
 #[tokio::test]
 async fn gateway_denies_missing_or_wrong_auth_and_unregistered_roots() {
     let fixture = Fixture::new();

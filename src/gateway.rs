@@ -254,15 +254,32 @@ struct Gateway {
     stopping: AtomicBool,
     token: BearerToken,
     roots: Vec<PathBuf>,
-    // Writers: create inserts a fully spawned actor; dead entries are replaced
-    // only by explicit restore. No guard spans await or child teardown. A panic
-    // before insertion drops kill-on-drop Child; after insertion actor owns it.
+    // Writers: create/restore inserts a fully spawned actor; reclamation removes
+    // completed actors; shutdown takes all entries. No guard spans await or child
+    // teardown. Before insertion Child is kill-on-drop; afterwards actor owns it.
     sessions: Mutex<HashMap<String, Entry>>,
+}
+impl Gateway {
+    async fn reclaim_exited(&self) {
+        let exited: Vec<_> = {
+            let mut entries = self.sessions.lock().await;
+            // Select the current generation while holding the registry lock, not
+            // an ID captured by an old actor's completion callback. Command-channel
+            // closure alone does not establish that the actor has finished cleanup.
+            entries
+                .extract_if(|_, entry| entry.stopped.has_changed().is_err())
+                .collect()
+        };
+        // Dropping channel handles can wake other tasks. Do that outside the lock.
+        drop(exited);
+    }
 }
 #[derive(Clone)]
 struct Entry {
     root: PathBuf,
     sender: mpsc::Sender<Envelope>,
+    // Closed when the actor task releases its completion sender. Normal return
+    // follows child cleanup; unwind relies on Child's kill-on-drop instead.
     stopped: watch::Receiver<()>,
 }
 struct Envelope {
@@ -454,6 +471,7 @@ async fn handle(
     }
     match request {
         Request::List => {
+            gateway.reclaim_exited().await;
             let entries = gateway.sessions.lock().await.clone();
             let roots = gateway.roots.clone();
             let rows = tokio::task::spawn_blocking(move || {
@@ -512,6 +530,7 @@ async fn handle(
             if !gateway.roots.contains(&root) {
                 return Err(Failure::bad("project is not registered"));
             }
+            gateway.reclaim_exited().await;
             let restore = session.is_some();
             let id = session.unwrap_or_else(crate::session::new_id);
             if restore {
@@ -542,7 +561,7 @@ async fn handle(
             } else {
                 if entries.len() >= MAX_SESSIONS && !entries.contains_key(&id) {
                     return Err(Failure::unavailable(
-                        "gateway session capacity reached; restart to reclaim exited slots",
+                        "gateway session capacity reached; all slots are occupied by active or stopping actors",
                     ));
                 }
                 let entry = spawn(&root, &id, restore, force)
