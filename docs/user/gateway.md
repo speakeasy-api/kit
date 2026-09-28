@@ -127,7 +127,7 @@ Its `result._meta` explicitly identifies the experimental limits:
 Both connection and session SSE GETs return HTTP 200 with `Content-Type: text/event-stream`. The session stream echoes both ACP ID headers. Subsequent POST and transport DELETE return HTTP 202. SSE `data:` contains JSON-RPC replies or notifications, for example:
 
 ```text
-data: {"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Invalid params","data":{"reason":"unknown_message_id"}}}
+data: {"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Resource not found","data":{"reason":"unknown_message_id","messageId":"not-pending"}}}
 
 ```
 
