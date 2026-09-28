@@ -4,7 +4,7 @@
 use crate::protocols::http::BearerToken;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    extract::State,
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -411,21 +411,28 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 mod framing;
+mod http_boundary;
 mod http_client;
 mod http_server;
 fn router(gateway: Arc<Gateway>) -> Router {
     let state = gateway.clone();
-    agent_client_protocol_http::AcpHttpServer::new(move || {
-        http_server::Connection::new(state.clone())
+    let boundary = Arc::new(http_boundary::Boundary::default());
+    let connection_boundary = boundary.clone();
+    let sdk = agent_client_protocol_http::AcpHttpServer::new(move || {
+        http_server::Connection::new(state.clone(), connection_boundary.clone())
     })
     .with_options(agent_client_protocol_http::ServerOptions {
         path: "/acp/v2".into(),
         health_endpoint: false,
         ..Default::default()
     })
-    .into_router()
-    .layer(DefaultBodyLimit::max(1024 * 1024))
-    .layer(middleware::from_fn_with_state(gateway, authorize))
+    .into_router();
+    sdk.clone()
+        .layer(middleware::from_fn_with_state(
+            (boundary, sdk),
+            http_boundary::handle,
+        ))
+        .layer(middleware::from_fn_with_state(gateway, authorize))
 }
 
 async fn authorize(

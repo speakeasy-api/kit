@@ -87,8 +87,12 @@ for line in sys.stdin:
   if pending: result(pending,{'stopReason':'cancelled' if method=='session/cancel' else 'end_turn'}); pending=None
  elif 'id' in req: result(req,{})
 "#;
+        self.child_source("resident", source, &[]).await;
+    }
+    async fn child_source(&self, id: &str, source: &str, args: &[String]) {
         let child = tokio::process::Command::new("python3")
             .args(["-u", "-c", source])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -96,7 +100,7 @@ for line in sys.stdin:
             .spawn()
             .unwrap();
         let actor = Actor {
-            id: "resident".into(),
+            id: id.to_owned(),
             root: self.gateway.roots[0].clone(),
             restore: false,
             attachment: None,
@@ -115,7 +119,7 @@ for line in sys.stdin:
             drop(completion);
         });
         self.gateway.sessions.lock().await.insert(
-            "resident".into(),
+            id.to_owned(),
             Entry {
                 root: self.gateway.roots[0].clone(),
                 sender,
@@ -519,4 +523,260 @@ fn no_replay_restore_and_claim_survive_incomplete_internal_cache() {
             .is_err()
     );
     assert_eq!(actor.attachment.as_ref().unwrap().id, attachment);
+}
+
+#[tokio::test]
+async fn raw_sdk_body_limit_covers_declared_and_streamed_lengths() {
+    let harness = Harness::new().await;
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"limit-test","version":"1"},"capabilities":{}}}).to_string();
+    let at_limit = format!("{initialize}{}", " ".repeat(1024 * 1024 - initialize.len()));
+    let oversized = format!("{at_limit} ");
+    for streamed in [false, true] {
+        for authorized in [false, true] {
+            let body = if streamed {
+                let chunks: Vec<_> = oversized
+                    .as_bytes()
+                    .chunks(65536)
+                    .map(|chunk| Ok::<_, io::Error>(chunk.to_vec()))
+                    .collect();
+                reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))
+            } else {
+                reqwest::Body::from(oversized.clone())
+            };
+            let request = harness
+                .client
+                .post(&harness.url)
+                .header("Content-Type", "application/json")
+                .body(body);
+            let request = if authorized {
+                request.bearer_auth("boundary-secret")
+            } else {
+                request
+            };
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                if authorized {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "streamed={streamed}, authorized={authorized}"
+            );
+        }
+    }
+    // Exactly the public limit still reaches the real SDK and initializes.
+    let response = harness
+        .client
+        .post(&harness.url)
+        .bearer_auth("boundary-secret")
+        .header("Content-Type", "application/json")
+        .body(at_limit)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let connection = response.headers()["acp-connection-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["result"]["protocolVersion"],
+        2
+    );
+    assert_eq!(
+        harness
+            .client
+            .delete(&harness.url)
+            .bearer_auth("boundary-secret")
+            .header("acp-connection-id", &connection)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    for missing in [&connection, "not-a-connection"] {
+        assert_eq!(
+            harness
+                .client
+                .delete(&harness.url)
+                .bearer_auth("boundary-secret")
+                .header("acp-connection-id", missing)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_delete_drains_accepted_prompt_behind_blocked_initialization() {
+    use tokio::io::AsyncReadExt as _;
+    async fn event(response: &mut reqwest::Response, buffer: &mut String) -> Value {
+        loop {
+            if let Some(end) = buffer.find("\n\n") {
+                let frame: String = buffer.drain(..end + 2).collect();
+                if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) {
+                    return serde_json::from_str(data).unwrap();
+                }
+            } else {
+                let chunk = response
+                    .chunk()
+                    .await
+                    .unwrap()
+                    .expect("SSE ended before setup");
+                buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+            }
+        }
+    }
+    // Exercise both ordinary DELETE and cancellation of its HTTP requester.
+    // Only the external ACP child boundary is fake; real HTTP/SDK mailboxes,
+    // adapter serialization, actor ownership, and teardown all participate.
+    for cancel_delete in [false, true] {
+        let harness = Harness::new().await;
+        harness.child().await;
+        let blocked = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        harness
+            .child_source(
+                "blocked",
+                r#"
+import sys,json,socket
+for line in sys.stdin:
+ req=json.loads(line)
+ if req['method']=='initialize':
+  with socket.create_connection(('127.0.0.1',int(sys.argv[1]))) as gate:
+   gate.sendall(b'R')
+   assert gate.recv(1)==b'G'
+  result={'protocolVersion':2,'info':{'name':'blocked','version':'1'},'capabilities':{}}
+ else: result={'sessionId':'blocked','configOptions':[]}
+ if 'id' in req: print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}),flush=True)
+"#,
+                &[blocked.local_addr().unwrap().port().to_string()],
+            )
+            .await;
+        let initialized = harness.client.post(&harness.url).bearer_auth("boundary-secret").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"drain-test","version":"1"},"capabilities":{}}})).send().await.unwrap();
+        assert_eq!(initialized.status(), StatusCode::OK);
+        let connection = initialized.headers()["acp-connection-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut stream = harness
+            .client
+            .get(&harness.url)
+            .bearer_auth("boundary-secret")
+            .header("acp-connection-id", &connection)
+            .header("acp-session-id", "resident")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        let post = |message: Value| {
+            harness
+                .client
+                .post(&harness.url)
+                .bearer_auth("boundary-secret")
+                .header("acp-connection-id", &connection)
+                .json(&message)
+        };
+        assert_eq!(post(json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"resident","cwd":harness.gateway.roots[0]}})).send().await.unwrap().status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buffer = String::new();
+            loop {
+                let message = event(&mut stream, &mut buffer).await;
+                if message["id"] == 2 {
+                    assert!(message.get("error").is_none(), "{message}");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(post(json!({"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"blocked","cwd":harness.gateway.roots[0]}})).send().await.unwrap().status(), StatusCode::ACCEPTED);
+        let (mut release, _) = tokio::time::timeout(Duration::from_secs(5), blocked.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ready = [0];
+        release.read_exact(&mut ready).await.unwrap();
+        assert_eq!(ready, [b'R']);
+        // A receives HTTP 202 while B still prevents adapter dispatch.
+        assert_eq!(post(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"resident","prompt":[]}})).send().await.unwrap().status(), StatusCode::ACCEPTED);
+        let delete = harness
+            .client
+            .delete(&harness.url)
+            .bearer_auth("boundary-secret")
+            .header("acp-connection-id", &connection);
+        let deletion = tokio::spawn(async move { delete.send().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response =
+                    post(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"id":999}}))
+                        .send()
+                        .await
+                        .unwrap();
+                if response.status() == StatusCode::CONFLICT {
+                    break;
+                }
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+            }
+        })
+        .await
+        .expect("DELETE did not close admission while initialization was blocked");
+        if cancel_delete {
+            deletion.abort();
+        }
+        release.write_all(b"G").await.unwrap();
+        let deleted = tokio::time::timeout(Duration::from_secs(5), deletion)
+            .await
+            .unwrap();
+        if cancel_delete {
+            assert!(deleted.unwrap_err().is_cancelled());
+        } else {
+            assert_eq!(deleted.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+        }
+        // Cancellation of the HTTP request cannot abandon server teardown.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = harness
+                    .client
+                    .get(&harness.url)
+                    .bearer_auth("boundary-secret")
+                    .header("acp-connection-id", &connection)
+                    .header("accept", "text/event-stream")
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() == StatusCode::NOT_FOUND {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("SDK connection was not removed after drain");
+        let attachment = harness
+            .call(json!({"op":"attach","session":"resident","replace":true,"replay":true}))
+            .await["attachment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        harness.handshake(&attachment).await;
+        harness
+            .events(&attachment, |events| {
+                events
+                    .iter()
+                    .any(|message| message["params"]["update"]["id"] == "started")
+            })
+            .await;
+        // The accepted prompt remains under resident ownership after DELETE.
+        harness.send(&attachment, json!({"jsonrpc":"2.0","method":"session/inject","params":{"sessionId":"resident"}})).await;
+        harness
+            .events(&attachment, |events| {
+                events
+                    .iter()
+                    .any(|message| message["params"]["update"]["state"] == "idle")
+            })
+            .await;
+    }
 }

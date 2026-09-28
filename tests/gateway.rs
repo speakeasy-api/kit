@@ -719,6 +719,32 @@ async fn running_prompt_finishes_unattached_and_replays_after_restart() {
     let mut reconnected = fixture.bridge(&url, Some(&id));
     assert_eq!(reconnected.handshake().await, id);
     assert_replayed_answer(&reconnected.updates, ANSWER);
+    // Transcript persistence precedes the final live state notification. A
+    // resumed stream can truthfully replay running, then deliver idle later.
+    timeout(WAIT, async {
+        while !reconnected
+            .updates
+            .iter()
+            .rev()
+            .find(|update| update["sessionUpdate"] == "state_update")
+            .is_some_and(|update| update["state"] == "idle")
+        {
+            let line = reconnected
+                .stdout
+                .next_line()
+                .await
+                .unwrap()
+                .expect("bridge closed before final idle");
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["method"] == "session/update" {
+                reconnected
+                    .updates
+                    .push(message["params"]["update"].clone());
+            }
+        }
+    })
+    .await
+    .expect("resumed stream never reached idle");
     let state = reconnected
         .updates
         .iter()

@@ -10,6 +10,7 @@ const OUTPUT_LIMIT_ERROR: &str = "experimental 8 MiB lifetime output limit excee
 
 pub(super) struct Connection {
     gateway: Arc<Gateway>,
+    boundary: Arc<http_boundary::Boundary>,
     initialize: Option<Value>,
     controls: HashMap<String, Control>,
 }
@@ -93,9 +94,10 @@ impl Control {
 }
 
 impl Connection {
-    pub(super) fn new(gateway: Arc<Gateway>) -> Self {
+    pub(super) fn new(gateway: Arc<Gateway>, boundary: Arc<http_boundary::Boundary>) -> Self {
         Self {
             gateway,
+            boundary,
             initialize: None,
             controls: HashMap::new(),
         }
@@ -117,6 +119,13 @@ impl Connection {
             .as_str()
             .ok_or_else(|| Failure::bad("ACP method required"))?
             .to_owned();
+        if method == http_boundary::DRAIN_METHOD {
+            let token = message["params"]["token"]
+                .as_str()
+                .ok_or_else(|| Failure::bad("drain token required"))?;
+            self.boundary.acknowledge(token).await;
+            return Ok(None);
+        }
         if method == "initialize" {
             if self.initialize.is_some() {
                 return Err(Failure::conflict("connection already initialized"));

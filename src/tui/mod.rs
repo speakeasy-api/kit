@@ -2895,7 +2895,7 @@ async fn run_client(
             voice.stop();
             voice.notify_state(&connection, &session_id);
             leave(&mut terminal);
-            print_exit_message(&app);
+            print_exit_message(&app, remote);
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
@@ -3880,21 +3880,30 @@ async fn bounded_graceful_close<T>(
 
 /// After the alternate screen is gone, leave the banner and the command that
 /// reopens this session, so nobody has to find the id in the session list.
-fn print_exit_message(app: &App) {
+fn print_exit_message(app: &App, remote: Option<&crate::gateway::Remote>) {
     use std::io::Write as _;
 
     let mut stdout = std::io::stdout();
-    let _ = writeln!(stdout);
+    let _ = write_exit_message(&mut stdout, app, remote);
+    let _ = stdout.flush();
+}
+
+fn write_exit_message(
+    output: &mut impl std::io::Write,
+    app: &App,
+    remote: Option<&crate::gateway::Remote>,
+) -> std::io::Result<()> {
+    writeln!(output)?;
     for line in ui::banner_lines() {
-        let _ = writeln!(stdout, "{line}");
+        writeln!(output, "{line}")?;
     }
     if let Some(command) = app.resume_command() {
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "resume this session with:");
-        let _ = writeln!(stdout, "  {command}");
+        let command = attachment_clipboard_text(app, remote, command);
+        writeln!(output)?;
+        writeln!(output, "resume this session with:")?;
+        writeln!(output, "  {command}")?;
     }
-    let _ = writeln!(stdout);
-    let _ = stdout.flush();
+    writeln!(output)
 }
 
 fn leave(terminal: &mut TerminalSession) {

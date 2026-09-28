@@ -6350,7 +6350,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_reconnect_clipboard_uses_current_session_and_quotes_arguments() {
+    fn remote_reconnect_clipboard_and_exit_use_current_session_and_quote_arguments() {
         let mut app = sample();
         app.root = PathBuf::from("/server/team's project");
         app.session_id = Some("s-current".into());
@@ -6369,6 +6369,15 @@ mod tests {
             crate::tui::attachment_clipboard_text(&app, None, local.clone()),
             local
         );
+        for (transport, expected) in [(Some(&remote), &command), (None, &local)] {
+            let mut output = Vec::new();
+            crate::tui::write_exit_message(&mut output, &app, transport).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(&format!("resume this session with:\n  {expected}\n")));
+            if transport.is_some() {
+                assert!(!output.contains(" --resume "), "{output}");
+            }
+        }
         let ordinary = "kit tui --root /another --resume s-other".to_string();
         assert_eq!(
             crate::tui::attachment_clipboard_text(&app, Some(&remote), ordinary.clone()),
