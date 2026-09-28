@@ -914,10 +914,13 @@ fn ensure_credential_binding(
     credentials: &auth::TokenRecord,
 ) -> Result<(), String> {
     let actual = credentials.binding().map_err(|error| error.to_string())?;
-    if &actual == expected {
+    // A fresh login changes generation, not necessarily account identity.
+    // Keep generation in authentication_attempt so continuation checks still
+    // invalidate provider state created before reauthentication.
+    if actual.account_id == expected.account_id {
         Ok(())
     } else {
-        Err("OpenAI credential account changed; start a new session".into())
+        Err("OpenAI credential account changed; restore the original account or restart Kit and resume this session".into())
     }
 }
 
@@ -1581,24 +1584,20 @@ mod tests {
     }
 
     #[test]
-    fn session_binding_rejects_generation_change() {
-        let expected = auth::test_support::token_record("a", "account", "one")
-            .binding()
-            .unwrap();
-        assert!(
-            ensure_credential_binding(
-                &expected,
-                &auth::test_support::token_record("b", "account", "one")
-            )
-            .is_ok()
+    fn credential_binding_accepts_reauthentication_but_rejects_account_changes() {
+        let original = auth::test_support::token_record("old", "account-one", "generation-one");
+        let expected = original.binding().unwrap();
+        let fresh = auth::test_support::token_record("new", "account-one", "generation-two");
+        assert!(ensure_credential_binding(&expected, &fresh).is_ok());
+        assert_ne!(
+            binding_string(&expected),
+            binding_string(&fresh.binding().unwrap())
         );
-        assert!(
-            ensure_credential_binding(
-                &expected,
-                &auth::test_support::token_record("c", "account", "two")
-            )
-            .is_err()
-        );
+
+        for generation in ["generation-one", "generation-two"] {
+            let other = auth::test_support::token_record("other", "account-two", generation);
+            assert!(ensure_credential_binding(&expected, &other).is_err());
+        }
     }
 
     #[tokio::test]
