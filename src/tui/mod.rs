@@ -1374,18 +1374,122 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     voice_enabled: bool,
     stop: &mut Stop,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The agent fixes itself to the canonical root, so the client resolves it
-    // up front: the header names a real directory and the ACP session opens on
-    // the same path the agent accepts.
-    let root = &root
-        .canonicalize()
-        .map_err(|error| Failure(format!("{}: {error}", root.display())))?;
+    run_client(
+        root,
+        model,
+        provider,
+        reasoning_effort,
+        a2a,
+        mcp_config,
+        credential_storage,
+        telemetry,
+        openrouter_api_key,
+        resume,
+        force,
+        voice_enabled,
+        stop,
+        None,
+    )
+    .await
+}
+
+fn client_root(root: &Path, remote: bool) -> Result<PathBuf, Failure> {
+    if remote {
+        if !root.is_absolute() {
+            return Err(Failure(
+                "remote root must be an absolute server path".into(),
+            ));
+        }
+        Ok(root.to_path_buf())
+    } else {
+        root.canonicalize()
+            .map_err(|error| Failure(format!("{}: {error}", root.display())))
+    }
+}
+
+// App emits local resume commands; translate that command at the transport boundary.
+// All other clipboard content must remain byte-for-byte unchanged.
+fn attachment_clipboard_text(
+    app: &App,
+    remote: Option<&crate::gateway::Remote>,
+    text: String,
+) -> String {
+    let Some(remote) = remote else {
+        return text;
+    };
+    if app.resume_command().as_deref() != Some(text.as_str()) {
+        return text;
+    }
+    let Some(id) = app.session_id.as_deref() else {
+        return text;
+    };
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    format!(
+        "kit tui --root {} --remote {} --remote-credential-file {} --remote-session {}",
+        quote(&app.root.to_string_lossy()),
+        quote(&remote.url),
+        quote(&remote.credential_file.to_string_lossy()),
+        quote(id),
+    )
+}
+
+/// Attach the terminal client without loading local provider or model configuration.
+pub async fn run_remote(
+    root: &Path,
+    remote: &crate::gateway::Remote,
+    stop: &mut Stop,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_client(
+        root,
+        "remote",
+        crate::ProviderKind::OpenAiSubscription,
+        None,
+        None,
+        None,
+        &CredentialStorage::Memory,
+        &crate::telemetry::Settings::default(),
+        None,
+        None,
+        false,
+        false,
+        stop,
+        Some(remote),
+    )
+    .await
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+async fn run_client(
+    root: &Path,
+    model: &str,
+    provider: crate::ProviderKind,
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    a2a: Option<&str>,
+    mcp_config: Option<&Path>,
+    credential_storage: &CredentialStorage,
+    telemetry: &crate::telemetry::Settings,
+    openrouter_api_key: Option<&crate::provider::OpenRouterApiKey>,
+    resume: Option<&str>,
+    force: bool,
+    voice_enabled: bool,
+    stop: &mut Stop,
+    remote: Option<&crate::gateway::Remote>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Local agents fix themselves to a canonical root. Remote paths belong to
+    // the gateway host and must never be resolved against the client filesystem.
+    let is_remote = remote.is_some();
+    let voice_enabled = voice_enabled && !is_remote;
+    let root = &client_root(root, is_remote)?;
     let credential_storage =
         credential_storage_for_launch(credential_storage, std::env::current_dir)?;
     let credential_storage = &credential_storage;
     let resume_session_id = resume.map(str::to_string);
+    // Seed routing before the handshake so an attached session's replay uses
+    // its real ID even though the bridge converts NewSession into Resume.
     let persisted_session_id = resume_session_id
         .clone()
+        .or_else(|| remote.and_then(|remote| remote.session.clone()))
         .unwrap_or_else(crate::session::new_id);
     let active_persisted_id = Arc::new(Mutex::new(ActiveSessionRoute {
         id: persisted_session_id.clone(),
@@ -1394,31 +1498,43 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
     let root = root.to_path_buf();
     let model = model.to_string();
     let a2a_address = a2a.map(str::to_string);
-    let a2a = a2a_address.clone().unwrap_or_else(|| "allocating…".into());
+    // Remote gateway children speak ACP only; no A2A listener is allocated.
+    let a2a = if is_remote {
+        String::new()
+    } else {
+        a2a_address.clone().unwrap_or_else(|| "allocating…".into())
+    };
     let mcp_config = mcp_config.map(Path::to_path_buf);
 
     {
         let launch_session_id = resume_session_id
             .as_deref()
             .unwrap_or(&persisted_session_id);
-        let mut command = agent_command_for_launch(
-            &root,
-            &model,
-            provider,
-            reasoning_effort,
-            openrouter_api_key,
-            a2a_address.as_deref(),
-            mcp_config.as_deref(),
-            telemetry,
-            credential_storage,
-            launch_session_id,
-            resume_session_id.is_some(),
-            force,
-        )?;
+        let mut command = if let Some(remote) = remote {
+            remote.command(&root)?
+        } else {
+            agent_command_for_launch(
+                &root,
+                &model,
+                provider,
+                reasoning_effort,
+                openrouter_api_key,
+                a2a_address.as_deref(),
+                mcp_config.as_deref(),
+                telemetry,
+                credential_storage,
+                launch_session_id,
+                resume_session_id.is_some(),
+                force,
+            )?
+        };
         let child_mcp_config = mcp_config.clone();
         let prepared = stop
             .until(async {
                 tokio::task::spawn_blocking(move || {
+                    if is_remote {
+                        return Ok(());
+                    }
                     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
                         crate::resilient_fs::global()
                             .require_disk(PathBuf::from(home).join(".kit/config.toml"))?;
@@ -1588,7 +1704,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                     std::io::Error::other("the agent did not negotiate ACP v2"),
                 ));
             }
-            let auth_methods = usable_terminal_auth_methods(&initialized.auth_methods);
+            let auth_methods = if is_remote {
+                Vec::new()
+            } else {
+                usable_terminal_auth_methods(&initialized.auth_methods)
+            };
             let can_steer = initialized.capabilities.session.as_ref()
                 .and_then(|session| session.inject.as_ref())
                 .is_some_and(|inject| {
@@ -2100,6 +2220,11 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                 }
                             }
                             match action {
+                                Action::Usage(_) | Action::Voice(_) | Action::Login(_)
+                                | Action::New(_) | Action::ListSessions | Action::RenameSession { .. }
+                                | Action::Resume(_) if is_remote => {
+                                    app.note("This action is unavailable in a remote attachment. Use kit gateway list, then restart kit tui with --remote-session to switch; omit --remote-session to create. Configure provider authentication on the gateway host.");
+                                }
                                 Action::Quit => return Ok(()),
 
                                 Action::Usage(provider) => {
@@ -2473,7 +2598,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                             app.note(format!(
                                                 "reasoning effort changed to {effort}"
                                             ));
-                                            if save_defaults {
+                                            if save_defaults && is_remote {
+                                                app.note("Remote reasoning effort changed for this session only; local defaults were not saved.");
+                                            }
+                                            if save_defaults && !is_remote {
                                                 let saved = {
                                                     let effort = effort.clone();
                                                     tokio::task::spawn_blocking(move || save_effort_default(&effort)).await.map_err(|error| error.to_string()).and_then(|result| result)
@@ -2599,6 +2727,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     }
                                 }
                                 Action::Copy(text) => {
+                                    let text = attachment_clipboard_text(&app, remote, text);
                                     execute!(terminal.backend_mut(), Print(osc52(&text)))
                                         .map_err(agent_client_protocol::Error::into_internal_error)?;
                                 }
@@ -2696,7 +2825,10 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
                                     app.usage = None;
                                     refresh_config_state(&mut app, Some(&response.config_options));
                                     app.note(format!("model changed to {} via {}", choice.model, choice.provider));
-                                    if save_defaults {
+                                    if save_defaults && is_remote {
+                                        app.note("Remote model changed for this session only; local defaults were not saved.");
+                                    }
+                                    if save_defaults && !is_remote {
                                         let saved = {
                                             let choice = choice.clone();
                                             tokio::task::spawn_blocking(move || save_model_defaults(&choice)).await.map_err(|error| error.to_string()).and_then(|result| result)
@@ -2767,14 +2899,19 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
             // Closing the ACP session removes its driver from the server,
             // dropping the transcript observer and its filesystem lock. Merely
             // closing stdio does not ask the headless runtime to close sessions.
-            let closed = bounded_graceful_close(
-                connection
-                    .send_request(CloseSessionRequest::new(session_id))
-                    .block_task(),
-                stop.requested(),
-                CLOSE_SESSION,
-            )
-            .await;
+            // Disconnecting a bridge must not close its durable remote session.
+            let closed = if is_remote {
+                None
+            } else {
+                bounded_graceful_close(
+                    connection
+                        .send_request(CloseSessionRequest::new(session_id))
+                        .block_task(),
+                    stop.requested(),
+                    CLOSE_SESSION,
+                )
+                .await
+            };
             result?;
             if let Some(closed) = closed {
                 closed?;
@@ -2791,7 +2928,7 @@ pub async fn run_with_reasoning_effort_and_openrouter_key(
         let shutdown_result = watcher.await;
         // If the server failed before acknowledging CloseSession, reclaim only a
         // lock that is now provably stale; a live owner's OS lock is never stolen.
-        if let Ok(active) = active_persisted_id.lock() {
+        if !is_remote && let Ok(active) = active_persisted_id.lock() {
             let _ = crate::session::remove_stale_lock(&cleanup_root, &active.id);
         }
 
@@ -4381,6 +4518,18 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags};
 
     use serde_json::json;
+
+    #[test]
+    fn remote_root_is_absolute_and_not_resolved_locally() {
+        let root = std::path::Path::new("/server-only/workspace/../project");
+        assert_eq!(super::client_root(root, true).unwrap(), root);
+        assert!(super::client_root(std::path::Path::new("relative/server"), true).is_err());
+        let local = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::client_root(local.path(), false).unwrap(),
+            local.path().canonicalize().unwrap()
+        );
+    }
 
     use super::{
         ActiveSessionRoute, AgentInvocation, BackgroundCompletion, ClipboardResult,

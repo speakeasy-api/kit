@@ -981,10 +981,12 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) -> Option<Rect> {
             vec![Span::styled(id.clone(), theme::dim())],
         ));
     }
-    right.push(header_field(
-        0,
-        vec![Span::styled(format!("a2a {}", app.a2a), theme::faint())],
-    ));
+    if !app.a2a.is_empty() {
+        right.push(header_field(
+            0,
+            vec![Span::styled(format!("a2a {}", app.a2a), theme::faint())],
+        ));
+    }
 
     let join = |fields: &[(u8, Vec<Span<'static>>)], separator: &str| {
         let mut spans = Vec::new();
@@ -6345,6 +6347,53 @@ mod tests {
                 ["kit", "tui", "--root", root, "--resume", "session-1"]
             );
         }
+    }
+
+    #[test]
+    fn remote_reconnect_clipboard_uses_current_session_and_quotes_arguments() {
+        let mut app = sample();
+        app.root = PathBuf::from("/server/team's project");
+        app.session_id = Some("s-current".into());
+        let remote = crate::gateway::Remote {
+            url: "https://gateway.example/kit?a=b&c=d".into(),
+            credential_file: PathBuf::from("/client/team's credential"),
+            session: Some("s-original".into()),
+        };
+        let local = app.resume_command().unwrap();
+        let command = crate::tui::attachment_clipboard_text(&app, Some(&remote), local.clone());
+        assert_eq!(
+            command,
+            "kit tui --root '/server/team'\\''s project' --remote 'https://gateway.example/kit?a=b&c=d' --remote-credential-file '/client/team'\\''s credential' --remote-session 's-current'"
+        );
+        assert_eq!(
+            crate::tui::attachment_clipboard_text(&app, None, local.clone()),
+            local
+        );
+        let ordinary = "kit tui --root /another --resume s-other".to_string();
+        assert_eq!(
+            crate::tui::attachment_clipboard_text(&app, Some(&remote), ordinary.clone()),
+            ordinary
+        );
+        app.session_id = None;
+        assert_eq!(
+            crate::tui::attachment_clipboard_text(&app, Some(&remote), local.clone()),
+            local
+        );
+    }
+
+    #[test]
+    fn header_omits_a2a_when_no_listener_is_expected() {
+        let mut app = sample();
+        app.a2a.clear();
+        let frame = render(&mut app, 240, 24);
+        let header = frame.lines().next().expect("header row");
+        assert!(!header.contains("a2a"), "{header}");
+        assert!(!header.contains("allocating"), "{header}");
+
+        app.a2a = "allocating…".into();
+        let frame = render(&mut app, 240, 24);
+        let header = frame.lines().next().expect("header row");
+        assert!(header.contains("a2a allocating"), "{header}");
     }
 
     #[test]

@@ -29,6 +29,7 @@ mod fatal;
 mod file_search;
 #[path = "resilient_fs/mod.rs"]
 mod filesystem;
+pub mod gateway;
 mod managed_files;
 pub mod plugins;
 pub(crate) mod process_tree;

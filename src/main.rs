@@ -709,6 +709,7 @@ impl ConfigAction {
 
 impl Command {
     fn augment_command(command: clap::Command) -> clap::Command {
+        let command = command.subcommand(kit::gateway::Args::command());
         let command = command.subcommand(
             clap::Command::new("update")
                 .about("Update Kit using its detected installation method")
@@ -1064,6 +1065,15 @@ impl Command {
         let command = command.subcommand({
             let command = clap::Command::new("tui").about("Start the ACP-backed terminal client");
             let command = command.group(clap::ArgGroup::new("Tui").multiple(true));
+            let command = command
+                .arg(clap::Arg::new("remote").long("remote").value_name("URL")
+                    .requires_all(["remote_credential_file", "root"])
+                    .conflicts_with_all(["resume", "force", "model", "provider", "reasoning_effort", "a2a"])
+                    .help("Connect to a remote Kit gateway"))
+                .arg(clap::Arg::new("remote_credential_file").long("remote-credential-file")
+                    .value_name("FILE").value_parser(clap::value_parser!(PathBuf)).requires("remote"))
+                .arg(clap::Arg::new("remote_session").long("remote-session")
+                    .value_name("ID").requires("remote"));
             let command = command.arg(
                 clap::Arg::new("root")
                     .long("root")
@@ -1153,6 +1163,7 @@ impl Command {
                 },
                 root: optional_arg(matches, "root")?,
             }),
+            "gateway" => Ok(Self::Gateway(kit::gateway::Args::from_matches(matches)?)),
             "serve" => Ok(Self::Serve {
                 root: optional_arg(matches, "root")?,
                 model: optional_arg(matches, "model")?,
@@ -1197,6 +1208,9 @@ impl Command {
             }),
             #[cfg(feature = "tui")]
             "tui" => Ok(Self::Tui {
+                remote: optional_arg(matches, "remote")?,
+                remote_credential_file: optional_arg(matches, "remote_credential_file")?,
+                remote_session: optional_arg(matches, "remote_session")?,
                 root: optional_arg(matches, "root")?,
                 model: optional_arg(matches, "model")?,
                 provider: optional_arg(matches, "provider")?,
@@ -1625,6 +1639,7 @@ enum SessionsAction {
 }
 
 enum Command {
+    Gateway(kit::gateway::Args),
     Usage {
         provider: Option<String>,
         credentials: CredentialArgs,
@@ -1734,6 +1749,9 @@ enum Command {
     /// Start the ACP-backed terminal client.
     #[cfg(feature = "tui")]
     Tui {
+        remote: Option<String>,
+        remote_credential_file: Option<PathBuf>,
+        remote_session: Option<String>,
         /// Working directory and project context (defaults to config or `.`).
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
@@ -2094,6 +2112,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .terminal_auth_login()
         .map(|(provider, _)| provider);
     match cli.command {
+        Command::Gateway(args) => kit::gateway::run(args).await?,
         Command::Update { dry_run } => update::run(dry_run)?,
         Command::Init => {
             tokio::task::spawn_blocking(init_default_config).await??;
@@ -2462,6 +2481,9 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "tui")]
         Command::Tui {
+            remote,
+            remote_credential_file,
+            remote_session,
             root,
             model,
             provider,
@@ -2471,6 +2493,16 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             resume,
             force,
         } => {
+            if let Some(url) = remote {
+                let root = root.ok_or("--remote requires --root")?;
+                let remote = kit::gateway::Remote {
+                    url,
+                    credential_file: remote_credential_file
+                        .ok_or("--remote requires --remote-credential-file")?,
+                    session: remote_session,
+                };
+                return kit::tui::run_remote(&root, &remote, &mut kit::tui::Stop::new()?).await;
+            }
             let (config, telemetry_settings, _telemetry, openrouter_api_key) = initialize.await?;
             // The TUI child reloads this config, but validate profile names and
             // the selected reference before starting that subprocess.
@@ -2591,6 +2623,62 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["kit", "usage", "openai", "extra"]).is_err());
         assert!(Cli::try_parse_from(["kit", "usage", "typesafe"]).is_err());
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn remote_tui_requires_explicit_gateway_credentials_and_root() {
+        let base = [
+            "kit",
+            "tui",
+            "--remote",
+            "https://gateway.example",
+            "--remote-credential-file",
+            "/client/credential",
+            "--root",
+            "/server/project",
+        ];
+        let mut args = base.to_vec();
+        args.extend(["--remote-session", "s-remote"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Tui {
+            remote,
+            remote_credential_file,
+            remote_session,
+            root,
+            resume,
+            ..
+        } = cli.command
+        else {
+            panic!("expected tui command");
+        };
+        assert_eq!(remote.as_deref(), Some("https://gateway.example"));
+        assert_eq!(
+            remote_credential_file.as_deref(),
+            Some(std::path::Path::new("/client/credential"))
+        );
+        assert_eq!(remote_session.as_deref(), Some("s-remote"));
+        assert_eq!(
+            root.as_deref(),
+            Some(std::path::Path::new("/server/project"))
+        );
+        assert!(resume.is_none());
+        for flag in ["--remote-credential-file", "--root"] {
+            let mut args = base.to_vec();
+            let index = args.iter().position(|arg| *arg == flag).unwrap();
+            args.drain(index..index + 2);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for extra in [
+            vec!["--resume"],
+            vec!["--model", "local-model"],
+            vec!["--provider", "openai"],
+        ] {
+            let mut args = base.to_vec();
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from(["kit", "tui", "--remote-session", "s-remote"]).is_err());
     }
 
     #[cfg(feature = "tui")]

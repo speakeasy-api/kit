@@ -282,3 +282,7 @@ If an external hard kill leaves the shell in raw mode or mouse reporting appears
 Use `/usage [provider]` to check account quotas or key spend without sending a
 model prompt. See [Provider usage](provider-usage.md) for supported providers,
 credentials, and the meaning of the reported limits.
+
+## Remote terminal sessions
+
+For an authenticated terminal attachment to a private gateway host, see [Private-network gateway](gateway.md). The gateway owns execution across terminal disconnects; provider credentials and tools stay on the host.

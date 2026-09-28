@@ -15,10 +15,10 @@ use tower::ServiceExt as _;
 use crate::runtime::Runtime;
 
 #[derive(Clone)]
-struct BearerToken(Vec<u8>);
+pub(crate) struct BearerToken(Vec<u8>);
 
 impl BearerToken {
-    fn load(path: &Path) -> io::Result<Self> {
+    pub(crate) fn load(path: &Path) -> io::Result<Self> {
         let mut token = crate::resilient_fs::read(path).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -46,7 +46,7 @@ impl BearerToken {
         Ok(Self(token))
     }
 
-    fn authorizes(&self, headers: &HeaderMap) -> bool {
+    pub(crate) fn authorizes(&self, headers: &HeaderMap) -> bool {
         let Some(value) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
