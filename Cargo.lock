@@ -81,7 +81,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol"
 version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=2f039993d1d6ed8da35b38c31f54a7cbb7338c70#2f039993d1d6ed8da35b38c31f54a7cbb7338c70"
+source = "git+https://github.com/danielkov/rust-sdk.git?rev=3e20af18f1b4ff86e8332b17eeafd59058c1f11d#3e20af18f1b4ff86e8332b17eeafd59058c1f11d"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -104,7 +104,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=2f039993d1d6ed8da35b38c31f54a7cbb7338c70#2f039993d1d6ed8da35b38c31f54a7cbb7338c70"
+source = "git+https://github.com/danielkov/rust-sdk.git?rev=3e20af18f1b4ff86e8332b17eeafd59058c1f11d#3e20af18f1b4ff86e8332b17eeafd59058c1f11d"
 dependencies = [
  "quote",
  "syn 3.0.4",
@@ -113,7 +113,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-http"
 version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=2f039993d1d6ed8da35b38c31f54a7cbb7338c70#2f039993d1d6ed8da35b38c31f54a7cbb7338c70"
+source = "git+https://github.com/danielkov/rust-sdk.git?rev=3e20af18f1b4ff86e8332b17eeafd59058c1f11d#3e20af18f1b4ff86e8332b17eeafd59058c1f11d"
 dependencies = [
  "agent-client-protocol",
  "async-stream",
@@ -4633,9 +4633,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",

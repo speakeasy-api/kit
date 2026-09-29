@@ -5,20 +5,34 @@ use axum::{
     http::{Method, header},
 };
 use std::sync::Weak;
+use tokio::sync::Semaphore;
 use tower::ServiceExt as _;
 
 const MAX_BODY: usize = 1024 * 1024;
+const MAX_REQUESTS: usize = 32;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const DRAIN_METHOD: &str = "_kit/gateway/drain";
 
-#[derive(Default)]
 pub(super) struct Boundary {
+    // One owner per outer POST/DELETE, including gate waiters and detached
+    // drain tasks. Acquire before touching request bodies or registries.
+    requests: Arc<Semaphore>,
     // Writers: admission lookup/prune only. Weak entries retire on completion,
     // cancellation, or unwind; arbitrary connection IDs cannot accumulate.
     admission: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
     // Writers: DELETE publishes, adapter acknowledges/removes, next DELETE
     // prunes expired entries. The drain task owns the only strong sender.
     drains: Mutex<HashMap<String, Weak<watch::Sender<bool>>>>,
+}
+
+impl Default for Boundary {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(MAX_REQUESTS)),
+            admission: Mutex::new(HashMap::new()),
+            drains: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl Boundary {
@@ -50,35 +64,34 @@ impl Boundary {
 
 pub(super) async fn handle(
     State((boundary, sdk)): State<(Arc<Boundary>, Router)>,
-    mut request: axum::extract::Request,
+    request: axum::extract::Request,
     next: Next,
 ) -> Response {
     if request.uri().path() != "/acp/v2" {
         return next.run(request).await;
     }
-    if request.method() == Method::POST {
-        if request
+    if !matches!(*request.method(), Method::POST | Method::DELETE) {
+        return next.run(request).await;
+    }
+    let Ok(permit) = boundary.requests.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway request admission is full; request was not admitted; prior submission outcome may be unknown; do not resubmit accepted work",
+        )
+            .into_response();
+    };
+    if request.method() == Method::POST
+        && request
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|length| length > MAX_BODY as u64)
-        {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        }
-        // DefaultBodyLimit does not constrain the SDK's raw Request handler.
-        // Consume with an actual byte bound, including chunked/unknown lengths,
-        // before parsing or allowing any frame into the SDK mailbox.
-        let (parts, body) = request.into_parts();
-        let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
-            Ok(bytes) => bytes,
-            Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-        };
-        request = axum::extract::Request::from_parts(parts, Body::from(bytes));
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
-    if !matches!(*request.method(), Method::POST | Method::DELETE) {
-        return next.run(request).await;
-    }
+    // The bounded SDK enforces the actual byte limit (including chunked or
+    // unknown lengths). Do not consume a second body before its admission.
     let Some(id) = request.headers().get("acp-connection-id").cloned() else {
         return next.run(request).await;
     };
@@ -123,7 +136,7 @@ pub(super) async fn handle(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json"),
     );
-    let (sender, mut acknowledged) = watch::channel(false);
+    let (sender, acknowledged) = watch::channel(false);
     let owner = Arc::new(sender);
     {
         let mut drains = boundary.drains.lock().await;
@@ -135,7 +148,21 @@ pub(super) async fn handle(
     }
     drop(closing);
     let work = tokio::spawn(async move {
-        let _owner = owner;
+        // Dropping the HTTP future must not release capacity while this task
+        // still retains a barrier, request body, or connection generation.
+        // Bind captures as locals in ownership order: reverse local drop
+        // order releases gates/bodies/barriers before capacity, including on
+        // early return or unwind. No suspension precedes this transfer.
+        let (_permit, _owner, gate, request, barrier, sdk, next, mut acknowledged) = (
+            permit,
+            owner,
+            gate,
+            request,
+            barrier,
+            sdk,
+            next,
+            acknowledged,
+        );
         // Re-enter the unwrapped SDK router to select POST. Next is already
         // bound to the selected DELETE route and cannot redispatch methods.
         let response = match sdk.oneshot(barrier).await {
@@ -200,6 +227,194 @@ mod tests {
             (Arc::new(Boundary::default()), sdk),
             handle,
         ))
+    }
+
+    fn wrapped_with(boundary: Arc<Boundary>, sdk: Router) -> Router {
+        sdk.clone()
+            .layer(middleware::from_fn_with_state((boundary, sdk), handle))
+    }
+
+    fn named_request(method: Method, id: &str, body: Body) -> axum::extract::Request {
+        let mut request = request(method);
+        request.headers_mut().insert(
+            "acp-connection-id",
+            header::HeaderValue::from_str(id).unwrap(),
+        );
+        *request.body_mut() = body;
+        request
+    }
+
+    fn pending_body() -> Body {
+        Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >())
+    }
+
+    fn unpollable_body() -> Body {
+        Body::from_stream(futures_util::stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<axum::body::Bytes, std::io::Error>>> {
+                panic!("rejected request body must not be polled")
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn saturation_rejects_before_body_poll_and_cancellation_reuses_permit() {
+        // Exercise both arbitrary IDs and waiters on one connection gate.
+        for same_id in [false, true] {
+            let boundary = Arc::new(Boundary::default());
+            let sdk = Router::new().route(
+                "/acp/v2",
+                axum::routing::post(|request: axum::extract::Request| async move {
+                    axum::body::to_bytes(request.into_body(), MAX_BODY)
+                        .await
+                        .unwrap();
+                    StatusCode::ACCEPTED
+                }),
+            );
+            let app = wrapped_with(boundary.clone(), sdk);
+            let mut waiting = Vec::new();
+            for index in 0..MAX_REQUESTS {
+                let id = if same_id {
+                    "shared".to_owned()
+                } else {
+                    format!("id-{index}")
+                };
+                let mut pending = Box::pin(app.clone().oneshot(named_request(
+                    Method::POST,
+                    &id,
+                    pending_body(),
+                )));
+                assert!(futures_util::poll!(&mut pending).is_pending());
+                waiting.push(pending);
+            }
+            for method in [Method::POST, Method::DELETE] {
+                assert_eq!(
+                    app.clone()
+                        .oneshot(named_request(method, "overflow", unpollable_body()))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            assert!(boundary.admission.lock().await.len() <= MAX_REQUESTS);
+            drop(waiting.pop());
+            assert_eq!(
+                app.clone()
+                    .oneshot(named_request(Method::POST, "replacement", Body::from("{}")))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::ACCEPTED
+            );
+            drop(waiting);
+            // Sequential unique IDs cannot grow the weak registry indefinitely.
+            for index in 0..MAX_REQUESTS * 2 {
+                assert_eq!(
+                    app.clone()
+                        .oneshot(named_request(
+                            Method::POST,
+                            &format!("churn-{index}"),
+                            Body::from("{}")
+                        ))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::ACCEPTED
+                );
+                assert!(boundary.admission.lock().await.len() <= MAX_REQUESTS);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_keeps_permit_until_background_drain_finishes() {
+        let boundary = Arc::new(Boundary::default());
+        let (tokens, mut received) = mpsc::unbounded_channel();
+        let (deleted, mut deletions) = mpsc::unbounded_channel();
+        let sdk = Router::new().route(
+            "/acp/v2",
+            axum::routing::post(move |Json(message): Json<Value>| {
+                let tokens = tokens.clone();
+                async move {
+                    if message["method"] == DRAIN_METHOD {
+                        tokens
+                            .send(message["params"]["token"].as_str().unwrap().to_owned())
+                            .unwrap();
+                    }
+                    StatusCode::ACCEPTED
+                }
+            })
+            .delete(move || {
+                let deleted = deleted.clone();
+                async move {
+                    deleted.send(()).unwrap();
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let app = wrapped_with(boundary.clone(), sdk);
+        let mut waiting = Vec::new();
+        for index in 0..MAX_REQUESTS - 1 {
+            let mut pending = Box::pin(app.clone().oneshot(named_request(
+                Method::POST,
+                &format!("pending-{index}"),
+                pending_body(),
+            )));
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            waiting.push(pending);
+        }
+        let mut deletion = Box::pin(app.clone().oneshot(request(Method::DELETE)));
+        assert!(futures_util::poll!(&mut deletion).is_pending());
+        let token = received.recv().await.unwrap();
+        drop(deletion);
+        assert_eq!(
+            app.clone()
+                .oneshot(named_request(Method::POST, "overflow", unpollable_body()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        boundary.acknowledge(&token).await;
+        // Wait for the task's real RAII release, not a timing-dependent yield.
+        let released = boundary.requests.clone().acquire_owned().await.unwrap();
+        drop(released);
+        assert_eq!(deletions.try_recv(), Ok(()));
+        assert_eq!(
+            app.oneshot(request(Method::POST)).await.unwrap().status(),
+            StatusCode::ACCEPTED
+        );
+        assert!(boundary.drains.lock().await.is_empty());
+        drop(waiting);
+    }
+
+    #[tokio::test]
+    async fn expired_drain_registrations_are_bounded_under_unique_id_churn() {
+        let boundary = Arc::new(Boundary::default());
+        let sdk = Router::new().route(
+            "/acp/v2",
+            axum::routing::post(|| async { StatusCode::NOT_FOUND })
+                .delete(|| async { StatusCode::IM_A_TEAPOT }),
+        );
+        let app = wrapped_with(boundary.clone(), sdk);
+        for index in 0..MAX_REQUESTS * 2 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(named_request(
+                        Method::DELETE,
+                        &format!("gone-{index}"),
+                        Body::empty()
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert!(boundary.admission.lock().await.len() <= MAX_REQUESTS);
+            assert!(boundary.drains.lock().await.len() <= MAX_REQUESTS);
+        }
     }
 
     #[tokio::test(start_paused = true)]

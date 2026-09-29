@@ -1,17 +1,14 @@
 //! ACP HTTP connection adapter. Only the resident actor owns execution.
 use super::*;
-use agent_client_protocol::{Agent, Channel, ConnectTo, TransportFrame};
+use agent_client_protocol::{
+    Agent, BoundedChannel, ChannelLimits, ChargedFrame, ConnectTo, TransportFrame,
+};
 use futures_util::StreamExt;
-
-// Reserved in addition to ordinary lifetime output; never grows with session
-// count, request IDs, or the size of the message that exhausted the budget.
-const TERMINAL_ALLOWANCE: usize = 4096;
-const OUTPUT_LIMIT_ERROR: &str = "experimental 8 MiB lifetime output limit exceeded; resident session continues; live replay may be unavailable; reconnect with session/resume without replay";
 
 pub(super) struct Connection {
     gateway: Arc<Gateway>,
     boundary: Arc<http_boundary::Boundary>,
-    initialize: Option<Value>,
+    initialize: Option<(Value, Arc<ChargedFrame>)>,
     controls: HashMap<String, Control>,
 }
 
@@ -51,13 +48,26 @@ impl Control {
             .map_err(|_| Failure::unavailable("resident child exited"))?
     }
 
-    async fn send(&mut self, message: Value) -> ResultValue {
-        let id = message.get("id").cloned();
+    async fn send(&mut self, message: Value, charge: Arc<ChargedFrame>) -> ResultValue {
+        // Responses and notifications never occupy pending request capacity.
+        let id = message
+            .get("id")
+            .filter(|_| message.get("method").is_some())
+            .cloned();
+        if let Some(id) = &id {
+            if self.pending.contains_key(&id.to_string()) {
+                return Err(Failure::conflict("request id already pending"));
+            }
+            if self.pending.len() >= ChannelLimits::default().max_pending_requests {
+                return Err(Failure::unavailable("pending request capacity exhausted"));
+            }
+        }
         let result = self
             .call(Request::Send {
                 session: self.session.clone(),
                 attachment: self.attachment.clone(),
                 message,
+                charge: Some(charge),
             })
             .await?;
         if let Some(id) = id {
@@ -112,8 +122,8 @@ impl Connection {
     async fn request(
         &mut self,
         mut message: Value,
-        channel: &Channel,
-        output_bytes: &mut usize,
+        channel: &BoundedChannel,
+        charge: &Arc<ChargedFrame>,
     ) -> Result<Option<Value>, Failure> {
         let method = message["method"]
             .as_str()
@@ -139,7 +149,7 @@ impl Connection {
                 }
                 session.insert("list".into(), object([]));
             }
-            self.initialize = Some(message.clone());
+            self.initialize = Some((message.clone(), Arc::clone(charge)));
             return Ok(Some(object([
                 ("protocolVersion", 2.into()),
                 (
@@ -156,9 +166,10 @@ impl Connection {
                         "kit/gateway",
                         object([
                             ("experimental", true.into()),
-                            ("connectionOutputLimitBytes", MAX_REPLAY.into()),
-                            ("connectionOutputLimitScope", "lifetime".into()),
-                            ("terminalOutputAllowanceBytes", TERMINAL_ALLOWANCE.into()),
+                            ("transport", "bounded-http".into()),
+                            ("maxFrameBytes", 1_048_576.into()),
+                            ("coreBufferedBytesPerDirection", 16_777_216.into()),
+                            ("httpEgressBytesPerConnection", 4_194_304.into()),
                             ("liveReplayLimitBytes", MAX_REPLAY.into()),
                             ("liveReplayLimitEvents", (MAX_QUEUE - 2).into()),
                         ]),
@@ -295,18 +306,18 @@ impl Connection {
                 cursor: 0,
                 pending: HashMap::new(),
             };
-            let mut initialize = self
+            let (mut initialize, initialize_charge) = self
                 .initialize
                 .clone()
                 .ok_or_else(|| Failure::bad("initialize required"))?;
             initialize["id"] = Value::String(crate::session::new_id());
             let initialize_id = initialize["id"].clone();
-            control.send(initialize).await?;
+            control.send(initialize, initialize_charge).await?;
             // Setup is serialized before the session request; the actor, not
             // this wait, owns the child request. Cancellation only drops a lease.
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    self.flush(channel, output_bytes)
+                    self.flush(channel)
                         .await
                         .map_err(|error| Failure::unavailable(error.to_string()))?;
                     for output in control.poll().await? {
@@ -323,7 +334,7 @@ impl Connection {
             .await
             .map_err(|_| Failure::unavailable("child initialization timed out"))??;
             message["params"]["cwd"] = created["root"].clone();
-            control.send(message).await?;
+            control.send(message, Arc::clone(charge)).await?;
             self.controls.insert(session, control);
             return Ok(None);
         }
@@ -334,21 +345,17 @@ impl Connection {
             .controls
             .get_mut(id)
             .ok_or_else(|| Failure::conflict("resume session before controlling it"))?;
-        control.send(message).await?;
+        control.send(message, Arc::clone(charge)).await?;
         Ok(None)
     }
 
-    async fn flush(
-        &mut self,
-        channel: &Channel,
-        output_bytes: &mut usize,
-    ) -> agent_client_protocol::Result<()> {
+    async fn flush(&mut self, channel: &BoundedChannel) -> agent_client_protocol::Result<()> {
         let mut failed = Vec::new();
         for (id, control) in &mut self.controls {
             match control.poll().await {
                 Ok(messages) => {
                     for message in messages {
-                        send(channel, message, output_bytes)?;
+                        send(channel, message)?;
                     }
                 }
                 Err(error) => failed.push((id.clone(), error)),
@@ -372,7 +379,6 @@ impl Connection {
                                 ]),
                             ),
                         ]),
-                        output_bytes,
                     )?;
                 }
             }
@@ -380,13 +386,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn run(mut self, mut channel: Channel) -> agent_client_protocol::Result<()> {
-        // The pinned SDK mailbox is unbounded. Bound the total bytes produced
-        // by one connection, even when an SSE reader disappears without DELETE.
-        // The SDK has further unbounded queues and no delivery acknowledgement:
-        // channel.tx.len() cannot measure outstanding HTTP output. This is an
-        // explicitly advertised experimental lifetime limit, NOT backpressure.
-        let mut output_bytes = 0;
+    async fn run(mut self, mut channel: BoundedChannel) -> agent_client_protocol::Result<()> {
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         loop {
             let frame = {
@@ -398,10 +398,13 @@ impl Connection {
                 }
             };
             if let Some(frame) = frame {
-                let Some(frame) = frame else {
+                let Some(charged_frame) = frame else {
                     return Ok(());
                 };
-                let messages = match frame {
+                let charged_frame = Arc::new(charged_frame);
+                // Retain admission through every decoded batch entry and actor await.
+                // Child-bound messages share this lease until writer serialization.
+                let messages = match charged_frame.decode() {
                     TransportFrame::Single(message) => vec![message],
                     TransportFrame::Batch(batch) => batch
                         .into_entries()
@@ -419,13 +422,19 @@ impl Connection {
                 for message in messages {
                     let message = serde_json::to_value(message).map_err(sdk_error)?;
                     let id = message.get("id").cloned();
-                    let response = match self.request(message, &channel, &mut output_bytes).await {
+                    let response = match self.request(message, &channel, &charged_frame).await {
                         Ok(Some(result)) => id.map(|id| {
                             object([("jsonrpc", "2.0".into()), ("id", id), ("result", result)])
                         }),
                         Ok(None) => None,
-                        Err(error) => id.map(|id| {
-                            object([
+                        Err(error) => {
+                            // A notification has no reply ID. If actor admission
+                            // rejects it, fail the transport instead of hiding
+                            // accepted-but-unperformed work from the sender.
+                            let Some(id) = id else {
+                                return Err(channel.tx.fail(&error.1));
+                            };
+                            Some(object([
                                 ("jsonrpc", "2.0".into()),
                                 ("id", id),
                                 (
@@ -435,18 +444,19 @@ impl Connection {
                                         ("message", error.1.into()),
                                     ]),
                                 ),
-                            ])
-                        }),
+                            ]))
+                        }
                     };
                     if let Some(response) = response {
-                        send(&channel, response, &mut output_bytes)?;
+                        send(&channel, response)?;
                     }
-                    self.flush(&channel, &mut output_bytes).await?;
+                    self.flush(&channel).await?;
                 }
+                drop(charged_frame);
             }
             // Drain after every inbound frame as well as idle ticks; a busy
             // client cannot starve updates or let its own controller lease lapse.
-            self.flush(&channel, &mut output_bytes).await?;
+            self.flush(&channel).await?;
         }
     }
 }
@@ -454,87 +464,28 @@ impl Connection {
 fn sdk_error(error: impl std::fmt::Display) -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data(error.to_string())
 }
-fn send(
-    channel: &Channel,
-    message: Value,
-    output_bytes: &mut usize,
-) -> agent_client_protocol::Result<()> {
-    if *output_bytes > MAX_REPLAY {
-        return Err(sdk_error(OUTPUT_LIMIT_ERROR));
-    }
-    let bytes = message.to_string().len();
-    if bytes > MAX_REPLAY - *output_bytes {
-        // Send one final, bounded protocol frame before closing. A response can
-        // settle its original call; an unsolicited update uses ACP's advisory
-        // notice rather than falsely claiming resident execution has stopped.
-        let error = |id| {
-            object([
-                ("jsonrpc", "2.0".into()),
-                ("id", id),
-                (
-                    "error",
-                    object([
-                        ("code", (-32000).into()),
-                        ("message", OUTPUT_LIMIT_ERROR.into()),
-                    ]),
-                ),
-            ])
-        };
-        let mut terminal = if let Some(id) = message.get("id") {
-            error(id.clone())
-        } else if let Some(session) = message["params"].get("sessionId") {
-            object([
-                ("jsonrpc", "2.0".into()),
-                ("method", "session/update".into()),
-                (
-                    "params",
-                    object([
-                        ("sessionId", session.clone()),
-                        (
-                            "update",
-                            object([
-                                ("sessionUpdate", "notice".into()),
-                                ("severity", "error".into()),
-                                ("title", "Gateway connection output limit reached".into()),
-                                ("description", OUTPUT_LIMIT_ERROR.into()),
-                            ]),
-                        ),
-                    ]),
-                ),
-            ])
-        } else {
-            error(Value::Null)
-        };
-        // A client-supplied request ID must not consume an unbounded reserve.
-        if terminal.to_string().len() > TERMINAL_ALLOWANCE {
-            terminal = error(Value::Null);
-        }
-        *output_bytes = MAX_REPLAY + terminal.to_string().len();
-        channel
-            .tx
-            .unbounded_send(TransportFrame::Single(
-                serde_json::from_value(terminal).map_err(sdk_error)?,
-            ))
-            .map_err(sdk_error)?;
-        eprintln!("Experimental gateway connection closed: {OUTPUT_LIMIT_ERROR}");
-        return Err(sdk_error(OUTPUT_LIMIT_ERROR));
-    }
-    *output_bytes += bytes;
+fn send(channel: &BoundedChannel, message: Value) -> agent_client_protocol::Result<()> {
+    let message =
+        serde_json::from_value(message).map_err(|error| channel.tx.fail(&error.to_string()))?;
+    // Wake the terminal failure observer even if request setup converts this
+    // SDK error to Failure. Saturation never silently drops an accepted frame.
     channel
         .tx
-        .unbounded_send(TransportFrame::Single(
-            serde_json::from_value(message).map_err(sdk_error)?,
-        ))
-        .map_err(sdk_error)
+        .try_send(TransportFrame::Single(message))
+        .map_err(|error| channel.tx.fail(&error.to_string()))
 }
 
 impl ConnectTo<agent_client_protocol::Client> for Connection {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
-        let (channel, driver) = client.into_channel_and_future();
+        let (channel, driver) = client.into_bounded_channel_and_future(ChannelLimits::default())?;
+        let failure = channel.tx.failure();
         // Channel's driver can return immediately while its endpoint remains
         // live. Drive both to completion, rather than treating that as EOF.
-        futures_util::future::try_join(self.run(channel), driver).await?;
-        Ok(())
+        let running = std::pin::pin!(futures_util::future::try_join(self.run(channel), driver));
+        match select(failure, running).await {
+            Either::Left((error, _)) => Err(error),
+            Either::Right((result, _)) => result.map(|_| ()),
+        }
     }
 }
 
@@ -550,145 +501,141 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[tokio::test]
-    async fn experimental_lifetime_limit_rejects_before_publishing_frame() {
-        let (channel, mut peer) = Channel::duplex();
-        let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
-        let mut bytes = MAX_REPLAY - message.to_string().len();
-        send(&channel, message.clone(), &mut bytes).unwrap();
-        assert_eq!(bytes, MAX_REPLAY);
-        assert!(peer.rx.next().await.is_some());
-        // Draining the mailbox intentionally does not reset a lifetime limit.
-        let error = send(&channel, message, &mut bytes).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("experimental 8 MiB lifetime output limit")
-        );
-        let terminal = peer.rx.next().await.unwrap();
-        let TransportFrame::Single(terminal) = terminal else {
-            panic!("expected a single terminal frame")
-        };
-        let terminal = serde_json::to_value(terminal).unwrap();
-        assert_eq!(terminal["id"], 1);
-        assert_eq!(terminal["error"]["code"], -32000);
-        assert!(bytes <= MAX_REPLAY + TERMINAL_ALLOWANCE);
-        drop(channel);
-        assert!(peer.rx.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn terminal_notice_is_bounded_and_preserves_running_session_semantics() {
-        for message in [
-            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"resident","update":{"sessionUpdate":"agent_message_chunk"}}}),
-            json!({"jsonrpc":"2.0","id":"x".repeat(TERMINAL_ALLOWANCE),"result":{}}),
-        ] {
-            let (channel, mut peer) = Channel::duplex();
-            let mut bytes = MAX_REPLAY;
-            assert!(send(&channel, message.clone(), &mut bytes).is_err());
-            let TransportFrame::Single(terminal) = peer.rx.next().await.unwrap() else {
-                panic!("expected a single terminal frame")
-            };
-            let terminal = serde_json::to_value(terminal).unwrap();
-            assert!(terminal.to_string().len() <= TERMINAL_ALLOWANCE);
-            if message.get("method").is_some() {
-                assert_eq!(terminal["params"]["sessionId"], "resident");
-                assert_eq!(terminal["params"]["update"]["sessionUpdate"], "notice");
-                assert_eq!(terminal["params"]["update"]["severity"], "error");
-                assert!(terminal["params"]["update"].get("state").is_none());
-                // Validate against the pinned schema, including its extension
-                // fallback when unstable notices are not enabled by a consumer.
-                let _: agentkit_acp::v2::wire::SessionUpdate =
-                    serde_json::from_value(terminal["params"]["update"].clone()).unwrap();
-            } else {
-                assert!(terminal["id"].is_null());
-                assert_eq!(terminal["error"]["code"], -32000);
-            }
-            assert!(send(&channel, message, &mut bytes).is_err());
-            drop(channel);
-            assert!(
-                peer.rx.next().await.is_none(),
-                "only one terminal frame is allowed"
-            );
+    fn limits() -> ChannelLimits {
+        ChannelLimits {
+            max_frame_bytes: 1024,
+            max_buffered_bytes: 1024,
+            max_buffered_frames: 1,
+            ..ChannelLimits::default()
         }
     }
 
     #[tokio::test]
-    async fn sdk_http_drains_terminal_notice_before_closing_stream() {
-        // Fake only the ACP agent boundary. The budget writer, SDK mailboxes,
-        // HTTP router, session SSE routing, and drain-on-close are real.
-        struct ExhaustedAgent;
-        impl ConnectTo<agent_client_protocol::Client> for ExhaustedAgent {
-            async fn connect_to(
-                self,
-                client: impl ConnectTo<Agent>,
-            ) -> agent_client_protocol::Result<()> {
-                let (mut channel, driver) = client.into_channel_and_future();
-                let run = async move {
-                    let _initialize = channel.rx.next().await.unwrap();
-                    let mut output_bytes = 0;
-                    send(
-                        &channel,
-                        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"info":{"name":"limit-fixture","version":"1"},"capabilities":{}}}),
-                        &mut output_bytes,
-                    )?;
-                    let _trigger = channel.rx.next().await.unwrap();
-                    output_bytes = MAX_REPLAY;
-                    send(
-                        &channel,
-                        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"limited","update":{"sessionUpdate":"agent_message_chunk"}}}),
-                        &mut output_bytes,
-                    )
-                };
-                futures_util::future::try_join(run, driver).await?;
-                Ok(())
-            }
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/acp/v2", listener.local_addr().unwrap());
-        let router = agent_client_protocol_http::AcpHttpServer::new(|| ExhaustedAgent)
-            .with_options(agent_client_protocol_http::ServerOptions {
-                path: "/acp/v2".into(),
-                ..Default::default()
-            })
-            .into_router();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+    async fn rejected_notification_terminates_instead_of_disappearing() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
         });
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .build()
+        let connection = Connection::new(gateway, Arc::new(http_boundary::Boundary::default()));
+        let (peer, endpoint) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        peer.tx
+            .try_send(TransportFrame::parse_json(
+                r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"missing"}}"#,
+            ))
             .unwrap();
-        let initialized = client.post(&endpoint).json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"test","version":"1"},"capabilities":{}}})).send().await.unwrap();
-        assert_eq!(initialized.status(), reqwest::StatusCode::OK);
-        let id = initialized.headers()["acp-connection-id"]
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let stream = client
-            .get(&endpoint)
-            .header("Acp-Connection-Id", &id)
-            .header("Acp-Session-Id", "limited")
-            .header("Accept", "text/event-stream")
-            .send()
+        // The endpoint's no-op driver is not EOF; the adapter processes the
+        // admitted notification and exposes its rejection as transport failure.
+        let error = tokio::time::timeout(Duration::from_secs(5), connection.connect_to(endpoint))
             .await
-            .unwrap();
-        assert_eq!(stream.status(), reqwest::StatusCode::OK);
-        let trigger = client.post(&endpoint).header("Acp-Connection-Id", &id).json(&json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"limited"}})).send().await.unwrap();
-        assert_eq!(trigger.status(), reqwest::StatusCode::ACCEPTED);
-        let body = stream.text().await.unwrap();
-        let data = body
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .unwrap();
-        let notice: Value = serde_json::from_str(data).unwrap();
-        assert_eq!(notice["params"]["update"]["severity"], "error");
-        assert_eq!(
-            notice["params"]["update"]["description"],
-            OUTPUT_LIMIT_ERROR
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("initialize is required"));
+    }
+
+    #[tokio::test]
+    async fn dequeued_frame_retains_admission_until_dropped() {
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        send(&channel, message.clone()).unwrap();
+        let charged = peer.rx.next().await.unwrap();
+        let decoded = charged.decode();
+        assert!(matches!(decoded, TransportFrame::Single(_)));
+        // Removing a frame from the queue does not release its reservation.
+        let rejected = send(&channel, message.clone()).unwrap_err();
+        assert_eq!(channel.tx.failure().await.to_string(), rejected.to_string());
+        drop(decoded);
+        drop(charged);
+        assert!(
+            send(&channel, message).is_err(),
+            "saturation stays terminal"
         );
-        server.abort();
-        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_consumed_frame_releases_current_admission() {
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        send(&channel, message.clone()).unwrap();
+        let charged = peer.rx.next().await.unwrap();
+        drop(charged);
+        send(&channel, message).unwrap();
+        assert!(peer.rx.next().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn healthy_cumulative_output_exceeds_former_lifetime_limit() {
+        let (channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{"text":"x".repeat(64 * 1024)}});
+        let mut total = 0;
+        while total <= MAX_REPLAY {
+            send(&channel, message.clone()).unwrap();
+            let charged = peer.rx.next().await.unwrap();
+            total += charged.as_bytes().len();
+            drop(charged);
+        }
+        send(&channel, message).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_request_capacity_preserves_response_lane() {
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
+        let (_stopped, stopped) = watch::channel(());
+        let mut control = Control {
+            session: "session".into(),
+            attachment: "attachment".into(),
+            entry: Entry {
+                root: PathBuf::new(),
+                sender,
+                stopped,
+            },
+            cursor: 0,
+            pending: (0..ChannelLimits::default().max_pending_requests)
+                .map(|id| (id.to_string(), json!(id)))
+                .collect(),
+        };
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        send(&channel, json!({"jsonrpc":"2.0","id":1,"result":{}})).unwrap();
+        let charge = Arc::new(peer.rx.next().await.unwrap());
+        let pending = control.pending.len();
+        assert!(
+            control
+                .send(
+                    json!({"jsonrpc":"2.0","id":"overflow","method":"session/prompt"}),
+                    Arc::clone(&charge)
+                )
+                .await
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        // The fake is the actor mailbox boundary; no production instrumentation.
+        let actor = async {
+            let envelope = receiver.recv().await.unwrap();
+            assert!(matches!(
+                envelope.request,
+                Request::Send {
+                    charge: Some(_),
+                    ..
+                }
+            ));
+            envelope.reply.send(Ok(json!({}))).unwrap();
+            envelope.request
+        };
+        let response = control.send(
+            json!({"jsonrpc":"2.0","id":"permission","result":{}}),
+            Arc::clone(&charge),
+        );
+        let (result, accepted) = tokio::join!(response, actor);
+        result.unwrap();
+        assert_eq!(control.pending.len(), pending);
+        drop(charge);
+        // Actor acceptance does not release SDK admission while the accepted
+        // child-bound request still owns decoded data.
+        assert!(send(&channel, json!({"jsonrpc":"2.0","id":2,"result":{}})).is_err());
+        drop(accepted);
     }
 }

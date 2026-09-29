@@ -1,8 +1,10 @@
 //! Stdio relay for the SDK's ACP v2 HTTP transport.
 use super::object;
 use agent_client_protocol::schema::v1::{RequestId, Response};
-use agent_client_protocol::{Channel, Client, ConnectTo, RawJsonRpcMessage, TransportFrame};
-use agent_client_protocol_http::HttpClient as AcpHttpClient;
+use agent_client_protocol::{BoundedChannel, ChargedFrame, RawJsonRpcMessage, TransportFrame};
+use agent_client_protocol_http::{
+    BoundedHttpClient, HttpClient as AcpHttpClient, HttpClientLimits,
+};
 use futures_util::{
     StreamExt,
     future::{Either, select},
@@ -10,7 +12,7 @@ use futures_util::{
 use serde_json::Value;
 use std::{io, path::PathBuf};
 
-fn client(remote: &super::Remote) -> Result<AcpHttpClient, Box<dyn std::error::Error>> {
+fn client(remote: &super::Remote) -> Result<BoundedHttpClient, Box<dyn std::error::Error>> {
     let mut endpoint = reqwest::Url::parse(&remote.url)?;
     if !matches!(endpoint.scheme(), "http" | "https") {
         return Err("gateway URL must use HTTP or HTTPS".into());
@@ -34,10 +36,10 @@ fn client(remote: &super::Remote) -> Result<AcpHttpClient, Box<dyn std::error::E
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .build()?;
-    Ok(AcpHttpClient::with_endpoint_and_client(
-        endpoint.as_str(),
-        http,
-    )?)
+    Ok(
+        AcpHttpClient::with_endpoint_and_client(endpoint.as_str(), http)?
+            .with_limits(HttpClientLimits::default())?,
+    )
 }
 
 fn rewrite(
@@ -142,14 +144,21 @@ pub(super) async fn bridge(
     remote: super::Remote,
     root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut channel, mut transport) =
-        ConnectTo::<Client>::into_channel_and_future(client(&remote)?);
+    let (mut channel, mut transport) = client(&remote)?.into_bounded_channel_and_future();
     // A dedicated reader avoids Tokio's uncancellable blocking stdin read keeping
     // the runtime alive after a remote disconnect.
     let (send, mut lines) = tokio::sync::mpsc::channel(16);
     std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in io::stdin().lock().lines() {
+        let mut stdin = io::stdin().lock();
+        loop {
+            let line = match read_stdin_line(&mut stdin) {
+                Ok(Some(line)) => Ok(line),
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = send.blocking_send(Err(error));
+                    break;
+                }
+            };
             if send.blocking_send(line).is_err() {
                 break;
             }
@@ -160,7 +169,7 @@ pub(super) async fn bridge(
     let mut resumed = None;
     let mut input_open = true;
     enum Event {
-        Frame(Option<TransportFrame>),
+        Frame(Option<ChargedFrame>),
         Transport(Result<(), agent_client_protocol::Error>),
         Line(Option<io::Result<String>>),
     }
@@ -181,19 +190,21 @@ pub(super) async fn bridge(
             }
         };
         match event {
-            Event::Frame(Some(mut frame)) => {
+            Event::Frame(Some(charged)) => {
+                // Keep the reservation until decoded data and stdout serialization
+                // have both been consumed; never queue an uncharged decoded frame.
+                let mut frame = charged.decode();
                 restore_new_response(&mut frame, &mut resumed);
                 print_frame(&frame)?;
+                drop(frame);
+                drop(charged);
             }
             Event::Frame(None) => return transport.await.map_err(transport_error),
             Event::Transport(result) => return result.map_err(transport_error),
             Event::Line(Some(line)) => {
                 let mut frame = TransportFrame::parse_json(&line?);
                 rewrite(&mut frame, &root, &mut session, &mut initial, &mut resumed)?;
-                channel
-                    .tx
-                    .unbounded_send(frame)
-                    .map_err(|_| io::Error::other("gateway transport closed"))?;
+                channel.tx.try_send(frame).map_err(transport_error)?;
             }
             Event::Line(None) => {
                 input_open = false;
@@ -202,6 +213,33 @@ pub(super) async fn bridge(
                 // would race process shutdown against best-effort cleanup.
                 channel.tx.close_channel();
             }
+        }
+    }
+}
+
+// Bound before parsing or entering the 16-slot local mailbox. BufRead::lines()
+// would allocate an arbitrary unterminated line outside SDK admission.
+fn read_stdin_line(reader: &mut impl io::BufRead) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(count) > super::MAX_HTTP_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gateway stdin frame exceeds 1 MiB",
+            ));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() || count == 0 {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(line)
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
         }
     }
 }
@@ -219,11 +257,11 @@ fn print_frame(frame: &TransportFrame) -> Result<(), Box<dyn std::error::Error>>
 }
 
 async fn request(
-    channel: &mut Channel,
+    channel: &mut BoundedChannel,
     id: i64,
     method: &str,
     params: Value,
-) -> Result<Value, Box<dyn std::error::Error>> {
+) -> Result<(Value, ChargedFrame), Box<dyn std::error::Error>> {
     let frame = TransportFrame::parse_json(
         &object([
             ("jsonrpc", Value::String("2.0".into())),
@@ -233,12 +271,9 @@ async fn request(
         ])
         .to_string(),
     );
-    channel
-        .tx
-        .unbounded_send(frame)
-        .map_err(|_| io::Error::other("gateway transport closed"))?;
+    channel.tx.try_send(frame).map_err(transport_error)?;
     while let Some(frame) = channel.rx.next().await {
-        let value: Value = serde_json::from_str(&frame.to_json()?)?;
+        let value: Value = serde_json::from_slice(frame.as_bytes())?;
         let values = match &value {
             Value::Array(values) => values.as_slice(),
             _ => std::slice::from_ref(&value),
@@ -251,6 +286,7 @@ async fn request(
                 return value
                     .get("result")
                     .cloned()
+                    .map(|result| (result, frame))
                     .ok_or_else(|| "gateway response omitted result".into());
             }
         }
@@ -259,13 +295,14 @@ async fn request(
 }
 
 pub(super) async fn list(remote: super::Remote) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut channel, mut transport) =
-        ConnectTo::<Client>::into_channel_and_future(client(&remote)?);
+    let (mut channel, mut transport) = client(&remote)?.into_bounded_channel_and_future();
     let result = {
         let requests = async {
             request(&mut channel, 1, "initialize", initialize_params()?).await?;
-            let response = request(&mut channel, 2, "session/list", object([])).await?;
+            let (response, charged) = request(&mut channel, 2, "session/list", object([])).await?;
             println!("{}", serde_json::to_string_pretty(&response)?);
+            drop(response);
+            drop(charged);
             Ok::<_, Box<dyn std::error::Error>>(())
         };
         let requests = std::pin::pin!(requests);
@@ -374,6 +411,39 @@ mod tests {
         deletes
             .try_recv()
             .expect("list returned without graceful DELETE");
+    }
+
+    #[test]
+    fn stdin_frames_are_bounded_before_mailbox_admission() {
+        let mut reader = io::BufReader::with_capacity(7, io::Cursor::new(b"first\nsecond"));
+        assert_eq!(
+            read_stdin_line(&mut reader).unwrap().as_deref(),
+            Some("first\n")
+        );
+        assert_eq!(
+            read_stdin_line(&mut reader).unwrap().as_deref(),
+            Some("second")
+        );
+        assert!(read_stdin_line(&mut reader).unwrap().is_none());
+
+        let maximum = vec![b'x'; super::super::MAX_HTTP_FRAME];
+        let mut reader = io::Cursor::new(maximum);
+        assert_eq!(
+            read_stdin_line(&mut reader).unwrap().unwrap().len(),
+            super::super::MAX_HTTP_FRAME
+        );
+        let oversized = vec![b'x'; super::super::MAX_HTTP_FRAME + 1];
+        let mut reader = io::BufReader::with_capacity(4096, io::Cursor::new(oversized));
+        assert_eq!(
+            read_stdin_line(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            read_stdin_line(&mut io::Cursor::new([0xff]))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

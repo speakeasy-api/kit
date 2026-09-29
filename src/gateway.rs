@@ -31,6 +31,7 @@ use tokio::{
 };
 const LEASE: Duration = Duration::from_secs(15);
 const MAX_REPLAY: usize = 8 * 1024 * 1024;
+const MAX_HTTP_FRAME: usize = 1024 * 1024;
 const MAX_QUEUE: usize = 4096;
 const MAX_SESSIONS: usize = 64;
 
@@ -78,7 +79,7 @@ impl Args {
                 )
         };
         Command::new("gateway")
-            .about("Experimental private-network session supervisor (8 MiB output per connection)")
+            .about("Experimental private-network session supervisor (bounded HTTP transport)")
             .arg(
                 Arg::new("listen")
                     .long("listen")
@@ -223,6 +224,9 @@ enum Request {
         session: String,
         attachment: String,
         message: Value,
+        // Private transport ownership, never part of ACP or durable state.
+        #[cfg_attr(test, serde(skip))]
+        charge: Option<Arc<agent_client_protocol::ChargedFrame>>,
     },
     Detach {
         session: String,
@@ -281,6 +285,13 @@ struct Entry {
     // Closed when the actor task releases its completion sender. Normal return
     // follows child cleanup; unwind relies on Child's kill-on-drop instead.
     stopped: watch::Receiver<()>,
+}
+#[derive(Debug)]
+struct ChildWrite {
+    message: Value,
+    // A batch lease can be shared by several accepted child writes. Retain it
+    // through serialization/write completion, even after the HTTP owner drops.
+    _charge: Option<Arc<agent_client_protocol::ChargedFrame>>,
 }
 struct Envelope {
     request: Request,
@@ -390,11 +401,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // HTTP connections can own long-lived SSE streams. Stop the listener and
     // release resident ownership without waiting indefinitely for clients.
     eprintln!(
-        "Experimental gateway: each HTTP connection closes after 8 MiB cumulative output plus a bounded terminal notice; live replay is limited to 8 MiB / 4094 events. Resume without replay when history exceeds these limits; transcripts remain on the host."
+        "Experimental gateway: bounded HTTP transport (1 MiB frames, 64 connections); live replay is limited to 8 MiB / 4094 events. Resume without replay when history exceeds these limits; transcripts remain on the host."
     );
     let served = {
         use std::future::IntoFuture as _;
-        let server = std::pin::pin!(axum::serve(listener, router(gateway.clone())).into_future());
+        let server = std::pin::pin!(axum::serve(listener, router(gateway.clone())?).into_future());
         let shutdown = std::pin::pin!(tokio::signal::ctrl_c());
         match select(server, shutdown).await {
             Either::Left((result, _)) => result,
@@ -431,25 +442,31 @@ mod framing;
 mod http_boundary;
 mod http_client;
 mod http_server;
-fn router(gateway: Arc<Gateway>) -> Router {
+fn router(gateway: Arc<Gateway>) -> Result<Router, agent_client_protocol_http::ServerLimitsError> {
     let state = gateway.clone();
     let boundary = Arc::new(http_boundary::Boundary::default());
     let connection_boundary = boundary.clone();
-    let sdk = agent_client_protocol_http::AcpHttpServer::new(move || {
-        http_server::Connection::new(state.clone(), connection_boundary.clone())
-    })
+    let sdk = agent_client_protocol_http::AcpHttpServer::new_bounded(
+        move || http_server::Connection::new(state.clone(), connection_boundary.clone()),
+        agent_client_protocol_http::ServerLimits {
+            channel_limits: agent_client_protocol::ChannelLimits::default(),
+            max_frame_bytes: MAX_HTTP_FRAME,
+            ..Default::default()
+        },
+    )?
     .with_options(agent_client_protocol_http::ServerOptions {
         path: "/acp/v2".into(),
         health_endpoint: false,
         ..Default::default()
     })
     .into_router();
-    sdk.clone()
+    Ok(sdk
+        .clone()
         .layer(middleware::from_fn_with_state(
             (boundary, sdk),
             http_boundary::handle,
         ))
-        .layer(middleware::from_fn_with_state(gateway, authorize))
+        .layer(middleware::from_fn_with_state(gateway, authorize)))
 }
 
 async fn authorize(
@@ -710,11 +727,12 @@ impl Actor {
         };
         // Drain stdout independently of a bounded stdin writer to avoid pipe
         // backpressure deadlocks. JoinSet aborts the writer on actor unwind/drop.
-        let (writes, mut queued) = mpsc::channel::<Value>(16);
+        let (writes, mut queued) = mpsc::channel::<ChildWrite>(16);
         let mut writer = tokio::task::JoinSet::new();
         writer.spawn(async move {
             while let Some(message) = queued.recv().await {
-                write_message(&mut stdin, &message).await?;
+                write_message(&mut stdin, &message.message).await?;
+                drop(message);
             }
             Ok::<_, io::Error>(())
         });
@@ -753,7 +771,12 @@ impl Actor {
                     Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
                         Ok(message) => {
                             if let Some(reply) = self.output(message)
-                                && writes.try_send(reply).is_err()
+                                && writes
+                                    .try_send(ChildWrite {
+                                        message: reply,
+                                        _charge: None,
+                                    })
+                                    .is_err()
                             {
                                 break;
                             }
@@ -891,7 +914,7 @@ impl Actor {
         }
         None
     }
-    fn command(&mut self, request: Request, writes: &mpsc::Sender<Value>) -> ResultValue {
+    fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
         if let Request::Attach {
             replace, replay, ..
         } = request
@@ -968,6 +991,7 @@ impl Actor {
             Request::Send {
                 attachment,
                 mut message,
+                charge,
                 ..
             } => {
                 let method = message["method"]
@@ -1107,9 +1131,14 @@ impl Actor {
                 // Capacity is checked before publishing the pending record. No
                 // await separates acceptance and commit; cancellation cannot
                 // strand a reserved ID or suppress an accepted child write.
-                writes.try_send(message).map_err(|_| {
-                    Failure::unavailable("child input queue unavailable; message not accepted")
-                })?;
+                writes
+                    .try_send(ChildWrite {
+                        message,
+                        _charge: charge,
+                    })
+                    .map_err(|_| {
+                        Failure::unavailable("child input queue unavailable; message not accepted")
+                    })?;
                 if let Some(pending) = pending {
                     self.pending.insert(self.serial, pending);
                 }

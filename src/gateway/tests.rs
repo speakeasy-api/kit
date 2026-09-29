@@ -34,7 +34,7 @@ impl Harness {
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/acp/v2", listener.local_addr().unwrap());
-        let app = router(gateway.clone());
+        let app = router(gateway.clone()).unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -404,6 +404,60 @@ fn isolated_actor() -> Actor {
     }
 }
 
+#[tokio::test]
+async fn accepted_child_write_retains_charge_after_dequeue_until_consumed() {
+    use agent_client_protocol::{BoundedChannel, ChannelLimits, TransportFrame};
+    use futures_util::StreamExt;
+
+    for release_write in [false, true] {
+        let (producer, mut incoming) = BoundedChannel::duplex(ChannelLimits {
+            max_buffered_frames: 1,
+            ..ChannelLimits::default()
+        })
+        .unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"resident","prompt":[]}});
+        producer
+            .tx
+            .try_send(TransportFrame::parse_json(&message.to_string()))
+            .unwrap();
+        let charge = Arc::new(incoming.rx.next().await.unwrap());
+        let mut actor = isolated_actor();
+        let (writes, mut receiver) = mpsc::channel(1);
+        let attached = actor
+            .command(
+                Request::Attach {
+                    session: actor.id.clone(),
+                    replace: false,
+                    replay: true,
+                },
+                &writes,
+            )
+            .unwrap();
+        actor
+            .command(
+                Request::Send {
+                    session: actor.id.clone(),
+                    attachment: attached["attachment"].as_str().unwrap().into(),
+                    message: message.clone(),
+                    charge: Some(charge),
+                },
+                &writes,
+            )
+            .unwrap();
+        // HTTP-side ownership is gone. Dequeue alone must not return capacity:
+        // the child writer still has to serialize and write this payload.
+        let mut writing = Some(receiver.try_recv().unwrap());
+        if release_write {
+            drop(writing.take());
+        }
+        let admitted = producer
+            .tx
+            .try_send(TransportFrame::parse_json(&message.to_string()));
+        assert_eq!(admitted.is_ok(), release_write);
+        drop(writing);
+    }
+}
+
 #[test]
 fn failed_child_enqueue_does_not_publish_pending_request() {
     let mut actor = isolated_actor();
@@ -419,8 +473,14 @@ fn failed_child_enqueue_does_not_publish_pending_request() {
         )
         .unwrap();
     let attachment = attached["attachment"].as_str().unwrap().to_owned();
-    writes.try_send(json!({"occupied":true})).unwrap();
+    writes
+        .try_send(ChildWrite {
+            message: json!({"occupied":true}),
+            _charge: None,
+        })
+        .unwrap();
     let request = || Request::Send {
+        charge: None,
         session: "resident".into(),
         attachment: attachment.clone(),
         message: json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"resident","prompt":[]}}),
@@ -430,7 +490,10 @@ fn failed_child_enqueue_does_not_publish_pending_request() {
     receiver.try_recv().unwrap();
     actor.command(request(), &writes).unwrap();
     assert_eq!(actor.pending.len(), 1);
-    assert_eq!(receiver.try_recv().unwrap()["method"], "session/prompt");
+    assert_eq!(
+        receiver.try_recv().unwrap().message["method"],
+        "session/prompt"
+    );
 }
 
 #[test]
@@ -480,6 +543,7 @@ async fn dropped_acceptance_future_does_not_cancel_resident_request() {
     let (reply, accepted) = oneshot::channel();
     entry.sender.send(Envelope {
         request: Request::Send {
+            charge: None,
             session: "resident".into(), attachment: attachment.clone(),
             message: json!({"jsonrpc":"2.0","id":51,"method":"session/prompt","params":{"sessionId":"resident","prompt":[]}}),
         }, reply,
