@@ -185,6 +185,60 @@ fn output_pipe() -> (
     });
     (writer, receive)
 }
+// Output is visible to an independent ACP peer before flush returns. This
+// acknowledged OS pipe deterministically lets that peer enqueue its follow-up
+// in that window, without callbacks or instrumentation in production code.
+struct AcknowledgedOutput {
+    writer: std::os::unix::net::UnixStream,
+    consumed: std::sync::mpsc::Receiver<()>,
+}
+impl Write for AcknowledgedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.writer.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.consumed
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(io::Error::other)
+    }
+}
+fn follow_up_during_publication(
+    input: mpsc::Sender<(Instant, io::Result<String>)>,
+    on_commit: bool,
+    next: Value,
+) -> (AcknowledgedOutput, mpsc::UnboundedReceiver<Value>) {
+    let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (consumed, acknowledgement) = std::sync::mpsc::channel();
+    let (observed, receive) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut follow_up = Some((input, next));
+        for line in io::BufReader::new(reader).lines() {
+            let value: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let ready = if on_commit {
+                value["params"]["_meta"][META]["kind"] == "commit"
+            } else {
+                value["id"] == 1 && value.get("result").is_some()
+            };
+            if ready && let Some((input, next)) = follow_up.take() {
+                input
+                    .blocking_send((Instant::now(), Ok(next.to_string())))
+                    .unwrap();
+            }
+            if observed.send(value).is_err() || consumed.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    (
+        AcknowledgedOutput {
+            writer,
+            consumed: acknowledgement,
+        },
+        receive,
+    )
+}
+
 fn frame(id: u64, method: &str, params: Value) -> (Instant, io::Result<String>) {
     (
         Instant::now(),
@@ -277,7 +331,11 @@ async fn lost_prompt_reinitializes_and_replays_same_session_before_commit() {
     let mut server = Server::new(None).await;
     let remote = server.remote.clone();
     let (send, lines) = mpsc::channel(16);
-    let (writer, mut output) = output_pipe();
+    let (writer, mut output) = follow_up_during_publication(
+        send.clone(),
+        true,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"durable","prompt":[]}}),
+    );
     let scenario = async {
         send.send(frame(1, "initialize", initialize_params().unwrap()))
             .await
@@ -381,6 +439,18 @@ async fn lost_prompt_reinitializes_and_replays_same_session_before_commit() {
             begin["params"]["_meta"][META]["epoch"]
         );
         assert_eq!(commit["params"]["_meta"][META]["historyAvailable"], true);
+        let follow_up = tokio::select! {
+            request = server.requests.recv() => request.unwrap(),
+            response = until_id(&mut output,json!(5)) => panic!("post-commit request rejected: {response}"),
+        };
+        assert_eq!(follow_up["method"], "session/prompt");
+        server.result(&follow_up, json!({"stopReason":"end_turn"}), "durable");
+        assert!(
+            until_id(&mut output, json!(5))
+                .await
+                .get("result")
+                .is_some()
+        );
         drop(send);
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
@@ -456,6 +526,47 @@ async fn eof_during_backoff_cancels_recovery_without_another_http_attempt() {
         drop(send);
     };
     let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(run(remote, "/remote".into(), lines, writer), scenario)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn recovered_initialize_accepts_follow_up_before_output_flush_returns() {
+    let mut server = Server::new(Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+    let remote = server.remote.clone();
+    let (send, lines) = mpsc::channel(16);
+    let (writer, mut output) = follow_up_during_publication(
+        send.clone(),
+        false,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/local","mcpServers":[]}}),
+    );
+    let scenario = async {
+        send.send(frame(1, "initialize", initialize_params().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(server.requests.recv().await.unwrap()["id"], 1);
+        assert!(reserved(&server.requests.recv().await.unwrap()["id"]));
+        assert_eq!(
+            until_id(&mut output, json!(1)).await["result"]["protocolVersion"],
+            2
+        );
+        let new = tokio::select! {
+            request = server.requests.recv() => request.unwrap(),
+            response = until_id(&mut output,json!(2)) => panic!("post-initialize request rejected: {response}"),
+        };
+        assert_eq!(new["method"], "session/new");
+        server.result(&new,json!({"sessionId":"durable","configOptions":[],"_meta":{"kit/gateway":{"attachment":"owner-1"}}}),"");
+        assert_eq!(
+            until_id(&mut output, json!(2)).await["result"]["sessionId"],
+            "durable"
+        );
+        drop(send);
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(8), async {
         tokio::join!(run(remote, "/remote".into(), lines, writer), scenario)
     })
     .await

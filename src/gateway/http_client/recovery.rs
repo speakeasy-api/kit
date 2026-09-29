@@ -540,6 +540,13 @@ pub(super) async fn run(
                                     break;
                                 }
                                 if !initialized {
+                                    // Open admission before publishing readiness: a local reader
+                                    // can enqueue its next request before emit/flush returns.
+                                    initialized = true;
+                                    phase = "live";
+                                    gate = Some(Instant::now());
+                                    recovery_start = None;
+                                    attempt = 0;
                                     // Initial initialize is safe to retry; preserve its original local ID.
                                     if let Some(index) =
                                         pending.iter().position(|v| v["method"] == "initialize")
@@ -547,11 +554,6 @@ pub(super) async fn run(
                                         value["id"] = pending.remove(index)["id"].clone();
                                         emit(&mut output, &value)?;
                                     }
-                                    initialized = true;
-                                    phase = "live";
-                                    gate = Some(Instant::now());
-                                    recovery_start = None;
-                                    attempt = 0;
                                 } else {
                                     let mut params = object([
                                         (
@@ -611,6 +613,11 @@ pub(super) async fn run(
                                     token,
                                 ) {
                                     attachment = Some(token.to_owned());
+                                    // Commit is the local readiness publication. Fence old
+                                    // queued input before it becomes visible to the consumer.
+                                    phase = "live";
+                                    gate = Some(Instant::now());
+                                    recovery_start = None;
                                     notice(
                                         &mut output,
                                         session.as_deref().ok_or("Missing durable target")?,
@@ -620,9 +627,6 @@ pub(super) async fn run(
                                         "Reconnected",
                                         bits,
                                     )?;
-                                    phase = "live";
-                                    gate = Some(Instant::now());
-                                    recovery_start = None;
                                     attempt = 0;
                                 } else {
                                     terminal = Some("Gateway recovery snapshot unavailable; session left unchanged".into());
