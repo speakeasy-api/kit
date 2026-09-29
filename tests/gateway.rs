@@ -113,6 +113,10 @@ impl Fixture {
     }
 
     fn bridge(&self, url: &str, session: Option<&str>) -> Bridge {
+        self.bridge_options(url, session, false)
+    }
+
+    fn bridge_options(&self, url: &str, session: Option<&str>, no_replay: bool) -> Bridge {
         let mut command = self.command();
         command
             .args(["gateway", "bridge", "--url", url, "--credential-file"])
@@ -124,6 +128,9 @@ impl Fixture {
             .stderr(Stdio::inherit());
         if let Some(session) = session {
             command.args(["--session", session]);
+        }
+        if no_replay {
+            command.arg("--no-replay");
         }
         let mut child = command.spawn().unwrap();
         Bridge {
@@ -1434,7 +1441,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
             "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{}}},
-            "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4094}}
+            "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );
     let mut stream = fixture
@@ -1780,4 +1787,622 @@ async fn unread_session_mailbox_terminates_http_but_preserves_resident_prompt() 
     fresh.detach().await;
     stop_gateway(&mut gateway).await;
     provider.abort();
+}
+
+// Real reverse proxy: successful frames, statuses, and headers come from the
+// gateway process. A single-owner arbiter selects faults from parsed wire data.
+#[derive(Clone)]
+struct RecoveryProxyState {
+    upstream: String,
+    client: reqwest::Client,
+    inspect: tokio::sync::mpsc::Sender<ProxyInspection>,
+}
+struct ProxyInspection {
+    phase: &'static str,
+    frame: Value,
+    decision: tokio::sync::oneshot::Sender<bool>,
+}
+struct ProxyFault {
+    phase: &'static str,
+    pointer: &'static str,
+    value: Value,
+}
+struct RecoveryProxy {
+    url: String,
+    server: tokio::task::JoinHandle<()>,
+    arbiter: tokio::task::JoinHandle<()>,
+    observed: tokio::sync::mpsc::UnboundedReceiver<Value>,
+}
+impl RecoveryProxyState {
+    async fn drop_frame(&self, phase: &'static str, frame: Value) -> bool {
+        let (decision, result) = tokio::sync::oneshot::channel();
+        self.inspect
+            .send(ProxyInspection {
+                phase,
+                frame,
+                decision,
+            })
+            .await
+            .unwrap();
+        result.await.unwrap()
+    }
+}
+fn broken_proxy_body() -> axum::body::Body {
+    axum::body::Body::from_stream(futures_util::stream::once(async {
+        Err::<axum::body::Bytes, _>(std::io::Error::other("intentional test transport loss"))
+    }))
+}
+async fn recovery_proxy_forward(
+    axum::extract::State(state): axum::extract::State<RecoveryProxyState>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap();
+    if let Ok(frame) = serde_json::from_slice::<Value>(&body)
+        && state.drop_frame("request", frame).await
+    {
+        return axum::response::Response::new(broken_proxy_body());
+    }
+    let mut headers = parts.headers;
+    headers.remove("host");
+    headers.remove("content-length");
+    let response = state
+        .client
+        .request(parts.method, format!("{}{}", state.upstream, parts.uri))
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let mut headers = response.headers().clone();
+    headers.remove("content-length");
+    headers.remove("transfer-encoding");
+    let sse = headers
+        .get("content-type")
+        .is_some_and(|value| value == "text/event-stream");
+    let body = if sse {
+        let (send, receive) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(8);
+        tokio::spawn(async move {
+            let mut stream = response.bytes_stream();
+            let mut buffer = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let Ok(chunk) = chunk else {
+                    let _ = send
+                        .send(Err(std::io::Error::other("upstream closed")))
+                        .await;
+                    return;
+                };
+                buffer.extend_from_slice(&chunk);
+                while let Some(end) = buffer.windows(2).position(|bytes| bytes == b"\n\n") {
+                    let event: Vec<_> = buffer.drain(..end + 2).collect();
+                    let text = std::str::from_utf8(&event).unwrap();
+                    for data in text.lines().filter_map(|line| line.strip_prefix("data:")) {
+                        let frame: Value = serde_json::from_str(data.trim()).unwrap();
+                        if state.drop_frame("sse", frame).await {
+                            let _ = send
+                                .send(Err(std::io::Error::other("intentional SSE loss")))
+                                .await;
+                            return;
+                        }
+                    }
+                    if send.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        axum::body::Body::from_stream(futures_util::stream::unfold(receive, |mut receive| async {
+            receive.recv().await.map(|chunk| (chunk, receive))
+        }))
+    } else {
+        axum::body::Body::from_stream(response.bytes_stream())
+    };
+    let mut response = axum::response::Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+impl RecoveryProxy {
+    async fn start(upstream: &str, faults: Vec<ProxyFault>) -> Self {
+        let (inspect, mut inspections) = tokio::sync::mpsc::channel::<ProxyInspection>(32);
+        let (observed, received) = tokio::sync::mpsc::unbounded_channel();
+        let arbiter = tokio::spawn(async move {
+            let mut faults = std::collections::VecDeque::from(faults);
+            while let Some(inspection) = inspections.recv().await {
+                let drop_frame = faults.front().is_some_and(|fault| {
+                    fault.phase == inspection.phase
+                        && inspection.frame.pointer(fault.pointer) == Some(&fault.value)
+                });
+                if drop_frame {
+                    faults.pop_front();
+                }
+                let _ = observed.send(
+                    json!({"phase":inspection.phase,"frame":inspection.frame,"dropped":drop_frame}),
+                );
+                let _ = inspection.decision.send(drop_frame);
+            }
+        });
+        let state = RecoveryProxyState {
+            upstream: upstream.into(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            inspect,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .fallback(recovery_proxy_forward)
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            url,
+            server,
+            arbiter,
+            observed: received,
+        }
+    }
+    fn observations(&mut self) -> Vec<Value> {
+        let mut result = Vec::new();
+        while let Ok(value) = self.observed.try_recv() {
+            result.push(value);
+        }
+        result
+    }
+}
+impl Drop for RecoveryProxy {
+    fn drop(&mut self) {
+        self.server.abort();
+        self.arbiter.abort();
+    }
+}
+impl Bridge {
+    async fn send_wire(&mut self, message: Value) {
+        self.stdin
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    async fn read_wire(&mut self) -> Value {
+        let line = timeout(WAIT, self.stdout.next_line())
+            .await
+            .expect("bridge wire output timed out")
+            .unwrap()
+            .expect("bridge stdout closed");
+        serde_json::from_str(&line).unwrap()
+    }
+    async fn recovery_until(&mut self, kind: &str) -> Vec<Value> {
+        timeout(WAIT, async {
+            let mut frames = Vec::new();
+            loop {
+                let frame = self.read_wire().await;
+                let done = frame["params"]["_meta"]["kit/gatewayRecovery"]["kind"] == kind;
+                frames.push(frame);
+                if done {
+                    return frames;
+                }
+            }
+        })
+        .await
+        .expect("recovery did not reach expected terminal boundary")
+    }
+}
+fn wire_method_count(observed: &[Value], method: &str) -> usize {
+    observed
+        .iter()
+        .filter(|entry| entry["phase"] == "request" && entry["frame"]["method"] == method)
+        .count()
+}
+#[tokio::test]
+async fn bridge_recovery_transient_preinitialize_drop() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut proxy = RecoveryProxy::start(
+        &url,
+        vec![ProxyFault {
+            phase: "request",
+            pointer: "/method",
+            value: json!("initialize"),
+        }],
+    )
+    .await;
+    let mut bridge = fixture.bridge(&proxy.url, None);
+    let id = bridge.handshake().await;
+    assert!(!id.is_empty());
+    let observed = proxy.observations();
+    assert_eq!(wire_method_count(&observed, "initialize"), 2);
+    assert_eq!(wire_method_count(&observed, "session/new"), 1);
+    bridge.detach().await;
+    stop_gateway(&mut gateway).await;
+}
+#[tokio::test]
+async fn bridge_recovery_lost_create_never_creates_again() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut proxy = RecoveryProxy::start(
+        &url,
+        vec![ProxyFault {
+            phase: "sse",
+            pointer: "/id",
+            value: json!(2),
+        }],
+    )
+    .await;
+    let mut bridge = fixture.bridge(&proxy.url, None);
+    bridge.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"fault-test","version":"0"},"capabilities":{}})).await;
+    bridge.send_wire(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":fixture.root,"mcpServers":[]}})).await;
+    let response = loop {
+        let frame = bridge.read_wire().await;
+        if frame["id"] == 2 {
+            break frame;
+        }
+    };
+    assert_eq!(
+        response["error"]["data"]["reason"], "outcome_unknown",
+        "{response}"
+    );
+    timeout(WAIT, bridge.child.wait())
+        .await
+        .expect("unknown create outcome must terminate without retry")
+        .unwrap();
+    let listed = fixture.catalog(&url).await;
+    let sessions = listed["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{listed}");
+    assert_eq!(sessions[0]["_meta"]["kit.gateway.state"], "resident");
+    let observed = proxy.observations();
+    assert_eq!(wire_method_count(&observed, "session/new"), 1);
+    let id = sessions[0]["sessionId"].as_str().unwrap();
+    let mut explicit = fixture.bridge(&url, Some(id));
+    assert_eq!(explicit.handshake().await, id);
+    explicit.detach().await;
+    stop_gateway(&mut gateway).await;
+}
+
+async fn bridge_active_recovery_faults(interrupt_replay: bool) {
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut faults = vec![ProxyFault {
+        phase: "sse",
+        pointer: "/id",
+        value: json!(3),
+    }];
+    if interrupt_replay {
+        faults.push(ProxyFault {
+            phase: "sse",
+            pointer: "/params/update/state",
+            value: json!("running"),
+        });
+    }
+    let mut proxy = RecoveryProxy::start(&url, faults).await;
+    let mut bridge = fixture.bridge(&proxy.url, None);
+    let id = bridge.handshake().await;
+    bridge.send_wire(json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"Accepted exactly once"}]}})).await;
+    // The real provider's response remains held while HTTP recovery executes.
+    let (_, abandoned) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    let frames = bridge.recovery_until("commit").await;
+    let metadata: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| frame["params"]["_meta"].get("kit/gatewayRecovery"))
+        .collect();
+    let committed = *metadata.last().unwrap();
+    let epoch = committed["epoch"].as_u64().unwrap();
+    assert!(epoch > 0);
+    assert_eq!(committed["historyAvailable"], true);
+    assert_eq!(committed["stateSnapshot"], true);
+    assert_eq!(committed["configSnapshot"], true);
+    assert_eq!(
+        metadata
+            .iter()
+            .filter(|meta| meta["kind"] == "commit")
+            .count(),
+        1
+    );
+    assert!(
+        metadata
+            .iter()
+            .any(|meta| meta["kind"] == "begin" && meta["epoch"] == epoch)
+    );
+    let candidate: Vec<_> = frames
+        .iter()
+        .filter(|frame| {
+            let meta = &frame["params"]["_meta"]["kit/gatewayRecovery"];
+            meta["kind"] == "replay" && meta["epoch"] == epoch
+        })
+        .collect();
+    assert!(!candidate.is_empty());
+    assert!(
+        candidate
+            .iter()
+            .all(|frame| frame["params"]["sessionId"] == id)
+    );
+    assert!(
+        candidate
+            .iter()
+            .any(|frame| frame["params"]["update"]["sessionUpdate"] == "config_option_update")
+    );
+    assert!(
+        candidate
+            .iter()
+            .any(|frame| frame["params"]["update"]["state"] == "running")
+    );
+    assert!(candidate.iter().any(|frame| {
+        frame["params"]["update"]
+            .to_string()
+            .contains("Accepted exactly once")
+    }));
+    assert_eq!(frames.iter().filter(|frame| frame["id"] == 3).count(), 1);
+    let uncertain = frames.iter().find(|frame| frame["id"] == 3).unwrap();
+    assert_eq!(uncertain["error"]["data"]["reason"], "outcome_unknown");
+    assert_eq!(uncertain["error"]["data"]["method"], "session/prompt");
+    assert_eq!(uncertain["error"]["data"]["sessionId"], id);
+    if interrupt_replay {
+        assert!(
+            metadata
+                .iter()
+                .any(|meta| meta["kind"] == "begin" && meta["epoch"].as_u64().unwrap() < epoch)
+        );
+    }
+    // Cancellation acts on the original accepted run, without releasing its
+    // provider response. A subsequent prompt must be the second provider call.
+    bridge
+        .send_wire(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+        .await;
+    bridge.wait_wire_idle().await;
+    bridge
+        .request(
+            4,
+            "session/prompt",
+            json!({"sessionId":id,"prompt":[{"type":"text","text":"Healthy after recovery"}]}),
+        )
+        .await;
+    let (body, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    assert!(
+        body["messages"]
+            .to_string()
+            .contains("Healthy after recovery"),
+        "{body}"
+    );
+    release.send("Recovered exactly once").unwrap();
+    let completed = bridge.wait_wire_idle().await;
+    let updates: Vec<_> = completed
+        .iter()
+        .map(|frame| frame["params"]["update"].clone())
+        .collect();
+    assert_replayed_answer(&updates, "Recovered exactly once");
+    assert!(requests.try_recv().is_err(), "unexpected extra inference");
+    let observed = proxy.observations();
+    let attempts = if interrupt_replay { 3 } else { 2 };
+    assert_eq!(wire_method_count(&observed, "initialize"), attempts);
+    assert_eq!(wire_method_count(&observed, "session/resume"), attempts - 1);
+    assert_eq!(wire_method_count(&observed, "session/new"), 1);
+    assert_eq!(wire_method_count(&observed, "session/prompt"), 2);
+    assert_eq!(wire_method_count(&observed, "session/cancel"), 1);
+    assert!(
+        observed
+            .iter()
+            .filter(|entry| entry["frame"]["method"] == "session/resume")
+            .all(|entry| entry["frame"]["params"]["sessionId"] == id)
+    );
+    drop(abandoned);
+    bridge.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+impl Bridge {
+    async fn wait_wire_idle(&mut self) -> Vec<Value> {
+        timeout(WAIT, async {
+            let mut frames = Vec::new();
+            loop {
+                let frame = self.read_wire().await;
+                let idle = frame["params"]["update"]["sessionUpdate"] == "state_update"
+                    && frame["params"]["update"]["state"] == "idle";
+                frames.push(frame);
+                if idle {
+                    return frames;
+                }
+            }
+        })
+        .await
+        .expect("recovered bridge did not become idle")
+    }
+}
+
+#[tokio::test]
+async fn bridge_recovery_lost_prompt_response_cancels_original_run() {
+    bridge_active_recovery_faults(false).await;
+}
+
+#[tokio::test]
+async fn bridge_recovery_interrupted_replay_commits_only_fresh_candidate() {
+    bridge_active_recovery_faults(true).await;
+}
+
+#[tokio::test]
+async fn bridge_recovery_wrong_auth_is_terminal_without_retry() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut proxy = RecoveryProxy::start(&url, vec![]).await;
+    // The gateway has already read its credential; only this bridge reads the
+    // changed isolated fixture file. The proxy forwards the actual HTTP 401.
+    fs::write(&fixture.credential, "incorrect-test-token").unwrap();
+    let mut bridge = fixture.bridge(&proxy.url, None);
+    bridge.send_wire(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"wrong-auth","version":"0"},"capabilities":{}}})).await;
+    let response = loop {
+        let frame = bridge.read_wire().await;
+        if frame["id"] == 1 {
+            break frame;
+        }
+    };
+    assert!(response.get("error").is_some(), "{response}");
+    let Bridge {
+        stdin,
+        mut stdout,
+        mut child,
+        ..
+    } = bridge;
+    drop(stdin);
+    timeout(WAIT, async {
+        while stdout.next_line().await.unwrap().is_some() {}
+        child.wait().await.unwrap();
+    })
+    .await
+    .expect("unauthorized bridge did not stop");
+    let observed = proxy.observations();
+    assert_eq!(wire_method_count(&observed, "initialize"), 1);
+    assert_eq!(wire_method_count(&observed, "session/new"), 0);
+    assert_eq!(wire_method_count(&observed, "session/resume"), 0);
+    stop_gateway(&mut gateway).await;
+}
+
+#[tokio::test]
+async fn bridge_recovery_replaced_controller_never_steals_session_back() {
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut proxy = RecoveryProxy::start(&url, vec![]).await;
+    let mut old = fixture.bridge(&proxy.url, None);
+    let id = old.handshake().await;
+    let mut replacement = SdkClient::connect(&url).await;
+    let resumed = replacement
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"replayFrom":{"type":"start"}}),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    let frames = old.recovery_until("failed").await;
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame["params"]["_meta"]["kit/gatewayRecovery"]["kind"] == "commit")
+    );
+    replacement
+        .start_prompt(3, &id, "Only replacement controls this session")
+        .await;
+    let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    release.send("Replacement retained authority").unwrap();
+    replacement.wait_idle().await;
+    let observed = proxy.observations();
+    assert_eq!(wire_method_count(&observed, "initialize"), 1);
+    assert_eq!(wire_method_count(&observed, "session/resume"), 0);
+    assert_eq!(wire_method_count(&observed, "session/new"), 1);
+    let _ = old.child.kill().await;
+    replacement.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+#[tokio::test]
+async fn bridge_recovery_explicit_no_replay_oversized_history_snapshots_idle_and_running() {
+    static ANSWER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "h".repeat(64 * 1024));
+    let (fixture, mut requests, provider) = controlled_provider().await;
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut seed = SdkClient::connect(&url).await;
+    let created = seed
+        .request(
+            2,
+            "session/new",
+            json!({"cwd":fixture.root,"mcpServers":[]}),
+        )
+        .await;
+    let id = created["result"]["sessionId"].as_str().unwrap();
+    // Pace every turn on actual idle, not socket buffering or a sleep. Each
+    // individual turn fits egress while cumulative journal history exceeds 8MiB.
+    for turn in 0..129 {
+        seed.start_prompt(3 + turn, id, "Grow history").await;
+        let (_, release) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+        release.send(ANSWER.as_str()).unwrap();
+        seed.wait_idle().await;
+    }
+    seed.detach().await;
+    let mut full = SdkClient::connect(&url).await;
+    let denied = full
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"replayFrom":{"type":"start"}}),
+        )
+        .await;
+    assert!(
+        denied.get("error").is_some(),
+        "full replay unexpectedly succeeded"
+    );
+    full.detach().await;
+    let mut idle = fixture.bridge_options(&url, Some(id), true);
+    assert_no_replay_snapshot(&mut idle, id, "idle").await;
+    idle.request(
+        3,
+        "session/prompt",
+        json!({"sessionId":id,"prompt":[{"type":"text","text":"Remain running through snapshot"}]}),
+    )
+    .await;
+    let (_, abandoned) = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+    let mut active = fixture.bridge_options(&url, Some(id), true);
+    assert_no_replay_snapshot(&mut active, id, "running").await;
+    active
+        .send_wire(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+        .await;
+    active.wait_wire_idle().await;
+    drop(abandoned);
+    let _ = idle.child.kill().await;
+    active.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
+}
+
+async fn assert_no_replay_snapshot(bridge: &mut Bridge, id: &str, state: &str) {
+    bridge.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"snapshot-test","version":"0"},"capabilities":{}})).await;
+    bridge.send_wire(json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/ignored","mcpServers":[]}})).await;
+    let frames = timeout(WAIT, async {
+        let mut frames = Vec::new();
+        let mut response = false;
+        let mut commit = false;
+        while !response || !commit {
+            let frame = bridge.read_wire().await;
+            if frame["id"] == 2 {
+                assert!(frame.get("error").is_none(), "{frame}");
+                assert_eq!(frame["result"]["sessionId"], id);
+                response = true;
+            }
+            commit |= frame["params"]["_meta"]["kit/gatewayRecovery"]["kind"] == "commit";
+            frames.push(frame);
+        }
+        frames
+    })
+    .await
+    .expect("explicit no-replay resume did not commit");
+    let commit = frames
+        .iter()
+        .find(|frame| frame["params"]["_meta"]["kit/gatewayRecovery"]["kind"] == "commit")
+        .unwrap();
+    let meta = &commit["params"]["_meta"]["kit/gatewayRecovery"];
+    assert_eq!(meta["historyAvailable"], false);
+    assert_eq!(meta["stateSnapshot"], true);
+    assert_eq!(meta["configSnapshot"], true);
+    let candidate: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame["params"]["_meta"]["kit/gatewayRecovery"]["kind"] == "replay")
+        .collect();
+    assert_eq!(
+        candidate.len(),
+        2,
+        "no-replay must contain only authoritative config and state"
+    );
+    assert!(
+        candidate
+            .iter()
+            .all(|frame| frame["params"]["sessionId"] == id)
+    );
+    assert_eq!(
+        candidate[0]["params"]["update"]["sessionUpdate"],
+        "config_option_update"
+    );
+    assert!(candidate[0]["params"]["update"]["configOptions"].is_array());
+    assert_eq!(
+        candidate[1]["params"]["update"]["sessionUpdate"],
+        "state_update"
+    );
+    assert_eq!(candidate[1]["params"]["update"]["state"], state);
 }

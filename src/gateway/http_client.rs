@@ -1,6 +1,8 @@
 //! Stdio relay for the SDK's ACP v2 HTTP transport.
 use super::object;
-use agent_client_protocol::schema::v1::{RequestId, Response};
+use agent_client_protocol::schema::v1::RequestId;
+#[cfg(test)]
+use agent_client_protocol::schema::v1::Response;
 use agent_client_protocol::{BoundedChannel, ChargedFrame, RawJsonRpcMessage, TransportFrame};
 use agent_client_protocol_http::{
     BoundedHttpClient, HttpClient as AcpHttpClient, HttpClientLimits,
@@ -83,7 +85,7 @@ fn rewrite(
         );
         if request.method.as_ref() == "session/new" && *initial {
             *initial = false;
-            if let Some(id) = session.take() {
+            if let Some(id) = session.clone() {
                 *resumed = Some((request.id.clone(), id.clone()));
                 request.method = "session/resume".into();
                 params["sessionId"] = Value::String(id);
@@ -109,6 +111,7 @@ fn rewrite(
 
 // The local TUI issued session/new, whose response requires sessionId. ACP
 // session/resume omits it, so restore that field only on the rewritten response.
+#[cfg(test)]
 fn restore_new_response(frame: &mut TransportFrame, resumed: &mut Option<(RequestId, String)>) {
     fn message(value: &mut RawJsonRpcMessage, resumed: &mut Option<(RequestId, String)>) {
         let Some((expected, session)) = resumed.as_ref() else {
@@ -140,14 +143,13 @@ fn restore_new_response(frame: &mut TransportFrame, resumed: &mut Option<(Reques
     }
 }
 
+mod recovery;
+
 pub(super) async fn bridge(
     remote: super::Remote,
     root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut channel, mut transport) = client(&remote)?.into_bounded_channel_and_future();
-    // A dedicated reader avoids Tokio's uncancellable blocking stdin read keeping
-    // the runtime alive after a remote disconnect.
-    let (send, mut lines) = tokio::sync::mpsc::channel(16);
+    let (send, lines) = tokio::sync::mpsc::channel(16);
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         loop {
@@ -155,66 +157,19 @@ pub(super) async fn bridge(
                 Ok(Some(line)) => Ok(line),
                 Ok(None) => break,
                 Err(error) => {
-                    let _ = send.blocking_send(Err(error));
+                    let _ = send.blocking_send((std::time::Instant::now(), Err(error)));
                     break;
                 }
             };
-            if send.blocking_send(line).is_err() {
+            if send
+                .blocking_send((std::time::Instant::now(), line))
+                .is_err()
+            {
                 break;
             }
         }
     });
-    let mut session = remote.session;
-    let mut initial = true;
-    let mut resumed = None;
-    let mut input_open = true;
-    enum Event {
-        Frame(Option<ChargedFrame>),
-        Transport(Result<(), agent_client_protocol::Error>),
-        Line(Option<io::Result<String>>),
-    }
-    loop {
-        let event = {
-            let frame = std::pin::pin!(channel.rx.next());
-            let line = std::pin::pin!(async {
-                if input_open {
-                    lines.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            });
-            match select(frame, select(&mut transport, line)).await {
-                Either::Left((frame, _)) => Event::Frame(frame),
-                Either::Right((Either::Left((result, _)), _)) => Event::Transport(result),
-                Either::Right((Either::Right((line, _)), _)) => Event::Line(line),
-            }
-        };
-        match event {
-            Event::Frame(Some(charged)) => {
-                // Keep the reservation until decoded data and stdout serialization
-                // have both been consumed; never queue an uncharged decoded frame.
-                let mut frame = charged.decode();
-                restore_new_response(&mut frame, &mut resumed);
-                print_frame(&frame)?;
-                drop(frame);
-                drop(charged);
-            }
-            Event::Frame(None) => return transport.await.map_err(transport_error),
-            Event::Transport(result) => return result.map_err(transport_error),
-            Event::Line(Some(line)) => {
-                let mut frame = TransportFrame::parse_json(&line?);
-                rewrite(&mut frame, &root, &mut session, &mut initial, &mut resumed)?;
-                channel.tx.try_send(frame).map_err(transport_error)?;
-            }
-            Event::Line(None) => {
-                input_open = false;
-                // Keep polling the driver after EOF: it drains accepted POSTs
-                // and awaits HTTP DELETE before returning. Dropping it here
-                // would race process shutdown against best-effort cleanup.
-                channel.tx.close_channel();
-            }
-        }
-    }
+    recovery::run(remote, root, lines, io::stdout()).await
 }
 
 // Bound before parsing or entering the 16-slot local mailbox. BufRead::lines()
@@ -246,14 +201,6 @@ fn read_stdin_line(reader: &mut impl io::BufRead) -> io::Result<Option<String>> 
 
 fn transport_error(error: agent_client_protocol::Error) -> Box<dyn std::error::Error> {
     format!("gateway transport failed; submission outcome may be unknown. Reconnect and inspect before resubmitting: {error}").into()
-}
-
-fn print_frame(frame: &TransportFrame) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write;
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{}", frame.to_json()?)?;
-    stdout.flush()?;
-    Ok(())
 }
 
 async fn request(
@@ -403,6 +350,7 @@ mod tests {
                 url: format!("http://{address}"),
                 credential_file: credential.path().to_owned(),
                 session: None,
+                no_replay: false,
             }),
         )
         .await;
@@ -476,6 +424,7 @@ mod tests {
         assert_eq!(value["params"]["sessionId"], "remote-session");
         assert_eq!(value["params"]["replayFrom"], json!({"type": "start"}));
         assert_eq!(value["id"], 7);
+        assert_eq!(session.as_deref(), Some("remote-session"));
         let mut response =
             TransportFrame::parse_json(r#"{"jsonrpc":"2.0","id":7,"result":{"configOptions":[]}}"#);
         restore_new_response(&mut response, &mut resumed);

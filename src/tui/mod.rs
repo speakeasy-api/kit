@@ -17,6 +17,7 @@ mod input;
 #[cfg(all(test, unix))]
 mod keyboard_tests;
 mod markdown;
+mod recovery;
 mod scheduler;
 mod source;
 mod startup;
@@ -639,7 +640,13 @@ fn spawn_background_workers(
                     break;
                 }
                 let mut remaining = 64 * 1024 * 1024;
-                let images = match &queued.update {
+                let materialize = match &queued.update {
+                    Update::GatewayRecovery(event) => {
+                        event.updates.first().unwrap_or(&queued.update)
+                    }
+                    update => update,
+                };
+                let images = match materialize {
                     Update::UserMessage { images, .. } => images
                         .iter()
                         // File-backed placeholders need materialization before they can
@@ -1479,6 +1486,12 @@ async fn run_client(
     // Local agents fix themselves to a canonical root. Remote paths belong to
     // the gateway host and must never be resolved against the client filesystem.
     let is_remote = remote.is_some();
+    let initial_remote_resume = remote.is_some_and(|remote| remote.session.is_some());
+    let recovery_ingress = Arc::new(Mutex::new(recovery::Ingress::for_session(
+        remote
+            .and_then(|remote| remote.session.clone())
+            .or_else(|| resume.map(str::to_owned)),
+    )));
     let voice_enabled = voice_enabled && !is_remote;
     let root = &client_root(root, is_remote)?;
     let credential_storage =
@@ -1636,6 +1649,7 @@ async fn run_client(
         let cleanup_root = root.clone();
         let transition_session = Arc::clone(&active_persisted_id);
         let notification_session = Arc::clone(&active_persisted_id);
+        let notification_recovery = Arc::clone(&recovery_ingress);
         let result = {
             let root = root.clone();
             let model = model.clone();
@@ -1646,6 +1660,12 @@ async fn run_client(
         .v2()
         .on_receive_notification(
             async move |notification: UpdateSessionNotification, _cx| {
+                if is_remote {
+                    if let Some(queued) = recovery::notification(notification, &notification_recovery, &notification_session) {
+                        let _ = notifications.send(queued);
+                    }
+                    return Ok(());
+                }
                 let current = notification_session.lock().ok().map(|route| route.clone());
                 for update in current.as_ref().map_or_else(Vec::new, |route| {
                     translate_for_session(notification, &route.id)
@@ -1748,7 +1768,7 @@ async fn run_client(
             };
             let initial = match initial {
                 Err(error)
-                    if auth_methods.is_empty()
+                    if is_remote || auth_methods.is_empty()
                         || !authentication_required(&error, &auth_methods) =>
                 {
                     return Err(error);
@@ -1948,7 +1968,9 @@ async fn run_client(
                             }
                         }
                         Ok(update) => match update {
-                            Some(update) => app.apply(update.update),
+                            Some(update) => {
+                                if let Some(update) = accept_queued_update(&transition_session, update) { app.apply(update); }
+                            },
                             None => {
                                 drop(events);
                                 leave(&mut terminal);
@@ -1986,6 +2008,11 @@ async fn run_client(
                 active.id = active_session_id.clone();
             }
             app.start_session(active_session_id.clone());
+            if is_remote {
+                recovery_ingress.lock().map_err(|_| agent_client_protocol::util::internal_error("recovery admission poisoned"))?.confirm_session(&active_session_id);
+                app.gateway_epoch = if initial_remote_resume { 0 } else { 1 };
+                app.gateway_blocked = initial_remote_resume;
+            }
             let storage_shutdown = crate::resilient_fs::shutdown_token();
             let mut voice = NativeVoice::default();
             // This scope owns events (authentication moves/drops it) but only
@@ -2019,6 +2046,17 @@ async fn run_client(
                 let mut priority = scheduler::Priority::default();
                 let mut frames = scheduler::Frames::new(tokio::time::Instant::now());
                 loop {
+                    let recovery_unavailable = is_remote && !recovery_available(&recovery_ingress, &transition_session, &app);
+                    if recovery_unavailable {
+                        if !app.gateway_blocked {
+                            app.gateway_status = Some("Reconnecting · previous outcome unknown; mutations disabled".into());
+                        }
+                        app.gateway_blocked = true;
+                        if let Some(pending) = clipboard_pastes.pending.as_mut() { pending.submit = false; }
+                        submit_after_paste = false;
+                        child_read = None;
+                        app.child_focus = None;
+                    }
                     let target = app.child_read_target().map(|target| (session_id.to_string(), target));
                     if child_read.as_ref().is_some_and(|read| Some(&read.target) != target.as_ref()) {
                         // Dropping the future cancels the local request and frees its page.
@@ -2136,7 +2174,8 @@ async fn run_client(
                         }
                         SessionEvent::ChildTranscript(result) => {
                             if let Some(read) = child_read.take()
-                                && read.target.0 == session_id.to_string() {
+                                && read.target.0 == session_id.to_string()
+                                && (!is_remote || recovery_available(&recovery_ingress, &transition_session, &app)) {
                                 finish_child_transcript(&mut app, &mut frames, &read.target.1, result);
                             }
                         }
@@ -2195,6 +2234,9 @@ async fn run_client(
                         },
                         SessionEvent::StorageShutdown => return Ok(()),
                         SessionEvent::Terminal(terminal_event) => {
+                            if is_remote && !recovery_available(&recovery_ingress, &transition_session, &app) {
+                                app.gateway_blocked = true;
+                            }
                             // A paste is a burst: one bracketed-paste event, or
                             // thousands of key events where the terminal cannot
                             // bracket it. Applying everything the terminal has
@@ -2219,7 +2261,15 @@ async fn run_client(
                                     break;
                                 }
                             }
+                            let action_generation = transition_session.lock().ok().map(|route| route.generation);
                             match action {
+                                action if is_remote && !recovery_available(&recovery_ingress, &transition_session, &app) && recovery_mutation(&action) => {
+                                    if let Action::Submit { prompt, .. } = action {
+                                        app.paste(&prompt.text);
+                                        app.restore_attachments(prompt.attachments);
+                                    }
+                                    app.toast("Gateway reconnecting; mutations disabled. Previous acceptance may be unknown.");
+                                }
                                 Action::Usage(_) | Action::Voice(_) | Action::Login(_)
                                 | Action::New(_) | Action::ListSessions | Action::RenameSession { .. }
                                 | Action::Resume(_) if is_remote => {
@@ -2280,6 +2330,12 @@ async fn run_client(
                                             .await
                                             .map(|_| None)
                                     };
+                                    if is_remote && !route_generation_matches(&transition_session, action_generation) {
+                                        app.paste(&prompt.text);
+                                        app.restore_attachments(prompt.attachments);
+                                        app.toast("Message acceptance unknown; not retried. Review the recovered transcript.");
+                                        continue;
+                                    }
                                     match outcome {
                                         Ok(Some(message_id)) => {
                                             app.accept_attachments(&prompt.attachments);
@@ -2293,12 +2349,12 @@ async fn run_client(
                                         Err(error) => {
                                             app.paste(&prompt.text);
                                             app.restore_attachments(prompt.attachments);
-                                            app.note(format!("message was not accepted: {}", error.message));
+                                            app.note(recovery::submission_error(&error));
                                         }
                                     }
                                 }
                                 Action::SteerChild { id, generation, text } => {
-                                    // transition_route is the only route writer. Snapshot its
+                                    // Route transitions and recovery admission fence writers. Snapshot its
                                     // generation synchronously with the root ACP identity, and
                                     // drop the guard before starting any asynchronous work.
                                     let route_generation = match transition_session.lock() {
@@ -2405,7 +2461,7 @@ async fn run_client(
                                             .block_task()
                                             .await;
                                         if let Err(error) = outcome {
-                                            app.note(format!("message was not accepted: {}", error.message));
+                                            app.note(recovery::submission_error(&error));
                                         }
                                     }
                                 }
@@ -2589,6 +2645,10 @@ async fn run_client(
                                         ))
                                         .block_task()
                                         .await;
+                                    if is_remote && !route_generation_matches(&transition_session, action_generation) {
+                                        app.toast("Configuration outcome unknown; recovered snapshot will be authoritative");
+                                        continue;
+                                    }
                                     match response {
                                         Ok(response) => {
                                             refresh_config_state(
@@ -2737,14 +2797,18 @@ async fn run_client(
                                     );
                                 }
                                 Action::DetachCompose(call_id) => {
-                                    match connection
+                                    let response = connection
                                         .send_request(DetachComposeRequest {
                                             session_id: session_id.clone(),
                                             call_id,
                                         })
                                         .block_task()
-                                        .await
-                                    {
+                                        .await;
+                                    if is_remote && !route_generation_matches(&transition_session, action_generation) {
+                                        app.toast("Backgrounding outcome unknown; not retried");
+                                        continue;
+                                    }
+                                    match response {
                                         Ok(response) if !response.detached => {
                                             app.note("compose call is no longer running in the foreground");
                                         }
@@ -2762,6 +2826,10 @@ async fn run_client(
                                         })
                                         .block_task()
                                         .await;
+                                    if is_remote && !route_generation_matches(&transition_session, action_generation) {
+                                        app.toast("Cancellation outcome unknown; not retried");
+                                        continue;
+                                    }
                                     if let Err(error) = response {
                                         app.note(format!(
                                             "could not cancel background call: {}", error.message
@@ -2773,6 +2841,7 @@ async fn run_client(
                                     revision,
                                     activation,
                                 } => {
+                                    let Some(generation) = action_generation else { continue; };
                                     let connection = connection.clone();
                                     let updates = updates_tx.clone();
                                     tokio::spawn(async move {
@@ -2782,7 +2851,7 @@ async fn run_client(
                                             .await
                                             .map(|response| response.matches)
                                             .map_err(|error| error.message.to_string());
-                                        let _ = updates.send(QueuedUpdate::global(
+                                        let _ = updates.send(QueuedUpdate::for_session(generation,
                                             Update::FileMatches { revision, result },
                                         ));
                                     });
@@ -3174,6 +3243,15 @@ fn pending_message_unavailable(error: &agent_client_protocol::Error) -> bool {
 
 /// Keep Enter behind earlier native pastes without blocking terminal events.
 fn handle_with_clipboard(app: &mut App, pastes: &mut ClipboardPastes, event: Event) -> Action {
+    if app.gateway_blocked {
+        if let Some(pending) = pastes.pending.as_mut() {
+            pending.submit = false;
+        }
+        if matches!(&event, Event::Key(key) if key.code == KeyCode::Enter) {
+            app.toast("Gateway recovery in progress; input retained, not submitted");
+            return Action::None;
+        }
+    }
     if let Some(pending) = &mut pastes.pending {
         if pending.route != app.clipboard_route() {
             pastes.pending = None;
@@ -3313,7 +3391,55 @@ fn handle(app: &mut App, event: Event) -> Action {
     action
 }
 
+fn recovery_available(
+    ingress: &Arc<Mutex<recovery::Ingress>>,
+    route: &Arc<Mutex<ActiveSessionRoute>>,
+    app: &App,
+) -> bool {
+    // Same ingress -> route ordering as callback admission. Poison isolates the
+    // remote attachment; never infer an epoch or permit mutations by default.
+    ingress
+        .lock()
+        .is_ok_and(|ingress| ingress.available(app) && route.lock().is_ok())
+}
+
+fn route_generation_matches(route: &Arc<Mutex<ActiveSessionRoute>>, expected: Option<u64>) -> bool {
+    route
+        .lock()
+        .is_ok_and(|route| Some(route.generation) == expected)
+}
+
+fn recovery_mutation(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Submit { .. }
+            | Action::ReplaceSteer { .. }
+            | Action::RevokeSteer { .. }
+            | Action::SteerChild { .. }
+            | Action::SelectModel { .. }
+            | Action::ConfirmModelSwitch(_)
+            | Action::SelectEffort { .. }
+            | Action::Cancel
+            | Action::DetachCompose(_)
+            | Action::CancelBackground(_)
+            | Action::New(_)
+            | Action::Resume(_)
+            | Action::RenameSession { .. }
+            | Action::Login(_)
+            | Action::Voice(_)
+    )
+}
+
 fn handle_inner(app: &mut App, event: Event) -> Action {
+    if app.gateway_blocked
+        && matches!(&event, Event::Key(key) if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return Action::Quit;
+    }
+    if app.gateway_blocked && matches!(&event, Event::Key(key) if key.code == KeyCode::Enter) {
+        app.toast("Gateway recovery in progress; input retained, not submitted");
+        return Action::None;
+    }
     match event {
         Event::Key(key) if clipboard_paste_key(key) => {
             if paste_blocked(app) {

@@ -1073,7 +1073,11 @@ impl Command {
                 .arg(clap::Arg::new("remote_credential_file").long("remote-credential-file")
                     .value_name("FILE").value_parser(clap::value_parser!(PathBuf)).requires("remote"))
                 .arg(clap::Arg::new("remote_session").long("remote-session")
-                    .value_name("ID").requires("remote"));
+                    .value_name("ID").requires("remote"))
+                .arg(clap::Arg::new("remote_no_replay").long("remote-no-replay")
+                    .action(clap::ArgAction::SetTrue)
+                    .requires_all(["remote", "remote_session"])
+                    .help("Attach without transcript history using the authoritative current snapshot"));
             let command = command.arg(
                 clap::Arg::new("root")
                     .long("root")
@@ -1211,6 +1215,7 @@ impl Command {
                 remote: optional_arg(matches, "remote")?,
                 remote_credential_file: optional_arg(matches, "remote_credential_file")?,
                 remote_session: optional_arg(matches, "remote_session")?,
+                remote_no_replay: required_arg(matches, "remote_no_replay")?,
                 root: optional_arg(matches, "root")?,
                 model: optional_arg(matches, "model")?,
                 provider: optional_arg(matches, "provider")?,
@@ -1752,6 +1757,7 @@ enum Command {
         remote: Option<String>,
         remote_credential_file: Option<PathBuf>,
         remote_session: Option<String>,
+        remote_no_replay: bool,
         /// Working directory and project context (defaults to config or `.`).
         root: Option<PathBuf>,
         /// Model name (defaults to config or `gpt-5.4`).
@@ -2484,6 +2490,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             remote,
             remote_credential_file,
             remote_session,
+            remote_no_replay,
             root,
             model,
             provider,
@@ -2500,6 +2507,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     credential_file: remote_credential_file
                         .ok_or("--remote requires --remote-credential-file")?,
                     session: remote_session,
+                    no_replay: remote_no_replay,
                 };
                 return kit::tui::run_remote(&root, &remote, &mut kit::tui::Stop::new()?).await;
             }
@@ -2645,6 +2653,7 @@ mod tests {
             remote,
             remote_credential_file,
             remote_session,
+            remote_no_replay,
             root,
             resume,
             ..
@@ -2658,6 +2667,7 @@ mod tests {
             Some(std::path::Path::new("/client/credential"))
         );
         assert_eq!(remote_session.as_deref(), Some("s-remote"));
+        assert!(!remote_no_replay);
         assert_eq!(
             root.as_deref(),
             Some(std::path::Path::new("/server/project"))
@@ -2679,6 +2689,54 @@ mod tests {
             assert!(Cli::try_parse_from(args).is_err());
         }
         assert!(Cli::try_parse_from(["kit", "tui", "--remote-session", "s-remote"]).is_err());
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn remote_no_replay_requires_an_explicit_remote_session() {
+        let base = [
+            "kit",
+            "tui",
+            "--remote",
+            "https://gateway.example",
+            "--remote-credential-file",
+            "/client/credential",
+            "--root",
+            "/server/project",
+        ];
+        for args in [vec!["kit", "tui"], base.to_vec()] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Tui {
+                remote_no_replay, ..
+            } = cli.command
+            else {
+                panic!("expected tui command");
+            };
+            assert!(!remote_no_replay);
+        }
+        for extra in [
+            vec!["--remote-no-replay"],
+            vec!["--remote-session", "s-remote", "--remote-no-replay"],
+        ] {
+            let mut args = vec!["kit", "tui"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let mut args = base.to_vec();
+        args.push("--remote-no-replay");
+        assert!(Cli::try_parse_from(args.clone()).is_err());
+        args.extend(["--remote-session", "s-remote"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Tui {
+            remote_no_replay,
+            remote_session,
+            ..
+        } = cli.command
+        else {
+            panic!("expected tui command");
+        };
+        assert!(remote_no_replay);
+        assert_eq!(remote_session.as_deref(), Some("s-remote"));
     }
 
     #[cfg(feature = "tui")]

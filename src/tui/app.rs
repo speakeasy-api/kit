@@ -43,11 +43,13 @@ use super::{
 };
 
 mod focus;
+mod recovery;
 pub use focus::ChildView;
 
 /// Everything the client learns from the agent or its own runtime channel.
 #[derive(Debug)]
 pub enum Update {
+    GatewayRecovery(crate::tui::recovery::Event),
     ChildSteerFinished {
         id: String,
         generation: u64,
@@ -105,7 +107,10 @@ pub enum Update {
         append: bool,
     },
     /// Atomic replacement of an assistant message with ordered content parts.
-    AgentParts { id: String, parts: Vec<AgentPart> },
+    AgentParts {
+        id: String,
+        parts: Vec<AgentPart>,
+    },
     /// Agent reasoning, either appended as a chunk or replaced by an upsert.
     AgentThought {
         id: String,
@@ -134,7 +139,10 @@ pub enum Update {
         backgrounded: bool,
     },
     /// ACP parent identity; absence of this update preserves the relationship.
-    ToolParent { id: String, parent: Option<String> },
+    ToolParent {
+        id: String,
+        parent: Option<String>,
+    },
     /// Agent-advertised slash commands for one session.
     AvailableCommands {
         session_id: String,
@@ -822,6 +830,10 @@ pub struct AgentCounts {
 }
 
 pub struct App {
+    pub(super) gateway_epoch: u64,
+    pub(super) gateway_blocked: bool,
+    pub(super) gateway_status: Option<String>,
+    gateway_candidate: Option<recovery::Candidate>,
     pub child_focus: Option<String>,
     child_ui: HashMap<String, focus::ChildUiState>,
     pub child_views: HashMap<String, ChildView>,
@@ -1103,6 +1115,10 @@ fn agent_status_rank(status: SubagentStatus) -> u8 {
 impl App {
     pub fn new(root: PathBuf, provider: String, model: String, a2a: String) -> Self {
         Self {
+            gateway_epoch: 0,
+            gateway_blocked: false,
+            gateway_status: None,
+            gateway_candidate: None,
             child_focus: None,
             child_ui: HashMap::new(),
             child_views: HashMap::new(),
@@ -2141,6 +2157,10 @@ impl App {
     }
 
     pub(super) fn apply_materialized(&mut self, update: Update, images: Vec<MaterializedImage>) {
+        if let Update::GatewayRecovery(event) = update {
+            self.apply_recovery(event, images);
+            return;
+        }
         if matches!(update, Update::OpenUserImage(_)) {
             use super::attachment::RetainOpenedError;
             let result = images
@@ -2214,6 +2234,7 @@ impl App {
     fn apply_observed(&mut self, update: Update) {
         let at = self.observed_at();
         match update {
+            Update::GatewayRecovery(event) => self.apply_recovery(event, Vec::new()),
             Update::ChildSteerFinished {
                 id,
                 generation,

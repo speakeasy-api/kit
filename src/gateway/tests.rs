@@ -57,7 +57,7 @@ impl Harness {
         .await
         {
             Ok(Json(value)) => (StatusCode::OK, value),
-            Err(Failure(status, message)) => (status, json!({"error":message})),
+            Err(Failure(status, message, _)) => (status, json!({"error":message})),
         }
     }
 
@@ -111,6 +111,7 @@ for line in sys.stdin:
             pending: HashMap::new(),
             initialized: None,
             session_result: None,
+            state: json!({"sessionUpdate":"state_update","state":"idle"}),
             journal: VecDeque::new(),
             journal_bytes: 0,
             replay_complete: true,
@@ -401,6 +402,7 @@ fn isolated_actor() -> Actor {
         pending: HashMap::new(),
         initialized: None,
         session_result: None,
+        state: json!({"sessionUpdate":"state_update","state":"idle"}),
         journal: VecDeque::new(),
         journal_bytes: 0,
         replay_complete: true,
@@ -429,6 +431,7 @@ async fn accepted_child_write_retains_charge_after_dequeue_until_consumed() {
         let attached = actor
             .command(
                 Request::Attach {
+                    startup: None,
                     session: actor.id.clone(),
                     replace: false,
                     replay: true,
@@ -468,6 +471,7 @@ fn failed_child_enqueue_does_not_publish_pending_request() {
     let attached = actor
         .command(
             Request::Attach {
+                startup: None,
                 session: actor.id.clone(),
                 replace: false,
                 replay: true,
@@ -504,6 +508,7 @@ fn failed_replay_claim_preserves_owner_and_stale_release_preserves_replacement()
     let mut actor = isolated_actor();
     let (writes, _receiver) = mpsc::channel(1);
     let claim = |replace| Request::Attach {
+        startup: None,
         session: "resident".into(),
         replace,
         replay: true,
@@ -584,6 +589,7 @@ fn transcript_replay_overflow_returns_error_not_truncated_success() {
     let attachment = actor
         .command(
             Request::Attach {
+                startup: None,
                 session: actor.id.clone(),
                 replace: false,
                 replay: true,
@@ -631,6 +637,7 @@ fn no_replay_restore_and_claim_survive_incomplete_internal_cache() {
     let attachment = actor
         .command(
             Request::Attach {
+                startup: None,
                 session: actor.id.clone(),
                 replace: true,
                 replay: false,
@@ -653,14 +660,19 @@ fn no_replay_restore_and_claim_survive_incomplete_internal_cache() {
     actor.output(json!({"jsonrpc":"2.0","id":1,"result":{"sessionId":"resident"}}));
     let owner = actor.attachment.as_ref().unwrap();
     assert!(owner.live);
-    assert_eq!(owner.events.len(), 1);
-    assert_eq!(owner.events[0].1["id"], 42);
-    assert!(owner.events[0].1.get("error").is_none());
+    assert_eq!(owner.events.len(), 3);
+    assert_eq!(owner.events[2].1["id"], 42);
+    assert!(owner.events[2].1.get("error").is_none());
+    assert_eq!(
+        owner.events[2].1["result"]["_meta"]["kit/gateway"]["historyAvailable"],
+        false
+    );
     // A later full-replay claimant still cannot evict this healthy controller.
     assert!(
         actor
             .command(
                 Request::Attach {
+                    startup: None,
                     session: actor.id.clone(),
                     replace: true,
                     replay: true,
@@ -1005,5 +1017,439 @@ for line in sys.stdin:
         while let Some(result) = bodies.join_next().await {
             assert!(result.unwrap_err().is_cancelled());
         }
+    }
+}
+
+fn resident_claim(actor: &Actor, replay: bool, id: u64) -> Request {
+    Request::Attach {
+        session: actor.id.clone(),
+        replace: true,
+        replay,
+        startup: Some(
+            json!({"jsonrpc":"2.0","id":id,"method":"session/resume","params":{"sessionId":actor.id}}),
+        ),
+    }
+}
+
+fn state_update(state: &str) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"resident","update":{"sessionUpdate":"state_update","state":state}}})
+}
+
+#[test]
+fn resident_snapshot_follows_replay_and_precedes_success() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor.output(state_update("running"));
+    actor.output(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"resident","update":{"sessionUpdate":"agent_message","id":"done","content":[]}}}));
+    // Assistant output is not evidence that foreground work stopped.
+    actor
+        .command(resident_claim(&actor, true, 50), &writes)
+        .unwrap();
+    let events: Vec<_> = actor
+        .attachment
+        .as_ref()
+        .unwrap()
+        .events
+        .iter()
+        .map(|(_, m)| m)
+        .collect();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[1]["params"]["update"]["id"], "done");
+    assert_eq!(
+        events[2]["params"]["update"]["sessionUpdate"],
+        "config_option_update"
+    );
+    assert_eq!(events[3]["params"]["update"]["state"], "running");
+    assert_eq!(events[4]["id"], 50);
+    assert_eq!(
+        events[4]["result"]["_meta"]["kit/gateway"],
+        json!({"historyAvailable":true,"stateSnapshot":true,"configSnapshot":true,"attachment":actor.attachment.as_ref().unwrap().id})
+    );
+    // Validate snapshots using the actual ACP v2 SDK, not an invented shape.
+    for event in &events[2..4] {
+        serde_json::from_value::<agent_client_protocol::schema::v2::UpdateSessionNotification>(
+            event["params"].clone(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn no_replay_snapshot_retains_running_state_and_current_config_after_eviction() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor.output(state_update("running"));
+    let options = json!([{"id":"model","name":"Model","type":"select","currentValue":"new","options":[{"value":"new","name":"New"}]}]);
+    actor.output(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"resident","update":{"sessionUpdate":"config_option_update","configOptions":options}}}));
+    actor.remember(json!({"payload":"x".repeat(MAX_REPLAY+1)}));
+    actor
+        .command(resident_claim(&actor, false, 51), &writes)
+        .unwrap();
+    let owner = actor.attachment.as_ref().unwrap();
+    assert_eq!(owner.events.len(), 3);
+    assert_eq!(
+        owner.events[0].1["params"]["update"]["configOptions"],
+        options
+    );
+    assert_eq!(owner.events[1].1["params"]["update"]["state"], "running");
+    assert_eq!(
+        owner.events[2].1["result"]["_meta"]["kit/gateway"]["historyAvailable"],
+        false
+    );
+    actor.output(state_update("idle"));
+    assert_eq!(
+        actor.attachment.as_ref().unwrap().events.back().unwrap().1["params"]["update"]["state"],
+        "idle"
+    );
+}
+
+#[test]
+fn failed_resident_snapshot_preserves_owner_and_success_fences_old_generation() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 60), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    // Journal itself is below aggregate limits, but cannot cross HTTP as one frame.
+    actor.remember(json!({"payload":"x".repeat(MAX_HTTP_FRAME)}));
+    assert!(actor.replay_complete);
+    let error = actor
+        .command(resident_claim(&actor, true, 61), &writes)
+        .unwrap_err();
+    assert_eq!(error.2, "replay_unavailable");
+    assert_eq!(actor.attachment.as_ref().unwrap().id, old);
+    assert_eq!(
+        actor.attachment.as_ref().unwrap().events.back().unwrap().1["id"],
+        60
+    );
+    actor.pending.insert(
+        9,
+        Pending {
+            attachment: old.clone(),
+            original: json!(99),
+            method: "session/prompt".into(),
+            replay: false,
+        },
+    );
+    actor
+        .command(resident_claim(&actor, false, 62), &writes)
+        .unwrap();
+    actor.output(json!({"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}));
+    let current = actor.attachment.as_ref().unwrap().id.clone();
+    assert_ne!(old, current);
+    assert_eq!(actor.attachment.as_ref().unwrap().events.len(), 3);
+    let error = actor
+        .command(
+            Request::Detach {
+                session: actor.id.clone(),
+                attachment: old,
+            },
+            &writes,
+        )
+        .unwrap_err();
+    assert_eq!(error.2, "controller_replaced");
+    assert_eq!(actor.attachment.as_ref().unwrap().id, current);
+}
+
+#[test]
+fn automatic_resume_is_conditioned_on_previous_controller_generation() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 70), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    let mut recovery = resident_claim(&actor, false, 72);
+    if let Request::Attach {
+        startup: Some(message),
+        ..
+    } = &mut recovery
+    {
+        message["params"]["_meta"]["kit/gateway"]["previousAttachment"] = old.clone().into();
+    }
+    // A separate explicit manual claim has replaced the transport being recovered.
+    actor
+        .command(resident_claim(&actor, false, 71), &writes)
+        .unwrap();
+    let current = actor.attachment.as_ref().unwrap().id.clone();
+    let error = actor.command(recovery, &writes).unwrap_err();
+    assert_eq!(error.2, "controller_replaced");
+    assert_eq!(actor.attachment.as_ref().unwrap().id, current);
+    assert_eq!(
+        actor.attachment.as_ref().unwrap().events.back().unwrap().1["id"],
+        71
+    );
+    let mut recovery = resident_claim(&actor, false, 73);
+    if let Request::Attach {
+        startup: Some(message),
+        ..
+    } = &mut recovery
+    {
+        message["params"]["_meta"]["kit/gateway"]["previousAttachment"] = current.clone().into();
+    }
+    actor.command(recovery, &writes).unwrap();
+    assert_ne!(actor.attachment.as_ref().unwrap().id, current);
+    assert_eq!(
+        actor.attachment.as_ref().unwrap().events.back().unwrap().1["result"]["_meta"]["kit/gateway"]
+            ["attachment"],
+        actor.attachment.as_ref().unwrap().id
+    );
+    let newest = actor.attachment.as_ref().unwrap().id.clone();
+    actor
+        .command(
+            Request::Detach {
+                session: actor.id.clone(),
+                attachment: newest.clone(),
+            },
+            &writes,
+        )
+        .unwrap();
+    let mut recovery = resident_claim(&actor, false, 74);
+    if let Request::Attach {
+        startup: Some(message),
+        ..
+    } = &mut recovery
+    {
+        message["params"]["_meta"]["kit/gateway"]["previousAttachment"] = newest.into();
+    }
+    actor.command(recovery, &writes).unwrap();
+}
+
+#[test]
+fn recovery_sequence_retries_own_unconfirmed_claim_but_not_manual_replacement() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 80), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    let recovery = |actor: &Actor, id| {
+        let mut request = resident_claim(actor, false, id);
+        if let Request::Attach {
+            startup: Some(message),
+            ..
+        } = &mut request
+        {
+            message["params"]["_meta"]["kit/gateway"] = json!({"previousAttachment":old,"recoveryId":"random-per-outage","recoveryAttempt":id});
+        }
+        request
+    };
+    actor.command(recovery(&actor, 81), &writes).unwrap();
+    let unconfirmed = actor.attachment.as_ref().unwrap().id.clone();
+    // The previous result was lost; reuse the same outage ID and old confirmed token.
+    actor.command(recovery(&actor, 82), &writes).unwrap();
+    assert_ne!(actor.attachment.as_ref().unwrap().id, unconfirmed);
+    actor
+        .command(resident_claim(&actor, false, 83), &writes)
+        .unwrap();
+    let manual = actor.attachment.as_ref().unwrap().id.clone();
+    assert_eq!(
+        actor.command(recovery(&actor, 84), &writes).unwrap_err().2,
+        "controller_replaced"
+    );
+    assert_eq!(actor.attachment.as_ref().unwrap().id, manual);
+    // Invalid recovery capabilities cannot mutate ownership either.
+    for metadata in [
+        json!({"recoveryId":"orphan"}),
+        json!({"previousAttachment":manual,"recoveryId":""}),
+        json!({"previousAttachment":manual,"recoveryId":"x".repeat(129)}),
+    ] {
+        let mut request = resident_claim(&actor, false, 85);
+        if let Request::Attach {
+            startup: Some(message),
+            ..
+        } = &mut request
+        {
+            message["params"]["_meta"]["kit/gateway"] = metadata;
+        }
+        assert_eq!(actor.command(request, &writes).unwrap_err().2, "protocol");
+        assert_eq!(actor.attachment.as_ref().unwrap().id, manual);
+    }
+}
+
+#[test]
+fn stale_config_response_refreshes_snapshot_without_cross_generation_response() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 90), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    actor.pending.insert(
+        1,
+        Pending {
+            attachment: old,
+            original: json!(900),
+            method: "session/set_config_option".into(),
+            replay: false,
+        },
+    );
+    actor
+        .command(resident_claim(&actor, false, 91), &writes)
+        .unwrap();
+    let options = json!([{"id":"model","name":"Model","type":"select","currentValue":"updated","options":[{"value":"updated","name":"Updated"}]}]);
+    actor.output(json!({"jsonrpc":"2.0","id":1,"result":{"configOptions":options}}));
+    assert_eq!(actor.attachment.as_ref().unwrap().events.len(), 3);
+    actor
+        .command(resident_claim(&actor, false, 92), &writes)
+        .unwrap();
+    assert_eq!(
+        actor.attachment.as_ref().unwrap().events[0].1["params"]["update"]["configOptions"],
+        options
+    );
+}
+
+#[test]
+fn aggregate_snapshot_overflow_preserves_prior_controller() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 93), &writes)
+        .unwrap();
+    let old = actor.attachment.as_ref().unwrap().id.clone();
+    // Every frame fits, and the journal alone fits, but trailing snapshots do not.
+    let frame = json!({"payload":"x".repeat(MAX_HTTP_FRAME / 2 - 100)});
+    for _ in 0..16 {
+        actor.remember(frame.clone());
+    }
+    let remaining = MAX_REPLAY - actor.journal_bytes;
+    actor.remember(json!({"payload":"x".repeat(remaining - 14)}));
+    assert!(actor.replay_complete);
+    assert!(actor.journal_bytes <= MAX_REPLAY);
+    assert_eq!(
+        actor
+            .command(resident_claim(&actor, true, 94), &writes)
+            .unwrap_err()
+            .2,
+        "replay_unavailable"
+    );
+    assert_eq!(actor.attachment.as_ref().unwrap().id, old);
+}
+
+#[test]
+fn recovery_attempt_high_water_mark_fences_delayed_and_duplicate_claims() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 100), &writes)
+        .unwrap();
+    let original = actor.attachment.as_ref().unwrap().id.clone();
+    let recovery = |actor: &Actor, previous: &str, attempt: u64| {
+        let mut request = resident_claim(actor, false, 100 + attempt);
+        if let Request::Attach {
+            startup: Some(message),
+            ..
+        } = &mut request
+        {
+            message["params"]["_meta"]["kit/gateway"] = json!({
+                "previousAttachment":previous,"recoveryId":"ordered-outage","recoveryAttempt":attempt
+            });
+        }
+        request
+    };
+    // Attempt 1 was delayed before mailbox admission; attempt 2 commits first.
+    let late = recovery(&actor, &original, 1);
+    actor
+        .command(recovery(&actor, &original, 2), &writes)
+        .unwrap();
+    let second = actor.attachment.as_ref().unwrap().id.clone();
+    let queued = actor.attachment.as_ref().unwrap().events.clone();
+    assert_eq!(
+        actor.command(late, &writes).unwrap_err().2,
+        "stale_recovery"
+    );
+    assert_eq!(actor.attachment.as_ref().unwrap().id, second);
+    assert_eq!(actor.attachment.as_ref().unwrap().events, queued);
+    // Even the current attachment ID must not bypass duplicate/older fencing.
+    for attempt in [1, 2] {
+        let error = actor
+            .command(recovery(&actor, &second, attempt), &writes)
+            .unwrap_err();
+        assert_eq!(
+            error.data(),
+            json!({"reason":"stale_recovery","terminal":true})
+        );
+        assert_eq!(actor.attachment.as_ref().unwrap().events, queued);
+    }
+    actor
+        .command(recovery(&actor, &original, 3), &writes)
+        .unwrap();
+    assert_ne!(actor.attachment.as_ref().unwrap().id, second);
+    assert_eq!(actor.attachment.as_ref().unwrap().recovery_attempt, Some(3));
+    actor
+        .command(resident_claim(&actor, false, 104), &writes)
+        .unwrap();
+    let manual = actor.attachment.as_ref().unwrap().id.clone();
+    assert!(actor.attachment.as_ref().unwrap().recovery_id.is_none());
+    assert!(
+        actor
+            .attachment
+            .as_ref()
+            .unwrap()
+            .recovery_attempt
+            .is_none()
+    );
+    assert_eq!(
+        actor
+            .command(recovery(&actor, &original, 4), &writes)
+            .unwrap_err()
+            .2,
+        "controller_replaced"
+    );
+    assert_eq!(actor.attachment.as_ref().unwrap().id, manual);
+}
+
+#[test]
+fn recovery_attempt_metadata_is_paired_positive_and_bounded() {
+    let mut actor = isolated_actor();
+    let (writes, _receiver) = mpsc::channel(1);
+    actor.session_result = Some(json!({"configOptions":[]}));
+    actor
+        .command(resident_claim(&actor, false, 110), &writes)
+        .unwrap();
+    let owner = actor.attachment.as_ref().unwrap().id.clone();
+    let mut invalid = vec![
+        json!({"previousAttachment":owner,"recoveryId":"missing-attempt"}),
+        json!({"previousAttachment":owner,"recoveryAttempt":1}),
+        json!({"recoveryId":"missing-predecessor","recoveryAttempt":1}),
+    ];
+    for attempt in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("1"),
+        Value::Null,
+        json!(18446744073709551616_f64),
+    ] {
+        invalid.push(json!({"previousAttachment":owner,"recoveryId":"invalid-attempt","recoveryAttempt":attempt}));
+    }
+    for metadata in invalid {
+        let mut request = resident_claim(&actor, false, 111);
+        if let Request::Attach {
+            startup: Some(message),
+            ..
+        } = &mut request
+        {
+            message["params"]["_meta"]["kit/gateway"] = metadata;
+        }
+        assert_eq!(actor.command(request, &writes).unwrap_err().2, "protocol");
+        assert_eq!(actor.attachment.as_ref().unwrap().id, owner);
+        assert!(
+            actor
+                .attachment
+                .as_ref()
+                .unwrap()
+                .recovery_attempt
+                .is_none()
+        );
     }
 }

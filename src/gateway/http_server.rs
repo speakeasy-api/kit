@@ -162,7 +162,7 @@ impl Connection {
                             ("coreBufferedBytesPerDirection", 16_777_216.into()),
                             ("httpEgressBytesPerConnection", 4_194_304.into()),
                             ("liveReplayLimitBytes", MAX_REPLAY.into()),
-                            ("liveReplayLimitEvents", (MAX_QUEUE - 2).into()),
+                            ("liveReplayLimitEvents", (MAX_QUEUE - 3).into()),
                         ]),
                     )]),
                 ),
@@ -271,17 +271,6 @@ impl Connection {
                 .as_str()
                 .ok_or_else(|| Failure::unavailable("missing session id"))?
                 .to_owned();
-            let attached = self
-                .operation(Request::Attach {
-                    session: session.clone(),
-                    replace: resume,
-                    replay: !resume || message["params"].get("replayFrom").is_some(),
-                })
-                .await?;
-            let attachment = attached["attachment"]
-                .as_str()
-                .ok_or_else(|| Failure::unavailable("missing controller id"))?
-                .to_owned();
             let entry = self
                 .gateway
                 .sessions
@@ -290,6 +279,28 @@ impl Connection {
                 .get(&session)
                 .cloned()
                 .ok_or_else(|| Failure::unavailable("resident child exited"))?;
+            // Pin the same resident actor for claim and subsequent control.
+            let (reply, accepted) = oneshot::channel();
+            entry
+                .sender
+                .send(Envelope {
+                    request: Request::Attach {
+                        session: session.clone(),
+                        replace: resume,
+                        replay: !resume || message["params"].get("replayFrom").is_some(),
+                        startup: Some(message.clone()),
+                    },
+                    reply,
+                })
+                .await
+                .map_err(|_| Failure::unavailable("resident child exited"))?;
+            let attached = accepted
+                .await
+                .map_err(|_| Failure::unavailable("resident child exited"))??;
+            let attachment = attached["attachment"]
+                .as_str()
+                .ok_or_else(|| Failure::unavailable("missing controller id"))?
+                .to_owned();
             let mut control = Control {
                 session: session.clone(),
                 attachment,
@@ -297,6 +308,13 @@ impl Connection {
                 cursor: 0,
                 pending: HashMap::new(),
             };
+            if attached["started"] == true {
+                if let Some(id) = message.get("id") {
+                    control.pending.insert(id.to_string(), id.clone());
+                }
+                self.controls.insert(session, control);
+                return Ok(None);
+            }
             let (mut initialize, initialize_charge) = self
                 .initialize
                 .clone()
@@ -356,6 +374,26 @@ impl Connection {
         // Settle that controller's pending calls explicitly before forgetting it.
         for (id, error) in failed {
             if let Some(mut control) = self.controls.remove(&id) {
+                send(
+                    channel,
+                    object([
+                        ("jsonrpc", "2.0".into()),
+                        ("method", "session/update".into()),
+                        (
+                            "params",
+                            object([
+                                ("sessionId", id.clone().into()),
+                                (
+                                    "update",
+                                    object([
+                                        ("sessionUpdate", "_gateway_controller".into()),
+                                        ("_meta", object([("kit/gateway", error.data())])),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                )?;
                 for (_, request_id) in control.pending.drain() {
                     send(
                         channel,
@@ -367,6 +405,7 @@ impl Connection {
                                 object([
                                     ("code", (-32000).into()),
                                     ("message", error.1.clone().into()),
+                                    ("data", error.data()),
                                 ]),
                             ),
                         ]),
@@ -432,6 +471,7 @@ impl Connection {
                                     "error",
                                     object([
                                         ("code", (-32000).into()),
+                                        ("data", error.data()),
                                         ("message", error.1.into()),
                                     ]),
                                 ),
@@ -570,6 +610,65 @@ mod tests {
             drop(charged);
         }
         send(&channel, message).unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoked_idle_controller_emits_terminal_notice_without_pending_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let (sender, mut receiver) = mpsc::channel::<Envelope>(2);
+        let (_stopped, stopped) = watch::channel(());
+        let mut connection = Connection::new(gateway);
+        connection.controls.insert(
+            "session".into(),
+            Control {
+                session: "session".into(),
+                attachment: "old".into(),
+                entry: Entry {
+                    root: PathBuf::new(),
+                    sender,
+                    stopped,
+                },
+                cursor: 0,
+                pending: HashMap::new(),
+            },
+        );
+        let actor = async {
+            let envelope = receiver.recv().await.unwrap();
+            assert!(matches!(envelope.request, Request::Poll { .. }));
+            envelope
+                .reply
+                .send(Err(Failure(
+                    StatusCode::CONFLICT,
+                    "replaced".into(),
+                    "controller_replaced",
+                )))
+                .unwrap();
+        };
+        let (channel, mut peer) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let (result, ()) = tokio::join!(connection.flush(&channel), actor);
+        result.unwrap();
+        assert!(connection.controls.is_empty());
+        let frame = peer.rx.next().await.unwrap();
+        let TransportFrame::Single(message) = frame.decode() else {
+            panic!("expected notification")
+        };
+        let message = serde_json::to_value(message).unwrap();
+        assert_eq!(
+            message["params"]["update"]["_meta"]["kit/gateway"],
+            json!({"reason":"controller_replaced","terminal":true})
+        );
+        serde_json::from_value::<agent_client_protocol::schema::v2::UpdateSessionNotification>(
+            message["params"].clone(),
+        )
+        .unwrap();
     }
 
     #[tokio::test]

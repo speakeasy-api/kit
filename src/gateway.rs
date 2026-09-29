@@ -63,6 +63,7 @@ enum InternalCommand {
         credential_file: PathBuf,
         root: PathBuf,
         session: Option<String>,
+        no_replay: bool,
     },
 }
 impl Args {
@@ -116,7 +117,12 @@ impl Args {
                             .required(true)
                             .value_parser(value_parser!(PathBuf)),
                     )
-                    .arg(Arg::new("session").long("session")),
+                    .arg(Arg::new("session").long("session"))
+                    .arg(
+                        Arg::new("no_replay")
+                            .long("no-replay")
+                            .action(ArgAction::SetTrue),
+                    ),
             )
     }
     pub fn from_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
@@ -130,6 +136,7 @@ impl Args {
                 credential_file: required_arg(args, "credential_file")?,
                 root: required_arg(args, "root")?,
                 session: optional_arg(args, "session")?,
+                no_replay: required_arg(args, "no_replay")?,
             }),
             Some((name, _)) => {
                 return Err(clap::Error::raw(
@@ -177,6 +184,7 @@ pub struct Remote {
     pub url: String,
     pub credential_file: PathBuf,
     pub session: Option<String>,
+    pub no_replay: bool,
 }
 impl Remote {
     pub fn command(&self, root: &Path) -> io::Result<tokio::process::Command> {
@@ -188,6 +196,9 @@ impl Remote {
             .arg(root);
         if let Some(id) = &self.session {
             command.arg("--session").arg(id);
+        }
+        if self.no_replay {
+            command.arg("--no-replay");
         }
         Ok(command)
     }
@@ -214,6 +225,8 @@ enum Request {
         replay: bool,
         #[cfg_attr(test, serde(default))]
         replace: bool,
+        #[cfg_attr(test, serde(default))]
+        startup: Option<Value>,
     },
     Poll {
         session: String,
@@ -235,21 +248,41 @@ enum Request {
 }
 type ResultValue = Result<Value, Failure>;
 #[derive(Debug)]
-struct Failure(StatusCode, String);
+struct Failure(StatusCode, String, &'static str);
 impl Failure {
+    fn replay(message: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, message.into(), "replay_unavailable")
+    }
+    fn data(&self) -> Value {
+        object([
+            ("reason", self.2.into()),
+            ("terminal", (self.2 != "unavailable").into()),
+        ])
+    }
+    fn root(message: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, message.into(), "root_denied")
+    }
     fn bad(message: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, message.into())
+        Self(StatusCode::BAD_REQUEST, message.into(), "protocol")
     }
     fn conflict(message: impl Into<String>) -> Self {
-        Self(StatusCode::CONFLICT, message.into())
+        Self(StatusCode::CONFLICT, message.into(), "conflict")
     }
     fn unavailable(message: impl Into<String>) -> Self {
-        Self(StatusCode::SERVICE_UNAVAILABLE, message.into())
+        Self(
+            StatusCode::SERVICE_UNAVAILABLE,
+            message.into(),
+            "unavailable",
+        )
     }
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
-        (self.0, Json(object([("error", self.1.into())]))).into_response()
+        (
+            self.0,
+            Json(object([("data", self.data()), ("error", self.1.into())])),
+        )
+            .into_response()
     }
 }
 struct Gateway {
@@ -343,12 +376,14 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 credential_file,
                 root,
                 session,
+                no_replay,
             } => {
                 http_client::bridge(
                     Remote {
                         url,
                         credential_file,
                         session,
+                        no_replay,
                     },
                     root,
                 )
@@ -362,6 +397,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     url,
                     credential_file,
                     session: None,
+                    no_replay: false,
                 })
                 .await
             }
@@ -401,7 +437,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // HTTP connections can own long-lived SSE streams. Stop the listener and
     // release resident ownership without waiting indefinitely for clients.
     eprintln!(
-        "Experimental gateway: bounded HTTP transport (1 MiB frames, 64 connections); live replay is limited to 8 MiB / 4094 events. Resume without replay when history exceeds these limits; transcripts remain on the host."
+        "Experimental gateway: bounded HTTP transport (1 MiB frames, 64 connections); live replay is limited to 8 MiB / 4093 events. Resume without replay when history exceeds these limits; transcripts remain on the host."
     );
     let served = {
         use std::future::IntoFuture as _;
@@ -542,9 +578,9 @@ async fn handle(
         } => {
             let root = root
                 .canonicalize()
-                .map_err(|_| Failure::bad("project is not registered"))?;
+                .map_err(|_| Failure::root("project is not registered"))?;
             if !gateway.roots.contains(&root) {
-                return Err(Failure::bad("project is not registered"));
+                return Err(Failure::root("project is not registered"));
             }
             gateway.reclaim_exited().await;
             let restore = session.is_some();
@@ -553,7 +589,7 @@ async fn handle(
                 let entries = gateway.sessions.lock().await;
                 if let Some(entry) = entries.get(&id).filter(|e| !e.sender.is_closed()) {
                     if entry.root != root {
-                        return Err(Failure::bad("session belongs to another project"));
+                        return Err(Failure::root("session belongs to another project"));
                     }
                     return Ok(Json(object([
                         ("session", id.into()),
@@ -563,7 +599,7 @@ async fn handle(
                 }
                 drop(entries);
                 if !crate::session::belongs_to_workspace(&root, &id).map_err(Failure::bad)? {
-                    return Err(Failure::bad("session does not belong to this project"));
+                    return Err(Failure::root("session does not belong to this project"));
                 }
             }
             let mut entries = gateway.sessions.lock().await;
@@ -572,7 +608,7 @@ async fn handle(
             }
             if let Some(entry) = entries.get(&id).filter(|e| !e.sender.is_closed()) {
                 if entry.root != root {
-                    return Err(Failure::bad("session belongs to another project"));
+                    return Err(Failure::root("session belongs to another project"));
                 }
             } else {
                 if entries.len() >= MAX_SESSIONS && !entries.contains_key(&id) {
@@ -610,6 +646,7 @@ async fn handle(
                     Failure(
                         StatusCode::NOT_FOUND,
                         "session is not resident; create with session id to restore".into(),
+                        "session_unavailable",
                     )
                 })?;
             let (reply, result) = oneshot::channel();
@@ -627,6 +664,8 @@ async fn handle(
 }
 struct Attachment {
     id: String,
+    recovery_id: Option<String>,
+    recovery_attempt: Option<u64>,
     touched: Instant,
     next: u64,
     events: VecDeque<(u64, Value)>,
@@ -661,6 +700,9 @@ struct Actor {
     pending: HashMap<u64, Pending>,
     initialized: Option<Value>,
     session_result: Option<Value>,
+    // Native child sessions start idle; only lifecycle notifications change this.
+    // Independent of bounded transcript retention, never inferred from text.
+    state: Value,
     journal: VecDeque<Value>,
     journal_bytes: usize,
     replay_complete: bool,
@@ -692,6 +734,10 @@ fn spawn(root: &Path, id: &str, restore: bool, force: bool) -> io::Result<Entry>
         pending: HashMap::new(),
         initialized: None,
         session_result: None,
+        state: object([
+            ("sessionUpdate", "state_update".into()),
+            ("state", "idle".into()),
+        ]),
         journal: VecDeque::new(),
         journal_bytes: 0,
         replay_complete: true,
@@ -815,7 +861,7 @@ impl Actor {
     fn remember(&mut self, message: Value) {
         self.journal_bytes += message.to_string().len();
         self.journal.push_back(message);
-        while self.journal_bytes > MAX_REPLAY || self.journal.len() > MAX_QUEUE - 2 {
+        while self.journal_bytes > MAX_REPLAY || self.journal.len() > MAX_QUEUE - 3 {
             if let Some(old) = self.journal.pop_front() {
                 self.journal_bytes -= old.to_string().len();
             }
@@ -836,6 +882,12 @@ impl Actor {
                         ]),
                     ),
                 ]));
+            }
+            if message["method"] == "session/update"
+                && message["params"]["sessionId"] == self.id
+                && message["params"]["update"]["sessionUpdate"] == "state_update"
+            {
+                self.state = message["params"]["update"].clone();
             }
             if let Some(options) = message["params"]["update"].get("configOptions")
                 && let Some(result) = &mut self.session_result
@@ -880,32 +932,63 @@ impl Actor {
                 if matches!(pending.method.as_str(), "session/new" | "session/resume")
                     && message.get("result").is_some()
                 {
-                    if pending.replay && !self.replay_complete {
-                        self.emit(object([
-                            ("jsonrpc", "2.0".into()),
-                            ("id", message["id"].clone()),
-                            (
-                                "error",
-                                object([
-                                    ("code", (-32000).into()),
-                                    (
-                                        "message",
-                                        "session opened but full replay exceeds the gateway limit"
-                                            .into(),
-                                    ),
-                                ]),
-                            ),
-                        ]));
-                        return None;
-                    }
-                    message["result"]["sessionId"] = Value::String(self.id.clone());
-                    if pending.replay {
-                        for update in self.journal.clone() {
-                            self.emit(update);
+                    let messages = self.startup_messages(
+                        message["result"].clone(),
+                        message["id"].clone(),
+                        pending.replay,
+                        &pending.attachment,
+                    );
+                    match messages {
+                        Ok(messages) => {
+                            // Include any unpolled initialization response in admission.
+                            let fits = self.attachment.as_ref().is_some_and(|a| {
+                                a.events.len() + messages.len() <= MAX_QUEUE
+                                    && a.bytes
+                                        + messages
+                                            .iter()
+                                            .map(|m| m.to_string().len())
+                                            .sum::<usize>()
+                                        <= MAX_REPLAY
+                            });
+                            if fits {
+                                for update in messages {
+                                    self.emit(update);
+                                }
+                                if let Some(attachment) = &mut self.attachment {
+                                    attachment.live = true;
+                                }
+                                return None;
+                            }
+                            message = object([
+                                ("jsonrpc", "2.0".into()),
+                                ("id", message["id"].clone()),
+                                (
+                                    "error",
+                                    object([
+                                        ("code", (-32000).into()),
+                                        (
+                                            "message",
+                                            "session snapshot exceeds the gateway limit".into(),
+                                        ),
+                                        ("data", Failure::replay("snapshot overflow").data()),
+                                    ]),
+                                ),
+                            ]);
                         }
-                    }
-                    if let Some(attachment) = &mut self.attachment {
-                        attachment.live = true;
+                        Err(error) => {
+                            message = object([
+                                ("jsonrpc", "2.0".into()),
+                                ("id", message["id"].clone()),
+                                (
+                                    "error",
+                                    object([
+                                        ("code", (-32000).into()),
+                                        ("data", error.data()),
+                                        ("message", error.1.into()),
+                                    ]),
+                                ),
+                            ]);
+                        }
                     }
                 }
                 self.emit(message);
@@ -913,11 +996,136 @@ impl Actor {
         }
         None
     }
+    fn startup_messages(
+        &self,
+        mut result: Value,
+        id: Value,
+        replay: bool,
+        attachment: &str,
+    ) -> Result<Vec<Value>, Failure> {
+        if replay && !self.replay_complete {
+            return Err(Failure::replay("full live replay is unavailable"));
+        }
+        let mut messages: Vec<Value> = if replay {
+            self.journal.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        let options = result
+            .get("configOptions")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        for update in [
+            object([
+                ("sessionUpdate", "config_option_update".into()),
+                ("configOptions", options),
+            ]),
+            self.state.clone(),
+        ] {
+            messages.push(object([
+                ("jsonrpc", "2.0".into()),
+                ("method", "session/update".into()),
+                (
+                    "params",
+                    object([("sessionId", self.id.clone().into()), ("update", update)]),
+                ),
+            ]));
+        }
+        result["sessionId"] = self.id.clone().into();
+        result["_meta"]["kit/gateway"] = object([
+            ("attachment", attachment.into()),
+            ("historyAvailable", replay.into()),
+            ("stateSnapshot", true.into()),
+            ("configSnapshot", true.into()),
+        ]);
+        messages.push(object([
+            ("jsonrpc", "2.0".into()),
+            ("id", id),
+            ("result", result),
+        ]));
+        if messages
+            .iter()
+            .any(|message| message.to_string().len() > MAX_HTTP_FRAME)
+            || messages.len() > MAX_QUEUE
+            || messages.iter().map(|m| m.to_string().len()).sum::<usize>() > MAX_REPLAY
+        {
+            return Err(Failure::replay(
+                "session snapshot exceeds the gateway limit",
+            ));
+        }
+        Ok(messages)
+    }
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
         if let Request::Attach {
-            replace, replay, ..
+            replace,
+            replay,
+            startup,
+            ..
         } = request
         {
+            let metadata = startup
+                .as_ref()
+                .map(|message| &message["params"]["_meta"]["kit/gateway"]);
+            let token = |name: &str| -> Result<Option<String>, Failure> {
+                metadata
+                    .and_then(|metadata| metadata.get(name))
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|value| !value.is_empty() && value.len() <= 128)
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                Failure::bad(format!(
+                                    "{name} must be a nonempty string of at most 128 bytes"
+                                ))
+                            })
+                    })
+                    .transpose()
+            };
+            let previous = token("previousAttachment")?;
+            let recovery_id = token("recoveryId")?;
+            let recovery_attempt = metadata
+                .and_then(|metadata| metadata.get("recoveryAttempt"))
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .filter(|attempt| *attempt > 0)
+                        .ok_or_else(|| Failure::bad("recoveryAttempt must be a positive u64"))
+                })
+                .transpose()?;
+            if recovery_id.is_some() != recovery_attempt.is_some() {
+                return Err(Failure::bad(
+                    "recoveryId and recoveryAttempt must be supplied together",
+                ));
+            }
+            if recovery_id.is_some() && previous.is_none() {
+                return Err(Failure::bad("recoveryId requires previousAttachment"));
+            }
+            // A matching predecessor must not bypass the sequence high-water mark.
+            // Validate before preparing anything, and commit the mark only with ownership.
+            if let Some(owner) = &self.attachment
+                && recovery_id.is_some()
+                && owner.recovery_id == recovery_id
+                && recovery_attempt <= owner.recovery_attempt
+            {
+                return Err(Failure(
+                    StatusCode::CONFLICT,
+                    "recovery attempt is stale; automatic resume refused".into(),
+                    "stale_recovery",
+                ));
+            }
+            if let Some(previous) = previous
+                && self.attachment.as_ref().is_some_and(|owner| {
+                    owner.id != previous
+                        && !(recovery_id.is_some() && owner.recovery_id == recovery_id)
+                })
+            {
+                return Err(Failure(
+                    StatusCode::CONFLICT,
+                    "controller was replaced; automatic resume refused".into(),
+                    "controller_replaced",
+                ));
+            }
             if !replace
                 && self
                     .attachment
@@ -929,20 +1137,44 @@ impl Actor {
                 ));
             }
             if replay && !self.replay_complete {
-                return Err(Failure::conflict(
+                return Err(Failure::replay(
                     "live replay limit reached; transcript is durable but a full live reattach is unavailable",
                 ));
             }
             let id = crate::session::new_id();
-            self.attachment = Some(Attachment {
+            let mut attachment = Attachment {
                 id: id.clone(),
+                recovery_id,
+                recovery_attempt,
                 touched: Instant::now(),
                 next: 0,
                 events: VecDeque::new(),
                 bytes: 0,
                 live: false,
-            });
+            };
+            let started =
+                if let (Some(startup), Some(result)) = (startup, self.session_result.clone()) {
+                    let request_id = startup
+                        .get("id")
+                        .cloned()
+                        .ok_or_else(|| Failure::bad("session startup requires a request id"))?;
+                    for message in self.startup_messages(result, request_id, replay, &id)? {
+                        if !attachment.push(message) {
+                            return Err(Failure::replay(
+                                "session snapshot exceeds the gateway limit",
+                            ));
+                        }
+                    }
+                    attachment.live = true;
+                    true
+                } else {
+                    false
+                };
+            // No fallible work after the ownership commit. The previous controller
+            // survives every replay/snapshot preparation failure.
+            self.attachment = Some(attachment);
             return Ok(object([
+                ("started", started.into()),
                 ("attachment", id.into()),
                 ("lease_seconds", LEASE.as_secs().into()),
             ]));
@@ -957,7 +1189,13 @@ impl Actor {
             .attachment
             .as_mut()
             .filter(|a| a.id == *token && a.touched.elapsed() < LEASE)
-            .ok_or_else(|| Failure::conflict("attachment expired or was replaced; reconnect"))?;
+            .ok_or_else(|| {
+                Failure(
+                    StatusCode::CONFLICT,
+                    "attachment expired or was replaced; reconnect".into(),
+                    "controller_replaced",
+                )
+            })?;
         attachment.touched = Instant::now();
         match request {
             Request::Detach { .. } => {
@@ -1057,7 +1295,7 @@ impl Actor {
                 let replay = method == "session/new"
                     || message["params"]["replayFrom"] == object([("type", "start".into())]);
                 if startup && replay && !self.replay_complete {
-                    return Err(Failure::conflict("full live replay is unavailable"));
+                    return Err(Failure::replay("full live replay is unavailable"));
                 }
                 let cached = match method.as_str() {
                     "initialize" => self.initialized.clone(),
@@ -1065,19 +1303,30 @@ impl Actor {
 
                     _ => None,
                 };
-                if let Some(mut result) = cached {
-                    if matches!(method.as_str(), "session/new" | "session/resume") {
-                        result["sessionId"] = Value::String(self.id.clone());
-                        if replay {
-                            for update in self.journal.clone() {
-                                self.emit(update);
-                            }
+                if let Some(result) = cached {
+                    if startup {
+                        let Some(id) = original else {
+                            return Err(Failure::bad("session startup requires a request id"));
+                        };
+                        let messages = self.startup_messages(result, id, replay, &attachment)?;
+                        let fits = self.attachment.as_ref().is_some_and(|a| {
+                            a.events.len() + messages.len() <= MAX_QUEUE
+                                && a.bytes
+                                    + messages.iter().map(|m| m.to_string().len()).sum::<usize>()
+                                    <= MAX_REPLAY
+                        });
+                        if !fits {
+                            return Err(Failure::replay(
+                                "session snapshot exceeds the gateway limit",
+                            ));
+                        }
+                        for update in messages {
+                            self.emit(update);
                         }
                         if let Some(attachment) = &mut self.attachment {
                             attachment.live = true;
                         }
-                    }
-                    if let Some(id) = original {
+                    } else if let Some(id) = original {
                         self.emit(object([
                             ("jsonrpc", "2.0".into()),
                             ("id", id),

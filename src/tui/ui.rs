@@ -3193,6 +3193,12 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(format!(" {}", timing_label(app.elapsed())), theme::dim()),
         ],
     };
+    if let Some(status) = &app.gateway_status {
+        left = vec![Span::styled(
+            format!(" {status}"),
+            Style::default().fg(theme::warn_color()),
+        )];
+    }
     let counts = app.agent_counts();
     let active_agents = counts.starting + counts.working;
     if active_agents > 0 {
@@ -6358,6 +6364,7 @@ mod tests {
             url: "https://gateway.example/kit?a=b&c=d".into(),
             credential_file: PathBuf::from("/client/team's credential"),
             session: Some("s-original".into()),
+            no_replay: false,
         };
         let local = app.resume_command().unwrap();
         let command = crate::tui::attachment_clipboard_text(&app, Some(&remote), local.clone());
