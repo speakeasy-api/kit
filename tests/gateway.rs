@@ -1747,7 +1747,12 @@ async fn unread_session_mailbox_terminates_http_but_preserves_resident_prompt() 
         .send()
         .await
         .unwrap();
-    assert_eq!(rejected.status(), reqwest::StatusCode::NOT_FOUND);
+    // Stream EOF can precede registry removal: the SDK rejects a registered
+    // closing connection with 410, and a removed connection with 404.
+    assert!(matches!(
+        rejected.status(),
+        reqwest::StatusCode::GONE | reqwest::StatusCode::NOT_FOUND
+    ));
 
     // The accepted resident turn must finish durably without a new controller
     // refreshing its lease, even though its original HTTP connection is gone.
