@@ -7,7 +7,6 @@ use futures_util::StreamExt;
 
 pub(super) struct Connection {
     gateway: Arc<Gateway>,
-    boundary: Arc<http_boundary::Boundary>,
     initialize: Option<(Value, Arc<ChargedFrame>)>,
     controls: HashMap<String, Control>,
 }
@@ -104,10 +103,9 @@ impl Control {
 }
 
 impl Connection {
-    pub(super) fn new(gateway: Arc<Gateway>, boundary: Arc<http_boundary::Boundary>) -> Self {
+    pub(super) fn new(gateway: Arc<Gateway>) -> Self {
         Self {
             gateway,
-            boundary,
             initialize: None,
             controls: HashMap::new(),
         }
@@ -129,13 +127,6 @@ impl Connection {
             .as_str()
             .ok_or_else(|| Failure::bad("ACP method required"))?
             .to_owned();
-        if method == http_boundary::DRAIN_METHOD {
-            let token = message["params"]["token"]
-                .as_str()
-                .ok_or_else(|| Failure::bad("drain token required"))?;
-            self.boundary.acknowledge(token).await;
-            return Ok(None);
-        }
         if method == "initialize" {
             if self.initialize.is_some() {
                 return Err(Failure::conflict("connection already initialized"));
@@ -521,7 +512,7 @@ mod tests {
             roots: Vec::new(),
             sessions: Mutex::new(HashMap::new()),
         });
-        let connection = Connection::new(gateway, Arc::new(http_boundary::Boundary::default()));
+        let connection = Connection::new(gateway);
         let (peer, endpoint) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
         peer.tx
             .try_send(TransportFrame::parse_json(

@@ -14,6 +14,7 @@ struct Harness {
     client: reqwest::Client,
     url: String,
     gateway: Arc<Gateway>,
+    app: Router,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Harness {
@@ -35,14 +36,16 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/acp/v2", listener.local_addr().unwrap());
         let app = router(gateway.clone()).unwrap();
+        let served_app = app.clone();
         let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            axum::serve(listener, served_app).await.unwrap();
         });
         Self {
             _directory: directory,
             client: reqwest::Client::new(),
             url,
             gateway,
+            app,
             server,
         }
     }
@@ -675,6 +678,13 @@ async fn raw_sdk_body_limit_covers_declared_and_streamed_lengths() {
     let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"limit-test","version":"1"},"capabilities":{}}}).to_string();
     let at_limit = format!("{initialize}{}", " ".repeat(1024 * 1024 - initialize.len()));
     let oversized = format!("{at_limit} ");
+    // Exercise early responses through the real router. A network client still
+    // writing a rejected body can observe TCP reset instead of the already-sent
+    // 401/413; that socket race is not this admission assertion. Integration
+    // coverage separately sends an unknown-length oversized body over HTTP.
+    use axum::body::Body;
+    use tower::ServiceExt as _;
+    let app = router(harness.gateway.clone()).unwrap();
     for streamed in [false, true] {
         for authorized in [false, true] {
             let body = if streamed {
@@ -683,22 +693,27 @@ async fn raw_sdk_body_limit_covers_declared_and_streamed_lengths() {
                     .chunks(65536)
                     .map(|chunk| Ok::<_, io::Error>(chunk.to_vec()))
                     .collect();
-                reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))
+                Body::from_stream(futures_util::stream::iter(chunks))
             } else {
-                reqwest::Body::from(oversized.clone())
+                Body::from(oversized.clone())
             };
-            let request = harness
-                .client
-                .post(&harness.url)
-                .header("Content-Type", "application/json")
-                .body(body);
-            let request = if authorized {
-                request.bearer_auth("boundary-secret")
-            } else {
-                request
-            };
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/acp/v2")
+                .header("Content-Type", "application/json");
+            if !streamed {
+                request = request.header("Content-Length", oversized.len());
+            }
+            if authorized {
+                request = request.header("Authorization", "Bearer boundary-secret");
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
             assert_eq!(
-                request.send().await.unwrap().status(),
+                response.status(),
                 if authorized {
                     StatusCode::PAYLOAD_TOO_LARGE
                 } else {
@@ -757,7 +772,10 @@ async fn raw_sdk_body_limit_covers_declared_and_streamed_lengths() {
 
 #[tokio::test]
 async fn http_delete_drains_accepted_prompt_behind_blocked_initialization() {
+    use axum::body::{Body, Bytes};
+    use std::{future::Future as _, task::Poll};
     use tokio::io::AsyncReadExt as _;
+    use tower::ServiceExt as _;
     async fn event(response: &mut reqwest::Response, buffer: &mut String) -> Value {
         loop {
             if let Some(end) = buffer.find("\n\n") {
@@ -847,38 +865,98 @@ for line in sys.stdin:
         assert_eq!(ready, [b'R']);
         // A receives HTTP 202 while B still prevents adapter dispatch.
         assert_eq!(post(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"resident","prompt":[]}})).send().await.unwrap().status(), StatusCode::ACCEPTED);
-        let delete = harness
-            .client
-            .delete(&harness.url)
-            .bearer_auth("boundary-secret")
-            .header("acp-connection-id", &connection);
-        let deletion = tokio::spawn(async move { delete.send().await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let response =
-                    post(json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"id":999}}))
-                        .send()
-                        .await
-                        .unwrap();
-                if response.status() == StatusCode::CONFLICT {
-                    break;
-                }
-                assert_eq!(response.status(), StatusCode::ACCEPTED);
-            }
-        })
-        .await
-        .expect("DELETE did not close admission while initialization was blocked");
-        if cancel_delete {
-            deletion.abort();
+        // Initialize the competing connections before reserving all eight MiB
+        // of the SDK's global body budget. Both paths share this exact router.
+        let mut other_connections = Vec::new();
+        for _ in 0..8 {
+            let response = harness.client.post(&harness.url).bearer_auth("boundary-secret").json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"body-holder","version":"1"},"capabilities":{}}})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            other_connections.push(
+                response.headers()["acp-connection-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            let _ = response.bytes().await.unwrap();
         }
-        release.write_all(b"G").await.unwrap();
-        let deleted = tokio::time::timeout(Duration::from_secs(5), deletion)
+        let request = |method: &str, connection: &str, body: Body| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri("/acp/v2")
+                .header("Authorization", "Bearer boundary-secret")
+                .header("Content-Type", "application/json")
+                .header("acp-connection-id", connection)
+                .body(body)
+                .unwrap()
+        };
+        let mut bodies = tokio::task::JoinSet::new();
+        for other in &other_connections {
+            let (ready, polled) = tokio::sync::oneshot::channel();
+            let mut ready = Some(ready);
+            let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+                if let Some(ready) = ready.take() {
+                    ready.send(()).unwrap();
+                }
+                Poll::<Option<Result<Bytes, io::Error>>>::Pending
+            }));
+            bodies.spawn(harness.app.clone().oneshot(request("POST", other, body)));
+            // A body is polled only after the SDK holds its 1 MiB reservation.
+            tokio::time::timeout(Duration::from_secs(5), polled)
+                .await
+                .expect("SDK did not poll the reserved body")
+                .unwrap();
+        }
+        let unpollable_body = || {
+            Body::from_stream(futures_util::stream::poll_fn(
+                |_| -> Poll<Option<Result<Bytes, io::Error>>> {
+                    panic!("rejected POST must not poll its body")
+                },
+            ))
+        };
+        let response = harness
+            .app
+            .clone()
+            .oneshot(request("POST", &other_connections[0], unpollable_body()))
             .await
             .unwrap();
-        if cancel_delete {
-            assert!(deleted.unwrap_err().is_cancelled());
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let mut deletion = Box::pin(harness.app.clone().oneshot(request(
+            "DELETE",
+            &connection,
+            Body::empty(),
+        )));
+        // Poll the real service once: DELETE must seal synchronously, without a
+        // body/core reservation, then wait for the blocked adapter to drain.
+        std::future::poll_fn(|cx| {
+            assert!(deletion.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let response = harness
+            .app
+            .clone()
+            .oneshot(request("POST", &connection, unpollable_body()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::GONE,
+            "sealed admission must precede the exhausted body budget"
+        );
+        let deletion = if cancel_delete {
+            drop(deletion);
+            None
         } else {
-            assert_eq!(deleted.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+            Some(deletion)
+        };
+        release.write_all(b"G").await.unwrap();
+        if let Some(deletion) = deletion {
+            let deleted = tokio::time::timeout(Duration::from_secs(5), deletion)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::ACCEPTED);
         }
         // Cancellation of the HTTP request cannot abandon server teardown.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -922,5 +1000,10 @@ for line in sys.stdin:
                     .any(|message| message["params"]["update"]["state"] == "idle")
             })
             .await;
+        // Keep every body reservation alive through teardown and actor checks.
+        bodies.abort_all();
+        while let Some(result) = bodies.join_next().await {
+            assert!(result.unwrap_err().is_cancelled());
+        }
     }
 }

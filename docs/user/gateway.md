@@ -69,7 +69,7 @@ bearer credential, not an OAuth login. Use the SDK's exact-endpoint constructor
 (for the Rust SDK, `HttpClient::with_endpoint_and_client`) so it does not append
 its default `/acp` path.
 
-The supported wire protocol is ACP v2, using the pinned ACP Rust SDK 2.0.0. The supported integration transport is HTTP/SSE. ACP v1 and arbitrary ACP extensions are not supported; although the underlying SDK also exposes WebSocket handling, it is not part of this gateway's validated integration contract. The bundled TUI bridge and gateway should use the same Kit version; compatibility with future SDK or Kit versions is not promised by this experimental interface.
+The supported wire protocol is ACP v2, using the pinned ACP Rust SDK 2.0.0. The supported integration transport is HTTP/SSE. ACP v1 and arbitrary ACP extensions are not supported; the selected bounded SDK path rejects WebSocket upgrades. The bundled TUI bridge and gateway should use the same Kit version; compatibility with future SDK or Kit versions is not promised by this experimental interface.
 
 Start with `initialize`, then use standard `session/new`, `session/list`, and
 `session/resume` requests. `session/new.cwd` must be an exact canonical root
@@ -85,7 +85,7 @@ abrupt child termination.
 Request `"replayFrom": {"type": "start"}` in `session/resume` to receive history as ACP
 session notifications. Resuming without requesting history is not a full replay.
 The bundled bridge maps `--remote-session` to this standard resume request and
-requests replay from the start. Clean SDK transport teardown stops new submissions and drains HTTP-accepted inbound frames through resident dispatch before releasing control; it does not wait for execution to finish or guarantee every outbound event was delivered. If the drain is not confirmed within 30 seconds, DELETE returns 503 without destructive teardown. The submission outcome is then unknown: do not blindly resubmit work. Ending a transport connection is not a session cancellation or deletion. A single
+requests replay from the start. Graceful DELETE seals new submissions without allocating another input frame, then drains HTTP-accepted inbound frames through resident dispatch before releasing control. It does not wait for inference to finish or guarantee outbound delivery. Later POSTs receive 410 while draining. Only confirmed clean adapter completion returns 202; a 30-second waiter deadline or drain failure returns 503. A timeout or canceled DELETE waiter does not reopen admission or abort accepted work: connection-owned draining continues, and another DELETE can join it while the connection remains registered. After removal, later requests receive 404. The bundled client's best-effort DELETE wait is capped at five seconds, so client exit alone is not confirmation of remote teardown. Submission outcomes can remain unknown: do not blindly resubmit work. Ending a transport connection is not a session cancellation or deletion. A single
 ACP connection can control multiple sessions. Replacing one controller settles
 that controller's pending requests with errors without detaching its other sessions.
 

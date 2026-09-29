@@ -128,8 +128,8 @@ tokio = { version = "=1.53.1", features = ["test-util"] }
 agentkit-provider-openai = { git = "https://git@github.com/danielkov/agentkit.git", rev = "04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58" }
 agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 agentkit-acp = { git = "https://github.com/daviddanialy/agentkit.git", rev = "6d519ed1e93e28e54ba1cc18889534e2e8337181" }
-agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "3e20af18f1b4ff86e8332b17eeafd59058c1f11d" }
-agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "3e20af18f1b4ff86e8332b17eeafd59058c1f11d" }
+agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "423ba77cd555a09f68472b93c142c8f0baaabf43" }
+agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "423ba77cd555a09f68472b93c142c8f0baaabf43" }
 
 [patch."https://github.com/danielkov/agentkit.git"]
 agentkit-capabilities = "=0.10.5"

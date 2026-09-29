@@ -445,15 +445,15 @@ mod http_server;
 fn router(gateway: Arc<Gateway>) -> Result<Router, agent_client_protocol_http::ServerLimitsError> {
     let state = gateway.clone();
     let boundary = Arc::new(http_boundary::Boundary::default());
-    let connection_boundary = boundary.clone();
     let sdk = agent_client_protocol_http::AcpHttpServer::new_bounded(
-        move || http_server::Connection::new(state.clone(), connection_boundary.clone()),
+        move || http_server::Connection::new(state.clone()),
         agent_client_protocol_http::ServerLimits {
             channel_limits: agent_client_protocol::ChannelLimits::default(),
             max_frame_bytes: MAX_HTTP_FRAME,
             ..Default::default()
         },
     )?
+    .with_graceful_delete(Duration::from_secs(30))
     .with_options(agent_client_protocol_http::ServerOptions {
         path: "/acp/v2".into(),
         health_endpoint: false,
@@ -461,9 +461,8 @@ fn router(gateway: Arc<Gateway>) -> Result<Router, agent_client_protocol_http::S
     })
     .into_router();
     Ok(sdk
-        .clone()
         .layer(middleware::from_fn_with_state(
-            (boundary, sdk),
+            boundary,
             http_boundary::handle,
         ))
         .layer(middleware::from_fn_with_state(gateway, authorize)))
