@@ -107,6 +107,7 @@ for line in sys.stdin:
             root: self.gateway.roots[0].clone(),
             restore: false,
             attachment: None,
+            committed_owner: None,
             serial: 0,
             pending: HashMap::new(),
             initialized: None,
@@ -398,6 +399,7 @@ fn isolated_actor() -> Actor {
         root: PathBuf::from("/approved"),
         restore: false,
         attachment: None,
+        committed_owner: None,
         serial: 0,
         pending: HashMap::new(),
         initialized: None,
@@ -1384,15 +1386,25 @@ fn recovery_attempt_high_water_mark_fences_delayed_and_duplicate_claims() {
         .command(recovery(&actor, &original, 3), &writes)
         .unwrap();
     assert_ne!(actor.attachment.as_ref().unwrap().id, second);
-    assert_eq!(actor.attachment.as_ref().unwrap().recovery_attempt, Some(3));
+    assert_eq!(
+        actor.committed_owner.as_ref().unwrap().recovery_attempt,
+        Some(3)
+    );
     actor
         .command(resident_claim(&actor, false, 104), &writes)
         .unwrap();
     let manual = actor.attachment.as_ref().unwrap().id.clone();
-    assert!(actor.attachment.as_ref().unwrap().recovery_id.is_none());
     assert!(
         actor
-            .attachment
+            .committed_owner
+            .as_ref()
+            .unwrap()
+            .recovery_id
+            .is_none()
+    );
+    assert!(
+        actor
+            .committed_owner
             .as_ref()
             .unwrap()
             .recovery_attempt
@@ -1445,11 +1457,149 @@ fn recovery_attempt_metadata_is_paired_positive_and_bounded() {
         assert_eq!(actor.attachment.as_ref().unwrap().id, owner);
         assert!(
             actor
-                .attachment
+                .committed_owner
                 .as_ref()
                 .unwrap()
                 .recovery_attempt
                 .is_none()
         );
+    }
+}
+
+fn recovery_claim(actor: &Actor, previous: &str, outage: &str, attempt: u64) -> Request {
+    let mut request = resident_claim(actor, false, 200 + attempt);
+    if let Request::Attach {
+        startup: Some(message),
+        ..
+    } = &mut request
+    {
+        message["params"]["_meta"]["kit/gateway"] = json!({
+            "previousAttachment": previous, "recoveryId": outage, "recoveryAttempt": attempt
+        });
+    }
+    request
+}
+
+#[test]
+fn detached_owner_fences_replaced_controller_and_preserves_recovery_high_water_mark() {
+    for overflow in [false, true] {
+        let mut actor = isolated_actor();
+        let (writes, _receiver) = mpsc::channel(1);
+        actor.session_result = Some(json!({"configOptions":[]}));
+        actor
+            .command(resident_claim(&actor, false, 200), &writes)
+            .unwrap();
+        let a = actor.attachment.as_ref().unwrap().id.clone();
+        actor
+            .command(resident_claim(&actor, false, 201), &writes)
+            .unwrap();
+        let b = actor.attachment.as_ref().unwrap().id.clone();
+        if overflow {
+            actor.emit(json!({"payload":"x".repeat(MAX_REPLAY)}));
+        } else {
+            actor
+                .command(
+                    Request::Detach {
+                        session: actor.id.clone(),
+                        attachment: b.clone(),
+                    },
+                    &writes,
+                )
+                .unwrap();
+        }
+        assert!(actor.attachment.is_none());
+        assert_eq!(
+            actor
+                .command(recovery_claim(&actor, &a, "a-outage", 1), &writes)
+                .unwrap_err()
+                .2,
+            "controller_replaced"
+        );
+        assert!(actor.attachment.is_none());
+
+        // Failed preparation of a manual replacement must not erase B's fence.
+        let mut invalid = resident_claim(&actor, false, 202);
+        if let Request::Attach {
+            startup: Some(message),
+            ..
+        } = &mut invalid
+        {
+            message.as_object_mut().unwrap().remove("id");
+        }
+        assert!(actor.command(invalid, &writes).is_err());
+        assert_eq!(actor.committed_owner.as_ref().unwrap().id, b);
+        assert_eq!(
+            actor
+                .command(recovery_claim(&actor, &a, "a-outage", 2), &writes)
+                .unwrap_err()
+                .2,
+            "controller_replaced"
+        );
+        actor
+            .command(recovery_claim(&actor, &b, "b-outage", 2), &writes)
+            .unwrap();
+        let recovered = actor.attachment.as_ref().unwrap().id.clone();
+        actor
+            .command(
+                Request::Detach {
+                    session: actor.id.clone(),
+                    attachment: recovered,
+                },
+                &writes,
+            )
+            .unwrap();
+        for attempt in [1, 2] {
+            assert_eq!(
+                actor
+                    .command(recovery_claim(&actor, &b, "b-outage", attempt), &writes)
+                    .unwrap_err()
+                    .2,
+                "stale_recovery"
+            );
+            assert!(actor.attachment.is_none());
+        }
+        // Lost recovery result: original B token is still valid for the same outage.
+        actor
+            .command(recovery_claim(&actor, &b, "b-outage", 3), &writes)
+            .unwrap();
+        assert_eq!(
+            actor.committed_owner.as_ref().unwrap().recovery_attempt,
+            Some(3)
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_detach_reply_keeps_committed_generation_fence() {
+    let harness = Harness::new().await;
+    harness.child().await;
+    let a = harness.attach().await;
+    harness.handshake(&a).await;
+    let b = harness
+        .call(json!({"op":"attach","session":"resident","replace":true,"replay":false}))
+        .await["attachment"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entry = harness.gateway.sessions.lock().await["resident"].clone();
+    let (reply, accepted) = oneshot::channel();
+    entry
+        .sender
+        .send(Envelope {
+            request: Request::Detach {
+                session: "resident".into(),
+                attachment: b.clone(),
+            },
+            reply,
+        })
+        .await
+        .unwrap();
+    drop(accepted);
+    // FIFO mailbox order makes cancellation deterministic, without sleeps.
+    for (previous, expected) in [(&a, StatusCode::CONFLICT), (&b, StatusCode::OK)] {
+        let (status, _) = harness.raw(json!({"op":"attach","session":"resident","replace":true,"replay":false,
+            "startup":{"jsonrpc":"2.0","id":205,"method":"session/resume","params":{"sessionId":"resident","_meta":{"kit/gateway":{"previousAttachment":previous,"recoveryId":"cancelled-detach","recoveryAttempt":1}}}}
+        })).await;
+        assert_eq!(status, expected);
     }
 }

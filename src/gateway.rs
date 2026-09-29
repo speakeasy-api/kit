@@ -662,10 +662,13 @@ async fn handle(
         }
     }
 }
-struct Attachment {
+struct CommittedOwner {
     id: String,
     recovery_id: Option<String>,
     recovery_attempt: Option<u64>,
+}
+struct Attachment {
+    id: String,
     touched: Instant,
     next: u64,
     events: VecDeque<(u64, Value)>,
@@ -696,6 +699,8 @@ struct Actor {
     root: PathBuf,
     restore: bool,
     attachment: Option<Attachment>,
+    // Survives detach, expiry and replay overflow; only a committed claim replaces it.
+    committed_owner: Option<CommittedOwner>,
     serial: u64,
     pending: HashMap<u64, Pending>,
     initialized: Option<Value>,
@@ -730,6 +735,7 @@ fn spawn(root: &Path, id: &str, restore: bool, force: bool) -> io::Result<Entry>
         root: root.to_owned(),
         restore,
         attachment: None,
+        committed_owner: None,
         serial: 0,
         pending: HashMap::new(),
         initialized: None,
@@ -1103,7 +1109,7 @@ impl Actor {
             }
             // A matching predecessor must not bypass the sequence high-water mark.
             // Validate before preparing anything, and commit the mark only with ownership.
-            if let Some(owner) = &self.attachment
+            if let Some(owner) = &self.committed_owner
                 && recovery_id.is_some()
                 && owner.recovery_id == recovery_id
                 && recovery_attempt <= owner.recovery_attempt
@@ -1115,7 +1121,7 @@ impl Actor {
                 ));
             }
             if let Some(previous) = previous
-                && self.attachment.as_ref().is_some_and(|owner| {
+                && self.committed_owner.as_ref().is_some_and(|owner| {
                     owner.id != previous
                         && !(recovery_id.is_some() && owner.recovery_id == recovery_id)
                 })
@@ -1144,8 +1150,6 @@ impl Actor {
             let id = crate::session::new_id();
             let mut attachment = Attachment {
                 id: id.clone(),
-                recovery_id,
-                recovery_attempt,
                 touched: Instant::now(),
                 next: 0,
                 events: VecDeque::new(),
@@ -1172,6 +1176,11 @@ impl Actor {
                 };
             // No fallible work after the ownership commit. The previous controller
             // survives every replay/snapshot preparation failure.
+            self.committed_owner = Some(CommittedOwner {
+                id: id.clone(),
+                recovery_id,
+                recovery_attempt,
+            });
             self.attachment = Some(attachment);
             return Ok(object([
                 ("started", started.into()),

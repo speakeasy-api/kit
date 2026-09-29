@@ -163,10 +163,15 @@ impl Editor {
         self.cursor = 0;
         self.browsing = None;
         self.stashed.clear();
-        if self.history.last().map(String::as_str) != Some(text.as_str()) {
-            self.history.push(text.clone());
-        }
+        self.remember(text.clone());
         text
+    }
+
+    /// Keeps text available for manual recall without submitting or changing the draft.
+    pub fn remember(&mut self, text: String) {
+        if self.history.last() != Some(&text) {
+            self.history.push(text);
+        }
     }
 
     /// Drops the prompt without recording it in the history.

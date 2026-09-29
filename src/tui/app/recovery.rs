@@ -62,12 +62,22 @@ impl App {
                 self.model_switch = None;
                 self.model_dialog = None;
                 self.effort_dialog = None;
+                self.cancel_clipboard_placeholders();
+                // The replacement target belongs to the old connection, but
+                // both unsent drafts belong to the client. Restore the ordinary
+                // composer and keep the edited text available for manual recall.
+                let steering_draft = self
+                    .steer_edit
+                    .as_ref()
+                    .map(|_| self.editor.text().to_owned());
                 self.cancel_steer_edit();
+                if let Some(text) = steering_draft {
+                    self.editor.remember(text);
+                }
                 self.selected_steer = None;
                 self.queue_focused = false;
                 self.queue_handoff = false;
                 self.steer_mutations.clear();
-                self.cancel_clipboard_placeholders();
                 self.gateway_status = Some(format!(
                     "Reconnecting {}/{}{} · previous outcome unknown; no automatic resubmission",
                     marker.attempt.unwrap_or(1),
@@ -285,6 +295,88 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn active_modified_steer(app: &mut App) {
+        app.can_steer = true;
+        app.can_replace_steer = true;
+        app.apply(Update::State(StateUpdate::Running(
+            RunningStateUpdate::new(),
+        )));
+        app.apply(Update::SteerAccepted {
+            editable: true,
+            id: "old-target".into(),
+            text: "queued steering".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.editing_steer());
+        app.paste(" modified but unsent");
+        assert_eq!(app.editor.text(), "queued steering modified but unsent");
+    }
+
+    fn assert_both_drafts_recallable(app: &mut App) {
+        assert!(!app.editing_steer());
+        assert_eq!(app.editor.text(), "unsent draft");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "queued steering modified but unsent");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert_eq!(app.editor.text(), "unsent draft");
+    }
+
+    #[test]
+    fn failed_recovery_preserves_active_modified_steer_and_ordinary_draft() {
+        let mut app = app();
+        active_modified_steer(&mut app);
+        let before = text(&app);
+        app.apply(Update::GatewayRecovery(event(Kind::Begin, Vec::new())));
+        assert_both_drafts_recallable(&mut app);
+        app.apply(Update::GatewayRecovery(event(Kind::Failed, Vec::new())));
+        assert!(app.gateway_blocked);
+        assert_eq!(text(&app), before);
+        assert_eq!(app.pending_steers[0].text, "queued steering");
+        assert_both_drafts_recallable(&mut app);
+    }
+
+    #[test]
+    fn committed_recovery_preserves_active_modified_steer_without_old_target() {
+        for running in [false, true] {
+            let mut app = app();
+            active_modified_steer(&mut app);
+            app.apply(Update::GatewayRecovery(event(Kind::Begin, Vec::new())));
+            // Even if the same target survives replay, the unsent edit must not
+            // retain replacement authority or be automatically submitted.
+            replay(
+                &mut app,
+                Update::SteerAccepted {
+                    editable: true,
+                    id: "old-target".into(),
+                    text: "queued steering".into(),
+                },
+            );
+            snapshot(&mut app, running);
+            app.apply(Update::GatewayRecovery(event(Kind::Commit, Vec::new())));
+            assert!(!app.gateway_blocked);
+            if running {
+                assert_eq!(app.pending_steers[0].text, "queued steering");
+            } else {
+                assert!(app.pending_steers.is_empty());
+            }
+            assert_both_drafts_recallable(&mut app);
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            app.last_key = None;
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Action::Submit { prompt, .. }
+                    if prompt.text == "queued steering modified but unsent"
+            ));
+        }
     }
 
     #[test]
