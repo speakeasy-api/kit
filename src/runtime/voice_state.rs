@@ -5,6 +5,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+const STATUS_PREFIX: &str = "[Kit voice session status] ";
 const ACTIVE: &str = "[Kit voice session status] A voice session is active, including while its microphone is muted. This current status supersedes earlier voice status, including resumed or summarized context. This is internal, non-actionable context; do not acknowledge it or start work because of it. Prefer backgrounding long-running compose work to keep voice responsive. Preserve dependency ordering and keep calls foregrounded when their result is needed for the next step. When only waiting for background results and no independent work remains, end the turn; do not poll or issue keepalive calls. The harness resumes work when results arrive.";
 const INACTIVE: &str = "[Kit voice session status] No voice session is active on this connection. This current status supersedes any earlier voice status, including in resumed or summarized context. This is internal, non-actionable context; do not acknowledge it or start work because of it. Voice-specific responsiveness guidance no longer applies; ordinary background-work and dependency-ordering instructions still apply. Existing tasks are not cancelled.";
 
@@ -20,16 +21,30 @@ impl VoiceState {
         self.0.store(active, Ordering::Relaxed);
     }
 
-    pub(crate) fn monitor(&self, correct_history: bool) -> VoiceMonitor {
+    pub(crate) fn monitor(&self, history: &[Item]) -> VoiceMonitor {
         VoiceMonitor {
             current: Arc::downgrade(&self.0),
-            baseline: if correct_history { None } else { Some(false) },
+            baseline: Some(last_status(history) == Some(ACTIVE)),
         }
     }
 }
 
-/// Actor-local baseline. Resumes/forks force a correction on the first user
-/// prompt; fresh sessions start with the known inactive baseline.
+fn last_status(history: &[Item]) -> Option<&str> {
+    history
+        .iter()
+        .rev()
+        .find_map(|item| match item.parts.as_slice() {
+            [agentkit_core::Part::Text(text)]
+                if item.kind == agentkit_core::ItemKind::Notification
+                    && text.text.starts_with(STATUS_PREFIX) =>
+            {
+                Some(text.text.as_str())
+            }
+            _ => None,
+        })
+}
+
+/// Actor-local baseline, seeded from the last status recorded in history.
 /// Autonomous work and tool continuations must never call `submit`.
 pub(crate) struct VoiceMonitor {
     current: Weak<AtomicBool>,
@@ -192,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn voice_state_idle_updates_wait_for_user_and_coalesce() {
         let state = VoiceState::default();
-        let mut monitor = state.monitor(false);
+        let mut monitor = state.monitor(&[]);
         let (mut driver, mut requests) = driver(vec![], false).await;
         state.set_active(true);
         state.set_active(false);
@@ -226,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn voice_state_resume_and_owner_drop_correct_only_next_user_prompt() {
         let state = VoiceState::default();
-        let mut monitor = state.monitor(true);
+        let mut monitor = state.monitor(&[Item::notification(ACTIVE)]);
         let (mut driver, mut requests) = driver(vec![Item::notification(ACTIVE)], false).await;
         assert!(matches!(
             driver.next().await.unwrap(),
@@ -256,7 +271,7 @@ mod tests {
     #[test]
     fn voice_state_failed_submission_preserves_pending_and_concurrent_update() {
         let state = VoiceState::default();
-        let mut monitor = state.monitor(false);
+        let mut monitor = state.monitor(&[]);
         state.set_active(true);
         let failure = monitor.submit(user(), |items| {
             assert_eq!(statuses(&items), vec![ACTIVE]);
@@ -287,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn voice_state_live_and_autonomous_work_do_not_consume_pending() {
         let state = VoiceState::default();
-        let mut monitor = state.monitor(false);
+        let mut monitor = state.monitor(&[]);
         let (mut driver, mut requests) = driver(vec![], true).await;
         monitor
             .submit(user(), |items| driver.submit_input(items))

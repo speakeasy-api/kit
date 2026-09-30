@@ -3,7 +3,7 @@ use crate::acp_child::transcript;
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -17,10 +17,83 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use serde_json::{Map, Value};
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::Instrument as _;
 
 const MAX_LIVE_SUBAGENTS: usize = 120;
+const MAX_TREE_SUBAGENTS: usize = MAX_LIVE_SUBAGENTS;
+const DELEGATION_USAGE: &str = "Delegate work that can proceed in parallel with other work, or a self-contained piece of work whose intermediate reads, attempts and output your conversation does not need, when only its outcome matters for what comes next, such as one step of a longer sequence. A subagent parallelizes model work, not tool calls: one `compose` call already reads, edits and runs across many files at once, and each subagent adds its own sequence of requests, so delegation pays off when a piece needs substantial reasoning or writing of its own. Keep work yourself when later steps depend on its details rather than its outcome.\n\nIn the prompt, state which files or directories it owns, any interface it must honor or provide, the command that verifies its work, and what to return. Only its final message enters your conversation, so ask for the outcome you need.";
+const FRESH_USAGE: &str = "A fresh subagent starts from your prompt alone: its requests carry only that prompt and what it reads itself, and it forms its own view without your conclusions. A fork carries your entire conversation in every request it makes. When what the work needs from your conversation fits in the prompt (paths, findings, constraints), or when its judgement should be independent of yours, a fresh subagent is cheaper and unbiased. The delegation criteria and brief contents are the same as for `fork`. A fresh subagent knows nothing you have learned, so also include the relevant paths, findings and constraints.";
+pub(crate) const TREE_SLOTS_ENV: &str = "KIT_SUBAGENT_TREE_SLOTS";
+pub(crate) const PROMPT_CACHE_KEY_ENV: &str = "KIT_PROMPT_CACHE_KEY";
+
+/// The delegation tree's shared prompt cache key: inherited, or this session's.
+pub(crate) fn prompt_cache_key(session_id: &str) -> String {
+    std::env::var(PROMPT_CACHE_KEY_ENV)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| session_id.to_owned())
+}
+
+#[derive(Debug)]
+pub(crate) struct Permit {
+    _local: OwnedSemaphorePermit,
+    _slot: std::fs::File,
+}
+
+type TreeSlots = Arc<std::sync::OnceLock<Result<PathBuf, String>>>;
+
+/// Slot directory shared by every Kit process in one delegation tree.
+fn tree_slot_directory(slots: &TreeSlots) -> Result<&PathBuf, ChildError> {
+    slots
+        .get_or_init(|| {
+            let directory = match std::env::var_os(TREE_SLOTS_ENV) {
+                Some(directory) => PathBuf::from(directory),
+                None => std::env::temp_dir().join(format!("kit-subagents-{}", session::new_id())),
+            };
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+            Ok(directory)
+        })
+        .as_ref()
+        .map_err(|error| ChildError::Failed(error.clone()))
+}
+
+/// Holds one of the tree-wide slots until dropped or the process exits.
+fn tree_slot(directory: &Path) -> Result<std::fs::File, ChildError> {
+    for slot in 0..MAX_TREE_SUBAGENTS {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join(format!("slot-{slot}")))
+            .map_err(|error| {
+                ChildError::Failed(format!("could not open subagent slot: {error}"))
+            })?;
+        if file.try_lock().is_ok() {
+            return Ok(file);
+        }
+    }
+    Err(ChildError::Failed(format!(
+        "subagent limit for this delegation tree ({MAX_TREE_SUBAGENTS}) reached"
+    )))
+}
+
+const DELEGATION_FRAME: &str = "You are a subagent working concurrently with the agent that started you. Do only the assignment below and stay within the files it gives you, because others may be editing the rest. Your final message is returned to the parent.";
+const INHERITED_FRAME: &str = "You are a subagent working concurrently with the agent that started you. The conversation above was copied from another session; background calls started in it will not reach you. Do only the assignment below and stay within the files it gives you, because others may be editing the rest. Your final message is returned to the parent.";
+
+fn framed(prompt: ChildPrompt, frame: &str) -> ChildPrompt {
+    match prompt {
+        ChildPrompt::Text(text) => ChildPrompt::Text(format!("{frame}\n\n{text}")),
+        ChildPrompt::Blocks(mut blocks) => {
+            blocks.insert(
+                0,
+                agentkit_acp::ContentBlock::Text(agentkit_acp::TextContent::new(frame)),
+            );
+            ChildPrompt::Blocks(blocks)
+        }
+    }
+}
 const MAX_DISPLAY_NAME_LEN: usize = 32;
 
 fn normalize_display_name(candidate: &str) -> Option<String> {
@@ -81,6 +154,28 @@ fn child_error_is_terminal(error: &ChildError, child: &ChildSession) -> bool {
     }
 }
 
+async fn wait_or_cancel(
+    changed: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>,
+    cancellation: &TurnCancellation,
+) -> Result<(), ChildError> {
+    match select(changed, Box::pin(cancellation.cancelled())).await {
+        Either::Left(_) => Ok(()),
+        Either::Right(_) => Err(ChildError::Cancelled),
+    }
+}
+
+fn failed_turn(id: &str, name: &str, error: ChildError) -> ChildError {
+    let ChildError::Failed(message) = error else {
+        return error;
+    };
+    let cause = crate::fatal::latest_cause(id)
+        .map(|cause| format!(" Cause: {cause}."))
+        .unwrap_or_default();
+    ChildError::Failed(format!(
+        "subagent {id:?} ({name}) failed during its turn: {message}.{cause} It is idle and keeps its conversation and edits; continue it with prompt({{subagent: {id:?}, prompt}})."
+    ))
+}
+
 fn task_summary(prompt: &str) -> String {
     let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -104,12 +199,14 @@ type EventSink = Arc<dyn Fn(&events::RuntimeEvent) -> Result<(), ()> + Send + Sy
 #[derive(Clone)]
 pub struct Subagents {
     config: ChildConfig,
-    max_depth: usize,
+    tree_slots: TreeSlots,
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     capacity: Arc<Semaphore>,
     event_sink: EventSink,
     transcripts: Arc<transcript::Transcripts>,
     observer: Option<session::SessionObserver>,
+    /// Signalled on every lifecycle event so deliveries can wait for a turn to end.
+    changed: Arc<Notify>,
 }
 
 struct SessionEntry {
@@ -137,7 +234,9 @@ struct State {
     child: Option<ChildSession>,
     recovery: Option<session::DurableChild>,
     forking: Option<String>,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<Permit>,
+    /// Prompt cache key the child process runs under; `None` uses its own id.
+    cache_key: Option<String>,
 }
 
 impl State {
@@ -255,6 +354,7 @@ struct CreateOptions {
     harness: Option<String>,
     model: Option<String>,
     cwd: Option<PathBuf>,
+    inherit: Option<String>,
 }
 
 struct ForkSuccess {
@@ -278,19 +378,20 @@ struct ForkOperation {
     depth: usize,
     cancellation: TurnCancellation,
     contract: Option<Arc<OutputContract>>,
-    permit: OwnedSemaphorePermit,
+    permit: Permit,
     native_fork: bool,
 }
 
 impl Subagents {
-    pub(crate) fn new(config: ChildConfig, max_depth: usize) -> Self {
+    pub(crate) fn new(config: ChildConfig) -> Self {
         Self {
             config,
-            max_depth,
+            tree_slots: TreeSlots::default(),
             sessions: Arc::default(),
             capacity: Arc::new(Semaphore::new(MAX_LIVE_SUBAGENTS)),
             observer: None,
             transcripts: Arc::default(),
+            changed: Arc::default(),
             event_sink: Arc::new(|event| {
                 events::emit(event);
                 Ok(())
@@ -298,12 +399,17 @@ impl Subagents {
         }
     }
 
+    pub(crate) fn with_prompt_cache_key(mut self, key: String) -> Self {
+        self.config.prompt_cache_key = Some(key);
+        self
+    }
+
     pub(crate) fn child_config(&self) -> ChildConfig {
         self.config.clone()
     }
 
     pub(crate) fn fresh(&self) -> Self {
-        Self::new(self.config.clone(), self.max_depth)
+        Self::new(self.config.clone())
     }
 
     pub(crate) fn fresh_for_workspace(
@@ -316,7 +422,7 @@ impl Subagents {
         if let Some((id, name)) = parent {
             config = config.with_parent_context(id, name);
         }
-        Self::new(config, self.max_depth)
+        Self::new(config)
     }
 
     pub(crate) async fn read_transcript(
@@ -333,6 +439,7 @@ impl Subagents {
     }
 
     fn emit_event(&self, mut event: events::RuntimeEvent) {
+        self.changed.notify_waiters();
         if let events::RuntimeEvent::SubagentStateChanged {
             id,
             generation,
@@ -395,7 +502,6 @@ impl Subagents {
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
-        self.check_depth(depth)?;
         let permit = self.reserve()?;
         let id = session::new_id();
         let CreateOptions {
@@ -403,9 +509,18 @@ impl Subagents {
             harness,
             model,
             cwd,
+            inherit,
         } = options;
         let root = self.resolve_root(cwd)?;
-        let harness = harness.unwrap_or_else(|| self.config.default_harness.clone());
+        let cache_key = inherit
+            .is_some()
+            .then(|| self.config.prompt_cache_key.clone())
+            .flatten();
+        let harness = if inherit.is_some() {
+            crate::acp_child::BUILTIN_HARNESS.to_string()
+        } else {
+            harness.unwrap_or_else(|| self.config.default_harness.clone())
+        };
         if !self.config.harnesses.contains(&harness) {
             return Err(ChildError::Failed(format!(
                 "unknown ACP harness {harness:?}"
@@ -442,13 +557,36 @@ impl Subagents {
                 recovery: None,
                 forking: None,
                 permit: Some(permit),
+                cache_key: cache_key.clone(),
             },
         )?;
-        let persisted = kit.then(|| (id.clone(), false));
+        let prompt = match (kit, inherit.is_some()) {
+            (false, _) => prompt,
+            (true, false) => framed(prompt, DELEGATION_FRAME),
+            (true, true) => framed(prompt, INHERITED_FRAME),
+        };
+        let seeded = inherit.is_some();
+        if let Some(source) = inherit {
+            let transcript_root = self.config.root.clone();
+            let branch_id = id.clone();
+            let cloned = tokio::task::spawn_blocking(move || {
+                session::clone_inherited(&transcript_root, &source, &branch_id)
+            })
+            .await
+            .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
+            .and_then(|result| result.map_err(ChildError::Failed));
+            if let Err(error) = cloned {
+                self.fail_removed_and_remove(&id, &state).await;
+                return Err(error);
+            }
+        }
+        let persisted = kit.then(|| (id.clone(), seeded));
         let child_config = self
             .config
             .clone()
             .with_root(root)
+            .with_tree_slots(tree_slot_directory(&self.tree_slots)?.clone())
+            .with_cache_lineage(cache_key)
             .with_parent_context(id.clone(), state.lock().await.name.clone());
         {
             let locked = state.lock().await;
@@ -507,11 +645,7 @@ impl Subagents {
             .await
         {
             Ok(output) => output,
-            Err(error) => {
-                self.fail_removed_and_remove(&id, &state).await;
-                let _ = child.close().await;
-                return Err(error);
-            }
+            Err(error) => return Err(self.retain_failed_turn(&id, &state, &child, error).await),
         };
         let (output, updates) = turn_output(output, contract);
         let mut locked = state.lock().await;
@@ -538,10 +672,6 @@ impl Subagents {
             generation: 1,
             updates,
         })
-    }
-
-    async fn steer(&self, id: &str, prompt: ChildPrompt) -> Result<Value, ChildError> {
-        self.steer_generation(id, None, prompt).await
     }
 
     pub(crate) async fn steer_generation(
@@ -591,6 +721,102 @@ impl Subagents {
         // Steering owns no lifecycle transition or generation. Do not hold state
         // across the child request: completion and close must remain independent.
         child.steer_generation(prompt, Some(generation)).await
+    }
+
+    /// Delivers `prompt` by whichever method the subagent's state allows and
+    /// returns its value once the turn that handled the prompt has ended.
+    async fn deliver(
+        &self,
+        id: &str,
+        prompt: ChildPrompt,
+        cancellation: TurnCancellation,
+        contract: Option<&OutputContract>,
+    ) -> Result<SubagentValue, ChildError> {
+        loop {
+            let state = self.lookup_id(id)?;
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let (status, forking, generation, handle_generation, child) = {
+                let locked = state.lock().await;
+                self.check_active(&locked)?;
+                (
+                    locked.status,
+                    locked.forking.is_some(),
+                    locked.generation,
+                    locked.handle_generation,
+                    locked.child.clone(),
+                )
+            };
+            if status == SubagentStatus::Idle && !forking {
+                let prior = SubagentValue {
+                    id: id.to_owned(),
+                    name: None,
+                    output: Value::Null,
+                    generation: handle_generation,
+                    updates: None,
+                };
+                return self.prompt(prior, prompt, cancellation, contract).await;
+            }
+            // An injected message has no turn of its own to carry an output contract.
+            if status == SubagentStatus::Working
+                && !forking
+                && contract.is_none()
+                && let Some(child) = child
+            {
+                match child
+                    .steer_generation(prompt.clone(), Some(generation))
+                    .await
+                {
+                    Ok(_) => {
+                        return self.turn_value(id, &state, generation, &cancellation).await;
+                    }
+                    Err(error) if child_error_is_terminal(&error, &child) => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            wait_or_cancel(changed, &cancellation).await?;
+        }
+    }
+
+    /// Waits for `generation` to end and returns what it produced.
+    async fn turn_value(
+        &self,
+        id: &str,
+        state: &Arc<AsyncMutex<State>>,
+        generation: u64,
+        cancellation: &TurnCancellation,
+    ) -> Result<SubagentValue, ChildError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let locked = state.lock().await;
+                self.check_active(&locked)?;
+                let ended = locked.generation != generation
+                    || matches!(locked.status, SubagentStatus::Idle) && locked.outcome.is_some();
+                if ended {
+                    if locked.generation == generation
+                        && locked.outcome == Some(GenerationOutcome::Failed)
+                    {
+                        return Err(failed_turn(
+                            id,
+                            &locked.name,
+                            ChildError::Failed("the turn that received this prompt failed".into()),
+                        ));
+                    }
+                    return Ok(SubagentValue {
+                        id: id.to_owned(),
+                        name: Some(locked.name.clone()),
+                        output: locked.output.clone(),
+                        generation,
+                        updates: locked.updates.clone(),
+                    });
+                }
+            }
+            wait_or_cancel(changed, cancellation).await?;
+        }
     }
 
     async fn prompt(
@@ -678,21 +904,21 @@ impl Subagents {
             Err(error) => {
                 if child_error_is_terminal(&error, &child) {
                     self.fail_removed_and_remove(&prior.id, &state).await;
-                } else {
-                    let mut locked = state.lock().await;
-                    if locked.status != SubagentStatus::Removed {
-                        locked.status = SubagentStatus::Idle;
-                        locked.outcome = Some(GenerationOutcome::Failed);
-                        locked.generation_finished_at_unix_ms = Some(events::now_millis());
-                        // A failed call returns no replacement handle, so preserve the
-                        // accepted handle generation for a retry while keeping lifecycle
-                        // generations monotonic.
-                        let event = locked.runtime_event(prior.id.clone());
-                        drop(locked);
-                        self.emit_event(event);
-                    }
+                    return Err(error);
                 }
-                Err(error)
+                let mut locked = state.lock().await;
+                if locked.status != SubagentStatus::Removed {
+                    locked.status = SubagentStatus::Idle;
+                    locked.outcome = Some(GenerationOutcome::Failed);
+                    locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                    // A failed call returns no replacement handle, so preserve the
+                    // accepted handle generation for a retry while keeping lifecycle
+                    // generations monotonic.
+                    let event = locked.runtime_event(prior.id.clone());
+                    drop(locked);
+                    self.emit_event(event);
+                }
+                Err(failed_turn(&prior.id, &name, error))
             }
         }
     }
@@ -706,7 +932,6 @@ impl Subagents {
         cancellation: TurnCancellation,
         contract: Option<Arc<OutputContract>>,
     ) -> Result<SubagentValue, ChildError> {
-        self.check_depth(depth)?;
         let permit = self.reserve()?;
         let source_state = self.lookup(&prior)?;
         self.reconnect(&prior, &source_state, &cancellation).await?;
@@ -846,6 +1071,14 @@ impl Subagents {
             return Err(ChildError::Cancelled);
         }
 
+        let cache_key = Some(
+            source_state
+                .lock()
+                .await
+                .cache_key
+                .clone()
+                .unwrap_or_else(|| source_id.clone()),
+        );
         let now = events::now_millis();
         let state = self.insert_starting(
             id.clone(),
@@ -870,6 +1103,7 @@ impl Subagents {
                 recovery: None,
                 forking: None,
                 permit: None,
+                cache_key: cache_key.clone(),
             },
         )?;
         let branch_name = state.lock().await.name.clone();
@@ -902,6 +1136,8 @@ impl Subagents {
             .config
             .clone()
             .with_root(root)
+            .with_tree_slots(tree_slot_directory(&self.tree_slots)?.clone())
+            .with_cache_lineage(cache_key)
             .with_parent_context(id.clone(), branch_name.clone());
         let child_result = if native_fork {
             let parent = kit.then(|| (id.clone(), branch_name));
@@ -994,18 +1230,21 @@ impl Subagents {
             .prompt_generation(
                 id.clone(),
                 generation,
-                structured_prompt(prompt, contract.as_deref()),
+                structured_prompt(
+                    if kit {
+                        framed(prompt, INHERITED_FRAME)
+                    } else {
+                        prompt
+                    },
+                    contract.as_deref(),
+                ),
                 cancellation,
                 self.transcripts.get(&id, generation).ok(),
             )
             .await
         {
             Ok(output) => output,
-            Err(error) => {
-                return Err(self
-                    .cleanup_installed_child(&id, &state, &child, error)
-                    .await);
-            }
+            Err(error) => return Err(self.retain_failed_turn(&id, &state, &child, error).await),
         };
         let (output, updates) = turn_output(output, contract.as_deref());
         let mut locked = state.lock().await;
@@ -1108,9 +1347,7 @@ impl Subagents {
             ));
         }
         let reconnect_permit = if locked.child.is_none() && locked.recovery.is_some() {
-            Some(self.capacity.clone().try_acquire_owned().map_err(|_| {
-                ChildError::Failed("live subagent session limit (120) reached".into())
-            })?)
+            Some(self.acquire_permit()?)
         } else {
             None
         };
@@ -1131,6 +1368,7 @@ impl Subagents {
                     .config
                     .clone()
                     .with_root(record.root)
+                    .with_tree_slots(tree_slot_directory(&self.tree_slots)?.clone())
                     .with_parent_context(id.into(), record.name);
                 let cancellation = cancellation.clone();
                 // Tombstoned cleanup owns startup and capacity independently of
@@ -1172,12 +1410,16 @@ impl Subagents {
     }
 
     fn lookup(&self, prior: &SubagentValue) -> Result<Arc<AsyncMutex<State>>, ChildError> {
+        self.lookup_id(&prior.id)
+    }
+
+    fn lookup_id(&self, id: &str) -> Result<Arc<AsyncMutex<State>>, ChildError> {
         self.sessions
             .lock()
             .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
-            .get(&prior.id)
+            .get(id)
             .map(|entry| Arc::clone(&entry.state))
-            .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {:?}", prior.id)))
+            .ok_or_else(|| ChildError::Failed(format!("unknown subagent session {id:?}")))
     }
 
     fn insert_starting(
@@ -1210,7 +1452,7 @@ impl Subagents {
         Ok(state)
     }
 
-    fn reserve(&self) -> Result<OwnedSemaphorePermit, ChildError> {
+    fn reserve(&self) -> Result<Permit, ChildError> {
         let mut removed_events = Vec::new();
         let mut sessions = self
             .sessions
@@ -1239,10 +1481,20 @@ impl Subagents {
         for event in removed_events {
             self.emit_event(event);
         }
-        Arc::clone(&self.capacity).try_acquire_owned().map_err(|_| {
-            ChildError::Failed(format!(
-                "live subagent session limit ({MAX_LIVE_SUBAGENTS}) reached"
-            ))
+        self.acquire_permit()
+    }
+
+    fn acquire_permit(&self) -> Result<Permit, ChildError> {
+        let local = Arc::clone(&self.capacity)
+            .try_acquire_owned()
+            .map_err(|_| {
+                ChildError::Failed(format!(
+                    "live subagent session limit ({MAX_LIVE_SUBAGENTS}) reached"
+                ))
+            })?;
+        Ok(Permit {
+            _local: local,
+            _slot: tree_slot(tree_slot_directory(&self.tree_slots)?)?,
         })
     }
 
@@ -1311,7 +1563,7 @@ impl Subagents {
     async fn cleanup_uninstalled_child(
         &self,
         child: ChildSession,
-        permit: Option<OwnedSemaphorePermit>,
+        permit: Option<Permit>,
         error: ChildError,
     ) -> ChildError {
         match child.close().await {
@@ -1324,6 +1576,34 @@ impl Subagents {
                 ))
             }
         }
+    }
+
+    /// A live child keeps its conversation after a failed turn, so it stays
+    /// promptable; only a dead child is retired.
+    async fn retain_failed_turn(
+        &self,
+        id: &str,
+        state: &Arc<AsyncMutex<State>>,
+        child: &ChildSession,
+        error: ChildError,
+    ) -> ChildError {
+        if child_error_is_terminal(&error, child) {
+            return self.cleanup_installed_child(id, state, child, error).await;
+        }
+        let mut locked = state.lock().await;
+        if locked.status == SubagentStatus::Removed {
+            return error;
+        }
+        locked.status = SubagentStatus::Idle;
+        locked.forking = None;
+        locked.outcome = Some(GenerationOutcome::Failed);
+        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        let _ = self.persist_state(&locked, session::ChildLifecycle::Idle);
+        let name = locked.name.clone();
+        let event = locked.runtime_event(id.to_string());
+        drop(locked);
+        self.emit_event(event);
+        failed_turn(id, &name, error)
     }
 
     async fn cleanup_installed_child(
@@ -1395,7 +1675,7 @@ impl Subagents {
         Self::watch_permit_until_process_exit(permit, child);
     }
 
-    fn watch_permit_until_process_exit(permit: Option<OwnedSemaphorePermit>, child: &ChildSession) {
+    fn watch_permit_until_process_exit(permit: Option<Permit>, child: &ChildSession) {
         let Some(permit) = permit else {
             return;
         };
@@ -1532,16 +1812,6 @@ impl Subagents {
             )))
         }
     }
-    fn check_depth(&self, depth: usize) -> Result<(), ChildError> {
-        if depth < self.max_depth {
-            Ok(())
-        } else {
-            Err(ChildError::Failed(format!(
-                "subagent depth limit ({}) reached",
-                self.max_depth
-            )))
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1552,11 +1822,6 @@ pub struct SubagentTool {
 }
 #[derive(Clone)]
 pub struct PromptTool {
-    manager: Subagents,
-    spec: ToolSpec,
-}
-#[derive(Clone)]
-pub struct SteerTool {
     manager: Subagents,
     spec: ToolSpec,
 }
@@ -1741,7 +2006,25 @@ fn continuation_schema() -> serde_json::Value {
         (
             "properties".into(),
             Value::Object(Map::from_iter([
-                ("subagent".into(), value_schema()),
+                (
+                    "subagent".into(),
+                    Value::Object(Map::from_iter([
+                        (
+                            "description".into(),
+                            Value::from("The subagent's id, or a subagent value returned for it."),
+                        ),
+                        (
+                            "oneOf".into(),
+                            Value::Array(vec![
+                                Value::Object(Map::from_iter([(
+                                    "type".into(),
+                                    Value::from("string"),
+                                )])),
+                                value_schema(),
+                            ]),
+                        ),
+                    ])),
+                ),
                 ("prompt".into(), crate::acp_child::prompt::schema()),
                 (
                     "output_schema".into(),
@@ -1811,19 +2094,8 @@ fn call_id_schema() -> serde_json::Value {
 impl SubagentTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
         let harnesses = manager.harness_references();
-        let usage = if depth == 1 {
-            concat!(
-                "Use this only if you uncover independent workstreams whose parallel execution would yield quicker or better results. ",
-                "Give each subagent a focused assignment based on what you discovered, and synthesize its findings into your response. "
-            )
-        } else {
-            concat!(
-                "Use a fresh subagent for work that changes phase or objective instead of carrying unrelated history. ",
-                "Keep outputs focused, pass only necessary context, reuse sessions only when continuity helps, and close subagents when no longer needed. "
-            )
-        };
         let description = format!(
-            "Start a parent-owned configured ACP harness, preferably assign a concise role-oriented display name, prompt it, and return its reusable session value. {usage}Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference."
+            "Start a subagent in a fresh conversation, optionally on a configured ACP harness or model, and return its reusable session value. Prefer a short role-oriented display name. {FRESH_USAGE} Omit `harness` and `model` unless the user or active workflow explicitly supplies the exact override or a configured alias. Never choose an override based on your own model, provider, publisher, familiarity, cost, or perceived quality; advertised choices indicate availability, not preference."
         );
         let input_schema = Value::Object(Map::from_iter([
             ("type".into(), Value::from("object")),
@@ -1904,45 +2176,13 @@ impl SubagentTool {
         }
     }
 }
-impl SteerTool {
-    pub fn new(manager: Subagents) -> Self {
-        Self {
-            manager,
-            spec: ToolSpec::new(
-                ToolName::new("steer"),
-                "Inject guidance into a working ACP subagent without starting a new turn. Use an ID from subagents while its originating compose is backgrounded. Requires ACP v2 with advertised steer support. Returns acceptance, not delivery or completion; never cancels or re-prompts unsupported peers.",
-                Value::Object(Map::from_iter([
-                    ("type".into(), Value::from("object")),
-                    ("properties".into(), Value::Object(Map::from_iter([
-                        ("id".into(), Value::Object(Map::from_iter([
-                            ("type".into(), Value::from("string")),
-                        ]))),
-                        ("prompt".into(), crate::acp_child::prompt::schema()),
-                    ]))),
-                    ("required".into(), Value::from(vec!["id", "prompt"])),
-                    ("additionalProperties".into(), Value::Bool(false)),
-                ])),
-            )
-            .with_output_schema(Value::Bool(true))
-            .with_annotations(ToolAnnotations::new()),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SteerInput {
-    id: String,
-    prompt: ChildPrompt,
-}
-
 impl PromptTool {
     pub fn new(manager: Subagents) -> Self {
         Self {
             manager,
             spec: ToolSpec::new(
                 ToolName::new("prompt"),
-                "Re-prompt the same completed ACP subagent session using a prior subagent value.",
+                "Send a message to an existing subagent and return its value once the turn that handled the message ends. It works in any state: an idle subagent, including one whose last turn failed, starts a new turn; a working one receives the message within its current turn when it supports that, otherwise in a new turn after the current one ends.",
                 continuation_schema(),
             )
             .with_output_schema(value_schema())
@@ -1952,13 +2192,8 @@ impl PromptTool {
 }
 impl ForkTool {
     pub fn new(manager: Subagents, depth: usize) -> Self {
-        let usage = if depth == 1 {
-            " Use this only for an independent workstream whose parallel execution would yield quicker or better results, and synthesize its findings into your response."
-        } else {
-            ""
-        };
         let description = format!(
-            "Fork a completed ACP subagent session using native capability support or the isolated Kit fallback, preferably assign the fork a concise role-oriented display name, prompt it, and return the new session value.{usage}"
+            "Start a subagent that works concurrently with you from a copy of an existing conversation, and return its reusable session value. The copied conversation depends on `subagent`: when omitted, it is your current conversation, including every message, tool call and tool result before this call; when given a prior subagent value, it is that subagent's completed session, which holds only what that subagent saw, not your conversation. Your prompt follows the copied conversation. Prefer a short role-oriented display name.\n\n{DELEGATION_USAGE}"
         );
         Self {
             manager,
@@ -1971,7 +2206,18 @@ impl ForkTool {
                     (
                         "properties".into(),
                         Value::Object(Map::from_iter([
-                            ("subagent".into(), value_schema()),
+                            ("subagent".into(), {
+                                let mut schema = value_schema();
+                                if let Value::Object(schema) = &mut schema {
+                                    schema.insert(
+                                        "description".into(),
+                                        Value::from(
+                                            "Completed subagent session to copy. Omit to copy your current conversation.",
+                                        ),
+                                    );
+                                }
+                                schema
+                            }),
                             ("prompt".into(), crate::acp_child::prompt::schema()),
                             ("name".into(), display_name_schema()),
                             (
@@ -1992,10 +2238,7 @@ impl ForkTool {
                             ),
                         ])),
                     ),
-                    (
-                        "required".into(),
-                        Value::Array(vec![Value::from("subagent"), Value::from("prompt")]),
-                    ),
+                    ("required".into(), Value::Array(vec![Value::from("prompt")])),
                     ("additionalProperties".into(), Value::from(false)),
                 ])),
             )
@@ -2051,15 +2294,31 @@ struct Input {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Continuation {
-    subagent: SubagentValue,
+    subagent: SubagentRef,
     prompt: ChildPrompt,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
     output_schema: Option<Value>,
 }
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum SubagentRef {
+    Id(String),
+    Value(SubagentValue),
+}
+
+impl SubagentRef {
+    fn id(&self) -> &str {
+        match self {
+            Self::Id(id) => id,
+            Self::Value(value) => &value.id,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForkInput {
-    subagent: SubagentValue,
+    subagent: Option<SubagentValue>,
     prompt: ChildPrompt,
     name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_output_schema")]
@@ -2196,6 +2455,7 @@ impl Tool for SubagentTool {
                         harness: input.harness,
                         model: input.model,
                         cwd: input.cwd,
+                        inherit: None,
                     },
                     self.depth,
                     cancellation(context),
@@ -2203,36 +2463,6 @@ impl Tool for SubagentTool {
                 )
                 .await,
         )
-    }
-}
-
-#[async_trait]
-impl Tool for SteerTool {
-    fn spec(&self) -> &ToolSpec {
-        &self.spec
-    }
-
-    async fn invoke(
-        &self,
-        request: ToolRequest,
-        _context: &mut ToolContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        let input: SteerInput = serde_json::from_value(request.input.clone())
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-        let receipt =
-            self.manager
-                .steer(&input.id, input.prompt)
-                .await
-                .map_err(|error| match error {
-                    ChildError::Cancelled | ChildError::TerminalCancelled => ToolError::Cancelled,
-                    ChildError::Failed(error) | ChildError::TerminalFailed(error) => {
-                        ToolError::ExecutionFailed(error)
-                    }
-                })?;
-        Ok(ToolResult::new(ToolResultPart::success(
-            request.call_id,
-            ToolOutput::structured(receipt),
-        )))
     }
 }
 
@@ -2252,8 +2482,8 @@ impl Tool for PromptTool {
         result(
             request,
             self.manager
-                .prompt(
-                    input.subagent,
+                .deliver(
+                    input.subagent.id(),
                     input.prompt,
                     cancellation(context),
                     contract.as_ref(),
@@ -2276,19 +2506,39 @@ impl Tool for ForkTool {
         let input: ForkInput = serde_json::from_value(request.input.clone())
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let contract = input.output_schema.map(OutputContract::new).transpose()?;
-        result(
-            request,
-            self.manager
-                .fork(
-                    input.subagent,
-                    input.prompt,
-                    input.name,
-                    self.depth,
-                    cancellation(context),
-                    contract.map(Arc::new),
-                )
-                .await,
-        )
+        let outcome = match input.subagent {
+            Some(subagent) => {
+                self.manager
+                    .fork(
+                        subagent,
+                        input.prompt,
+                        input.name,
+                        self.depth,
+                        cancellation(context),
+                        contract.map(Arc::new),
+                    )
+                    .await
+            }
+            None => {
+                let source = request.session_id.0.clone();
+                self.manager
+                    .create(
+                        input.prompt,
+                        CreateOptions {
+                            name: input.name,
+                            harness: None,
+                            model: None,
+                            cwd: None,
+                            inherit: Some(source),
+                        },
+                        self.depth,
+                        cancellation(context),
+                        contract.as_ref(),
+                    )
+                    .await
+            }
+        };
+        result(request, outcome)
     }
 }
 
@@ -2317,27 +2567,26 @@ mod steer_tests {
     fn manager_with_disconnected_session(
         root: &Path,
     ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
-        let manager = Subagents::new(
-            ChildConfig {
-                root: root.to_path_buf(),
-                additional_directories: Vec::new(),
-                model: "test".into(),
-                provider: Default::default(),
-                reasoning_effort: None,
-                openrouter_api_key: None,
-                configured_mcp_config: None,
-                configured_mcp_config_inherited: false,
-                legacy_mcp_config: false,
-                mcp_config: None,
-                credential_storage: Default::default(),
-                telemetry: Default::default(),
-                harnesses: Default::default(),
-                default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            2,
-        );
+        let manager = Subagents::new(ChildConfig {
+            root: root.to_path_buf(),
+            additional_directories: Vec::new(),
+            model: "test".into(),
+            provider: Default::default(),
+            reasoning_effort: None,
+            openrouter_api_key: None,
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: false,
+            mcp_config: None,
+            credential_storage: Default::default(),
+            telemetry: Default::default(),
+            harnesses: Default::default(),
+            default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+            parent_id: None,
+            parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
+        });
         let state = Arc::new(AsyncMutex::new(State {
             name: "Scout".into(),
             status: SubagentStatus::Idle,
@@ -2358,7 +2607,8 @@ mod steer_tests {
             child: Some(ChildSession::disconnected_for_test()),
             recovery: None,
             forking: None,
-            permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
+            permit: Some(manager.acquire_permit().unwrap()),
+            cache_key: None,
         }));
         manager.sessions.lock().unwrap().insert(
             "source".into(),
@@ -2378,26 +2628,26 @@ mod steer_tests {
     }
 
     #[test]
-    fn steer_schema_accepts_ids_and_child_prompts_only() {
+    fn prompt_accepts_an_id_or_a_subagent_value() {
         let (manager, _, _) = manager_with_disconnected_session(Path::new("."));
-        let tool = SteerTool::new(manager);
+        let tool = PromptTool::new(manager);
         let validator = jsonschema::validator_for(&tool.spec.input_schema).unwrap();
         for input in [
-            json!({"id": "source", "prompt": "focus on tests"}),
-            json!({"id": "source", "prompt": [{"type": "text", "text": "focus on tests"}]}),
+            json!({"subagent": "source", "prompt": "focus on tests"}),
+            json!({"subagent": {"id": "source", "output": null, "generation": 1}, "prompt": "go"}),
+            json!({"subagent": "source", "prompt": [{"type": "text", "text": "focus on tests"}]}),
         ] {
-            assert!(validator.is_valid(&input));
-            assert!(serde_json::from_value::<SteerInput>(input).is_ok());
+            assert!(validator.is_valid(&input), "{input}");
+            let parsed = serde_json::from_value::<Continuation>(input).unwrap();
+            assert_eq!(parsed.subagent.id(), "source");
         }
         for input in [
-            json!({"prompt": "missing ID"}),
-            json!({"id": "source"}),
-            json!({"id": 1, "prompt": "work"}),
-            json!({"id": "source", "prompt": "work", "generation": 1}),
-            json!({"id": "source", "prompt": null}),
+            json!({"prompt": "missing subagent"}),
+            json!({"subagent": "source"}),
+            json!({"subagent": 1, "prompt": "work"}),
+            json!({"subagent": "source", "prompt": null}),
         ] {
-            assert!(!validator.is_valid(&input));
-            assert!(serde_json::from_value::<SteerInput>(input).is_err());
+            assert!(!validator.is_valid(&input), "{input}");
         }
     }
 
@@ -2428,7 +2678,7 @@ mod steer_tests {
                     },
                 )]))
                 .unwrap();
-            let manager = Subagents::new(config, 2);
+            let manager = Subagents::new(config);
             let turn_manager = manager.clone();
             let turn = tokio::spawn(async move {
                 turn_manager
@@ -2465,15 +2715,38 @@ mod steer_tests {
                     locked.generation,
                     locked.handle_generation,
                     locked.output.clone(),
-                    locked.permit.as_ref().unwrap().num_permits(),
+                    locked.permit.as_ref().unwrap()._local.num_permits(),
                 )
             };
             let capacity = manager.capacity.available_permits();
-            let receipt = manager.steer(id, "original turn".into()).await.unwrap();
-            assert_eq!(receipt, json!({"messageId": "injected-1"}));
+            let delivery = {
+                let manager = manager.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    manager
+                        .deliver(
+                            &id,
+                            "original turn".into(),
+                            TurnCancellation::default(),
+                            None,
+                        )
+                        .await
+                })
+            };
+            loop {
+                let log = std::fs::read_to_string(&request_log).unwrap_or_default();
+                if log
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|request| request["method"] == "session/inject")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert!(
-                !turn.is_finished(),
-                "acceptance must not finish the gated turn"
+                !turn.is_finished() && !delivery.is_finished(),
+                "an injected prompt must not finish the gated turn"
             );
             {
                 let locked = state.lock().await;
@@ -2481,7 +2754,10 @@ mod steer_tests {
                 assert_eq!(locked.generation, before.0);
                 assert_eq!(locked.handle_generation, before.1);
                 assert_eq!(locked.output, before.2);
-                assert_eq!(locked.permit.as_ref().unwrap().num_permits(), before.3);
+                assert_eq!(
+                    locked.permit.as_ref().unwrap()._local.num_permits(),
+                    before.3
+                );
                 assert_eq!(manager.capacity.available_permits(), capacity);
                 assert!(locked.outcome.is_none());
                 assert!(locked.generation_finished_at_unix_ms.is_none());
@@ -2491,6 +2767,9 @@ mod steer_tests {
             assert_eq!(completed.id, *id);
             assert_eq!(completed.output, json!("original turn"));
             assert_eq!(completed.generation, before.0);
+            let delivered = delivery.await.unwrap().unwrap();
+            assert_eq!(delivered.generation, completed.generation);
+            assert_eq!(delivered.output, completed.output);
             {
                 let locked = state.lock().await;
                 assert_eq!(locked.status, SubagentStatus::Idle);
@@ -2500,12 +2779,7 @@ mod steer_tests {
                 assert!(locked.permit.is_some());
             }
             let continued = manager
-                .prompt(
-                    completed,
-                    "next turn".into(),
-                    TurnCancellation::default(),
-                    None,
-                )
+                .deliver(id, "next turn".into(), TurnCancellation::default(), None)
                 .await
                 .unwrap();
             assert_eq!(continued.id, *id);
@@ -2557,6 +2831,146 @@ mod steer_tests {
     }
 
     #[tokio::test]
+    async fn failed_first_turn_keeps_a_live_subagent_promptable() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = manager_with_disconnected_session(root.path())
+                .0
+                .child_config();
+            config.default_harness = "acp.mock".into();
+            config.harnesses =
+                crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                    "mock".into(),
+                    crate::acp_child::AcpHarnessProfile {
+                        command: "python3".into(),
+                        args: vec![format!(
+                            "{}/fixtures/mock-acp-v2.py",
+                            env!("CARGO_MANIFEST_DIR")
+                        )],
+                        permissions: Default::default(),
+                    },
+                )]))
+                .unwrap();
+            let manager = Subagents::new(config);
+            let error = manager
+                .create(
+                    "MOCK_TURN_ERROR".into(),
+                    CreateOptions {
+                        name: Some("worker".into()),
+                        ..Default::default()
+                    },
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            let listing = manager.list(&TurnCancellation::default()).await.unwrap();
+            assert_eq!(listing.len(), 1);
+            let id = listing[0].id.clone();
+            assert_eq!(listing[0].status, SubagentStatus::Idle);
+            assert!(error.contains(&format!("{id:?} (worker)")), "{error}");
+            assert!(error.contains("nested agent turn failed"), "{error}");
+            assert!(
+                error.contains(&format!("prompt({{subagent: {id:?}")),
+                "{error}"
+            );
+
+            let continued = manager
+                .deliver(&id, "continue".into(), TurnCancellation::default(), None)
+                .await
+                .unwrap();
+            assert_eq!(continued.id, id);
+            assert_eq!(continued.output, json!("continue"));
+            assert_eq!(continued.generation, 2);
+            manager
+                .close(&id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_to_a_working_subagent_without_steering_runs_after_its_turn() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let release = root.path().join("release");
+            let request_log = root.path().join("requests");
+            let mut config = manager_with_disconnected_session(root.path())
+                .0
+                .child_config();
+            config.default_harness = "acp.mock".into();
+            config.harnesses =
+                crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                    "mock".into(),
+                    crate::acp_child::AcpHarnessProfile {
+                        command: "python3".into(),
+                        args: vec![
+                            format!("{}/fixtures/mock-acp-v2.py", env!("CARGO_MANIFEST_DIR")),
+                            format!("--prompt-release={}", release.display()),
+                            format!("--request-log={}", request_log.display()),
+                        ],
+                        permissions: Default::default(),
+                    },
+                )]))
+                .unwrap();
+            let manager = Subagents::new(config);
+            let turn = {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .create(
+                            "first".into(),
+                            CreateOptions::default(),
+                            0,
+                            TurnCancellation::default(),
+                            None,
+                        )
+                        .await
+                })
+            };
+            while !std::fs::read_to_string(&request_log)
+                .unwrap_or_default()
+                .contains("session/prompt")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let id = manager.list(&TurnCancellation::default()).await.unwrap()[0]
+                .id
+                .clone();
+            let delivery = {
+                let manager = manager.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    manager
+                        .deliver(&id, "second".into(), TurnCancellation::default(), None)
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!delivery.is_finished());
+            std::fs::write(&release, b"release").unwrap();
+            assert_eq!(turn.await.unwrap().unwrap().output, json!("first"));
+            let delivered = delivery.await.unwrap().unwrap();
+            assert_eq!(delivered.output, json!("second"));
+            assert_eq!(delivered.generation, 2);
+            manager
+                .close(&id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn steer_rejects_ineligible_sessions_without_changing_lifecycle() {
         let (manager, state, prior) = manager_with_disconnected_session(Path::new("."));
         for (status, forking, expected) in [
@@ -2572,7 +2986,7 @@ mod steer_tests {
                 locked.forking = forking.map(str::to_owned);
             }
             let error = manager
-                .steer(&prior.id, "guidance".into())
+                .steer_generation(&prior.id, None, "guidance".into())
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
@@ -2587,7 +3001,7 @@ mod steer_tests {
         }
         assert!(
             manager
-                .steer("unknown", "guidance".into())
+                .steer_generation("unknown", None, "guidance".into())
                 .await
                 .unwrap_err()
                 .to_string()

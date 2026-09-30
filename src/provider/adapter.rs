@@ -359,6 +359,7 @@ pub struct SelectableSession {
     config: SessionConfig,
     active: SessionSelection,
     inner: KitSession,
+    retry_observer: Option<Arc<dyn agentkit_loop::RetryObserver>>,
 }
 
 #[async_trait]
@@ -390,6 +391,7 @@ impl ModelAdapter for SelectableAdapter {
             config,
             active,
             inner,
+            retry_observer: None,
         })
     }
 
@@ -424,6 +426,11 @@ fn expose_background_call_ids(request: &mut TurnRequest) {
 #[async_trait]
 impl ModelSession for SelectableSession {
     type Turn = KitTurn;
+
+    fn set_retry_observer(&mut self, observer: Option<Arc<dyn agentkit_loop::RetryObserver>>) {
+        self.inner.set_retry_observer(observer.clone());
+        self.retry_observer = observer;
+    }
 
     async fn begin_turn(
         &mut self,
@@ -468,7 +475,8 @@ impl SelectableSession {
         selected: SessionSelection,
         replacement: Result<KitSession, LoopError>,
     ) -> Result<(), LoopError> {
-        let replacement = replacement?;
+        let mut replacement = replacement?;
+        replacement.set_retry_observer(self.retry_observer.clone());
         self.inner = replacement;
         self.active = selected;
         Ok(())
@@ -1102,6 +1110,14 @@ fn tool_image_traversal_error() -> LoopError {
 #[async_trait]
 impl ModelSession for KitSession {
     type Turn = KitTurn;
+
+    fn set_retry_observer(&mut self, observer: Option<Arc<dyn agentkit_loop::RetryObserver>>) {
+        match self {
+            Self::OpenAiSubscription(session) => session.set_retry_observer(observer),
+            Self::OpenRouter(session) => session.inner.set_retry_observer(observer),
+            Self::Speakeasy(session) => session.inner.set_retry_observer(observer),
+        }
+    }
 
     async fn begin_turn(
         &mut self,
@@ -2063,6 +2079,7 @@ mod tests {
             config: SessionConfig::new("provider-identity-test"),
             active,
             inner,
+            retry_observer: None,
         }
     }
 

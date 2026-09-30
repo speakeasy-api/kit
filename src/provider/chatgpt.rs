@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     io::Cursor,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -55,6 +55,9 @@ const MAX_NORMALIZED_IMAGE_BYTES: usize = ((MAX_FIELD_BYTES - JPEG_DATA_URL_PREF
 const MAX_SERVER_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_SUBSCRIPTION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_CATALOG_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_CATALOG_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const MODEL_CATALOG_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MODEL_CATALOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 
@@ -163,7 +166,7 @@ impl SubscriptionConfig {
 pub struct OpenAiSubscriptionAdapter {
     config: SubscriptionConfig,
     reasoning_effort: Option<super::adapter::ReasoningEffort>,
-    catalog_client: reqwest::Client,
+    catalog_client: ModelCatalogClient,
     responses_client: agentkit_http::Http,
     model_catalog: SubscriptionModelCatalogCache,
 }
@@ -196,7 +199,10 @@ impl OpenAiSubscriptionAdapter {
             .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| "could not build OpenAI subscription client".to_owned())?;
-        let catalog_client = client.clone();
+        let catalog_client = ModelCatalogClient {
+            client: client.clone(),
+            endpoint: MODELS_ENDPOINT.to_owned(),
+        };
         let responses_client = agentkit_http::Http::new(ChatGptRetryHintsClient(client));
         Ok(Self {
             config,
@@ -211,11 +217,10 @@ impl OpenAiSubscriptionAdapter {
         &self,
         credentials: &auth::TokenRecord,
         binding: &auth::CredentialBinding,
+        timeout: Duration,
     ) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
         self.model_catalog
-            .get_or_try_init(binding, || {
-                fetch_model_catalog(&self.catalog_client, credentials)
-            })
+            .get_or_try_init(binding, || self.catalog_client.fetch(credentials, timeout))
             .await
     }
 
@@ -234,7 +239,8 @@ impl OpenAiSubscriptionAdapter {
         let binding = credentials
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
-        self.catalog_with_credentials(&credentials, &binding).await
+        self.catalog_with_credentials(&credentials, &binding, MODEL_CATALOG_AUTH_TIMEOUT)
+            .await
     }
 }
 
@@ -257,14 +263,9 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .binding()
             .map_err(|error| LoopError::Provider(error.to_string()))?;
         let authentication_binding = binding_string(&binding);
-        // Catalog discovery stays independent and best-effort. A failed fetch is not cached.
-        let model_catalog = self
-            .catalog_with_credentials(&credentials, &binding)
-            .await
-            .unwrap_or_else(|_| Arc::new(SubscriptionModelCatalog::default()));
         let authentication = Authentication::new(OpenAiAuthenticationProvider {
             credential_storage: self.config.credential_storage.clone(),
-            binding,
+            binding: binding.clone(),
             timeout: auth_timeout(&resilience),
         });
         let config = subscription_responses_config(
@@ -278,10 +279,7 @@ impl ModelAdapter for OpenAiSubscriptionAdapter {
             .await?;
         Ok(OpenAiSubscriptionSession {
             inner,
-            context_window: model_catalog
-                .context_windows
-                .get(&self.config.model)
-                .copied(),
+            context_window: ContextWindowDiscovery::start(self.clone(), credentials, binding),
             authentication_binding,
         })
     }
@@ -311,22 +309,101 @@ fn subscription_responses_config(
             max_items: MAX_ITEMS,
             max_text_bytes: MAX_FIELD_BYTES,
         })
-        .with_resilience(resilience);
+        .with_resilience(resilience)
+        .with_progress_timeouts(
+            Some(Duration::from_secs(60)),
+            Some(Duration::from_secs(180)),
+        );
     if let Some(effort) = reasoning_effort {
         config = config.with_reasoning_effort(effort.as_str());
     }
     config
 }
 
+// One worker publishes capacity once; readers never wait for discovery. The
+// worker owns only the value, not this owner, so dropping the last session/turn
+// aborts pending HTTP, credential loading, or retry sleep without a cycle.
+struct ContextWindowDiscovery {
+    value: Arc<OnceLock<u64>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl ContextWindowDiscovery {
+    fn start(
+        adapter: OpenAiSubscriptionAdapter,
+        mut credentials: auth::TokenRecord,
+        binding: auth::CredentialBinding,
+    ) -> Arc<Self> {
+        let value = Arc::new(OnceLock::new());
+        let published = Arc::clone(&value);
+        let worker = tokio::spawn(async move {
+            let mut delay = MODEL_CATALOG_RETRY_DELAY;
+            loop {
+                match adapter
+                    .catalog_with_credentials(
+                        &credentials,
+                        &binding,
+                        MODEL_CATALOG_BACKGROUND_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(catalog) => {
+                        if let Some(&window) = catalog.context_windows.get(&adapter.config.model) {
+                            let _ = published.set(window);
+                        }
+                        // A valid catalog may not advertise this model's capacity.
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "context capacity discovery failed; retrying");
+                    }
+                }
+                loop {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MODEL_CATALOG_MAX_RETRY_DELAY);
+                    match load_credentials(
+                        adapter.config.credential_storage.clone(),
+                        MODEL_CATALOG_AUTH_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            if ensure_credential_binding(&binding, &fresh).is_err() {
+                                return;
+                            }
+                            credentials = fresh;
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "context capacity credentials unavailable; retrying");
+                        }
+                    }
+                }
+            }
+        });
+        Arc::new(Self { value, worker })
+    }
+}
+
+impl Drop for ContextWindowDiscovery {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
 pub struct OpenAiSubscriptionSession {
     inner: OpenAIResponsesSession,
-    context_window: Option<u64>,
+    context_window: Arc<ContextWindowDiscovery>,
     authentication_binding: String,
 }
 
 #[async_trait]
 impl ModelSession for OpenAiSubscriptionSession {
     type Turn = OpenAiSubscriptionTurn;
+
+    fn set_retry_observer(&mut self, observer: Option<Arc<dyn agentkit_loop::RetryObserver>>) {
+        self.inner.set_retry_observer(observer);
+    }
     async fn begin_turn(
         &mut self,
         mut request: TurnRequest,
@@ -351,7 +428,7 @@ impl ModelSession for OpenAiSubscriptionSession {
             .await
             .map(|inner| OpenAiSubscriptionTurn {
                 inner,
-                context_window: self.context_window,
+                context_window: Arc::clone(&self.context_window),
             })
     }
     fn model_name(&self) -> Option<&str> {
@@ -569,7 +646,7 @@ fn encode_image_to_budget(
 
 pub struct OpenAiSubscriptionTurn {
     inner: UpstreamOpenAIResponsesTurn,
-    context_window: Option<u64>,
+    context_window: Arc<ContextWindowDiscovery>,
 }
 
 #[async_trait]
@@ -583,7 +660,7 @@ impl ModelTurn for OpenAiSubscriptionTurn {
         cancellation: Option<agentkit_core::TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         let mut event = self.inner.next_event(cancellation).await?;
-        if let Some(context_window) = self.context_window {
+        if let Some(&context_window) = self.context_window.value.get() {
             stamp_context_window(
                 &mut event,
                 context_window,
@@ -947,48 +1024,62 @@ fn binding_string(binding: &auth::CredentialBinding) -> String {
     format!("openai-chatgpt-v1:{account_digest}:{}", binding.generation)
 }
 
-async fn fetch_model_catalog(
-    client: &reqwest::Client,
-    credentials: &auth::TokenRecord,
-) -> Result<SubscriptionModelCatalog, LoopError> {
-    let endpoint = format!("{MODELS_ENDPOINT}?client_version={MODEL_CATALOG_CLIENT_VERSION}");
-    let mut request = client
-        .get(endpoint)
-        .bearer_auth(credentials.access_token())
-        .header("originator", "kit")
-        .header("Accept", "application/json")
-        .timeout(Duration::from_secs(5));
-    if let Some(account_id) = credentials.account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| LoopError::Provider("model catalog transport failed".into()))?;
-    if !response.status().is_success() {
-        return Err(LoopError::Provider(format!(
-            "model catalog returned {}",
-            response.status()
-        )));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_MODELS_BYTES as u64)
-    {
-        return Err(protocol("model catalog exceeds 2 MiB"));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| LoopError::Provider("model catalog body failed".into()))?;
-        if body.len().saturating_add(chunk.len()) > MAX_MODELS_BYTES {
+#[derive(Clone)]
+struct ModelCatalogClient {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl ModelCatalogClient {
+    async fn fetch(
+        &self,
+        credentials: &auth::TokenRecord,
+        timeout: Duration,
+    ) -> Result<SubscriptionModelCatalog, LoopError> {
+        let endpoint = format!(
+            "{}?client_version={MODEL_CATALOG_CLIENT_VERSION}",
+            self.endpoint
+        );
+        let mut request = self
+            .client
+            .get(endpoint)
+            .bearer_auth(credentials.access_token())
+            .header("originator", "kit")
+            .header("Accept", "application/json")
+            .timeout(timeout);
+        if let Some(account_id) = credentials.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| LoopError::Provider("model catalog transport failed".into()))?;
+        if !response.status().is_success() {
+            return Err(LoopError::Provider(format!(
+                "model catalog returned {}",
+                response.status()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MODELS_BYTES as u64)
+        {
             return Err(protocol("model catalog exceeds 2 MiB"));
         }
-        body.extend_from_slice(&chunk);
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|_| LoopError::Provider("model catalog body failed".into()))?;
+            if body.len().saturating_add(chunk.len()) > MAX_MODELS_BYTES {
+                return Err(protocol("model catalog exceeds 2 MiB"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| protocol("model catalog is not valid JSON"))?;
+        parse_model_catalog(&value)
     }
-    let value: Value =
-        serde_json::from_slice(&body).map_err(|_| protocol("model catalog is not valid JSON"))?;
-    parse_model_catalog(&value)
 }
 
 fn parse_model_catalog(value: &Value) -> Result<SubscriptionModelCatalog, LoopError> {
@@ -1051,6 +1142,34 @@ fn protocol(message: &str) -> LoopError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    pub(super) fn context_window(window: Option<u64>) -> Arc<ContextWindowDiscovery> {
+        let value = Arc::new(OnceLock::new());
+        if let Some(window) = window {
+            value.set(window).unwrap();
+        }
+        Arc::new(ContextWindowDiscovery {
+            value,
+            worker: tokio::spawn(async {}),
+        })
+    }
+
+    #[test]
+    fn credential_binding_accepts_reauthentication_but_rejects_account_changes() {
+        let original = auth::test_support::token_record("old", "account-one", "generation-one");
+        let expected = original.binding().unwrap();
+        let fresh = auth::test_support::token_record("new", "account-one", "generation-two");
+        assert!(ensure_credential_binding(&expected, &fresh).is_ok());
+        assert_ne!(
+            binding_string(&expected),
+            binding_string(&fresh.binding().unwrap())
+        );
+
+        for generation in ["generation-one", "generation-two"] {
+            let other = auth::test_support::token_record("other", "account-two", generation);
+            assert!(ensure_credential_binding(&expected, &other).is_err());
+        }
+    }
 
     fn image_tool_request() -> TurnRequest {
         use agentkit_core::{Item, SessionId, ToolResultPart, TurnId};
@@ -1360,7 +1479,7 @@ mod tests {
             .unwrap();
         let mut session = OpenAiSubscriptionSession {
             inner,
-            context_window: None,
+            context_window: tests::context_window(None),
             authentication_binding: "unused".into(),
         };
         let mut request = image_tool_request();
@@ -1583,83 +1702,6 @@ mod tests {
         assert!(!format!("{attempt:?}").contains("secret-token"));
     }
 
-    #[test]
-    fn credential_binding_accepts_reauthentication_but_rejects_account_changes() {
-        let original = auth::test_support::token_record("old", "account-one", "generation-one");
-        let expected = original.binding().unwrap();
-        let fresh = auth::test_support::token_record("new", "account-one", "generation-two");
-        assert!(ensure_credential_binding(&expected, &fresh).is_ok());
-        assert_ne!(
-            binding_string(&expected),
-            binding_string(&fresh.binding().unwrap())
-        );
-
-        for generation in ["generation-one", "generation-two"] {
-            let other = auth::test_support::token_record("other", "account-two", generation);
-            assert!(ensure_credential_binding(&expected, &other).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn model_catalog_cache_is_scoped_to_account_and_generation() {
-        let cache = SubscriptionModelCatalogCache::default();
-        let first_binding = auth::test_support::token_record("token", "account-1", "generation-1")
-            .binding()
-            .unwrap();
-        let next_generation =
-            auth::test_support::token_record("token", "account-1", "generation-2")
-                .binding()
-                .unwrap();
-        let next_account = auth::test_support::token_record("token", "account-2", "generation-1")
-            .binding()
-            .unwrap();
-
-        let first = cache
-            .get_or_try_init(&first_binding, || async {
-                Ok(SubscriptionModelCatalog {
-                    context_windows: HashMap::from([("first".into(), 100)]),
-                    visible_models: vec!["first".into()],
-                })
-            })
-            .await
-            .unwrap();
-        let same = cache
-            .get_or_try_init(&first_binding, || async {
-                Err(protocol("cached catalog was unexpectedly reloaded"))
-            })
-            .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&first, &same));
-
-        let second = cache
-            .get_or_try_init(&next_generation, || async {
-                Ok(SubscriptionModelCatalog {
-                    context_windows: HashMap::from([("second".into(), 200)]),
-                    visible_models: vec!["second".into()],
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(second.visible_models, ["second"]);
-        assert_eq!(second.context_windows.get("first"), None);
-        assert_eq!(second.context_windows.get("second"), Some(&200));
-        assert!(!Arc::ptr_eq(&first, &second));
-
-        let third = cache
-            .get_or_try_init(&next_account, || async {
-                Ok(SubscriptionModelCatalog {
-                    context_windows: HashMap::from([("third".into(), 300)]),
-                    visible_models: vec!["third".into()],
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(third.visible_models, ["third"]);
-        assert_eq!(third.context_windows.get("second"), None);
-        assert_eq!(third.context_windows.get("third"), Some(&300));
-        assert!(!Arc::ptr_eq(&second, &third));
-    }
-
     #[tokio::test]
     async fn model_catalog_cache_retries_after_failure() {
         let cache = SubscriptionModelCatalogCache::default();
@@ -1825,3 +1867,6 @@ mod image_tests;
 
 #[cfg(all(test, feature = "tui"))]
 mod websocket_tests;
+
+#[cfg(test)]
+mod catalog_tests;

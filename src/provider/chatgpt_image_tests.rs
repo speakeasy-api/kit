@@ -96,7 +96,7 @@ async fn authenticated_continuation_replays_parallel_results_with_fallback_image
             .start_session(SessionConfig::new("image-replay"))
             .await
             .unwrap(),
-        context_window: None,
+        context_window: super::tests::context_window(None),
         // No legacy metadata is injected: the real adapter creates and validates
         // its current authentication-bound continuation metadata.
         authentication_binding: "unused-legacy-binding".into(),

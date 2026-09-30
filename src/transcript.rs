@@ -65,12 +65,11 @@ pub fn repair_unanswered_tool_calls(transcript: &mut Vec<Item>) -> Vec<Item> {
     synthesized
 }
 
-/// Removes provider continuation state that is bound to the source session.
+/// Rebinds provider continuation state to a fork's new session identity.
 ///
-/// A fork has a new durable identity, so replaying opaque continuation state from
-/// the source would violate the provider's session binding. Generated assistant
-/// images cannot be encoded without that continuation and are omitted as well.
-pub(crate) fn sanitize_forked_transcript(transcript: &mut [Item]) {
+/// Encrypted reasoning stays replayable under the same account binding, which the
+/// provider still checks, so a fork keeps the source's request prefix intact.
+pub(crate) fn rebind_forked_transcript(transcript: &mut [Item], session_id: &str) {
     for item in transcript {
         let assistant = item.kind == ItemKind::Assistant;
         item.parts.retain_mut(|part| {
@@ -84,9 +83,19 @@ pub(crate) fn sanitize_forked_transcript(transcript: &mut [Item]) {
             let Some(metadata) = metadata else {
                 return true;
             };
-            metadata.remove(OPENAI_RESPONSES_CONTINUATION);
             metadata.remove(OPENAI_SUBSCRIPTION_CONTINUATION);
-            !(assistant && is_media)
+            let rebound = match metadata.get_mut(OPENAI_RESPONSES_CONTINUATION) {
+                Some(serde_json::Value::Object(continuation)) => {
+                    continuation.insert("session_id".into(), session_id.into());
+                    true
+                }
+                Some(_) => {
+                    metadata.remove(OPENAI_RESPONSES_CONTINUATION);
+                    false
+                }
+                None => false,
+            };
+            !(assistant && is_media && !rebound)
         });
     }
 }
@@ -202,14 +211,25 @@ mod tests {
             Item::new(ItemKind::User, vec![user_media.clone()]),
         ];
 
-        sanitize_forked_transcript(&mut transcript);
+        rebind_forked_transcript(&mut transcript, "s-fork");
 
-        assert_eq!(transcript[0].parts.len(), 1);
+        assert_eq!(transcript[0].parts.len(), 2);
         let Part::ToolCall(call) = &transcript[0].parts[0] else {
             panic!("expected tool call");
         };
-        assert_eq!(call.metadata.len(), 1);
         assert_eq!(call.metadata["preserved"], true);
+        assert!(!call.metadata.contains_key(OPENAI_SUBSCRIPTION_CONTINUATION));
+        assert_eq!(
+            call.metadata[OPENAI_RESPONSES_CONTINUATION]["session_id"],
+            "s-fork"
+        );
+        let Part::Media(media) = &transcript[0].parts[1] else {
+            panic!("expected continued media");
+        };
+        assert_eq!(
+            media.metadata[OPENAI_RESPONSES_CONTINUATION]["session_id"],
+            "s-fork"
+        );
         assert_eq!(transcript[1].parts, vec![user_media]);
     }
 

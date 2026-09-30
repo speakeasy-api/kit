@@ -54,6 +54,10 @@ fn accept(listener: &TcpListener) -> TcpStream {
 }
 
 async fn session(endpoint: &str) -> OpenAiSubscriptionSession {
+    session_with_retries(endpoint, 0).await
+}
+
+async fn session_with_retries(endpoint: &str, max_retries: usize) -> OpenAiSubscriptionSession {
     // Exercise Kit's real transport selection and request policy; override only
     // the destination, dummy authentication, and bounded test timeouts.
     let authentication = Authentication::bearer("loopback-only");
@@ -68,7 +72,7 @@ async fn session(endpoint: &str) -> OpenAiSubscriptionSession {
         "gpt-5.4".into(),
         authentication,
         ResilienceConfig {
-            max_retries: 0,
+            max_retries,
             retry_budget: WAIT,
             attempt_timeout: Some(WAIT),
             stream_idle_timeout: Some(WAIT),
@@ -84,7 +88,7 @@ async fn session(endpoint: &str) -> OpenAiSubscriptionSession {
             .start_session(SessionConfig::new("session"))
             .await
             .unwrap(),
-        context_window: Some(200_000),
+        context_window: super::tests::context_window(Some(200_000)),
         authentication_binding,
     }
 }
@@ -477,6 +481,28 @@ fn http(listener: &TcpListener, status: &str, body: &str) -> (String, Value) {
 }
 
 #[tokio::test]
+async fn subscription_retries_reach_the_session_retry_observer() {
+    let (endpoint, peer) = server(|listener| {
+        let mut lost = tungstenite::accept(accept(&listener)).unwrap();
+        receive(&mut lost, false);
+        drop(lost);
+        let mut fresh = tungstenite::accept(accept(&listener)).unwrap();
+        receive(&mut fresh, false);
+        success(&mut fresh, "retried", "first answer");
+    });
+    let mut session = session_with_retries(&endpoint, 1).await;
+    let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&retries);
+    session.set_retry_observer(Some(Arc::new(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let mut turn = begin(&mut session, false).await;
+    finished(&mut turn, "retried", "first answer").await;
+    peer.join().unwrap();
+    assert!(retries.load(std::sync::atomic::Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
 async fn subscription_auto_426_fallback_stays_http_for_future_turns() {
     let (endpoint, peer) = server(|listener| {
         let (headers, _) = http(&listener, "426 Upgrade Required", "");
@@ -506,5 +532,65 @@ async fn subscription_auto_426_fallback_stays_http_for_future_turns() {
         let mut turn = begin(&mut session, second).await;
         finished(&mut turn, "fallback", "HTTP answer").await;
     }
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn subscription_websocket_reports_capacity_discovered_after_first_turn() {
+    use super::catalog_tests;
+    let (endpoint, peer) = server(|listener| {
+        let mut socket = tungstenite::accept(accept(&listener)).unwrap();
+        receive(&mut socket, false);
+        success(&mut socket, "first-response", "first answer");
+        let wire = receive_wire(&mut socket);
+        assert_eq!(wire["previous_response_id"], "first-response");
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"][0]["text"], "second question");
+        success(&mut socket, "second-response", "second answer");
+    });
+    let (adapter, catalog_listener, _directory) = catalog_tests::adapter().await;
+    let mut deferred = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    // Use the existing loopback Responses configuration; retain the real
+    // session-started discovery and its credential-bound cache.
+    deferred.inner = session(&endpoint).await.inner;
+    let catalog_request = catalog_tests::request(&catalog_listener).await;
+    let mut first = deferred.begin_turn(request(false), None).await.unwrap();
+    let mut first_usage = false;
+    while let Some(event) = first.next_event(None).await.unwrap() {
+        if let ModelTurnEvent::Usage(usage) = event {
+            first_usage = true;
+            assert!(!usage.metadata.contains_key("context_window"));
+        }
+    }
+    assert!(first_usage);
+    // A completed/dropped turn must not cancel in-flight session discovery.
+    drop(first);
+    catalog_tests::respond(catalog_request, "503 Service Unavailable", "").await;
+    let retry = catalog_tests::request(&catalog_listener).await;
+    catalog_tests::respond(
+        retry,
+        "200 OK",
+        r#"{"models":[{"slug":"gpt-5.4","context_window":272000}]}"#,
+    )
+    .await;
+    catalog_tests::discovered(&deferred).await;
+    let mut second = deferred.begin_turn(request(true), None).await.unwrap();
+    let mut second_usage = false;
+    while let Some(event) = second.next_event(None).await.unwrap() {
+        if let ModelTurnEvent::Usage(usage) = event {
+            second_usage = true;
+            assert_eq!(usage.metadata["context_window"], 272_000);
+            assert_eq!(
+                usage.metadata["openai.subscription.context_window"],
+                272_000
+            );
+            assert_eq!(usage.tokens.unwrap().input_tokens, 3);
+        }
+    }
+    assert!(second_usage);
     peer.join().unwrap();
 }

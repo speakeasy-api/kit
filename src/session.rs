@@ -248,10 +248,52 @@ pub(crate) fn clone_completed_in(
     let reasoning_effort = authority.reasoning_effort;
     let mut transcript = authority.items;
     crate::transcript::repair_unanswered_tool_calls(&mut transcript);
-    crate::transcript::sanitize_forked_transcript(&mut transcript);
+    crate::transcript::rebind_forked_transcript(&mut transcript, destination);
     let opened = open_with_initial_timestamps_in(
         root,
         directory,
+        destination,
+        false,
+        false,
+        transcript,
+        InitialTranscriptOptions {
+            stamp_items: false,
+            commit_creation: false,
+        },
+    )?;
+    if let Some(effort) = reasoning_effort {
+        opened.observer.set_reasoning_effort(effort)?;
+    }
+    opened.observer.commit_creation()?;
+    drop(opened);
+    Ok(())
+}
+
+/// Seeds `destination` with `source`'s history before its in-flight response.
+pub fn clone_inherited(root: &Path, source: &str, destination: &str) -> Result<(), String> {
+    let directory = default_directory()?;
+    validate_id(source)?;
+    let authority = select_authority(&directory, &canonical_workspace(root), source)?
+        .ok_or_else(|| format!("session {source:?} does not exist"))?;
+    let reasoning_effort = authority.reasoning_effort;
+    let mut transcript = authority.items;
+    while transcript
+        .last()
+        .is_some_and(|item| item.kind == ItemKind::Assistant)
+    {
+        transcript.pop();
+    }
+    crate::transcript::repair_unanswered_tool_calls(&mut transcript);
+    crate::transcript::rebind_forked_transcript(&mut transcript, destination);
+    if let Some(first) = transcript.first_mut() {
+        first.metadata.insert(
+            SESSION_ORIGIN_METADATA_KEY.into(),
+            serde_json::Value::String(SUBAGENT_SESSION_ORIGIN.into()),
+        );
+    }
+    let opened = open_with_initial_timestamps_in(
+        root,
+        &directory,
         destination,
         false,
         false,
@@ -3603,7 +3645,7 @@ mod tests {
     }
 
     #[test]
-    fn cloning_sanitizes_session_bound_continuation_metadata() {
+    fn cloning_rebinds_continuation_metadata_to_the_branch() {
         let root = tempfile::tempdir().unwrap();
         let mut metadata = MetadataMap::new();
         metadata.insert(
@@ -3641,10 +3683,13 @@ mod tests {
                 .metadata
                 .contains_key("openai.responses.continuation.v1")
         );
-        assert!(
-            !branch
-                .metadata
-                .contains_key("openai.responses.continuation.v1")
+        assert_eq!(
+            source.metadata["openai.responses.continuation.v1"]["session_id"],
+            "source"
+        );
+        assert_eq!(
+            branch.metadata["openai.responses.continuation.v1"]["session_id"],
+            "branch"
         );
         assert_eq!(branch.metadata["preserved"], true);
     }

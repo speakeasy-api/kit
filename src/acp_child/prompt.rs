@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use super::ChildError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum ChildPrompt {
     Text(String),
