@@ -43,7 +43,7 @@ pub(super) async fn request(listener: &TcpListener) -> TcpStream {
         }
         let header = String::from_utf8(header).unwrap();
         assert!(
-            header.starts_with("GET /models?client_version="),
+            header.starts_with("GET /models?client_version=0.159.3 HTTP/1.1\r\n"),
             "{header}"
         );
         stream
