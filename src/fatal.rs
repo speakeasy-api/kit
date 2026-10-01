@@ -268,14 +268,19 @@ pub(crate) fn record_loop_error(
     .map(Some)
 }
 
-/// Summarizes the newest fatal record of `session_id` without prompt content.
-pub(crate) fn latest_cause(session_id: &str) -> Option<String> {
+/// Summarizes the newest fatal record of `session_id` written at or after
+/// `since_ms`, without prompt content.
+pub(crate) fn latest_cause(session_id: &str, since_ms: u64) -> Option<String> {
     crate::session::validate_id(session_id).ok()?;
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    latest_cause_in(&PathBuf::from(home).join(".kit/errors"), session_id)
+    latest_cause_in(
+        &PathBuf::from(home).join(".kit/errors"),
+        session_id,
+        since_ms,
+    )
 }
 
-fn latest_cause_in(base: &Path, session_id: &str) -> Option<String> {
+fn latest_cause_in(base: &Path, session_id: &str, since_ms: u64) -> Option<String> {
     let directory = base.join(session_id);
     let path = fs::read_dir(&directory)
         .ok()?
@@ -292,6 +297,9 @@ fn latest_cause_in(base: &Path, session_id: &str) -> Option<String> {
                 .and_then(|millis| millis.parse::<u64>().ok())
         })?;
     let record: FatalRecord = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if record.occurred_at_ms < since_ms {
+        return None;
+    }
     let mut cause = format!("{} ({})", record.message, record.code);
     if let Some(failure) = record.failure {
         cause.push_str(&format!("; reason {:?}", failure.reason));
@@ -1034,6 +1042,39 @@ mod tests {
             serde_json::from_value::<ProviderFailure>(record["failure"].clone()).unwrap(),
             failure
         );
+    }
+
+    #[test]
+    fn latest_cause_ignores_records_older_than_the_failing_turn() {
+        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+
+        let root = tempfile::tempdir().unwrap();
+        let failure = ProviderFailure {
+            route: ProviderRoute::OpenAiResponses,
+            reason: ProviderFailureReason::RetryExhausted,
+            last_attempt_reason: None,
+            upstream: Default::default(),
+            accounting: Default::default(),
+        };
+        super::write_record(
+            root.path(),
+            "session-1",
+            Surface::Acp,
+            "provider",
+            "provider_error",
+            "provider request failed",
+            None,
+            Some(&failure),
+        )
+        .unwrap();
+        let cause = super::latest_cause_in(root.path(), "session-1", 0).unwrap();
+        assert!(cause.contains("RetryExhausted"), "{cause}");
+        let later = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        assert!(super::latest_cause_in(root.path(), "session-1", later).is_none());
     }
 
     #[test]

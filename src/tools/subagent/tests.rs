@@ -55,6 +55,7 @@ impl Subagents {
                     forking: None,
                     permit: Some(self.reserve().unwrap()),
                     cache_key: None,
+                    finished: Default::default(),
                 },
             )
             .unwrap();
@@ -351,6 +352,7 @@ fn manager_with_disconnected_session(
         forking: None,
         permit: Some(manager.acquire_permit().unwrap()),
         cache_key: None,
+        finished: Default::default(),
     }));
     manager.sessions.lock().unwrap().insert(
         "source".into(),

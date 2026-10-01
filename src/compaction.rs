@@ -395,7 +395,11 @@ where
             .with_strategy(SummarizeForContinuation::default()),
     )
     .with_backend(backend);
-    Ok(AutomaticCompactor { inner, persistence })
+    Ok(AutomaticCompactor {
+        inner,
+        persistence,
+        mirror: None,
+    })
 }
 
 struct KitCompactionBackend<M> {
@@ -665,6 +669,15 @@ fn user_message_from_marker(
 pub struct AutomaticCompactor {
     inner: StrategyCompactor,
     persistence: Option<SessionObserver>,
+    mirror: Option<crate::session::TransientTranscript>,
+}
+
+impl AutomaticCompactor {
+    /// Applies each replacement to an in-memory transcript as well.
+    pub(crate) fn mirroring(mut self, transcript: crate::session::TransientTranscript) -> Self {
+        self.mirror = Some(transcript);
+        self
+    }
 }
 
 #[async_trait]
@@ -743,6 +756,9 @@ impl LoopMutator for AutomaticCompactor {
                     // Storage, poison, and lost ownership stop persistence,
                     // never the already-computed in-memory compaction.
                     metadata.insert("persistence_error".into(), error.into());
+                }
+                if let Some(mirror) = &self.mirror {
+                    mirror.replace(&compacted);
                 }
                 metadata.insert(
                     "replaced_items".into(),
@@ -898,6 +914,7 @@ mod tests {
             )
             .with_backend(FixedBackend),
             persistence: Some(opened.observer),
+            mirror: None,
         };
         let mut transcript = opened.transcript;
         let marker = transcript.pop().unwrap();
@@ -956,6 +973,7 @@ mod tests {
                 CompactionPipeline::new().with_strategy(EmptyStrategy),
             ),
             persistence: None,
+            mirror: None,
         };
         let agent = Agent::builder()
             .model(NoModelTurn)

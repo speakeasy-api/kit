@@ -224,23 +224,23 @@ impl OpenAiSubscriptionAdapter {
             .await
     }
 
+    /// Foreground lookup: bounded as a whole, including waiting on a background
+    /// discovery that is already initializing the shared cache.
     pub(crate) async fn model_catalog(&self) -> Result<Arc<SubscriptionModelCatalog>, LoopError> {
-        let credentials = tokio::time::timeout(
-            MODEL_CATALOG_AUTH_TIMEOUT,
-            load_credentials(
+        tokio::time::timeout(MODEL_CATALOG_AUTH_TIMEOUT, async {
+            let credentials = load_credentials(
                 self.config.credential_storage.clone(),
                 MODEL_CATALOG_AUTH_TIMEOUT,
-            ),
-        )
+            )
+            .await?;
+            let binding = credentials
+                .binding()
+                .map_err(|error| LoopError::Provider(error.to_string()))?;
+            self.catalog_with_credentials(&credentials, &binding, MODEL_CATALOG_AUTH_TIMEOUT)
+                .await
+        })
         .await
-        .map_err(|_| {
-            LoopError::Provider("OpenAI model catalog credential load timed out".into())
-        })??;
-        let binding = credentials
-            .binding()
-            .map_err(|error| LoopError::Provider(error.to_string()))?;
-        self.catalog_with_credentials(&credentials, &binding, MODEL_CATALOG_AUTH_TIMEOUT)
-            .await
+        .map_err(|_| LoopError::Provider("OpenAI model catalog lookup timed out".into()))?
     }
 }
 

@@ -52,6 +52,7 @@ impl Subagents {
                 forking: None,
                 permit: None,
                 cache_key: None,
+                finished: Default::default(),
             };
             if sessions
                 .insert(

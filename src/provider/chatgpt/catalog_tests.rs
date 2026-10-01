@@ -157,3 +157,21 @@ async fn context_discovery_stops_when_credentials_change() {
     respond(request(&listener).await, "200 OK", CATALOG).await;
     discovered(&next).await;
 }
+
+#[tokio::test]
+async fn foreground_catalog_lookup_does_not_wait_out_background_discovery() {
+    let (adapter, listener, _directory) = adapter().await;
+    let session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    // Background discovery now owns cache initialization and its request stalls.
+    let _stalled = request(&listener).await;
+    let started = std::time::Instant::now();
+    let lookup = tokio::time::timeout(MODEL_CATALOG_BACKGROUND_TIMEOUT, adapter.model_catalog())
+        .await
+        .expect("foreground lookup waited for background discovery");
+    assert!(lookup.is_err());
+    assert!(started.elapsed() < MODEL_CATALOG_AUTH_TIMEOUT * 2);
+    drop(session);
+}

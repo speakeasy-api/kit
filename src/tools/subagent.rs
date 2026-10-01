@@ -164,15 +164,17 @@ async fn wait_or_cancel(
     }
 }
 
-fn failed_turn(id: &str, name: &str, error: ChildError) -> ChildError {
+/// `started_at_ms` is when the failing turn began; older fatal records belong
+/// to other turns.
+fn failed_turn(id: &str, name: &str, started_at_ms: u64, error: ChildError) -> ChildError {
     let ChildError::Failed(message) = error else {
         return error;
     };
-    let cause = crate::fatal::latest_cause(id)
+    let cause = crate::fatal::latest_cause(id, started_at_ms)
         .map(|cause| format!(" Cause: {cause}."))
         .unwrap_or_default();
     ChildError::Failed(format!(
-        "subagent {id:?} ({name}) failed during its turn: {message}.{cause} It is idle and keeps its conversation and edits; continue it with prompt({{subagent: {id:?}, prompt}})."
+        "subagent {id:?} ({name}) failed during its turn: {message}.{cause} It is idle and keeps its conversation and edits; continue it with prompt({{subagent: {{id: {id:?}}}, prompt}})."
     ))
 }
 
@@ -207,6 +209,8 @@ pub struct Subagents {
     observer: Option<session::SessionObserver>,
     /// Signalled on every lifecycle event so deliveries can wait for a turn to end.
     changed: Arc<Notify>,
+    /// The parent's conversation when it has no durable session to fork from.
+    transient_parent: Option<session::TransientTranscript>,
 }
 
 struct SessionEntry {
@@ -237,6 +241,56 @@ struct State {
     permit: Option<Permit>,
     /// Prompt cache key the child process runs under; `None` uses its own id.
     cache_key: Option<String>,
+    /// Recent finished generations, newest last, for callers waiting on one.
+    finished: std::collections::VecDeque<FinishedTurn>,
+}
+
+/// What one generation produced, kept for callers that injected a message into
+/// it: later generations replace the session's current output and outcome.
+struct FinishedTurn {
+    generation: u64,
+    started_at_ms: u64,
+    outcome: GenerationOutcome,
+    output: Value,
+    updates: Option<SubagentUpdates>,
+}
+
+const FINISHED_TURNS: usize = 8;
+
+/// Whether another caller is using, starting or forking the session, or has
+/// advanced it past `prior`.
+fn busy(state: &State, prior: &SubagentValue) -> bool {
+    matches!(
+        state.status,
+        SubagentStatus::Working | SubagentStatus::Starting
+    ) || state.forking.is_some()
+        || prior.generation != state.handle_generation
+}
+
+/// A session claimed for a new turn that has not been submitted yet.
+struct Admitted {
+    state: Arc<AsyncMutex<State>>,
+    child: ChildSession,
+    name: String,
+    generation: u64,
+}
+
+impl State {
+    fn record_finished(&mut self) {
+        let Some(outcome) = self.outcome else {
+            return;
+        };
+        self.finished.push_back(FinishedTurn {
+            generation: self.generation,
+            started_at_ms: self.generation_started_at_unix_ms,
+            outcome,
+            output: self.output.clone(),
+            updates: self.updates.clone(),
+        });
+        while self.finished.len() > FINISHED_TURNS {
+            self.finished.pop_front();
+        }
+    }
 }
 
 impl State {
@@ -392,11 +446,20 @@ impl Subagents {
             observer: None,
             transcripts: Arc::default(),
             changed: Arc::default(),
+            transient_parent: None,
             event_sink: Arc::new(|event| {
                 events::emit(event);
                 Ok(())
             }),
         }
+    }
+
+    pub(crate) fn with_transient_parent(
+        mut self,
+        transcript: session::TransientTranscript,
+    ) -> Self {
+        self.transient_parent = Some(transcript);
+        self
     }
 
     pub(crate) fn with_prompt_cache_key(mut self, key: String) -> Self {
@@ -558,6 +621,7 @@ impl Subagents {
                 forking: None,
                 permit: Some(permit),
                 cache_key: cache_key.clone(),
+                finished: Default::default(),
             },
         )?;
         let prompt = match (kit, inherit.is_some()) {
@@ -569,8 +633,15 @@ impl Subagents {
         if let Some(source) = inherit {
             let transcript_root = self.config.root.clone();
             let branch_id = id.clone();
-            let cloned = tokio::task::spawn_blocking(move || {
-                session::clone_inherited(&transcript_root, &source, &branch_id)
+            let transient = self
+                .transient_parent
+                .as_ref()
+                .map(session::TransientTranscript::snapshot);
+            let cloned = tokio::task::spawn_blocking(move || match transient {
+                Some(transcript) => {
+                    session::clone_inherited_items(&transcript_root, transcript, &branch_id)
+                }
+                None => session::clone_inherited(&transcript_root, &source, &branch_id),
             })
             .await
             .map_err(|error| ChildError::Failed(format!("transcript clone task failed: {error}")))
@@ -655,6 +726,7 @@ impl Subagents {
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
         locked.output.clone_from(&output);
         locked.updates.clone_from(&updates);
+        locked.record_finished();
         if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
             drop(locked);
             return Err(self
@@ -756,7 +828,14 @@ impl Subagents {
                     generation: handle_generation,
                     updates: None,
                 };
-                return self.prompt(prior, prompt, cancellation, contract).await;
+                // Another caller can claim the session between reading its state
+                // and admitting this prompt; nothing was submitted, so re-check.
+                if let Some(admitted) = self.admit(&prior, &prompt, &cancellation, true).await? {
+                    return self
+                        .run_admitted(prior.id, admitted, prompt, cancellation, contract)
+                        .await;
+                }
+                continue;
             }
             // An injected message has no turn of its own to carry an output contract.
             if status == SubagentStatus::Working
@@ -793,32 +872,39 @@ impl Subagents {
             changed.as_mut().enable();
             {
                 let locked = state.lock().await;
-                self.check_active(&locked)?;
-                let ended = locked.generation != generation
-                    || matches!(locked.status, SubagentStatus::Idle) && locked.outcome.is_some();
-                if ended {
-                    if locked.generation == generation
-                        && locked.outcome == Some(GenerationOutcome::Failed)
-                    {
-                        return Err(failed_turn(
+                if let Some(turn) = locked
+                    .finished
+                    .iter()
+                    .find(|turn| turn.generation == generation)
+                {
+                    return match turn.outcome {
+                        GenerationOutcome::Success => Ok(SubagentValue {
+                            id: id.to_owned(),
+                            name: Some(locked.name.clone()),
+                            output: turn.output.clone(),
+                            generation,
+                            updates: turn.updates.clone(),
+                        }),
+                        GenerationOutcome::Failed => Err(failed_turn(
                             id,
                             &locked.name,
+                            turn.started_at_ms,
                             ChildError::Failed("the turn that received this prompt failed".into()),
-                        ));
-                    }
-                    return Ok(SubagentValue {
-                        id: id.to_owned(),
-                        name: Some(locked.name.clone()),
-                        output: locked.output.clone(),
-                        generation,
-                        updates: locked.updates.clone(),
-                    });
+                        )),
+                    };
+                }
+                self.check_active(&locked)?;
+                if locked.generation != generation {
+                    return Err(ChildError::Failed(format!(
+                        "subagent {id:?} finished generation {generation} without a recorded result"
+                    )));
                 }
             }
             wait_or_cancel(changed, cancellation).await?;
         }
     }
 
+    #[cfg(test)]
     async fn prompt(
         &self,
         prior: SubagentValue,
@@ -826,8 +912,30 @@ impl Subagents {
         cancellation: TurnCancellation,
         contract: Option<&OutputContract>,
     ) -> Result<SubagentValue, ChildError> {
-        let state = self.lookup(&prior)?;
-        self.reconnect(&prior, &state, &cancellation).await?;
+        let Some(admitted) = self.admit(&prior, &prompt, &cancellation, false).await? else {
+            return Err(ChildError::Failed("subagent session is busy".into()));
+        };
+        self.run_admitted(prior.id, admitted, prompt, cancellation, contract)
+            .await
+    }
+
+    /// Claims an idle session for a new turn. With `yield_when_busy`, a session
+    /// that another caller is using or forking is reported as `None` instead of
+    /// an error, before anything is submitted.
+    async fn admit(
+        &self,
+        prior: &SubagentValue,
+        prompt: &ChildPrompt,
+        cancellation: &TurnCancellation,
+        yield_when_busy: bool,
+    ) -> Result<Option<Admitted>, ChildError> {
+        let state = self.lookup(prior)?;
+        if let Err(error) = self.reconnect(prior, &state, cancellation).await {
+            if yield_when_busy && busy(&*state.lock().await, prior) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
         // Lock-first ties were already allowed by the unbiased select.
         // The losing lock future is dropped before returning cancellation.
         let mut locked =
@@ -838,13 +946,16 @@ impl Subagents {
                     return Err(ChildError::Cancelled);
                 }
             };
+        if yield_when_busy && busy(&locked, prior) {
+            return Ok(None);
+        }
         self.check_ready(&locked)?;
         if locked.forking.is_some() {
             return Err(ChildError::Failed(
                 "subagent session is being forked".into(),
             ));
         }
-        self.check_generation(&prior, locked.handle_generation)?;
+        self.check_generation(prior, locked.handle_generation)?;
         let generation = locked
             .generation
             .checked_add(1)
@@ -864,6 +975,35 @@ impl Subagents {
         let event = locked.runtime_event(prior.id.clone());
         drop(locked);
         self.emit_event(event);
+        Ok(Some(Admitted {
+            state,
+            child,
+            name,
+            generation,
+        }))
+    }
+
+    async fn run_admitted(
+        &self,
+        id: String,
+        admitted: Admitted,
+        prompt: ChildPrompt,
+        cancellation: TurnCancellation,
+        contract: Option<&OutputContract>,
+    ) -> Result<SubagentValue, ChildError> {
+        let Admitted {
+            state,
+            child,
+            name,
+            generation,
+        } = admitted;
+        let prior = SubagentValue {
+            id,
+            name: None,
+            output: Value::Null,
+            generation,
+            updates: None,
+        };
         match child
             .prompt_generation(
                 prior.id.clone(),
@@ -884,6 +1024,7 @@ impl Subagents {
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
                 locked.output.clone_from(&output);
                 locked.updates.clone_from(&updates);
+                locked.record_finished();
                 if let Err(error) = self.persist_state(&locked, session::ChildLifecycle::Idle) {
                     drop(locked);
                     return Err(self
@@ -907,10 +1048,12 @@ impl Subagents {
                     return Err(error);
                 }
                 let mut locked = state.lock().await;
+                let started_at_ms = locked.generation_started_at_unix_ms;
                 if locked.status != SubagentStatus::Removed {
                     locked.status = SubagentStatus::Idle;
                     locked.outcome = Some(GenerationOutcome::Failed);
                     locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                    locked.record_finished();
                     // A failed call returns no replacement handle, so preserve the
                     // accepted handle generation for a retry while keeping lifecycle
                     // generations monotonic.
@@ -918,7 +1061,7 @@ impl Subagents {
                     drop(locked);
                     self.emit_event(event);
                 }
-                Err(failed_turn(&prior.id, &name, error))
+                Err(failed_turn(&prior.id, &name, started_at_ms, error))
             }
         }
     }
@@ -1027,6 +1170,7 @@ impl Subagents {
                 locked.status = SubagentStatus::Idle;
                 locked.outcome = Some(GenerationOutcome::Success);
                 locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                locked.record_finished();
                 let event = locked.runtime_event(success.value.id.clone());
                 drop(locked);
                 if success.acknowledge.send(()).is_err() {
@@ -1104,6 +1248,7 @@ impl Subagents {
                 forking: None,
                 permit: None,
                 cache_key: cache_key.clone(),
+                finished: Default::default(),
             },
         )?;
         let branch_name = state.lock().await.name.clone();
@@ -1598,12 +1743,14 @@ impl Subagents {
         locked.forking = None;
         locked.outcome = Some(GenerationOutcome::Failed);
         locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        locked.record_finished();
         let _ = self.persist_state(&locked, session::ChildLifecycle::Idle);
         let name = locked.name.clone();
+        let started_at_ms = locked.generation_started_at_unix_ms;
         let event = locked.runtime_event(id.to_string());
         drop(locked);
         self.emit_event(event);
-        failed_turn(id, &name, error)
+        failed_turn(id, &name, started_at_ms, error)
     }
 
     async fn cleanup_installed_child(
@@ -1695,6 +1842,7 @@ impl Subagents {
         let sessions = Arc::downgrade(&self.sessions);
         let state = Arc::downgrade(state);
         let event_sink = Arc::clone(&self.event_sink);
+        let changed = Arc::clone(&self.changed);
         let transcripts = Arc::downgrade(&self.transcripts);
         let parent_id = self.config.parent_id.clone();
         let parent_name = self.config.parent_name.clone();
@@ -1721,6 +1869,7 @@ impl Subagents {
             let mut event = locked.runtime_event(id.clone());
             let generation = locked.generation;
             drop(locked);
+            changed.notify_waiters();
             if let Some(transcripts) = transcripts.upgrade()
                 && let Ok(transcript) = transcripts.get(&id, generation)
             {
@@ -1769,6 +1918,8 @@ impl Subagents {
         let mut locked = state.lock().await;
         if locked.forking.as_deref() == Some(reservation) {
             locked.forking = None;
+            drop(locked);
+            self.changed.notify_waiters();
         }
     }
 
@@ -2011,11 +2162,28 @@ fn continuation_schema() -> serde_json::Value {
                     Value::Object(Map::from_iter([
                         (
                             "description".into(),
-                            Value::from("The subagent's id, or a subagent value returned for it."),
+                            Value::from(
+                                "The subagent as `{ id }`, its id string, or a subagent value returned for it.",
+                            ),
                         ),
                         (
-                            "oneOf".into(),
+                            "anyOf".into(),
                             Value::Array(vec![
+                                Value::Object(Map::from_iter([
+                                    ("type".into(), Value::from("object")),
+                                    (
+                                        "properties".into(),
+                                        Value::Object(Map::from_iter([(
+                                            "id".into(),
+                                            Value::Object(Map::from_iter([(
+                                                "type".into(),
+                                                Value::from("string"),
+                                            )])),
+                                        )])),
+                                    ),
+                                    ("required".into(), Value::from(vec!["id"])),
+                                    ("additionalProperties".into(), Value::Bool(false)),
+                                ])),
                                 Value::Object(Map::from_iter([(
                                     "type".into(),
                                     Value::from("string"),
@@ -2304,12 +2472,13 @@ struct Continuation {
 enum SubagentRef {
     Id(String),
     Value(SubagentValue),
+    Handle { id: String },
 }
 
 impl SubagentRef {
     fn id(&self) -> &str {
         match self {
-            Self::Id(id) => id,
+            Self::Id(id) | Self::Handle { id } => id,
             Self::Value(value) => &value.id,
         }
     }
@@ -2609,6 +2778,7 @@ mod steer_tests {
             forking: None,
             permit: Some(manager.acquire_permit().unwrap()),
             cache_key: None,
+            finished: Default::default(),
         }));
         manager.sessions.lock().unwrap().insert(
             "source".into(),
@@ -2633,6 +2803,7 @@ mod steer_tests {
         let tool = PromptTool::new(manager);
         let validator = jsonschema::validator_for(&tool.spec.input_schema).unwrap();
         for input in [
+            json!({"subagent": {"id": "source"}, "prompt": "focus on tests"}),
             json!({"subagent": "source", "prompt": "focus on tests"}),
             json!({"subagent": {"id": "source", "output": null, "generation": 1}, "prompt": "go"}),
             json!({"subagent": "source", "prompt": [{"type": "text", "text": "focus on tests"}]}),
@@ -2875,7 +3046,7 @@ mod steer_tests {
             assert!(error.contains(&format!("{id:?} (worker)")), "{error}");
             assert!(error.contains("nested agent turn failed"), "{error}");
             assert!(
-                error.contains(&format!("prompt({{subagent: {id:?}")),
+                error.contains(&format!("prompt({{subagent: {{id: {id:?}}}")),
                 "{error}"
             );
 
@@ -2963,6 +3134,160 @@ mod steer_tests {
             assert_eq!(delivered.generation, 2);
             manager
                 .close(&id, &TurnCancellation::default())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_callers_get_their_own_generations_result() {
+        let (manager, state, prior) = manager_with_disconnected_session(Path::new("."));
+        {
+            let mut locked = state.lock().await;
+            locked.generation = 1;
+            locked.outcome = Some(GenerationOutcome::Failed);
+            locked.output = json!("stale");
+            locked.record_finished();
+            locked.generation = 2;
+            locked.outcome = Some(GenerationOutcome::Success);
+            locked.output = json!("second");
+            locked.record_finished();
+            locked.generation = 3;
+            locked.status = SubagentStatus::Working;
+            locked.outcome = None;
+            locked.output = json!("third in progress");
+        }
+        let cancellation = TurnCancellation::default();
+        let failed = manager
+            .turn_value(&prior.id, &state, 1, &cancellation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failed.contains("the turn that received this prompt failed"),
+            "{failed}"
+        );
+        let second = manager
+            .turn_value(&prior.id, &state, 2, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(second.output, json!("second"));
+        assert_eq!(second.generation, 2);
+    }
+
+    #[tokio::test]
+    async fn releasing_a_fork_reservation_wakes_delivery_waiters() {
+        let (manager, state, _) = manager_with_disconnected_session(Path::new("."));
+        state.lock().await.forking = Some("branch".into());
+        let changed = manager.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        manager.finish_forking(&state, "branch").await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), changed)
+            .await
+            .expect("waiters were not woken");
+    }
+
+    #[tokio::test]
+    async fn busy_admission_yields_the_prompt_instead_of_failing() {
+        let (manager, state, prior) = manager_with_disconnected_session(Path::new("."));
+        let cancellation = TurnCancellation::default();
+        let prompt: ChildPrompt = "queued".into();
+        for (status, forking, generation) in [
+            (SubagentStatus::Working, None, prior.generation),
+            (SubagentStatus::Starting, None, prior.generation),
+            (SubagentStatus::Idle, Some("fork"), prior.generation),
+            (SubagentStatus::Idle, None, prior.generation + 1),
+        ] {
+            {
+                let mut locked = state.lock().await;
+                locked.status = status;
+                locked.forking = forking.map(str::to_owned);
+                locked.handle_generation = generation;
+            }
+            assert!(
+                manager
+                    .admit(&prior, &prompt, &cancellation, true)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .admit(&prior, &prompt, &cancellation, false)
+                    .await
+                    .is_err()
+            );
+            let locked = state.lock().await;
+            assert_eq!(locked.status, status);
+            assert_eq!(locked.generation, prior.generation);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_prompts_to_an_idle_subagent_run_one_after_another() {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = manager_with_disconnected_session(root.path())
+                .0
+                .child_config();
+            config.default_harness = "acp.mock".into();
+            config.harnesses =
+                crate::acp_child::AcpHarnesses::new(std::collections::BTreeMap::from([(
+                    "mock".into(),
+                    crate::acp_child::AcpHarnessProfile {
+                        command: "python3".into(),
+                        args: vec![format!(
+                            "{}/fixtures/mock-acp-v2.py",
+                            env!("CARGO_MANIFEST_DIR")
+                        )],
+                        permissions: Default::default(),
+                    },
+                )]))
+                .unwrap();
+            let manager = Subagents::new(config);
+            let first = manager
+                .create(
+                    "first".into(),
+                    CreateOptions::default(),
+                    0,
+                    TurnCancellation::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let deliveries = ["a", "b"].map(|text| {
+                let manager = manager.clone();
+                let id = first.id.clone();
+                tokio::spawn(async move {
+                    manager
+                        .deliver(&id, text.into(), TurnCancellation::default(), None)
+                        .await
+                })
+            });
+            let mut results = Vec::new();
+            for delivery in deliveries {
+                let value = delivery.await.unwrap().unwrap();
+                results.push((value.generation, value.output));
+            }
+            results.sort_by_key(|(generation, _)| *generation);
+            let generations = results
+                .iter()
+                .map(|(generation, _)| *generation)
+                .collect::<Vec<_>>();
+            assert_eq!(generations, vec![2, 3]);
+            let mut outputs = results
+                .into_iter()
+                .map(|(_, output)| output)
+                .collect::<Vec<_>>();
+            outputs.sort_by_key(|output| output.to_string());
+            assert_eq!(outputs, vec![json!("a"), json!("b")]);
+            manager
+                .close(&first.id, &TurnCancellation::default())
                 .await
                 .unwrap();
         })

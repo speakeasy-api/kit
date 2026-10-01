@@ -1519,16 +1519,19 @@ impl Runtime {
             .await
             .map_err(LoopError::InvalidState)?;
         let skills = self.fresh_skills();
+        let recorded = crate::session::TransientTranscript::new(transcript.clone());
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
             self.agentkit_telemetry(),
             None,
             format!("compaction-{session}"),
         )
-        .map_err(LoopError::InvalidState)?;
+        .map_err(LoopError::InvalidState)?
+        .mirroring(recorded.clone());
         let subagents = self
             .subagents
             .fresh()
+            .with_transient_parent(recorded.clone())
             .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session));
         let builder = Agent::builder()
             .model(self.adapter.clone())
@@ -1541,6 +1544,7 @@ impl Runtime {
             ))
             .task_manager(background_task_manager())
             .mutator(compactor)
+            .transcript_observer(recorded)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
         let builder = builder.cancellation(controller.handle());

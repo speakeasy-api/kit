@@ -90,7 +90,7 @@ return { main: second.output, alternative: branch.output }
 
 Each successful turn returns a session value with `id`, `name`, `output`, and `generation`. `subagent` creates an ID at generation 1. `prompt` keeps that ID and name while incrementing its generation. `fork` creates a different ID and uses its own preferred or fallback name; its generation is one greater than the supplied source value, and it does not advance the source session. Close a session with either `close(value)` or `close({ id: value.id })`; the latter is useful when only an ID is available. Closing an unknown ID fails with `unknown subagent session`. Kit sends ACP `session/close` when the harness advertises it. Explicit `close` also sends `session/delete` when advertised, removing the discarded branch’s persistent history after closing it. Delete failures are reported rather than silently ignored. Process shutdown and internal cleanup do not delete persistent history; this preserves completed child sessions for restart recovery. A standalone process without that capability is terminated when its handle is dropped. If native-fork siblings share a process and the harness cannot close one logical session, `close` fails rather than claiming success or disrupting the siblings.
 
-`prompt` accepts the subagent's ID or any value returned for it, and always targets the session's current state. `fork` copies a completed turn, so pass it the latest completed value; an older value fails with `stale subagent generation N; current generation is M`. Prompt and fork calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
+`prompt` accepts `{ id }`, the subagent's ID string, or any value returned for it, and always targets the session's current state. `fork` copies a completed turn, so pass it the latest completed value; an older value fails with `stale subagent generation N; current generation is M`. Prompt and fork calls on an individual ACP session are serialized, while separate forked sessions can be prompted concurrently.
 
 The optional `name` argument is preferred on `subagent` and `fork`; `prompt` has no naming input and preserves the session name. The optional `harness`, `model`, and `cwd` arguments belong only on `subagent`. `harness` overrides the user's configured harness preference. `model` selects an exact model value ID advertised by that harness through its ACP session configuration, or a model alias configured for that harness. `cwd` selects the new subagent's working directory; relative paths resolve from Kit's working directory, and missing paths or non-directories fail before startup. Omit an argument to retain its configured default. `prompt` and `fork` retain the original session's harness, model, and working directory. An explicit model fails before the first prompt if the harness does not advertise a selectable `model` option or rejects the value.
 
@@ -106,7 +106,7 @@ An `output_schema` applies to a new turn only, so a prompt with one always waits
 
 ```text
 return prompt({
-  subagent: "s-…",
+  subagent: { id: "s-…" },
   prompt: "Keep the change limited to the parser; do not modify the public API."
 })
 ```
