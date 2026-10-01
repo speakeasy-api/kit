@@ -1515,6 +1515,10 @@ fn fallback_catalog() -> DiscoveredModels {
 }
 
 async fn fetch_model_ids(url: &str) -> Result<DiscoveredModels, String> {
+    // Unit tests must see one deterministic catalog, never the live public listing.
+    if cfg!(test) {
+        return Err("model catalog discovery is disabled in unit tests".into());
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
