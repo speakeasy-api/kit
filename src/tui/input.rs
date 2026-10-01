@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self as exit, RecvTimeoutError},
     },
     task::{Context, Poll},
     thread::{self, JoinHandle},
@@ -19,10 +20,16 @@ use crossterm::event::{self, Event};
 use futures_util::Stream;
 use tokio::sync::mpsc;
 
+/// A stopped reader returns within one poll interval. On a terminal that hung
+/// up, crossterm's poll retries the dead descriptor forever and never returns,
+/// so teardown abandons the reader after this long instead of joining it.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(super) struct Events {
     receiver: mpsc::Receiver<io::Result<Event>>,
     stopped: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
+    exited: exit::Receiver<()>,
 }
 
 impl Events {
@@ -30,9 +37,12 @@ impl Events {
         let (sender, receiver) = mpsc::channel(256);
         let stopped = Arc::new(AtomicBool::new(false));
         let reader_stopped = Arc::clone(&stopped);
+        let (exiting, exited) = exit::channel();
         let reader = thread::Builder::new()
             .name("kit-terminal-input".into())
             .spawn(move || {
+                // Dropped when this thread returns or unwinds; never sent on.
+                let _exiting = exiting;
                 // No other EventStream or synchronous reader may coexist with this owner.
                 // poll and read always execute on this same OS thread.
                 while !reader_stopped.load(Ordering::Acquire) {
@@ -59,6 +69,7 @@ impl Events {
             receiver,
             stopped,
             reader: Some(reader),
+            exited,
         })
     }
 
@@ -83,6 +94,13 @@ impl Drop for Events {
         self.receiver.close();
         self.stopped.store(true, Ordering::Release);
         if let Some(reader) = self.reader.take() {
+            // A reader that outlives the timeout is stuck on a dead terminal:
+            // there is no input left to steal, and waiting would keep the
+            // process alive and spinning after its terminal closed. Detach it
+            // so the process can exit.
+            if self.exited.recv_timeout(JOIN_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
+                return;
+            }
             // A worker panic is already reported by the panic hook and closes
             // the stream. Never turn cleanup (possibly unwinding) into a panic.
             let _ = reader.join();

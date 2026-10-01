@@ -108,6 +108,26 @@ fn child_case(case: &str) {
             }
             drop(terminal);
         }
+        "hangup" => {
+            // The parent closes the PTY master, as a closed terminal window
+            // does. Take the hangup through the real stop boundary, then tear
+            // input down: it must return although the terminal is gone.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut stop = crate::tui::Stop::new().unwrap();
+                let (_terminal, _images) = enter().unwrap();
+                let events = Events::new().unwrap();
+                marker("HANGUP");
+                assert!(stop.until(std::future::pending::<()>()).await.is_none());
+                drop(events);
+                // Nothing is left to restore or report to; only the exit
+                // status still reaches the parent.
+                std::process::exit(0);
+            });
+        }
         "cancel" => {
             // Poll through actual terminal setup and input acquisition, suspend
             // at an await, then cancel by dropping the owning future.
@@ -211,6 +231,7 @@ fn terminal_input_lifecycle() {
         "unwind",
         "worker_unwind",
         "setup_failure",
+        "hangup",
     ] {
         run_pty(case);
     }
@@ -229,6 +250,13 @@ fn run_pty(case: &str) {
                 std::ptr::null_mut(),
             )
         },
+        0
+    );
+    // The child must not inherit the master, or the parent closing it would
+    // never hang the terminal up.
+    // SAFETY: master_fd is the open descriptor openpty just returned.
+    assert_eq!(
+        unsafe { libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC) },
         0
     );
     let (mut master, slave) =
@@ -312,6 +340,18 @@ fn run_pty(case: &str) {
                 master.write_all(&bytes).unwrap();
                 sent.push(name);
             }
+        }
+        if case == "hangup" && output.contains("INPUT_TEST:HANGUP") {
+            drop(master);
+            let status = loop {
+                assert!(Instant::now() < deadline, "{case} never exited: {output:?}");
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(status.success(), "{case} failed ({status}): {output:?}");
+            return;
         }
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success(), "{case} failed ({status}): {output:?}");
