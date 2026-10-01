@@ -4093,6 +4093,18 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER {
             self.command_copy_observed = true;
         }
+        // A focused child has a restricted key handler. Copy only its visible
+        // selection here rather than forwarding arbitrary root actions to it.
+        if ((key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER)
+            || (key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL)))
+            && let Some(id) = self.child_focus.as_ref()
+        {
+            return self
+                .child_views
+                .get(id)
+                .and_then(|view| view.app.selection_text())
+                .map_or(Action::None, Action::Copy);
+        }
         if let Some(action) = self.handle_focus_key(key) {
             return action;
         }
