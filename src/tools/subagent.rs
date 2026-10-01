@@ -164,13 +164,13 @@ async fn wait_or_cancel(
     }
 }
 
-/// `started_at_ms` is when the failing turn began; older fatal records belong
-/// to other turns.
-fn failed_turn(id: &str, name: &str, started_at_ms: u64, error: ChildError) -> ChildError {
+/// `window` is when the failing turn ran; fatal records outside it belong to
+/// other turns.
+fn failed_turn(id: &str, name: &str, window: (u64, u64), error: ChildError) -> ChildError {
     let ChildError::Failed(message) = error else {
         return error;
     };
-    let cause = crate::fatal::latest_cause(id, started_at_ms)
+    let cause = crate::fatal::latest_cause(id, window)
         .map(|cause| format!(" Cause: {cause}."))
         .unwrap_or_default();
     ChildError::Failed(format!(
@@ -250,6 +250,7 @@ struct State {
 struct FinishedTurn {
     generation: u64,
     started_at_ms: u64,
+    finished_at_ms: u64,
     outcome: GenerationOutcome,
     output: Value,
     updates: Option<SubagentUpdates>,
@@ -283,6 +284,9 @@ impl State {
         self.finished.push_back(FinishedTurn {
             generation: self.generation,
             started_at_ms: self.generation_started_at_unix_ms,
+            finished_at_ms: self
+                .generation_finished_at_unix_ms
+                .unwrap_or_else(events::now_millis),
             outcome,
             output: self.output.clone(),
             updates: self.updates.clone(),
@@ -888,7 +892,7 @@ impl Subagents {
                         GenerationOutcome::Failed => Err(failed_turn(
                             id,
                             &locked.name,
-                            turn.started_at_ms,
+                            (turn.started_at_ms, turn.finished_at_ms),
                             ChildError::Failed("the turn that received this prompt failed".into()),
                         )),
                     };
@@ -1048,11 +1052,11 @@ impl Subagents {
                     return Err(error);
                 }
                 let mut locked = state.lock().await;
-                let started_at_ms = locked.generation_started_at_unix_ms;
+                let window = (locked.generation_started_at_unix_ms, events::now_millis());
                 if locked.status != SubagentStatus::Removed {
                     locked.status = SubagentStatus::Idle;
                     locked.outcome = Some(GenerationOutcome::Failed);
-                    locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                    locked.generation_finished_at_unix_ms = Some(window.1);
                     locked.record_finished();
                     // A failed call returns no replacement handle, so preserve the
                     // accepted handle generation for a retry while keeping lifecycle
@@ -1061,7 +1065,7 @@ impl Subagents {
                     drop(locked);
                     self.emit_event(event);
                 }
-                Err(failed_turn(&prior.id, &name, started_at_ms, error))
+                Err(failed_turn(&prior.id, &name, window, error))
             }
         }
     }
@@ -1742,15 +1746,15 @@ impl Subagents {
         locked.status = SubagentStatus::Idle;
         locked.forking = None;
         locked.outcome = Some(GenerationOutcome::Failed);
-        locked.generation_finished_at_unix_ms = Some(events::now_millis());
+        let window = (locked.generation_started_at_unix_ms, events::now_millis());
+        locked.generation_finished_at_unix_ms = Some(window.1);
         locked.record_finished();
         let _ = self.persist_state(&locked, session::ChildLifecycle::Idle);
         let name = locked.name.clone();
-        let started_at_ms = locked.generation_started_at_unix_ms;
         let event = locked.runtime_event(id.to_string());
         drop(locked);
         self.emit_event(event);
-        failed_turn(id, &name, started_at_ms, error)
+        failed_turn(id, &name, window, error)
     }
 
     async fn cleanup_installed_child(

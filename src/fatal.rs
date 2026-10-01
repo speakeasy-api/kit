@@ -268,21 +268,17 @@ pub(crate) fn record_loop_error(
     .map(Some)
 }
 
-/// Summarizes the newest fatal record of `session_id` written at or after
-/// `since_ms`, without prompt content.
-pub(crate) fn latest_cause(session_id: &str, since_ms: u64) -> Option<String> {
+/// Summarizes the newest fatal record of `session_id` written within
+/// `window` (inclusive milliseconds), without prompt content.
+pub(crate) fn latest_cause(session_id: &str, window: (u64, u64)) -> Option<String> {
     crate::session::validate_id(session_id).ok()?;
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    latest_cause_in(
-        &PathBuf::from(home).join(".kit/errors"),
-        session_id,
-        since_ms,
-    )
+    latest_cause_in(&PathBuf::from(home).join(".kit/errors"), session_id, window)
 }
 
-fn latest_cause_in(base: &Path, session_id: &str, since_ms: u64) -> Option<String> {
+fn latest_cause_in(base: &Path, session_id: &str, (since, until): (u64, u64)) -> Option<String> {
     let directory = base.join(session_id);
-    let path = fs::read_dir(&directory)
+    let (_, path) = fs::read_dir(&directory)
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -290,14 +286,17 @@ fn latest_cause_in(base: &Path, session_id: &str, since_ms: u64) -> Option<Strin
             path.extension()
                 .is_some_and(|extension| extension == "json")
         })
-        .max_by_key(|path| {
-            path.file_stem()
+        .filter_map(|path| {
+            let millis = path
+                .file_stem()
                 .and_then(|stem| stem.to_str())
                 .and_then(|stem| stem.split('-').nth(1))
-                .and_then(|millis| millis.parse::<u64>().ok())
-        })?;
+                .and_then(|millis| millis.parse::<u64>().ok())?;
+            (since..=until).contains(&millis).then_some((millis, path))
+        })
+        .max_by_key(|(millis, _)| *millis)?;
     let record: FatalRecord = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-    if record.occurred_at_ms < since_ms {
+    if !(since..=until).contains(&record.occurred_at_ms) {
         return None;
     }
     let mut cause = format!("{} ({})", record.message, record.code);
@@ -1045,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_cause_ignores_records_older_than_the_failing_turn() {
+    fn latest_cause_is_limited_to_the_failing_turn() {
         use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
 
         let root = tempfile::tempdir().unwrap();
@@ -1067,14 +1066,17 @@ mod tests {
             Some(&failure),
         )
         .unwrap();
-        let cause = super::latest_cause_in(root.path(), "session-1", 0).unwrap();
-        assert!(cause.contains("RetryExhausted"), "{cause}");
-        let later = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64
-            + 60_000;
-        assert!(super::latest_cause_in(root.path(), "session-1", later).is_none());
+            .as_millis() as u64;
+        let cause = super::latest_cause_in(root.path(), "session-1", (0, now)).unwrap();
+        assert!(cause.contains("RetryExhausted"), "{cause}");
+        // A turn that started later must not inherit it.
+        let later = now + 60_000;
+        assert!(super::latest_cause_in(root.path(), "session-1", (later, u64::MAX)).is_none());
+        // Nor may a turn that finished before it was written.
+        assert!(super::latest_cause_in(root.path(), "session-1", (0, now - 60_000)).is_none());
     }
 
     #[test]
