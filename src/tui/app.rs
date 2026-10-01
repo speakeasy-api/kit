@@ -958,6 +958,8 @@ pub struct App {
     pub transcript_left: usize,
     pub transcript_width: usize,
     pub selection: Option<Selection>,
+    /// Observed Command+C forwarding; protocol support alone cannot prove it.
+    pub command_copy_observed: bool,
     /// Pending left press; the flag suppresses a release-click when this press
     /// dismissed an older selection, while still allowing it to start a drag.
     press: Option<(usize, usize, bool)>,
@@ -1225,6 +1227,7 @@ impl App {
             transcript_left: 0,
             transcript_width: 0,
             selection: None,
+            command_copy_observed: false,
             press: None,
             toast: None,
             last_key: None,
@@ -4086,6 +4089,9 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.kind != KeyEventKind::Press {
             return Action::None;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER {
+            self.command_copy_observed = true;
         }
         if let Some(action) = self.handle_focus_key(key) {
             return action;

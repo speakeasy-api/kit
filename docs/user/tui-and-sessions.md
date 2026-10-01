@@ -73,7 +73,7 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 
 `Command` and `Shift+Enter` require a terminal with the Kitty keyboard protocol, such as Ghostty, Kitty, WezTerm, or recent iTerm2. The control-key alternatives work without that protocol.
 
-Drag over the transcript to select text within Kit. `Command+C` copies that selection when the terminal forwards the shortcut through the Kitty keyboard protocol; if the terminal intercepts it for native Copy, use `Ctrl+Y` instead. Selection copying rejoins wrapped lines and removes code-block gutters. Shift-drag uses the terminal's own selection instead.
+Drag over the transcript to select text within Kit. `Command+C` copies that selection when the terminal forwards the shortcut through the Kitty keyboard protocol; if the terminal intercepts it for native Copy, use `Ctrl+Y` instead. Selection copying rejoins wrapped lines and removes code-block gutters. Shift-drag uses the terminal's own selection instead. While text is selected, the footer shows `Ctrl+Y` to copy; after Kit receives a `Command+C` keypress, it shows `⌘C` instead. Keyboard-protocol support alone cannot establish whether the terminal forwards that specific shortcut.
 
 `Ctrl+Y` copies with the terminal's OSC 52 clipboard protocol. It preserves the agent's original Markdown, whitespace, and newlines instead of copying rendered TUI borders, list glyphs, or wrapped lines. Clipboard access must be enabled in the terminal; multiplexers such as tmux may also require OSC 52 passthrough.
 

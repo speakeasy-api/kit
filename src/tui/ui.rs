@@ -3263,6 +3263,18 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "⏎ send   ⇧⏎ newline   ^r agents   ^t reasoning   ^l log   ^c quit "
     };
+    let selection_hints;
+    let hints = if app.selection.is_some() {
+        let copy = if app.command_copy_observed {
+            "⌘c copy selection"
+        } else {
+            "^y copy selection"
+        };
+        selection_hints = format!("{copy}   {hints}");
+        selection_hints.as_str()
+    } else {
+        hints
+    };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
 
     let hint_width = hints.chars().count();
@@ -6203,14 +6215,23 @@ mod tests {
         };
         assert_eq!(text, "one");
 
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.lines().last().unwrap().contains("^y copy selection"));
+        assert!(!frame.contains("⌘c copy selection"));
+
         let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert!(matches!(action, Action::Copy(text) if text == "one"));
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.lines().last().unwrap().contains("⌘c copy selection"));
+        assert!(!frame.contains("^y copy selection"));
 
         // The next press clears the selection.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
         assert!(app.selection.is_none());
         let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert!(matches!(action, Action::None));
+        let frame = render(&mut app, 100, 24);
+        assert!(!frame.contains("copy selection"));
     }
 
     #[test]
