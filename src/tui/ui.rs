@@ -185,6 +185,14 @@ fn child_body_layout(area: Rect) -> (Rect, Rect) {
     }
 }
 
+fn selection_copy_hint(command_copy_observed: bool) -> &'static str {
+    if command_copy_observed {
+        "⌘c copy selection"
+    } else {
+        "^y copy selection"
+    }
+}
+
 fn draw_child(
     frame: &mut Frame<'_>,
     root: &mut App,
@@ -205,12 +213,13 @@ fn draw_child(
         .display_rows(app.prompt_width)
         .clamp(1, MAX_PROMPT_ROWS) as u16
         + 2;
-    let [back, title, notice, body, prompt] = Layout::vertical([
+    let [back, title, notice, body, prompt, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(prompt_rows),
+        Constraint::Length(u16::from(app.selection.is_some())),
     ])
     .areas(frame.area());
     root.child_back_area = Rect {
@@ -234,6 +243,12 @@ fn draw_child(
     let (transcript, agents) = child_body_layout(body);
     draw_transcript(frame, app, images, transcript);
     draw_agents(frame, root, agents);
+    if app.selection.is_some() {
+        frame.render_widget(
+            Paragraph::new(selection_copy_hint(root.command_copy_observed)).style(theme::dim()),
+            footer,
+        );
+    }
 
     // This is deliberately not the root prompt: no commands, attachments,
     // queue actions, session controls, or idle-message submission affordance.
@@ -3263,6 +3278,16 @@ fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "⏎ send   ⇧⏎ newline   ^r agents   ^t reasoning   ^l log   ^c quit "
     };
+    let selection_hints;
+    let hints = if app.selection.is_some() {
+        selection_hints = format!(
+            "{}   {hints}",
+            selection_copy_hint(app.command_copy_observed)
+        );
+        selection_hints.as_str()
+    } else {
+        hints
+    };
     let used: usize = left.iter().map(|span| span.content.chars().count()).sum();
 
     let hint_width = hints.chars().count();
@@ -4434,6 +4459,106 @@ mod tests {
                     && cell.bg == ratatui::style::Color::Rgb(0, 0, 0)
             })
         })
+    }
+
+    #[test]
+    fn focused_child_drag_copy_routes_through_root_without_editing_drafts() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        for mode in ["steerable", "read-only", "pending", "roster"] {
+            let mut app = panel_app(1);
+            app.editor.insert_str("root draft");
+            app.blocks
+                .push(Block::Agent("root response must not be copied".into()));
+            app.apply(Update::Runtime(RuntimeEvent::SubagentStateChanged {
+                id: "agent-0".into(),
+                name: "Scout 0".into(),
+                status: SubagentStatus::Working,
+                outcome: None,
+                generation: 2,
+                task: "task".into(),
+                parent_id: None,
+                parent_name: None,
+                harness: "acp.kit".into(),
+                vendor: crate::events::HarnessVendor::Kit,
+                model: None,
+                created_at_unix_ms: 1,
+                generation_started_at_unix_ms: 1,
+                generation_finished_at_unix_ms: None,
+            }));
+            app.focus_child("agent-0".into());
+            let child = app.child_views.get_mut("agent-0").unwrap();
+            child.can_steer = mode != "read-only";
+            child.app.phase = Phase::Working;
+            child.app.editor.insert_str("child draft");
+            child
+                .app
+                .blocks
+                .push(Block::Agent("visible child text".into()));
+            if mode == "pending" {
+                assert!(
+                    matches!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::SteerChild { text, .. } if text == "child draft")
+                );
+            }
+            app.agents_keyboard_focus = mode == "roster";
+            let frame = render(&mut app, 100, 24);
+            let row = frame
+                .lines()
+                .position(|line| line.contains("visible child text"))
+                .expect("child transcript is visible") as u16;
+            let left = app.child_views["agent-0"].app.transcript_left as u16;
+            let mouse = |kind, column| MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
+            app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left + 6));
+            assert!(matches!(
+                app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), left + 6)),
+                Action::None
+            ));
+            assert_eq!(
+                app.child_views["agent-0"].app.selection_text().as_deref(),
+                Some("visible")
+            );
+            let frame = render(&mut app, 100, 24);
+            assert!(frame.lines().last().unwrap().contains("^y copy selection"));
+
+            let mut release = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+            release.kind = KeyEventKind::Release;
+            assert!(matches!(app.handle_key(release), Action::None));
+            assert!(!app.command_copy_observed);
+            for (code, modifiers) in [('y', KeyModifiers::CONTROL), ('c', KeyModifiers::SUPER)] {
+                assert!(
+                    matches!(app.handle_key(KeyEvent::new(KeyCode::Char(code), modifiers)), Action::Copy(text) if text == "visible")
+                );
+            }
+            let frame = render(&mut app, 100, 24);
+            assert!(frame.lines().last().unwrap().contains("⌘c copy selection"));
+            assert!(!frame.contains("^y copy selection"));
+
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
+            for (code, modifiers) in [('c', KeyModifiers::SUPER), ('y', KeyModifiers::CONTROL)] {
+                assert!(matches!(
+                    app.handle_key(KeyEvent::new(KeyCode::Char(code), modifiers)),
+                    Action::None
+                ));
+            }
+            assert!(!render(&mut app, 100, 24).contains("copy selection"));
+            assert_eq!(app.editor.text(), "root draft");
+            let child = &app.child_views["agent-0"];
+            assert_eq!(child.app.editor.text(), "child draft");
+            if mode == "pending" {
+                assert!(matches!(
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    Action::Redraw
+                ));
+            }
+        }
     }
 
     #[test]
@@ -6163,7 +6288,7 @@ mod tests {
     }
 
     #[test]
-    fn dragging_selects_and_ctrl_y_copies_instead_of_clicking() {
+    fn dragging_selects_and_copy_shortcuts_copy_instead_of_clicking() {
         use crossterm::event::{
             KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
         };
@@ -6203,9 +6328,23 @@ mod tests {
         };
         assert_eq!(text, "one");
 
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.lines().last().unwrap().contains("^y copy selection"));
+        assert!(!frame.contains("⌘c copy selection"));
+
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert!(matches!(action, Action::Copy(text) if text == "one"));
+        let frame = render(&mut app, 100, 24);
+        assert!(frame.lines().last().unwrap().contains("⌘c copy selection"));
+        assert!(!frame.contains("^y copy selection"));
+
         // The next press clears the selection.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
         assert!(app.selection.is_none());
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert!(matches!(action, Action::None));
+        let frame = render(&mut app, 100, 24);
+        assert!(!frame.contains("copy selection"));
     }
 
     #[test]

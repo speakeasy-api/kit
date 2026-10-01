@@ -67,10 +67,13 @@ Use the `artifact` tool to read spilled output, including memory-only artifacts;
 | `Ctrl+R` / `Ctrl+L` / `Ctrl+T` | Toggle the agent roster / agent log / reasoning |
 | `Ctrl+K` | Kill the selected running background tool call; otherwise delete to the end of the editor line |
 | `Ctrl+O`, or click a tool card | Fold or unfold raw tool output |
-| `Ctrl+Y` | Copy the latest agent response as original Markdown |
+| `Ctrl+Y` | Copy the drag selection, or the latest agent response as original Markdown |
+| `Command+C` | Copy the drag selection when the terminal forwards the shortcut |
 | Click a fenced code block | Copy its contents without the backticks or language label |
 
 `Command` and `Shift+Enter` require a terminal with the Kitty keyboard protocol, such as Ghostty, Kitty, WezTerm, or recent iTerm2. The control-key alternatives work without that protocol.
+
+Drag over the transcript to select text within Kit. `Command+C` copies that selection when the terminal forwards the shortcut through the Kitty keyboard protocol; if the terminal intercepts it for native Copy, use `Ctrl+Y` instead. Selection copying rejoins wrapped lines and removes code-block gutters. Shift-drag uses the terminal's own selection instead. While text is selected, the footer shows `Ctrl+Y` to copy; after Kit receives a `Command+C` keypress, it shows `⌘C` instead. Keyboard-protocol support alone cannot establish whether the terminal forwards that specific shortcut.
 
 `Ctrl+Y` copies with the terminal's OSC 52 clipboard protocol. It preserves the agent's original Markdown, whitespace, and newlines instead of copying rendered TUI borders, list glyphs, or wrapped lines. Clipboard access must be enabled in the terminal; multiplexers such as tmux may also require OSC 52 passthrough.
 

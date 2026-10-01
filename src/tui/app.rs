@@ -958,6 +958,8 @@ pub struct App {
     pub transcript_left: usize,
     pub transcript_width: usize,
     pub selection: Option<Selection>,
+    /// Observed Command+C forwarding; protocol support alone cannot prove it.
+    pub command_copy_observed: bool,
     /// Pending left press; the flag suppresses a release-click when this press
     /// dismissed an older selection, while still allowing it to start a drag.
     press: Option<(usize, usize, bool)>,
@@ -1225,6 +1227,7 @@ impl App {
             transcript_left: 0,
             transcript_width: 0,
             selection: None,
+            command_copy_observed: false,
             press: None,
             toast: None,
             last_key: None,
@@ -4087,6 +4090,21 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::None;
         }
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER {
+            self.command_copy_observed = true;
+        }
+        // A focused child has a restricted key handler. Copy only its visible
+        // selection here rather than forwarding arbitrary root actions to it.
+        if ((key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::SUPER)
+            || (key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL)))
+            && let Some(id) = self.child_focus.as_ref()
+        {
+            return self
+                .child_views
+                .get(id)
+                .and_then(|view| view.app.selection_text())
+                .map_or(Action::None, Action::Copy);
+        }
         if let Some(action) = self.handle_focus_key(key) {
             return action;
         }
@@ -4174,7 +4192,7 @@ impl App {
         // Ctrl+K is global only when it cancels background work; otherwise it
         // must not fall through and delete text from the parked composer.
         let global_key = match key.code {
-            KeyCode::Char('b') => key.modifiers == KeyModifiers::SUPER,
+            KeyCode::Char('b' | 'c') => key.modifiers == KeyModifiers::SUPER,
             KeyCode::Char('k') => {
                 key.modifiers.contains(KeyModifiers::CONTROL)
                     && self
@@ -4331,6 +4349,13 @@ impl App {
                         .map(|call| call.id.clone())
                         .unwrap_or_default(),
                 );
+            }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::SUPER => {
+                if let Some(text) = self.selection_text() {
+                    self.toast("copied selection");
+                    return Action::Copy(text);
+                }
+                return Action::None;
             }
             KeyCode::Char('y') if control => {
                 if let Some(text) = self.selection_text() {
