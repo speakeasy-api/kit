@@ -32,15 +32,15 @@ tokio-tungstenite = { version = "=0.29.0", default-features = false, features = 
 a2a-protocol-client = "=0.11.0"
 a2a-protocol-server = { version = "=0.11.0", default-features = false }
 a2a-protocol-types = "=0.11.0"
-agent-client-protocol = { version = "=2.0.0", features = ["unstable_session_fork", "unstable_session_inject"] }
-agent-client-protocol-schema = { git = "https://github.com/danielkov/agent-client-protocol", rev = "6e7e044f9464c4fd652d90699a09e9edc8b3bbad", features = ["unstable_session_notices", "unstable_session_compaction", "unstable_tool_call_name"] }
-agent-client-protocol-http = { version = "=2.0.0", default-features = false, features = ["server", "client"] }
-agentkit-acp = { version = "=0.10.11", features = ["unstable-inject"] }
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0", features = ["unstable_session_fork", "unstable_session_inject"] }
+agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.9.1", features = ["unstable_session_notices", "unstable_session_compaction"] }
+agent-client-protocol-http = { package = "agentkit-acp-http", version = "=2.2.0", default-features = false, features = ["server", "client"] }
+agentkit-acp = { version = "=0.10.12", features = ["unstable-inject"] }
 agentkit-adapter-completions = "=0.10.9"
 agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
-agentkit-loop = { version = "=0.10.12", features = ["otel"] }
+agentkit-loop = { version = "=0.10.13", features = ["otel"] }
 agentkit-mcp = "=0.10.7"
 agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
@@ -124,18 +124,6 @@ windows-sys = { version = "=0.61.2", features = [
 jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
-[patch.crates-io]
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
-agentkit-acp = { git = "https://github.com/daviddanialy/agentkit.git", rev = "6d519ed1e93e28e54ba1cc18889534e2e8337181" }
-agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "423ba77cd555a09f68472b93c142c8f0baaabf43" }
-agent-client-protocol-http = { git = "https://github.com/danielkov/rust-sdk.git", rev = "423ba77cd555a09f68472b93c142c8f0baaabf43" }
-
-[patch."https://github.com/danielkov/agentkit.git"]
-agentkit-capabilities = "=0.10.5"
-agentkit-core = "=0.10.5"
-agentkit-task-manager = "=0.10.7"
-agentkit-tools-core = "=0.10.5"
-
 # Deny also in test builds; only test-only scopes may relax ergonomics. Crate
 # roots additionally forbid these in production so local allows cannot evade it.
 [lints.clippy]
@@ -147,9 +135,3 @@ todo = "deny"
 unimplemented = "deny"
 disallowed_methods = "deny"
 disallowed_macros = "deny"
-
-# Keep the media-budget fork limited to ACP; share the existing loop and registry types.
-[patch."https://github.com/daviddanialy/agentkit.git"]
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
-agentkit-core = "=0.10.5"
-agentkit-tools-core = "=0.10.5"

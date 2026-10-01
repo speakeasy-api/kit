@@ -136,7 +136,7 @@ def prompt(request):
     if "MOCK_REJECT" in text:
         send({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "prompt rejected"}})
         return
-    respond(request["id"], {})
+    respond(request["id"], {"messageId": "user-1"})
     send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "running"}}})
     if "MOCK_PERMISSION" in text:
         send({

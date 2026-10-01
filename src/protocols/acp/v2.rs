@@ -511,7 +511,7 @@ fn compose_title_update(call: &agentkit_core::ToolCallPart) -> Option<wire::Sess
 struct PromptCommand {
     request: wire::PromptRequest,
     cancellation_generation: u64,
-    reply: oneshot::Sender<Result<oneshot::Sender<()>, AcpRuntimeError>>,
+    reply: oneshot::Sender<Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError>>,
 }
 
 enum Command {
@@ -1106,7 +1106,7 @@ impl Server {
     async fn prepare_prompt(
         &self,
         request: wire::PromptRequest,
-    ) -> Result<oneshot::Sender<()>, AcpRuntimeError> {
+    ) -> Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError> {
         let (sender, busy, handle) = self.prompt_route(&request.session_id)?;
         // Reject overlaps before waiting: mailbox pressure must not queue another turn.
         if busy.load(Ordering::Acquire) {
@@ -1597,7 +1597,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     };
     handle.start_injection_turn();
     let (start, started) = oneshot::channel();
-    if reply.send(Ok(start)).is_err() || started.await.is_err() {
+    if reply.send(Ok((start, user_message_id.clone()))).is_err() || started.await.is_err() {
         handle.stop_injection_turn();
         integration.finish_prompt(session_id);
         return Ok(());
@@ -2359,8 +2359,8 @@ pub(crate) fn component(
                     let state = Arc::clone(&state);
                     cx.spawn(async move {
                         match state.prepare_prompt(request).await {
-                            Ok(start) => {
-                                responder.respond(wire::PromptResponse::new())?;
+                            Ok((start, message_id)) => {
+                                responder.respond(wire::PromptResponse::new(message_id))?;
                                 let _ = start.send(());
                                 Ok(())
                             }
@@ -3554,7 +3554,7 @@ mod tests {
             reply,
         };
         let acknowledge = async move {
-            response.await.unwrap().unwrap().send(()).unwrap();
+            response.await.unwrap().unwrap().0.send(()).unwrap();
         };
 
         let task_manager = AsyncTaskManager::new();

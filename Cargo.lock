@@ -79,43 +79,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol"
-version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=423ba77cd555a09f68472b93c142c8f0baaabf43#423ba77cd555a09f68472b93c142c8f0baaabf43"
-dependencies = [
- "agent-client-protocol-derive",
- "agent-client-protocol-schema",
- "async-io",
- "async-process",
- "blocking",
- "futures",
- "futures-concurrency",
- "rustc-hash",
- "rustix 1.1.4",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "shell-words",
- "tracing",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "agent-client-protocol-derive"
-version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=423ba77cd555a09f68472b93c142c8f0baaabf43#423ba77cd555a09f68472b93c142c8f0baaabf43"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de"
 dependencies = [
  "quote",
  "syn 3.0.4",
 ]
 
 [[package]]
-name = "agent-client-protocol-http"
-version = "2.0.0"
-source = "git+https://github.com/danielkov/rust-sdk.git?rev=423ba77cd555a09f68472b93c142c8f0baaabf43#423ba77cd555a09f68472b93c142c8f0baaabf43"
+name = "agentkit-acp"
+version = "0.10.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "394478ee8cb0e8916531ae4f450b953e4adfc0f700bbd4a1a85ebb265bfb18ce"
 dependencies = [
- "agent-client-protocol",
+ "agentkit-acp-sdk",
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-tools-core",
+ "async-trait",
+ "base64 0.22.1",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentkit-acp-http"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dac1fe9230b43784cb66312e93eb72d6420c0a027029879feb02361435856b66"
+dependencies = [
+ "agentkit-acp-sdk",
  "async-stream",
  "async-tungstenite",
  "axum",
@@ -132,9 +129,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol-schema"
-version = "1.7.0"
-source = "git+https://github.com/danielkov/agent-client-protocol?rev=6e7e044f9464c4fd652d90699a09e9edc8b3bbad#6e7e044f9464c4fd652d90699a09e9edc8b3bbad"
+name = "agentkit-acp-schema"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfcb839ccca8f4f43bfc9aa26473396f16afbd32071efd00d36801daed62f9d7"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -147,20 +145,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentkit-acp"
-version = "0.10.11"
-source = "git+https://github.com/daviddanialy/agentkit.git?rev=6d519ed1e93e28e54ba1cc18889534e2e8337181#6d519ed1e93e28e54ba1cc18889534e2e8337181"
+name = "agentkit-acp-sdk"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b93c10bb458dd1c2c822275a7e1c390b46846a6bcd3cbc84aafa312563e36ad"
 dependencies = [
- "agent-client-protocol",
- "agentkit-core",
- "agentkit-loop",
- "agentkit-tools-core",
- "async-trait",
- "base64 0.22.1",
+ "agent-client-protocol-derive",
+ "agentkit-acp-schema",
+ "async-io",
+ "async-process",
+ "blocking",
+ "futures",
+ "futures-concurrency",
+ "rustc-hash",
+ "rustix 1.1.4",
+ "schemars 1.2.2",
+ "serde",
  "serde_json",
- "thiserror 2.0.18",
- "tokio",
+ "shell-words",
  "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -255,8 +260,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.12"
-source = "git+https://github.com/danielkov/agentkit.git?rev=bec9dcc45ee0f436d538286bc220b16dc19fd5f3#bec9dcc45ee0f436d538286bc220b16dc19fd5f3"
+version = "0.10.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e581d59925462f08c1145ee85e4c937db76fb6d1690b4b9ed49d44ca8c560141"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -3058,10 +3064,10 @@ dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
- "agent-client-protocol",
- "agent-client-protocol-http",
- "agent-client-protocol-schema",
  "agentkit-acp",
+ "agentkit-acp-http",
+ "agentkit-acp-schema",
+ "agentkit-acp-sdk",
  "agentkit-adapter-completions",
  "agentkit-compaction",
  "agentkit-context",
