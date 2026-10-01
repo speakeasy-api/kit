@@ -4174,7 +4174,7 @@ impl App {
         // Ctrl+K is global only when it cancels background work; otherwise it
         // must not fall through and delete text from the parked composer.
         let global_key = match key.code {
-            KeyCode::Char('b') => key.modifiers == KeyModifiers::SUPER,
+            KeyCode::Char('b' | 'c') => key.modifiers == KeyModifiers::SUPER,
             KeyCode::Char('k') => {
                 key.modifiers.contains(KeyModifiers::CONTROL)
                     && self
@@ -4331,6 +4331,13 @@ impl App {
                         .map(|call| call.id.clone())
                         .unwrap_or_default(),
                 );
+            }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::SUPER => {
+                if let Some(text) = self.selection_text() {
+                    self.toast("copied selection");
+                    return Action::Copy(text);
+                }
+                return Action::None;
             }
             KeyCode::Char('y') if control => {
                 if let Some(text) = self.selection_text() {

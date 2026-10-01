@@ -6163,7 +6163,7 @@ mod tests {
     }
 
     #[test]
-    fn dragging_selects_and_ctrl_y_copies_instead_of_clicking() {
+    fn dragging_selects_and_copy_shortcuts_copy_instead_of_clicking() {
         use crossterm::event::{
             KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
         };
@@ -6203,9 +6203,14 @@ mod tests {
         };
         assert_eq!(text, "one");
 
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert!(matches!(action, Action::Copy(text) if text == "one"));
+
         // The next press clears the selection.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left));
         assert!(app.selection.is_none());
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert!(matches!(action, Action::None));
     }
 
     #[test]
