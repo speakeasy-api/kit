@@ -1000,7 +1000,7 @@ impl Server {
         let busy = Arc::new(AtomicBool::new(false));
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
-            voice_monitor: voice_state.monitor(claim.is_resumed() || claim.is_fork()),
+            voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -3561,7 +3561,7 @@ mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let (result, ()) = tokio::join!(
             prepare_prompt(
                 &session_id,
@@ -4591,7 +4591,7 @@ mod tests {
             ))
             .unwrap();
         let state = crate::runtime::voice_state::VoiceState::default();
-        let mut monitor = state.monitor(false);
+        let mut monitor = state.monitor(&[]);
         let turns = Arc::new(AtomicU64::new(0));
         let mut driver = Agent::builder()
             .model(TestAdapter {

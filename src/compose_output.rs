@@ -129,18 +129,22 @@ async fn guard_text(
     };
     // Artifact storage must not turn an already-executed tool into a failed
     // tool call: retrying that call could duplicate its side effects.
-    let marker = if artifact.is_some() {
-        format!(
-            "\n...[compose output spilled: {original_bytes} bytes; read with artifact(path)]...\n"
-        )
-    } else {
-        format!(
-            "\n...[tool completed; output truncated: {original_bytes} bytes; artifact storage failed]...\n"
-        )
+    let stored = artifact.is_some();
+    let marker = |start: usize, end: usize| {
+        if stored {
+            format!(
+                "\n...[compose output spilled: bytes {start}..{end} of {original_bytes} omitted here; read them with artifact({{path, offset: {start}}})]...\n"
+            )
+        } else {
+            format!(
+                "\n...[tool completed; output truncated: bytes {start}..{end} of {original_bytes} omitted here; artifact storage failed]...\n"
+            )
+        }
     };
+    let marker_bytes = marker(original_bytes, original_bytes).len();
     let mut preview_budget = budget;
     loop {
-        let preview = preview(&body, &marker, preview_budget);
+        let preview = preview(&body, marker, marker_bytes, preview_budget);
         let replacement = Value::Object(Map::from_iter([
             ("preview".into(), Value::from(preview)),
             ("artifact".into(), Value::from(artifact.as_deref())),
@@ -161,7 +165,7 @@ async fn guard_text(
             .checked_div(replacement_bytes)
             .unwrap_or(0)
             .min(preview_budget.saturating_sub(1))
-            .max(marker.len());
+            .max(marker_bytes);
         if next_budget >= preview_budget {
             return Err(ToolError::Internal(
                 "compose spill metadata exceeds the model output budget".into(),
@@ -171,15 +175,21 @@ async fn guard_text(
     }
 }
 
-fn preview(value: &str, marker: &str, budget: usize) -> String {
-    let remaining = budget.saturating_sub(marker.len());
+/// `marker_bytes` bounds the marker for any omitted range of `value`.
+fn preview(
+    value: &str,
+    marker: impl Fn(usize, usize) -> String,
+    marker_bytes: usize,
+    budget: usize,
+) -> String {
+    let remaining = budget.saturating_sub(marker_bytes);
     let head_budget = remaining / 2;
     let tail_budget = remaining - head_budget;
+    let head = prefix(value, head_budget);
+    let tail = suffix(value, tail_budget);
     format!(
-        "{}{}{}",
-        prefix(value, head_budget),
-        marker,
-        suffix(value, tail_budget)
+        "{head}{}{tail}",
+        marker(head.len(), value.len() - tail.len())
     )
 }
 
@@ -292,5 +302,37 @@ mod tests {
         );
         assert!(serde_json::to_vec(&output).unwrap().len() <= MAX_MODEL_OUTPUT_BYTES);
         assert_eq!(std::fs::read_to_string(artifact).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn spill_marker_names_the_omitted_artifact_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = (0..4000)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let expected = serde_json::to_string(&json!({ "stdout": text })).unwrap();
+
+        let output = guard(
+            directory.path(),
+            ToolOutput::structured(json!({ "stdout": text })),
+        )
+        .await
+        .unwrap();
+        let ToolOutput::Structured(output) = output else {
+            panic!("guard returned non-structured output");
+        };
+        let preview = output["preview"].as_str().unwrap();
+        let (head, rest) = preview
+            .split_once("\n...[compose output spilled: bytes ")
+            .unwrap();
+        let (range, rest) = rest.split_once(" of ").unwrap();
+        let (start, end) = range.split_once("..").unwrap();
+        let (start, end) = (
+            start.parse::<usize>().unwrap(),
+            end.parse::<usize>().unwrap(),
+        );
+        let tail = rest.split_once("]...\n").unwrap().1;
+        assert!(rest.contains(&format!("offset: {start}")));
+        assert_eq!(format!("{head}{}{tail}", &expected[start..end]), expected);
     }
 }

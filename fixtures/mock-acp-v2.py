@@ -158,6 +158,9 @@ def prompt(request):
         text = selected_models.get(session_id, model_ids[0])
     if "MOCK_STRUCTURED_OUTPUT" in text:
         text = json.dumps({"approved": True, "reason": "mock approved"})
+    if "MOCK_TURN_ERROR" in text:
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "_error"}}})
+        return
     if "MOCK_REFUSAL" in text:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": session_id, "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"}}})
         return

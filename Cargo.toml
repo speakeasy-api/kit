@@ -47,7 +47,7 @@ agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.12"
 agentkit-provider-openrouter = "=0.10.8"
 agentkit-task-manager = "=0.10.7"
-agentkit-tool-compose = { version = "=0.10.11", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "=0.10.12", default-features = false, features = ["runlet"] }
 agentkit-tool-skills = "=0.10.8"
 agentkit-tools-core = "=0.10.5"
 arboard = { version = "=3.6.1", default-features = false, features = ["image-data"], optional = true }
@@ -81,7 +81,7 @@ rpassword = "=7.5.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 shlex = { version = "=2.0.1", optional = true }
-runlet = "=0.6.0"
+runlet = "=0.6.1"
 sha2 = "=0.11.0"
 subtle = "=2.6.1"
 tar = { version = "=0.4.46", default-features = false }
@@ -125,7 +125,6 @@ jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 [patch.crates-io]
-agentkit-provider-openai = { git = "https://git@github.com/danielkov/agentkit.git", rev = "04148b4fe88ebfbe9ba79762dcf272bd5a7b8f58" }
 agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 agentkit-acp = { git = "https://github.com/daviddanialy/agentkit.git", rev = "6d519ed1e93e28e54ba1cc18889534e2e8337181" }
 agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk.git", rev = "423ba77cd555a09f68472b93c142c8f0baaabf43" }
@@ -136,15 +135,6 @@ agentkit-capabilities = "=0.10.5"
 agentkit-core = "=0.10.5"
 agentkit-task-manager = "=0.10.7"
 agentkit-tools-core = "=0.10.5"
-
-# Keep the provider fix on a distinct public HTTPS source so its workspace
-# dependencies reuse the existing registry packages and reviewed loop pin.
-# The git username distinguishes Cargo source IDs; anonymous fetch still works.
-[patch."https://git@github.com/danielkov/agentkit.git"]
-agentkit-adapter-completions = "=0.10.9"
-agentkit-core = "=0.10.5"
-agentkit-http = "=0.10.7"
-agentkit-loop = { git = "https://github.com/danielkov/agentkit.git", rev = "bec9dcc45ee0f436d538286bc220b16dc19fd5f3" }
 
 # Deny also in test builds; only test-only scopes may relax ergonomics. Crate
 # roots additionally forbid these in production so local allows cannot evade it.

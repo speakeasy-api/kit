@@ -6,7 +6,7 @@ pub(crate) mod mcp;
 mod observed;
 mod read_file;
 mod shell;
-mod subagent;
+pub(crate) mod subagent;
 
 pub use crate::credentials::CredentialStorage;
 pub use a2a::A2aTool;
@@ -18,9 +18,7 @@ pub use observed::Observed;
 pub(crate) use observed::shared as observe_shared;
 pub use read_file::ReadFileTool;
 pub use shell::ShellTool;
-pub use subagent::{
-    CloseTool, ForkTool, PromptTool, SteerTool, SubagentTool, Subagents, SubagentsTool,
-};
+pub use subagent::{CloseTool, ForkTool, PromptTool, SubagentTool, Subagents, SubagentsTool};
 
 mod image_gen;
 pub use image_gen::ImageGenTool;

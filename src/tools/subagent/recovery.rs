@@ -51,6 +51,8 @@ impl Subagents {
                 recovery: Some(record.clone()),
                 forking: None,
                 permit: None,
+                cache_key: None,
+                finished: Default::default(),
             };
             if sessions
                 .insert(
@@ -153,7 +155,6 @@ impl Subagents {
                 record.harness
             )));
         }
-        self.check_depth(record.depth.saturating_sub(1))?;
         let model = record
             .model
             .as_deref()
@@ -161,16 +162,14 @@ impl Subagents {
             .transpose()
             .map_err(ChildError::Failed)?;
         // Capacity is private to this attempt until the child is installed.
-        let permit = self
-            .capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ChildError::Failed("maximum live subagent count reached".into()))?;
+        let permit = self.acquire_permit()?;
         locked.status = SubagentStatus::Starting;
         let config = self
             .config
             .clone()
             .with_root(record.root.clone())
+            .with_tree_slots(super::tree_slot_directory(&self.tree_slots)?.clone())
+            .with_cache_lineage(locked.cache_key.clone())
             .with_parent_context(id.into(), locked.name.clone());
         drop(locked);
         let manager = self.clone();

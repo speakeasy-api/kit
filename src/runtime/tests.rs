@@ -1416,46 +1416,38 @@ async fn exact_mcp_name_cannot_bypass_the_tool_meta_dispatch() {
 }
 
 #[test]
-fn maximum_depth_compose_omits_depth_increasing_tools() {
+fn delegation_tools_are_identical_at_every_depth() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let max_depth = runtime.max_subagent_depth();
-
-    let below_maximum = runtime.compose(max_depth - 1);
-    for name in ["subagent", "fork"] {
-        assert!(
-            ToolSource::get(&below_maximum.compose, &ToolName::new(name)).is_some(),
-            "{name} should be available below the maximum depth"
-        );
-    }
-
-    let subagent_description = ToolSource::get(&below_maximum.compose, &ToolName::new("subagent"))
-        .unwrap()
-        .current_spec()
-        .unwrap()
-        .description;
-    assert!(subagent_description.contains(
-        "Use this only if you uncover independent workstreams whose parallel execution would yield quicker or better results."
-    ));
-    let fork_description = ToolSource::get(&below_maximum.compose, &ToolName::new("fork"))
-        .unwrap()
-        .current_spec()
-        .unwrap()
-        .description;
-    assert!(fork_description.contains(
-        "Use this only for an independent workstream whose parallel execution would yield quicker or better results"
-    ));
-
-    let at_maximum = runtime.compose(max_depth);
-    for name in ["subagent", "fork"] {
-        assert!(
-            ToolSource::get(&at_maximum.compose, &ToolName::new(name)).is_none(),
-            "{name} should not be advertised at the maximum depth"
-        );
+    let describe = |depth, name| {
+        ToolSource::get(&runtime.compose(depth).compose, &ToolName::new(name))
+            .unwrap()
+            .current_spec()
+            .unwrap()
+    };
+    for name in ["subagent", "fork", "prompt"] {
+        let top = describe(0, name);
+        for depth in [1, 5] {
+            let nested = describe(depth, name);
+            assert_eq!(
+                top.description, nested.description,
+                "{name} at depth {depth}"
+            );
+            assert_eq!(
+                top.input_schema, nested.input_schema,
+                "{name} at depth {depth}"
+            );
+        }
     }
     assert!(
-        ToolSource::get(&at_maximum.compose, &ToolName::new("prompt")).is_some(),
-        "non-depth-increasing session tools remain available"
+        describe(0, "fork")
+            .description
+            .contains("when omitted, it is your current conversation")
+    );
+    assert!(
+        describe(0, "subagent")
+            .description
+            .contains("A fork carries your entire conversation")
     );
 }
 
@@ -2502,10 +2494,7 @@ async fn initial_transcript_records_structured_session_origin() {
     for (depth, expected) in [
         (0, crate::session::TOP_LEVEL_SESSION_ORIGIN),
         (1, crate::session::SUBAGENT_SESSION_ORIGIN),
-        (
-            runtime.max_subagent_depth(),
-            crate::session::SUBAGENT_SESSION_ORIGIN,
-        ),
+        (5, crate::session::SUBAGENT_SESSION_ORIGIN),
     ] {
         let transcript = runtime.initial_transcript(depth).await.unwrap();
         assert_eq!(
@@ -2518,36 +2507,12 @@ async fn initial_transcript_records_structured_session_origin() {
 }
 
 #[test]
-fn system_prompt_guides_compose_and_subagent_hygiene() {
+fn system_prompt_is_independent_of_delegation() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
-    let prompt = runtime.system_prompt(0);
+    let prompt = runtime.system_prompt();
     assert!(prompt.contains("Keep tool output lean"));
     assert!(prompt.contains("Do not dump whole trees"));
-    assert!(prompt.contains("Use compose as a dependency graph"));
-    assert!(prompt.contains("use `fold` only for reductions or genuinely sequential chains"));
-    assert!(prompt.contains("Background long-running compose work across turn boundaries"));
-    assert!(prompt.contains("monitors that wait or poll for EXTERNAL events or state changes"));
-    assert!(prompt.contains("including launching more detached work"));
-    assert!(prompt.contains("STOP: end your turn now."));
-    assert!(prompt.contains("Stopping is a valid intermediate response"));
-    assert!(prompt.contains("the harness automatically resumes you when it finishes"));
-    assert!(
-        prompt.contains(
-            "Do not issue additional tool calls to wait or poll for a background tool call to finish, or to keep the turn alive"
-        )
-    );
-    assert!(prompt.contains("the next step needs its result in the current turn"));
-    assert!(
-        prompt.contains("Prefer one compose program whenever the remaining tool graph is known")
-    );
-    assert!(prompt.contains("keep intermediate results inside it"));
-    assert!(prompt.contains("return only the bare minimum information necessary"));
-    let delegated_prompt = runtime.system_prompt(1);
-    assert!(delegated_prompt.contains(
-        "This task was delegated to you by the primary agent. Investigate it and carry out the work."
-    ));
-    assert!(!prompt.contains("This task was delegated to you by the primary agent."));
-    let max_depth_prompt = runtime.system_prompt(runtime.max_subagent_depth());
-    assert!(max_depth_prompt.contains("This task was delegated to you by the primary agent."));
+    assert!(!prompt.contains("compose"));
+    assert!(!prompt.contains("delegat"));
 }

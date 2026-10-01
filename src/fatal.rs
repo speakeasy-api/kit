@@ -56,6 +56,8 @@ struct FatalRecord {
         deserialize_with = "deserialize_span_context"
     )]
     span_context: Option<crate::telemetry::error_spans::Snapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<agentkit_loop::ProviderFailure>,
 }
 
 fn deserialize_span_context<'de, D: serde::Deserializer<'de>>(
@@ -250,6 +252,10 @@ pub(crate) fn record_loop_error(
     let Some((kind, code, message, diagnostics)) = classify(error) else {
         return Ok(None);
     };
+    let failure = match error {
+        LoopError::ProviderFailure(failure) => Some(failure.as_ref()),
+        _ => None,
+    };
     write_default(
         session_id,
         surface,
@@ -257,8 +263,55 @@ pub(crate) fn record_loop_error(
         code,
         &message,
         diagnostics.as_ref(),
+        failure,
     )
     .map(Some)
+}
+
+/// Summarizes the newest fatal record of `session_id` written within
+/// `window` (inclusive milliseconds), without prompt content.
+pub(crate) fn latest_cause(session_id: &str, window: (u64, u64)) -> Option<String> {
+    crate::session::validate_id(session_id).ok()?;
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    latest_cause_in(&PathBuf::from(home).join(".kit/errors"), session_id, window)
+}
+
+fn latest_cause_in(base: &Path, session_id: &str, (since, until): (u64, u64)) -> Option<String> {
+    let directory = base.join(session_id);
+    let (_, path) = fs::read_dir(&directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|path| {
+            let millis = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.split('-').nth(1))
+                .and_then(|millis| millis.parse::<u64>().ok())?;
+            (since..=until).contains(&millis).then_some((millis, path))
+        })
+        .max_by_key(|(millis, _)| *millis)?;
+    let record: FatalRecord = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if !(since..=until).contains(&record.occurred_at_ms) {
+        return None;
+    }
+    let mut cause = format!("{} ({})", record.message, record.code);
+    if let Some(failure) = record.failure {
+        cause.push_str(&format!("; reason {:?}", failure.reason));
+        if let Some(last) = failure.last_attempt_reason {
+            cause.push_str(&format!(", last attempt {last:?}"));
+        }
+        if let Some(status) = failure.upstream.http_status {
+            cause.push_str(&format!(", HTTP {status}"));
+        }
+        cause.push_str(&format!(", {} attempts", failure.accounting.attempts));
+    }
+    cause.push_str(&format!("; log {}", path.display()));
+    Some(cause)
 }
 
 pub(crate) fn record_runtime_error(
@@ -272,6 +325,7 @@ pub(crate) fn record_runtime_error(
         "runtime",
         canonical_code(code),
         "runtime failed before the session could continue",
+        None,
         None,
     )
 }
@@ -419,6 +473,48 @@ fn canonical_code(code: &str) -> &str {
     }
 }
 
+/// Appends provider retry and stall events to the session's error directory.
+pub(crate) struct RetryLog;
+
+impl agentkit_loop::LoopObserver for RetryLog {
+    fn handle_event(&self, event: agentkit_loop::ObservedEvent) {
+        let agentkit_loop::AgentEvent::ProviderRetry(retry) = &event.event else {
+            return;
+        };
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let directory = PathBuf::from(home)
+            .join(".kit/errors")
+            .join(event.session_id.to_string());
+        if create_private_directory(&directory).is_err() {
+            return;
+        }
+        #[derive(Serialize)]
+        struct RetryLogEntry<'a> {
+            at_ms: u128,
+            event: &'a agentkit_loop::ProviderRetryEvent,
+        }
+        let entry = RetryLogEntry {
+            at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis()),
+            event: retry,
+        };
+        let Ok(line) = serde_json::to_string(&entry) else {
+            return;
+        };
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("retries.jsonl"))
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{line}")
+            });
+    }
+}
+
 fn write_default(
     session_id: &str,
     surface: Surface,
@@ -426,11 +522,12 @@ fn write_default(
     code: &str,
     message: &str,
     diagnostics: Option<&TransportDiagnostics>,
+    failure: Option<&agentkit_loop::ProviderFailure>,
 ) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| "HOME is unset; cannot store fatal error log".to_owned())?;
-    write_in_with_diagnostics(
+    write_record(
         &PathBuf::from(home).join(".kit/errors"),
         session_id,
         surface,
@@ -438,9 +535,11 @@ fn write_default(
         code,
         message,
         diagnostics,
+        failure,
     )
 }
 
+#[cfg(test)]
 fn write_in_with_diagnostics(
     base: &Path,
     session_id: &str,
@@ -449,6 +548,29 @@ fn write_in_with_diagnostics(
     code: &str,
     message: &str,
     diagnostics: Option<&TransportDiagnostics>,
+) -> Result<PathBuf, String> {
+    write_record(
+        base,
+        session_id,
+        surface,
+        kind,
+        code,
+        message,
+        diagnostics,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_record(
+    base: &Path,
+    session_id: &str,
+    surface: Surface,
+    kind: &str,
+    code: &str,
+    message: &str,
+    diagnostics: Option<&TransportDiagnostics>,
+    failure: Option<&agentkit_loop::ProviderFailure>,
 ) -> Result<PathBuf, String> {
     crate::session::validate_id(session_id)?;
     let occurred_at_ms = SystemTime::now()
@@ -472,6 +594,7 @@ fn write_in_with_diagnostics(
         message: bounded(message),
         diagnostics: diagnostics.filter(|value| value.valid()).cloned(),
         span_context: crate::telemetry::error_spans::snapshot(&tracing::Span::current()),
+        failure: failure.copied(),
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode fatal error log: {error}"))?;
@@ -886,6 +1009,74 @@ mod tests {
         assert_eq!(code, "provider_error");
         assert_eq!(message, "provider request failed");
         assert!(diagnostics.is_none());
+    }
+
+    #[test]
+    fn provider_failure_records_its_typed_cause() {
+        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+
+        let root = tempfile::tempdir().unwrap();
+        let failure = ProviderFailure {
+            route: ProviderRoute::OpenAiResponses,
+            reason: ProviderFailureReason::RetryExhausted,
+            last_attempt_reason: Some(ProviderFailureReason::IdleTimeout),
+            upstream: Default::default(),
+            accounting: Default::default(),
+        };
+        let path = super::write_record(
+            root.path(),
+            "session-1",
+            Surface::Acp,
+            "provider",
+            "provider_error",
+            "provider request failed",
+            None,
+            Some(&failure),
+        )
+        .unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record["message"], "provider request failed");
+        assert_eq!(
+            serde_json::from_value::<ProviderFailure>(record["failure"].clone()).unwrap(),
+            failure
+        );
+    }
+
+    #[test]
+    fn latest_cause_is_limited_to_the_failing_turn() {
+        use agentkit_loop::{ProviderFailure, ProviderFailureReason, ProviderRoute};
+
+        let root = tempfile::tempdir().unwrap();
+        let failure = ProviderFailure {
+            route: ProviderRoute::OpenAiResponses,
+            reason: ProviderFailureReason::RetryExhausted,
+            last_attempt_reason: None,
+            upstream: Default::default(),
+            accounting: Default::default(),
+        };
+        super::write_record(
+            root.path(),
+            "session-1",
+            Surface::Acp,
+            "provider",
+            "provider_error",
+            "provider request failed",
+            None,
+            Some(&failure),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cause = super::latest_cause_in(root.path(), "session-1", (0, now)).unwrap();
+        assert!(cause.contains("RetryExhausted"), "{cause}");
+        // A turn that started later must not inherit it.
+        let later = now + 60_000;
+        assert!(super::latest_cause_in(root.path(), "session-1", (later, u64::MAX)).is_none());
+        // Nor may a turn that finished before it was written.
+        assert!(super::latest_cause_in(root.path(), "session-1", (0, now - 60_000)).is_none());
     }
 
     #[test]

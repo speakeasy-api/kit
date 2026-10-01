@@ -15,7 +15,8 @@ use agentkit_core::{
     ToolOutput, ToolResultPart,
 };
 use agentkit_loop::{
-    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+    Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    SessionConfig,
 };
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskManager, TaskManagerHandle};
 use agentkit_tool_compose::{
@@ -40,8 +41,8 @@ use crate::{
     },
     tools::{
         A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
-        Observed, PromptTool, ReadFileTool, ShellTool, SteerTool, SubagentTool, Subagents,
-        SubagentsTool, ToolSchema, ToolSearch, observe_shared,
+        Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents, SubagentsTool,
+        ToolSchema, ToolSearch, observe_shared,
     },
 };
 
@@ -370,10 +371,6 @@ impl SessionClaim {
         self.uncommitted_observer = Some(observer.clone());
     }
 
-    pub(crate) fn is_resumed(&self) -> bool {
-        self.request.resume
-    }
-
     pub(crate) fn is_fork(&self) -> bool {
         matches!(self.kind, SessionClaimKind::Fork)
     }
@@ -486,9 +483,6 @@ struct McpInstallSources {
     configured_inherited: bool,
 }
 
-pub(crate) const SUBAGENT_SYSTEM_PROMPT_MARKER: &str =
-    "This task was delegated to you by the primary agent.";
-
 #[derive(Debug)]
 pub(crate) enum LogoutAuthenticationError {
     CredentialStateUnchanged(String),
@@ -515,7 +509,6 @@ pub struct Runtime {
     openrouter_api_key: Option<crate::provider::OpenRouterApiKey>,
     ambient_openrouter_api_key: bool,
     telemetry: agentkit_loop::TelemetryConfig,
-    max_subagent_depth: usize,
     base_depth: usize,
     subagents: Subagents,
     /// The explicitly selected session is consumed by the first ACP session.
@@ -601,28 +594,26 @@ impl Runtime {
             reasoning_effort,
             openrouter_api_key.clone(),
         )?;
-        let max_subagent_depth = 2;
-        let subagents = Subagents::new(
-            ChildConfig {
-                additional_directories: Vec::new(),
-                root: root.clone(),
-                model: model.clone(),
-                provider,
-                reasoning_effort,
-                openrouter_api_key: openrouter_api_key.clone(),
-                configured_mcp_config: None,
-                configured_mcp_config_inherited: false,
-                legacy_mcp_config: true,
-                mcp_config: None,
-                credential_storage: credential_storage.clone(),
-                telemetry: Default::default(),
-                harnesses: AcpHarnesses::default(),
-                default_harness: BUILTIN_HARNESS.into(),
-                parent_id: None,
-                parent_name: None,
-            },
-            max_subagent_depth,
-        );
+        let subagents = Subagents::new(ChildConfig {
+            additional_directories: Vec::new(),
+            root: root.clone(),
+            model: model.clone(),
+            provider,
+            reasoning_effort,
+            openrouter_api_key: openrouter_api_key.clone(),
+            configured_mcp_config: None,
+            configured_mcp_config_inherited: false,
+            legacy_mcp_config: true,
+            mcp_config: None,
+            credential_storage: credential_storage.clone(),
+            telemetry: Default::default(),
+            harnesses: AcpHarnesses::default(),
+            default_harness: BUILTIN_HARNESS.into(),
+            parent_id: None,
+            parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
+        });
         Ok(Arc::new(Self {
             eval: None,
             root,
@@ -635,7 +626,6 @@ impl Runtime {
             ambient_openrouter_api_key: std::env::var_os("OPENROUTER_API_KEY")
                 .is_some_and(|value| !value.is_empty()),
             telemetry: Default::default(),
-            max_subagent_depth,
             base_depth: 0,
             subagents,
             session: Mutex::new(SessionSelection::default()),
@@ -740,12 +730,6 @@ impl Runtime {
 
     /// Sets the inherited nesting depth for an ACP subprocess.
     pub fn with_depth(runtime: Arc<Self>, depth: usize) -> Result<Arc<Self>, String> {
-        if depth > runtime.max_subagent_depth {
-            return Err(format!(
-                "subagent depth {depth} exceeds limit {}",
-                runtime.max_subagent_depth
-            ));
-        }
         let mut runtime = Arc::try_unwrap(runtime)
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
@@ -823,7 +807,7 @@ impl Runtime {
             Some((id, name)) => (Some(id), Some(name)),
             None => (None, None),
         };
-        runtime.subagents = Subagents::new(config, runtime.max_subagent_depth);
+        runtime.subagents = Subagents::new(config);
         Ok(Arc::new(runtime))
     }
 
@@ -840,14 +824,11 @@ impl Runtime {
             "could not configure ACP harnesses after runtime was shared".to_string()
         })?;
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
-            ChildConfig {
-                harnesses,
-                default_harness,
-                ..previous
-            },
-            runtime.max_subagent_depth,
-        );
+        runtime.subagents = Subagents::new(ChildConfig {
+            harnesses,
+            default_harness,
+            ..previous
+        });
         Ok(Arc::new(runtime))
     }
 
@@ -861,13 +842,10 @@ impl Runtime {
             .map_err(|_| "could not configure telemetry after runtime was shared".to_string())?;
         runtime.telemetry = config;
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
-            ChildConfig {
-                telemetry,
-                ..previous
-            },
-            runtime.max_subagent_depth,
-        );
+        runtime.subagents = Subagents::new(ChildConfig {
+            telemetry,
+            ..previous
+        });
         Ok(Arc::new(runtime))
     }
 
@@ -1049,27 +1027,26 @@ impl Runtime {
         runtime.mcp = mcp;
         runtime.credential_storage = credential_storage.clone();
         let previous = runtime.subagents.child_config();
-        runtime.subagents = Subagents::new(
-            ChildConfig {
-                additional_directories: Vec::new(),
-                root: runtime.root.clone(),
-                model: runtime.model.clone(),
-                provider: runtime.provider,
-                reasoning_effort: runtime.reasoning_effort,
-                openrouter_api_key: runtime.openrouter_api_key.clone(),
-                configured_mcp_config: install.configured_path,
-                configured_mcp_config_inherited: install.configured_inherited,
-                legacy_mcp_config: install.legacy,
-                mcp_config: install.explicit_path,
-                credential_storage,
-                telemetry: previous.telemetry,
-                harnesses: previous.harnesses,
-                default_harness: previous.default_harness,
-                parent_id: previous.parent_id,
-                parent_name: previous.parent_name,
-            },
-            runtime.max_subagent_depth,
-        );
+        runtime.subagents = Subagents::new(ChildConfig {
+            additional_directories: Vec::new(),
+            root: runtime.root.clone(),
+            model: runtime.model.clone(),
+            provider: runtime.provider,
+            reasoning_effort: runtime.reasoning_effort,
+            openrouter_api_key: runtime.openrouter_api_key.clone(),
+            configured_mcp_config: install.configured_path,
+            configured_mcp_config_inherited: install.configured_inherited,
+            legacy_mcp_config: install.legacy,
+            mcp_config: install.explicit_path,
+            credential_storage,
+            telemetry: previous.telemetry,
+            harnesses: previous.harnesses,
+            default_harness: previous.default_harness,
+            parent_id: previous.parent_id,
+            parent_name: previous.parent_name,
+            tree_slots: None,
+            prompt_cache_key: None,
+        });
         Ok(Arc::new(runtime))
     }
 
@@ -1125,10 +1102,6 @@ impl Runtime {
             .with_session_servers(servers, &cwd)
             .await
             .map_err(AcpRuntimeError::Loop)
-    }
-
-    pub const fn max_subagent_depth(&self) -> usize {
-        self.max_subagent_depth
     }
 
     /// Returns the depth inherited by this runtime process.
@@ -1239,14 +1212,10 @@ impl Runtime {
         if let Some(eval) = &self.eval {
             children.register(Observed::new(eval.clone()));
         }
-        if depth < self.max_subagent_depth {
-            children
-                .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
-                .register(Observed::new(ForkTool::new(subagents.clone(), depth)));
-        }
         children
+            .register(Observed::new(SubagentTool::new(subagents.clone(), depth)))
+            .register(Observed::new(ForkTool::new(subagents.clone(), depth)))
             .register(Observed::new(PromptTool::new(subagents.clone())))
-            .register(Observed::new(SteerTool::new(subagents.clone())))
             .register(Observed::new(SubagentsTool::new(subagents.clone())))
             .register(Observed::new(CloseTool::new(subagents, {
                 let background_jobs = background_jobs.clone();
@@ -1350,7 +1319,7 @@ impl Runtime {
                 })?;
             }
             let initial = if request.resume {
-                vec![Item::text(ItemKind::System, self.system_prompt(0))]
+                vec![Item::text(ItemKind::System, self.system_prompt())]
             } else {
                 self.initial_transcript(0).await.map_err(|error| {
                     record_runtime_failure(
@@ -1404,6 +1373,7 @@ impl Runtime {
             let subagents = self
                 .subagents
                 .fresh()
+                .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session_id))
                 .with_observer(opened.observer.clone(), opened.children)
                 .map_err(|error| {
                     record_runtime_failure(
@@ -1415,6 +1385,7 @@ impl Runtime {
                 })?;
             let agent = Agent::builder()
                 .cancellation(controller.handle())
+                .observer(crate::fatal::RetryLog)
                 .model(adapter.clone())
                 .telemetry(self.agentkit_telemetry())
                 .add_tool_source(self.compose_with_jobs(
@@ -1438,7 +1409,12 @@ impl Runtime {
                     )
                 })?;
             let driver = match agent
-                .start(SessionConfig::new(session_id.clone()).without_cache())
+                .start(
+                    SessionConfig::new(session_id.clone()).with_cache(
+                        PromptCacheRequest::automatic()
+                            .with_key(crate::tools::subagent::prompt_cache_key(&session_id)),
+                    ),
+                )
                 .await
             {
                 Ok(driver) => driver,
@@ -1543,14 +1519,20 @@ impl Runtime {
             .await
             .map_err(LoopError::InvalidState)?;
         let skills = self.fresh_skills();
+        let recorded = crate::session::TransientTranscript::new(transcript.clone());
         let compactor = crate::compaction::automatic(
             self.adapter.clone(),
             self.agentkit_telemetry(),
             None,
             format!("compaction-{session}"),
         )
-        .map_err(LoopError::InvalidState)?;
-        let subagents = self.subagents.fresh();
+        .map_err(LoopError::InvalidState)?
+        .mirroring(recorded.clone());
+        let subagents = self
+            .subagents
+            .fresh()
+            .with_transient_parent(recorded.clone())
+            .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session));
         let builder = Agent::builder()
             .model(self.adapter.clone())
             .telemetry(self.agentkit_telemetry())
@@ -1562,12 +1544,18 @@ impl Runtime {
             ))
             .task_manager(background_task_manager())
             .mutator(compactor)
+            .transcript_observer(recorded)
             .transcript(transcript)
             .input(vec![Item::text(ItemKind::User, prompt)]);
         let builder = builder.cancellation(controller.handle());
         let mut driver = builder
             .build()?
-            .start(SessionConfig::new(session).without_cache())
+            .start(
+                SessionConfig::new(session.clone()).with_cache(
+                    PromptCacheRequest::automatic()
+                        .with_key(crate::tools::subagent::prompt_cache_key(&session)),
+                ),
+            )
             .await?;
         drive(&mut driver).await
     }
@@ -1656,18 +1644,16 @@ impl Runtime {
             None => (None, None, None),
         };
         let is_fork = forked_transcript.is_some();
-        let initial = if let Some(transcript) = forked_transcript {
+        let initial = if let Some(mut transcript) = forked_transcript {
             if request.resume {
                 return Err(AcpRuntimeError::Loop(
                     "a forked transcript requires a new session identity".into(),
                 ));
             }
+            crate::transcript::rebind_forked_transcript(&mut transcript, &request.id);
             transcript
         } else if request.resume {
-            vec![Item::text(
-                ItemKind::System,
-                self.system_prompt(self.base_depth),
-            )]
+            vec![Item::text(ItemKind::System, self.system_prompt())]
         } else {
             self.initial_transcript(self.base_depth)
                 .await
@@ -1729,16 +1715,19 @@ impl Runtime {
             format!("compaction-{}", crate::session::new_id()),
         )
         .map_err(AcpRuntimeError::Loop)?;
+        let prompt_cache_key = crate::tools::subagent::prompt_cache_key(&session_id);
         let subagents = self
             .subagents
             .fresh_for_workspace(additional_directories, parent_context)
+            .with_prompt_cache_key(prompt_cache_key.clone())
             .with_observer(opened.observer.clone(), opened.children)
             .map_err(AcpRuntimeError::Loop)?;
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let canonical_transcript = opened.transcript.clone();
-        let mut session_config = SessionConfig::new(session_id.clone()).without_cache();
+        let mut session_config = SessionConfig::new(session_id.clone())
+            .with_cache(PromptCacheRequest::automatic().with_key(prompt_cache_key));
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
         }
@@ -1755,6 +1744,7 @@ impl Runtime {
             .task_manager(task_manager)
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
+            .observer(crate::fatal::RetryLog)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
             .cancellation(context.cancellation)
@@ -1777,7 +1767,7 @@ impl Runtime {
     }
 
     async fn initial_transcript(&self, depth: usize) -> Result<Vec<Item>, String> {
-        let mut transcript = load_initial_transcript(&self.root, self.system_prompt(depth)).await?;
+        let mut transcript = load_initial_transcript(&self.root, self.system_prompt()).await?;
         let origin = if depth > 0 {
             crate::session::SUBAGENT_SESSION_ORIGIN
         } else {
@@ -1790,31 +1780,15 @@ impl Runtime {
         Ok(transcript)
     }
 
-    fn system_prompt(&self, depth: usize) -> String {
-        let delegation_context = if depth > 0 {
-            format!("{SUBAGENT_SYSTEM_PROMPT_MARKER} Investigate it and carry out the work.\n\n")
-        } else {
-            String::new()
-        };
+    fn system_prompt(&self) -> String {
         format!(
             concat!(
                 "You are a coding agent using Kit version {} as your harness, working in {}. This is your cwd and project context, not a filesystem boundary. ",
                 "Make minimal changes, inspect before editing, and run the smallest useful check. ",
-                "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n",
-                "Use compose as a dependency graph: independent calls and `for` iterations run concurrently, including effectful calls; ",
-                "express required ordering with data dependencies or `after`, and use `fold` only for reductions or genuinely sequential chains. ",
-                "Parallelize independent work deliberately. Prefer one compose program whenever the remaining tool graph is known: keep intermediate results inside it when they can directly drive downstream work, and return only the bare minimum information necessary to plan the next turn or provide the final answer. ",
-                "Background long-running compose work across turn boundaries, including monitors that wait or poll for EXTERNAL events or state changes. ",
-                "Set the outer `background` argument to `true` to detach immediately or to a positive integer to wait that many seconds before detaching. ",
-                "After detaching, continue any independent work, including launching more detached work. When no independent work remains and you need background results, STOP: end your turn now. ",
-                "Stopping is a valid intermediate response, not completion or abandonment of the user's task. ",
-                "Do not issue additional tool calls to wait or poll for a background tool call to finish, or to keep the turn alive; the harness automatically resumes you when it finishes. ",
-                "Keep work foregrounded when the next step needs its result in the current turn, and do not treat backgrounding as durable job execution.\n\n",
-                "{}"
+                "Keep tool output lean: use targeted paths, ranges, filters, and bounded `head`/`tail` output. Do not dump whole trees, generated files, long successful build logs, credential files, or environment contents.\n\n"
             ),
             env!("CARGO_PKG_VERSION"),
             self.root.display(),
-            delegation_context
         )
     }
 }
@@ -2635,7 +2609,10 @@ fn background_requested(request: &ToolRequest) -> bool {
     )
 }
 
+const COMPOSE_GUIDANCE: &str = "\n\nPrefer one program whenever the remaining tool graph is known: keep intermediate results inside it when they can directly drive downstream work, and return only what you need to plan the next step or answer.";
+
 fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
+    spec.description.push_str(COMPOSE_GUIDANCE);
     if let Some(properties) = spec
         .input_schema
         .get_mut("properties")
@@ -2651,7 +2628,7 @@ fn backgroundable_spec(mut spec: ToolSpec) -> ToolSpec {
         properties.insert(
             "background".into(),
             Value::Object(Map::from_iter([
-                ("description".into(), Value::String("Run immediately in the background when true, or move to the background after this many seconds. False keeps the call in the foreground.".into())),
+                ("description".into(), Value::String("Run immediately in the background when true, or move to the background after this many seconds; false keeps the call in the foreground. Use it for long-running work or for waiting on external events while you have other work to do. You are resumed automatically when it finishes: once no independent work remains, end your turn instead of polling or making calls to keep the turn alive. Ending the turn this way does not complete the task. Keep a call in the foreground when your next step needs its result.".into())),
                 ("oneOf".into(), Value::Array(vec![
                     Value::Object(Map::from_iter([
                         ("type".into(), Value::String("boolean".into())),

@@ -340,6 +340,12 @@ impl AcpHarnesses {
         }
         config.credential_storage.append_cli_args(&mut command);
         config.telemetry.append_cli_args(&mut command);
+        if let Some(slots) = &config.tree_slots {
+            command.env(crate::tools::subagent::TREE_SLOTS_ENV, slots);
+        }
+        if let Some(key) = &config.prompt_cache_key {
+            command.env(crate::tools::subagent::PROMPT_CACHE_KEY_ENV, key);
+        }
         if let Some(api_key) = &config.openrouter_api_key {
             command.env("OPENROUTER_API_KEY", api_key.as_str());
         }
@@ -422,6 +428,10 @@ pub(crate) struct ChildConfig {
     /// Immediate owning Kit subagent, present only inside a nested Kit runtime.
     pub parent_id: Option<String>,
     pub parent_name: Option<String>,
+    /// Slot directory bounding live subagents across the whole delegation tree.
+    pub tree_slots: Option<PathBuf>,
+    /// Prompt cache key shared by every session in one delegation tree.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ChildConfig {
@@ -438,6 +448,16 @@ impl ChildConfig {
             *path = previous_root.join(&*path);
         }
         self.root = root;
+        self
+    }
+
+    pub(crate) fn with_tree_slots(mut self, directory: PathBuf) -> Self {
+        self.tree_slots = Some(directory);
+        self
+    }
+
+    pub(crate) fn with_cache_lineage(mut self, key: Option<String>) -> Self {
+        self.prompt_cache_key = key;
         self
     }
 
@@ -2740,6 +2760,8 @@ mod tests {
             default_harness: BUILTIN_HARNESS.into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -2843,6 +2865,8 @@ mod tests {
                 default_harness: "acp.external".into(),
                 parent_id: None,
                 parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3221,6 +3245,8 @@ for line in sys.stdin:
                 default_harness: "acp.broken".into(),
                 parent_id: None,
                 parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
             };
             let result = ChildSession::start(
                 config,
@@ -3307,6 +3333,8 @@ for line in sys.stdin:
             default_harness: "acp.broken".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let result = ChildSession::start(
             config,
@@ -3371,6 +3399,8 @@ for line in sys.stdin:
             default_harness: "acp.exits".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
 
         let error = match ChildSession::start(
@@ -3430,6 +3460,8 @@ for line in sys.stdin:
             default_harness: "acp.other".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3484,6 +3516,8 @@ for line in sys.stdin:
             default_harness: BUILTIN_HARNESS.into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -3618,6 +3652,8 @@ for line in sys.stdin:
             default_harness: "acp.broken".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let starts = (0..64)
             .map(|_| {
@@ -3686,6 +3722,8 @@ for line in sys.stdin:
             default_harness: "acp.mock".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let base = ChildSession::start(
             config,
@@ -3765,6 +3803,8 @@ for line in sys.stdin:
                 default_harness: "acp.mock".into(),
                 parent_id: None,
                 parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
             };
             let base = ChildSession::start(
                 config,
@@ -3929,6 +3969,8 @@ for line in sys.stdin:
                 default_harness: "acp.mock".into(),
                 parent_id: None,
                 parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
             };
             ChildSession::start(
                 config,
@@ -4250,6 +4292,8 @@ for line in sys.stdin:
             default_harness: "acp.mock".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -4518,6 +4562,8 @@ for line in sys.stdin:
             default_harness: "acp.mock".into(),
             parent_id: None,
             parent_name: None,
+            tree_slots: None,
+            prompt_cache_key: None,
         };
         let base = ChildSession::start(
             config,
@@ -4648,6 +4694,8 @@ for line in sys.stdin:
                     default_harness: "acp.mock".into(),
                     parent_id: None,
                     parent_name: None,
+                    tree_slots: None,
+                    prompt_cache_key: None,
                 },
                 "acp.mock".into(),
                 None,
@@ -4789,6 +4837,8 @@ for line in sys.stdin:
                 default_harness: "acp.mock".into(),
                 parent_id: None,
                 parent_name: None,
+                tree_slots: None,
+                prompt_cache_key: None,
             };
             let base = ChildSession::start(
                 config,
@@ -5245,6 +5295,8 @@ for line in sys.stdin:
                 default_harness: BUILTIN_HARNESS.into(),
                 parent_id: parent_id.map(str::to_owned),
                 parent_name: parent_name.map(str::to_owned),
+                tree_slots: None,
+                prompt_cache_key: None,
             }
         }
 

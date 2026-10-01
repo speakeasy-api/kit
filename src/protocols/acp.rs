@@ -1629,7 +1629,7 @@ impl Server {
         let (tx, rx) = mpsc::channel(8);
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
-            voice_monitor: voice_state.monitor(claim.is_resumed() || claim.is_fork()),
+            voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
             integration: Arc::clone(&self.integration),
@@ -2083,8 +2083,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     reply,
                 }) => {
                     let result = (|| {
-                        let mut transcript = driver.snapshot().transcript;
-                        crate::transcript::sanitize_forked_transcript(&mut transcript);
+                        let transcript = driver.snapshot().transcript;
                         Ok(AcpForkState {
                             transcript,
                             selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
@@ -5731,7 +5730,7 @@ pub(super) mod tests {
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let response = drive_runtime_prompt(
@@ -5855,7 +5854,7 @@ pub(super) mod tests {
             .unwrap();
         let task_manager = AsyncTaskManager::new();
         let tasks = task_manager.handle();
-        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let response = drive_runtime_prompt(
             &acp_session_id,
             &runtime,
@@ -5944,7 +5943,7 @@ pub(super) mod tests {
             .unwrap();
         let background_jobs = BackgroundJobs::default();
         let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
-        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(false);
+        let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let request = PromptRequest::new(
             acp_session_id.clone(),
             vec![agentkit_acp::ContentBlock::Text(
@@ -6238,7 +6237,7 @@ pub(super) mod tests {
         let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
         let skills = runtime.current_skills().await.unwrap();
         let actor = tokio::spawn(session_actor(SessionActor {
-            voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(false),
+            voice_monitor: crate::runtime::voice_state::VoiceState::default().monitor(&[]),
             session_id: acp_session_id.clone(),
             runtime,
             integration: Arc::clone(&integration),

@@ -248,7 +248,72 @@ pub(crate) fn clone_completed_in(
     let reasoning_effort = authority.reasoning_effort;
     let mut transcript = authority.items;
     crate::transcript::repair_unanswered_tool_calls(&mut transcript);
-    crate::transcript::sanitize_forked_transcript(&mut transcript);
+    crate::transcript::rebind_forked_transcript(&mut transcript, destination);
+    let opened = open_with_initial_timestamps_in(
+        root,
+        directory,
+        destination,
+        false,
+        false,
+        transcript,
+        InitialTranscriptOptions {
+            stamp_items: false,
+            commit_creation: false,
+        },
+    )?;
+    if let Some(effort) = reasoning_effort {
+        opened.observer.set_reasoning_effort(effort)?;
+    }
+    opened.observer.commit_creation()?;
+    drop(opened);
+    Ok(())
+}
+
+/// Seeds `destination` with `source`'s history before its in-flight response.
+pub fn clone_inherited(root: &Path, source: &str, destination: &str) -> Result<(), String> {
+    let directory = default_directory()?;
+    validate_id(source)?;
+    let authority = select_authority(&directory, &canonical_workspace(root), source)?
+        .ok_or_else(|| format!("session {source:?} does not exist"))?;
+    inherit_into(
+        root,
+        &directory,
+        destination,
+        authority.items,
+        authority.reasoning_effort,
+    )
+}
+
+/// Like [`clone_inherited`], for a parent whose conversation lives only in memory.
+pub(crate) fn clone_inherited_items(
+    root: &Path,
+    transcript: Vec<Item>,
+    destination: &str,
+) -> Result<(), String> {
+    inherit_into(root, &default_directory()?, destination, transcript, None)
+}
+
+fn inherit_into(
+    root: &Path,
+    directory: &Path,
+    destination: &str,
+    mut transcript: Vec<Item>,
+    reasoning_effort: Option<Option<crate::ReasoningEffort>>,
+) -> Result<(), String> {
+    while transcript
+        .last()
+        .is_some_and(|item| item.kind == ItemKind::Assistant)
+    {
+        transcript.pop();
+    }
+    crate::transcript::repair_unanswered_tool_calls(&mut transcript);
+    crate::transcript::rebind_forked_transcript(&mut transcript, destination);
+    if let Some(first) = transcript.first_mut() {
+        first.metadata.insert(
+            SESSION_ORIGIN_METADATA_KEY.into(),
+            serde_json::Value::String(SUBAGENT_SESSION_ORIGIN.into()),
+        );
+    }
     let opened = open_with_initial_timestamps_in(
         root,
         directory,
@@ -711,6 +776,35 @@ impl SessionObserver {
             .lock()
             .map_err(|_| "session transcript writer poisoned".to_string())?
             .replace(transcript)
+    }
+}
+
+/// In-memory transcript of a session without durable storage, kept so its
+/// conversation can still be forked.
+#[derive(Clone)]
+pub(crate) struct TransientTranscript(Arc<Mutex<Vec<Item>>>);
+
+impl TransientTranscript {
+    pub(crate) fn new(transcript: Vec<Item>) -> Self {
+        Self(Arc::new(Mutex::new(transcript)))
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<Item> {
+        self.0.lock().map(|items| items.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn replace(&self, transcript: &[Item]) {
+        if let Ok(mut items) = self.0.lock() {
+            transcript.clone_into(&mut items);
+        }
+    }
+}
+
+impl TranscriptObserver for TransientTranscript {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        if let Ok(mut items) = self.0.lock() {
+            items.push(event.item.clone());
+        }
     }
 }
 
@@ -2699,6 +2793,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn transient_transcripts_follow_the_conversation_and_can_be_forked() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let system = Item::text(ItemKind::System, "system");
+        let transcript = TransientTranscript::new(vec![system.clone()]);
+        let session = agentkit_core::SessionId::new("run-1");
+        for item in [
+            Item::text(ItemKind::User, "question"),
+            Item::text(ItemKind::Assistant, "partial"),
+        ] {
+            transcript.on_transcript_event(TranscriptEvent {
+                session_id: &session,
+                item: &item,
+            });
+        }
+        assert_eq!(transcript.snapshot().len(), 3);
+
+        let destination = new_id();
+        inherit_into(
+            root.path(),
+            directory.path(),
+            &destination,
+            transcript.snapshot(),
+            None,
+        )
+        .unwrap();
+        let forked = load_in(root.path(), directory.path(), &destination).unwrap();
+        let kinds = forked.iter().map(|item| item.kind).collect::<Vec<_>>();
+        assert_eq!(kinds, vec![ItemKind::System, ItemKind::User]);
+
+        transcript.replace(&[system, Item::text(ItemKind::User, "summary")]);
+        assert_eq!(transcript.snapshot().len(), 2);
+    }
+
+    #[test]
     fn reasoning_effort_absent_changes_reset_and_fork() {
         let root = tempfile::tempdir().unwrap();
         let opened = open(
@@ -3603,7 +3732,7 @@ mod tests {
     }
 
     #[test]
-    fn cloning_sanitizes_session_bound_continuation_metadata() {
+    fn cloning_rebinds_continuation_metadata_to_the_branch() {
         let root = tempfile::tempdir().unwrap();
         let mut metadata = MetadataMap::new();
         metadata.insert(
@@ -3641,10 +3770,13 @@ mod tests {
                 .metadata
                 .contains_key("openai.responses.continuation.v1")
         );
-        assert!(
-            !branch
-                .metadata
-                .contains_key("openai.responses.continuation.v1")
+        assert_eq!(
+            source.metadata["openai.responses.continuation.v1"]["session_id"],
+            "source"
+        );
+        assert_eq!(
+            branch.metadata["openai.responses.continuation.v1"]["session_id"],
+            "branch"
         );
         assert_eq!(branch.metadata["preserved"], true);
     }

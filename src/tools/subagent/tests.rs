@@ -54,6 +54,8 @@ impl Subagents {
                     recovery: None,
                     forking: None,
                     permit: Some(self.reserve().unwrap()),
+                    cache_key: None,
+                    finished: Default::default(),
                 },
             )
             .unwrap();
@@ -308,27 +310,26 @@ fn text_only_values_keep_the_existing_json_shape() {
 fn manager_with_disconnected_session(
     root: &Path,
 ) -> (Subagents, Arc<AsyncMutex<State>>, SubagentValue) {
-    let manager = Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.to_path_buf(),
-            model: "test".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses: Default::default(),
-            default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    );
+    let manager = Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.to_path_buf(),
+        model: "test".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses: Default::default(),
+        default_harness: crate::acp_child::BUILTIN_HARNESS.into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    });
     let state = Arc::new(AsyncMutex::new(State {
         name: "Scout".into(),
         status: SubagentStatus::Idle,
@@ -349,7 +350,9 @@ fn manager_with_disconnected_session(
         child: Some(ChildSession::disconnected_for_test()),
         recovery: None,
         forking: None,
-        permit: Some(Arc::clone(&manager.capacity).try_acquire_owned().unwrap()),
+        permit: Some(manager.acquire_permit().unwrap()),
+        cache_key: None,
+        finished: Default::default(),
     }));
     manager.sessions.lock().unwrap().insert(
         "source".into(),
@@ -381,27 +384,26 @@ async fn close_does_not_block_listings_or_allow_stale_reuse() {
         },
     )]))
     .unwrap();
-    let manager = Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.path().to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses,
-            default_harness: "acp.generic".into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    );
+    let manager = Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.path().to_path_buf(),
+        model: "unused".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses,
+        default_harness: "acp.generic".into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    });
     let handle = manager
         .create(
             "base".into(),
@@ -546,27 +548,26 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
         },
     )]))
     .unwrap();
-    Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses,
-            default_harness: "acp.generic".into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    )
+    Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.to_path_buf(),
+        model: "unused".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses,
+        default_harness: "acp.generic".into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    })
 }
 
 #[test]
@@ -1036,7 +1037,7 @@ mod lifecycle_events {
         let mut config = base.child_config();
         config.parent_id = Some("s-parent".into());
         config.parent_name = Some("偵察 🦀".into());
-        let (manager, events) = observe_events(Subagents::new(config, 2));
+        let (manager, events) = observe_events(Subagents::new(config));
 
         manager.insert_starting_for_test().await;
 
@@ -1101,8 +1102,10 @@ mod lifecycle_events {
                 None,
             )
             .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "nested agent refused the prompt");
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nested agent refused the prompt"), "{error}");
+        assert!(error.contains(&format!("{:?}", handle.id)), "{error}");
         manager
             .close(&handle.id, &TurnCancellation::default())
             .await
@@ -1776,27 +1779,26 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
         },
     )]))
     .unwrap();
-    let manager = Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.path().to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses,
-            default_harness: "acp.generic".into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    );
+    let manager = Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.path().to_path_buf(),
+        model: "unused".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses,
+        default_harness: "acp.generic".into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    });
     let handle = manager
         .create(
             "base".into(),
@@ -1816,8 +1818,10 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
             None,
         )
         .await
-        .unwrap_err();
-    assert_eq!(error.to_string(), "nested agent refused the prompt");
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nested agent refused the prompt"), "{error}");
+    assert!(error.contains(&format!("{:?}", handle.id)), "{error}");
     let state = manager
         .lookup(&handle)
         .expect("live child remains reusable");
@@ -1874,27 +1878,26 @@ async fn listing_includes_named_starting_and_idle_subagents() {
         },
     )]))
     .unwrap();
-    let manager = Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.path().to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses,
-            default_harness: "acp.generic".into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    );
+    let manager = Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.path().to_path_buf(),
+        model: "unused".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses,
+        default_harness: "acp.generic".into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    });
     let create_manager = manager.clone();
     let create = tokio::spawn(async move {
         create_manager
@@ -2027,27 +2030,26 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         },
     )]))
     .unwrap();
-    let manager = Subagents::new(
-        ChildConfig {
-            additional_directories: Vec::new(),
-            root: root.path().to_path_buf(),
-            model: "unused".into(),
-            provider: Default::default(),
-            reasoning_effort: None,
-            openrouter_api_key: None,
-            configured_mcp_config: None,
-            configured_mcp_config_inherited: false,
-            legacy_mcp_config: false,
-            mcp_config: None,
-            credential_storage: Default::default(),
-            telemetry: Default::default(),
-            harnesses,
-            default_harness: "acp.generic".into(),
-            parent_id: None,
-            parent_name: None,
-        },
-        2,
-    );
+    let manager = Subagents::new(ChildConfig {
+        additional_directories: Vec::new(),
+        root: root.path().to_path_buf(),
+        model: "unused".into(),
+        provider: Default::default(),
+        reasoning_effort: None,
+        openrouter_api_key: None,
+        configured_mcp_config: None,
+        configured_mcp_config_inherited: false,
+        legacy_mcp_config: false,
+        mcp_config: None,
+        credential_storage: Default::default(),
+        telemetry: Default::default(),
+        harnesses,
+        default_harness: "acp.generic".into(),
+        parent_id: None,
+        parent_name: None,
+        tree_slots: None,
+        prompt_cache_key: None,
+    });
     let prior = manager
         .create(
             "base".into(),
