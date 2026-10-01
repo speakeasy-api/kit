@@ -3804,7 +3804,7 @@ fn draw_frame<W: std::io::Write>(
 }
 
 /// Owns terminal modes across fallible setup, dropped futures, and unwind.
-/// Declare input after this guard so its reader joins before mode restoration.
+/// Declare input after this guard so its reader stops before mode restoration.
 struct TerminalSession {
     terminal: DefaultTerminal,
     active: bool,
@@ -3832,7 +3832,7 @@ impl Drop for TerminalSession {
 }
 
 fn enter() -> std::io::Result<(TerminalSession, image::ImageRuntime)> {
-    // Unwinding restores through TerminalSession, after Events has joined.
+    // Unwinding restores through TerminalSession, after Events has dropped.
     // A process-global unwind hook would restore too early, including for an
     // unrelated worker panic whose terminal owner remains alive.
     #[cfg(panic = "abort")]
@@ -4036,7 +4036,14 @@ fn leave(terminal: &mut TerminalSession) {
     terminal.active = false;
     restore_modes();
     let _ = terminal.show_cursor();
-    ratatui::restore();
+    if let Err(error) = ratatui::try_restore() {
+        // After a hangup stderr is the same dead terminal: `eprintln!` would
+        // panic there and skip the session close that follows teardown.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("Failed to restore terminal: {error}\n").as_bytes(),
+        );
+    }
     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
 }
 

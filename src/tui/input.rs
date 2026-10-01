@@ -1,5 +1,6 @@
 //! Single-owner terminal input. Create only after capability queries finish;
 //! drop (and join) before restoring the terminal or handing stdin to a child.
+//! The join is bounded: a reader stuck on a hung-up terminal is detached.
 //! Image/keyboard capability queries may read synchronously during setup, before
 //! this owner exists. During its lifetime the UI only consumes the bounded queue:
 //! it never polls the OS input reader or acquires crossterm's input lock.
@@ -94,10 +95,10 @@ impl Drop for Events {
         self.receiver.close();
         self.stopped.store(true, Ordering::Release);
         if let Some(reader) = self.reader.take() {
-            // A reader that outlives the timeout is stuck on a dead terminal:
-            // there is no input left to steal, and waiting would keep the
-            // process alive and spinning after its terminal closed. Detach it
-            // so the process can exit.
+            // A reader that outlives the timeout is stuck inside crossterm,
+            // in practice on a dead terminal with no input left to steal.
+            // Waiting would keep the process alive and spinning after its
+            // terminal closed. Detach it so the process can exit.
             if self.exited.recv_timeout(JOIN_TIMEOUT) == Err(RecvTimeoutError::Timeout) {
                 return;
             }

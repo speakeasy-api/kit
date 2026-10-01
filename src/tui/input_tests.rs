@@ -111,20 +111,22 @@ fn child_case(case: &str) {
         "hangup" => {
             // The parent closes the PTY master, as a closed terminal window
             // does. Take the hangup through the real stop boundary, then tear
-            // input down: it must return although the terminal is gone.
+            // down: both steps must return although the terminal is gone.
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             runtime.block_on(async {
                 let mut stop = crate::tui::Stop::new().unwrap();
-                let (_terminal, _images) = enter().unwrap();
+                let (mut terminal, _images) = enter().unwrap();
                 let events = Events::new().unwrap();
                 marker("HANGUP");
                 assert!(stop.until(std::future::pending::<()>()).await.is_none());
                 drop(events);
-                // Nothing is left to restore or report to; only the exit
-                // status still reaches the parent.
+                // Restoring a dead terminal fails; it must not panic either.
+                leave(&mut terminal);
+                // Nothing is left to report to; only the exit status still
+                // reaches the parent.
                 std::process::exit(0);
             });
         }
