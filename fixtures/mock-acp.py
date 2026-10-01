@@ -150,7 +150,7 @@ def prompt(request):
             "sessionId": request["params"]["sessionId"],
             "update": {"sessionUpdate": "state_update", "state": "idle", "stopReason": "refusal"}
         }})
-        respond(request["id"], {})
+        respond(request["id"], {"messageId": "user-1"})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": request["params"]["sessionId"],
             "update": {"sessionUpdate": "state_update", "state": "running"}
