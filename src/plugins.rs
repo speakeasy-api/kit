@@ -3328,7 +3328,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], String> {
         return Err("plugin archive sha256 must contain exactly 64 hexadecimal characters".into());
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let text = std::str::from_utf8(pair)
             .map_err(|error| format!("could not parse plugin archive sha256: {error}"))?;
         digest[index] = u8::from_str_radix(text, 16)

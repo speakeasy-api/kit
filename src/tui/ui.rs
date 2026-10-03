@@ -907,11 +907,11 @@ fn cost_label(amount: f64, currency: &str) -> String {
 fn gauge_spans(used: u64, size: u64) -> Vec<Span<'static>> {
     const CELLS: u64 = 10;
     const COMPACT_AT: u64 = 8;
-    let filled = if size == 0 {
-        0
-    } else {
-        (used.saturating_mul(CELLS) / size).min(CELLS)
-    };
+    let filled = used
+        .saturating_mul(CELLS)
+        .checked_div(size)
+        .unwrap_or(0)
+        .min(CELLS);
     let fill = Style::default().fg(if filled >= COMPACT_AT {
         theme::warn_color()
     } else {
@@ -2658,11 +2658,11 @@ fn agent_lines(
 /// Six-cell context gauge for an agent row, followed by a space.
 fn agent_gauge(used: u64, size: u64) -> Vec<Span<'static>> {
     const CELLS: u64 = 6;
-    let filled = if size == 0 {
-        0
-    } else {
-        (used.saturating_mul(CELLS) / size).min(CELLS)
-    };
+    let filled = used
+        .saturating_mul(CELLS)
+        .checked_div(size)
+        .unwrap_or(0)
+        .min(CELLS);
     let fill = Style::default().fg(if used.saturating_mul(10) >= size.saturating_mul(8) {
         theme::warn_color()
     } else {

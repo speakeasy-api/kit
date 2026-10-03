@@ -480,7 +480,7 @@ impl Selection {
                     return Err("compose return exceeds file-selection traversal budget".into());
                 }
                 let mut entries = object.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+                entries.sort_unstable_by_key(|(a, _)| *a);
                 for (key, child) in entries {
                     if key.len() > MAX_HEADER_BYTES {
                         return Err("compose return key exceeds file-selection label budget".into());
