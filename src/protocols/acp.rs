@@ -699,7 +699,7 @@ impl SessionRegistry {
     pub(super) fn next_token(&self) -> Result<u64, AcpRuntimeError> {
         self.inner
             .next_token
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
                 token.checked_add(1)
             })
             .map_err(|_| AcpRuntimeError::Loop("ACP session registry token space exhausted".into()))

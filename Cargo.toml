@@ -2,7 +2,7 @@
 name = "kit"
 version = "0.2.8"
 edition = "2024"
-rust-version = "1.94.0"
+rust-version = "1.99.0"
 publish = false
 
 [features]
@@ -26,9 +26,9 @@ tui = [
 ]
 
 [dependencies]
-opus-pure = { version = "=0.2.1", default-features = false, optional = true }
-str0m = { version = "=0.23.1", default-features = false, features = ["aws-lc-rs"], optional = true }
-tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
+opus-pure = { version = "=0.2.2", default-features = false, optional = true }
+str0m = { version = "=0.24.0", default-features = false, features = ["aws-lc-rs"], optional = true }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
 a2a-protocol-client = "=0.11.0"
 a2a-protocol-server = { version = "=0.11.0", default-features = false }
 a2a-protocol-types = "=0.11.0"
@@ -57,24 +57,24 @@ axum = "=0.8.9"
 base64 = "=0.23.1"
 blake3 = "=1.8.7"
 bytes = "=1.12.1"
-clap = { version = "=4.6.6", features = ["derive"] }
+clap = { version = "=4.6.7", features = ["derive"] }
 crossterm = { version = "=0.29.0", features = ["event-stream"], optional = true }
 flate2 = "=1.1.10"
 ignore = "=0.4.33"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
 hyper = "=1.11.1"
-hyper-util = { version = "=0.1.20", features = ["server", "http1", "http2", "tokio"] }
+hyper-util = { version = "=0.1.21", features = ["server", "http1", "http2", "tokio"] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
 keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
-jsonschema = { version = "=0.52.1", default-features = false, features = ["idna"] }
+jsonschema = { version = "=0.58.5", default-features = false, features = ["idna"] }
 neo_frizbee = "=0.11.0"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
-ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"], optional = true }
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"], optional = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
 rpassword = "=7.5.4"
@@ -86,8 +86,8 @@ sha2 = "=0.11.0"
 subtle = "=2.6.1"
 tar = { version = "=0.4.46", default-features = false }
 tempfile = "=3.27.0"
-toml = "=1.1.5"
-toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
+toml = "=1.1.6"
+toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "=0.7.19", features = ["compat"] }
 tower = { version = "=0.5.3", features = ["util"] }
@@ -97,7 +97,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 unicode-segmentation = { version = "=1.13.3", optional = true }
 unicode-width = { version = "=0.2.2", optional = true }
 url = "=2.5.8"
-uuid = { version = "=1.26.0", features = ["v5"] }
+uuid = { version = "=1.26.1", features = ["v5"] }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zeroize = { version = "=1.9.0", features = ["derive"] }
 
@@ -121,7 +121,7 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
-jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 tokio = { version = "=1.53.1", features = ["test-util"] }
 
 # Deny also in test builds; only test-only scopes may relax ergonomics. Crate

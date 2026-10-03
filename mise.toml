@@ -1,7 +1,7 @@
 min_version = "2026.7.0"
 
 [tools]
-rust = { version = "1.94.0", profile = "minimal", components = "rustfmt,clippy" }
+rust = { version = "1.99.0", profile = "minimal", components = "rustfmt,clippy" }
 python = { version = "3.13", os = ["macos"] }
 # Checksum-pinned release archive; scripts/generate-macos-project.sh also verifies the binary hash.
 "http:xcodegen" = { version = "2.45.4", os = ["macos"], url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip", checksum = "sha256:090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef", bin_path = "xcodegen/bin" }

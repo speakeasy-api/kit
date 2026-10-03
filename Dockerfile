@@ -3,7 +3,7 @@
 # Published flavors are built from the named final stages: bookworm, slim,
 # and alpine. The unqualified image uses the final `default` stage, which
 # intentionally aliases slim.
-ARG RUST_VERSION=1.94.0
+ARG RUST_VERSION=1.99.0
 ARG DEBIAN_SUITE=bookworm
 ARG ALPINE_VERSION=3.23
 ARG VERSION=source

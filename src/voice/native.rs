@@ -1,9 +1,9 @@
 //! Native, actor-owned WebRTC transport. The caller exchanges `offer` for an SDP
 //! answer, then calls `accept_answer`. No browser, subprocess, or signaling I/O.
 //!
-//! API verified against str0m 0.23.1 (aws-lc-rs), cubeb 0.38.0 on Linux,
+//! API verified against str0m 0.24.0 (aws-lc-rs), cubeb 0.38.0 on Linux,
 //! cpal 0.18.2 elsewhere,
-//! and opus-pure 0.2.1, all with default features disabled. TUI availability is
+//! and opus-pure 0.2.2, all with default features disabled. TUI availability is
 //! gated by the default-off experimental.voice startup setting.
 //! Supply a concrete local interface address; no STUN/TURN discovery is performed.
 //! The answer must contain reachable ICE candidates. Capture starts closed.
@@ -176,7 +176,7 @@ fn negotiation(bind: SocketAddr) -> Result<(Rtc, Mid, ChannelId, String, SdpPend
     let mut rtc = Rtc::builder()
         .set_crypto_provider(str0m::crypto::from_feature_flags().into())
         .clear_codecs()
-        .enable_opus(true)
+        .enable_opus(true, false)
         .set_reordering_size_audio(10)
         .set_send_buffer_audio(50)
         .build(Instant::now());
@@ -612,7 +612,7 @@ mod tests {
         let mut peer = Rtc::builder()
             .set_crypto_provider(str0m::crypto::from_feature_flags().into())
             .clear_codecs()
-            .enable_opus(true)
+            .enable_opus(true, false)
             .build(Instant::now());
         peer.add_local_candidate(
             Candidate::host("127.0.0.1:19003".parse().unwrap(), "udp").unwrap(),

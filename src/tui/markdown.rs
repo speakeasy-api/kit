@@ -892,10 +892,7 @@ fn next_link<'a>(
         let mut balance = source[start..end].bytes().fold(0isize, |balance, byte| {
             balance + isize::from(byte == b')') - isize::from(byte == b'(')
         });
-        loop {
-            let Some(character) = source[..end].chars().next_back() else {
-                break;
-            };
+        while let Some(character) = source[..end].chars().next_back() {
             let unmatched_close = character == ')' && balance > 0;
             if matches!(
                 character,

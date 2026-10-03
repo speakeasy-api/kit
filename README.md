@@ -137,7 +137,7 @@ USER kit
 
 ```sh
 git clone https://github.com/speakeasy-api/kit && cd kit
-mise install                   # Rust 1.94 with rustfmt and clippy; Python and XcodeGen on macOS
+mise install                   # Rust 1.99 with rustfmt and clippy; Python and XcodeGen on macOS
 mise run setup:linux           # Debian/Ubuntu only: C/C++, CMake, pkg-config, ALSA/PulseAudio headers (sudo)
 mise run install               # cargo install into ~/.cargo/bin
 mise run dev -- tui --root .   # cargo run; arguments pass through
