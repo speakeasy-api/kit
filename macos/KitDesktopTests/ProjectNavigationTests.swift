@@ -15,8 +15,10 @@ final class ProjectNavigationTests: XCTestCase {
         try store.save(PersistedAppState(workspaces: [newer, older], conversations: conversations))
         let model = AppModel(store: store, catalogLoader: nil, requestNotificationAuthorization: false)
 
+        XCTAssertNil(model.persistenceError)
         let projects = model.projects
         XCTAssertEqual(projects.map(\.id), [older.id, newer.id])
+        _ = try XCTUnwrap(projects.first)
         XCTAssertEqual(projects[0].recentConversations.map(\.title), ["Task 4", "Task 3", "Task 2"])
         XCTAssertEqual(projects[0].conversations.count, 5)
         XCTAssertTrue(projects[1].recentConversations.isEmpty)
@@ -35,6 +37,7 @@ final class ProjectNavigationTests: XCTestCase {
         let conversation = Conversation(workspaceID: workspace.id, unread: true, awaitingUser: true)
         try store.save(PersistedAppState(workspaces: [workspace], conversations: [conversation]))
         let model = AppModel(store: store, catalogLoader: nil, requestNotificationAuthorization: false)
+        XCTAssertNil(model.persistenceError)
         model.selectedConversationID = conversation.id
         model.showProjects()
         model.appBecameActive()
@@ -66,6 +69,7 @@ final class ProjectNavigationTests: XCTestCase {
             ConversationController(conversation: conversation, workspacePath: path,
                                    client: ACPClient(launchOverride: launch, requestTimeout: 2, promptTimeout: 2))
         }, requestNotificationAuthorization: false)
+        XCTAssertNil(model.persistenceError)
         model.selectConversation(conversation.id)
         XCTAssertEqual(model.selectedWorkspaceID, second.id)
         let controller = try XCTUnwrap(model.selectedController)
