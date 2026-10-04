@@ -5,12 +5,27 @@ struct Workspace: Codable, Identifiable, Equatable {
     var name: String
     var path: String
     var createdAt: Date
+    var additionalDirectories: [String]
 
-    init(id: UUID = UUID(), name: String, path: String, createdAt: Date = Date()) {
+    init(id: UUID = UUID(), name: String, path: String, createdAt: Date = Date(), additionalDirectories: [String] = []) {
         self.id = id
         self.name = name
         self.path = path
         self.createdAt = createdAt
+        self.additionalDirectories = additionalDirectories
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, path, createdAt, additionalDirectories }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        path = try values.decode(String.self, forKey: .path)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        // Additive v3 field: absence is legacy; null and malformed values are errors.
+        additionalDirectories = values.contains(.additionalDirectories)
+            ? try values.decode([String].self, forKey: .additionalDirectories) : []
     }
 }
 
@@ -306,6 +321,21 @@ struct AgentRoster: Equatable {
     }
 
     private(set) var rowsByID: [String: AgentRosterRow] = [:]
+    private(set) var usageByID: [String: DesktopUsageUpdate] = [:]
+    private var steerableGenerations: [String: UInt64] = [:]
+
+    func canSteer(id: String, generation: UInt64) -> Bool {
+        steerableGenerations[id] == generation
+    }
+    // Costs are cumulative snapshots per child, not deltas. Keep closed children
+    // in the ledger so removal from the live roster does not reduce session spend.
+    private var costsByID: [String: DesktopCost] = [:]
+
+    var costTotals: [String: Double] {
+        costsByID.values.reduce(into: [:]) { totals, cost in
+            totals[cost.currency, default: 0] += cost.amount
+        }
+    }
     private var versions: [String: Version] = [:]
     private var cleanedIDs: Set<String> = []
 
@@ -353,6 +383,14 @@ struct AgentRoster: Equatable {
 
     mutating func reset() { self = AgentRoster() }
 
+    /// A transport gap invalidates live observations, not accumulated provider spend.
+    mutating func invalidateLiveState() {
+        rowsByID.removeAll()
+        usageByID.removeAll()
+        steerableGenerations.removeAll()
+        versions.removeAll()
+    }
+
     @discardableResult
     mutating func apply(event: [String: Any], nowMS: UInt64) -> Bool {
         switch event["event"] as? String {
@@ -361,11 +399,36 @@ struct AgentRoster: Equatable {
             let incoming = Version(generation: row.generation, statusRank: row.status.rank)
             if let current = versions[row.id], incoming <= current { return false }
             versions[row.id] = incoming
+            if row.status != .working || steerableGenerations[row.id] != row.generation {
+                steerableGenerations.removeValue(forKey: row.id)
+            }
             if row.status == .removed,
                row.outcome != .failed || row.generationFinishedAtMS.map({ nowMS - min(nowMS, $0) >= 4_000 }) != false {
                 rowsByID.removeValue(forKey: row.id)
+                usageByID.removeValue(forKey: row.id)
             } else {
                 rowsByID[row.id] = row
+            }
+            return true
+        case "subagent_capabilities":
+            guard let id = event["id"] as? String, let generation = Self.unsigned(event["generation"]),
+                  let canSteer = event["can_steer"] as? Bool, let row = rowsByID[id],
+                  row.generation == generation, row.status == .working else { return false }
+            if canSteer { steerableGenerations[id] = generation }
+            else { steerableGenerations.removeValue(forKey: id) }
+            return true
+        case "subagent_usage":
+            guard let id = event["id"] as? String else { return false }
+            let used = (event["used"] as? NSNumber)?.intValue
+            let size = (event["size"] as? NSNumber)?.intValue
+            var cost: DesktopCost?
+            if let value = event["cost"] as? [String: Any],
+               let amount = value["amount"] as? NSNumber, let currency = value["currency"] as? String {
+                let candidate = DesktopCost(amount: amount.doubleValue, currency: currency)
+                if candidate.isValid { cost = candidate; costsByID[id] = candidate }
+            }
+            if rowsByID[id] != nil {
+                usageByID[id] = DesktopUsageUpdate(used: used, size: size, cost: cost ?? usageByID[id]?.cost)
             }
             return true
         case "subagent_descendants_removed":
@@ -379,6 +442,8 @@ struct AgentRoster: Equatable {
                 if removed.count == before { break }
             }
             rowsByID = rowsByID.filter { !removed.contains($0.key) }
+            usageByID = usageByID.filter { !removed.contains($0.key) }
+            steerableGenerations = steerableGenerations.filter { !removed.contains($0.key) }
             cleanedIDs.formUnion(removed)
             return true
         default: return false
@@ -392,6 +457,7 @@ struct AgentRoster: Equatable {
             row.status != .removed || row.outcome != .failed
                 || row.generationFinishedAtMS.map { nowMS - min(nowMS, $0) < 4_000 } == true
         }
+        usageByID = usageByID.filter { rowsByID[$0.key] != nil }
         return rowsByID.count != before
     }
 
@@ -405,6 +471,7 @@ struct AgentRoster: Equatable {
                 generationFinishedAtMS: row.generationFinishedAtMS ?? nowMS
             )
             rowsByID[id] = retired
+            steerableGenerations.removeValue(forKey: id)
             versions[id] = Version(generation: row.generation, statusRank: SubagentStatus.removed.rank)
         }
     }
@@ -458,7 +525,10 @@ struct TranscriptEntry: Identifiable {
     var formatted: AttributedString?
     var children: [RuntimeChild]
     var backgrounded: Bool
-    var contentBlocks: [DesktopContentBlock]
+    var contentBlocksRevision: UInt64 = 0
+    var contentBlocks: [DesktopContentBlock] {
+        didSet { contentBlocksRevision &+= 1 }
+    }
     var presentation: TranscriptPresentation?
 
     init(

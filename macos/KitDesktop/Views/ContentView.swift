@@ -3,9 +3,14 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var expandedProjects: Set<UUID> = []
 
     var body: some View {
-        NavigationSplitView { sidebar } detail: { detail }
+        let projects = model.projects
+        NavigationSplitView { sidebar(projects) } detail: {
+            if model.showingProjects { ProjectsView(projects: projects, addFolder: chooseWorkspace) }
+            else { detail }
+        }
             .navigationSplitViewStyle(.balanced)
             .tint(Brand.primary)
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -21,85 +26,71 @@ struct ContentView: View {
             }
     }
 
-    private var sidebar: some View {
+    private func sidebar(_ projects: [ProjectSummary]) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Text("Kit").brandDisplay(21)
+                Image("KitMark").resizable().scaledToFit().frame(width: 24, height: 24)
+                Text("Kit").brandDisplay(23)
                 Spacer()
                 Button(action: chooseWorkspace) { Image(systemName: "folder.badge.plus") }
-                    .buttonStyle(.plain).pointingHandCursor().help("Add workspace")
+                    .buttonStyle(.plain).pointingHandCursor().help("Add project folder")
                 Button(action: model.createConversation) { Image(systemName: "square.and.pencil") }
                     .buttonStyle(.plain).pointingHandCursor()
                     .disabled(model.selectedWorkspaceID == nil).help("New conversation")
-            }
-            .font(.system(size: 15, weight: .medium))
-            .padding(.horizontal, 16).frame(height: 50)
+            }.padding(.horizontal, 16).frame(height: 56)
             BrandSpectrumRule()
-
-            if model.state.workspaces.isEmpty {
-                Spacer()
-                VStack(spacing: 12) {
-                    Image(systemName: "folder.badge.plus").font(.system(size: 28)).foregroundStyle(.secondary)
-                    Text("Add a workspace").brandDisplay(20)
-                    Text("Choose a project folder to start.").font(.callout).foregroundStyle(.secondary)
-                    Button("Choose Folder", action: chooseWorkspace).pointingHandCursor()
-                }.multilineTextAlignment(.center).padding(24)
-                Spacer()
-            } else {
-                workspacePicker.padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
-                Divider().opacity(0.55)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text("Conversations").brandMicroLabel().foregroundStyle(.tertiary)
-                            Spacer()
-                        }.padding(.horizontal, 10).padding(.top, 13).padding(.bottom, 5)
-                        ForEach(model.workspaceConversations) { conversation in
+            List {
+                Button(action: model.showProjects) {
+                    Label("Projects", systemImage: "square.grid.2x2")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                }.buttonStyle(.plain).pointingHandCursor()
+                    .listRowBackground(model.showingProjects ? Brand.ember.opacity(0.14) : Color.clear)
+                ForEach(projects) { project in
+                    Section {
+                        HStack(spacing: 6) {
+                            Button { model.selectWorkspace(project.id) } label: {
+                                Label(project.workspace.name, systemImage: "folder")
+                                    .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                            }.buttonStyle(.plain).pointingHandCursor()
+                            Button { model.createConversation(in: project.id) } label: {
+                                Image(systemName: "plus").font(.caption)
+                            }.buttonStyle(.plain).pointingHandCursor().help("New conversation in \(project.workspace.name)")
+                        }.padding(.vertical, 4)
+                            .listRowBackground(!model.showingProjects && model.selectedWorkspaceID == project.id && model.selectedConversationID == nil ? Brand.ember.opacity(0.14) : Color.clear)
+                        ForEach(expandedProjects.contains(project.id) ? project.conversations : project.recentConversations) { conversation in
                             Button { model.selectConversation(conversation.id) } label: {
                                 ConversationRow(
                                     conversation: conversation,
-                                    selected: conversation.id == model.selectedConversationID,
+                                    selected: !model.showingProjects && conversation.id == model.selectedConversationID,
                                     running: model.activity[conversation.id] == true,
                                     locked: model.lockedConversationIDs.contains(conversation.id)
                                 )
                             }.buttonStyle(.plain).pointingHandCursor()
                         }
-                        if model.workspaceConversations.isEmpty {
-                            VStack(spacing: 8) {
-                                Text("No conversations yet").font(.callout).foregroundStyle(.secondary)
-                                Button("Start a conversation", action: model.createConversation)
-                                    .buttonStyle(.link).pointingHandCursor()
-                            }.frame(maxWidth: .infinity).padding(.top, 36)
+                        if project.conversations.isEmpty {
+                            Text("No conversations yet").font(.caption).foregroundStyle(.tertiary).padding(.leading, 22)
                         }
-                    }.padding(.horizontal, 8).padding(.bottom, 12)
+                        if project.conversations.count > 3 {
+                            Button {
+                                if expandedProjects.contains(project.id) { expandedProjects.remove(project.id) }
+                                else { expandedProjects.insert(project.id) }
+                            } label: {
+                                Text(expandedProjects.contains(project.id) ? "Show less" : "Show \(project.conversations.count - 3) more")
+                                    .font(.caption).foregroundStyle(.secondary).padding(.leading, 22)
+                            }.buttonStyle(.plain).pointingHandCursor()
+                        }
+                    }
                 }
-            }
-        }
-        .background(Brand.paper)
-        .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
-    }
-
-    private var workspacePicker: some View {
-        Menu {
-            ForEach(model.state.workspaces) { workspace in
-                Button { model.selectWorkspace(workspace.id) } label: {
-                    if workspace.id == model.selectedWorkspaceID { Label(workspace.name, systemImage: "checkmark") }
-                    else { Text(workspace.name) }
-                }
-            }
+            }.listStyle(.sidebar)
             Divider()
-            Button("Add Workspace…", action: chooseWorkspace)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "folder").foregroundStyle(.secondary)
-                Text(model.selectedWorkspace?.name ?? "Workspace").fontWeight(.medium).lineLimit(1)
-                Spacer()
-                Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 10).frame(height: 34)
-            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: Brand.Radius.small))
-            .overlay { RoundedRectangle(cornerRadius: Brand.Radius.small).stroke(Brand.hairline) }
-        }.buttonStyle(.plain)
+            Button(action: chooseWorkspace) { Label("Add project folder", systemImage: "plus") }
+                .buttonStyle(.plain).pointingHandCursor().font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+        }.background(Brand.paper)
+            .navigationSplitViewColumnWidth(min: 230, ideal: 280, max: 380)
     }
 
     @ViewBuilder
@@ -130,7 +121,7 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Add Workspace"
+        panel.prompt = "Add Project"
         if panel.runModal() == .OK, let url = panel.url { model.addWorkspace(path: url.path) }
     }
 }
@@ -312,6 +303,27 @@ private final class DroppableTextView: NSTextView {
         )
     }
 
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        if !urls.isEmpty, onDrop?(urls) == true { return }
+        guard let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) else {
+            super.paste(sender)
+            return
+        }
+        // Publish pending state before scheduling conversion so send/steer cannot race it.
+        onPromisesStarted?(1)
+        let receive = onPromiseReceived
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try ClipboardMediaImport.writeImage(data) }
+            }.value
+            receive?(result)
+        }
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard canReceiveFiles(from: sender) else { return super.draggingEntered(sender) }
         onTargeted?(true)
@@ -490,9 +502,11 @@ private struct ConversationView: View {
     @ObservedObject var controller: ConversationController
     let title: String
     @State private var choosingFiles = false
+    @State private var editingSteer: ConversationController.PendingSteer?
     @State private var followTranscript = true
     @State private var showDiagnostics = false
     @State private var showAgentRoster = false
+    @State private var hasOpenedAgentRoster = false
     @State private var isTargetingComposer = false
 
     var body: some View {
@@ -512,14 +526,23 @@ private struct ConversationView: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
         .background(Brand.canvas)
+        .onChange(of: controller.agentRoster.rowsByID.isEmpty, initial: true) { _, isEmpty in
+            if !isEmpty && !hasOpenedAgentRoster {
+                showAgentRoster = true
+                hasOpenedAgentRoster = true
+            }
+        }
         .fileImporter(isPresented: $choosingFiles, allowedContentTypes: [.image, .audio], allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { controller.addAttachments(urls) }
+        }
+        .sheet(item: $editingSteer) { item in
+            PendingSteerEditor(controller: controller, item: item)
         }
     }
 
     @ViewBuilder private var agentRosterPanel: some View {
         if showAgentRoster && controller.shouldPresentAgentRoster {
-            AgentRosterView(roster: controller.agentRoster)
+            AgentRosterView(controller: controller)
                 .frame(minWidth: 240, idealWidth: 290, maxWidth: 340)
                 .padding(.leading, 10).padding(.trailing, 12).padding(.vertical, 12)
         }
@@ -576,15 +599,11 @@ private struct ConversationView: View {
                         Text("What should we work on?").brandDisplay(30)
                     }.frame(maxWidth: .infinity).padding(.top, 150)
                 } else {
-                    LazyVStack(alignment: .leading, spacing: 22) {
-                        ForEach(controller.entries) { entry in
-                            TranscriptRow(
-                                entry: entry,
-                                detach: { if let id = entry.toolCallID { controller.detachCompose(callID: id) } },
-                                cancelBackground: { if let id = entry.toolCallID { controller.cancelBackground(callID: id) } }
-                            ).id(entry.id)
-                        }
-                    }
+                    TranscriptItemsView(
+                        projection: controller.transcriptProjection,
+                        detach: controller.detachCompose,
+                        cancelBackground: controller.cancelBackground
+                    )
                     .frame(maxWidth: 820, alignment: .leading)
                     .padding(.horizontal, 30).padding(.top, 28).padding(.bottom, 24)
                     .frame(maxWidth: .infinity)
@@ -624,8 +643,7 @@ private struct ConversationView: View {
                         .buttonStyle(.plain).font(.system(size: 15, weight: .medium)).pointingHandCursor()
                         .disabled(controller.attachments.count >= ConversationController.maximumAttachmentCount)
                         .help("Attach image or audio")
-                    modelControl
-                    effortControl
+                    ModelEffortSelector(controller: controller)
                     contextControl
                     Spacer(minLength: 6)
                     Text(controller.pendingAttachmentReceipts > 0 ? "Receiving attachment…" : controller.status)
@@ -665,7 +683,19 @@ private struct ConversationView: View {
                     Image(systemName: "clock").foregroundStyle(.secondary)
                     Text(item.summary).lineLimit(1)
                     Spacer()
-                    Text("Pending").brandMicroLabel().foregroundStyle(.secondary)
+                    if controller.isMutatingSteerIDs.contains(item.id) {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Text("Pending").brandMicroLabel().foregroundStyle(.secondary)
+                    }
+                    if controller.supportsPendingSteerEdit && item.attachmentCount == 0 {
+                        Button { editingSteer = item } label: { Image(systemName: "pencil") }
+                            .buttonStyle(.plain).pointingHandCursor().help("Edit queued message")
+                            .disabled(!controller.isReady || controller.isMutatingSteerIDs.contains(item.id))
+                    }
+                    Button { controller.revokePendingSteer(id: item.id) } label: { Image(systemName: "trash") }
+                        .buttonStyle(.plain).pointingHandCursor().help("Remove queued message")
+                        .disabled(!controller.isReady || controller.isMutatingSteerIDs.contains(item.id))
                 }
                 .font(.caption)
                 .padding(.horizontal, 12).padding(.vertical, 8)
@@ -720,63 +750,10 @@ private struct ConversationView: View {
         }
     }
 
-    @ViewBuilder private var modelControl: some View {
-        if let option = controller.configOptions.first(where: { $0.id == "model" }) {
-            Menu {
-                ForEach(option.groups) { group in
-                    Section(group.name) {
-                        ForEach(group.choices) { choice in
-                            Button { controller.choose(option, value: choice.value) } label: {
-                                if choice.value == option.currentValue { Label(choice.name, systemImage: "checkmark") }
-                                else { Text(choice.name) }
-                            }
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 4) { Image(systemName: "cpu"); Text(selectedModelLabel(option)).lineLimit(1) }
-            }.menuStyle(.borderlessButton).fixedSize().font(.caption)
-        }
-    }
-
-    @ViewBuilder private var effortControl: some View {
-        if let option = reasoningOption, !option.choices.isEmpty {
-            HStack(spacing: 6) {
-                Image(systemName: "brain.head.profile").foregroundStyle(.secondary)
-                if usesSegmentedEffortControl(option) {
-                    Picker(option.name, selection: configBinding(option)) {
-                        ForEach(option.choices) { choice in
-                            Text(choice.name).tag(choice.value)
-                        }
-                    }
-                    .pickerStyle(.segmented).labelsHidden().fixedSize().controlSize(.mini)
-                } else {
-                    Menu {
-                        ForEach(option.groups) { group in
-                            Section(group.name) {
-                                ForEach(group.choices) { choice in
-                                    Button { controller.choose(option, value: choice.value) } label: {
-                                        if choice.value == option.currentValue { Label(choice.name, systemImage: "checkmark") }
-                                        else { Text(choice.name) }
-                                    }
-                                }
-                            }
-                        }
-                    } label: { Text(selectedName(option)) }
-                    .menuStyle(.borderlessButton).fixedSize().font(.caption)
-                }
-            }.help(option.name)
-        }
-    }
-
-    @ViewBuilder private var contextControl: some View {
-        if let used = controller.contextUsed, let size = controller.contextSize, size > 0 {
-            let percentage = min(100, Int((Double(used) / Double(size) * 100).rounded()))
-            HStack(spacing: 5) {
-                ProgressView(value: Double(used), total: Double(size)).controlSize(.mini).frame(width: 38)
-                Text("\(percentage)%").font(.caption2).monospacedDigit().foregroundStyle(.tertiary)
-            }.help("Context: \(used.formatted()) of \(size.formatted()) tokens")
-        }
+    private var contextControl: some View {
+        SessionUsageControl(used: controller.contextUsed, size: controller.contextSize,
+                            tokens: controller.tokenUsage, cost: controller.sessionCost,
+                            agentCosts: controller.agentRoster.costTotals)
     }
 
     private var canSend: Bool {
@@ -784,35 +761,208 @@ private struct ConversationView: View {
             && (!controller.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !controller.attachments.isEmpty)
     }
 
-    private func selectedName(_ option: ConfigOption) -> String {
-        option.choices.first(where: { $0.value == option.currentValue })?.name ?? option.currentValue.split(separator: ":").last.map(String.init) ?? option.currentValue
-    }
-
-    private var reasoningOption: ConfigOption? {
-        controller.configOptions.first(where: \.isReasoningEffort)
-    }
-
-    private func configBinding(_ option: ConfigOption) -> Binding<String> {
-        Binding(
-            get: { option.currentValue },
-            set: { value in if value != option.currentValue { controller.choose(option, value: value) } }
-        )
-    }
-
-    private func usesSegmentedEffortControl(_ option: ConfigOption) -> Bool {
-        (2...4).contains(option.choices.count) && option.choices.reduce(0) { $0 + $1.name.count } <= 36
-    }
-
-    private func selectedModelLabel(_ option: ConfigOption) -> String {
-        let pieces = option.currentValue.split(separator: ":", maxSplits: 1).map(String.init)
-        guard pieces.count == 2 else { return selectedName(option) }
-        return "\(pieces[0]) / \(selectedName(option))"
-    }
 
 }
 
+private struct SessionUsageControl: View {
+    let used: Int?
+    let size: Int?
+    let tokens: DesktopTokenUsage?
+    let cost: DesktopCost?
+    let agentCosts: [String: Double]
+    @State private var isPresented = false
+
+    var body: some View {
+        if used != nil || tokens != nil || cost != nil || !agentCosts.isEmpty {
+            Button { isPresented.toggle() } label: {
+                HStack(spacing: 5) {
+                    if let used, let size, size > 0 {
+                        let fraction = min(1, max(0, Double(used) / Double(size)))
+                        ProgressView(value: fraction).controlSize(.mini).frame(width: 34)
+                        Text("\(Int((fraction * 100).rounded()))%").monospacedDigit()
+                    } else { Image(systemName: "chart.bar") }
+                    if let cost { Text(cost.amount, format: .currency(code: cost.currency)).monospacedDigit() }
+                }.font(.caption2).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain).pointingHandCursor().help("Context, tokens and reported cost")
+            .popover(isPresented: $isPresented, arrowEdge: .top) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Session usage").font(.headline)
+                    if let used, let size, size > 0 {
+                        LabeledContent("Context", value: "\(used.formatted()) / \(size.formatted()) tokens")
+                    }
+                    if let tokens {
+                        usageRow("Input", tokens.inputTokens)
+                        usageRow("Output", tokens.outputTokens)
+                        usageRow("Reasoning", tokens.thoughtTokens)
+                        usageRow("Cache read", tokens.cachedReadTokens)
+                        usageRow("Cache write", tokens.cachedWriteTokens)
+                        usageRow("Total tokens", tokens.totalTokens)
+                    }
+                    if let cost {
+                        Divider()
+                        LabeledContent("This session") { Text(cost.amount, format: .currency(code: cost.currency)) }
+                    }
+                    if !agentCosts.isEmpty {
+                        Divider()
+                        ForEach(agentCosts.keys.sorted(), id: \.self) { currency in
+                            LabeledContent("Subagents") { Text(agentCosts[currency] ?? 0, format: .currency(code: currency)) }
+                        }
+                        Text("Includes completed and closed subagents.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text("Reported by the provider; unavailable values are omitted.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.font(.callout).padding(16).frame(width: 340)
+            }
+        }
+    }
+
+    @ViewBuilder private func usageRow(_ label: String, _ count: Int?) -> some View {
+        if let count { LabeledContent(label, value: count.formatted()) }
+    }
+}
+
+private struct ModelEffortSelector: View {
+    @ObservedObject var controller: ConversationController
+    @State private var isPresented = false
+    @State private var query = ""
+
+    private var model: ConfigOption? {
+        controller.configOptions.first { $0.id == "model" || $0.category == "model" }
+    }
+    private var effort: ConfigOption? {
+        controller.configOptions.first { $0.isReasoningEffort && $0.valueType == "select" && !$0.choices.isEmpty }
+    }
+    private var disabled: Bool {
+        !controller.isReady || controller.isLocked || controller.isRunning || controller.isUpdatingConfig
+    }
+
+    var body: some View {
+        if let model {
+            Button { query = ""; isPresented.toggle() } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "cpu")
+                    Text(selectedName(model)).lineLimit(1)
+                    if let effort { Text(selectedName(effort)).foregroundStyle(.secondary).lineLimit(1) }
+                    if controller.isUpdatingConfig { ProgressView().controlSize(.mini) }
+                    else { Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold)) }
+                }
+                .font(.caption).padding(.horizontal, 8).padding(.vertical, 5)
+                .background(Brand.paper, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
+            }
+            .buttonStyle(.plain).pointingHandCursor().disabled(!controller.isReady || controller.isLocked)
+            .help("Model and reasoning effort")
+            .popover(isPresented: $isPresented, arrowEdge: .top) { panel }
+        }
+    }
+
+    private var panel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Image(systemName: "cpu").foregroundStyle(Brand.moss)
+                Text("Model & effort").font(.headline)
+                Spacer()
+                if controller.isUpdatingConfig { ProgressView().controlSize(.small) }
+            }.padding(16)
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Find a model or provider", text: $query).textFieldStyle(.plain)
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).accessibilityLabel("Clear model search")
+                }
+            }
+            .padding(10).background(Brand.canvas, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
+            .padding(.horizontal, 16).padding(.bottom, 12)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 5) {
+                    if let model {
+                        let groups = matchingGroups(model)
+                        if groups.isEmpty { Text("No matching models").foregroundStyle(.secondary).padding(16) }
+                        ForEach(groups) { group in
+                            Text(group.name).brandMicroLabel().foregroundStyle(.secondary)
+                                .padding(.horizontal, 10).padding(.top, 10)
+                            ForEach(group.choices) { choice in
+                                Button { choose(model, value: choice.value) } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: choice.value == model.currentValue ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(choice.value == model.currentValue ? Brand.moss : Color.secondary)
+                                        Text(choice.name).lineLimit(2).multilineTextAlignment(.leading)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(choice.value == model.currentValue ? Brand.moss.opacity(0.09) : .clear,
+                                                in: RoundedRectangle(cornerRadius: Brand.Radius.small))
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain).pointingHandCursor().disabled(disabled)
+                                .accessibilityAddTraits(choice.value == model.currentValue ? .isSelected : [])
+                                .help(choice.value)
+                            }
+                        }
+                    } else {
+                        Text("Model selection is no longer available.").foregroundStyle(.secondary).padding(16)
+                    }
+                }.padding(8)
+            }.frame(maxHeight: 290)
+            Divider()
+            VStack(alignment: .leading, spacing: 9) {
+                if let effort {
+                    Text(effort.name).brandMicroLabel().foregroundStyle(.secondary)
+                    if (2...4).contains(effort.choices.count) && effort.choices.reduce(0, { $0 + $1.name.count }) <= 36 {
+                        Picker(effort.name, selection: binding(effort)) {
+                            ForEach(effort.choices) { Text($0.name).tag($0.value) }
+                        }.pickerStyle(.segmented).labelsHidden().disabled(disabled)
+                    } else {
+                        Picker(effort.name, selection: binding(effort)) {
+                            ForEach(effort.choices) { Text($0.name).tag($0.value) }
+                        }.labelsHidden().disabled(disabled)
+                    }
+                } else {
+                    Text("This model does not advertise an effort control.").font(.caption).foregroundStyle(.secondary)
+                }
+                if controller.isUpdatingConfig {
+                    Text("Applying selection…").font(.caption).foregroundStyle(.secondary)
+                } else if controller.isRunning {
+                    Text("Model settings can be changed when this turn finishes.").font(.caption).foregroundStyle(.secondary)
+                } else if !controller.isReady || controller.isLocked {
+                    Text("Connect to this thread to change model settings.").font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(16)
+        }.frame(width: 360).background(Brand.paper)
+    }
+
+    private func selectedName(_ option: ConfigOption) -> String {
+        option.choices.first { $0.value == option.currentValue }?.name ?? option.currentValue
+    }
+
+    private func matchingGroups(_ option: ConfigOption) -> [ConfigGroup] {
+        let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return option.groups.compactMap { group in
+            let choices = group.choices.filter {
+                search.isEmpty || group.name.localizedCaseInsensitiveContains(search)
+                    || $0.name.localizedCaseInsensitiveContains(search) || $0.value.localizedCaseInsensitiveContains(search)
+            }
+            return choices.isEmpty ? nil : ConfigGroup(id: group.id, name: group.name, choices: choices)
+        }
+    }
+
+    private func binding(_ option: ConfigOption) -> Binding<String> {
+        Binding(get: { option.currentValue }, set: { choose(option, value: $0) })
+    }
+
+    private func choose(_ option: ConfigOption, value: String) {
+        guard let current = ModelSelection.option(in: controller.configOptions, id: option.id,
+                                                  value: value, disabled: disabled) else { return }
+        controller.choose(current, value: value)
+    }
+}
+
 private struct AgentRosterView: View {
-    let roster: AgentRoster
+    @ObservedObject var controller: ConversationController
+    @State private var focusedAgent: AgentRosterRow?
+    private var roster: AgentRoster { controller.agentRoster }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -839,7 +989,9 @@ private struct AgentRosterView: View {
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             ForEach(roster.treeRows) { treeRow in
-                                AgentRosterRowView(treeRow: treeRow, now: timeline.date)
+                                AgentRosterRowView(treeRow: treeRow, now: timeline.date, usage: roster.usageByID[treeRow.id]) {
+                                    focusedAgent = treeRow.row
+                                }
                                 Divider().padding(.leading, 14 + CGFloat(treeRow.depth) * 16)
                             }
                         }.padding(.vertical, 6)
@@ -854,6 +1006,9 @@ private struct AgentRosterView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Agent roster")
+        .sheet(item: $focusedAgent) { agent in
+            FocusedSubagentView(parent: controller, childID: agent.id)
+        }
     }
 
     private var countSummary: String {
@@ -869,10 +1024,21 @@ private struct AgentRosterView: View {
 private struct AgentRosterRowView: View {
     let treeRow: AgentRosterTreeRow
     let now: Date
+    let usage: DesktopUsageUpdate?
+    let inspect: () -> Void
+    @State private var showDetails = false
 
     private var row: AgentRosterRow { treeRow.row }
 
     var body: some View {
+        Button { showDetails = true } label: {
+            rosterRow
+        }
+        .buttonStyle(.plain).pointingHandCursor()
+        .popover(isPresented: $showDetails) { details }
+    }
+
+    private var rosterRow: some View {
         HStack(alignment: .top, spacing: 9) {
             Image(systemName: statusSymbol).foregroundStyle(statusColor).frame(width: 12)
             VStack(alignment: .leading, spacing: 4) {
@@ -885,12 +1051,51 @@ private struct AgentRosterRowView: View {
                     Text(duration).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                 }
                 Text(row.task).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                Text(statusText).brandMicroLabel().foregroundStyle(statusColor)
+                HStack(spacing: 7) {
+                    Text(statusText).brandMicroLabel().foregroundStyle(statusColor)
+                    Spacer(minLength: 0)
+                    if let usage, let used = usage.used, let size = usage.size, size > 0 {
+                        let fraction = min(1, max(0, Double(used) / Double(size)))
+                        Text("\(Int((fraction * 100).rounded()))% context")
+                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+                Text(row.model.map { "\(row.harness) · \($0)" } ?? row.harness)
+                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                if let cost = usage?.cost {
+                    Text(cost.amount, format: .currency(code: cost.currency))
+                        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                }
             }
         }
         .padding(.leading, 14 + CGFloat(treeRow.depth) * 16).padding(.trailing, 12).padding(.vertical, 9)
         .help("\(row.harness)\(row.model.map { " · \($0)" } ?? "") · generation \(row.generation)")
         .accessibilityElement(children: .combine)
+        .contentShape(Rectangle())
+    }
+
+    private var details: some View {
+            VStack(alignment: .leading, spacing: 12) {
+                Label(row.name, systemImage: statusSymbol).font(.headline).foregroundStyle(statusColor)
+                Text(row.task).font(.callout).textSelection(.enabled)
+                Divider()
+                LabeledContent("Status", value: statusText)
+                LabeledContent("Harness", value: row.harness)
+                if let model = row.model { LabeledContent("Model", value: model) }
+                LabeledContent("Generation", value: String(row.generation))
+                LabeledContent("Duration", value: duration)
+                Button("Open transcript") {
+                    showDetails = false
+                    inspect()
+                }.buttonStyle(.borderedProminent)
+                if let parent = row.parentName { LabeledContent("Parent", value: parent) }
+                if let usage, let used = usage.used, let size = usage.size, size > 0 {
+                    LabeledContent("Context", value: "\(used.formatted()) / \(size.formatted()) tokens")
+                }
+                if let cost = usage?.cost {
+                    LabeledContent("Reported cost") { Text(cost.amount, format: .currency(code: cost.currency)) }
+                }
+            }.font(.callout).padding(16).frame(width: 350)
     }
 
     private var ageMilliseconds: UInt64 {
@@ -906,9 +1111,7 @@ private struct AgentRosterRowView: View {
     }
 
     private var recentFailure: Bool {
-        guard row.outcome == .failed, let finished = row.generationFinishedAtMS else { return false }
-        let nowMS = UInt64(max(0, now.timeIntervalSince1970 * 1_000))
-        return nowMS - min(nowMS, finished) < 4_000
+        row.outcome == .failed
     }
 
     private var statusText: String {
@@ -941,6 +1144,61 @@ private struct AgentRosterRowView: View {
     }
 }
 
+private struct TranscriptItemsView: View {
+    @ObservedObject var projection: TranscriptProjection
+    let detach: (String) -> Void
+    let cancelBackground: (String) -> Void
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 22) {
+            ForEach(projection.items) { item in
+                TranscriptItemView(item: item, detach: detach, cancelBackground: cancelBackground)
+            }
+        }
+    }
+}
+
+private struct TranscriptItemView: View {
+    @ObservedObject var item: TranscriptItem
+    let detach: (String) -> Void
+    let cancelBackground: (String) -> Void
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if item.isActivity {
+                Button { expanded.toggle() } label: {
+                    HStack(spacing: 8) {
+                        if item.runningCount > 0 { ProgressView().controlSize(.small) }
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        Text(item.summary).lineLimit(1)
+                        Text("\(item.entries.count) events").foregroundStyle(.secondary)
+                        if item.errorCount > 0 {
+                            Label("\(item.errorCount) errors", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Brand.vermilion)
+                        }
+                    }
+                    .font(.callout).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).pointingHandCursor()
+                .accessibilityLabel("Activity: \(item.summary), \(item.entries.count) events, \(item.errorCount) errors")
+                .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+                .accessibilityHint("Show or hide thoughts, tool output, plans, and status")
+            }
+            // Do not build markdown, media, tool JSON, or nested compose views while hidden.
+            if !item.isActivity || expanded {
+                ForEach(item.entries) { entry in
+                    TranscriptRow(
+                        entry: entry,
+                        detach: { if let id = entry.toolCallID { detach(id) } },
+                        cancelBackground: { if let id = entry.toolCallID { cancelBackground(id) } }
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
 private struct TranscriptRow: View {
     let entry: TranscriptEntry
     let detach: () -> Void
@@ -957,7 +1215,7 @@ private struct TranscriptRow: View {
             case .status: statusMessage
             case .error: errorMessage
             case .duration: durationMessage
-            case .usage: EmptyView()
+            case .usage: Text(entry.text).font(.caption).textSelection(.enabled)
             }
         }.frame(maxWidth: .infinity, alignment: entry.role == .user ? .trailing : .leading)
     }
@@ -970,7 +1228,10 @@ private struct TranscriptRow: View {
     }
 
     private var assistantMessage: some View {
-        MessageText(entry: entry).frame(maxWidth: 760, alignment: .leading)
+        VStack(alignment: .leading, spacing: 9) {
+            MessageText(entry: entry)
+            AssistantMediaView(entryID: entry.id, revision: entry.contentBlocksRevision, blocks: entry.contentBlocks).equatable()
+        }.frame(maxWidth: 760, alignment: .leading)
     }
 
     private var planMessage: some View {
@@ -1035,33 +1296,11 @@ private struct UserMessageView: View {
 private struct UserMediaView: View {
     let media: UserMediaPresentation
 
-    private var image: NSImage? {
-        if let data = media.data { return NSImage(data: data) }
-        if let url = media.url, url.isFileURL { return NSImage(contentsOf: url) }
-        return nil
-    }
-
     var body: some View {
-        Group {
-            if media.kind == .image, let image {
-                Image(nsImage: image).resizable().scaledToFit()
-                    .frame(maxWidth: 320, maxHeight: 240)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else if media.kind == .image, let url = media.url {
-                AsyncImage(url: url) { image in
-                    image.resizable().scaledToFit()
-                } placeholder: {
-                    ProgressView().frame(width: 80, height: 60)
-                }
-                .frame(maxWidth: 320, maxHeight: 240)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            } else {
-                Label(media.name ?? media.mimeType, systemImage: "waveform")
-                    .font(.caption).padding(8)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-            }
-        }
-        .accessibilityLabel(media.name ?? (media.kind == .image ? "Image attachment" : "Audio attachment"))
+        TranscriptMediaView(
+            media: TranscriptMedia(mimeType: media.mimeType, name: media.name, data: media.data, url: media.url),
+            identity: TranscriptMediaIdentity(owner: media.id)
+        ).equatable()
     }
 }
 
@@ -1075,7 +1314,8 @@ private struct MessageText: View {
 
 private struct ThoughtCard: View {
     let entry: TranscriptEntry
-    @State private var expanded = false
+    // The parent activity disclosure already controls the default collapsed state.
+    @State private var expanded = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1187,7 +1427,7 @@ private struct ToolCard: View {
     let entry: TranscriptEntry
     let detach: () -> Void
     let cancelBackground: () -> Void
-    @State private var expanded = false
+    @State private var expanded = true
 
     private var tool: ToolPresentation {
         entry.presentation?.tool ?? ToolPresentation(
@@ -1226,14 +1466,15 @@ private struct ToolCard: View {
                             Image(systemName: childIcon(child))
                                 .foregroundStyle(childColor(child))
                             Text(child.tool).font(.caption.weight(.semibold))
-                            Text(child.summary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            Text(child.summary).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                             Spacer()
                             if let duration = child.durationMS { Text(durationText(duration)).font(.caption2).foregroundStyle(.tertiary) }
                         }
                     }
                     if let compose = tool.compose {
                         ComposePresentationView(compose: compose)
-                    } else if !tool.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    }
+                    if !tool.detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         ScrollView([.horizontal, .vertical]) {
                             Text(tool.detail).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading).padding(10)
@@ -1255,7 +1496,8 @@ private struct ToolCard: View {
 
     private func childIcon(_ child: RuntimeChild) -> String {
         if child.running { return "circle.dotted" }
-        return child.succeeded == true ? "checkmark.circle.fill" : "xmark.circle.fill"
+        guard let succeeded = child.succeeded else { return "questionmark.circle" }
+        return succeeded ? "checkmark.circle.fill" : "xmark.circle.fill"
     }
     private func childColor(_ child: RuntimeChild) -> Color {
         if child.running { return .secondary }

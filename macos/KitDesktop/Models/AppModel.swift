@@ -11,6 +11,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var controllers: [UUID: ConversationController] = [:]
     @Published private(set) var activity: [UUID: Bool] = [:]
     @Published private(set) var lockedConversationIDs: Set<UUID> = []
+    @Published private(set) var showingProjects = false
     @Published var selectedWorkspaceID: UUID?
     @Published var selectedConversationID: UUID?
     @Published var persistenceError: String?
@@ -18,7 +19,7 @@ final class AppModel: ObservableObject {
 
     private let store: PersistenceStore
     private let catalogLoader: CatalogLoader?
-    private let controllerFactory: ControllerFactory
+    private let controllerFactory: ControllerFactory?
     private var catalogGenerations: [UUID: Int] = [:]
     private var pendingConversationID: UUID?
     private var isClosing = false
@@ -31,7 +32,7 @@ final class AppModel: ObservableObject {
     ) {
         self.store = store
         self.catalogLoader = catalogLoader
-        self.controllerFactory = controllerFactory ?? { ConversationController(conversation: $0, workspacePath: $1) }
+        self.controllerFactory = controllerFactory
         do { state = try store.load() }
         catch let error as PersistenceError {
             state = PersistedAppState()
@@ -42,6 +43,7 @@ final class AppModel: ObservableObject {
             persistenceError = error.localizedDescription
         }
         selectedWorkspaceID = state.workspaces.first?.id
+        showingProjects = state.workspaces.isEmpty
         if requestNotificationAuthorization {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
@@ -55,6 +57,57 @@ final class AppModel: ObservableObject {
         state.conversations.filter { $0.workspaceID == selectedWorkspaceID }.sorted { $0.updatedAt > $1.updatedAt }
     }
 
+    /// Groups and sorts once for a complete navigation snapshot, never once per row.
+    var projects: [ProjectSummary] {
+        let grouped = Dictionary(grouping: state.conversations, by: \.workspaceID)
+        return state.workspaces.map { workspace in
+            ProjectSummary(workspace: workspace, conversations: (grouped[workspace.id] ?? []).sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            })
+        }.sorted {
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    func showProjects() {
+        pendingConversationID = nil
+        showingProjects = true
+    }
+
+    func createConversation(in workspaceID: UUID) {
+        guard state.workspaces.contains(where: { $0.id == workspaceID }) else { return }
+        selectWorkspace(workspaceID)
+        createConversation()
+    }
+
+    func addProjectDirectory(_ path: String, to workspaceID: UUID) {
+        guard allowPersistenceMutation(),
+              let index = state.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        let directory = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard directory != state.workspaces[index].path,
+              !state.workspaces[index].additionalDirectories.contains(directory) else { return }
+        state.workspaces[index].additionalDirectories.append(directory)
+        updateLaunchDirectories(for: workspaceID)
+        save()
+    }
+
+    func removeProjectDirectory(_ path: String, from workspaceID: UUID) {
+        guard allowPersistenceMutation(),
+              let index = state.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        state.workspaces[index].additionalDirectories.removeAll { $0 == path }
+        updateLaunchDirectories(for: workspaceID)
+        save()
+    }
+
+    private func updateLaunchDirectories(for workspaceID: UUID) {
+        guard let workspace = state.workspaces.first(where: { $0.id == workspaceID }) else { return }
+        for conversation in state.conversations where conversation.workspaceID == workspaceID {
+            controllers[conversation.id]?.setAdditionalDirectoriesForNextStart(workspace.additionalDirectories)
+        }
+    }
+
     func addWorkspace(path: String) {
         guard allowPersistenceMutation() else { return }
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -62,6 +115,7 @@ final class AppModel: ObservableObject {
         let name = URL(fileURLWithPath: standardized).lastPathComponent
         let workspace = Workspace(name: name.isEmpty ? standardized : name, path: standardized)
         state.workspaces.append(workspace)
+        showingProjects = false
         selectedWorkspaceID = workspace.id
         selectedConversationID = nil
         save()
@@ -69,6 +123,7 @@ final class AppModel: ObservableObject {
     }
 
     func selectWorkspace(_ id: UUID?) {
+        showingProjects = false
         selectedWorkspaceID = id
         if let selectedConversationID, !state.conversations.contains(where: { $0.id == selectedConversationID && $0.workspaceID == id }) { self.selectedConversationID = nil }
         if let pendingConversationID, !state.conversations.contains(where: { $0.id == pendingConversationID && $0.workspaceID == id }) { self.pendingConversationID = nil }
@@ -101,6 +156,8 @@ final class AppModel: ObservableObject {
     }
 
     private func commitSelection(_ id: UUID) {
+        showingProjects = false
+        selectedWorkspaceID = state.conversations.first(where: { $0.id == id })?.workspaceID
         selectedConversationID = id
         updateConversation(id) { item in
             item.unread = false
@@ -110,7 +167,7 @@ final class AppModel: ObservableObject {
     }
 
     func appBecameActive() {
-        guard let id = selectedConversationID else { return }
+        guard !showingProjects, let id = selectedConversationID else { return }
         updateConversation(id) { item in
             item.unread = false
             item.awaitingUser = false
@@ -266,11 +323,14 @@ final class AppModel: ObservableObject {
         }
         guard let conversation = state.conversations.first(where: { $0.id == id }),
               let workspace = state.workspaces.first(where: { $0.id == conversation.workspaceID }) else { return }
-        let controller = controllerFactory(conversation, workspace.path)
+        let controller = controllerFactory?(conversation, workspace.path) ?? ConversationController(
+            conversation: conversation, workspacePath: workspace.path,
+            additionalDirectories: workspace.additionalDirectories
+        )
         controller.onSessionReady = { [weak self] sessionID, _ in
             guard let self else { return }
             self.sessionBecameReady(conversationID: id, sessionID: sessionID)
-            if self.pendingConversationID == id || self.selectedConversationID == id {
+            if self.pendingConversationID == id || (!self.showingProjects && self.selectedConversationID == id) {
                 self.pendingConversationID = nil
                 self.commitSelection(id)
             }
@@ -307,7 +367,7 @@ final class AppModel: ObservableObject {
 
     private func turnFinished(id: UUID, reason: String) {
         let inactive = NSApp == nil || !NSApp.isActive
-        let hidden = selectedConversationID != id
+        let hidden = showingProjects || selectedConversationID != id
         let needsAttention = inactive || hidden
         let attention = Self.attentionState(reason: reason, isFocused: !needsAttention)
         updateConversation(id) { item in

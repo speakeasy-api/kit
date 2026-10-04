@@ -8,7 +8,9 @@ final class ConversationController: ObservableObject {
     static let maximumAttachmentBytes: Int64 = 10 * 1024 * 1024
     static let maximumTotalAttachmentBytes: Int64 = 20 * 1024 * 1024
 
-    @Published var entries: [TranscriptEntry] = []
+    // Publish once at the revision boundary; per-field array writes must not
+    // invalidate every transcript view (or copy a publisher snapshot) per token.
+    private(set) var entries: [TranscriptEntry] = []
     @Published var configOptions: [ConfigOption] = []
     @Published var advertisedCommands: [AdvertisedCommand] = []
     @Published var draft = ""
@@ -17,10 +19,30 @@ final class ConversationController: ObservableObject {
     @Published var status = "Connecting…"
     @Published var isReady = false
     @Published var isRunning = false
+    @Published private(set) var isUpdatingConfig = false
     @Published var contextUsed: Int?
     @Published var contextSize: Int?
     @Published var tokenUsage: DesktopTokenUsage?
-    @Published var transcriptRevision = 0
+    @Published var sessionCost: DesktopCost?
+    @Published private(set) var runtimeTransportAvailable: Bool?
+    let transcriptProjection = TranscriptProjection()
+    private var changedTranscriptIndices: Set<Int> = []
+    private var entryIndices: [UUID: Int] = [:]
+    private var toolEntryIDs: [String: UUID] = [:]
+    private var rebuildTranscriptProjection = false
+    @Published var transcriptRevision = 0 {
+        didSet {
+            if rebuildTranscriptProjection {
+                entryIndices = Dictionary(uniqueKeysWithValues: entries.enumerated().map { ($0.element.id, $0.offset) })
+                toolEntryIDs = entries.reduce(into: [:]) { result, entry in
+                    if let callID = entry.toolCallID { result[callID] = entry.id }
+                }
+            }
+            transcriptProjection.synchronize(entries, changedIndices: changedTranscriptIndices, rebuilding: rebuildTranscriptProjection)
+            changedTranscriptIndices.removeAll(keepingCapacity: true)
+            rebuildTranscriptProjection = false
+        }
+    }
     @Published private(set) var pendingAttachmentReceipts = 0
     @Published private(set) var isRetryable = false
     @Published private(set) var isLocked = false
@@ -29,6 +51,8 @@ final class ConversationController: ObservableObject {
     @Published private(set) var pendingSteers: [PendingSteer] = []
     @Published private(set) var canSteer = false
     @Published private(set) var isInjecting = false
+    @Published private(set) var isMutatingSteerIDs: Set<String> = []
+    var supportsPendingSteerEdit: Bool { client.supportsPendingSteerEdit }
 
     struct PendingSteer: Identifiable, Equatable {
         let id: String
@@ -70,7 +94,7 @@ final class ConversationController: ObservableObject {
     }
 
     var shouldPresentAgentRoster: Bool {
-        Self.shouldPresentAgentRoster(
+        runtimeTransportAvailable != false && Self.shouldPresentAgentRoster(
             expectedSessionID: expectedRuntimeSessionID, runtimeSessionID: runtimeSessionID,
             transcriptIsEmpty: entries.isEmpty
         )
@@ -84,18 +108,21 @@ final class ConversationController: ObservableObject {
 
     private var client: ACPClient
     private let workspacePath: String
+    private var additionalDirectories: [String]
     private let launchSessionID: String
     private var conversation: Conversation
     private var foregroundRunning = false
     private var autonomousTurns: Set<Int> = []
     private var streamingEntryIDs: Set<UUID> = []
-    private var messageEntryIDs: [String: UUID] = [:]
+    private struct MessageIdentity: Hashable {
+        let role: String
+        let id: String
+    }
+    private var messageEntryIDs: [MessageIdentity: UUID] = [:]
     private var planEntryIDs: [String: UUID] = [:]
     private var toolStates: [String: DesktopToolUpdate] = [:]
     private var activeThoughtEntryID: UUID?
     private var activeThoughtStartedAt: ContinuousClock.Instant?
-    private var thoughtTexts: [String: String] = [:]
-    private var thoughtBlocks: [String: [DesktopContentBlock]] = [:]
     private let clock = ContinuousClock()
     private var foregroundStartedAt: ContinuousClock.Instant?
     private var autonomousStartedAt: [Int: ContinuousClock.Instant] = [:]
@@ -109,6 +136,17 @@ final class ConversationController: ObservableObject {
     private var startupUpdates: [DesktopUpdate]?
     private var expectedRuntimeSessionID: String?
     private var rosterPruneWorkItem: DispatchWorkItem?
+    private var runtimeLeaseWorkItem: DispatchWorkItem?
+    private var runtimeLastFrame: ContinuousClock.Instant?
+
+    var subagentClient: FocusedSubagentTransport { client }
+
+    func canSteerSubagent(id: String, generation: UInt64) -> Bool {
+        guard isReady, !shuttingDown, shouldPresentAgentRoster,
+              let row = agentRoster.rowsByID[id], row.generation == generation else { return false }
+        return row.status == .working && row.parentID == nil
+            && agentRoster.canSteer(id: id, generation: generation)
+    }
 
     var onSessionReady: ((String, [ConfigOption]) -> Void)?
     var onTurnStarted: ((String) -> Void)?
@@ -118,15 +156,20 @@ final class ConversationController: ObservableObject {
     var onLockChanged: ((Bool) -> Void)?
     var onConfigChanged: ((String, String, String, Bool) -> Void)?
 
-    init(conversation: Conversation, workspacePath: String, client: ACPClient = ACPClient()) {
+    init(conversation: Conversation, workspacePath: String, additionalDirectories: [String] = [], client: ACPClient = ACPClient()) {
         conversationID = conversation.id
         self.conversation = conversation
         self.workspacePath = workspacePath
+        self.additionalDirectories = additionalDirectories
         launchSessionID = conversation.sessionID ?? "s-desktop-\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         self.client = client
     }
 
     var reservedSessionID: String { conversation.sessionID ?? launchSessionID }
+
+    func setAdditionalDirectoriesForNextStart(_ directories: [String]) {
+        additionalDirectories = directories
+    }
 
     func start() { start(force: false) }
 
@@ -152,6 +195,7 @@ final class ConversationController: ObservableObject {
 
     private func start(force: Bool) {
         guard !shuttingDown else { return }
+        isUpdatingConfig = false
         status = force ? "Recovering stale session lock…" : "Connecting…"
         let persisted = conversation.sessionID
         let activeClient = client
@@ -187,7 +231,7 @@ final class ConversationController: ObservableObject {
             provider: inheritsConfig ? nil : conversation.provider,
             model: inheritsConfig ? nil : conversation.model,
             reasoningEffort: inheritsConfig ? nil : conversation.reasoningEffort,
-            force: force
+            additionalDirectories: additionalDirectories, force: force
         )
         activeClient.start(options: options, loading: persisted != nil) { [weak self, weak activeClient] result in
             guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
@@ -253,7 +297,6 @@ final class ConversationController: ObservableObject {
                 presentation: .user(UserMessagePresentation(text: text, media: media))
             )
             self.appendEntry(entry)
-            self.finalizeLastEntry()
             self.composerTransaction?.transcriptEntryID = entry.id
         }) { [weak self] result in
             guard let self else { return }
@@ -274,16 +317,26 @@ final class ConversationController: ObservableObject {
     }
 
     func choose(_ option: ConfigOption, value: String) {
+        guard isReady, !isRunning, !isLocked, !shuttingDown, !isUpdatingConfig,
+              let current = configOptions.first(where: { $0.id == option.id }),
+              current.valueType == option.valueType else { return }
         let wireValue: ACPSessionConfigValue
-        switch option.valueType {
-        case "select": wireValue = .select(value)
+        switch current.valueType {
+        case "select":
+            guard current.choices.contains(where: { $0.value == value }) else { return }
+            wireValue = .select(value)
         case "boolean":
             guard value == "true" || value == "false" else { return }
             wireValue = .boolean(value == "true")
         default: return
         }
-        client.setConfig(id: option.id, value: wireValue) { [weak self] result in
-            guard let self else { return }
+        let activeClient = client
+        let generation = clientGeneration
+        isUpdatingConfig = true
+        activeClient.setConfig(id: current.id, value: wireValue) { [weak self, weak activeClient] result in
+            guard let self, let activeClient, !self.shuttingDown,
+                  self.isCurrentClient(activeClient, generation: generation) else { return }
+            self.isUpdatingConfig = false
             switch result {
             case .failure(let error): self.fail(error)
             case .success(let payload):
@@ -303,8 +356,10 @@ final class ConversationController: ObservableObject {
             switch result {
             case .failure(let error): self.fail(error)
             case .success(let payload):
-                if payload["detached"] as? Bool == true, let index = self.entries.firstIndex(where: { $0.toolCallID == callID }) {
+                if payload["detached"] as? Bool == true, let index = self.toolEntryIDs[callID].flatMap({ self.transcriptIndex(for: $0) }) {
+                    self.changedTranscriptIndices.insert(index)
                     self.entries[index].backgrounded = true
+                    self.changedTranscriptIndices.insert(index)
                     self.entries[index].isStreaming = true
                     self.streamingEntryIDs.insert(self.entries[index].id)
                     self.status = "Compose call moved to background"
@@ -354,6 +409,10 @@ final class ConversationController: ObservableObject {
     func removeAttachment(_ id: UUID) { attachments.removeAll { $0.id == id } }
 
     func close(completion: (() -> Void)? = nil) {
+        runtimeLeaseWorkItem?.cancel()
+        runtimeLeaseWorkItem = nil
+        runtimeLastFrame = nil
+        isUpdatingConfig = false
         let hadActiveTurn = !activeTurns.isEmpty
         reduceSettlement(.shutdown)
         client.close(activeTurn: hadActiveTurn) { [weak self] in
@@ -382,7 +441,10 @@ final class ConversationController: ObservableObject {
             finishActiveThought()
             applyPlan(plan)
         case .planRemoved(let id): removePlan(id: id)
-        case .usage(let usage): contextUsed = usage.used; contextSize = usage.size
+        case .usage(let usage):
+            contextUsed = usage.used
+            contextSize = usage.size
+            if let cost = usage.cost, cost.isValid { sessionCost = cost }
         case .tokenUsage(let usage): tokenUsage = usage
         case .configOptions(let options): configOptions = Self.parseConfigOptions(options.anyValue); publishCurrentConfig()
         case .sessionInfo(let info): if info.titlePresent { onTitleChanged?(info.title ?? "") }
@@ -392,12 +454,16 @@ final class ConversationController: ObservableObject {
         case .notice(let notice):
             finishActiveThought()
             status = notice.title
-            appendEntry(TranscriptEntry(role: .status, title: notice.severity?.capitalized ?? "Notice", text: notice.description ?? notice.title))
+            appendEntry(TranscriptEntry(role: notice.severity?.lowercased() == "error" ? .error : .status, title: notice.severity?.capitalized ?? "Notice", text: notice.description ?? notice.title))
         case .compaction(let compaction):
             finishActiveThought()
             status = compaction.error ?? "Compaction " + compaction.status.replacingOccurrences(of: "_", with: " ")
             let text = compaction.summary?.map(Self.contentText).joined() ?? status
-            upsertSingleton(role: .status, title: "Compaction", text: text)
+            if compaction.error != nil {
+                appendEntry(TranscriptEntry(role: .error, title: "Compaction", text: text))
+            } else {
+                upsertSingleton(role: .status, title: "Compaction", text: text)
+            }
         case .compactionChunk(_, let content):
             finishActiveThought()
             appendChunk(role: .status, content: content)
@@ -407,83 +473,93 @@ final class ConversationController: ObservableObject {
     }
 
     private func applyThought(_ message: DesktopMessageUpdate) {
-        let blocks = message.content
-        let text = blocks.map(Self.contentText).joined()
-        let currentText = message.replace
-            ? text
-            : (thoughtTexts[message.messageId] ?? "") + text
-        let currentBlocks = message.replace
-            ? blocks
-            : (thoughtBlocks[message.messageId] ?? []) + blocks
-        thoughtTexts[message.messageId] = String(currentText.suffix(256 * 1024))
-        thoughtBlocks[message.messageId] = currentBlocks
-
-        if activeThoughtEntryID == nil {
+        guard message.hasContent else { return }
+        let identity = MessageIdentity(role: TranscriptRole.thought.rawValue, id: message.messageId)
+        let text = message.content.map(Self.contentText).joined()
+        let entryID: UUID
+        if let existing = messageEntryIDs[identity], transcriptIndex(for: existing) != nil {
+            entryID = existing
+        } else {
+            finishActiveThought()
             let entry = TranscriptEntry(role: .thought, text: "", isStreaming: true)
             appendEntry(entry)
-            activeThoughtEntryID = entry.id
-            activeThoughtStartedAt = clock.now
-            streamingEntryIDs.insert(entry.id)
+            entryID = entry.id
+            messageEntryIDs[identity] = entryID
         }
-        guard let entryID = activeThoughtEntryID,
-              let index = entries.firstIndex(where: { $0.id == entryID }) else { return }
-        entries[index].text = thoughtTexts[message.messageId] ?? ""
-        entries[index].contentBlocks = thoughtBlocks[message.messageId] ?? []
+        if activeThoughtEntryID != entryID {
+            finishActiveThought()
+            activeThoughtEntryID = entryID
+            activeThoughtStartedAt = clock.now
+        }
+        guard let index = transcriptIndex(for: entryID) else { return }
+        let previousText = message.replace ? "" : entries[index].text
+        let previousBlocks = message.replace ? [] : entries[index].contentBlocks
+        changedTranscriptIndices.insert(index)
+        entries[index].text = TranscriptContentBuffer.text(previousText + text)
+        entries[index].contentBlocks = TranscriptContentBuffer.append(message.content, to: previousBlocks)
         entries[index].formatted = nil
         entries[index].isStreaming = true
-        messageEntryIDs[message.messageId] = entryID
+        streamingEntryIDs.insert(entryID)
         transcriptRevision += 1
     }
 
     private func applyMessage(_ message: DesktopMessageUpdate, role: TranscriptRole) {
+        let identity = MessageIdentity(role: role.rawValue, id: message.messageId)
         let deliveredSteer = role == .user && pendingSteers.contains(where: { $0.id == message.messageId })
-        if deliveredSteer { pendingSteers.removeAll { $0.id == message.messageId } }
+        if deliveredSteer { pendingSteers.removeAll { $0.id == message.messageId }; isMutatingSteerIDs.remove(message.messageId) }
         if message.replace, !message.hasContent {
             if role == .user, !deliveredSteer, let optimistic = composerTransaction?.transcriptEntryID {
-                messageEntryIDs[message.messageId] = optimistic
+                messageEntryIDs[identity] = optimistic
             }
             return
         }
         if role == .user, !deliveredSteer, composerTransaction != nil {
             if !message.content.isEmpty, consumeComposerEcho(message.content, requireComplete: message.replace) {
-                if let optimistic = composerTransaction?.transcriptEntryID { messageEntryIDs[message.messageId] = optimistic }
+                if let optimistic = composerTransaction?.transcriptEntryID { messageEntryIDs[identity] = optimistic }
                 return
             }
             if message.replace, let optimistic = composerTransaction?.transcriptEntryID {
-                messageEntryIDs[message.messageId] = optimistic
+                messageEntryIDs[identity] = optimistic
             }
         }
         let blocks = message.content
         let text = blocks.map(Self.contentText).joined()
-        if role == .assistant { latestAssistantSource = message.replace ? text : latestAssistantSource + text }
-        if let entryID = messageEntryIDs[message.messageId], let index = entries.firstIndex(where: { $0.id == entryID }) {
+        if role == .assistant { latestAssistantSource = TranscriptContentBuffer.text(message.replace ? text : latestAssistantSource + text) }
+        if let entryID = messageEntryIDs[identity], let index = transcriptIndex(for: entryID) {
             if message.replace {
-                entries[index].contentBlocks = blocks
-                entries[index].text = String(text.suffix(256 * 1024))
+                changedTranscriptIndices.insert(index)
+                entries[index].contentBlocks = TranscriptContentBuffer.append(blocks)
+                changedTranscriptIndices.insert(index)
+                entries[index].text = TranscriptContentBuffer.text(text)
                 if role == .user {
+                    changedTranscriptIndices.insert(index)
                     entries[index].presentation = .user(UserMessagePresentation(
                         text: entries[index].text, media: blocks.flatMap { Self.userContent($0).media }
                     ))
                 }
             } else {
-                entries[index].contentBlocks.append(contentsOf: blocks)
-                entries[index].text = String((entries[index].text + text).suffix(256 * 1024))
+                changedTranscriptIndices.insert(index)
+                entries[index].contentBlocks = TranscriptContentBuffer.append(blocks, to: entries[index].contentBlocks)
+                changedTranscriptIndices.insert(index)
+                entries[index].text = TranscriptContentBuffer.text(entries[index].text + text)
             }
+            changedTranscriptIndices.insert(index)
             entries[index].formatted = nil
+            changedTranscriptIndices.insert(index)
             entries[index].isStreaming = true
             streamingEntryIDs.insert(entryID)
             transcriptRevision += 1
             return
         }
-        let limitedText = String(text.suffix(256 * 1024))
+        let limitedText = TranscriptContentBuffer.text(text)
         let presentation: TranscriptPresentation? = role == .user
             ? .user(UserMessagePresentation(text: limitedText, media: blocks.flatMap { Self.userContent($0).media }))
             : nil
         let entry = TranscriptEntry(
-            role: role, text: limitedText, isStreaming: true, contentBlocks: blocks, presentation: presentation
+            role: role, text: limitedText, isStreaming: true, contentBlocks: TranscriptContentBuffer.append(blocks), presentation: presentation
         )
         appendEntry(entry)
-        messageEntryIDs[message.messageId] = entry.id
+        messageEntryIDs[identity] = entry.id
         streamingEntryIDs.insert(entry.id)
     }
 
@@ -497,7 +573,7 @@ final class ConversationController: ObservableObject {
             status = "Action required"
         case "idle":
             canSteer = false
-            pendingSteers.removeAll()
+            pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
             if let usage = state.usage { tokenUsage = usage }
             if let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) {
                 reduceSettlement(.terminal(turn, reason: state.stopReason ?? "end_turn", error: nil))
@@ -515,17 +591,18 @@ final class ConversationController: ObservableObject {
         case .markdown(_, let content): text = content
         case .unknown: return
         }
-        if let entryID = planEntryIDs[plan.id], let index = entries.firstIndex(where: { $0.id == entryID }) {
-            entries[index].text = text; entries[index].formatted = Self.markdown(text)
+        if let entryID = planEntryIDs[plan.id], let index = transcriptIndex(for: entryID) {
+            changedTranscriptIndices.insert(index)
+            entries[index].text = text; entries[index].formatted = nil
         } else {
-            let entry = TranscriptEntry(role: .plan, title: "Plan", text: text, formatted: Self.markdown(text))
+            let entry = TranscriptEntry(role: .plan, title: "Plan", text: text)
             appendEntry(entry); planEntryIDs[plan.id] = entry.id
         }
         transcriptRevision += 1
     }
 
     private func removePlan(id: String) {
-        if let entryID = planEntryIDs.removeValue(forKey: id) { entries.removeAll { $0.id == entryID } }
+        if let entryID = planEntryIDs.removeValue(forKey: id) { rebuildTranscriptProjection = true; entries.removeAll { $0.id == entryID } }
         transcriptRevision += 1
     }
 
@@ -538,12 +615,20 @@ final class ConversationController: ObservableObject {
     }
 
     func applyRuntime(_ event: [String: Any]) {
-        guard let kind = event["event"] as? String else { return }
+        guard let kind = event["event"] as? String, expectedRuntimeSessionID != nil else { return }
+        let now = clock.now
+        expireRuntimeLease(at: now)
+        if kind == "runlet_transport", let available = event["available"] as? Bool {
+            setRuntimeTransportAvailable(available)
+            if available { refreshRuntimeLease(at: now) }
+            return
+        }
+        if runtimeTransportAvailable != false { refreshRuntimeLease(at: now) }
         if kind == "session_started" {
             runtimeSessionID = event["session_id"] as? String
             return
         }
-        guard expectedRuntimeSessionID != nil, runtimeSessionID == expectedRuntimeSessionID else { return }
+        guard runtimeTransportAvailable != false, runtimeSessionID == expectedRuntimeSessionID else { return }
         var roster = agentRoster
         if roster.apply(event: event, nowMS: Self.nowMilliseconds()) {
             agentRoster = roster
@@ -552,13 +637,18 @@ final class ConversationController: ObservableObject {
         }
         switch kind {
         case "child_started":
-            guard let call = event["call"] as? String, let parent = Self.parentCall(call), let index = entries.firstIndex(where: { $0.toolCallID == parent }) else { return }
+            guard let call = event["call"] as? String, let parent = Self.parentCall(call), let index = toolEntryIDs[parent].flatMap({ transcriptIndex(for: $0) }) else { return }
+            changedTranscriptIndices.insert(index)
             entries[index].children.append(RuntimeChild(id: call, tool: event["tool"] as? String ?? "tool", summary: event["summary"] as? String ?? "", running: true, succeeded: nil, durationMS: nil))
         case "child_finished":
-            guard let call = event["call"] as? String, let parent = Self.parentCall(call), let entry = entries.firstIndex(where: { $0.toolCallID == parent }), let child = entries[entry].children.firstIndex(where: { $0.id == call }) else { return }
+            guard let call = event["call"] as? String, let parent = Self.parentCall(call), let entry = toolEntryIDs[parent].flatMap({ transcriptIndex(for: $0) }), let child = entries[entry].children.firstIndex(where: { $0.id == call }) else { return }
+            changedTranscriptIndices.insert(entry)
             entries[entry].children[child].running = false
+            changedTranscriptIndices.insert(entry)
             entries[entry].children[child].succeeded = event["ok"] as? Bool
+            changedTranscriptIndices.insert(entry)
             entries[entry].children[child].summary = event["summary"] as? String ?? entries[entry].children[child].summary
+            changedTranscriptIndices.insert(entry)
             entries[entry].children[child].durationMS = (event["millis"] as? NSNumber)?.intValue
         case "compaction_started": status = "Compacting context…"
         case "compaction_finished": status = (event["ok"] as? Bool == true) ? "Context compaction finished" : "Context compaction failed"
@@ -575,11 +665,14 @@ final class ConversationController: ObservableObject {
         let text = Self.contentText(content)
         guard !text.isEmpty || content != .text("") else { return }
         if let index = entries.indices.last, entries[index].role == role, entries[index].isStreaming {
-            entries[index].text = String((entries[index].text + text).suffix(256 * 1024))
-            entries[index].contentBlocks.append(content)
+            changedTranscriptIndices.insert(index)
+            entries[index].text = TranscriptContentBuffer.text(entries[index].text + text)
+            changedTranscriptIndices.insert(index)
+            entries[index].contentBlocks = TranscriptContentBuffer.append([content], to: entries[index].contentBlocks)
+            changedTranscriptIndices.insert(index)
             entries[index].formatted = nil
         } else {
-            appendEntry(TranscriptEntry(role: role, text: String(text.suffix(256 * 1024)), isStreaming: true, contentBlocks: [content]))
+            appendEntry(TranscriptEntry(role: role, text: TranscriptContentBuffer.text(text), isStreaming: true, contentBlocks: [content]))
             if let id = entries.last?.id { streamingEntryIDs.insert(id) }
         }
         transcriptRevision += 1
@@ -591,11 +684,15 @@ final class ConversationController: ObservableObject {
         if let index = entries.indices.last, entries[index].role == .user, entries[index].isStreaming {
             var current = entries[index].presentation?.userMessage
                 ?? UserMessagePresentation(text: entries[index].text, media: [])
-            entries[index].text = String((entries[index].text + content.text).suffix(256 * 1024))
-            entries[index].contentBlocks.append(block)
+            changedTranscriptIndices.insert(index)
+            entries[index].text = TranscriptContentBuffer.text(entries[index].text + content.text)
+            changedTranscriptIndices.insert(index)
+            entries[index].contentBlocks = TranscriptContentBuffer.append([block], to: entries[index].contentBlocks)
             current.text = entries[index].text
             current.media.append(contentsOf: content.media)
+            changedTranscriptIndices.insert(index)
             entries[index].presentation = .user(current)
+            changedTranscriptIndices.insert(index)
             entries[index].formatted = nil
         } else {
             let text = String(content.text.suffix(256 * 1024))
@@ -623,12 +720,24 @@ final class ConversationController: ObservableObject {
         return TurnDurationPresentation(milliseconds: max(0, Int(clamping: milliseconds)))
     }
 
+    private func transcriptIndex(for id: UUID) -> Int? {
+        if let index = entryIndices[id], entries.indices.contains(index), entries[index].id == id { return index }
+        return entries.firstIndex { $0.id == id }
+    }
+
     private func appendEntry(_ entry: TranscriptEntry) {
+        entryIndices[entry.id] = entries.count
+        if let callID = entry.toolCallID { toolEntryIDs[callID] = entry.id }
         entries.append(entry)
         if entries.count > Self.maximumEntries {
             let count = entries.count - Self.maximumEntries
-            let removed = entries.prefix(count).map(\.id)
-            entries.removeFirst(count)
+            let removed = Set(entries.prefix(count).map(\.id))
+            for entry in entries.prefix(count) {
+                if let callID = entry.toolCallID { toolStates.removeValue(forKey: callID) }
+            }
+            messageEntryIDs = messageEntryIDs.filter { !removed.contains($0.value) }
+            planEntryIDs = planEntryIDs.filter { !removed.contains($0.value) }
+            rebuildTranscriptProjection = true; entries.removeFirst(count)
             streamingEntryIDs.subtract(removed)
         }
         transcriptRevision += 1
@@ -639,14 +748,19 @@ final class ConversationController: ObservableObject {
         let update = (toolStates[id] ?? DesktopToolUpdate(toolCallId: id)).merging(patch)
         toolStates[id] = update
         let dictionary = Self.toolDictionary(update)
-        if let index = entries.lastIndex(where: { $0.role == .tool && $0.toolCallID == id }) {
+        if let index = toolEntryIDs[id].flatMap({ transcriptIndex(for: $0) }) {
             let tool = Self.toolPresentation(dictionary)
+            changedTranscriptIndices.insert(index)
             entries[index].title = tool.title
+            changedTranscriptIndices.insert(index)
             entries[index].text = tool.detail
+            changedTranscriptIndices.insert(index)
             entries[index].presentation = .tool(tool)
             if patch.present.contains("rawInput") {
+                changedTranscriptIndices.insert(index)
                 entries[index].backgrounded = (update.rawInput?.anyValue as? [String: Any])?["background"] as? Bool == true
             }
+            changedTranscriptIndices.insert(index)
             entries[index].isStreaming = tool.status == .inProgress || tool.status == .pending
             if entries[index].isStreaming { streamingEntryIDs.insert(entries[index].id) }
             else { streamingEntryIDs.remove(entries[index].id) }
@@ -667,26 +781,30 @@ final class ConversationController: ObservableObject {
 
     private func appendToolContent(id: String, content: JSONValue) {
         var patch = toolStates[id] ?? DesktopToolUpdate(toolCallId: id)
-        var chunks: [JSONValue]
-        if case .array(let existing)? = patch.content { chunks = existing } else { chunks = [] }
-        chunks.append(content)
-        patch.content = .array(chunks)
+        patch.content = TranscriptToolContentBuffer.append(content, to: patch.content)
         patch.present.insert("content")
         updateTool(patch)
     }
 
     private func upsertSingleton(role: TranscriptRole, title: String, text: String) {
-        if let index = entries.lastIndex(where: { $0.role == role }) { entries[index].text = text; entries[index].formatted = Self.markdown(text) }
-        else { appendEntry(TranscriptEntry(role: role, title: title, text: text, formatted: Self.markdown(text))) }
+        if let index = entries.indices.last, entries[index].role == role, entries[index].title == title {
+            changedTranscriptIndices.insert(index)
+            entries[index].text = text
+            entries[index].formatted = nil
+        }
+        else { appendEntry(TranscriptEntry(role: role, title: title, text: text)) }
         transcriptRevision += 1
     }
 
     private func finishActiveThought() {
         guard let entryID = activeThoughtEntryID else { return }
-        if let index = entries.firstIndex(where: { $0.id == entryID }) {
+        if let index = transcriptIndex(for: entryID) {
             let elapsed = activeThoughtStartedAt.map { $0.duration(to: clock.now) } ?? .zero
+            changedTranscriptIndices.insert(index)
             entries[index].isStreaming = false
-            entries[index].formatted = Self.markdown(entries[index].text)
+            changedTranscriptIndices.insert(index)
+            entries[index].formatted = nil
+            changedTranscriptIndices.insert(index)
             entries[index].presentation = .thought(ThoughtPresentation(
                 milliseconds: Self.turnDuration(elapsed).milliseconds
             ))
@@ -694,8 +812,6 @@ final class ConversationController: ObservableObject {
         streamingEntryIDs.remove(entryID)
         activeThoughtEntryID = nil
         activeThoughtStartedAt = nil
-        thoughtTexts.removeAll(keepingCapacity: true)
-        thoughtBlocks.removeAll(keepingCapacity: true)
         transcriptRevision += 1
     }
 
@@ -703,13 +819,15 @@ final class ConversationController: ObservableObject {
         finishActiveThought()
         var retained: Set<UUID> = []
         for id in streamingEntryIDs {
-            guard let index = entries.firstIndex(where: { $0.id == id }) else { continue }
+            guard let index = transcriptIndex(for: id) else { continue }
             if preservingBackgroundWork, entries[index].role == .tool, entries[index].backgrounded, entries[index].isStreaming {
                 retained.insert(id)
                 continue
             }
+            changedTranscriptIndices.insert(index)
             entries[index].isStreaming = false
-            entries[index].formatted = Self.markdown(entries[index].text)
+            changedTranscriptIndices.insert(index)
+            entries[index].formatted = nil
         }
         streamingEntryIDs = retained
         transcriptRevision += 1
@@ -722,9 +840,11 @@ final class ConversationController: ObservableObject {
             return entry.role == .assistant || entry.role == .thought
         }
         for id in responseIDs {
-            guard let index = entries.firstIndex(where: { $0.id == id }) else { continue }
+            guard let index = transcriptIndex(for: id) else { continue }
+            changedTranscriptIndices.insert(index)
             entries[index].isStreaming = false
-            entries[index].formatted = Self.markdown(entries[index].text)
+            changedTranscriptIndices.insert(index)
+            entries[index].formatted = nil
         }
         streamingEntryIDs.subtract(responseIDs)
         transcriptRevision += 1
@@ -786,11 +906,11 @@ final class ConversationController: ObservableObject {
                 foregroundRunning = false
                 canSteer = false
                 isInjecting = false
-                pendingSteers.removeAll()
+                pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
                 if let transaction = composerTransaction, transaction.turn == turn {
                     if let error {
                         restoreComposer(transaction)
-                        if let entryID = transaction.transcriptEntryID { entries.removeAll { $0.id == entryID } }
+                        if let entryID = transaction.transcriptEntryID { rebuildTranscriptProjection = true; entries.removeAll { $0.id == entryID } }
                         fail(error)
                     }
                     composerTransaction = nil
@@ -807,6 +927,7 @@ final class ConversationController: ObservableObject {
             let turns = activeTurns
             for turn in turns { reduceSettlement(.terminal(turn, reason: "error", error: ACPClientError.process("Kit exited (status \(code))"))) }
             isReady = false
+            isUpdatingConfig = false
             finishStreamingEntries(preservingBackgroundWork: false)
             if shuttingDown { status = "Closed" } else { status = "Kit exited (status \(code))" }
         case .shutdown:
@@ -814,6 +935,7 @@ final class ConversationController: ObservableObject {
             shuttingDown = true
             status = "Closing…"
             isReady = false
+            isUpdatingConfig = false
             let turns = activeTurns
             for turn in turns { reduceSettlement(.terminal(turn, reason: "cancelled", error: nil)) }
             finishStreamingEntries(preservingBackgroundWork: false)
@@ -829,13 +951,17 @@ final class ConversationController: ObservableObject {
     }
 
     private func sendSteer(text: String, attachments files: [Attachment]) {
+        guard let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) else { return }
         let snapshot = InjectionSnapshot(text: text, attachments: files)
         draft = ""
         attachments = []
         isInjecting = true
         status = "Queueing…"
-        client.inject(text: text, attachments: files) { [weak self] result in
-            guard let self else { return }
+        let activeClient = client
+        let generation = clientGeneration
+        activeClient.inject(text: text, attachments: files) { [weak self, weak activeClient] result in
+            guard let self, let activeClient, self.isCurrentClient(activeClient, generation: generation), !self.shuttingDown else { return }
+            guard self.activeTurns.contains(turn) else { return }
             self.isInjecting = false
             switch result {
             case .failure(let error):
@@ -848,6 +974,47 @@ final class ConversationController: ObservableObject {
                 ))
                 self.status = "Running…"
             }
+        }
+    }
+
+    func replacePendingSteer(id: String, text: String) {
+        guard supportsPendingSteerEdit, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              pendingSteers.first(where: { $0.id == id })?.attachmentCount == 0 else { return }
+        mutatePendingSteer(id: id, replacement: text)
+    }
+
+    func revokePendingSteer(id: String) {
+        mutatePendingSteer(id: id, replacement: nil)
+    }
+
+    private func mutatePendingSteer(id: String, replacement: String?) {
+        guard isReady, client.supportsSteering, !shuttingDown, !isMutatingSteerIDs.contains(id),
+              pendingSteers.contains(where: { $0.id == id }),
+              let turn = activeTurns.first(where: { if case .foreground = $0 { return true }; return false }) else { return }
+        let activeClient = client
+        let generation = clientGeneration
+        isMutatingSteerIDs.insert(id)
+        let completion: (Result<[String: Any], Error>) -> Void = { [weak self, weak activeClient] result in
+            guard let self, let activeClient, !self.shuttingDown,
+                  self.isCurrentClient(activeClient, generation: generation), self.activeTurns.contains(turn) else { return }
+            self.isMutatingSteerIDs.remove(id)
+            // Delivery is authoritative: a late replacement/revoke reply never
+            // recreates a pending row or rewrites an already delivered prompt.
+            guard let index = self.pendingSteers.firstIndex(where: { $0.id == id }) else { return }
+            switch result {
+            case .failure(let error): self.fail(error)
+            case .success:
+                if let replacement {
+                    self.pendingSteers[index] = PendingSteer(id: id, text: replacement, attachmentCount: 0)
+                } else {
+                    self.pendingSteers.remove(at: index)
+                }
+            }
+        }
+        if let replacement {
+            activeClient.replacePendingSteer(id: id, text: replacement, completion: completion)
+        } else {
+            activeClient.revokePendingSteer(id: id, completion: completion)
         }
     }
 
@@ -866,10 +1033,7 @@ final class ConversationController: ObservableObject {
         attachments = restored
     }
 
-    private func finalizeLastEntry() {
-        guard let index = entries.indices.last else { return }
-        entries[index].formatted = Self.markdown(entries[index].text)
-    }
+
 
     private func recordDiagnostic(_ line: String, updateStatus: Bool = true) {
         diagnostics.append(line)
@@ -901,18 +1065,18 @@ final class ConversationController: ObservableObject {
     }
 
     private func replaceTranscript(with updates: [DesktopUpdate]) {
-        entries.removeAll(keepingCapacity: true)
+        rebuildTranscriptProjection = true; entries.removeAll(keepingCapacity: true)
         streamingEntryIDs.removeAll()
         messageEntryIDs.removeAll()
         planEntryIDs.removeAll()
         toolStates.removeAll()
         activeThoughtEntryID = nil
         activeThoughtStartedAt = nil
-        thoughtTexts.removeAll(keepingCapacity: true)
-        thoughtBlocks.removeAll(keepingCapacity: true)
         latestAssistantSource = ""
         contextUsed = nil
         contextSize = nil
+        tokenUsage = nil
+        sessionCost = nil
         transcriptRevision += 1
         for update in updates { apply(update) }
     }
@@ -952,7 +1116,7 @@ final class ConversationController: ObservableObject {
     private func fail(_ error: Error) {
         finishActiveThought()
         status = "Error: \(error.localizedDescription)"
-        appendEntry(TranscriptEntry(role: .error, text: error.localizedDescription, formatted: Self.markdown(error.localizedDescription)))
+        appendEntry(TranscriptEntry(role: .error, text: error.localizedDescription))
     }
 
     static func parseConfigOptions(_ value: Any?) -> [ConfigOption] {
@@ -1008,10 +1172,62 @@ final class ConversationController: ObservableObject {
         rosterPruneWorkItem = nil
         expectedRuntimeSessionID = sessionID
         runtimeSessionID = nil
+        runtimeLeaseWorkItem?.cancel()
+        runtimeLeaseWorkItem = nil
+        runtimeLastFrame = nil
+        runtimeTransportAvailable = nil
+        isUpdatingConfig = false
         agentRoster = AgentRoster()
         canSteer = false
         isInjecting = false
-        pendingSteers.removeAll()
+        pendingSteers.removeAll(); isMutatingSteerIDs.removeAll()
+    }
+
+    // Matches diagnostic_transport::LEASE. Check before accepting each frame as well
+    // as on the timer: a delayed main queue must not refresh an already-expired lease.
+    func expireRuntimeLease(at now: ContinuousClock.Instant) {
+        if runtimeTransportAvailable != false, let last = runtimeLastFrame,
+           last.duration(to: now) >= .seconds(5) {
+            setRuntimeTransportAvailable(false)
+        }
+    }
+
+    private func refreshRuntimeLease(at now: ContinuousClock.Instant) {
+        runtimeLastFrame = now
+        runtimeLeaseWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.expireRuntimeLease(at: self.clock.now)
+        }
+        runtimeLeaseWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
+
+    private func setRuntimeTransportAvailable(_ available: Bool) {
+        guard runtimeTransportAvailable != available else { return }
+        let wasUnavailable = runtimeTransportAvailable == false
+        runtimeTransportAvailable = available
+        if !available {
+            runtimeLeaseWorkItem?.cancel()
+            runtimeLeaseWorkItem = nil
+            agentRoster.invalidateLiveState()
+            rosterPruneWorkItem?.cancel()
+            // Tool status itself is ACP-authoritative. Only nested runtime child
+            // observations become unknown when the diagnostic stream is lost.
+            for index in entries.indices where entries[index].children.contains(where: { $0.running }) {
+                changedTranscriptIndices.insert(index)
+                for child in entries[index].children.indices where entries[index].children[child].running {
+                    entries[index].children[child].running = false
+                    entries[index].children[child].succeeded = nil
+                    entries[index].children[child].summary += " (live status unavailable)"
+                }
+            }
+            status = "Runtime connection unavailable"
+            appendEntry(TranscriptEntry(role: .error, title: "Runtime connection", text: status))
+        } else if wasUnavailable {
+            status = "Runtime connection restored; earlier live state remains unknown"
+            appendEntry(TranscriptEntry(role: .status, title: "Runtime connection", text: status))
+        }
     }
 
     private func scheduleRosterPrune() {
@@ -1216,7 +1432,5 @@ final class ConversationController: ObservableObject {
         return String(String(describing: value).prefix(128 * 1024))
     }
 
-    private static func markdown(_ text: String) -> AttributedString {
-        (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .full))) ?? AttributedString(text)
-    }
+
 }

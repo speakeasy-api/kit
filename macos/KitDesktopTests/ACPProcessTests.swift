@@ -307,10 +307,8 @@ final class ACPProcessTests: XCTestCase {
         wait(for: [finished], timeout: 3)
 
         let thoughts = controller.entries.filter { $0.role == .thought }
-        XCTAssertEqual(thoughts.count, 1)
-        XCTAssertEqual(thoughts.first?.text, "latest thought")
-        XCTAssertNotNil(thoughts.first?.presentation?.thought)
-        XCTAssertFalse(thoughts.first?.isStreaming ?? true)
+        XCTAssertEqual(thoughts.map(\.text), ["outdated thought", "latest thought"])
+        XCTAssertTrue(thoughts.allSatisfy { $0.presentation?.thought != nil && !$0.isStreaming })
         XCTAssertTrue(controller.entries.contains {
             $0.role == .tool && $0.title == "Inspect files" && !$0.isStreaming && $0.presentation?.tool?.status == .completed
         })

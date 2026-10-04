@@ -8,6 +8,7 @@ struct ACPLaunchOptions {
     let provider: String?
     let model: String?
     let reasoningEffort: String?
+    var additionalDirectories: [String] = []
     var force = false
 }
 
@@ -66,8 +67,10 @@ final class ACPClient {
     private var pendingChunk: DesktopUpdate?
     private var closeCompletions: [() -> Void] = []
     private var chunkFlush: DispatchWorkItem?
+    private var supportsAdditionalDirectories = false
     private var promptCapabilities: ACPPromptCapabilities?
     private(set) var supportsSteering = false
+    private(set) var supportsPendingSteerEdit = false
 
     init(launchOverride: LaunchOverride? = nil, requestTimeout: TimeInterval = 30, promptTimeout: TimeInterval = 6 * 60 * 60) {
         self.launchOverride = launchOverride
@@ -129,6 +132,27 @@ final class ACPClient {
         }
     }
 
+    func replacePendingSteer(id: String, text: String, completion: @escaping (Result<Dictionary, Error>) -> Void) {
+        mutatePendingSteer(method: "session/replace_inject", id: id, text: text, completion: completion)
+    }
+
+    func revokePendingSteer(id: String, completion: @escaping (Result<Dictionary, Error>) -> Void) {
+        mutatePendingSteer(method: "session/revoke_inject", id: id, text: nil, completion: completion)
+    }
+
+    private func mutatePendingSteer(method: String, id: String, text: String?, completion: @escaping (Result<Dictionary, Error>) -> Void) {
+        queue.async {
+            guard let sessionID = self.sessionID, self.supportsSteering,
+                  text == nil || self.supportsPendingSteerEdit else {
+                self.complete(completion, with: .failure(ACPClientError.protocolError("Pending message mutation is unavailable")))
+                return
+            }
+            var params: Dictionary = ["sessionId": sessionID, "messageId": id]
+            if let text { params["content"] = [["type": "text", "text": text]] }
+            self.requestLocked(method: method, params: params, completion: completion)
+        }
+    }
+
     func setConfig(id: String, value: ACPSessionConfigValue, completion: @escaping (Result<Dictionary, Error>) -> Void) {
         queue.async {
             guard let sessionID = self.sessionID else { return }
@@ -136,6 +160,37 @@ final class ACPClient {
                 let request = ACPSetSessionConfigOptionRequest(sessionId: sessionID, configId: id, value: value)
                 self.requestLocked(method: "session/set_config_option", params: try Self.dictionary(request), completion: completion)
             } catch { self.complete(completion, with: .failure(error)) }
+        }
+    }
+
+    func readSubagentTranscript(id: String, generation: UInt64, cursor: UInt64,
+                                completion: @escaping (Result<SubagentTranscriptPage, Error>) -> Void) {
+        subagentRequest(method: "kit/subagent/transcript/read", id: id, generation: generation,
+                        fields: ["cursor": cursor]) { result in
+            completion(result.flatMap { payload in
+                Result { try Self.decode(SubagentTranscriptPage.self, from: payload) }
+            })
+        }
+    }
+
+    func steerSubagent(id: String, generation: UInt64, prompt: String,
+                       completion: @escaping (Result<Dictionary, Error>) -> Void) {
+        subagentRequest(method: "kit/subagent/steer", id: id, generation: generation,
+                        fields: ["prompt": prompt], completion: completion)
+    }
+
+    private func subagentRequest(method: String, id: String, generation: UInt64, fields: Dictionary,
+                                 completion: @escaping (Result<Dictionary, Error>) -> Void) {
+        queue.async {
+            guard let sessionID = self.sessionID, !self.closing, !self.exited else {
+                self.complete(completion, with: .failure(ACPClientError.protocolError("ACP session is not ready")))
+                return
+            }
+            var params = fields
+            params["session_id"] = sessionID
+            params["id"] = id
+            params["generation"] = generation
+            self.requestLocked(method: method, params: params, completion: completion)
         }
     }
 
@@ -199,13 +254,16 @@ final class ACPClient {
                 if loading { self.sessionID = options.sessionID }
                 self.queue.async {
                     do {
+                        guard options.additionalDirectories.isEmpty || self.supportsAdditionalDirectories else {
+                            throw ACPClientError.protocolError("This Kit helper does not support additional project directories.")
+                        }
                         let params: Dictionary
                         if loading {
                             params = try Self.dictionary(ACPResumeSessionRequest(
-                                sessionId: options.sessionID, cwd: options.root, replayFrom: ACPReplayFrom()
+                                sessionId: options.sessionID, cwd: options.root, additionalDirectories: options.additionalDirectories, replayFrom: ACPReplayFrom()
                             ))
                         } else {
-                            params = try Self.dictionary(ACPNewSessionRequest(cwd: options.root))
+                            params = try Self.dictionary(ACPNewSessionRequest(cwd: options.root, additionalDirectories: options.additionalDirectories))
                         }
                         self.requestLocked(method: method, params: params) { result in
                             self.queue.async {
@@ -333,11 +391,17 @@ final class ACPClient {
                         guard response.protocolVersion == Self.protocolVersion else {
                             throw ACPClientError.protocolError("Kit negotiated a non-v2 ACP connection")
                         }
+                        self.supportsAdditionalDirectories = response.capabilities?.session?.additionalDirectories != nil
                         self.promptCapabilities = response.capabilities?.session?.prompt
                         let injection = response.capabilities?.session?.inject
                         // Match the TUI: finish-mode steering queues input for the next safe boundary.
                         self.supportsSteering = injection?.modes.contains("steer") == true
                             && injection?.steerInStream?.contains("finish") == true
+                        let capabilities = payload["capabilities"] as? Dictionary
+                        let session = capabilities?["session"] as? Dictionary
+                        let inject = session?["inject"] as? Dictionary
+                        let pending = inject?["pending"] as? Dictionary
+                        self.supportsPendingSteerEdit = self.supportsSteering && pending?["replace"] as? Bool == true
                         completion(result)
                     } catch {
                         completion(.failure(ACPClientError.protocolError("Malformed ACP v2 initialize response: " + error.localizedDescription)))
@@ -746,7 +810,7 @@ final class ACPClient {
         return pid
     }
 
-    private static func resolveLaunch() throws -> LaunchOverride {
+    static func resolveLaunch(allowLoginShell: Bool = true) throws -> LaunchOverride {
         let fileManager = FileManager.default
         let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/kit")
         if fileManager.isExecutableFile(atPath: bundled.path) {
@@ -770,7 +834,7 @@ final class ACPClient {
         // Finder-launched apps receive a minimal PATH. Ask the user's login shell for
         // the same command lookup they get in Terminal, then launch the resolved file
         // directly so every conversation uses an identical executable.
-        if let executable = resolveFromLoginShell(environment: environment) {
+        if allowLoginShell, let executable = resolveFromLoginShell(environment: environment) {
             return LaunchOverride(executable: executable)
         }
         throw ACPClientError.missingBinary

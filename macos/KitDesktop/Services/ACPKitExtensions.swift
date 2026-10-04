@@ -46,8 +46,8 @@ enum JSONValue: Codable, Equatable {
         }
     }
 
-    fileprivate var objectValue: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
-    fileprivate var stringValue: String? { if case .string(let value) = self { value } else { nil } }
+    var objectValue: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    var stringValue: String? { if case .string(let value) = self { value } else { nil } }
     fileprivate var boolValue: Bool? { if case .bool(let value) = self { value } else { nil } }
     fileprivate var intValue: Int? {
         switch self { case .integer(let value): Int(value); case .number(let value): Int(value); default: nil }
@@ -178,7 +178,16 @@ enum DesktopPlanContent: Equatable {
         }
     }
 }
-struct DesktopUsageUpdate: Codable, Equatable { var used: Int?; var size: Int? }
+struct DesktopCost: Codable, Equatable {
+    var amount: Double
+    var currency: String
+
+    var isValid: Bool {
+        amount.isFinite && amount >= 0 && currency.utf8.count == 3
+            && currency.utf8.allSatisfy { (65...90).contains($0) }
+    }
+}
+struct DesktopUsageUpdate: Codable, Equatable { var used: Int?; var size: Int?; var cost: DesktopCost? = nil }
 struct DesktopTokenUsage: Codable, Equatable { var totalTokens: Int?; var inputTokens: Int?; var outputTokens: Int?; var thoughtTokens: Int?; var cachedReadTokens: Int?; var cachedWriteTokens: Int? }
 struct DesktopCommand: Codable, Equatable { var name: String; var description: String? = nil }
 struct DesktopSessionInfo: Equatable { var title: String?; var updatedAt: String?; var titlePresent: Bool; var updatedAtPresent: Bool }
