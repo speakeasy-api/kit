@@ -51,10 +51,12 @@ type TreeSlots = Arc<TreeSlotDirectory>;
 
 /// Slot directory shared by every Kit process in one delegation tree.
 fn tree_slot_directory(slots: &TreeSlots) -> Result<&PathBuf, ChildError> {
-    let directory = slots.path.get_or_init(|| match std::env::var_os(TREE_SLOTS_ENV) {
-        Some(directory) => PathBuf::from(directory),
-        None => std::env::temp_dir().join(format!("kit-subagents-{}", session::new_id())),
-    });
+    let directory = slots
+        .path
+        .get_or_init(|| match std::env::var_os(TREE_SLOTS_ENV) {
+            Some(directory) => PathBuf::from(directory),
+            None => std::env::temp_dir().join(format!("kit-subagents-{}", session::new_id())),
+        });
     // Cache only success: failed attempts retry the same path. Once initialized,
     // callers can reuse the path without new filesystem errors after reserving a slot.
     if slots.initialized.get().is_none() {

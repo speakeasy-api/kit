@@ -20,7 +20,10 @@ fn tree_slot_directory_failure_is_retryable() {
     std::fs::remove_file(&blocker).unwrap();
     let permit = manager.acquire_permit().unwrap();
     assert!(directory.is_dir());
-    assert_eq!(tree_slot_directory(&manager.tree_slots).unwrap(), &directory);
+    assert_eq!(
+        tree_slot_directory(&manager.tree_slots).unwrap(),
+        &directory
+    );
     drop(permit);
     assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
 }
