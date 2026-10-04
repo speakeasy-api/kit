@@ -80,10 +80,17 @@ final class FocusedSubagentController: ObservableObject {
         }
         guard row.generation >= generation else { return }
         if row.generation != generation { focus(row, canSteer: canSteer); return }
+        let wasActive = active
         active = row.status == .working
         capability = canSteer
         self.canSteer = active && capability && readEnabled
         if !loading { refreshNotice() }
+        if active && !wasActive && readEnabled {
+            // A caught-up startup page is not the end of this generation.
+            poll?.cancel()
+            poll = nil
+            readNext()
+        }
     }
 
     func stop() {

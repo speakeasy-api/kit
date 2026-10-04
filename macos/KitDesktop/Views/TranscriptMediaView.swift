@@ -78,7 +78,7 @@ actor TranscriptMediaCache {
     ) async -> CGImage? {
         // Even a previously cached remote preview requires consent in this view.
         guard media.isImage, allowRemote || !media.requiresRemotePreviewConsent else { return nil }
-        // Payload equality happens only on this actor, never in SwiftUI's task/equality keys.
+        // Validate the source as retention can reuse the same owner/block key.
         if let cached = thumbnails[identity], cached.media == media { return cached.image }
         let bytes: Data?
         if media.data == nil, media.base64 == nil,
@@ -145,16 +145,18 @@ struct TranscriptMediaIdentity: Hashable {
     var block: Int = 0
 }
 
-private struct TranscriptMediaLoadIdentity: Equatable {
+/// Compare source values rather than the message-wide streaming revision.
+/// Equatable avoids hashing/copying the inline payload on every body evaluation;
+/// unchanged String/Data values retain their shared storage.
+struct TranscriptMediaLoadIdentity: Equatable {
     let source: TranscriptMediaIdentity
-    let revision: UInt64
+    let media: TranscriptMedia
     let allowRemote: Bool
 }
 
 struct TranscriptMediaView: View, Equatable {
     let media: TranscriptMedia
     let identity: TranscriptMediaIdentity
-    var revision: UInt64 = 0
     @State private var thumbnail: CGImage?
     @State private var loaded = false
     @State private var opening = false
@@ -166,7 +168,11 @@ struct TranscriptMediaView: View, Equatable {
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.identity == rhs.identity && lhs.revision == rhs.revision
+        lhs.identity == rhs.identity && lhs.media == rhs.media
+    }
+
+    var loadIdentity: TranscriptMediaLoadIdentity {
+        TranscriptMediaLoadIdentity(source: identity, media: media, allowRemote: allowRemote)
     }
 
     var body: some View {
@@ -203,7 +209,7 @@ struct TranscriptMediaView: View, Equatable {
                     .help("Contacts the remote server to load this image")
             }
         }
-        .task(id: TranscriptMediaLoadIdentity(source: identity, revision: revision, allowRemote: allowRemote)) {
+        .task(id: loadIdentity) {
             loaded = false
             let image = await TranscriptMediaCache.shared.thumbnail(media, identity: identity, allowRemote: allowRemote)
             guard !Task.isCancelled else { return }
@@ -228,7 +234,7 @@ struct AssistantMediaView: View, Equatable {
         ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
             if let media = TranscriptMedia.derive(block) {
                 TranscriptMediaView(
-                    media: media, identity: TranscriptMediaIdentity(owner: entryID, block: index), revision: revision
+                    media: media, identity: TranscriptMediaIdentity(owner: entryID, block: index)
                 ).equatable()
             }
         }

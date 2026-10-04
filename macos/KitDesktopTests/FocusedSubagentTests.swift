@@ -22,6 +22,25 @@ final class FocusedSubagentTests: XCTestCase {
     }
 
     @MainActor
+    func testCaughtUpStartingChildResumesPollingWhenWorking() {
+        let transport = ChildTransport()
+        let controller = FocusedSubagentController(transport: transport)
+        controller.focus(row(status: .starting), canSteer: true)
+        transport.reads[0].completion(.success(SubagentTranscriptPage(updates: [], nextCursor: 0, generation: 1, caughtUp: true)))
+        XCTAssertFalse(controller.loading)
+        XCTAssertFalse(controller.canSteer)
+        controller.update(row(status: .working), canSteer: true)
+        XCTAssertEqual(transport.reads.count, 2)
+        controller.update(row(status: .working), canSteer: true)
+        XCTAssertEqual(transport.reads.count, 2)
+        transport.reads[1].completion(.success(page(generation: 1, cursor: 10, text: "Child output after startup")))
+        XCTAssertEqual(controller.entries.first?.text, "Child output after startup")
+        XCTAssertEqual(controller.cursor, 10)
+        XCTAssertTrue(controller.canSteer)
+        controller.stop()
+    }
+
+    @MainActor
     func testSteeringCapabilityLifecycleAndStaleAcknowledgement() {
         let transport = ChildTransport()
         let controller = FocusedSubagentController(transport: transport)

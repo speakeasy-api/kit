@@ -34,14 +34,42 @@ final class TranscriptMediaTests: XCTestCase {
         XCTAssertFalse(inline.requiresRemotePreviewConsent)
     }
 
-    func testViewIdentityDoesNotComparePayloadsAndRevisionInvalidates() {
-        let id = TranscriptMediaIdentity(owner: UUID())
-        let first = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", data: Data([1])), identity: id)
-        let second = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", data: Data([2])), identity: id)
-        XCTAssertEqual(first, second)
-        let changed = TranscriptMediaView(media: second.media, identity: id, revision: 1)
-        XCTAssertNotEqual(first, changed)
-        XCTAssertNotEqual(id, TranscriptMediaIdentity(owner: id.owner, block: 1))
+    func testLoadIdentitySurvivesStreamingTextButInvalidatesReplacedMedia() throws {
+        let image = DesktopContentBlock.image(data: nil, mimeType: "image/png", uri: "https://example.com/first.png")
+        var entry = TranscriptEntry(role: .assistant, text: "Hello", isStreaming: true,
+                                    contentBlocks: [image, .text("Hello")])
+        let identity = TranscriptMediaIdentity(owner: entry.id, block: 0)
+        let first = TranscriptMediaView(media: try XCTUnwrap(TranscriptMedia.derive(entry.contentBlocks[0])), identity: identity)
+        let revision = entry.contentBlocksRevision
+        entry.contentBlocks[1] = .text("Hello world")
+        XCTAssertNotEqual(entry.contentBlocksRevision, revision)
+        let streamed = TranscriptMediaView(media: try XCTUnwrap(TranscriptMedia.derive(entry.contentBlocks[0])), identity: identity)
+        XCTAssertEqual(first, streamed)
+        XCTAssertEqual(first.loadIdentity, streamed.loadIdentity)
+
+        // Replacing a block (including retention reusing its index) must reload.
+        entry.contentBlocks = [.image(data: nil, mimeType: "image/png", uri: "https://example.com/second.png")]
+        let replaced = TranscriptMediaView(media: try XCTUnwrap(TranscriptMedia.derive(entry.contentBlocks[0])), identity: identity)
+        XCTAssertNotEqual(first, replaced)
+        XCTAssertNotEqual(first.loadIdentity, replaced.loadIdentity)
+    }
+
+    func testLoadIdentityTracksInlinePayloadAndRemoteConsent() {
+        let identity = TranscriptMediaIdentity(owner: UUID())
+        let first = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", data: Data([1])), identity: identity)
+        let replaced = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", data: Data([2])), identity: identity)
+        XCTAssertNotEqual(first, replaced)
+        XCTAssertNotEqual(first.loadIdentity, replaced.loadIdentity)
+        let inline = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", base64: "AQ=="), identity: identity)
+        let replacedInline = TranscriptMediaView(media: TranscriptMedia(mimeType: "image/png", base64: "Ag=="), identity: identity)
+        XCTAssertNotEqual(inline.loadIdentity, replacedInline.loadIdentity)
+        XCTAssertNotEqual(identity, TranscriptMediaIdentity(owner: identity.owner, block: 1))
+
+        let remote = TranscriptMedia(mimeType: "image/png", url: URL(string: "https://example.com/image.png"))
+        XCTAssertNotEqual(
+            TranscriptMediaLoadIdentity(source: identity, media: remote, allowRemote: false),
+            TranscriptMediaLoadIdentity(source: identity, media: remote, allowRemote: true)
+        )
     }
 
     func testClipboardImportAndThumbnailDownsampling() async throws {
