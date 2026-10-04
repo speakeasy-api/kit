@@ -5,6 +5,8 @@
 //! actually show up in agent output and deliberately stops there: block
 //! quotes, rules, fenced and inline code, bullets, tables, and emphasis.
 
+mod syntax;
+
 use std::ops::Range;
 
 use super::{
@@ -45,6 +47,8 @@ pub(super) fn render_copyable_with_sources(
         .collect();
     let mut lines = Vec::new();
     let mut fence: Option<(String, char, usize, Range<usize>)> = None;
+    let mut code_syntax = syntax::CodeSyntax::plain();
+    let mut syntax_budget = syntax::DOCUMENT_BUDGET;
     let mut table_end = 0;
     for (index, (offset, raw)) in raw_lines.iter().copied().enumerate() {
         if index < table_end {
@@ -69,7 +73,11 @@ pub(super) fn render_copyable_with_sources(
                 ));
                 fence = None;
             } else {
-                lines.push((code_line(raw), Some(content.clone()), source_range));
+                lines.push((
+                    code_line(raw, &mut code_syntax, &mut syntax_budget),
+                    Some(content.clone()),
+                    source_range,
+                ));
             }
             continue;
         }
@@ -102,6 +110,7 @@ pub(super) fn render_copyable_with_sources(
                 Some(content.clone()),
                 source_range,
             ));
+            code_syntax = syntax::CodeSyntax::new(&language);
             fence = Some((language, marker, length, content));
             continue;
         }
@@ -469,12 +478,10 @@ fn bullet(trimmed: &str) -> Option<&str> {
         .or_else(|| trimmed.strip_prefix("* "))
 }
 
-fn code_line(raw: &str) -> LinkedLine {
-    plain_line(Line::from(vec![
-        Span::styled("│ ", theme::faint()),
-        Span::styled(raw.replace('\t', "    "), theme::code()),
-    ]))
-    .with_leading_gutter()
+fn code_line(raw: &str, syntax: &mut syntax::CodeSyntax, budget: &mut usize) -> LinkedLine {
+    let mut spans = vec![Span::styled("│ ", theme::faint())];
+    spans.extend(syntax.line(raw, budget));
+    plain_line(Line::from(spans)).with_leading_gutter()
 }
 
 fn code_frame(label: &str) -> LinkedLine {
@@ -1614,8 +1621,128 @@ mod tests {
         assert_eq!(lines.len(), 5);
         assert!(lines[1].spans[0].content.contains("rust"));
         assert_eq!(lines[2].spans[0].content, "│ ");
-        assert!(lines[2].spans[1].content.contains("let x = 1;"));
+        assert_eq!(line_text(&lines[2]), "│ let x = 1;");
         assert_eq!(lines[2].spans[1].style.bg, None);
+    }
+
+    #[test]
+    fn typescript_uses_terminal_styles_and_aliases() {
+        for language in ["ts", "typescript", "TypeScript", "tsx", "ts title=example"] {
+            let lines = render(&format!("```{language}\nconst answer: number = 42;\n```"));
+            let spans = &lines[1].spans;
+            assert!(
+                spans.iter().any(|s| s.content.contains("const")
+                    && s.style == theme::bold(theme::accent_color())),
+                "{language}: {spans:?}"
+            );
+            assert!(
+                spans
+                    .iter()
+                    .any(|s| s.content.contains("42") && s.style.fg == Some(theme::warn_color()))
+            );
+            assert!(spans.iter().all(|s| s.style.bg.is_none()
+                && !matches!(
+                    s.style.fg,
+                    Some(ratatui::style::Color::Rgb(..) | ratatui::style::Color::Indexed(_))
+                )));
+        }
+    }
+
+    #[test]
+    fn multiline_code_state_survives_lines_but_not_fences_or_renders() {
+        let lines = render(
+            "```ts\n/* comment\nstill comment */\nconst s = `first\nsecond`;\n```\n```ts\nconst fresh = 1;\n```",
+        );
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|s| s.style == theme::dim())
+        );
+        assert!(lines[4].spans.iter().any(|s| s.content.contains("second")
+            && s.style.fg == Some(theme::success_color())));
+        assert!(
+            lines[7]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("const")
+                    && s.style == theme::bold(theme::accent_color()))
+        );
+        let open = render("```ts\n/* open");
+        assert!(
+            open[1]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|s| s.style == theme::dim())
+        );
+        let fresh = render("```ts\nconst fresh = 1;");
+        assert!(
+            fresh[1]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("const")
+                    && s.style == theme::bold(theme::accent_color()))
+        );
+    }
+
+    #[test]
+    fn highlighting_preserves_unicode_tabs_and_copy_ranges() {
+        for language in ["ts", "text", "unknown-language", ""] {
+            for closing in ["\n```", ""] {
+                let source = format!("```{language}\n\tconst 界 = \"é\";  {closing}");
+                let lines = render_copyable(&source);
+                assert_eq!(line_text(&lines[1].0.line()), "│     const 界 = \"é\";  ");
+                assert!(
+                    lines.iter().all(
+                        |(_, range)| &source[range.clone().unwrap()] == "\tconst 界 = \"é\";  "
+                    )
+                );
+                let wrapped = super::super::wrap::wrap_linked_tagged(&lines, 12);
+                assert!(wrapped.iter().all(|(line, range, _, _)| {
+                    line.width() <= 12 && &source[range.clone().unwrap()] == "\tconst 界 = \"é\";  "
+                }));
+                assert!(
+                    wrapped
+                        .iter()
+                        .any(|(line, _, _, _)| line_text(line).contains('界'))
+                );
+                if language != "ts" {
+                    assert!(
+                        lines[1]
+                            .0
+                            .spans
+                            .iter()
+                            .skip(1)
+                            .all(|s| s.span.style == theme::code())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_code_abandons_fence_without_resuming_stale_state() {
+        let source = format!(
+            "```ts\n/*\n{} */\nconst plain = 1;\n```\n```ts\nconst colored = 2;\n```",
+            "x".repeat(4097)
+        );
+        let lines = render(&source);
+        assert!(
+            lines[3]
+                .spans
+                .iter()
+                .skip(1)
+                .all(|s| s.style == theme::code())
+        );
+        assert!(
+            lines[6]
+                .spans
+                .iter()
+                .any(|s| s.content.contains("const")
+                    && s.style == theme::bold(theme::accent_color()))
+        );
     }
 
     #[test]
