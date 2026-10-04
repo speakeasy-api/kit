@@ -41,22 +41,30 @@ pub(crate) struct Permit {
     _slot: std::fs::File,
 }
 
-type TreeSlots = Arc<std::sync::OnceLock<Result<PathBuf, String>>>;
+#[derive(Debug, Default)]
+struct TreeSlotDirectory {
+    path: std::sync::OnceLock<PathBuf>,
+    initialized: std::sync::OnceLock<()>,
+}
+
+type TreeSlots = Arc<TreeSlotDirectory>;
 
 /// Slot directory shared by every Kit process in one delegation tree.
 fn tree_slot_directory(slots: &TreeSlots) -> Result<&PathBuf, ChildError> {
-    slots
-        .get_or_init(|| {
-            let directory = match std::env::var_os(TREE_SLOTS_ENV) {
-                Some(directory) => PathBuf::from(directory),
-                None => std::env::temp_dir().join(format!("kit-subagents-{}", session::new_id())),
-            };
-            std::fs::create_dir_all(&directory)
-                .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
-            Ok(directory)
-        })
-        .as_ref()
-        .map_err(|error| ChildError::Failed(error.clone()))
+    let directory = slots.path.get_or_init(|| match std::env::var_os(TREE_SLOTS_ENV) {
+        Some(directory) => PathBuf::from(directory),
+        None => std::env::temp_dir().join(format!("kit-subagents-{}", session::new_id())),
+    });
+    // Cache only success: failed attempts retry the same path. Once initialized,
+    // callers can reuse the path without new filesystem errors after reserving a slot.
+    if slots.initialized.get().is_none() {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            ChildError::Failed(format!("could not create {}: {error}", directory.display()))
+        })?;
+        // Concurrent successful creators publish the same fact; neither owns cleanup.
+        let _ = slots.initialized.set(());
+    }
+    Ok(directory)
 }
 
 /// Holds one of the tree-wide slots until dropped or the process exits.

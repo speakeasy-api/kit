@@ -2,6 +2,62 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+#[test]
+fn tree_slot_directory_failure_is_retryable() {
+    let root = tempfile::tempdir().unwrap();
+    let blocker = root.path().join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let directory = blocker.join("slots");
+    let manager = manager_with_generic_harness(root.path(), Vec::new());
+    manager.tree_slots.path.set(directory.clone()).unwrap();
+
+    for _ in 0..2 {
+        let error = manager.acquire_permit().unwrap_err();
+        assert!(error.to_string().contains("could not create"));
+        assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
+    }
+
+    std::fs::remove_file(&blocker).unwrap();
+    let permit = manager.acquire_permit().unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(tree_slot_directory(&manager.tree_slots).unwrap(), &directory);
+    drop(permit);
+    assert_eq!(manager.capacity.available_permits(), MAX_LIVE_SUBAGENTS);
+}
+
+#[test]
+fn tree_slot_directory_is_shared_across_concurrent_callers() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("slots");
+    let slots = TreeSlots::default();
+    slots.path.set(directory.clone()).unwrap();
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let slots = Arc::clone(&slots);
+            let expected = &directory;
+            scope.spawn(move || {
+                assert_eq!(tree_slot_directory(&slots).unwrap(), expected);
+                let _permit = tree_slot(expected).unwrap();
+            });
+        }
+    });
+    assert!(directory.is_dir());
+}
+
+#[test]
+fn tree_slot_directory_success_does_not_recheck_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("slots");
+    let slots = TreeSlots::default();
+    slots.path.set(directory.clone()).unwrap();
+    assert_eq!(tree_slot_directory(&slots).unwrap(), &directory);
+
+    std::fs::remove_dir(&directory).unwrap();
+    std::fs::write(&directory, b"not a directory").unwrap();
+    assert_eq!(tree_slot_directory(&slots).unwrap(), &directory);
+}
+
 fn listing_id(value: &SubagentListing) -> &str {
     &value.id
 }
