@@ -13,6 +13,10 @@ final class TranscriptItem: ObservableObject, Identifiable {
     private(set) var summary = "Activity"
     private var indices: [UUID: Int] = [:]
 
+    var isExpandableActivity: Bool {
+        isActivity && !(entries.count == 1 && entries[0].role == .duration)
+    }
+
     init(_ entry: TranscriptEntry) {
         id = entry.id
         isActivity = entry.role != .user && entry.role != .assistant

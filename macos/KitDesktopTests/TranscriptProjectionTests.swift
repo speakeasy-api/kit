@@ -15,6 +15,19 @@ final class TranscriptProjectionTests: XCTestCase {
     }
 
     @MainActor
+    func testDurationOnlyItemIsNotExpandable() {
+        let projection = TranscriptProjection()
+        let answer = TranscriptEntry(role: .assistant, text: "Done")
+        let duration = TranscriptEntry(role: .duration, text: "took 3 s")
+        projection.synchronize([answer, duration])
+        XCTAssertFalse(projection.items[0].isExpandableActivity)
+        XCTAssertFalse(projection.items[1].isExpandableActivity)
+        XCTAssertEqual(projection.items[1].entries.map(\.id), [duration.id])
+        projection.synchronize([answer, duration, TranscriptEntry(role: .status, text: "Notice")])
+        XCTAssertTrue(projection.items[1].isExpandableActivity)
+    }
+
+    @MainActor
     func testStreamingAndNonTailToolUpdatesKeepDisplayIdentity() {
         var entries = [TranscriptEntry(role: .assistant, text: "completed"), TranscriptEntry(role: .tool, text: "pending", isStreaming: true)]
         let projection = TranscriptProjection()

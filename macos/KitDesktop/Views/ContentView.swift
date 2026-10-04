@@ -1166,7 +1166,7 @@ private struct TranscriptItemView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if item.isActivity {
+            if item.isExpandableActivity {
                 Button { expanded.toggle() } label: {
                     HStack(spacing: 8) {
                         if item.runningCount > 0 { ProgressView().controlSize(.small) }
@@ -1186,7 +1186,7 @@ private struct TranscriptItemView: View {
                 .accessibilityHint("Show or hide thoughts, tool output, plans, and status")
             }
             // Do not build markdown, media, tool JSON, or nested compose views while hidden.
-            if !item.isActivity || expanded {
+            if !item.isExpandableActivity || expanded {
                 ForEach(item.entries) { entry in
                     TranscriptRow(
                         entry: entry,
