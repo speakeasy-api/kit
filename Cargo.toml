@@ -20,12 +20,16 @@ tui = [
     "dep:ratatui-image",
     "dep:shlex",
     "dep:str0m",
+    "dep:syntect",
+    "dep:two-face",
     "dep:tokio-tungstenite",
     "dep:unicode-segmentation",
     "dep:unicode-width",
 ]
 
 [dependencies]
+syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy"], optional = true }
+two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"], optional = true }
 opus-pure = { version = "=0.2.2", default-features = false, optional = true }
 str0m = { version = "=0.24.0", default-features = false, features = ["aws-lc-rs"], optional = true }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
