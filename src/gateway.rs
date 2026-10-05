@@ -1069,6 +1069,22 @@ impl Actor {
             ..
         } = request
         {
+            // A live runtime owns its MCP configuration. Do not replace the
+            // controller and then silently ignore a new configuration.
+            if (self.session_result.is_some()
+                || self.pending.values().any(|pending| {
+                    matches!(pending.method.as_str(), "session/new" | "session/resume")
+                }))
+                && startup.as_ref().is_some_and(|message| {
+                    message["params"].get("mcpServers").is_some_and(|servers| {
+                        !servers.is_null() && servers != &Value::Array(Vec::new())
+                    })
+                })
+            {
+                return Err(Failure::conflict(
+                    "resident session retains its MCP servers; omit mcpServers or send an empty array",
+                ));
+            }
             let metadata = startup
                 .as_ref()
                 .map(|message| &message["params"]["_meta"]["kit/gateway"]);
@@ -1256,6 +1272,9 @@ impl Actor {
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
+                if method == "kit/background/cancel" && message["params"]["session_id"] != self.id {
+                    return Err(Failure::bad("ACP session does not match gateway session"));
+                }
                 // Request-task cancellation is not an execution interrupt. In
                 // particular, SDK teardown must not cancel detached work; use
                 // explicit session/cancel (which is session-scoped) instead.
@@ -1272,6 +1291,7 @@ impl Actor {
                         | "session/revoke_inject"
                         | "session/replace_inject"
                         | "session/cancel"
+                        | "kit/background/cancel"
                         | "session/set_config_option"
                 ) {
                     return Err(Failure::bad(
@@ -1314,6 +1334,13 @@ impl Actor {
                 };
                 if let Some(result) = cached {
                     if startup {
+                        if message["params"].get("mcpServers").is_some_and(|servers| {
+                            !servers.is_null() && servers != &Value::Array(Vec::new())
+                        }) {
+                            return Err(Failure::conflict(
+                                "resident session retains its MCP servers; omit mcpServers or send an empty array",
+                            ));
+                        }
                         let Some(id) = original else {
                             return Err(Failure::bad("session startup requires a request id"));
                         };
@@ -1360,7 +1387,9 @@ impl Actor {
                     message["params"]["cwd"] =
                         Value::String(self.root.to_string_lossy().into_owned());
                     message["params"]["additionalDirectories"] = Value::Array(Vec::new());
-                    message["params"]["mcpServers"] = Value::Array(Vec::new());
+                    if message["params"]["mcpServers"].is_null() {
+                        message["params"]["mcpServers"] = Value::Array(Vec::new());
+                    }
                     if self.restore {
                         message["method"] = Value::String("session/resume".into());
                         message["params"]["sessionId"] = Value::String(self.id.clone());

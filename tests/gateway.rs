@@ -174,6 +174,10 @@ impl SdkClient {
         let response = client.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"standard-sdk-test","version":"0"},"capabilities":{}})).await;
         assert_eq!(response["result"]["protocolVersion"], 2, "{response}");
         assert_eq!(
+            response["result"]["capabilities"]["session"]["mcp"],
+            json!({"stdio":{}})
+        );
+        assert_eq!(
             response["result"]["_meta"]["kit/gateway"]["transport"],
             "bounded-http"
         );
@@ -339,6 +343,153 @@ async fn stop_gateway(child: &mut Child) {
             .unwrap()
             .success()
     );
+}
+
+#[tokio::test]
+async fn sdk_session_mcp_validation_preserves_directory_boundaries() {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture.gateway().await;
+    let stdio =
+        json!({"type":"stdio","name":"fixture","command":"/usr/bin/python3","args":[],"env":[]});
+    let cases = [
+        (
+            json!({"cwd":fixture.root,"mcpServers":[{"name":"missing-type","command":"/usr/bin/python3"}]}),
+            "invalid mcpServers",
+        ),
+        (
+            json!({"cwd":fixture.root,"mcpServers":[{"type":"http","name":"unsupported","url":"http://127.0.0.1:1/mcp","headers":[]}]}),
+            "stdio transport",
+        ),
+        (
+            json!({"cwd":fixture.root,"mcpServers":[stdio.clone(),stdio.clone()]}),
+            "duplicate session MCP server",
+        ),
+        (
+            json!({"cwd":fixture.root,"mcpServers":[stdio.clone()],"additionalDirectories":[fixture.home.path()]}),
+            "directories are not supported",
+        ),
+        (
+            json!({"cwd":fixture.home.path(),"mcpServers":[stdio]}),
+            "project is not registered",
+        ),
+    ];
+    for (params, expected) in cases {
+        let mut sdk = SdkClient::connect(&url).await;
+        let response = sdk.request(2, "session/new", params).await;
+        assert!(response.get("error").is_some(), "{response}");
+        assert!(response.to_string().contains(expected), "{response}");
+        sdk.detach().await;
+    }
+    stop_gateway(&mut gateway).await;
+}
+
+#[tokio::test]
+async fn sdk_session_mcp_new_reattach_and_restore() {
+    // MCP connections are lazy. A local provider boundary requests discovery
+    // through the real compose tool; no inference reaches a paid service.
+    async fn inference(axum::Json(body): axum::Json<Value>) -> impl axum::response::IntoResponse {
+        let finished = body["messages"].as_array().unwrap().last().unwrap()["role"] == "tool";
+        let delta = if finished {
+            json!({"role":"assistant","content":"MCP discovery complete"})
+        } else {
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"discover-mcp","type":"function","function":{"name":"compose","arguments":json!({"script":"return tool_search({ query: \"slick-test echo\" })"}).to_string()}}]})
+        };
+        let chunk = json!({"id":"local-mcp-test","choices":[{"index":0,"delta":delta,"finish_reason":if finished {"stop"} else {"tool_calls"}}]});
+        (
+            [("content-type", "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+    }
+    let mut fixture = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fixture.provider_url = format!("http://{}/stream", listener.local_addr().unwrap());
+    let provider = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(axum::routing::post(inference)),
+        )
+        .await
+        .unwrap();
+    });
+    let marker = fixture.home.path().join("mcp-started");
+    let script = fixture.home.path().join("mcp.py");
+    fs::write(&script, format!(
+        "import os, runpy\nwith open(os.environ['MCP_MARKER'], 'a') as f: f.write(os.getcwd() + '\\n')\nrunpy.run_path({:?}, run_name='__main__')\n",
+        format!("{}/fixtures/mock-mcp.py", env!("CARGO_MANIFEST_DIR"))
+    )).unwrap();
+    let servers = json!([{"type":"stdio","name":"slick-test","command":"/usr/bin/python3","args":[script],"env":[{"name":"MCP_MARKER","value":marker}]}]);
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut sdk = SdkClient::connect(&url).await;
+    let created = sdk
+        .request(
+            2,
+            "session/new",
+            json!({"cwd":fixture.root,"mcpServers":servers}),
+        )
+        .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let id = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    sdk.start_prompt(3, &id, "Discover the session MCP fixture")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        format!("{}\n", fixture.root.display())
+    );
+
+    // Nonempty MCP on a resident resume must not silently replace or ignore it,
+    // and rejection must preserve the current controller.
+    let mut other = SdkClient::connect(&url).await;
+    let rejected = other
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"mcpServers":servers}),
+        )
+        .await;
+    assert!(
+        rejected["error"].to_string().contains("resident"),
+        "{rejected}"
+    );
+    other.detach().await;
+    sdk.start_prompt(4, &id, "Confirm the original controller remains attached")
+        .await;
+    sdk.wait_idle().await;
+    sdk.detach().await;
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"mcpServers":[]}),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    sdk.start_prompt(3, &id, "Discover the retained session MCP fixture")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    sdk.detach().await;
+    stop_gateway(&mut gateway).await;
+
+    // A restorable session starts a new child, so its incoming MCP is applied.
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut sdk = SdkClient::connect(&url).await;
+    let resumed = sdk
+        .request(
+            2,
+            "session/resume",
+            json!({"sessionId":id,"cwd":fixture.root,"mcpServers":servers}),
+        )
+        .await;
+    assert!(resumed.get("error").is_none(), "{resumed}");
+    sdk.start_prompt(3, &id, "Discover the restored session MCP fixture")
+        .await;
+    sdk.wait_idle().await;
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 2);
+    sdk.detach().await;
+    stop_gateway(&mut gateway).await;
+    provider.abort();
 }
 
 #[tokio::test]
@@ -1440,7 +1591,7 @@ async fn pinned_sdk_http_initialize_capabilities_and_session_stream_contract() {
         initialized,
         json!({"jsonrpc":"2.0","id":1,"result":{
             "protocolVersion":2,"info":{"name":"kit-gateway","version":env!("CARGO_PKG_VERSION")},
-            "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{}}},
+            "capabilities":{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{}}}},
             "_meta":{"kit/gateway":{"experimental":true,"transport":"bounded-http","maxFrameBytes":1048576,"coreBufferedBytesPerDirection":16777216,"httpEgressBytesPerConnection":4194304,"liveReplayLimitBytes":8388608,"liveReplayLimitEvents":4093}}
         }})
     );
@@ -2411,3 +2562,6 @@ async fn assert_no_replay_snapshot(bridge: &mut Bridge, id: &str, state: &str) {
     );
     assert_eq!(candidate[1]["params"]["update"]["state"], state);
 }
+
+#[path = "gateway_background_cancel/mod.rs"]
+mod background_cancel;
