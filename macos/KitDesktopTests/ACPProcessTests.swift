@@ -307,10 +307,8 @@ final class ACPProcessTests: XCTestCase {
         wait(for: [finished], timeout: 3)
 
         let thoughts = controller.entries.filter { $0.role == .thought }
-        XCTAssertEqual(thoughts.count, 1)
-        XCTAssertEqual(thoughts.first?.text, "latest thought")
-        XCTAssertNotNil(thoughts.first?.presentation?.thought)
-        XCTAssertFalse(thoughts.first?.isStreaming ?? true)
+        XCTAssertEqual(thoughts.map(\.text), ["outdated thought", "latest thought"])
+        XCTAssertTrue(thoughts.allSatisfy { $0.presentation?.thought != nil && !$0.isStreaming })
         XCTAssertTrue(controller.entries.contains {
             $0.role == .tool && $0.title == "Inspect files" && !$0.isStreaming && $0.presentation?.tool?.status == .completed
         })
@@ -452,7 +450,9 @@ final class ACPProcessTests: XCTestCase {
             provider: "openrouter", model: "openai/gpt-4o-mini", reasoningEffort: "default"
         )
 
-        let created = ACPClient(launchOverride: launch, requestTimeout: 5, promptTimeout: 5)
+        // Exercise the real helper with the production initialization deadline.
+        // Debug helper startup is not a five-second performance assertion.
+        let created = ACPClient(launchOverride: launch, promptTimeout: 5)
         var createdSessionID: String?
         let ready = expectation(description: "real kit session/new")
         created.start(options: options, loading: false) { result in
@@ -460,7 +460,8 @@ final class ACPProcessTests: XCTestCase {
             catch { XCTFail(error.localizedDescription) }
             ready.fulfill()
         }
-        wait(for: [ready], timeout: 10)
+        wait(for: [ready], timeout: 40)
+        let sessionID = try XCTUnwrap(createdSessionID)
 
         let prompted = expectation(description: "real kit session/prompt")
         created.prompt(text: "wait until cancelled", attachments: []) { _ in prompted.fulfill() }
@@ -468,17 +469,17 @@ final class ACPProcessTests: XCTestCase {
         created.close(activeTurn: true) { closed.fulfill() }
         wait(for: [prompted, closed], timeout: 12)
 
-        let loaded = ACPClient(launchOverride: launch, requestTimeout: 5, promptTimeout: 5)
+        let loaded = ACPClient(launchOverride: launch, promptTimeout: 5)
         let resumed = expectation(description: "real kit session/resume")
         let resumedOptions = ACPLaunchOptions(
-            root: root.path, sessionID: try XCTUnwrap(createdSessionID), resume: true,
+            root: root.path, sessionID: sessionID, resume: true,
             provider: "openrouter", model: "openai/gpt-4o-mini", reasoningEffort: "default"
         )
         loaded.start(options: resumedOptions, loading: true) { result in
             if case .failure(let error) = result { XCTFail(error.localizedDescription) }
             resumed.fulfill()
         }
-        wait(for: [resumed], timeout: 10)
+        wait(for: [resumed], timeout: 40)
         let loadClosed = expectation(description: "loaded session close")
         loaded.close(activeTurn: false) { loadClosed.fulfill() }
         wait(for: [loadClosed], timeout: 5)

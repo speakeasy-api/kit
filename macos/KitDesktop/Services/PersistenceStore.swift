@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 enum PersistenceError: LocalizedError, Equatable {
     case unsupportedSchema(Int)
@@ -95,7 +96,9 @@ final class PersistenceStore {
 
         let version: Int
         if let rawVersion = object["schemaVersion"] {
-            guard !(rawVersion is Bool), let decoded = rawVersion as? Int, decoded >= 1 else {
+            guard let number = rawVersion as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  let decoded = rawVersion as? Int, decoded >= 1 else {
                 throw PersistenceError.unreadableState("schemaVersion must be a positive integer.")
             }
             version = decoded

@@ -159,6 +159,15 @@ struct MarkdownDocument: Equatable {
 
 struct MarkdownView: View {
     let source: String
+
+    var body: some View {
+        // Unrelated streaming, roster, and composer changes must not reparse completed text.
+        MarkdownContentView(source: source).equatable()
+    }
+}
+
+private struct MarkdownContentView: View, Equatable {
+    let source: String
     private var document: MarkdownDocument { MarkdownDocument(source) }
 
     var body: some View {
