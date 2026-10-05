@@ -6,7 +6,7 @@ This is an experimental, single-user, private-network facility, not a public ser
 
 ## Start the host
 
-Configure the host's provider credentials, model, tools, and MCP servers as for a local Kit session. Children inherit the gateway host's environment and load its configuration; the remote terminal does not supply provider credentials or local MCP servers.
+Configure the host's provider credentials, model, tools, and MCP servers as for a local Kit session. Children inherit the gateway host's environment and load its configuration; the remote terminal does not supply provider credentials. ACP clients may supply session-scoped stdio `mcpServers` when creating a session or restoring one after its child exits. These commands execute on the gateway host under the existing runtime's MCP validation and configuration rules, not on the client. Each ACP v2 stdio entry needs `"type":"stdio"` and an absolute host executable path. Resident reattach retains the running session's MCP runtime: omit `mcpServers` or send an empty array; a nonempty list is rejected rather than ignored or used to replace live servers. Session-scoped MCP configuration is not persisted in the transcript, so clients must supply it again when restoring a stopped session.
 
 Create a high-entropy bearer credential without putting it in command-line arguments:
 
@@ -120,10 +120,19 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/resume` | Acquire or replace control of a session; optional replay from `start` only. |
 | `session/prompt` | Submit work to the resident child. |
 | `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
-| `session/cancel` | Explicitly interrupt work; this is distinct from closing a connection. |
+| `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
+| `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
 | `session/set_config_option` | Select configuration advertised by the child, without changing client-local defaults. |
 
-Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose. Do not automatically resend a prompt after a transport failure.
+Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose, and cancel detached jobs separately. Do not automatically resend a prompt after a transport failure.
+
+The Kit-private background operation uses **snake_case** parameters, unlike standard ACP session methods:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"kit/background/cancel","params":{"session_id":"SESSION_ID","call_id":"CALL_ID"}}
+```
+
+Only the current controller can send it. The gateway forwards the native response (`{"cancelled":true}`); this acknowledges the cancellation request, not completion or proof that the call was running. The native operation also accepts unknown call IDs and repeated requests. Observe subsequent task updates to confirm completion. Neither this operation nor `session/cancel` is a gateway-wide “stop all.”
 
 ### Pinned wire fixture
 
@@ -169,6 +178,6 @@ The error above illustrates a session-routed revoke of an unknown pending messag
 - These bounds exclude allocator overhead, transient JSON conversion, arbitrary application state, and HTTP/TLS/socket buffers. They are not a hard process-memory ceiling or a denial-of-service-hardening claim. The bounded transport supports HTTP/SSE, not WebSocket upgrades. SSE has no replay cursor: reopening a stream alone cannot recover lost events. Recovery uses fresh initialization and session-level resume, not SSE event IDs. There is no idle connection expiration or body-read deadline: disconnected peers that do not DELETE or otherwise terminate their transport can retain connection slots. Slot exhaustion may require restarting the gateway; do not expose it to untrusted clients.
 - At most 64 active or stopping actors occupy session slots. Listing or creating sessions reclaims completed actor slots without restarting the gateway or deleting durable transcripts. Detached actors, including idle actors, are not automatically terminated; accepted work continues. HTTP POST bodies are limited to 1 MiB inside SDK admission, including streamed bodies; supervisor command queues and pending child requests are also bounded. Child stdout frames are limited to 8 MiB before JSON parsing; oversized or malformed frames stop that child.
 - Graceful `Ctrl+C` shutdown stops serving, releases resident actor ownership, closes each ACP child’s input, drains its output, and waits for cleanup and exit. A 10-second timeout falls back to killing and reaping the child. That fallback can leave a stale transcript lock requiring operator intervention. Hard process termination has operating-system-dependent cleanup behavior; arbitrary tool descendants are not a managed process group.
-- Client-side ACP services, arbitrary extra directories, remote MCP injection, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
+- Client-side ACP services, arbitrary extra directories, session-scoped HTTP/SSE MCP servers, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
 
 The internal `gateway bridge` stdio command is a transport adapter for the bundled TUI, not a stable public protocol or general-purpose ACP proxy. The public transport is ACP HTTP at `/acp/v2`, implemented by the ACP SDK rather than a Kit-specific RPC protocol.

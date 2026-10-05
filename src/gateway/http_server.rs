@@ -135,10 +135,11 @@ impl Connection {
             let mut capabilities = serde_json::to_value(agentkit_acp::v2::agent_capabilities())
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
             if let Some(session) = capabilities["session"].as_object_mut() {
-                for name in ["close", "delete", "fork", "mcp"] {
+                for name in ["close", "delete", "fork"] {
                     session.remove(name);
                 }
                 session.insert("list".into(), object([]));
+                session.insert("mcp".into(), object([("stdio", object([]))]));
             }
             self.initialize = Some((message.clone(), Arc::clone(charge)));
             return Ok(Some(object([
@@ -221,15 +222,23 @@ impl Connection {
             if id.as_ref().is_some_and(|id| self.controls.contains_key(id)) {
                 return Err(Failure::conflict("connection already controls session"));
             }
-            for field in ["mcpServers", "additionalDirectories"] {
-                if message["params"]
-                    .get(field)
-                    .is_some_and(|v| !v.is_null() && v != &Value::Array(vec![]))
-                {
-                    return Err(Failure::bad(
-                        "client directories and MCP servers are not supported",
-                    ));
-                }
+            if message["params"]
+                .get("additionalDirectories")
+                .is_some_and(|v| !v.is_null() && v != &Value::Array(vec![]))
+            {
+                return Err(Failure::bad("client directories are not supported"));
+            }
+            // ACP startup decoding skips invalid MCP entries by default.
+            // Validate the list directly so forwarded configuration is never
+            // silently dropped; the runtime still validates supported transports
+            // and server configuration.
+            if let Some(servers) = message["params"].get("mcpServers")
+                && !servers.is_null()
+            {
+                serde_json::from_value::<Vec<agent_client_protocol::schema::v2::McpServer>>(
+                    servers.clone(),
+                )
+                .map_err(|_| Failure::bad("invalid mcpServers configuration"))?;
             }
             if message["params"]
                 .get("replayFrom")
@@ -347,9 +356,15 @@ impl Connection {
             self.controls.insert(session, control);
             return Ok(None);
         }
-        let id = message["params"]["sessionId"]
+        // Kit's existing background extension uses snake_case on the wire.
+        let session_field = if method == "kit/background/cancel" {
+            "session_id"
+        } else {
+            "sessionId"
+        };
+        let id = message["params"][session_field]
             .as_str()
-            .ok_or_else(|| Failure::bad("sessionId required"))?;
+            .ok_or_else(|| Failure::bad(format!("{session_field} required")))?;
         let control = self
             .controls
             .get_mut(id)
