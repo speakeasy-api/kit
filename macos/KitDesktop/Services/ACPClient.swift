@@ -792,8 +792,13 @@ final class ACPClient {
         let chdirResult = workingDirectory.withCString { directory in
             posix_spawn_file_actions_addchdir_np(&actions, directory)
         }
-        guard chdirResult == 0,
-              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
+        // Dispatch worker threads block SIGCHLD. Do not pass that mask to Kit:
+        // Tokio needs child-exit signals to complete shell subprocess waits.
+        var signalMask = sigset_t()
+        guard sigemptyset(&signalMask) == 0,
+              chdirResult == 0,
+              posix_spawnattr_setsigmask(&attributes, &signalMask) == 0,
+              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK)) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
             throw ACPClientError.process("Unable to configure process group")
         }
