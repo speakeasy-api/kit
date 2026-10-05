@@ -392,7 +392,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         let delta = if finished {
             json!({"role":"assistant","content":"MCP discovery complete"})
         } else {
-            json!({"role":"assistant","tool_calls":[{"index":0,"id":"discover-mcp","type":"function","function":{"name":"compose","arguments":json!({"script":"return tool_search({ query: \"slick-test echo\" })"}).to_string()}}]})
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"discover-mcp","type":"function","function":{"name":"compose","arguments":json!({"script":"return tool_search({ query: \"session-fixture echo\" })"}).to_string()}}]})
         };
         let chunk = json!({"id":"local-mcp-test","choices":[{"index":0,"delta":delta,"finish_reason":if finished {"stop"} else {"tool_calls"}}]});
         (
@@ -417,7 +417,7 @@ async fn sdk_session_mcp_new_reattach_and_restore() {
         "import os, runpy\nwith open(os.environ['MCP_MARKER'], 'a') as f: f.write(os.getcwd() + '\\n')\nrunpy.run_path({:?}, run_name='__main__')\n",
         format!("{}/fixtures/mock-mcp.py", env!("CARGO_MANIFEST_DIR"))
     )).unwrap();
-    let servers = json!([{"type":"stdio","name":"slick-test","command":"/usr/bin/python3","args":[script],"env":[{"name":"MCP_MARKER","value":marker}]}]);
+    let servers = json!([{"type":"stdio","name":"session-fixture","command":"/usr/bin/python3","args":[script],"env":[{"name":"MCP_MARKER","value":marker}]}]);
     let (mut gateway, url) = fixture.gateway().await;
     let mut sdk = SdkClient::connect(&url).await;
     let created = sdk
