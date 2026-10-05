@@ -833,9 +833,10 @@ private struct ModelEffortSelector: View {
     private var effort: ConfigOption? {
         controller.configOptions.first { $0.isReasoningEffort && $0.valueType == "select" && !$0.choices.isEmpty }
     }
-    private var disabled: Bool {
-        !controller.isReady || controller.isLocked || controller.isRunning || controller.isUpdatingConfig
+    private var settingsUnavailable: Bool {
+        !controller.isReady || controller.isLocked || controller.isRunning
     }
+    private var disabled: Bool { settingsUnavailable || controller.isUpdatingConfig }
 
     var body: some View {
         if let model {
@@ -844,8 +845,7 @@ private struct ModelEffortSelector: View {
                     Image(systemName: "cpu")
                     Text(selectedName(model)).lineLimit(1)
                     if let effort { Text(selectedName(effort)).foregroundStyle(.secondary).lineLimit(1) }
-                    if controller.isUpdatingConfig { ProgressView().controlSize(.mini) }
-                    else { Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold)) }
+                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
                 }
                 .font(.caption).padding(.horizontal, 8).padding(.vertical, 5)
                 .background(Brand.paper, in: RoundedRectangle(cornerRadius: Brand.Radius.small))
@@ -862,7 +862,6 @@ private struct ModelEffortSelector: View {
                 Image(systemName: "cpu").foregroundStyle(Brand.moss)
                 Text("Model & effort").font(.headline)
                 Spacer()
-                if controller.isUpdatingConfig { ProgressView().controlSize(.small) }
             }.padding(16)
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -896,7 +895,8 @@ private struct ModelEffortSelector: View {
                                                 in: RoundedRectangle(cornerRadius: Brand.Radius.small))
                                     .contentShape(Rectangle())
                                 }
-                                .buttonStyle(.plain).pointingHandCursor().disabled(disabled)
+                                .buttonStyle(.plain).pointingHandCursor().disabled(settingsUnavailable)
+                                .allowsHitTesting(!controller.isUpdatingConfig)
                                 .accessibilityAddTraits(choice.value == model.currentValue ? .isSelected : [])
                                 .help(choice.value)
                             }
@@ -913,18 +913,18 @@ private struct ModelEffortSelector: View {
                     if (2...4).contains(effort.choices.count) && effort.choices.reduce(0, { $0 + $1.name.count }) <= 36 {
                         Picker(effort.name, selection: binding(effort)) {
                             ForEach(effort.choices) { Text($0.name).tag($0.value) }
-                        }.pickerStyle(.segmented).labelsHidden().disabled(disabled)
+                        }.pickerStyle(.segmented).labelsHidden().disabled(settingsUnavailable)
+                            .allowsHitTesting(!controller.isUpdatingConfig)
                     } else {
                         Picker(effort.name, selection: binding(effort)) {
                             ForEach(effort.choices) { Text($0.name).tag($0.value) }
-                        }.labelsHidden().disabled(disabled)
+                        }.labelsHidden().disabled(settingsUnavailable)
+                            .allowsHitTesting(!controller.isUpdatingConfig)
                     }
                 } else {
                     Text("This model does not advertise an effort control.").font(.caption).foregroundStyle(.secondary)
                 }
-                if controller.isUpdatingConfig {
-                    Text("Applying selection…").font(.caption).foregroundStyle(.secondary)
-                } else if controller.isRunning {
+                if controller.isRunning {
                     Text("Model settings can be changed when this turn finishes.").font(.caption).foregroundStyle(.secondary)
                 } else if !controller.isReady || controller.isLocked {
                     Text("Connect to this thread to change model settings.").font(.caption).foregroundStyle(.secondary)
