@@ -316,8 +316,9 @@ pub(super) async fn run(
                 Timeout,
             }
             let event = {
-                // select polls its left branch first. Keep timeout > driver >
-                // inbound frame > stdin priority; disabled branches never poll
+                // select polls its left branch first. Drain admitted inbound
+                // frames before driving more HTTP work: timeout > inbound frame
+                // > driver > stdin. Disabled branches never poll
                 // their underlying receiver or deadline.
                 let timeout = std::pin::pin!(async {
                     if phase != "live" {
@@ -340,11 +341,11 @@ pub(super) async fn run(
                         std::future::pending().await
                     }
                 });
-                match select(timeout, select(&mut transport, select(frame, line))).await {
+                match select(timeout, select(frame, select(&mut transport, line))).await {
                     Either::Left(_) => Event::Timeout,
-                    Either::Right((Either::Left((result, _)), _)) => Event::Driver(result),
-                    Either::Right((Either::Right((Either::Left((frame, _)), _)), _)) => {
-                        Event::Frame(frame)
+                    Either::Right((Either::Left((frame, _)), _)) => Event::Frame(frame),
+                    Either::Right((Either::Right((Either::Left((result, _)), _)), _)) => {
+                        Event::Driver(result)
                     }
                     Either::Right((Either::Right((Either::Right((line, _)), _)), _)) => {
                         Event::Line(line)

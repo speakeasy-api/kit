@@ -5,6 +5,10 @@ use agent_client_protocol::{
 };
 use futures_util::StreamExt;
 
+// Shorter than the controller lease; a stalled HTTP consumer cannot hold a
+// replay producer forever or silently extend ownership without polling.
+const OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(super) struct Connection {
     gateway: Arc<Gateway>,
     initialize: Option<(Value, Arc<ChargedFrame>)>,
@@ -379,7 +383,7 @@ impl Connection {
             match control.poll().await {
                 Ok(messages) => {
                     for message in messages {
-                        send(channel, message)?;
+                        send(channel, message).await?;
                     }
                 }
                 Err(error) => failed.push((id.clone(), error)),
@@ -408,7 +412,8 @@ impl Connection {
                             ]),
                         ),
                     ]),
-                )?;
+                )
+                .await?;
                 for (_, request_id) in control.pending.drain() {
                     send(
                         channel,
@@ -424,7 +429,8 @@ impl Connection {
                                 ]),
                             ),
                         ]),
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -494,7 +500,7 @@ impl Connection {
                         }
                     };
                     if let Some(response) = response {
-                        send(&channel, response)?;
+                        send(&channel, response).await?;
                     }
                     self.flush(&channel).await?;
                 }
@@ -510,15 +516,20 @@ impl Connection {
 fn sdk_error(error: impl std::fmt::Display) -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data(error.to_string())
 }
-fn send(channel: &BoundedChannel, message: Value) -> agent_client_protocol::Result<()> {
+async fn send(channel: &BoundedChannel, message: Value) -> agent_client_protocol::Result<()> {
     let message =
         serde_json::from_value(message).map_err(|error| channel.tx.fail(&error.to_string()))?;
     // Wake the terminal failure observer even if request setup converts this
     // SDK error to Failure. Saturation never silently drops an accepted frame.
-    channel
-        .tx
-        .try_send(TransportFrame::Single(message))
-        .map_err(|error| channel.tx.fail(&error.to_string()))
+    // Admission stays charged through SDK routing and HTTP body handoff, not
+    // merely dequeue. Wait for actual release instead of relying on scheduling.
+    tokio::time::timeout(
+        OUTPUT_STALL_TIMEOUT,
+        channel.tx.send(TransportFrame::Single(message)),
+    )
+    .await
+    .map_err(|_| channel.tx.fail("gateway HTTP output admission stalled"))?
+    .map_err(|error| channel.tx.fail(&error.to_string()))
 }
 
 impl ConnectTo<agent_client_protocol::Client> for Connection {
@@ -583,33 +594,67 @@ mod tests {
         assert!(error.to_string().contains("initialize is required"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dequeued_frame_retains_admission_until_dropped() {
         let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
         let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
-        send(&channel, message.clone()).unwrap();
+        send(&channel, message.clone()).await.unwrap();
         let charged = peer.rx.next().await.unwrap();
         let decoded = charged.decode();
         assert!(matches!(decoded, TransportFrame::Single(_)));
         // Removing a frame from the queue does not release its reservation.
-        let rejected = send(&channel, message.clone()).unwrap_err();
+        let rejected = send(&channel, message.clone()).await.unwrap_err();
+        assert!(rejected.to_string().contains("output admission stalled"));
         assert_eq!(channel.tx.failure().await.to_string(), rejected.to_string());
         drop(decoded);
         drop(charged);
         assert!(
-            send(&channel, message).is_err(),
+            send(&channel, message).await.is_err(),
             "saturation stays terminal"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn output_waits_for_http_body_charge_release_before_stall_deadline() {
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        send(&channel, message.clone()).await.unwrap();
+        // HTTP routing/body ownership can retain a dequeued frame. Progress is
+        // tied to that ownership ending, not a producer yield or queue dequeue.
+        let held = Arc::new(peer.rx.next().await.unwrap());
+        let body = held.clone();
+        drop(held);
+        let mut sending = Box::pin(send(&channel, message));
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        tokio::time::advance(OUTPUT_STALL_TIMEOUT / 2).await;
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        drop(body);
+        sending.await.unwrap();
+        assert!(peer.rx.next().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_output_wait_releases_registration_without_failing_channel() {
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
+        send(&channel, message.clone()).await.unwrap();
+        let held = peer.rx.next().await.unwrap();
+        let mut sending = Box::pin(send(&channel, message.clone()));
+        assert!(futures_util::poll!(&mut sending).is_pending());
+        drop(sending);
+        drop(held);
+        send(&channel, message).await.unwrap();
+        assert!(peer.rx.next().await.is_some());
     }
 
     #[tokio::test]
     async fn dropping_consumed_frame_releases_current_admission() {
         let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
         let message = json!({"jsonrpc":"2.0","id":1,"result":{}});
-        send(&channel, message.clone()).unwrap();
+        send(&channel, message.clone()).await.unwrap();
         let charged = peer.rx.next().await.unwrap();
         drop(charged);
-        send(&channel, message).unwrap();
+        send(&channel, message).await.unwrap();
         assert!(peer.rx.next().await.is_some());
     }
 
@@ -619,12 +664,12 @@ mod tests {
         let message = json!({"jsonrpc":"2.0","id":1,"result":{"text":"x".repeat(64 * 1024)}});
         let mut total = 0;
         while total <= MAX_REPLAY {
-            send(&channel, message.clone()).unwrap();
+            send(&channel, message.clone()).await.unwrap();
             let charged = peer.rx.next().await.unwrap();
             total += charged.as_bytes().len();
             drop(charged);
         }
-        send(&channel, message).unwrap();
+        send(&channel, message).await.unwrap();
     }
 
     #[tokio::test]
@@ -686,7 +731,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pending_request_capacity_preserves_response_lane() {
         let (sender, mut receiver) = mpsc::channel::<Envelope>(1);
         let (_stopped, stopped) = watch::channel(());
@@ -704,7 +749,9 @@ mod tests {
                 .collect(),
         };
         let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
-        send(&channel, json!({"jsonrpc":"2.0","id":1,"result":{}})).unwrap();
+        send(&channel, json!({"jsonrpc":"2.0","id":1,"result":{}}))
+            .await
+            .unwrap();
         let charge = Arc::new(peer.rx.next().await.unwrap());
         let pending = control.pending.len();
         assert!(
@@ -740,7 +787,11 @@ mod tests {
         drop(charge);
         // Actor acceptance does not release SDK admission while the accepted
         // child-bound request still owns decoded data.
-        assert!(send(&channel, json!({"jsonrpc":"2.0","id":2,"result":{}})).is_err());
+        assert!(
+            send(&channel, json!({"jsonrpc":"2.0","id":2,"result":{}}))
+                .await
+                .is_err()
+        );
         drop(accepted);
     }
 }
