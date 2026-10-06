@@ -272,6 +272,7 @@ struct Bridge {
 
 impl Bridge {
     async fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        let started = std::time::Instant::now();
         let mut bytes = serde_json::to_vec(
             &json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
         )
@@ -291,7 +292,12 @@ impl Bridge {
                     self.updates.push(message["params"]["update"].clone());
                 }
                 if message["id"] == id {
-                    assert!(message.get("error").is_none(), "{message}");
+                    assert!(
+                        message.get("error").is_none(),
+                        "{message}; {method} failed after {:?}, received {} updates",
+                        started.elapsed(),
+                        self.updates.len()
+                    );
                     return message["result"].clone();
                 }
             }
@@ -2565,3 +2571,71 @@ async fn assert_no_replay_snapshot(bridge: &mut Bridge, id: &str, state: &str) {
 
 #[path = "gateway_background_cancel/mod.rs"]
 mod background_cancel;
+
+// Seed durable history only after every writer has exited. No prompt or model
+// request is needed: replay must work even when inference is unavailable.
+async fn assert_bridge_replays_ready_history(records: usize) {
+    let fixture = Fixture::new();
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut bridge = fixture.bridge(&url, None);
+    let id = bridge.handshake().await;
+    bridge.detach().await;
+    stop_gateway(&mut gateway).await;
+    let path = fs::read_dir(fixture.home.path().join(".kit/sessions"))
+        .unwrap()
+        .flat_map(|workspace| fs::read_dir(workspace.unwrap().path()).unwrap())
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == format!("{id}.jsonl").as_str())
+        .unwrap()
+        .path();
+    let mut transcript = fs::read_to_string(&path).unwrap();
+    let mut record: Value = serde_json::from_str(transcript.lines().next().unwrap()).unwrap();
+    let generation = transcript
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["generation"]
+                .as_u64()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    for index in 0..records {
+        record["generation"] = json!(generation + index as u64 + 1);
+        record["item"] = json!({
+            "kind":"Assistant", "id":format!("replay-{index}"),
+            "created_at":1_700_000_000_000u64 + index as u64,
+            "finish_reason":"Completed", "metadata":{}, "usage":null,
+            "parts":[{"Text":{"text":format!("History entry {index:04}"),"metadata":{}}}]
+        });
+        transcript.push_str(&serde_json::to_string(&record).unwrap());
+        transcript.push('\n');
+    }
+    fs::write(path, transcript).unwrap();
+    let (mut gateway, url) = fixture.gateway().await;
+    let mut bridge = fixture.bridge(&url, Some(&id));
+    assert_eq!(bridge.handshake().await, id);
+    let expected = (0..records)
+        .map(|index| format!("History entry {index:04}"))
+        .collect::<String>();
+    assert_replayed_answer(&bridge.updates, &expected);
+    // Each assistant record expands into multiple wire events; this exceeds
+    // the incoming channel's fixed frame bound without increasing that bound.
+    assert!(bridge.updates.len() >= records);
+    bridge.detach().await;
+    stop_gateway(&mut gateway).await;
+}
+
+#[tokio::test]
+async fn bridge_replays_thirteen_short_history_records() {
+    assert_bridge_replays_ready_history(13).await;
+}
+
+#[tokio::test]
+async fn bridge_replays_160_short_history_records() {
+    assert_bridge_replays_ready_history(160).await;
+}
+
+#[tokio::test]
+async fn bridge_replays_1000_short_history_records() {
+    assert_bridge_replays_ready_history(1000).await;
+}

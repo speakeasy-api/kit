@@ -139,3 +139,8 @@ todo = "deny"
 unimplemented = "deny"
 disallowed_methods = "deny"
 disallowed_macros = "deny"
+
+# Bounded SSE replay fairness; keep HTTP and core channel types on one revision.
+[patch.crates-io]
+agentkit-acp-http = { git = "https://github.com/danielkov/rust-sdk", rev = "03eab519aa5ecfc97a43bf17f9721c38c065c47b" }
+agentkit-acp-sdk = { git = "https://github.com/danielkov/rust-sdk", rev = "03eab519aa5ecfc97a43bf17f9721c38c065c47b" }

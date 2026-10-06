@@ -81,8 +81,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de"
+source = "git+https://github.com/danielkov/rust-sdk?rev=03eab519aa5ecfc97a43bf17f9721c38c065c47b#03eab519aa5ecfc97a43bf17f9721c38c065c47b"
 dependencies = [
  "quote",
  "syn 3.0.4",
@@ -109,8 +108,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-http"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dac1fe9230b43784cb66312e93eb72d6420c0a027029879feb02361435856b66"
+source = "git+https://github.com/danielkov/rust-sdk?rev=03eab519aa5ecfc97a43bf17f9721c38c065c47b#03eab519aa5ecfc97a43bf17f9721c38c065c47b"
 dependencies = [
  "agentkit-acp-sdk",
  "async-stream",
@@ -147,8 +145,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-sdk"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b93c10bb458dd1c2c822275a7e1c390b46846a6bcd3cbc84aafa312563e36ad"
+source = "git+https://github.com/danielkov/rust-sdk?rev=03eab519aa5ecfc97a43bf17f9721c38c065c47b#03eab519aa5ecfc97a43bf17f9721c38c065c47b"
 dependencies = [
  "agent-client-protocol-derive",
  "agentkit-acp-schema",
