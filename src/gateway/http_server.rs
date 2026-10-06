@@ -5,9 +5,9 @@ use agent_client_protocol::{
 };
 use futures_util::StreamExt;
 
-// Shorter than the controller lease; a stalled HTTP consumer cannot hold a
-// replay producer forever or silently extend ownership without polling.
-const OUTPUT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+// One budget for a response and all controller polling/output in a drain.
+// Progress does not restart it or renew leases while another controller waits.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct Connection {
     gateway: Arc<Gateway>,
@@ -378,12 +378,41 @@ impl Connection {
     }
 
     async fn flush(&mut self, channel: &BoundedChannel) -> agent_client_protocol::Result<()> {
+        self.flush_with_response(channel, None).await
+    }
+
+    async fn flush_with_response(
+        &mut self,
+        channel: &BoundedChannel,
+        response: Option<Value>,
+    ) -> agent_client_protocol::Result<()> {
+        let deadline = tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+        let drain = async {
+            if let Some(response) = response {
+                send(channel, response, deadline).await?;
+            }
+            self.flush_before(channel, deadline).await
+        };
+        let timeout = std::pin::pin!(tokio::time::sleep_until(deadline));
+        let drain = std::pin::pin!(drain);
+        // Poll the deadline first, including when actor output is already ready.
+        match select(timeout, drain).await {
+            Either::Left(_) => Err(channel.tx.fail("gateway HTTP output admission stalled")),
+            Either::Right((result, _)) => result,
+        }
+    }
+
+    async fn flush_before(
+        &mut self,
+        channel: &BoundedChannel,
+        deadline: tokio::time::Instant,
+    ) -> agent_client_protocol::Result<()> {
         let mut failed = Vec::new();
         for (id, control) in &mut self.controls {
             match control.poll().await {
                 Ok(messages) => {
                     for message in messages {
-                        send(channel, message).await?;
+                        send(channel, message, deadline).await?;
                     }
                 }
                 Err(error) => failed.push((id.clone(), error)),
@@ -412,6 +441,7 @@ impl Connection {
                             ]),
                         ),
                     ]),
+                    deadline,
                 )
                 .await?;
                 for (_, request_id) in control.pending.drain() {
@@ -429,6 +459,7 @@ impl Connection {
                                 ]),
                             ),
                         ]),
+                        deadline,
                     )
                     .await?;
                 }
@@ -499,10 +530,7 @@ impl Connection {
                             ]))
                         }
                     };
-                    if let Some(response) = response {
-                        send(&channel, response).await?;
-                    }
-                    self.flush(&channel).await?;
+                    self.flush_with_response(&channel, response).await?;
                 }
                 drop(charged_frame);
             }
@@ -516,20 +544,26 @@ impl Connection {
 fn sdk_error(error: impl std::fmt::Display) -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data(error.to_string())
 }
-async fn send(channel: &BoundedChannel, message: Value) -> agent_client_protocol::Result<()> {
+async fn send(
+    channel: &BoundedChannel,
+    message: Value,
+    deadline: tokio::time::Instant,
+) -> agent_client_protocol::Result<()> {
+    // Ready sends must also respect the deadline; timeout_at alone can finish
+    // a ready future even when its timer has already elapsed.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(channel.tx.fail("gateway HTTP output admission stalled"));
+    }
     let message =
         serde_json::from_value(message).map_err(|error| channel.tx.fail(&error.to_string()))?;
     // Wake the terminal failure observer even if request setup converts this
     // SDK error to Failure. Saturation never silently drops an accepted frame.
     // Admission stays charged through SDK routing and HTTP body handoff, not
     // merely dequeue. Wait for actual release instead of relying on scheduling.
-    tokio::time::timeout(
-        OUTPUT_STALL_TIMEOUT,
-        channel.tx.send(TransportFrame::Single(message)),
-    )
-    .await
-    .map_err(|_| channel.tx.fail("gateway HTTP output admission stalled"))?
-    .map_err(|error| channel.tx.fail(&error.to_string()))
+    tokio::time::timeout_at(deadline, channel.tx.send(TransportFrame::Single(message)))
+        .await
+        .map_err(|_| channel.tx.fail("gateway HTTP output admission stalled"))?
+        .map_err(|error| channel.tx.fail(&error.to_string()))
 }
 
 impl ConnectTo<agent_client_protocol::Client> for Connection {
@@ -557,6 +591,17 @@ mod tests {
     )]
     use super::*;
     use serde_json::json;
+
+    // Single-send tests use the same production deadline path. Connection tests
+    // below exercise sharing that deadline across complete output drains.
+    async fn send(channel: &BoundedChannel, message: Value) -> agent_client_protocol::Result<()> {
+        super::send(
+            channel,
+            message,
+            tokio::time::Instant::now() + OUTPUT_DRAIN_TIMEOUT,
+        )
+        .await
+    }
 
     fn limits() -> ChannelLimits {
         ChannelLimits {
@@ -626,7 +671,7 @@ mod tests {
         drop(held);
         let mut sending = Box::pin(send(&channel, message));
         assert!(futures_util::poll!(&mut sending).is_pending());
-        tokio::time::advance(OUTPUT_STALL_TIMEOUT / 2).await;
+        tokio::time::advance(OUTPUT_DRAIN_TIMEOUT / 2).await;
         assert!(futures_util::poll!(&mut sending).is_pending());
         drop(body);
         sending.await.unwrap();
@@ -670,6 +715,140 @@ mod tests {
             drop(charged);
         }
         send(&channel, message).await.unwrap();
+    }
+
+    async fn assert_slow_progress_has_one_drain_deadline(
+        batches: &[usize],
+        poll_delay: Duration,
+        with_response: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let token = directory.path().join("token");
+        std::fs::write(&token, "test-token").unwrap();
+        let gateway = Arc::new(Gateway {
+            stopping: AtomicBool::new(false),
+            token: BearerToken::load(&token).unwrap(),
+            roots: Vec::new(),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        let mut connection = Connection::new(gateway);
+        let mut actors = Vec::new();
+        for (index, count) in batches.iter().copied().enumerate() {
+            let session = format!("session-{index}");
+            let (sender, mut receiver) = mpsc::channel::<Envelope>(2);
+            let (_stopped, stopped) = watch::channel(());
+            connection.controls.insert(
+                session.clone(),
+                Control {
+                    session,
+                    attachment: "current".into(),
+                    entry: Entry {
+                        root: PathBuf::new(),
+                        sender,
+                        stopped,
+                    },
+                    cursor: 0,
+                    pending: HashMap::new(),
+                },
+            );
+            // The resident actor mailbox is the real adapter boundary. Each
+            // controller contributes a batch to the same HTTP output channel.
+            actors.push(tokio::spawn(async move {
+                let envelope = receiver.recv().await.unwrap();
+                assert!(matches!(envelope.request, Request::Poll { .. }));
+                tokio::time::sleep(poll_delay).await;
+                let events = (1..=count)
+                    .map(|cursor| {
+                        json!({
+                            "cursor":cursor,
+                            "message":{"jsonrpc":"2.0","id":cursor,"result":{}}
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let _ = envelope.reply.send(Ok(json!({"events":events})));
+            }));
+        }
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let response = with_response.then(|| json!({"jsonrpc":"2.0","id":0,"result":{}}));
+        if with_response {
+            // A prior HTTP body owns the only slot when the response arrives.
+            send(&channel, json!({"jsonrpc":"2.0","id":-1,"result":{}}))
+                .await
+                .unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        let output = async {
+            let result = if response.is_some() {
+                connection.flush_with_response(&channel, response).await
+            } else {
+                connection.flush(&channel).await
+            };
+            channel.tx.close_channel();
+            result
+        };
+        let consumer = async {
+            while let Some(charged) = peer.rx.next().await {
+                // Every individual frame makes progress well before five
+                // seconds, but the complete batch exceeds the drain budget.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                drop(charged);
+            }
+        };
+        let (result, ()) = tokio::join!(output, consumer);
+        for actor in actors {
+            actor.abort();
+            let _ = actor.await;
+        }
+        let error = result.expect_err("slow progress reset the output drain deadline");
+        assert!(
+            error.to_string().contains("output admission stalled"),
+            "{error}"
+        );
+        assert!(started.elapsed() <= OUTPUT_DRAIN_TIMEOUT + Duration::from_secs(1));
+        assert!(started.elapsed() < LEASE);
+        assert_eq!(
+            connection.controls.len(),
+            batches.len(),
+            "drain timeout must not be reported as controller replacement"
+        );
+        assert_eq!(channel.tx.failure().await.to_string(), error.to_string());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_cannot_extend_one_controller_output_drain() {
+        assert_slow_progress_has_one_drain_deadline(&[128], Duration::ZERO, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_cannot_reset_output_drain_between_controllers() {
+        // Each controller fits individually inside the budget. Only a shared
+        // deadline across the multiplexed connection bounds the whole drain.
+        assert_slow_progress_has_one_drain_deadline(&[4, 4], Duration::ZERO, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_progress_response_and_replay_share_output_drain_deadline() {
+        assert_slow_progress_has_one_drain_deadline(&[4], Duration::ZERO, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_actor_polling_consumes_the_shared_output_drain_budget() {
+        assert_slow_progress_has_one_drain_deadline(&[0, 0, 0], Duration::from_secs(2), false)
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_output_cannot_bypass_expired_drain_deadline() {
+        let (channel, mut peer) = BoundedChannel::duplex(limits()).unwrap();
+        let error = super::send(
+            &channel,
+            json!({"jsonrpc":"2.0","id":1,"result":{}}),
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("output admission stalled"));
+        assert!(peer.rx.next().await.is_none());
     }
 
     #[tokio::test]
