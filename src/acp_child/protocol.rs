@@ -425,6 +425,29 @@ mod tests {
     }
 
     #[test]
+    fn foreground_running_then_pre_start_error_completes_without_accepting_stale_idle() {
+        let update = |state, reason: Option<&str>| {
+            let mut value = json!({"sessionId": "child", "update": {
+                "sessionUpdate": "state_update", "state": state,
+            }});
+            if let Some(reason) = reason {
+                value["update"]["stopReason"] = json!(reason);
+            }
+            foreground(&value).unwrap().unwrap()
+        };
+        let mut state = Foreground::Waiting;
+        assert!(!state.advance(update("idle", Some("_error"))));
+        assert!(state.advance(update("running", None)));
+        assert!(state.advance(update("idle", Some("_error"))));
+        let Foreground::Idle(reason) = state.clone() else {
+            panic!("accepted prompt must settle");
+        };
+        assert!(completion(reason).is_err());
+        assert!(!state.advance(update("idle", Some("end_turn"))));
+        assert!(!state.advance(update("running", None)));
+    }
+
+    #[test]
     fn recognizes_idle_without_treating_running_as_completion() {
         let update = |state| json!({"sessionId": "child", "update": {"sessionUpdate": "state_update", "state": state}});
         assert_eq!(
