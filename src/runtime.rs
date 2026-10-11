@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use agenthooksprotocol::SessionStartInputTrigger;
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, MetadataMap, Part,
@@ -36,6 +37,7 @@ use tracing::Instrument as _;
 
 use crate::{
     acp_child::{AcpHarnesses, BUILTIN_HARNESS, ChildConfig},
+    ahp::{HookedAdapter, HookedSession},
     provider::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
@@ -466,7 +468,7 @@ impl Drop for SessionClaim {
 
 pub(crate) struct AcpDriver {
     pub subagents: Subagents,
-    pub driver: LoopDriver<SelectableSession>,
+    pub driver: LoopDriver<HookedSession<SelectableSession>>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
@@ -520,6 +522,7 @@ pub struct Runtime {
     skills: Arc<SkillRegistry>,
     skill_package_roots: Vec<PathBuf>,
     skill_directories: Vec<PathBuf>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
 }
 
 impl Runtime {
@@ -635,6 +638,7 @@ impl Runtime {
             skills,
             skill_package_roots: Vec::new(),
             skill_directories: Vec::new(),
+            hooks: None,
         }))
     }
 
@@ -736,6 +740,14 @@ impl Runtime {
         Ok(Arc::new(runtime))
     }
 
+    /// Loads agent hook registrations from the global and project `.agents` directories.
+    pub fn with_hooks(runtime: Arc<Self>) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure agent hooks after runtime was shared".to_string())?;
+        runtime.hooks = crate::ahp::Hooks::load(&runtime.root);
+        Ok(Arc::new(runtime))
+    }
+
     /// Enables evaluation only after explicit user opt-in and credential resolution.
     pub fn with_eval(runtime: Arc<Self>, enabled: bool) -> Result<Arc<Self>, String> {
         let mut runtime = Arc::try_unwrap(runtime)
@@ -752,6 +764,10 @@ impl Runtime {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn hooks(&self) -> Option<&crate::ahp::Hooks> {
+        self.hooks.as_deref()
     }
 
     pub(crate) fn supports_terminal_authentication(&self, provider: ProviderKind) -> bool {
@@ -1246,6 +1262,9 @@ impl Runtime {
                 children.register(observe_shared(skill_tool));
             }
         }
+        if let Some(hooks) = &self.hooks {
+            children = crate::ahp::hooked_tools(children, hooks);
+        }
         let hidden_tools = children.clone();
         let compose = ComposeTool::wrap(children)
             .with_config(
@@ -1361,6 +1380,7 @@ impl Runtime {
                 self.agentkit_telemetry(),
                 Some(opened.observer.clone()),
                 format!("compaction-{}", crate::session::new_id()),
+                self.hooks.clone(),
             )
             .map_err(|error| {
                 record_runtime_failure(
@@ -1383,10 +1403,19 @@ impl Runtime {
                         error,
                     )
                 })?;
-            let agent = Agent::builder()
+            let trigger = if request.resume {
+                SessionStartInputTrigger::Resume
+            } else {
+                SessionStartInputTrigger::Startup
+            };
+            let mut builder = Agent::builder()
                 .cancellation(controller.handle())
                 .observer(crate::fatal::RetryLog)
-                .model(adapter.clone())
+                .model(HookedAdapter::new(
+                    adapter.clone(),
+                    self.hooks.clone(),
+                    trigger,
+                ))
                 .telemetry(self.agentkit_telemetry())
                 .add_tool_source(self.compose_with_jobs(
                     0,
@@ -1395,7 +1424,15 @@ impl Runtime {
                     skills,
                 ))
                 .task_manager(task_manager)
-                .mutator(compactor)
+                .mutator(compactor);
+            if let Some(hooks) = &self.hooks {
+                builder = builder.mutator(crate::ahp::PromptHook::new(
+                    Arc::clone(hooks),
+                    "cli",
+                    opened.observer.clone(),
+                ));
+            }
+            let agent = builder
                 .transcript_observer(opened.observer)
                 .transcript(opened.transcript)
                 .input(vec![Item::text(ItemKind::User, prompt)])
@@ -1462,6 +1499,11 @@ impl Runtime {
         for task in tasks.list_running().await {
             let _ = tasks.cancel(task.id).await;
         }
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .session_end(&session_id, crate::ahp::session_outcome(&result))
+                .await;
+        }
         match result {
             Ok(output) => Ok(output),
             Err(error) => Err(record_loop_failure(
@@ -1525,6 +1567,7 @@ impl Runtime {
             self.agentkit_telemetry(),
             None,
             format!("compaction-{session}"),
+            self.hooks.clone(),
         )
         .map_err(LoopError::InvalidState)?
         .mirroring(recorded.clone());
@@ -1534,7 +1577,11 @@ impl Runtime {
             .with_transient_parent(recorded.clone())
             .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session));
         let builder = Agent::builder()
-            .model(self.adapter.clone())
+            .model(HookedAdapter::new(
+                self.adapter.clone(),
+                self.hooks.clone(),
+                SessionStartInputTrigger::Startup,
+            ))
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs(
                 depth,
@@ -1557,7 +1604,13 @@ impl Runtime {
                 ),
             )
             .await?;
-        drive(&mut driver).await
+        let result = drive(&mut driver).await;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .session_end(&session, crate::ahp::session_outcome(&result))
+                .await;
+        }
+        result
     }
 
     pub(crate) fn claim_session(self: &Arc<Self>) -> Result<SessionClaim, AcpRuntimeError> {
@@ -1713,6 +1766,7 @@ impl Runtime {
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
             format!("compaction-{}", crate::session::new_id()),
+            self.hooks.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;
         let prompt_cache_key = crate::tools::subagent::prompt_cache_key(&session_id);
@@ -1731,8 +1785,19 @@ impl Runtime {
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
         }
-        let driver = Agent::builder()
-            .model(adapter.clone())
+        let trigger = if is_fork {
+            SessionStartInputTrigger::Fork
+        } else if request.resume {
+            SessionStartInputTrigger::Resume
+        } else {
+            SessionStartInputTrigger::Startup
+        };
+        let mut builder = Agent::builder()
+            .model(HookedAdapter::new(
+                adapter.clone(),
+                self.hooks.clone(),
+                trigger,
+            ))
             .telemetry(self.agentkit_telemetry())
             .add_tool_source(self.compose_with_jobs_and_mcp(
                 self.base_depth,
@@ -1742,7 +1807,15 @@ impl Runtime {
                 mcp,
             ))
             .task_manager(task_manager)
-            .mutator(compactor)
+            .mutator(compactor);
+        if let Some(hooks) = &self.hooks {
+            builder = builder.mutator(crate::ahp::PromptHook::new(
+                Arc::clone(hooks),
+                "acp",
+                opened.observer.clone(),
+            ));
+        }
+        let driver = builder
             .observer(context.integration.as_ref().clone())
             .observer(crate::fatal::RetryLog)
             .transcript_observer(opened.observer)
@@ -1997,7 +2070,15 @@ fn build_skill_registry(
 }
 
 fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![root.join(".agents/skills")];
+    agents_directories(root)
+        .into_iter()
+        .map(|directory| directory.join("skills"))
+        .collect()
+}
+
+/// Project-local `.agents`, then the user's `~/.agents` when a home is set.
+pub(crate) fn agents_directories(root: &Path) -> Vec<PathBuf> {
+    let mut directories = vec![root.join(".agents")];
     #[cfg(unix)]
     let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
     #[cfg(not(unix))]
@@ -2005,9 +2086,9 @@ fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
         .filter(|value| !value.is_empty())
         .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()));
     if let Some(home) = home {
-        roots.push(PathBuf::from(home).join(".agents/skills"));
+        directories.push(PathBuf::from(home).join(".agents"));
     }
-    roots
+    directories
 }
 
 pub struct ComposeOnly {
@@ -2856,7 +2937,9 @@ fn record_loop_failure(
     }
 }
 
-async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
+async fn drive(
+    driver: &mut LoopDriver<HookedSession<SelectableSession>>,
+) -> Result<String, LoopError> {
     drive_with_tasks(driver, None).await
 }
 

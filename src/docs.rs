@@ -414,6 +414,7 @@ mod tests {
         assert_eq!(
             paths,
             vec![
+                "docs/user/agent-hooks-protocol.md",
                 "docs/user/agent-plugins.md",
                 "docs/user/compose-and-local-tools.md",
                 "docs/user/evaluations.md",
