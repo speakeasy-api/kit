@@ -20,7 +20,7 @@ use std::{
 use crate::resilient_fs::{self as fs, File, Fs, Lease, LeaseMode, OpenOptions};
 
 use agentkit_core::{Item, ItemKind, Part, Timestamp};
-use agentkit_loop::{TranscriptEvent, TranscriptObserver};
+use agentkit_loop::{TranscriptEvent, TranscriptObserver, TranscriptRewriteEvent};
 use serde::{Deserialize, Serialize};
 
 mod children;
@@ -801,6 +801,10 @@ impl TransientTranscript {
 }
 
 impl TranscriptObserver for TransientTranscript {
+    fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+        self.replace(event.items);
+    }
+
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         if let Ok(mut items) = self.0.lock() {
             items.push(event.item.clone());
@@ -809,6 +813,12 @@ impl TranscriptObserver for TransientTranscript {
 }
 
 impl TranscriptObserver for SessionObserver {
+    fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+        // The existing replacement writer preserves append history and publishes
+        // one canonical snapshot. Failed/poisoned persistence stays isolated.
+        let _ = self.replace(event.items);
+    }
+
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         // Persistence must not prevent the loop from committing its in-memory
         // transcript. Poison still isolates the writer: never recover a guard
@@ -2791,6 +2801,37 @@ mod tests {
     use super::*;
     use agentkit_core::{ItemKind, MetadataMap, Part, ReasoningPart};
     use serde_json::json;
+
+    #[test]
+    fn transcript_rewrite_observers_preserve_canonical_history_and_later_appends() {
+        let root = tempfile::tempdir().unwrap();
+        let id = new_id();
+        let initial = vec![Item::text(ItemKind::System, "system").with_created_at(Timestamp(123))];
+        let opened = open(root.path(), &id, false, false, initial.clone()).unwrap();
+        let transient = TransientTranscript::new(initial);
+        let session = agentkit_core::SessionId::new(&id);
+        let rewritten = vec![
+            Item::text(ItemKind::System, "system").with_created_at(Timestamp(123)),
+            Item::text(ItemKind::User, "policy-rewritten prompt").with_created_at(Timestamp(123)),
+        ];
+        let event = TranscriptRewriteEvent {
+            session_id: &session,
+            items: &rewritten,
+        };
+        opened.observer.on_transcript_rewrite(event.clone());
+        transient.on_transcript_rewrite(event);
+        let answer = Item::text(ItemKind::Assistant, "answer").with_created_at(Timestamp(123));
+        let append = TranscriptEvent {
+            session_id: &session,
+            item: &answer,
+        };
+        opened.observer.on_transcript_event(append.clone());
+        transient.on_transcript_event(append);
+        let expected = [rewritten, vec![answer]].concat();
+        assert_eq!(transient.snapshot(), expected);
+        drop(opened);
+        assert_eq!(load(root.path(), &id).unwrap(), expected);
+    }
 
     #[test]
     fn transient_transcripts_follow_the_conversation_and_can_be_forked() {

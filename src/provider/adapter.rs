@@ -362,6 +362,20 @@ pub struct SelectableSession {
     retry_observer: Option<Arc<dyn agentkit_loop::RetryObserver>>,
 }
 
+/// The native hook boundaries name Kit's own selection, which the loop no
+/// longer reports, so the adapter that owns it answers for it.
+impl crate::ahp::SessionSelection for SelectableAdapter {
+    fn model_id(&self) -> Option<String> {
+        self.selection().ok().map(|selection| selection.model)
+    }
+
+    fn provider(&self) -> Option<String> {
+        self.selection()
+            .ok()
+            .map(|selection| selection.provider.as_str().to_owned())
+    }
+}
+
 #[async_trait]
 impl ModelAdapter for SelectableAdapter {
     type Session = SelectableSession;

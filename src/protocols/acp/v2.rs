@@ -1015,6 +1015,7 @@ impl Server {
             structured_completion,
             skill_catalog,
             adapter: driver.adapter,
+            hooks: driver.hooks,
             catalog,
             commands: rx,
             mcp_events,
@@ -1334,6 +1335,7 @@ struct SessionActor<S: ModelSession> {
     structured_completion: bool,
     skill_catalog: skill_catalog::SkillCatalogMonitor,
     adapter: SelectableAdapter,
+    hooks: Option<Arc<crate::ahp::AhpHost>>,
     catalog: Vec<crate::provider::ModelGroup>,
     commands: mpsc::Receiver<Command>,
     mcp_events: crate::tools::mcp::McpSubscription,
@@ -1356,6 +1358,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
         structured_completion,
         mut skill_catalog,
         adapter,
+        hooks,
         catalog,
         mut commands,
         mut mcp_events,
@@ -1400,6 +1403,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &background_jobs,
                         structured_completion,
                         &activity,
+                        hooks.as_ref(),
                     )
                     .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
@@ -1472,14 +1476,28 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
                 Some(Command::Close { reply }) => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    super::clean_up_session(
+                        &v1_id,
+                        &mut driver,
+                        &tasks,
+                        &background_jobs,
+                        hooks.as_ref(),
+                    )
+                    .await;
                     drop(binding.take());
                     let _ = reply.send(());
                     break;
                 }
                 None => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    super::clean_up_session(
+                        &v1_id,
+                        &mut driver,
+                        &tasks,
+                        &background_jobs,
+                        hooks.as_ref(),
+                    )
+                    .await;
                     break;
                 }
             },
@@ -1551,6 +1569,7 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
     activity: &SessionActivity,
+    hooks: Option<&Arc<crate::ahp::AhpHost>>,
 ) -> Result<(), AcpRuntimeError> {
     let PromptCommand {
         request,
@@ -1573,7 +1592,24 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         }
     };
     background_jobs.begin_turn();
-    let prepared = integration.prompt_to_items(&request).and_then(|items| {
+    // ACP prompts use the same Kit-owned admission as the runtime prompts, so
+    // the inbound boundary covers the user's own items on every surface. The
+    // hook await is cancelled cooperatively through the session's checkpoint.
+    let admitted = match integration.prompt_to_items(&request) {
+        Ok(items) => match hooks {
+            Some(host) => host
+                .inbound(
+                    &session_id.to_string(),
+                    items,
+                    Some(handle.cancellation_handle().checkpoint()),
+                )
+                .await
+                .map_err(|error| map_loop_error(session_id, &error)),
+            None => Ok(items),
+        },
+        Err(error) => Err(error),
+    };
+    let prepared = admitted.and_then(|items| {
         skill_catalog
             .submit(&current.skills, items, |items| {
                 voice_monitor.submit(items, |items| driver.submit_input(items))
@@ -1649,10 +1685,9 @@ where
     if matches!(result, Ok(FinishReason::Cancelled)) {
         // A cooperative interrupt is still a live logical turn. Retire it
         // without another `next`, which could execute cancelled model work.
-        driver
-            .retire_interrupted_turn()
-            .await
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        let retired = driver.retire_interrupted_turn().await;
+        crate::ahp::drain_delivery_diagnostics(driver);
+        retired.map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
     }
     result
 }
@@ -1668,7 +1703,10 @@ where
     S: ModelSession + Send + 'static,
 {
     loop {
-        let step = match driver.next().await {
+        let step = driver.next().await;
+        // Read-only delivery failures are diagnostics, never this call's result.
+        crate::ahp::drain_delivery_diagnostics(driver);
+        let step = match step {
             Ok(step) => step,
             Err(error) => {
                 handle.stop_injection_turn();
@@ -3577,6 +3615,7 @@ mod tests {
                 &background_jobs,
                 false,
                 &activity,
+                None,
             ),
             acknowledge,
         );

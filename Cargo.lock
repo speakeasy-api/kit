@@ -88,10 +88,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agenthooksprotocol"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "036c046bd6b6f4b4311f7ecdcb57972eb44e738cf65196ebc8501b4fdfb135c8"
+dependencies = [
+ "jsonschema 0.33.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "agentkit-acp"
 version = "0.10.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "394478ee8cb0e8916531ae4f450b953e4adfc0f700bbd4a1a85ebb265bfb18ce"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",
@@ -116,7 +131,7 @@ dependencies = [
  "axum",
  "eventsource-stream",
  "futures",
- "reqwest",
+ "reqwest 0.13.5",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -168,8 +183,7 @@ dependencies = [
 [[package]]
 name = "agentkit-adapter-completions"
 version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f99b81132ad4c4a62575ce4f39f133245607769923072df88de4865e7efa782"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -178,7 +192,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -187,8 +201,7 @@ dependencies = [
 [[package]]
 name = "agentkit-capabilities"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7193f4a771e30b61fbabecd90dba9a9bc16bdafc2cf717d086727871e9d0e3cf"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -200,8 +213,7 @@ dependencies = [
 [[package]]
 name = "agentkit-compaction"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "483b8de89e4d2de33370151c398c4d81bfd3267899cdc2caee4361c9dab052f2"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -213,8 +225,7 @@ dependencies = [
 [[package]]
 name = "agentkit-context"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3c5c91fed4a5ceb3afa3584877aa94304c2bccb2b383ddb964b4c0024165e8"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -226,8 +237,7 @@ dependencies = [
 [[package]]
 name = "agentkit-core"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2110778950cdd87cc8ea3f0697c0551eb515ef23841b9c5d255a01974be17798"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "futures-timer",
  "serde",
@@ -238,8 +248,7 @@ dependencies = [
 [[package]]
 name = "agentkit-http"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "697f08884433720327a7a5b4345fceff1a3ef46e67751d546ebb39a816f4b824"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "async-trait",
  "bytes",
@@ -248,7 +257,7 @@ dependencies = [
  "futures-util",
  "http",
  "httpdate",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -258,8 +267,7 @@ dependencies = [
 [[package]]
 name = "agentkit-loop"
 version = "0.10.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e581d59925462f08c1145ee85e4c937db76fb6d1690b4b9ed49d44ca8c560141"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -276,8 +284,7 @@ dependencies = [
 [[package]]
 name = "agentkit-mcp"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e6dc29da7d0d393a1234c874ffe5035f0f38bc81a8a95176a3c3c6267a98f6"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -285,7 +292,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "http",
- "reqwest",
+ "reqwest 0.13.5",
  "rmcp",
  "serde",
  "serde_json",
@@ -298,8 +305,7 @@ dependencies = [
 [[package]]
 name = "agentkit-plugins"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5081b285831d69d9304052ae12a3468dfb850e84732dc3ec4a726906d7592daa"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "http",
  "serde",
@@ -312,8 +318,7 @@ dependencies = [
 [[package]]
 name = "agentkit-provider-openai"
 version = "0.10.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59949238158745f1c53d3f31057dda3b7a643581f067b91b993075e6b3b09511"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -322,7 +327,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -333,8 +338,7 @@ dependencies = [
 [[package]]
 name = "agentkit-provider-openrouter"
 version = "0.10.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211948f3127537bcdb4dfc77c59a6bee447ec3eca9f75a21697dbea5d038276d"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -349,8 +353,7 @@ dependencies = [
 [[package]]
 name = "agentkit-task-manager"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f893be1f3d14f060e141e6b50baa09338778f90764cc030295105e101d29c06"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -362,8 +365,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tool-compose"
 version = "0.10.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "207f07133cbe21cd63e2c0d46952d3bdab378d3c84bc1e11878f2f489a8b1c3b"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -377,8 +379,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tool-skills"
 version = "0.10.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb5c594d40e5308f9a90bac127ba5ad728ba8e9845a811ced94a03c80633fe3e"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -393,8 +394,7 @@ dependencies = [
 [[package]]
 name = "agentkit-tools-core"
 version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10b9a8af3f09c79fc0707ea87dc377edd40bdf65db11e6ebfb50783f4e8e8ff3"
+source = "git+https://github.com/danielkov/agentkit?rev=3d75d7179ad6ef4d675d6b9d88cc1864f59be759#3d75d7179ad6ef4d675d6b9d88cc1864f59be759"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2077,6 +2077,17 @@ dependencies = [
 
 [[package]]
 name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
+]
+
+[[package]]
+name = "fluent-uri"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e"
@@ -2105,6 +2116,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fraction"
+version = "0.15.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
+dependencies = [
+ "lazy_static",
+ "num",
 ]
 
 [[package]]
@@ -2974,6 +2995,32 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d46662859bc5f60a145b75f4632fbadc84e829e45df6c5de74cfc8e05acb96b5"
+dependencies = [
+ "ahash",
+ "base64 0.22.1",
+ "bytecount",
+ "email_address",
+ "fancy-regex 0.16.2",
+ "fraction 0.15.4",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "num-traits",
+ "once_cell",
+ "percent-encoding",
+ "referencing 0.33.0",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema"
 version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea18b8d5e1469b1bdd6b349169305141316a7c26da27f239773b65c830c0f5d6"
@@ -2983,7 +3030,7 @@ dependencies = [
  "data-encoding",
  "email_address",
  "fancy-regex 0.19.0",
- "fraction",
+ "fraction 0.17.0",
  "getrandom 0.3.4",
  "idna",
  "itoa",
@@ -2992,7 +3039,7 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.58.5",
  "regex",
  "serde",
  "serde_json",
@@ -3018,7 +3065,7 @@ checksum = "4e3bfac11ac357ec620880025757d38c67da8fd5b9ef5024d19f0f360002b4ca"
 dependencies = [
  "ahash",
  "bytecount",
- "fraction",
+ "fraction 0.17.0",
  "getrandom 0.3.4",
  "num-cmp",
  "num-traits",
@@ -3083,6 +3130,7 @@ dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
+ "agenthooksprotocol",
  "agentkit-acp",
  "agentkit-acp-http",
  "agentkit-acp-schema",
@@ -3120,7 +3168,7 @@ dependencies = [
  "hyper-util",
  "ignore",
  "image",
- "jsonschema",
+ "jsonschema 0.58.5",
  "jsonwebtoken",
  "keyring",
  "libc",
@@ -3131,7 +3179,7 @@ dependencies = [
  "opus-pure",
  "ratatui",
  "ratatui-image",
- "reqwest",
+ "reqwest 0.13.5",
  "rmcp",
  "rpassword",
  "runlet",
@@ -3725,7 +3773,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest",
+ "reqwest 0.13.5",
 ]
 
 [[package]]
@@ -3740,7 +3788,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest",
+ "reqwest 0.13.5",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -4445,12 +4493,26 @@ dependencies = [
 
 [[package]]
 name = "referencing"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e9c261f7ce75418b3beadfb3f0eb1299fe8eb9640deba45ffa2cb783098697d"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.3.2",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
 version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "590efadb0a669f1712c1e3ab810a55d4c3d20d0127c455f7236dd0710aba0346"
 dependencies = [
  "ahash",
- "fluent-uri",
+ "fluent-uri 0.4.1",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
  "itoa",
@@ -4488,6 +4550,44 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http 0.6.11",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
 
 [[package]]
 name = "reqwest"
@@ -4561,7 +4661,7 @@ dependencies = [
  "oauth2",
  "pin-project-lite",
  "process-wrap",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "sse-stream",
@@ -6042,6 +6142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8"
 dependencies = [
  "outref",
+ "uuid",
  "vsimd",
 ]
 

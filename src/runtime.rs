@@ -12,7 +12,7 @@ use std::{
 use agentkit_acp::{AcpIntegration, AcpRuntimeError};
 use agentkit_core::{
     CancellationController, CancellationHandle, FinishReason, Item, ItemKind, MetadataMap, Part,
-    ToolOutput, ToolResultPart,
+    ToolOutput, ToolResultPart, TurnCancellation,
 };
 use agentkit_loop::{
     Agent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
@@ -314,6 +314,7 @@ impl SessionSelection {
 }
 
 pub(crate) struct AcpForkState {
+    pub source_session_id: String,
     pub transcript: Vec<Item>,
     pub selection: ModelSelection,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -464,9 +465,15 @@ impl Drop for SessionClaim {
     }
 }
 
+/// Kit's model stack: the selectable adapter wrapped so inference failures
+/// reach the native hook boundaries the generic loop no longer reports.
+pub(crate) type HookedModel = crate::ahp::model::HookedAdapter<SelectableAdapter>;
+pub(crate) type HookedModelSession = crate::ahp::model::HookedSession<SelectableSession>;
+
 pub(crate) struct AcpDriver {
+    pub hooks: Option<Arc<crate::ahp::AhpHost>>,
     pub subagents: Subagents,
-    pub driver: LoopDriver<SelectableSession>,
+    pub driver: LoopDriver<HookedModelSession>,
     pub skills: Vec<Skill>,
     pub tasks: TaskManagerHandle,
     pub background_jobs: BackgroundJobs,
@@ -500,6 +507,7 @@ impl std::fmt::Display for LogoutAuthenticationError {
 
 pub struct Runtime {
     eval: Option<crate::tools::EvalTool>,
+    ahp: Option<crate::ahp::AhpConfig>,
     root: PathBuf,
     adapter: SelectableAdapter,
     provider: ProviderKind,
@@ -585,6 +593,7 @@ impl Runtime {
                 root.display()
             ));
         }
+        let ahp = crate::ahp::AhpConfig::load(&root)?;
         let skills = build_skill_tools(&root, &[], &[]);
         let model = model.into();
         let adapter = SelectableAdapter::new_with_credentials_effort_and_openrouter_key(
@@ -616,6 +625,7 @@ impl Runtime {
         });
         Ok(Arc::new(Self {
             eval: None,
+            ahp,
             root,
             adapter,
             provider,
@@ -734,6 +744,44 @@ impl Runtime {
             .map_err(|_| "could not configure runtime depth after it was shared".to_string())?;
         runtime.base_depth = depth;
         Ok(Arc::new(runtime))
+    }
+
+    /// Overrides automatically discovered global/project hooks for this runtime.
+    /// Each driver creates its own SDK host so closing one cannot close siblings.
+    pub fn with_ahp(
+        runtime: Arc<Self>,
+        config: Option<crate::ahp::AhpConfig>,
+    ) -> Result<Arc<Self>, String> {
+        let mut runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| "could not configure AHP after runtime was shared".to_string())?;
+        runtime.ahp = config;
+        Ok(Arc::new(runtime))
+    }
+
+    fn native_hooks(
+        &self,
+        trigger: &str,
+        resumed_from: Option<String>,
+        selection: &SelectableAdapter,
+    ) -> Result<Option<Arc<crate::ahp::AhpHost>>, String> {
+        // These native builders retain AgentKit's AllowAllPermissions checker.
+        // AHP interception is independent policy, not a different permission mode.
+        let selection: Arc<dyn crate::ahp::SessionSelection> = Arc::new(selection.clone());
+        self.ahp
+            .clone()
+            .map(|config| {
+                crate::ahp::AhpHost::new_with_selection(
+                    config,
+                    crate::ahp::SessionFacts {
+                        trigger: trigger.to_owned(),
+                        permission_mode: "allow-all".to_owned(),
+                        resumed_from,
+                    },
+                    Some(selection),
+                    agenthooksprotocol::adapters::registered::BackendOptions::default(),
+                )
+            })
+            .transpose()
     }
 
     /// Enables evaluation only after explicit user opt-in and credential resolution.
@@ -1186,7 +1234,14 @@ impl Runtime {
         background_jobs: BackgroundJobs,
         skills: Arc<SkillRegistry>,
     ) -> ComposeOnly {
-        self.compose_with_jobs_and_mcp(depth, subagents, background_jobs, skills, self.mcp.clone())
+        self.compose_with_jobs_and_mcp(
+            depth,
+            subagents,
+            background_jobs,
+            skills,
+            self.mcp.clone(),
+            None,
+        )
     }
 
     fn compose_with_jobs_and_mcp(
@@ -1196,6 +1251,7 @@ impl Runtime {
         background_jobs: BackgroundJobs,
         skills: Arc<SkillRegistry>,
         mcp: crate::tools::mcp::McpRuntime,
+        hooks: Option<Arc<crate::ahp::AhpHost>>,
     ) -> ComposeOnly {
         let mut children = agentkit_tools_core::ToolRegistry::new()
             .with(Observed::new(ArtifactTool::new(crate::artifacts::base(
@@ -1208,7 +1264,10 @@ impl Runtime {
             )))
             .with(Observed::new(DocsTool::new()))
             .with(Observed::new(ShellTool::new(self.root.clone())))
-            .with(Observed::new(EditTool::new(self.root.clone())).with_root(self.root.clone()));
+            .with(
+                Observed::new(EditTool::new(self.root.clone()).with_ahp(hooks.clone()))
+                    .with_root(self.root.clone()),
+            );
         if let Some(eval) = &self.eval {
             children.register(Observed::new(eval.clone()));
         }
@@ -1236,8 +1295,14 @@ impl Runtime {
                 mcp.clone(),
                 crate::artifacts::base(&self.root),
             )))
-            .register(Observed::new(AuthTool::new(mcp.clone())))
-            .register(Observed::new(McpTool::new(mcp)));
+            .register(Observed::new(AuthTool::new(mcp.clone())));
+        let mcp = McpTool::new(mcp);
+        let mcp = if let Some(hooks) = hooks {
+            mcp.with_hooks(hooks)
+        } else {
+            mcp
+        };
+        children.register(Observed::new(mcp));
         if let Some(skill_tool) = &self.dynamic_skill_tool {
             children.register(observe_shared(Arc::clone(skill_tool)));
         } else {
@@ -1307,6 +1372,9 @@ impl Runtime {
         let task_manager = background_task_manager();
         let tasks = task_manager.handle();
         let background_jobs = BackgroundJobs::default();
+        // One-shot handover for a startup the cancellation select can drop.
+        let opened_host: std::sync::Mutex<Option<Arc<crate::ahp::AhpHost>>> =
+            std::sync::Mutex::new(None);
         let startup = async {
             if self.plugin_runtime.is_some() {
                 self.mcp.refresh().await.map_err(|error| {
@@ -1383,22 +1451,34 @@ impl Runtime {
                         error,
                     )
                 })?;
-            let agent = Agent::builder()
+            let hooks = self.native_hooks(
+                if request.resume { "resume" } else { "startup" },
+                request.resume.then(|| request.id.clone()),
+                &adapter,
+            )?;
+            let compactor = if let Some(host) = &hooks {
+                compactor.with_hooks(host.clone())
+            } else {
+                compactor
+            };
+            let compose = self.compose_with_jobs_and_mcp(
+                0,
+                subagents,
+                background_jobs.clone(),
+                skills,
+                self.mcp.clone(),
+                hooks.clone(),
+            );
+            let builder = Agent::builder()
                 .cancellation(controller.handle())
                 .observer(crate::fatal::RetryLog)
-                .model(adapter.clone())
+                .model(HookedModel::new(adapter.clone(), hooks.clone()))
                 .telemetry(self.agentkit_telemetry())
-                .add_tool_source(self.compose_with_jobs(
-                    0,
-                    subagents,
-                    background_jobs.clone(),
-                    skills,
-                ))
                 .task_manager(task_manager)
                 .mutator(compactor)
                 .transcript_observer(opened.observer)
-                .transcript(opened.transcript)
-                .input(vec![Item::text(ItemKind::User, prompt)])
+                .transcript(opened.transcript);
+            let agent = attach_native_hooks(builder, compose, hooks.clone())
                 .build()
                 .map_err(|error| {
                     record_runtime_failure(
@@ -1408,6 +1488,13 @@ impl Runtime {
                         error.to_string(),
                     )
                 })?;
+            // A dropped startup still owes an opened host its closure, so
+            // publish it before the boundary that can emit `session.start`.
+            if let Some(host) = &hooks
+                && let Ok(mut slot) = opened_host.lock()
+            {
+                *slot = Some(host.clone());
+            }
             let driver = match agent
                 .start(
                     SessionConfig::new(session_id.clone()).with_cache(
@@ -1419,6 +1506,10 @@ impl Runtime {
             {
                 Ok(driver) => driver,
                 Err(error) => {
+                    // `session.start` is delivered before the adapter opens its
+                    // session, so a failed start still owes a paired closure.
+                    abandon_startup_host(hooks, &session_id, crate::ahp::SessionOutcome::Error)
+                        .await;
                     return Err(record_loop_failure(
                         &session_id,
                         crate::fatal::Surface::Prompt,
@@ -1426,31 +1517,60 @@ impl Runtime {
                     ));
                 }
             };
-            Ok::<_, String>((driver, pending_creation))
+            Ok::<_, String>((driver, pending_creation, hooks))
         };
         // No model tool work is launched until drive_with_tasks below. Dropping
         // async startup here must never replace the execution cleanup path.
         // Provider-owned blocking credential workers still retain their existing
         // deadline and runtime-shutdown ownership; this is not their quiescence.
-        let (mut driver, pending_creation) = {
+        let (mut driver, pending_creation, hooks) = {
             let startup = std::pin::pin!(startup);
             let cancellation = std::pin::pin!(cancelled.cancelled());
             match select(cancellation, startup).await {
-                Either::Left(((), _)) => return Err("prompt cancelled during startup".into()),
+                Either::Left(((), _)) => {
+                    // Startup has no driver to retire, but a host that reached
+                    // its start boundary is still owed a Kit-owned closure.
+                    // Take the host before awaiting so no lock is held across it.
+                    let abandoned = opened_host.lock().ok().and_then(|mut slot| slot.take());
+                    abandon_startup_host(
+                        abandoned,
+                        &session_id,
+                        crate::ahp::SessionOutcome::Cancelled,
+                    )
+                    .await;
+                    return Err("prompt cancelled during startup".into());
+                }
                 Either::Right((result, _)) => result?,
             }
         };
-        if let Some(observer) = pending_creation {
-            observer.commit_creation()?;
+        if let Some(observer) = pending_creation
+            && let Err(error) = observer.commit_creation()
+        {
+            // The session is open, so it is owed its closure before unwinding.
+            let _ = crate::ahp::close_session(
+                &mut driver,
+                hooks.as_ref(),
+                &session_id,
+                crate::ahp::SessionOutcome::Error,
+            )
+            .await;
+            return Err(error);
         }
-        let result = {
-            let cancellation = std::pin::pin!(cancelled.cancelled());
-            let run = std::pin::pin!(drive_with_tasks(&mut driver, Some(&tasks)));
-            // Idle prompts must observe cancellation too, not just model turns.
-            match select(cancellation, run).await {
-                Either::Left(((), _)) => Err(LoopError::Cancelled),
-                Either::Right((result, _)) => result,
-            }
+        // Admission after start keeps `session.start` ahead of the prompt, and
+        // the hook boundary is cancelled cooperatively rather than dropped.
+        let admitted = admit_prompt(
+            hooks.as_ref(),
+            &session_id,
+            vec![Item::text(ItemKind::User, prompt)],
+            Some(&cancelled),
+        )
+        .await
+        .and_then(|input| driver.submit_input(input));
+        let result = match admitted {
+            // Cancellation is signalled through the loop's own handle; this
+            // call is awaited so the turn's terminal boundaries still run.
+            Ok(()) => drive_with_tasks(&mut driver, Some(&tasks), Some(&cancelled)).await,
+            Err(error) => Err(error),
         };
         // Cancel owned compose work cooperatively before aborting task handles.
         background_jobs.cancel_all();
@@ -1462,6 +1582,14 @@ impl Runtime {
         for task in tasks.list_running().await {
             let _ = tasks.cancel(task.id).await;
         }
+        let closed = crate::ahp::close_session(
+            &mut driver,
+            hooks.as_ref(),
+            &session_id,
+            session_outcome(&result),
+        )
+        .await;
+        let result = result.and_then(|output| closed.map(|()| output));
         match result {
             Ok(output) => Ok(output),
             Err(error) => Err(record_loop_failure(
@@ -1509,6 +1637,7 @@ impl Runtime {
             ));
         }
         let controller = CancellationController::new();
+        let cancelled = controller.handle().checkpoint();
         let _shutdown_bridge = StorageCancellationBridge::new(controller.clone(), cancellation);
         if self.plugin_runtime.is_some() {
             self.mcp.refresh().await.map_err(LoopError::InvalidState)?;
@@ -1533,31 +1662,83 @@ impl Runtime {
             .fresh()
             .with_transient_parent(recorded.clone())
             .with_prompt_cache_key(crate::tools::subagent::prompt_cache_key(&session));
+        let background_jobs = BackgroundJobs::default();
+        let task_manager = background_task_manager();
+        let tasks = task_manager.handle();
+        let hooks = self
+            .native_hooks("startup", None, &self.adapter)
+            .map_err(LoopError::InvalidState)?;
+        let compactor = if let Some(host) = &hooks {
+            compactor.with_hooks(host.clone())
+        } else {
+            compactor
+        };
+        let compose = self.compose_with_jobs_and_mcp(
+            depth,
+            subagents,
+            background_jobs.clone(),
+            skills,
+            self.mcp.clone(),
+            hooks.clone(),
+        );
         let builder = Agent::builder()
-            .model(self.adapter.clone())
+            .model(HookedModel::new(self.adapter.clone(), hooks.clone()))
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs(
-                depth,
-                subagents,
-                BackgroundJobs::default(),
-                skills,
-            ))
-            .task_manager(background_task_manager())
+            .task_manager(task_manager)
             .mutator(compactor)
             .transcript_observer(recorded)
-            .transcript(transcript)
-            .input(vec![Item::text(ItemKind::User, prompt)]);
-        let builder = builder.cancellation(controller.handle());
-        let mut driver = builder
-            .build()?
+            .transcript(transcript);
+        let builder =
+            attach_native_hooks(builder, compose, hooks.clone()).cancellation(controller.handle());
+        let agent = builder.build()?;
+        let started = agent
             .start(
                 SessionConfig::new(session.clone()).with_cache(
                     PromptCacheRequest::automatic()
                         .with_key(crate::tools::subagent::prompt_cache_key(&session)),
                 ),
             )
-            .await?;
-        drive(&mut driver).await
+            .await;
+        let mut driver = match started {
+            Ok(driver) => driver,
+            Err(error) => {
+                // `session.start` precedes the adapter's own session, so a
+                // failed start still owes a paired closure.
+                abandon_startup_host(hooks, &session, crate::ahp::SessionOutcome::Error).await;
+                return Err(error);
+            }
+        };
+        // Admission after start keeps `session.start` ahead of the prompt, and
+        // the hook boundary is cancelled cooperatively rather than dropped.
+        let admitted = admit_prompt(
+            hooks.as_ref(),
+            &session,
+            vec![Item::text(ItemKind::User, prompt)],
+            Some(&cancelled),
+        )
+        .await
+        .and_then(|input| driver.submit_input(input));
+        let result = match admitted {
+            Ok(()) => drive(&mut driver, Some(&cancelled)).await,
+            Err(error) => Err(error),
+        };
+        background_jobs.cancel_all();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            background_jobs.wait_for_quiescence(),
+        )
+        .await;
+        for task in tasks.list_running().await {
+            let _ = tasks.cancel(task.id).await;
+        }
+        let closed = crate::ahp::close_session(
+            &mut driver,
+            hooks.as_ref(),
+            &session,
+            session_outcome(&result),
+        )
+        .await;
+        result.and_then(|output| closed.map(|()| output))
     }
 
     pub(crate) fn claim_session(self: &Arc<Self>) -> Result<SessionClaim, AcpRuntimeError> {
@@ -1635,13 +1816,14 @@ impl Runtime {
             self.additional_directories(&context.additional_directories)?;
         let request = claim.request.clone();
         let session_id = request.id.clone();
-        let (forked_transcript, selected, parent_context) = match forked {
+        let (forked_transcript, selected, parent_context, source_session_id) = match forked {
             Some(forked) => (
                 Some(forked.transcript),
                 Some((forked.selection, forked.reasoning_effort)),
                 forked.parent_context,
+                Some(forked.source_session_id),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         let is_fork = forked_transcript.is_some();
         let initial = if let Some(mut transcript) = forked_transcript {
@@ -1731,29 +1913,56 @@ impl Runtime {
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
         }
-        let driver = Agent::builder()
-            .model(adapter.clone())
+        let hooks = self
+            .native_hooks(
+                if is_fork {
+                    "fork"
+                } else if request.resume {
+                    "resume"
+                } else {
+                    "startup"
+                },
+                source_session_id.or_else(|| request.resume.then(|| request.id.clone())),
+                &adapter,
+            )
+            .map_err(AcpRuntimeError::Loop)?;
+        let compactor = if let Some(host) = &hooks {
+            compactor.with_hooks(host.clone())
+        } else {
+            compactor
+        };
+        let compose = self.compose_with_jobs_and_mcp(
+            self.base_depth,
+            subagents.clone(),
+            background_jobs.clone(),
+            skills,
+            mcp,
+            hooks.clone(),
+        );
+        let builder = Agent::builder()
+            .model(HookedModel::new(adapter.clone(), hooks.clone()))
             .telemetry(self.agentkit_telemetry())
-            .add_tool_source(self.compose_with_jobs_and_mcp(
-                self.base_depth,
-                subagents.clone(),
-                background_jobs.clone(),
-                skills,
-                mcp,
-            ))
             .task_manager(task_manager)
             .mutator(compactor)
             .observer(context.integration.as_ref().clone())
             .observer(crate::fatal::RetryLog)
             .transcript_observer(opened.observer)
             .transcript(opened.transcript)
-            .cancellation(context.cancellation)
+            .cancellation(context.cancellation);
+        let agent = attach_native_hooks(builder, compose, hooks.clone())
             .build()
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
-            .start(session_config)
-            .await
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        let driver = match agent.start(session_config).await {
+            Ok(driver) => driver,
+            Err(error) => {
+                // `session.start` precedes the adapter's own session, so a
+                // failed start still owes a paired closure.
+                abandon_startup_host(hooks, &session_id, crate::ahp::SessionOutcome::Error).await;
+                return Err(AcpRuntimeError::Loop(error.to_string()));
+            }
+        };
         let driver = AcpDriver {
+            hooks,
             subagents,
             driver,
             skills: skill_catalog,
@@ -2010,6 +2219,76 @@ fn default_skill_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
+fn attach_native_hooks(
+    builder: agentkit_loop::AgentBuilder<HookedModel>,
+    compose: ComposeOnly,
+    host: Option<Arc<crate::ahp::AhpHost>>,
+) -> agentkit_loop::AgentBuilder<HookedModel> {
+    if let Some(host) = host {
+        let executor = agentkit_tools_core::BasicToolExecutor::new([
+            Arc::new(compose.clone()) as Arc<dyn ToolSource>
+        ]);
+        builder
+            .add_tool_source(compose)
+            .tool_executor(crate::tools::ahp::AhpToolExecutor::new(
+                Arc::new(executor),
+                host.clone(),
+            ))
+            .delivery(crate::ahp::HostDelivery::new(host.clone()))
+            .mutator(crate::ahp::HostMutator::new(host))
+    } else {
+        builder.add_tool_source(compose)
+    }
+}
+
+/// Kit owns inbound prompt admission now that the loop no longer intercepts
+/// submitted input. Dispatched after `Agent::start`, so a hook consumer still
+/// sees `session.start` before the prompt it admits.
+async fn admit_prompt(
+    host: Option<&Arc<crate::ahp::AhpHost>>,
+    session: &str,
+    prompt: Vec<Item>,
+    cancellation: Option<&TurnCancellation>,
+) -> Result<Vec<Item>, LoopError> {
+    let Some(host) = host else {
+        return Ok(prompt);
+    };
+    host.inbound(session, prompt, cancellation.cloned()).await
+}
+
+/// Closes a host whose startup ended before it handed over a driver. There is
+/// no turn to retire and no transcript to report, so the closure is reported
+/// without one rather than inventing an empty transcript.
+async fn abandon_startup_host(
+    host: Option<Arc<crate::ahp::AhpHost>>,
+    session: &str,
+    outcome: crate::ahp::SessionOutcome,
+) {
+    let Some(host) = host else { return };
+    let reason = match outcome {
+        crate::ahp::SessionOutcome::Cancelled => {
+            "Kit cancelled the session before startup handed over its driver"
+        }
+        _ => "Kit closed the session after startup failed to hand over a driver",
+    };
+    if let Err(error) = host.session_end(session, None, outcome, reason).await {
+        tracing::warn!(%error, "AHP startup session end failed");
+    }
+    if let Err(error) = host.shutdown().await {
+        tracing::warn!(%error, "AHP session shutdown failed");
+    }
+}
+
+/// How the Kit-owned closure should describe a run that just ended.
+fn session_outcome<T>(result: &Result<T, LoopError>) -> crate::ahp::SessionOutcome {
+    match result {
+        Ok(_) => crate::ahp::SessionOutcome::Completed,
+        Err(LoopError::Cancelled) => crate::ahp::SessionOutcome::Cancelled,
+        Err(_) => crate::ahp::SessionOutcome::Error,
+    }
+}
+
+#[derive(Clone)]
 pub struct ComposeOnly {
     compose: ComposeTool,
     backgroundable: BackgroundableCompose,
@@ -2856,16 +3135,32 @@ fn record_loop_failure(
     }
 }
 
-async fn drive(driver: &mut LoopDriver<SelectableSession>) -> Result<String, LoopError> {
-    drive_with_tasks(driver, None).await
+async fn drive(
+    driver: &mut LoopDriver<HookedModelSession>,
+    cancellation: Option<&TurnCancellation>,
+) -> Result<String, LoopError> {
+    drive_with_tasks(driver, None, cancellation).await
 }
 
+/// Drives one prompt to its own stopping point.
+///
+/// `driver.next()` is always awaited to completion. Cooperative cancellation is
+/// signalled through the loop's own handle, and the loop ends the live turn
+/// through its awaited terminal boundaries; dropping the call instead would
+/// lose or re-deliver that ending. Only the idle wait for a background task
+/// event — which the loop does not own — is raced against cancellation, so an
+/// interrupt with no running turn still returns promptly.
 async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
     driver: &mut LoopDriver<S>,
     tasks: Option<&TaskManagerHandle>,
+    cancellation: Option<&TurnCancellation>,
 ) -> Result<String, LoopError> {
+    let cancelled = || cancellation.is_some_and(TurnCancellation::is_cancelled);
     let mut output = String::new();
     loop {
+        if cancelled() {
+            return Err(LoopError::Cancelled);
+        }
         // Read running state BEFORE probing the loop: completion publishes its
         // loop update atomically with clearing running. The probe therefore
         // cannot miss the last completion and mistake it for quiescence.
@@ -2873,7 +3168,10 @@ async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
             Some(tasks) => !tasks.list_running().await.is_empty(),
             None => false,
         };
-        match driver.next().await? {
+        let step = driver.next().await;
+        // Read-only delivery failures are diagnostics, never this call's result.
+        crate::ahp::drain_delivery_diagnostics(driver);
+        match step? {
             LoopStep::Finished(result) => {
                 if result.finish_reason == FinishReason::Cancelled {
                     return Err(LoopError::Cancelled);
@@ -2896,10 +3194,28 @@ async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
                 if !running {
                     return Ok(output);
                 }
+                // An interrupt while idle still ends the prompt as cancelled,
+                // exactly as the dropped outer race used to report it.
+                if cancelled() {
+                    return Err(LoopError::Cancelled);
+                }
                 if let Some(tasks) = tasks {
                     // Events are queued during model turns, including failure
                     // and cancellation; no check-to-wait notification is lost.
-                    if tasks.next_event().await.is_none() {
+                    // This wait is the one droppable await here: it belongs to
+                    // the task manager, not to a live turn.
+                    let event = match cancellation {
+                        Some(cancellation) => {
+                            let waiting = std::pin::pin!(tasks.next_event());
+                            let interrupted = std::pin::pin!(cancellation.cancelled());
+                            match select(interrupted, waiting).await {
+                                Either::Left(((), _)) => return Err(LoopError::Cancelled),
+                                Either::Right((event, _)) => event,
+                            }
+                        }
+                        None => tasks.next_event().await,
+                    };
+                    if event.is_none() {
                         return Err(LoopError::InvalidState("task event stream closed".into()));
                     }
                 }

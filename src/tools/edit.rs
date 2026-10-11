@@ -18,9 +18,32 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 pub struct EditTool {
     root: PathBuf,
     spec: ToolSpec,
+    hooks: Option<std::sync::Arc<crate::ahp::AhpHost>>,
 }
 
 impl EditTool {
+    pub(crate) fn with_ahp(mut self, hooks: Option<std::sync::Arc<crate::ahp::AhpHost>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    async fn changed(&self, request: &ToolRequest, path: &Path, operation: &str) {
+        if let Some(host) = &self.hooks
+            && let Err(error) = host
+                .event(
+                    crate::ahp::domain::file_event(
+                        &request.session_id.to_string(),
+                        path,
+                        operation,
+                    ),
+                    vec![],
+                    vec![],
+                )
+                .await
+        {
+            tracing::warn!(%error, "AHP committed file change notification failed");
+        }
+    }
     pub fn new(root: PathBuf) -> Self {
         let input_schema = Value::Object(Map::from_iter([
             ("type".into(), Value::from("object")),
@@ -219,6 +242,7 @@ impl EditTool {
         ]));
         Self {
             root,
+            hooks: None,
             spec: ToolSpec::new(
                 ToolName::new("edit"),
                 "Apply exact, git-style text hunks to one file. Anchors must match exactly once.",
@@ -275,6 +299,7 @@ impl Tool for EditTool {
                     )));
                 }
                 write_atomic(&path, content.as_bytes())?;
+                self.changed(&request, &path, "create").await;
                 crate::protocols::acp::tool_projection::diff(&request, &path, None, Some(&content));
                 "added"
             }
@@ -292,6 +317,7 @@ impl Tool for EditTool {
                     content = content.replace('\n', "\r\n");
                 }
                 write_atomic(&path, content.as_bytes())?;
+                self.changed(&request, &path, "update").await;
                 if let Some(line) = first_line {
                     crate::protocols::acp::tool_projection::location(&request, &path, line);
                 }
@@ -307,6 +333,7 @@ impl Tool for EditTool {
                 let original =
                     crate::protocols::acp::tool_projection::deletion_text(&request, &path);
                 fs::remove_file(&path).map_err(io_error)?;
+                self.changed(&request, &path, "remove").await;
                 if let Some(original) = original {
                     crate::protocols::acp::tool_projection::diff(
                         &request,
@@ -419,6 +446,103 @@ fn io_error(error: std::io::Error) -> ToolError {
 )]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn real_host_file_event_follows_only_successful_atomic_commit() {
+        use agentkit_core::{MetadataMap, SessionId, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, BasicToolExecutor, ToolExecutionScope, ToolExecutor, ToolRegistry,
+        };
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let (host, mut received, server) = crate::ahp::domain::test_support::host(None).await;
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+            ToolRegistry::new()
+                .with(EditTool::new(root.path().to_path_buf()).with_ahp(Some(host.clone()))),
+        ));
+        let scope = ToolExecutionScope {
+            executor: executor.clone(),
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        };
+        let context = scope.nested_context(MetadataMap::new());
+        let add = ToolRequest::new(
+            "add",
+            "edit",
+            serde_json::json!({"op":"add","path":"committed.txt","content":"before"}),
+            "s",
+            "t",
+        );
+        assert!(matches!(
+            executor.execute_owned(add, context.clone()).await,
+            agentkit_tools_core::ToolExecutionOutcome::Completed(_)
+        ));
+        let message = received.try_recv().unwrap();
+        assert_eq!(
+            message["params"]["event"]["changes"][0]["operation"],
+            "create"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("committed.txt")).unwrap(),
+            "before"
+        );
+        let bad = ToolRequest::new(
+            "bad",
+            "edit",
+            serde_json::json!({"op":"edit","path":"committed.txt","hunks":[{"old":"missing","new":"after"}]}),
+            "s",
+            "t",
+        );
+        assert!(matches!(
+            executor.execute_owned(bad, context.clone()).await,
+            agentkit_tools_core::ToolExecutionOutcome::Failed(_)
+        ));
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("committed.txt")).unwrap(),
+            "before"
+        );
+        let update = ToolRequest::new(
+            "update",
+            "edit",
+            serde_json::json!({"op":"edit","path":"committed.txt","hunks":[{"old":"before","new":"after"}]}),
+            "s",
+            "t",
+        );
+        assert!(matches!(
+            executor.execute_owned(update, context.clone()).await,
+            agentkit_tools_core::ToolExecutionOutcome::Completed(_)
+        ));
+        assert_eq!(
+            received.try_recv().unwrap()["params"]["event"]["changes"][0]["operation"],
+            "update"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("committed.txt")).unwrap(),
+            "after"
+        );
+        let delete = ToolRequest::new(
+            "delete",
+            "edit",
+            serde_json::json!({"op":"delete","path":"committed.txt"}),
+            "s",
+            "t",
+        );
+        assert!(matches!(
+            executor.execute_owned(delete, context).await,
+            agentkit_tools_core::ToolExecutionOutcome::Completed(_)
+        ));
+        assert_eq!(
+            received.try_recv().unwrap()["params"]["event"]["changes"][0]["operation"],
+            "remove"
+        );
+        assert!(!root.path().join("committed.txt").exists());
+        host.shutdown().await.unwrap();
+        server.abort();
+    }
 
     #[test]
     fn hunk_requires_one_exact_anchor() {

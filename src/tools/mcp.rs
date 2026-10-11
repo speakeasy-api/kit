@@ -3312,6 +3312,7 @@ pub struct McpTool {
     runtime: McpRuntime,
     catalog: CatalogReader,
     executor: Arc<dyn ToolExecutor>,
+    hooks: Option<Arc<dyn super::ahp::ToolHooks>>,
     spec: ToolSpec,
 }
 
@@ -3335,6 +3336,12 @@ struct ExecutedMcpCall {
 }
 
 impl McpTool {
+    /// Apply awaited AHP boundaries to dynamically discovered MCP tools.
+    pub fn with_hooks(mut self, hooks: Arc<dyn super::ahp::ToolHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
     pub fn new(runtime: McpRuntime) -> Self {
         let catalog = runtime.catalog();
         let source: Arc<dyn ToolSource> = Arc::new(catalog.clone());
@@ -3342,6 +3349,7 @@ impl McpTool {
             runtime,
             catalog,
             executor: Arc::new(BasicToolExecutor::new([source])),
+            hooks: None,
             spec: ToolSpec::new(
                 ToolName::new("tool"),
                 "Invoke an authenticated MCP tool returned by tool_search.",
@@ -3446,10 +3454,18 @@ impl McpTool {
             Err(error) => return ToolExecutionOutcome::Failed(error),
         };
         let tool_name = ToolName::new(name.clone());
-        let Some(scope) = context.execution_scope.clone() else {
+        let Some(mut scope) = context.execution_scope.clone() else {
             return ToolExecutionOutcome::Failed(ToolError::Unavailable(
                 "tool requires an execution scope".into(),
             ));
+        };
+        scope.executor = match &self.hooks {
+            Some(hooks) => Arc::new(super::ahp::AhpToolExecutor::for_context(
+                self.executor.clone(),
+                hooks.clone(),
+                context,
+            )),
+            None => self.executor.clone(),
         };
         let timeout_name = name.clone();
         let call = tokio::time::timeout(timeout, async {
@@ -3516,6 +3532,77 @@ impl McpTool {
                 };
             }
         };
+        // Read discovery under the same operation -> manager lock order as
+        // authorization. No registry guard is live, and the manager guard is
+        // released before hooks, transport, or any further await. This is a
+        // read-only snapshot: cancellation cannot partially publish state.
+        let discovered_mcp = {
+            let manager = self.runtime.inner.manager.lock().await;
+            manager
+                .connected_server(&McpServerId::new(&invocation.server))
+                .and_then(|handle| {
+                    let discovered = handle.snapshot().tools.iter().find(|discovered| {
+                        handle
+                            .namespace()
+                            .apply(handle.server_id(), &discovered.name)
+                            == name
+                    })?;
+                    // The connected handle owns the original transport binding;
+                    // runtime search records and OAuth routes are not connection facts.
+                    let connection = match &handle.config().transport {
+                        McpTransportBinding::StreamableHttp(transport) => {
+                            Value::Object(Map::from_iter([
+                                ("transport".into(), Value::from("http")),
+                                ("url".into(), Value::from(transport.url.as_str())),
+                            ]))
+                        }
+                        McpTransportBinding::Stdio(transport) => {
+                            let mut connection = Value::Object(Map::from_iter([
+                                ("transport".into(), Value::from("stdio")),
+                                ("command".into(), Value::from(transport.command.as_str())),
+                                (
+                                    "args".into(),
+                                    Value::Array(transport.args.iter().map(|arg| Value::from(arg.as_str())).collect()),
+                                ),
+                            ]));
+                            if let Some(cwd) = transport.cwd.as_ref().and_then(|cwd| cwd.to_str()) {
+                                connection["cwd"] = Value::from(cwd);
+                            } else {
+                                connection["gaps"] = Value::Array(vec![Value::Object(Map::from_iter([
+                                    ("path".into(), Value::from("cwd")),
+                                    ("reason".into(), Value::from("working directory unavailable in the transport binding")),
+                                ]))]);
+                            }
+                            connection
+                        }
+                    };
+                    Some(Value::Object(Map::from_iter([
+                        ("server".into(), Value::Object(Map::from_iter([
+                            ("id".into(), Value::from(handle.server_id().to_string())),
+                        ]))),
+                        ("toolName".into(), Value::from(discovered.name.to_string())),
+                        ("provenance".into(), Value::from("runtime")),
+                        ("connection".into(), connection),
+                    ])))
+                })
+                .ok_or_else(|| {
+                    ToolError::Unavailable(format!(
+                        "MCP tool discovery changed before invocation: {name}"
+                    ))
+                })
+        };
+        let mcp = match discovered_mcp {
+            Ok(tool) => tool,
+            Err(error) => {
+                return ExecutedMcpCall {
+                    outcome: ToolExecutionOutcome::FailedBeforeInvocation(error),
+                    replay: ReplayCleanup::empty(),
+                    _invocation: Some(invocation),
+                };
+            }
+        };
+        let mut metadata = request.metadata.clone();
+        metadata.insert("kit.ahp.mcp".into(), mcp);
         let server = Some((invocation.server.clone(), invocation.fingerprint.clone()));
         let replay = match ReplayCleanup::new(
             match server.as_ref() {
@@ -3541,10 +3628,6 @@ impl McpTool {
                 };
             }
         };
-        let scope = ToolExecutionScope {
-            executor: Arc::clone(&self.executor),
-            ..scope
-        };
         let outcome = scope
             .execute_child(
                 ToolRequest::new(
@@ -3554,7 +3637,7 @@ impl McpTool {
                     request.session_id,
                     request.turn_id,
                 )
-                .with_metadata(request.metadata),
+                .with_metadata(metadata),
             )
             .await;
         ExecutedMcpCall {
@@ -5069,39 +5152,56 @@ mod tests {
             ServerStatus::Connected
         ));
 
-        // Exercise production dispatch admission with the real execution scope.
-        // An isolated owner must fail before reaching the nested executor.
-        use agentkit_core::{SessionId, ToolCallId, TurnId};
-        use agentkit_tools_core::{
-            AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
-        };
-        let tool = McpTool::new(runtime.clone());
-        let scope = ToolExecutionScope {
-            executor: Arc::clone(&tool.executor),
-            session_id: SessionId::new("isolation"),
-            turn_id: TurnId::new("turn"),
-            permissions: Arc::new(AllowAllPermissions),
-            resources: Arc::new(()),
-            cancellation: None,
-        };
-        let request = ToolRequest::new(
-            ToolCallId::new("call"),
-            ToolName::new("tool"),
-            json!({}),
-            scope.session_id.clone(),
-            scope.turn_id.clone(),
-        );
-        let call = tool
-            .dispatch_call(
-                request,
-                scope,
-                "mcp_remote_write".into(),
-                ToolName::new("mcp_remote_write"),
+        // Exercise production dispatch admission with connected discovery and a
+        // real execution scope. An isolated owner must not reach the executor.
+        #[cfg(unix)]
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let (_, config) =
+                schema_api_fixture(directory.path(), &json!({"type":"object"}), "inspect").await;
+            let server = serde_json::from_value(config["mcpServers"]["local"].clone()).unwrap();
+            let (binding, _) = super::prepare_server("remote", server, vec![1], None).unwrap();
+            {
+                let mut manager = runtime.inner.manager.lock().await;
+                let id = agentkit_mcp::McpServerId::new("remote");
+                manager.register_server_with_options(
+                    agentkit_mcp::McpServerConfig::new("remote", binding),
+                    agentkit_mcp::McpServerOptions::new(),
+                );
+                manager.connect_server(&id).await.unwrap();
+            }
+            use agentkit_core::{SessionId, ToolCallId, TurnId};
+            use agentkit_tools_core::{
+                AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+            };
+            let tool = McpTool::new(runtime.clone());
+            let scope = ToolExecutionScope {
+                executor: Arc::clone(&tool.executor),
+                session_id: SessionId::new("isolation"),
+                turn_id: TurnId::new("turn"),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+            };
+            let request = ToolRequest::new(
+                ToolCallId::new("call"),
+                ToolName::new("tool"),
                 json!({}),
-            )
-            .await;
-        assert!(matches!(tool.finish_dispatch(call).await,
+                scope.session_id.clone(),
+                scope.turn_id.clone(),
+            );
+            let call = tool
+                .dispatch_call(
+                    request,
+                    scope,
+                    "mcp_remote_inspect".into(),
+                    ToolName::new("mcp_remote_inspect"),
+                    json!({}),
+                )
+                .await;
+            assert!(matches!(tool.finish_dispatch(call).await,
             ToolExecutionOutcome::FailedBeforeInvocation(error) if error.to_string().contains("isolated")));
+        }
         assert!(runtime.inner.challenges.lock().await.is_empty());
         assert!(runtime.inner.active_replays.lock().await.is_empty());
     }
@@ -8123,6 +8223,245 @@ for line in sys.stdin:
         assert_eq!(results["servers"][0]["status"], "error");
     }
 
+    // The fake boundaries are external MCP stdio and hook HTTP servers. Kit's
+    // canonical loader, AhpHost, dispatch API, and execute_child remain real.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_canonical_mcp_with_lifecycle_only_and_tool_hooks() {
+        use crate::ahp::{AhpConfig, AhpHost, SessionFacts};
+        use agentkit_core::{SessionId, TurnId};
+        use agentkit_tools_core::{
+            AllowAllPermissions, Tool, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+        };
+        use axum::response::IntoResponse;
+
+        for (mode, transport) in [
+            ("lifecycle", "http"),
+            ("allow", "http"),
+            ("observe", "http"),
+            ("modify", "http"),
+            ("deny", "http"),
+            ("modify", "stdio"),
+            ("allow", "stdio-gap"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let cwd = directory.path().canonicalize().unwrap();
+            let script = r#"
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'gateway', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'list_servers', 'description': 'List servers', 'inputSchema': {'type': 'object'}}]}
+    elif method == 'tools/call':
+        data = request['params']['arguments']
+        with open(sys.argv[1], 'w') as marker:
+            json.dump(data, marker)
+        result = {'content': [{'type': 'text', 'text': json.dumps(data)}], 'structuredContent': data, 'isError': False}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+            let command = "/usr/bin/env";
+            let marker = cwd.join("invoked.json");
+            let args = vec!["python3", "-u", "-c", script, marker.to_str().unwrap()];
+            let path = cwd.join("mcp.json");
+            let (binding, connection, remote) = if transport == "http" {
+                let marker = cwd.join("invoked.json");
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let router = axum::Router::new().route("/mcp", axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                    let marker = marker.clone();
+                    async move {
+                        if request.get("id").is_none() {
+                            return axum::http::StatusCode::NO_CONTENT.into_response();
+                        }
+                        let result = match request["method"].as_str().unwrap() {
+                            "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"gateway","version":"1"}}),
+                            "tools/list" => json!({"tools":[{"name":"list_servers","description":"List servers","inputSchema":{"type":"object"}}]}),
+                            "tools/call" => {
+                                let data = request["params"]["arguments"].clone();
+                                std::fs::write(marker, serde_json::to_vec(&data).unwrap()).unwrap();
+                                json!({"content":[{"type":"text","text":data.to_string()}],"structuredContent":data,"isError":false})
+                            }
+                            _ => json!({}),
+                        };
+                        axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).into_response()
+                    }
+                }));
+                let remote = tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+                (
+                    json!({"url":url}),
+                    json!({"transport":"http","url":url}),
+                    Some(remote),
+                )
+            } else {
+                let mut binding = json!({"command":command,"args":args});
+                let mut connection = json!({"transport":"stdio","command":command,"args":args});
+                if transport == "stdio" {
+                    binding["cwd"] = json!(cwd);
+                    connection["cwd"] = json!(cwd);
+                } else {
+                    connection["gaps"] = json!([{"path":"cwd","reason":"working directory unavailable in the transport binding"}]);
+                }
+                (binding, connection, None)
+            };
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json!({"mcpServers":{"gateway":binding}})).unwrap(),
+            )
+            .unwrap();
+            let runtime = super::connect(Some(&path), &[], false, CredentialStorage::Memory)
+                .await
+                .unwrap();
+
+            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/hooks", listener.local_addr().unwrap());
+            let router = axum::Router::new().route("/hooks", axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let events = events.clone();
+                async move {
+                    let event = request["params"]["event"].clone();
+                    events.send(event.clone()).unwrap();
+                    if request["method"] == "hooks/observe" {
+                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                    }
+                    let effects = if event["type"] == "tool.before" {
+                        match mode {
+                            "modify" => json!([{"type":"modify","target":"input","operation":"merge","value":{"changed":true}}, {"type":"allow"}]),
+                            "deny" => json!([{"type":"deny","reason":"MCP policy"}]),
+                            _ => json!([]),
+                        }
+                    } else { json!([]) };
+                    axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"protocolVersion":"draft","effects":effects}})).into_response()
+                }
+            }));
+            let backend = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let subscription = if mode == "lifecycle" {
+                json!({"events":["session.start","session.end","turn.start","turn.end"],"mode":"observe","content":{"default":"metadata"}})
+            } else if mode == "observe" {
+                json!({"events":["tool.before","tool.after"],"mode":"observe","content":{"default":"metadata"}})
+            } else {
+                json!({"events":["tool.before","tool.after"],"mode":"intercept","timeoutMs":1000,"failurePolicy":"fail-closed","content":{"default":"metadata"}})
+            };
+            let hooks_path = cwd.join(".agents/hooks.json");
+            std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+            std::fs::write(hooks_path, serde_json::to_vec(&json!({"protocolVersion":"draft","hooks":[{
+                "id":"org.example.mcp-regression","transport":{"type":"stdio","command":"herdr","args":["hooks","run"],"lifecycle":"persistent"},"subscriptions":[subscription]
+            }]})).unwrap()).unwrap();
+            let mut config = AhpConfig::load(&cwd).unwrap().unwrap();
+            assert!(config.grants.contains_key("tool.before"));
+            // Load a canonical HerdR-shaped registration with full Kit grants.
+            // Replace only its external backend with the loopback hook fixture;
+            // global user hooks must not participate in this isolated test.
+            let mut hook = config.registration["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|hook| hook["id"] == "org.example.mcp-regression")
+                .unwrap()
+                .clone();
+            hook["transport"] = json!({"type":"http","url":url});
+            config.registration["hooks"] = json!([hook]);
+            let options = agenthooksprotocol::adapters::registered::BackendOptions {
+                allow_loopback_http: true,
+                ..Default::default()
+            };
+            let host = AhpHost::new_with_options(
+                config,
+                SessionFacts {
+                    trigger: "startup".into(),
+                    permission_mode: "test".into(),
+                    resumed_from: None,
+                },
+                options,
+            )
+            .unwrap();
+            let tool = McpTool::new(runtime).with_hooks(host.clone());
+            let scope = ToolExecutionScope {
+                executor: Arc::clone(&tool.executor),
+                session_id: SessionId::new("mcp-session"),
+                turn_id: TurnId::new("mcp-turn"),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+            };
+            let context = scope.nested_context(MetadataMap::new());
+            let outcome = tool
+                .invoke_outcome(
+                    ToolRequest::new(
+                        "mcp-call",
+                        "tool",
+                        json!({"name":"mcp_gateway_list_servers","args":{"original":true}}),
+                        "mcp-session",
+                        "mcp-turn",
+                    ),
+                    &mut context.borrowed(),
+                )
+                .await;
+            if mode == "deny" {
+                assert!(
+                    matches!(outcome, ToolExecutionOutcome::FailedBeforeInvocation(_)),
+                    "{outcome:?}"
+                );
+                assert!(!cwd.join("invoked.json").exists());
+            } else {
+                let ToolExecutionOutcome::Completed(result) = outcome else {
+                    panic!("{mode}: {outcome:?}");
+                };
+                assert!(!result.result.is_error);
+                let expected = if mode == "modify" {
+                    json!({"original":true,"changed":true})
+                } else {
+                    json!({"original":true})
+                };
+                assert_eq!(
+                    serde_json::from_slice::<Value>(
+                        &std::fs::read(cwd.join("invoked.json")).unwrap()
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+            host.shutdown().await.unwrap();
+            if mode == "lifecycle" {
+                assert!(
+                    received.try_recv().is_err(),
+                    "lifecycle subscriptions must not run for MCP calls"
+                );
+            } else {
+                let before = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let after = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before["type"], "tool.before");
+                assert_eq!(after["type"], "tool.after");
+                assert_eq!(after["parentEventId"], before["id"]);
+                assert_eq!(after["source"], before["source"]);
+                let expected = json!({"server":{"id":"gateway"},"toolName":"list_servers","provenance":"runtime","connection":connection});
+                assert_eq!(before["tool"]["mcp"], expected);
+                assert_eq!(after["tool"]["mcp"], expected);
+            }
+            backend.abort();
+            if let Some(remote) = remote {
+                remote.abort();
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_cancellation_tie_and_pending_loser_release_invocation() {
         use agentkit_core::{
@@ -8164,17 +8503,16 @@ for line in sys.stdin:
         }
 
         for (pre_cancelled, pending) in [(true, false), (false, true), (false, false)] {
-            let runtime = super::empty();
-            runtime
-                .inner
-                .servers
-                .write()
-                .await
-                .insert("remote".into(), connected_oauth_record());
+            // Discovery must come from a connected transport binding, even when
+            // the executable Tool boundary is replaced by the effect fake.
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _) =
+                schema_api_fixture(directory.path(), &json!({"type":"object"}), "inspect").await;
+            runtime.search("inspect").await.unwrap();
             let applied = Arc::new(AtomicBool::new(false));
             let (writer, catalog) = dynamic_catalog("test-remote");
             writer.upsert(Arc::new(EffectTool {
-                spec: spec("mcp_remote_write", "write"),
+                spec: spec("mcp_local_inspect", "inspect"),
                 applied: Arc::clone(&applied),
                 pending,
             }));
@@ -8198,11 +8536,11 @@ for line in sys.stdin:
             let request = ToolRequest::new(
                 "call",
                 "tool",
-                json!({"name":"mcp_remote_write", "args":{}}),
+                json!({"name":"mcp_local_inspect", "args":{}}),
                 "session",
                 "turn",
             );
-            let gate = runtime.operation_gate("remote").await;
+            let gate = runtime.operation_gate("local").await;
             if pre_cancelled {
                 controller.interrupt();
             }

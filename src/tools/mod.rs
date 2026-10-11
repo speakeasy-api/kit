@@ -1,4 +1,5 @@
 mod a2a;
+pub mod ahp;
 mod artifact;
 mod docs;
 mod edit;

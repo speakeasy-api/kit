@@ -20,6 +20,54 @@ use super::{
 };
 
 #[tokio::test]
+async fn ahp_project_hooks_are_discovered_by_runtime_construction() {
+    let root = tempfile::tempdir().unwrap();
+    let agents = root.path().join(".agents");
+    std::fs::create_dir(&agents).unwrap();
+    let registration = json!({
+        "protocolVersion": "draft",
+        "hooks": [{
+            "id": "org.example.kit.runtime-discovery",
+            "transport": {
+                "type": "stdio",
+                "command": "missing-hook-not-started-during-discovery",
+                "lifecycle": "persistent"
+            },
+            "subscriptions": [{
+                "events": ["session.start"],
+                "mode": "observe",
+                "content": {"default": "metadata"}
+            }]
+        }]
+    });
+    let path = agents.join("hooks.json");
+    let bytes = serde_json::to_vec(&registration).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    let hooks = runtime.ahp.as_ref().unwrap().registration["hooks"]
+        .as_array()
+        .unwrap();
+    assert!(
+        hooks
+            .iter()
+            .any(|hook| hook["id"] == "org.example.kit.runtime-discovery")
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn ahp_invalid_project_hooks_do_not_fail_runtime_construction() {
+    let root = tempfile::tempdir().unwrap();
+    let agents = root.path().join(".agents");
+    std::fs::create_dir(&agents).unwrap();
+    let path = agents.join("hooks.json");
+    std::fs::write(&path, "not JSON").unwrap();
+    // A broken optional hook file must not prevent ordinary Kit startup.
+    let _runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "not JSON");
+}
+
+#[tokio::test]
 async fn subagent_manager_survives_runtime_reconstruction() {
     let root = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
@@ -364,6 +412,7 @@ mod reasoning_effort_persistence {
             .select_reasoning_effort(Some(ReasoningEffort::High))
             .unwrap();
         let forked = AcpForkState {
+            source_session_id: parent_id.clone(),
             transcript: parent.canonical_transcript.clone(),
             selection: parent.adapter.selection().unwrap(),
             reasoning_effort: parent.adapter.reasoning_effort().unwrap(),

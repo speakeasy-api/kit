@@ -1640,6 +1640,7 @@ impl Server {
             structured_completion,
             skill_catalog,
             adapter: driver.adapter,
+            hooks: driver.hooks,
             catalog,
             commands: rx,
             activity,
@@ -1927,10 +1928,66 @@ struct SessionActor<S: ModelSession> {
     structured_completion: bool,
     skill_catalog: skill_catalog::SkillCatalogMonitor,
     adapter: SelectableAdapter,
+    hooks: Option<Arc<crate::ahp::AhpHost>>,
     catalog: Vec<ModelGroup>,
     commands: mpsc::Receiver<Command>,
     activity: activity::SessionActivity,
     mcp_events: crate::tools::mcp::McpSubscription,
+}
+
+// Kept at the ACP operation seam: hooks settle before guard/compaction and
+// selected values remain subject to the ordinary advertised-catalog checks.
+async fn before_config_hooks(
+    host: &crate::ahp::AhpHost,
+    session: &str,
+    previous: &ModelSelection,
+    mut request: SetSessionConfigOptionRequest,
+    cancellation: &agentkit_core::CancellationHandle,
+    generation: u64,
+) -> Result<SetSessionConfigOptionRequest, String> {
+    let checkpoint = cancellation.checkpoint();
+    // A queued request can have an older generation than the checkpoint.
+    // Check it separately, including after every external await.
+    if cancellation.is_cancelled_since(generation) {
+        return Err("model change cancelled".into());
+    }
+    let setting = request.config_id.to_string();
+    host.event_with_cancellation(
+        crate::ahp::domain::config_event(session, true, &setting),
+        vec![],
+        vec![],
+        Some(checkpoint.clone()),
+    )
+    .await?;
+    if cancellation.is_cancelled_since(generation) {
+        return Err("model change cancelled".into());
+    }
+    if setting == MODEL_CONFIG_ID {
+        let target = request
+            .value
+            .as_value_id()
+            .ok_or("selection requires an id value")?;
+        let proposed = ModelSelection::from_id(&target.to_string())?;
+        let settled = host
+            .event_with_cancellation(
+                crate::ahp::domain::model_event(session, true, previous, &proposed),
+                vec![],
+                vec![],
+                Some(checkpoint),
+            )
+            .await?;
+        if cancellation.is_cancelled_since(generation) {
+            return Err("model change cancelled".into());
+        }
+        let model = &settled.event["proposed"];
+        let provider = model["provider"]
+            .as_str()
+            .ok_or("missing proposed provider")?;
+        let id = model["id"].as_str().ok_or("missing proposed model")?;
+        let selected = ModelSelection::from_id(&format!("{provider}:{id}"))?;
+        request.value = agentkit_acp::SessionConfigValueId::new(selected.id()).into();
+    }
+    Ok(request)
 }
 
 async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
@@ -1946,6 +2003,7 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
         structured_completion,
         mut skill_catalog,
         adapter,
+        hooks,
         catalog,
         mut commands,
         activity,
@@ -1975,48 +2033,59 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             }
         }; // Drop the owning futures before handlers reborrow receivers/driver.
         match event {
-            Either::Left(command) => match command {
-                Some(Command::Prompt { request, reply }) => {
-                    let result = activity
-                        .execute(
-                            activity::ExecutionOrigin::Prompt,
-                            drive_runtime_prompt(
-                                &session_id,
-                                &runtime,
-                                &integration,
-                                &mut skill_catalog,
-                                &mut voice_monitor,
-                                &mut driver,
-                                request,
-                                &tasks,
-                                &background_jobs,
-                                structured_completion,
-                                &activity,
-                            ),
-                            |reason| Some(reason.clone()),
-                        )
-                        .instrument(crate::telemetry::error_spans::operation("acp"))
-                        .await;
-                    let response = result.and_then(|reason| {
-                        agentkit_acp::finish_reason_to_stop_reason(&reason).map(PromptResponse::new)
-                    });
-                    let _ = reply.send(response);
-                }
-                // The server already interrupted the shared controller; this
-                // marker only establishes its serialized actor position.
-                Some(Command::Cancel) => {}
-                Some(Command::SetConfig {
-                    request,
-                    reply,
-                    cancellation_generation,
-                }) => {
-                    let result = async {
+            Either::Left(command) => {
+                match command {
+                    Some(Command::Prompt { request, reply }) => {
+                        let result = activity
+                            .execute(
+                                activity::ExecutionOrigin::Prompt,
+                                drive_runtime_prompt(
+                                    &session_id,
+                                    &runtime,
+                                    &integration,
+                                    &mut skill_catalog,
+                                    &mut voice_monitor,
+                                    &mut driver,
+                                    request,
+                                    &tasks,
+                                    &background_jobs,
+                                    structured_completion,
+                                    &activity,
+                                    hooks.as_ref(),
+                                ),
+                                |reason| Some(reason.clone()),
+                            )
+                            .instrument(crate::telemetry::error_spans::operation("acp"))
+                            .await;
+                        let response = result.and_then(|reason| {
+                            agentkit_acp::finish_reason_to_stop_reason(&reason)
+                                .map(PromptResponse::new)
+                        });
+                        let _ = reply.send(response);
+                    }
+                    // The server already interrupted the shared controller; this
+                    // marker only establishes its serialized actor position.
+                    Some(Command::Cancel) => {}
+                    Some(Command::SetConfig {
+                        request,
+                        reply,
+                        cancellation_generation,
+                    }) => {
+                        let result = async {
                         let cancellation = integration
                             .cancellation_handle(&session_id)
                             .map_err(sdk_error)?;
                         if cancellation.is_cancelled_since(cancellation_generation) {
                             return Err(model_switch::error("model change cancelled"));
                         }
+                        let setting = request.config_id.to_string();
+                        let previous = adapter.selection().map_err(|e| model_switch::error(&e))?;
+                        let request = if let Some(host) = &hooks {
+                            before_config_hooks(host, &session_id.to_string(), &previous, request, &cancellation, cancellation_generation)
+                                .await.map_err(|e| model_switch::error(&e))?
+                        } else {
+                            request
+                        };
                         if request.config_id.to_string() == MODEL_CONFIG_ID {
                             let target = request.value.as_value_id().ok_or_else(|| {
                                 model_switch::error("selection requires an id value")
@@ -2073,41 +2142,71 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                         if cancellation.is_cancelled_since(cancellation_generation) {
                             return Err(model_switch::error("model change cancelled"));
                         }
-                        set_config(&adapter, &catalog, request).map_err(sdk_error)
+                        let response = set_config(&adapter, &catalog, request).map_err(sdk_error)?;
+                        if let Some(host) = &hooks {
+                            // These notifications describe an already committed operation;
+                            // a hook failure must not report that commit as a failed switch.
+                            if setting == MODEL_CONFIG_ID {
+                                let current = adapter.selection().map_err(|e| model_switch::error(&e))?;
+                                if let Err(error) = host.event(crate::ahp::domain::model_event(&session_id.to_string(), false, &previous, &current), vec![], vec![]).await {
+                                    tracing::warn!(%error, "AHP model switch notification failed");
+                                }
+                            }
+                            if let Err(error) = host.event(crate::ahp::domain::config_event(&session_id.to_string(), false, &setting), vec![], vec![]).await {
+                                tracing::warn!(%error, "AHP config change notification failed");
+                            }
+                        }
+                        Ok(response)
                     }
                     .await;
-                    let _ = reply.send(result);
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::Fork {
+                        parent_context,
+                        reply,
+                    }) => {
+                        let result = (|| {
+                            let transcript = driver.snapshot().transcript;
+                            Ok(AcpForkState {
+                                source_session_id: session_id.to_string(),
+                                transcript,
+                                selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
+                                reasoning_effort: adapter
+                                    .reasoning_effort()
+                                    .map_err(AcpRuntimeError::Loop)?,
+                                parent_context,
+                            })
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::Close { reply }) => {
+                        clean_up_session(
+                            &session_id,
+                            &mut driver,
+                            &tasks,
+                            &background_jobs,
+                            hooks.as_ref(),
+                        )
+                        .await;
+                        // A close acknowledgement means the actor-owned binding is
+                        // already gone, so callers can immediately reuse the id.
+                        drop(binding.take());
+                        let _ = reply.send(());
+                        break;
+                    }
+                    None => {
+                        clean_up_session(
+                            &session_id,
+                            &mut driver,
+                            &tasks,
+                            &background_jobs,
+                            hooks.as_ref(),
+                        )
+                        .await;
+                        break;
+                    }
                 }
-                Some(Command::Fork {
-                    parent_context,
-                    reply,
-                }) => {
-                    let result = (|| {
-                        let transcript = driver.snapshot().transcript;
-                        Ok(AcpForkState {
-                            transcript,
-                            selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
-                            reasoning_effort: adapter
-                                .reasoning_effort()
-                                .map_err(AcpRuntimeError::Loop)?,
-                            parent_context,
-                        })
-                    })();
-                    let _ = reply.send(result);
-                }
-                Some(Command::Close { reply }) => {
-                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
-                    // A close acknowledgement means the actor-owned binding is
-                    // already gone, so callers can immediately reuse the id.
-                    drop(binding.take());
-                    let _ = reply.send(());
-                    break;
-                }
-                None => {
-                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
-                    break;
-                }
-            },
+            }
             Either::Right(Either::Left(event)) => {
                 let result = driver
                     .submit_input(vec![Item::notification(event.message)])
@@ -2331,7 +2430,10 @@ pub(super) async fn clean_up_session<S: ModelSession>(
     driver: &mut LoopDriver<S>,
     tasks: &TaskManagerHandle,
     background_jobs: &BackgroundJobs,
+    hooks: Option<&Arc<crate::ahp::AhpHost>>,
 ) {
+    // Owned background work is cancelled and awaited before the turn is
+    // retired: retirement cleans up the turn, not the work it launched.
     cancel_background_jobs(tasks, background_jobs).await;
     for task in tasks.list_running().await {
         if let Err(error) = tasks.cancel(task.id).await {
@@ -2343,8 +2445,19 @@ pub(super) async fn clean_up_session<S: ModelSession>(
         background_jobs.wait_for_quiescence(),
     )
     .await;
+    // The reported outcome describes the closure Kit actually performed, not a
+    // fixed value: failed approval cleanup is an error, and `close_session`
+    // reports cancellation when it had to retire a turn that was still live.
+    let mut outcome = crate::ahp::SessionOutcome::Completed;
     if let Err(error) = driver.cancel_pending_approvals().await {
         eprintln!("failed to cancel ACP approvals for {session_id}: {error}");
+        outcome = crate::ahp::SessionOutcome::Error;
+    }
+    crate::ahp::drain_delivery_diagnostics(driver);
+    if let Err(error) =
+        crate::ahp::close_session(driver, hooks, &session_id.to_string(), outcome).await
+    {
+        eprintln!("failed to close ACP session {session_id}: {error}");
     }
 }
 
@@ -2401,6 +2514,7 @@ async fn drive_runtime_prompt<S: ModelSession>(
     background_jobs: &BackgroundJobs,
     structured_completion: bool,
     activity: &activity::SessionActivity,
+    hooks: Option<&Arc<crate::ahp::AhpHost>>,
 ) -> Result<FinishReason, AcpRuntimeError> {
     if structured_completion {
         let _ = settle_background_jobs(tasks, background_jobs).await?;
@@ -2411,6 +2525,14 @@ async fn drive_runtime_prompt<S: ModelSession>(
         .map_err(AcpRuntimeError::Loop)?;
     background_jobs.begin_turn();
     let items = integration.input_port().prompt_to_items(&request)?;
+    // ACP prompts use the same Kit-owned admission as the runtime prompts, so
+    // the inbound boundary covers the user's own items on every surface. The
+    // skill catalogue and voice monitor then add their own submissions, which
+    // are not inbound user messages.
+    let Some(items) = admit_acp_prompt(hooks, session_id, items, integration).await? else {
+        // A cancelled admission is this prompt's ending, not a failure.
+        return Ok(FinishReason::Cancelled);
+    };
     skill_catalog
         .submit(&current.skills, items, |items| {
             voice_monitor.submit(items, |items| driver.submit_input(items))
@@ -2433,6 +2555,29 @@ async fn drive_runtime_prompt<S: ModelSession>(
         activity,
     )
     .await
+}
+
+/// Dispatches Kit-owned inbound admission for an ACP prompt. The hook await is
+/// cancelled cooperatively through the session's own cancellation checkpoint;
+/// `None` reports that cancellation rather than a failure.
+async fn admit_acp_prompt(
+    hooks: Option<&Arc<crate::ahp::AhpHost>>,
+    session_id: &agentkit_acp::SessionId,
+    items: Vec<Item>,
+    integration: &AcpIntegration,
+) -> Result<Option<Vec<Item>>, AcpRuntimeError> {
+    let Some(host) = hooks else {
+        return Ok(Some(items));
+    };
+    let cancellation = integration.cancellation_handle(session_id)?.checkpoint();
+    match host
+        .inbound(&session_id.to_string(), items, Some(cancellation))
+        .await
+    {
+        Ok(items) => Ok(Some(items)),
+        Err(LoopError::Cancelled) => Ok(None),
+        Err(error) => Err(record_acp_loop_failure(session_id, &error)),
+    }
 }
 
 async fn drive_unsolicited<S: ModelSession>(
@@ -2487,7 +2632,10 @@ async fn drive_domain_until_pause<S: ModelSession>(
     let cancellation = integration.cancellation_handle(session_id)?;
     let generation = cancellation.generation();
     loop {
-        let step = match driver.next().await {
+        let step = driver.next().await;
+        // Read-only delivery failures are diagnostics, never this call's result.
+        crate::ahp::drain_delivery_diagnostics(driver);
+        let step = match step {
             Ok(step) => step,
             Err(LoopError::Cancelled) => {
                 return Ok(FinishReason::Cancelled);
@@ -2495,10 +2643,9 @@ async fn drive_domain_until_pause<S: ModelSession>(
             Err(error) => return Err(record_acp_loop_failure(session_id, &error)),
         };
         if cancellation.is_cancelled_since(generation) {
-            driver
-                .retire_interrupted_turn()
-                .await
-                .map_err(|error| record_acp_loop_failure(session_id, &error))?;
+            let retired = driver.retire_interrupted_turn().await;
+            crate::ahp::drain_delivery_diagnostics(driver);
+            retired.map_err(|error| record_acp_loop_failure(session_id, &error))?;
             return Ok(FinishReason::Cancelled);
         }
         match step {
@@ -5750,6 +5897,7 @@ pub(super) mod tests {
             &background_jobs,
             false,
             &legacy_activity(acp_session_id.clone(), |_| Ok(())),
+            None,
         )
         .await
         .expect("cancellation must be an ACP response, not an RPC error");
@@ -5872,6 +6020,7 @@ pub(super) mod tests {
             &BackgroundJobs::default(),
             false,
             &legacy_activity(acp_session_id.clone(), |_| Ok(())),
+            None,
         )
         .await
         .unwrap();
@@ -5965,6 +6114,7 @@ pub(super) mod tests {
             &background_jobs,
             true,
             &activity,
+            None,
         );
         tokio::pin!(prompt);
 
@@ -6249,6 +6399,7 @@ pub(super) mod tests {
             skill_catalog: skill_catalog::SkillCatalogMonitor::new(&skills.skills).unwrap(),
             adapter: SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4")
                 .unwrap(),
+            hooks: None,
             catalog: Vec::new(),
             commands: commands_rx,
             activity,
@@ -6362,6 +6513,85 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
         drain.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_config_cancellation_prevents_hooks_and_selection() {
+        let (host, mut received, server) = crate::ahp::domain::test_support::host(None).await;
+        let adapter =
+            SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+        let previous = adapter.selection().unwrap();
+        let controller = agentkit_core::CancellationController::new();
+        let cancellation = controller.handle();
+        let generation = cancellation.generation();
+        controller.interrupt();
+        let request = SetSessionConfigOptionRequest::new(
+            "s",
+            MODEL_CONFIG_ID,
+            "openai-subscription:gpt-5.4-mini",
+        );
+        let error = before_config_hooks(&host, "s", &previous, request, &cancellation, generation)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "model change cancelled");
+        assert_eq!(adapter.selection().unwrap(), previous);
+        host.shutdown().await.unwrap();
+        assert!(received.try_recv().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn real_ahp_before_denial_prevents_config_selection() {
+        for denied in ["config.change.before", "model.switch.before"] {
+            let (host, mut received, server) =
+                crate::ahp::domain::test_support::host(Some(denied)).await;
+            let adapter =
+                SelectableAdapter::new(crate::ProviderKind::OpenAiSubscription, "gpt-5.4").unwrap();
+            let previous = adapter.selection().unwrap();
+            let catalog = vec![ModelGroup {
+                context_windows: Default::default(),
+                provider: previous.provider,
+                models: vec![previous.model.clone(), "gpt-5.4-mini".into()],
+            }];
+            let controller = agentkit_core::CancellationController::new();
+            let cancellation = controller.handle();
+            let request = SetSessionConfigOptionRequest::new(
+                "s",
+                MODEL_CONFIG_ID,
+                "openai-subscription:gpt-5.4-mini",
+            );
+            let result = before_config_hooks(
+                &host,
+                "s",
+                &previous,
+                request,
+                &cancellation,
+                cancellation.generation(),
+            )
+            .await;
+            let result = match result {
+                Ok(request) => {
+                    set_config(&adapter, &catalog, request).map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error),
+            };
+            assert!(result.unwrap_err().contains("AHP denied"));
+            assert_eq!(adapter.selection().unwrap(), previous);
+            host.shutdown().await.unwrap();
+            let mut intercepted = Vec::new();
+            while let Ok(message) = received.try_recv() {
+                if message["method"] == "hooks/intercept" {
+                    intercepted.push(
+                        message["params"]["event"]["type"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    );
+                }
+            }
+            assert_eq!(intercepted, [denied]);
+            server.abort();
+        }
     }
 
     #[test]
