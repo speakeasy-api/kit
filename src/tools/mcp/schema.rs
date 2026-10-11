@@ -403,6 +403,10 @@ fn walk(scope: &DiscoveryScope, schema: &Value, input: &SchemaInput) -> Result<V
     Ok(output)
 }
 
+pub(super) fn argument_contract() -> crate::tools::ahp::ToolArgumentContract {
+    crate::tools::ahp::ToolArgumentContract::new::<SchemaInput>()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

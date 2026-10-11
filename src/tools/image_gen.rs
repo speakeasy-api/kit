@@ -290,6 +290,11 @@ impl Tool for ImageGenTool {
     }
 }
 
+/// Native invocation decoder for SDK argument admission.
+pub(super) fn argument_contract() -> super::ahp::ToolArgumentContract {
+    super::ahp::ToolArgumentContract::new::<Input>()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

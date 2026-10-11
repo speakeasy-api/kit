@@ -3951,6 +3951,17 @@ fn bounded_server_text(value: &str) -> &str {
 /// connected tools globally and returns at most `SEARCH_RESULT_LIMIT` of
 /// them. Both modes drop tail results until the serialized response fits
 /// `SEARCH_RESULT_BYTE_CAP`.
+pub(super) fn argument_contracts() -> [(&'static str, super::ahp::ToolArgumentContract); 3] {
+    [
+        (
+            "tool_search",
+            super::ahp::ToolArgumentContract::new::<SearchInput>(),
+        ),
+        ("auth", super::ahp::ToolArgumentContract::new::<AuthInput>()),
+        ("tool_schema", schema::argument_contract()),
+    ]
+}
+
 #[cfg(test)]
 fn render_search(
     query: &PreparedQuery,
@@ -8231,7 +8242,8 @@ for line in sys.stdin:
         use crate::ahp::{AhpConfig, AhpHost, SessionFacts};
         use agentkit_core::{SessionId, TurnId};
         use agentkit_tools_core::{
-            AllowAllPermissions, Tool, ToolExecutionOutcome, ToolExecutionScope, ToolRequest,
+            AllowAllPermissions, Tool, ToolError, ToolExecutionOutcome, ToolExecutionScope,
+            ToolRequest,
         };
         use axum::response::IntoResponse;
 
@@ -8241,6 +8253,8 @@ for line in sys.stdin:
             ("observe", "http"),
             ("modify", "http"),
             ("deny", "http"),
+            ("invalid-schema", "http"),
+            ("invalid-schema", "stdio"),
             ("modify", "stdio"),
             ("allow", "stdio-gap"),
         ] {
@@ -8256,7 +8270,7 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'gateway', 'version': '1'}}
     elif method == 'tools/list':
-        result = {'tools': [{'name': 'list_servers', 'description': 'List servers', 'inputSchema': {'type': 'object'}}]}
+        result = {'tools': [{'name': 'list_servers', 'description': 'List servers', 'inputSchema': {'type': 'object', 'properties': {'original': {'type': 'boolean'}, 'changed': {'type': 'boolean'}}, 'additionalProperties': False}}]}
     elif method == 'tools/call':
         data = request['params']['arguments']
         with open(sys.argv[1], 'w') as marker:
@@ -8282,7 +8296,7 @@ for line in sys.stdin:
                         }
                         let result = match request["method"].as_str().unwrap() {
                             "initialize" => json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"gateway","version":"1"}}),
-                            "tools/list" => json!({"tools":[{"name":"list_servers","description":"List servers","inputSchema":{"type":"object"}}]}),
+                            "tools/list" => json!({"tools":[{"name":"list_servers","description":"List servers","inputSchema":{"type":"object","properties":{"original":{"type":"boolean"},"changed":{"type":"boolean"}},"additionalProperties":false}}]}),
                             "tools/call" => {
                                 let data = request["params"]["arguments"].clone();
                                 std::fs::write(marker, serde_json::to_vec(&data).unwrap()).unwrap();
@@ -8335,6 +8349,7 @@ for line in sys.stdin:
                     let effects = if event["type"] == "tool.before" {
                         match mode {
                             "modify" => json!([{"type":"modify","target":"input","operation":"merge","value":{"changed":true}}, {"type":"allow"}]),
+                            "invalid-schema" => json!([{"type":"modify","target":"input","operation":"merge","value":{"changed":17}}]),
                             "deny" => json!([{"type":"deny","reason":"MCP policy"}]),
                             _ => json!([]),
                         }
@@ -8407,12 +8422,23 @@ for line in sys.stdin:
                     &mut context.borrowed(),
                 )
                 .await;
-            if mode == "deny" {
+            if matches!(mode, "deny" | "invalid-schema") {
                 assert!(
                     matches!(outcome, ToolExecutionOutcome::FailedBeforeInvocation(_)),
                     "{outcome:?}"
                 );
                 assert!(!cwd.join("invoked.json").exists());
+                if mode == "invalid-schema" {
+                    assert!(
+                        matches!(
+                            outcome,
+                            ToolExecutionOutcome::FailedBeforeInvocation(
+                                ToolError::PermissionDenied(_)
+                            )
+                        ),
+                        "schema failure must be an SDK denial: {outcome:?}"
+                    );
+                }
             } else {
                 let ToolExecutionOutcome::Completed(result) = outcome else {
                     panic!("{mode}: {outcome:?}");

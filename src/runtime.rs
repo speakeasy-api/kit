@@ -2228,12 +2228,13 @@ fn attach_native_hooks(
         let executor = agentkit_tools_core::BasicToolExecutor::new([
             Arc::new(compose.clone()) as Arc<dyn ToolSource>
         ]);
+        let contracts = HiddenRunletBackend(compose.backgroundable.hidden_tools.clone()).specs();
         builder
             .add_tool_source(compose)
-            .tool_executor(crate::tools::ahp::AhpToolExecutor::new(
-                Arc::new(executor),
-                host.clone(),
-            ))
+            .tool_executor(
+                crate::tools::ahp::AhpToolExecutor::new(Arc::new(executor), host.clone())
+                    .with_specs(contracts),
+            )
             .delivery(crate::ahp::HostDelivery::new(host.clone()))
             .mutator(crate::ahp::HostMutator::new(host))
     } else {

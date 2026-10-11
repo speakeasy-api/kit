@@ -170,6 +170,11 @@ impl Tool for A2aTool {
     }
 }
 
+/// Native invocation decoder for SDK argument admission.
+pub(super) fn argument_contract() -> super::ahp::ToolArgumentContract {
+    super::ahp::ToolArgumentContract::new::<Input>()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};

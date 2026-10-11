@@ -14,6 +14,21 @@ use agentkit_tools_core::{
 use async_trait::async_trait;
 use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
+pub(super) fn argument_contracts() -> [(&'static str, super::ahp::ToolArgumentContract); 4] {
+    [
+        ("subagent", super::ahp::ToolArgumentContract::new::<Input>()),
+        ("fork", super::ahp::ToolArgumentContract::new::<ForkInput>()),
+        (
+            "prompt",
+            super::ahp::ToolArgumentContract::new::<Continuation>(),
+        ),
+        (
+            "close",
+            super::ahp::ToolArgumentContract::new::<CloseInput>(),
+        ),
+    ]
+}
+
 #[cfg(test)]
 use serde_json::json;
 use serde_json::{Map, Value};

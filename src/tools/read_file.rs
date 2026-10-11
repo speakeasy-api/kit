@@ -161,3 +161,8 @@ impl Tool for ReadFileTool {
         )))
     }
 }
+
+/// Native invocation decoder for SDK argument admission.
+pub(super) fn argument_contract() -> super::ahp::ToolArgumentContract {
+    super::ahp::ToolArgumentContract::new::<Input>()
+}

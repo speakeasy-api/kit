@@ -435,6 +435,11 @@ fn io_error(error: std::io::Error) -> ToolError {
     ToolError::ExecutionFailed(error.to_string())
 }
 
+/// Native invocation decoder for SDK argument admission.
+pub(super) fn argument_contract() -> super::ahp::ToolArgumentContract {
+    super::ahp::ToolArgumentContract::new::<EditInput>()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

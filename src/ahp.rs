@@ -13,7 +13,7 @@ pub use lifecycle::SessionOutcome;
 
 use agenthooksprotocol::{
     Attachment,
-    client::{Decision, ToolContext as HookContext},
+    client::Decision,
     hooks::{Capabilities, EventGrant, Hooks, HooksOptions},
     inputs::{MessageInput, PartInput},
 };
@@ -921,6 +921,7 @@ async fn dispatch_before(
     mut request: ToolRequest,
     parent: Option<ToolEventIdentity>,
     cancellation: Option<TurnCancellation>,
+    contract: Option<&crate::tools::ahp::ToolArgumentContract>,
 ) -> ToolBeforeOutcome {
     let mut event = tool_event("tool.before", &request);
     let fallback = ToolEventIdentity {
@@ -944,14 +945,11 @@ async fn dispatch_before(
             }),
         };
     }
-    let mut boundary = hooks
-        .tool_input(request.input.clone())
-        .context(HookContext::new(event))
-        .initial_state(Decision::Allow);
-    if let Some(cancellation) = cancellation {
-        boundary = boundary.cancel_when(async move { cancellation.cancelled().await });
-    }
-    let result = boundary.await;
+    let fallback_contract = crate::tools::ahp::ToolArgumentContract::new::<Value>();
+    let result = contract
+        .unwrap_or(&fallback_contract)
+        .settle(hooks, request.input.clone(), event, cancellation)
+        .await;
     match result {
         Err(error) => ToolBeforeOutcome::Complete(
             if error.code() == agenthooksprotocol::generated::DeliveryDiagnosticCode::Cancelled {
@@ -1038,9 +1036,30 @@ impl ToolHooks for AhpHost {
             request,
             parent,
             cancellation,
+            None,
         )
         .await
     }
+
+    async fn before_with_contract(
+        &self,
+        request: ToolRequest,
+        parent: Option<ToolEventIdentity>,
+        cancellation: Option<TurnCancellation>,
+        contract: Option<&crate::tools::ahp::ToolArgumentContract>,
+    ) -> ToolBeforeOutcome {
+        dispatch_before(
+            &self.hooks,
+            &self.grants,
+            &self.source,
+            request,
+            parent,
+            cancellation,
+            contract,
+        )
+        .await
+    }
+
     async fn after(
         &self,
         request: &ToolRequest,

@@ -2,7 +2,7 @@
 use super::*;
 use agenthooksprotocol::{
     adapters::registered::ManagedBackend,
-    client::{HookError, LocalFuture},
+    client::{HookError, LocalFuture, ToolContext as HookContext},
 };
 use agentkit_core::{CancellationController, ToolOutput, ToolResultPart};
 use agentkit_tools_core::ToolResult;
@@ -956,4 +956,130 @@ async fn typed_accepted_response_effects_match_effective_tool_input() {
     let canonical = serde_json::to_value(&settled.settled_event).unwrap();
     assert_eq!(canonical["tool"]["input"]["command"], "changed");
     host.shutdown().await.unwrap();
+}
+
+async fn execute_edit_contract(
+    input: Value,
+    effect: Value,
+) -> (ToolExecutionOutcome, Vec<Value>, String) {
+    use agentkit_core::{MetadataMap, SessionId, TurnId};
+    use agentkit_tools_core::{
+        AllowAllPermissions, BasicToolExecutor, ToolExecutionScope, ToolExecutor, ToolRegistry,
+    };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("target.txt"), "original").unwrap();
+    let (host, mut events) = host(json!([effect]), json!([]), false);
+    let host = Arc::new(host);
+    let inner = BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(crate::tools::EditTool::new(root.path().to_path_buf())),
+    );
+    let executor: Arc<dyn ToolExecutor> = Arc::new(crate::tools::ahp::AhpToolExecutor::new(
+        Arc::new(inner),
+        host.clone(),
+    ));
+    let scope = ToolExecutionScope {
+        executor: executor.clone(),
+        session_id: SessionId::new("session-1"),
+        turn_id: TurnId::new("turn-1"),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+    };
+    let request = ToolRequest::new("edit-contract", "edit", input, "session-1", "turn-1");
+    let outcome = executor
+        .execute_owned(request, scope.nested_context(MetadataMap::new()))
+        .await;
+    let content = std::fs::read_to_string(root.path().join("target.txt")).unwrap();
+    let mut received = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        received.push(event);
+    }
+    host.shutdown().await.unwrap();
+    (outcome, received, content)
+}
+
+#[tokio::test]
+async fn native_argument_contract_valid_merge_and_replace_execute_real_edit() {
+    for operation in ["merge", "replace"] {
+        let input = json!({"op":"edit","path":"target.txt","hunks":[{"old":"original","new":"unused"}],"extension":{"kept":true}});
+        let replacement = if operation == "merge" {
+            json!({"hunks":[{"old":"original","new":"changed"}]})
+        } else {
+            json!({"op":"edit","path":"target.txt","hunks":[{"old":"original","new":"changed"}],"extension":{"kept":true}})
+        };
+        let (outcome, events, content) = execute_edit_contract(
+            input,
+            json!({
+                "type":"modify","target":"input","operation":operation,"value":replacement,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ToolExecutionOutcome::Completed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(content, "changed");
+        let before = &events[0];
+        let after = events
+            .iter()
+            .find(|event| event["type"] == "tool.after")
+            .unwrap();
+        assert_eq!(after["parentEventId"], before["id"]);
+        assert_eq!(after["tool"]["input"]["extension"], json!({"kept":true}));
+        assert_eq!(after["tool"]["input"]["hunks"][0]["new"], "changed");
+    }
+}
+
+#[tokio::test]
+async fn native_argument_contract_invalid_edits_are_sdk_denials_before_invocation() {
+    for (operation, invalid) in [
+        ("replace", json!({"op":"delete","path":17})),
+        ("replace", json!({"op":"delete"})),
+        (
+            "replace",
+            json!({"op":"edit","path":"target.txt","hunks":[{"old":"original","new":false}]}),
+        ),
+        ("replace", json!({"op":"unsupported","path":"target.txt"})),
+        ("merge", json!({"path":false})),
+        (
+            "merge",
+            json!({"op":"edit","hunks":[{"old":17,"new":"changed"}]}),
+        ),
+    ] {
+        let (outcome, events, content) = execute_edit_contract(
+            json!({"op":"delete","path":"target.txt"}),
+            json!({"type":"modify","target":"input","operation":operation,"value":invalid}),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ToolExecutionOutcome::FailedBeforeInvocation(ToolError::PermissionDenied(_))
+            ),
+            "must be an SDK fail-closed denial, not native decoder failure: {outcome:?}"
+        );
+        assert_eq!(content, "original");
+        let after = events
+            .iter()
+            .find(|event| event["type"] == "tool.after")
+            .unwrap();
+        assert_eq!(after["execution"]["status"], "skipped");
+        assert_eq!(after["outcome"], "denied");
+        assert_eq!(
+            after["tool"]["input"],
+            json!({"op":"delete","path":"target.txt"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_argument_contract_rejects_invalid_initial_input_without_delivery() {
+    let (outcome, events, content) =
+        execute_edit_contract(json!({"op":"delete","path":false}), json!({"type":"allow"})).await;
+    assert!(matches!(
+        outcome,
+        ToolExecutionOutcome::FailedBeforeInvocation(_)
+    ));
+    assert!(events.is_empty());
+    assert_eq!(content, "original");
 }

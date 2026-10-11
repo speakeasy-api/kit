@@ -1,7 +1,14 @@
 //! Awaited tool boundaries. The host owns SDK reduction and transport; this module
 //! only carries effective values and immutable, source-scoped invocation lineage.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+
+use agenthooksprotocol::{
+    client::{Decision, HookError, ToolContext as HookContext},
+    contracts::Contract,
+    hooks::{Hooks, ToolOutcome},
+};
+use futures_util::future::BoxFuture;
 
 use agentkit_core::TurnCancellation;
 use agentkit_tools_core::{
@@ -10,6 +17,122 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// An erased SDK boundary whose decoder is the native tool's argument type.
+/// The wire envelope retains every supplied field, including opaque extensions;
+/// decoding still uses precisely the type used by the tool's invocation.
+#[derive(Clone)]
+pub struct ToolArgumentContract {
+    settle: ArgumentSettlement,
+    runtime: Option<Contract<serde_json::Value>>,
+}
+
+type ArgumentSettlement =
+    for<'a> fn(
+        &'a Hooks,
+        serde_json::Value,
+        serde_json::Value,
+        Option<TurnCancellation>,
+    ) -> BoxFuture<'a, Result<ToolOutcome<serde_json::Value>, HookError>>;
+
+struct WireArguments<T> {
+    raw: serde_json::Value,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Serialize for WireArguments<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for WireArguments<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        serde_json::from_value::<T>(raw.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            raw,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl ToolArgumentContract {
+    pub fn new<T: serde::de::DeserializeOwned + Send + 'static>() -> Self {
+        Self {
+            settle: settle_arguments::<T>,
+            runtime: None,
+        }
+    }
+
+    /// Runtime-only tools use their advertised schema, not a pretend Rust type.
+    pub(crate) fn from_schema(schema: &serde_json::Value) -> Self {
+        let validator = jsonschema::validator_for(schema).map_err(|error| error.to_string());
+        Self {
+            settle: settle_arguments::<serde_json::Value>,
+            runtime: Some(Contract::validated(move |input| {
+                let validator = validator.as_ref().map_err(Clone::clone)?;
+                validator.validate(input).map_err(|error| error.to_string())
+            })),
+        }
+    }
+
+    pub(crate) async fn settle(
+        &self,
+        hooks: &Hooks,
+        input: serde_json::Value,
+        event: serde_json::Value,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<ToolOutcome<serde_json::Value>, HookError> {
+        if let Some(contract) = &self.runtime {
+            let mut boundary = hooks
+                .tool_input(input)
+                .arguments_contract(contract.clone())
+                .context(HookContext::new(event))
+                .initial_state(Decision::Allow);
+            if let Some(cancellation) = cancellation {
+                boundary = boundary.cancel_when(async move { cancellation.cancelled().await });
+            }
+            boundary.await
+        } else {
+            (self.settle)(hooks, input, event, cancellation).await
+        }
+    }
+}
+
+fn settle_arguments<T: serde::de::DeserializeOwned + Send + 'static>(
+    hooks: &Hooks,
+    input: serde_json::Value,
+    event: serde_json::Value,
+    cancellation: Option<TurnCancellation>,
+) -> BoxFuture<'_, Result<ToolOutcome<serde_json::Value>, HookError>> {
+    Box::pin(async move {
+        // Initial admission and all edit candidates are decoded by the SDK.
+        // Constructing the envelope does not pre-validate or change wire input.
+        let arguments = WireArguments::<T> {
+            raw: input,
+            marker: PhantomData,
+        };
+        let mut boundary = hooks
+            .tool_input(arguments)
+            .arguments_contract(Contract::<WireArguments<T>>::new())
+            .context(HookContext::new(event))
+            .initial_state(Decision::Allow);
+        if let Some(cancellation) = cancellation {
+            boundary = boundary.cancel_when(async move { cancellation.cancelled().await });
+        }
+        let settled = boundary.await?;
+        Ok(ToolOutcome {
+            candidate: settled.candidate,
+            content: settled.content,
+            diagnostics: settled.diagnostics,
+            outcome: settled.outcome,
+            effective_input: settled.effective_input,
+            settled_event: settled.settled_event,
+            input: settled.input.map(|input| input.raw),
+        })
+    })
+}
 
 const PARENT: &str = "kit.ahp.tool_parent";
 
@@ -45,6 +168,17 @@ pub trait ToolHooks: Send + Sync {
         cancellation: Option<TurnCancellation>,
     ) -> ToolBeforeOutcome;
 
+    /// Supply the registered tool's native argument decoder to the SDK host.
+    async fn before_with_contract(
+        &self,
+        request: ToolRequest,
+        parent: Option<ToolEventIdentity>,
+        cancellation: Option<TurnCancellation>,
+        _contract: Option<&ToolArgumentContract>,
+    ) -> ToolBeforeOutcome {
+        self.before(request, parent, cancellation).await
+    }
+
     async fn after(
         &self,
         request: &ToolRequest,
@@ -60,15 +194,37 @@ pub struct AhpToolExecutor {
     inner: Arc<dyn ToolExecutor>,
     hooks: Arc<dyn ToolHooks>,
     parent: Option<ToolEventIdentity>,
+    arguments: Arc<BTreeMap<String, ToolArgumentContract>>,
+    runtime_arguments: bool,
 }
 
 impl AhpToolExecutor {
     pub fn new(inner: Arc<dyn ToolExecutor>, hooks: Arc<dyn ToolHooks>) -> Self {
+        let mut arguments = super::native_argument_contracts();
+        for spec in inner.specs() {
+            arguments
+                .entry(spec.name.0)
+                .or_insert_with(|| ToolArgumentContract::from_schema(&spec.input_schema));
+        }
         Self {
             inner,
             hooks,
             parent: None,
+            arguments: Arc::new(arguments),
+            runtime_arguments: false,
         }
+    }
+
+    /// Register schemas for hidden tools available through executor lookup.
+    /// Native Rust decoders take precedence over runtime-only schemas.
+    pub(crate) fn with_specs(mut self, specs: impl IntoIterator<Item = ToolSpec>) -> Self {
+        let arguments = Arc::make_mut(&mut self.arguments);
+        for spec in specs {
+            arguments
+                .entry(spec.name.0)
+                .or_insert_with(|| ToolArgumentContract::from_schema(&spec.input_schema));
+        }
+        self
     }
 
     fn scoped(&self, parent: ToolEventIdentity) -> Self {
@@ -76,6 +232,8 @@ impl AhpToolExecutor {
             inner: self.inner.clone(),
             hooks: self.hooks.clone(),
             parent: Some(parent),
+            arguments: self.arguments.clone(),
+            runtime_arguments: self.runtime_arguments,
         }
     }
 
@@ -89,6 +247,8 @@ impl AhpToolExecutor {
             inner,
             hooks,
             parent: parent(context),
+            arguments: Arc::new(BTreeMap::new()),
+            runtime_arguments: true,
         }
     }
 
@@ -98,9 +258,34 @@ impl AhpToolExecutor {
         approval: Option<&ApprovalRequest>,
         context: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
+        // MCP discovery can happen after its scoped executor is constructed.
+        // Resolve its current advertised schema at invocation, never by builtin name.
+        let runtime_contract = if self.runtime_arguments {
+            let Some(spec) = self
+                .inner
+                .specs()
+                .into_iter()
+                .find(|spec| spec.name == request.tool_name)
+            else {
+                return ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Unavailable(
+                    format!("missing argument schema for {}", request.tool_name),
+                ));
+            };
+            Some(ToolArgumentContract::from_schema(&spec.input_schema))
+        } else {
+            None
+        };
+        let contract = runtime_contract
+            .as_ref()
+            .or_else(|| self.arguments.get(request.tool_name.0.as_str()));
         let (request, event) = match self
             .hooks
-            .before(request, self.parent.clone(), context.cancellation.clone())
+            .before_with_contract(
+                request,
+                self.parent.clone(),
+                context.cancellation.clone(),
+                contract,
+            )
             .await
         {
             ToolBeforeOutcome::Invoke { request, event } => (request, event),
@@ -207,9 +392,19 @@ impl<T: Tool> AhpTool<T> {
         context: &mut ToolContext<'_>,
         direct: bool,
     ) -> ToolExecutionOutcome {
+        let arguments = super::native_argument_contracts();
+        let runtime_contract = ToolArgumentContract::from_schema(&self.inner.spec().input_schema);
+        let contract = arguments
+            .get(request.tool_name.0.as_str())
+            .or(Some(&runtime_contract));
         let (request, event) = match self
             .hooks
-            .before(request, parent(context), context.cancellation.clone())
+            .before_with_contract(
+                request,
+                parent(context),
+                context.cancellation.clone(),
+                contract,
+            )
             .await
         {
             ToolBeforeOutcome::Invoke { request, event } => (request, event),
@@ -237,11 +432,10 @@ impl<T: Tool> AhpTool<T> {
         capability.metadata = &metadata;
         let mut scope = context.execution_scope.clone();
         if let Some(scope) = &mut scope {
-            scope.executor = Arc::new(AhpToolExecutor {
-                inner: scope.executor.clone(),
-                hooks: self.hooks.clone(),
-                parent: Some(event.clone()),
-            });
+            scope.executor = Arc::new(
+                AhpToolExecutor::new(scope.executor.clone(), self.hooks.clone())
+                    .scoped(event.clone()),
+            );
         }
         let mut nested = ToolContext {
             capability,
