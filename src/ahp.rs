@@ -3,7 +3,6 @@ mod model;
 mod prompt;
 mod tool;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -36,7 +35,6 @@ const CONFIG_FILE: &str = "hooks.json";
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
     sdk: agenthooksprotocol::Hooks,
-    subscribed: BTreeSet<String>,
 }
 
 impl Hooks {
@@ -63,26 +61,12 @@ impl Hooks {
     }
 
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
-        let selectors = selectors(&registration);
-        let subscribed = options
-            .capabilities
-            .keys()
-            .filter(|event| selectors.iter().any(|selector| matches(selector, event)))
-            .cloned()
-            .collect();
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
-        Ok(Self { sdk, subscribed })
-    }
-
-    fn subscribes(&self, event: EventType) -> bool {
-        self.subscribed.contains(event.as_str())
+        Ok(Self { sdk })
     }
 
     pub(crate) async fn session_start(&self, session: &str, trigger: SessionStartInputTrigger) {
-        if !self.subscribes(EventType::SessionStart) {
-            return;
-        }
         let input = SessionStartInput::new(
             SessionStartInputHarness::new("kit", env!("CARGO_PKG_VERSION")),
             Vec::new(),
@@ -94,9 +78,6 @@ impl Hooks {
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
-        if !self.subscribes(EventType::SessionEnd) {
-            return;
-        }
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, Box::new(Session::new(session)));
         settle(EventType::SessionEnd, self.sdk.session_end(input).await);
@@ -111,9 +92,6 @@ impl Hooks {
         instructions: &str,
         cancellation: Option<&TurnCancellation>,
     ) -> Option<Compaction> {
-        if !self.subscribes(EventType::ContextCompactBefore) {
-            return None;
-        }
         let trigger = if manual {
             ContextCompactBeforeInputTrigger::Manual
         } else {
@@ -146,9 +124,6 @@ impl Hooks {
     /// Runs `context.compact.after`; a hook may replace the summary before it
     /// is installed.
     pub(crate) async fn compact_after(&self, items: &[Item], summary: String) -> String {
-        if !self.subscribes(EventType::ContextCompactAfter) {
-            return summary;
-        }
         let removed = items
             .iter()
             .enumerate()
@@ -258,29 +233,6 @@ fn merge(merged: &mut Option<Registration>, next: Registration) {
         }
     }
     registration.protocol_version = next.protocol_version;
-}
-
-fn selectors(registration: &Registration) -> Vec<String> {
-    let Ok(registration) = serde_json::to_value(registration) else {
-        return Vec::new();
-    };
-    let each =
-        |value: &serde_json::Value, key: &str| value[key].as_array().cloned().unwrap_or_default();
-    each(&registration, "hooks")
-        .iter()
-        .flat_map(|backend| each(backend, "subscriptions"))
-        .flat_map(|subscription| each(&subscription, "events"))
-        .filter_map(|event| event.as_str().map(str::to_owned))
-        .collect()
-}
-
-fn matches(selector: &str, event: &str) -> bool {
-    selector == event
-        || selector == "*"
-        || selector
-            .strip_suffix(".*")
-            .and_then(|prefix| event.strip_prefix(prefix))
-            .is_some_and(|tail| tail.starts_with('.'))
 }
 
 fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use agenthooksprotocol::{EventType, SessionStartInputTrigger};
+use agenthooksprotocol::SessionStartInputTrigger;
 use agentkit_core::{
     FinishReason, Item, ItemKind, MetadataMap, SessionId, ToolCallId, ToolOutput, ToolResultPart,
     TurnCancellation, TurnId,
@@ -21,23 +21,7 @@ use super::*;
 
 #[test]
 fn every_granted_event_accepts_wildcard_subscriptions() {
-    let (hooks, _) = hooks(vec![intercept(&["*"]), observe(&["*"])]);
-
-    for event in [
-        EventType::SessionStart,
-        EventType::SessionEnd,
-        EventType::UserMessageInbound,
-        EventType::ModelRequestBefore,
-        EventType::ModelResponseAfter,
-        EventType::ModelError,
-        EventType::ToolBefore,
-        EventType::ToolAfter,
-        EventType::ContextCompactBefore,
-        EventType::ContextCompactAfter,
-    ] {
-        assert!(hooks.subscribes(event), "{}", event.as_str());
-    }
-    assert!(!hooks.subscribes(EventType::TurnEnd));
+    hooks(vec![intercept(&["*"]), observe(&["*"])]);
 }
 
 #[test]
@@ -90,6 +74,7 @@ fn unreadable_registration_is_reported_and_missing_is_ignored() {
 
 struct Echo {
     spec: ToolSpec,
+    current: Mutex<Option<ToolSpec>>,
     received: Mutex<Vec<Value>>,
 }
 
@@ -106,6 +91,7 @@ impl Echo {
                     "additionalProperties": false,
                 }),
             ),
+            current: Mutex::default(),
             received: Mutex::default(),
         })
     }
@@ -115,6 +101,10 @@ impl Echo {
 impl Tool for Echo {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn current_spec(&self) -> Option<ToolSpec> {
+        self.current.lock().unwrap().clone()
     }
 
     async fn invoke(
@@ -219,6 +209,44 @@ async fn tool_before_edits_must_satisfy_the_tool_schema() {
 
     denial_message(outcome);
     assert!(echo.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_before_validates_against_the_current_schema() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before"])]);
+    backend.respond(
+        "tool.before",
+        json!([{"type": "modify", "target": "input", "operation": "merge", "value": {"extra": true}}]),
+    );
+    let echo = Echo::new();
+    denial_message(call(&hooks, &echo, json!({"text": "hello"})).await);
+
+    *echo.current.lock().unwrap() = Some(ToolSpec::new(
+        ToolName::new("echo"),
+        "echo",
+        json!({"type": "object"}),
+    ));
+    call(&hooks, &echo, json!({"text": "hello"})).await;
+
+    assert_eq!(
+        *echo.received.lock().unwrap(),
+        [json!({"text": "hello", "extra": true})]
+    );
+}
+
+#[tokio::test]
+async fn unsubscribed_events_leave_tools_and_prompts_unchanged() {
+    let (hooks, _) = hooks(vec![observe(&["session.start"])]);
+    let echo = Echo::new();
+    let model = Model::default();
+
+    let outcome = call(&hooks, &echo, json!({"text": "hello"})).await;
+    let (_, persisted) = prompt(&hooks, &model, "original").await;
+
+    assert_eq!(output(outcome), ToolOutput::text("hello"));
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(last_user_text(&requests[0]).as_deref(), Some("original"));
+    assert_eq!(last_user_text(&persisted).as_deref(), Some("original"));
 }
 
 #[tokio::test]

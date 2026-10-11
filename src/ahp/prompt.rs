@@ -41,9 +41,7 @@ impl LoopMutator for PromptHook {
         cursor: &mut TranscriptCursor<'_>,
         ctx: LoopCtx<'_>,
     ) -> Result<(), LoopError> {
-        if ctx.point != MutationPoint::AfterTurnEnded
-            || !self.hooks.subscribes(EventType::UserMessageInbound)
-        {
+        if ctx.point != MutationPoint::AfterTurnEnded {
             return Ok(());
         }
         let Some(prompt) = cursor.last().filter(|item| item.kind == ItemKind::User) else {

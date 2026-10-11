@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agenthooksprotocol::client::{Decision, HookError};
 use agenthooksprotocol::contracts::Contract;
@@ -28,6 +28,7 @@ pub(crate) fn hooked_tools(registry: ToolRegistry, hooks: &Arc<Hooks>) -> ToolRe
             hooked.register(HookedTool {
                 tool,
                 hooks: Arc::clone(hooks),
+                validator: Mutex::default(),
             });
             hooked
         })
@@ -36,6 +37,7 @@ pub(crate) fn hooked_tools(registry: ToolRegistry, hooks: &Arc<Hooks>) -> ToolRe
 struct HookedTool {
     tool: Arc<dyn Tool>,
     hooks: Arc<Hooks>,
+    validator: Mutex<Option<(Value, Arc<jsonschema::Validator>)>>,
 }
 
 enum Before {
@@ -45,16 +47,9 @@ enum Before {
 
 impl HookedTool {
     async fn before(&self, mut request: ToolRequest, context: &ToolContext<'_>) -> Before {
-        if !self.hooks.subscribes(EventType::ToolBefore) {
-            return Before::Run(request);
-        }
-        let spec = self
-            .tool
-            .current_spec()
-            .unwrap_or_else(|| self.tool.spec().clone());
-        let validator = match jsonschema::validator_for(&spec.input_schema) {
+        let validator = match self.validator() {
             Ok(validator) => validator,
-            Err(error) => return Before::Return(denied(format!("invalid tool schema: {error}"))),
+            Err(error) => return Before::Return(denied(error)),
         };
         let input = ToolBeforeInput::new(
             request.call_id.to_string(),
@@ -115,6 +110,28 @@ impl HookedTool {
         Before::Run(request)
     }
 
+    fn validator(&self) -> Result<Arc<jsonschema::Validator>, String> {
+        let mut cached = self
+            .validator
+            .lock()
+            .map_err(|_| "tool schema cache is poisoned".to_owned())?;
+        let schema = match self.tool.current_spec() {
+            Some(spec) => spec.input_schema,
+            None => self.tool.spec().input_schema.clone(),
+        };
+        if let Some((cached_schema, validator)) = cached.as_ref()
+            && *cached_schema == schema
+        {
+            return Ok(Arc::clone(validator));
+        }
+        let validator = Arc::new(
+            jsonschema::validator_for(&schema)
+                .map_err(|error| format!("invalid tool schema: {error}"))?,
+        );
+        *cached = Some((schema, Arc::clone(&validator)));
+        Ok(validator)
+    }
+
     /// Applies the host permission policy to input a hook edited; `None`
     /// authorizes the call.
     fn authorize(
@@ -152,9 +169,6 @@ impl HookedTool {
     }
 
     async fn after(&self, request: &ToolRequest, outcome: &ToolExecutionOutcome) {
-        if !self.hooks.subscribes(EventType::ToolAfter) {
-            return;
-        }
         let (status, output, error) = match outcome {
             ToolExecutionOutcome::Completed(result) if result.result.is_error => (
                 ToolAfterInputOutcome::Error,

@@ -76,7 +76,7 @@ struct Call {
 
 impl Call {
     async fn failed(&self, error: &LoopError) {
-        if matches!(error, LoopError::Cancelled) || !self.hooks.subscribes(EventType::ModelError) {
+        if matches!(error, LoopError::Cancelled) {
             return;
         }
         let class = match error {
@@ -129,30 +129,28 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
                 self.inner.provider_name().unwrap_or("unknown"),
             ),
         };
-        if hooks.subscribes(EventType::ModelRequestBefore) {
-            let input = ModelRequestBeforeInput::new(
-                Box::new(call.attempt.clone()),
-                Vec::new(),
-                Box::new(call.model.clone()),
-                ModelRequestBeforeInputParams::new(),
-            )
-            .with_sources()
-            .with_items(super::messages(&request.transcript));
-            let boundary = hooks.sdk.model_request_before(input);
-            let result = match &cancellation {
-                Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-                None => boundary.await,
-            };
-            let reason = match super::settle(EventType::ModelRequestBefore, result) {
-                Some(outcome) if !outcome.outcome.is_denied() => None,
-                Some(outcome) => Some(super::denial(&outcome.outcome)),
-                None => Some("agent hook dispatch failed".into()),
-            };
-            if let Some(reason) = reason {
-                return Err(LoopError::InvalidState(format!(
-                    "model request denied by agent hook: {reason}"
-                )));
-            }
+        let input = ModelRequestBeforeInput::new(
+            Box::new(call.attempt.clone()),
+            Vec::new(),
+            Box::new(call.model.clone()),
+            ModelRequestBeforeInputParams::new(),
+        )
+        .with_sources()
+        .with_items(super::messages(&request.transcript));
+        let boundary = hooks.sdk.model_request_before(input);
+        let result = match &cancellation {
+            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
+            None => boundary.await,
+        };
+        let reason = match super::settle(EventType::ModelRequestBefore, result) {
+            Some(outcome) if !outcome.outcome.is_denied() => None,
+            Some(outcome) => Some(super::denial(&outcome.outcome)),
+            None => Some("agent hook dispatch failed".into()),
+        };
+        if let Some(reason) = reason {
+            return Err(LoopError::InvalidState(format!(
+                "model request denied by agent hook: {reason}"
+            )));
         }
         match self.inner.begin_turn(request, cancellation).await {
             Ok(inner) => Ok(HookedTurn {
@@ -195,9 +193,7 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
             return event;
         };
         match &event {
-            Ok(Some(ModelTurnEvent::Finished(result)))
-                if call.hooks.subscribes(EventType::ModelResponseAfter) =>
-            {
+            Ok(Some(ModelTurnEvent::Finished(result))) => {
                 let input = ModelResponseAfterInput::new(
                     Box::new(call.attempt.clone()),
                     Box::new(ExecutionEventExecution::Executed(
