@@ -56,7 +56,8 @@ before you run Kit in a project you do not trust.
 | `context.compact.before` | Before compaction summarizes the transcript | Return a summary, replace summarizer instructions |
 | `context.compact.after` | Before the summary is installed | Replace the summary |
 
-A denied prompt is removed and the turn ends without a model call. A denied
+A denied prompt is removed, together with resources attached to it, and the
+turn ends without a model call. A denied
 model request fails the turn. A denied tool call returns a permission error to
 the model.
 

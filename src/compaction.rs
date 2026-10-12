@@ -491,7 +491,7 @@ where
                 .await
             {
                 Some(crate::ahp::Compaction::Summary(summary)) => {
-                    return Ok(self.installed(&request, summary).await);
+                    return self.installed(&request, summary).await;
                 }
                 Some(crate::ahp::Compaction::Instructions(replacement)) => {
                     instructions = replacement;
@@ -543,26 +543,30 @@ where
                 Err(error) => return Err(CompactionError::Failed(error.to_string())),
             }
         };
-        if summary.trim().is_empty() {
-            return Err(CompactionError::Failed(
-                "compaction agent returned an empty summary".into(),
-            ));
-        }
-        Ok(self.installed(&request, summary).await)
+        self.installed(&request, summary).await
     }
 }
 
 impl<M> KitCompactionBackend<M> {
-    async fn installed(&self, request: &SummaryRequest, summary: String) -> SummaryResult {
+    async fn installed(
+        &self,
+        request: &SummaryRequest,
+        summary: String,
+    ) -> Result<SummaryResult, CompactionError> {
         let summary = match &self.hooks {
             Some(hooks) => hooks.compact_after(&request.items, summary).await,
             None => summary,
         };
+        if summary.trim().is_empty() {
+            return Err(CompactionError::Failed(
+                "compaction summary is empty".into(),
+            ));
+        }
         let mut metadata = MetadataMap::new();
         metadata.insert(COMPACTION_SUMMARY_METADATA_KEY.into(), true.into());
-        SummaryResult::new(vec![
+        Ok(SummaryResult::new(vec![
             Item::text(ItemKind::Developer, summary).with_metadata(metadata),
-        ])
+        ]))
     }
 }
 
@@ -941,6 +945,34 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert!(is_compaction_summary(&result.items[0]));
         assert_eq!(item_text(&result.items[0]), Some("from hook"));
+    }
+
+    #[tokio::test]
+    async fn blank_hook_summary_fails_compaction() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "  "}]}]),
+        );
+        let compactor = KitCompactionBackend {
+            adapter: NoModelTurn,
+            telemetry: TelemetryConfig::default(),
+            session_id: SessionId::new("compaction"),
+            hooks: Some(hooks),
+        };
+
+        let result = compactor
+            .summarize(
+                SummaryRequest::new(
+                    vec![Item::text(ItemKind::User, "old request")],
+                    CompactionReason::Manual,
+                ),
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(CompactionError::Failed(_))));
     }
 
     #[tokio::test]

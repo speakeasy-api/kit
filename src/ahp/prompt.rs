@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
 use agenthooksprotocol::generated::Event;
-use agenthooksprotocol::inputs::UserMessageInboundInput;
-use agenthooksprotocol::{EventType, Session, UserMessageInboundInputMessage};
+use agenthooksprotocol::inputs::{MessageInput, UserMessageInboundInput};
+use agenthooksprotocol::{
+    CanonicalMessageRole, EventType, Session, UserMessageInboundInputMessage,
+};
 use agentkit_core::{ItemKind, Part};
 use agentkit_loop::{AgentEvent, LoopCtx, LoopError, LoopMutator, MutationPoint, TranscriptCursor};
 use async_trait::async_trait;
 
 use super::Hooks;
-use crate::session::SessionObserver;
+use crate::session::{SessionObserver, TransientTranscript};
+
+const ACP_RESOURCE: &str = "acp.resource.uri";
 
 /// Runs `user.message.inbound` over the prompt a new turn just admitted.
 ///
@@ -17,19 +21,33 @@ use crate::session::SessionObserver;
 pub(crate) struct PromptHook {
     hooks: Arc<Hooks>,
     channel: &'static str,
-    persistence: SessionObserver,
+    record: PromptRecord,
+}
+
+/// Where the transcript a prompt edit or denial rewrites is recorded.
+pub(crate) enum PromptRecord {
+    Session(SessionObserver),
+    Transient(TransientTranscript),
+}
+
+impl PromptRecord {
+    fn replace(&self, transcript: &[agentkit_core::Item]) -> Result<(), String> {
+        match self {
+            Self::Session(observer) => observer.replace(transcript),
+            Self::Transient(recorded) => {
+                recorded.replace(transcript);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl PromptHook {
-    pub(crate) fn new(
-        hooks: Arc<Hooks>,
-        channel: &'static str,
-        persistence: SessionObserver,
-    ) -> Self {
+    pub(crate) fn new(hooks: Arc<Hooks>, channel: &'static str, record: PromptRecord) -> Self {
         Self {
             hooks,
             channel,
-            persistence,
+            record,
         }
     }
 }
@@ -47,9 +65,14 @@ impl LoopMutator for PromptHook {
         let Some(prompt) = cursor.last().filter(|item| item.kind == ItemKind::User) else {
             return Ok(());
         };
-        let Some(message) = super::message(prompt, cursor.len().saturating_sub(1)) else {
-            return Ok(());
-        };
+        let index = cursor.len().saturating_sub(1);
+        let message = super::message(prompt, index).unwrap_or_else(|| {
+            MessageInput::new(
+                super::item_id(prompt, index),
+                CanonicalMessageRole::User,
+                Vec::new(),
+            )
+        });
         let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
             self.channel,
             Vec::new(),
@@ -102,12 +125,17 @@ impl LoopMutator for PromptHook {
             }
             Err(reason) => {
                 cursor.pop();
+                while cursor.last().is_some_and(|item| {
+                    item.kind == ItemKind::Context && item.metadata.contains_key(ACP_RESOURCE)
+                }) {
+                    cursor.pop();
+                }
                 ctx.emitter.emit(AgentEvent::Warning {
                     message: format!("prompt blocked by agent hook: {reason}"),
                 });
             }
         }
-        if let Err(error) = self.persistence.replace(cursor) {
+        if let Err(error) = self.record.replace(cursor) {
             ctx.emitter.emit(AgentEvent::Warning {
                 message: format!("could not persist agent hook prompt edit: {error}"),
             });

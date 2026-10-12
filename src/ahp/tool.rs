@@ -2,10 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use agenthooksprotocol::client::{Decision, HookError};
 use agenthooksprotocol::contracts::Contract;
+use agenthooksprotocol::generated::Presence;
 use agenthooksprotocol::inputs::{MessageInput, ToolAfterInput, ToolBeforeInput};
 use agenthooksprotocol::{
     Attachment, CanonicalMessageRole, EventType, ExecutionEventError, ExecutionEventExecution,
-    ExecutionEventExecutionExecuted, ToolAfterInputOrigin, ToolAfterInputOutcome,
+    ExecutionEventExecutionExecuted, ExecutionEventExecutionSkippedCancelled,
+    ExecutionEventExecutionSkippedOther, ExecutionEventExecutionSkippedPolicy,
+    ExecutionEventExecutionSkippedSuppliedResult, ToolAfterInputOrigin, ToolAfterInputOutcome,
     ToolBeforeInputOrigin, state,
 };
 use agentkit_core::{ToolOutput, ToolResultPart};
@@ -42,6 +45,7 @@ struct HookedTool {
 
 enum Before {
     Run(ToolRequest),
+    Supplied(ToolRequest, ToolExecutionOutcome),
     Return(ToolExecutionOutcome),
 }
 
@@ -90,9 +94,11 @@ impl HookedTool {
                 Value::String(text) => ToolOutput::text(text.clone()),
                 value => ToolOutput::structured(value.clone()),
             };
-            return Before::Return(ToolExecutionOutcome::Completed(ToolResult::new(
-                ToolResultPart::success(request.call_id, output),
-            )));
+            let result = ToolResultPart::success(request.call_id.clone(), output);
+            return Before::Supplied(
+                request,
+                ToolExecutionOutcome::Completed(ToolResult::new(result)),
+            );
         }
         let reauthorize = !outcome.outcome.can_execute();
         if reauthorize
@@ -168,7 +174,26 @@ impl HookedTool {
         None
     }
 
-    async fn after(&self, request: &ToolRequest, outcome: &ToolExecutionOutcome) {
+    async fn after(&self, request: &ToolRequest, outcome: &ToolExecutionOutcome, supplied: bool) {
+        let execution = match outcome {
+            _ if supplied => ExecutionEventExecution::SkippedSuppliedResult(
+                ExecutionEventExecutionSkippedSuppliedResult::new(),
+            ),
+            ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Cancelled) => {
+                ExecutionEventExecution::SkippedCancelled(
+                    ExecutionEventExecutionSkippedCancelled::new(),
+                )
+            }
+            ToolExecutionOutcome::FailedBeforeInvocation(ToolError::PermissionDenied(_)) => {
+                ExecutionEventExecution::SkippedPolicy(ExecutionEventExecutionSkippedPolicy::new())
+            }
+            ToolExecutionOutcome::FailedBeforeInvocation(error) => {
+                let mut skipped = ExecutionEventExecutionSkippedOther::new();
+                skipped.detail = Presence::Present(error.to_string());
+                ExecutionEventExecution::SkippedOther(skipped)
+            }
+            _ => ExecutionEventExecution::Executed(ExecutionEventExecutionExecuted::new()),
+        };
         let (status, output, error) = match outcome {
             ToolExecutionOutcome::Completed(result) if result.result.is_error => (
                 ToolAfterInputOutcome::Error,
@@ -180,7 +205,8 @@ impl HookedTool {
                 super::output_text(&result.result.output),
                 None,
             ),
-            ToolExecutionOutcome::Failed(ToolError::Cancelled) => {
+            ToolExecutionOutcome::Failed(ToolError::Cancelled)
+            | ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Cancelled) => {
                 (ToolAfterInputOutcome::Cancelled, None, None)
             }
             ToolExecutionOutcome::Failed(error)
@@ -191,9 +217,7 @@ impl HookedTool {
         };
         let mut input = ToolAfterInput::new(
             request.call_id.to_string(),
-            Box::new(ExecutionEventExecution::Executed(
-                ExecutionEventExecutionExecuted::new(),
-            )),
+            Box::new(execution),
             Vec::new(),
             status,
             request.tool_name.to_string(),
@@ -273,10 +297,14 @@ impl Tool for HookedTool {
     ) -> ToolExecutionOutcome {
         let request = match self.before(request, context).await {
             Before::Run(request) => request,
+            Before::Supplied(request, outcome) => {
+                self.after(&request, &outcome, true).await;
+                return outcome;
+            }
             Before::Return(outcome) => return outcome,
         };
         let outcome = self.tool.invoke_outcome(request.clone(), context).await;
-        self.after(&request, &outcome).await;
+        self.after(&request, &outcome, false).await;
         outcome
     }
 }

@@ -1429,7 +1429,7 @@ impl Runtime {
                 builder = builder.mutator(crate::ahp::PromptHook::new(
                     Arc::clone(hooks),
                     "cli",
-                    opened.observer.clone(),
+                    crate::ahp::PromptRecord::Session(opened.observer.clone()),
                 ));
             }
             let agent = builder
@@ -1590,11 +1590,20 @@ impl Runtime {
                 skills,
             ))
             .task_manager(background_task_manager())
-            .mutator(compactor)
+            .mutator(compactor);
+        let builder = match &self.hooks {
+            Some(hooks) => builder.mutator(crate::ahp::PromptHook::new(
+                Arc::clone(hooks),
+                "a2a",
+                crate::ahp::PromptRecord::Transient(recorded.clone()),
+            )),
+            None => builder,
+        };
+        let builder = builder
             .transcript_observer(recorded)
             .transcript(transcript)
-            .input(vec![Item::text(ItemKind::User, prompt)]);
-        let builder = builder.cancellation(controller.handle());
+            .input(vec![Item::text(ItemKind::User, prompt)])
+            .cancellation(controller.handle());
         let mut driver = builder
             .build()?
             .start(
@@ -1812,7 +1821,7 @@ impl Runtime {
             builder = builder.mutator(crate::ahp::PromptHook::new(
                 Arc::clone(hooks),
                 "acp",
-                opened.observer.clone(),
+                crate::ahp::PromptRecord::Session(opened.observer.clone()),
             ));
         }
         let driver = builder
