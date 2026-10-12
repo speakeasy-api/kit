@@ -1472,14 +1472,28 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
                 Some(Command::Close { reply }) => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    super::clean_up_session(
+                        &runtime,
+                        &v1_id,
+                        &mut driver,
+                        &tasks,
+                        &background_jobs,
+                    )
+                    .await;
                     drop(binding.take());
                     let _ = reply.send(());
                     break;
                 }
                 None => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(&v1_id, &mut driver, &tasks, &background_jobs).await;
+                    super::clean_up_session(
+                        &runtime,
+                        &v1_id,
+                        &mut driver,
+                        &tasks,
+                        &background_jobs,
+                    )
+                    .await;
                     break;
                 }
             },
@@ -5920,6 +5934,7 @@ mod tests {
                 Default::default(),
                 None,
                 loop_id.clone(),
+                None,
             )
             .unwrap();
             let mut driver = Agent::builder()
