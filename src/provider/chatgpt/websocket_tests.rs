@@ -503,6 +503,39 @@ async fn subscription_retries_reach_the_session_retry_observer() {
 }
 
 #[tokio::test]
+async fn subscription_retries_correlated_transient_response_failure() {
+    let (endpoint, peer) = server(|listener| {
+        let mut failed = tungstenite::accept(accept(&listener)).unwrap();
+        receive(&mut failed, false);
+        failed
+            .send(Message::Text(response("failed", "")[0].to_string().into()))
+            .unwrap();
+        failed
+            .send(Message::Text(
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "failed",
+                        "error": {"type": "server_error", "code": "server_error", "status": 503}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        // Keep the failed socket open: recovery must follow the terminal event,
+        // not a transport disconnect. The replacement sends the full request.
+        let mut fresh = tungstenite::accept(accept(&listener)).unwrap();
+        receive(&mut fresh, false);
+        success(&mut fresh, "retried", "first answer");
+    });
+    let mut session = session_with_retries(&endpoint, 1).await;
+    let mut turn = begin(&mut session, false).await;
+    finished(&mut turn, "retried", "first answer").await;
+    peer.join().unwrap();
+}
+
+#[tokio::test]
 async fn subscription_auto_426_fallback_stays_http_for_future_turns() {
     let (endpoint, peer) = server(|listener| {
         let (headers, _) = http(&listener, "426 Upgrade Required", "");
