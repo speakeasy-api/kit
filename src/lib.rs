@@ -15,6 +15,7 @@
 )]
 
 mod acp_child;
+mod ahp;
 mod artifacts;
 pub mod compaction;
 mod compose_output;

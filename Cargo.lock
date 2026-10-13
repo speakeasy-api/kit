@@ -88,6 +88,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agenthooksprotocol"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "036c046bd6b6f4b4311f7ecdcb57972eb44e738cf65196ebc8501b4fdfb135c8"
+dependencies = [
+ "jsonschema 0.33.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "agentkit-acp"
 version = "0.10.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -116,7 +132,7 @@ dependencies = [
  "axum",
  "eventsource-stream",
  "futures",
- "reqwest",
+ "reqwest 0.13.5",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -178,7 +194,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -248,7 +264,7 @@ dependencies = [
  "futures-util",
  "http",
  "httpdate",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -285,7 +301,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "http",
- "reqwest",
+ "reqwest 0.13.5",
  "rmcp",
  "serde",
  "serde_json",
@@ -311,9 +327,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.12"
+version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59949238158745f1c53d3f31057dda3b7a643581f067b91b993075e6b3b09511"
+checksum = "aea3cc16b94aa7bc6e55e403c8224d27eb6838af31626fd9404ab888e99f4ca6"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -322,7 +338,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures-util",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2077,6 +2093,17 @@ dependencies = [
 
 [[package]]
 name = "fluent-uri"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1918b65d96df47d3591bed19c5cca17e3fa5d0707318e4b5ef2eae01764df7e5"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
+]
+
+[[package]]
+name = "fluent-uri"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e"
@@ -2105,6 +2132,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fraction"
+version = "0.15.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
+dependencies = [
+ "lazy_static",
+ "num",
 ]
 
 [[package]]
@@ -2974,6 +3011,32 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d46662859bc5f60a145b75f4632fbadc84e829e45df6c5de74cfc8e05acb96b5"
+dependencies = [
+ "ahash",
+ "base64 0.22.1",
+ "bytecount",
+ "email_address",
+ "fancy-regex 0.16.2",
+ "fraction 0.15.4",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "num-traits",
+ "once_cell",
+ "percent-encoding",
+ "referencing 0.33.0",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema"
 version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea18b8d5e1469b1bdd6b349169305141316a7c26da27f239773b65c830c0f5d6"
@@ -2983,7 +3046,7 @@ dependencies = [
  "data-encoding",
  "email_address",
  "fancy-regex 0.19.0",
- "fraction",
+ "fraction 0.17.0",
  "getrandom 0.3.4",
  "idna",
  "itoa",
@@ -2992,7 +3055,7 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.58.5",
  "regex",
  "serde",
  "serde_json",
@@ -3018,7 +3081,7 @@ checksum = "4e3bfac11ac357ec620880025757d38c67da8fd5b9ef5024d19f0f360002b4ca"
 dependencies = [
  "ahash",
  "bytecount",
- "fraction",
+ "fraction 0.17.0",
  "getrandom 0.3.4",
  "num-cmp",
  "num-traits",
@@ -3078,11 +3141,12 @@ dependencies = [
 
 [[package]]
 name = "kit"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "a2a-protocol-client",
  "a2a-protocol-server",
  "a2a-protocol-types",
+ "agenthooksprotocol",
  "agentkit-acp",
  "agentkit-acp-http",
  "agentkit-acp-schema",
@@ -3120,7 +3184,7 @@ dependencies = [
  "hyper-util",
  "ignore",
  "image",
- "jsonschema",
+ "jsonschema 0.58.5",
  "jsonwebtoken",
  "keyring",
  "libc",
@@ -3131,7 +3195,7 @@ dependencies = [
  "opus-pure",
  "ratatui",
  "ratatui-image",
- "reqwest",
+ "reqwest 0.13.5",
  "rmcp",
  "rpassword",
  "runlet",
@@ -3725,7 +3789,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest",
+ "reqwest 0.13.5",
 ]
 
 [[package]]
@@ -3740,7 +3804,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest",
+ "reqwest 0.13.5",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -4445,12 +4509,26 @@ dependencies = [
 
 [[package]]
 name = "referencing"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e9c261f7ce75418b3beadfb3f0eb1299fe8eb9640deba45ffa2cb783098697d"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.3.2",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
 version = "0.58.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "590efadb0a669f1712c1e3ab810a55d4c3d20d0127c455f7236dd0710aba0346"
 dependencies = [
  "ahash",
- "fluent-uri",
+ "fluent-uri 0.4.1",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
  "itoa",
@@ -4488,6 +4566,44 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reqwest"
+version = "0.12.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http 0.6.11",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webpki-roots",
+]
 
 [[package]]
 name = "reqwest"
@@ -4561,7 +4677,7 @@ dependencies = [
  "oauth2",
  "pin-project-lite",
  "process-wrap",
- "reqwest",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "sse-stream",
@@ -6042,6 +6158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8"
 dependencies = [
  "outref",
+ "uuid",
  "vsimd",
 ]
 

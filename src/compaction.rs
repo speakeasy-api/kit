@@ -13,7 +13,7 @@ use agentkit_loop::{
     MutationPoint, SessionConfig, TelemetryConfig, TranscriptCursor,
 };
 use async_trait::async_trait;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use crate::{
     events::{self, RuntimeEvent},
@@ -373,6 +373,7 @@ pub fn automatic<M>(
     telemetry: TelemetryConfig,
     persistence: Option<SessionObserver>,
     session_id: impl Into<SessionId>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
 ) -> Result<AutomaticCompactor, String>
 where
     M: ModelAdapter + Clone + 'static,
@@ -381,6 +382,7 @@ where
         adapter,
         telemetry,
         session_id: session_id.into(),
+        hooks,
     };
     let inner = StrategyCompactor::new(
         |transcript: &[Item], _point: MutationPoint| {
@@ -406,6 +408,7 @@ struct KitCompactionBackend<M> {
     adapter: M,
     telemetry: TelemetryConfig,
     session_id: SessionId,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
 }
 
 fn build_summary_prompt(request: &SummaryRequest) -> Result<String, CompactionError> {
@@ -476,11 +479,31 @@ where
         {
             return Err(CompactionError::Cancelled);
         }
+        let mut instructions = SUMMARY_PROMPT.to_owned();
+        if let Some(hooks) = &self.hooks {
+            match hooks
+                .compact_before(
+                    &request.items,
+                    request.reason == CompactionReason::Manual,
+                    SUMMARY_PROMPT,
+                    cancellation.as_ref(),
+                )
+                .await
+            {
+                Some(crate::ahp::Compaction::Summary(summary)) => {
+                    return self.installed(&request, summary).await;
+                }
+                Some(crate::ahp::Compaction::Instructions(replacement)) => {
+                    instructions = replacement;
+                }
+                None => {}
+            }
+        }
         let prompt = build_summary_prompt(&request)?;
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
             .input(vec![
-                Item::text(ItemKind::System, SUMMARY_PROMPT),
+                Item::text(ItemKind::System, instructions),
                 Item::text(ItemKind::User, prompt),
             ])
             .telemetry(self.telemetry);
@@ -520,9 +543,23 @@ where
                 Err(error) => return Err(CompactionError::Failed(error.to_string())),
             }
         };
+        self.installed(&request, summary).await
+    }
+}
+
+impl<M> KitCompactionBackend<M> {
+    async fn installed(
+        &self,
+        request: &SummaryRequest,
+        summary: String,
+    ) -> Result<SummaryResult, CompactionError> {
+        let summary = match &self.hooks {
+            Some(hooks) => hooks.compact_after(&request.items, summary).await,
+            None => summary,
+        };
         if summary.trim().is_empty() {
             return Err(CompactionError::Failed(
-                "compaction agent returned an empty summary".into(),
+                "compaction summary is empty".into(),
             ));
         }
         let mut metadata = MetadataMap::new();
@@ -844,6 +881,7 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
     struct NoModelTurn;
 
     #[async_trait]
@@ -876,6 +914,65 @@ mod tests {
         ) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> {
             Err(LoopError::Provider("unexpected model turn".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn hook_supplied_summary_skips_the_summarizer_model() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "from hook"}]}]),
+        );
+        let compactor = KitCompactionBackend {
+            adapter: NoModelTurn,
+            telemetry: TelemetryConfig::default(),
+            session_id: SessionId::new("compaction"),
+            hooks: Some(hooks),
+        };
+
+        let result = compactor
+            .summarize(
+                SummaryRequest::new(
+                    vec![Item::text(ItemKind::User, "old request")],
+                    CompactionReason::Manual,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert!(is_compaction_summary(&result.items[0]));
+        assert_eq!(item_text(&result.items[0]), Some("from hook"));
+    }
+
+    #[tokio::test]
+    async fn blank_hook_summary_fails_compaction() {
+        use crate::ahp::test_support::{hooks, intercept};
+        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "  "}]}]),
+        );
+        let compactor = KitCompactionBackend {
+            adapter: NoModelTurn,
+            telemetry: TelemetryConfig::default(),
+            session_id: SessionId::new("compaction"),
+            hooks: Some(hooks),
+        };
+
+        let result = compactor
+            .summarize(
+                SummaryRequest::new(
+                    vec![Item::text(ItemKind::User, "old request")],
+                    CompactionReason::Manual,
+                ),
+                None,
+            )
+            .await;
+
+        assert!(matches!(result, Err(CompactionError::Failed(_))));
     }
 
     #[tokio::test]

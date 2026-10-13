@@ -2282,6 +2282,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )?,
             };
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;
@@ -2381,6 +2382,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 )?,
             };
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let runtime = kit::Runtime::with_depth(runtime, subagent_depth)?;
@@ -2449,6 +2451,7 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     openrouter_api_key.as_ref().map(|(key, _)| key.clone()),
                 )?;
             let runtime = kit::Runtime::with_eval(runtime, config.experimental.eval)?;
+            let runtime = kit::Runtime::with_hooks(runtime)?;
             let runtime = kit::Runtime::with_plugin_runtime(runtime, plugins)?;
             let runtime = kit::Runtime::with_telemetry(runtime, telemetry_settings.clone())?;
             let (harnesses, default_harness) = config.harnesses()?;

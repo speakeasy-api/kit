@@ -11,6 +11,7 @@ use std::{
 };
 
 use agent_client_protocol::{Client, ConnectTo, ConnectionTo, Handled};
+use agenthooksprotocol::SessionEndInputOutcome;
 use agentkit_acp::{
     AcpClientHandle, AcpClientMessage, AcpIntegration, AcpRuntimeError, AcpSessionBinding,
     AgentAuthCapabilities, AudioContent, AuthMethod, AuthMethodTerminal, AuthenticateRequest,
@@ -2174,7 +2175,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     let _ = reply.send(result);
                 }
                 Some(Command::Close { reply }) => {
-                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
+                    clean_up_session(&runtime, &session_id, &mut driver, &tasks, &background_jobs)
+                        .await;
                     // A close acknowledgement means the actor-owned binding is
                     // already gone, so callers can immediately reuse the id.
                     drop(binding.take());
@@ -2182,7 +2184,8 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     break;
                 }
                 None => {
-                    clean_up_session(&session_id, &mut driver, &tasks, &background_jobs).await;
+                    clean_up_session(&runtime, &session_id, &mut driver, &tasks, &background_jobs)
+                        .await;
                     break;
                 }
             },
@@ -2405,6 +2408,7 @@ pub(super) async fn cancel_background_jobs(
 }
 
 pub(super) async fn clean_up_session<S: ModelSession>(
+    runtime: &Runtime,
     session_id: &agentkit_acp::SessionId,
     driver: &mut LoopDriver<S>,
     tasks: &TaskManagerHandle,
@@ -2423,6 +2427,11 @@ pub(super) async fn clean_up_session<S: ModelSession>(
     .await;
     if let Err(error) = driver.cancel_pending_approvals().await {
         eprintln!("failed to cancel ACP approvals for {session_id}: {error}");
+    }
+    if let Some(hooks) = runtime.hooks() {
+        hooks
+            .session_end(&session_id.to_string(), SessionEndInputOutcome::Completed)
+            .await;
     }
 }
 
