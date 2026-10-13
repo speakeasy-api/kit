@@ -113,6 +113,7 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
             let inner = self.inner.begin_turn(request, cancellation).await?;
             return Ok(HookedTurn { inner, call: None });
         };
+        hooks.flush_turn_events().await;
         self.attempts += 1;
         let Some(number) = Integer::new(self.attempts.into()) else {
             let inner = self.inner.begin_turn(request, cancellation).await?;

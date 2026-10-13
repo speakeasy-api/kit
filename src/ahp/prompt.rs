@@ -62,6 +62,7 @@ impl LoopMutator for PromptHook {
         if ctx.point != MutationPoint::AfterTurnEnded {
             return Ok(());
         }
+        self.hooks.flush_turn_events().await;
         let Some(prompt) = cursor.last().filter(|item| item.kind == ItemKind::User) else {
             return Ok(());
         };

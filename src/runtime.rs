@@ -1426,6 +1426,7 @@ impl Runtime {
                 .task_manager(task_manager)
                 .mutator(compactor);
             if let Some(hooks) = &self.hooks {
+                builder = builder.observer(crate::ahp::TurnHook(Arc::clone(hooks)));
                 builder = builder.mutator(crate::ahp::PromptHook::new(
                     Arc::clone(hooks),
                     "cli",
@@ -1592,11 +1593,13 @@ impl Runtime {
             .task_manager(background_task_manager())
             .mutator(compactor);
         let builder = match &self.hooks {
-            Some(hooks) => builder.mutator(crate::ahp::PromptHook::new(
-                Arc::clone(hooks),
-                "a2a",
-                crate::ahp::PromptRecord::Transient(recorded.clone()),
-            )),
+            Some(hooks) => builder
+                .observer(crate::ahp::TurnHook(Arc::clone(hooks)))
+                .mutator(crate::ahp::PromptHook::new(
+                    Arc::clone(hooks),
+                    "a2a",
+                    crate::ahp::PromptRecord::Transient(recorded.clone()),
+                )),
             None => builder,
         };
         let builder = builder
@@ -1818,6 +1821,7 @@ impl Runtime {
             .task_manager(task_manager)
             .mutator(compactor);
         if let Some(hooks) = &self.hooks {
+            builder = builder.observer(crate::ahp::TurnHook(Arc::clone(hooks)));
             builder = builder.mutator(crate::ahp::PromptHook::new(
                 Arc::clone(hooks),
                 "acp",
