@@ -1387,19 +1387,23 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
                     let result = prepare_prompt(
-                        &session_id,
-                        &runtime,
-                        &integration,
-                        &handle,
-                        &mut skill_catalog,
-                        &mut voice_monitor,
+                        TurnContext {
+                            session_id: &session_id,
+                            integration: &integration,
+                            handle: &handle,
+                            sink: &sink,
+                            activity: &activity,
+                        },
+                        PromptPreparation {
+                            runtime: &runtime,
+                            skill_catalog: &mut skill_catalog,
+                            voice_monitor: &mut voice_monitor,
+                            tasks: &tasks,
+                            background_jobs: &background_jobs,
+                            structured_completion,
+                        },
                         &mut driver,
                         command,
-                        &sink,
-                        &tasks,
-                        &background_jobs,
-                        structured_completion,
-                        &activity,
                     )
                     .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
@@ -1550,27 +1554,59 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct TurnContext<'a, T> {
+    session_id: &'a wire::SessionId,
+    integration: &'a AcpIntegration,
+    handle: &'a AcpSessionHandle,
+    sink: &'a ResponseReplacementSink<T>,
+    activity: &'a SessionActivity,
+}
+
+struct TurnOptions<'a> {
+    cancellation_generation: u64,
+    structured: Option<(&'a TaskManagerHandle, &'a BackgroundJobs)>,
+}
+
+struct PromptPreparation<'a> {
+    runtime: &'a Arc<Runtime>,
+    skill_catalog: &'a mut skill_catalog::SkillCatalogMonitor,
+    voice_monitor: &'a mut crate::runtime::voice_state::VoiceMonitor,
+    tasks: &'a TaskManagerHandle,
+    background_jobs: &'a BackgroundJobs,
+    structured_completion: bool,
+}
+
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    runtime: &Arc<Runtime>,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
-    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
-    voice_monitor: &mut crate::runtime::voice_state::VoiceMonitor,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
+    preparation: PromptPreparation<'_>,
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-    activity: &SessionActivity,
 ) -> Result<(), AcpRuntimeError> {
+    let TurnContext {
+        session_id,
+        integration,
+        handle,
+        sink,
+        activity,
+    } = context;
+    let PromptPreparation {
+        runtime,
+        skill_catalog,
+        voice_monitor,
+        tasks,
+        background_jobs,
+        structured_completion,
+    } = preparation;
     let PromptCommand {
         request,
         cancellation_generation,
         reply,
     } = command;
+    if let Err(error) = activity.check_prompt_admission() {
+        handle.stop_injection_turn();
+        let _ = reply.send(Err(error));
+        return Ok(());
+    }
     if structured_completion
         && let Err(error) = super::settle_background_jobs(tasks, background_jobs).await
     {
@@ -1616,27 +1652,38 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
         integration.finish_prompt(session_id);
         return Ok(());
     }
-    let result = async {
-        sink.update(wire::UpdateSessionNotification::new(
-            session_id.clone(),
-            wire::SessionUpdate::UserMessage(
-                wire::UserMessage::new(user_message_id).content(request.prompt),
-            ),
-        ))?;
-        run_active_turn(
-            session_id,
-            integration,
-            handle,
-            driver,
-            sink,
-            cancellation_generation,
-            structured_completion.then_some((tasks, background_jobs)),
-            activity,
+    let result = activity
+        .execute(
             ExecutionOrigin::Prompt,
+            async {
+                let published = activity.start_prompt().and_then(|()| {
+                    sink.update(wire::UpdateSessionNotification::new(
+                        session_id.clone(),
+                        wire::SessionUpdate::UserMessage(
+                            wire::UserMessage::new(user_message_id).content(request.prompt),
+                        ),
+                    ))
+                });
+                finish_active_turn(
+                    TurnContext {
+                        session_id,
+                        integration,
+                        handle,
+                        sink,
+                        activity,
+                    },
+                    driver,
+                    TurnOptions {
+                        cancellation_generation,
+                        structured: structured_completion.then_some((tasks, background_jobs)),
+                    },
+                    published,
+                )
+                .await
+            },
+            |reason| Some(reason.clone()),
         )
-        .await
-    }
-    .await;
+        .await;
     integration.finish_prompt(session_id);
     handle.stop_injection_turn();
     result.map(|_| ())
@@ -1824,14 +1871,18 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
         .submit_input(vec![marker])
         .map_err(|error| sdk_error(map_loop_error(session_id, &error)))?;
     let reason = run_active_turn(
-        session_id,
-        integration,
-        handle,
+        TurnContext {
+            session_id,
+            integration,
+            handle,
+            sink,
+            activity,
+        },
         driver,
-        sink,
-        cancellation_generation,
-        None,
-        activity,
+        TurnOptions {
+            cancellation_generation,
+            structured: None,
+        },
         ExecutionOrigin::Prompt,
     )
     .await
@@ -1851,54 +1902,72 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_active_turn<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    cancellation_generation: u64,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-    activity: &SessionActivity,
+    options: TurnOptions<'_>,
     origin: ExecutionOrigin,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    activity
+    context
+        .activity
         .execute(
             origin,
-            async {
-                let result = drive_prompt(
-                    session_id,
-                    driver,
-                    handle,
-                    cancellation_generation,
-                    structured,
-                )
-                .await;
-                let outcome = super::activity::ExecutionOutcome::new(
-                    result,
-                    handle
-                        .cancellation_handle()
-                        .is_cancelled_since(cancellation_generation),
-                );
-                handle.stop_injection_turn();
-                let result = super::activity::finalize(
-                    outcome,
-                    structured,
-                    async {
-                        let projected = activity.drain_tool_projection().await;
-                        let delivered = integration.flush_session_updates(session_id).await;
-                        projected.and(delivered)
-                    },
-                    |error| sink.update(error_diagnostic_notification(session_id, error)),
-                )
-                .await;
-                integration.finish_prompt(session_id);
-                result
-            },
+            finish_active_turn(context, driver, options, Ok(())),
             |reason| Some(reason.clone()),
         )
         .await
+}
+
+async fn finish_active_turn<S: ModelSession + Send + 'static>(
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
+    driver: &mut LoopDriver<S>,
+    options: TurnOptions<'_>,
+    published: Result<(), AcpRuntimeError>,
+) -> Result<FinishReason, AcpRuntimeError> {
+    let TurnContext {
+        session_id,
+        integration,
+        handle,
+        sink,
+        activity,
+    } = context;
+    let TurnOptions {
+        cancellation_generation,
+        structured,
+    } = options;
+    let result = match published {
+        Ok(()) => {
+            drive_prompt(
+                session_id,
+                driver,
+                handle,
+                cancellation_generation,
+                structured,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let outcome = super::activity::ExecutionOutcome::new(
+        result,
+        handle
+            .cancellation_handle()
+            .is_cancelled_since(cancellation_generation),
+    );
+    handle.stop_injection_turn();
+    let result = super::activity::finalize(
+        outcome,
+        structured,
+        async {
+            let projected = activity.drain_tool_projection().await;
+            let delivered = integration.flush_session_updates(session_id).await;
+            projected.and(delivered)
+        },
+        |error| sink.update(error_diagnostic_notification(session_id, error)),
+    )
+    .await;
+    integration.finish_prompt(session_id);
+    result
 }
 
 async fn drive_autonomous<S: ModelSession + Send + 'static>(
@@ -1918,14 +1987,18 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     let cancellation_generation = handle.cancellation_handle().generation();
     handle.start_injection_turn();
     let result = run_active_turn(
-        session_id,
-        integration,
-        handle,
+        TurnContext {
+            session_id,
+            integration,
+            handle,
+            sink,
+            activity,
+        },
         driver,
-        sink,
-        cancellation_generation,
-        None,
-        activity,
+        TurnOptions {
+            cancellation_generation,
+            structured: None,
+        },
         ExecutionOrigin::Autonomous,
     )
     .await;
@@ -2628,6 +2701,8 @@ mod tests {
         updates: Arc<Mutex<Vec<wire::UpdateSessionNotification>>>,
         flushes: Arc<AtomicU64>,
         fail_flush: Arc<AtomicBool>,
+        fail_user: Arc<AtomicBool>,
+        fail_running: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -2636,6 +2711,18 @@ mod tests {
             &self,
             notification: wire::UpdateSessionNotification,
         ) -> Result<(), AcpRuntimeError> {
+            if matches!(
+                notification.update,
+                wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+            ) && self.fail_running.load(Ordering::Relaxed)
+            {
+                return Err(AcpRuntimeError::ClientClosed);
+            }
+            if matches!(notification.update, wire::SessionUpdate::UserMessage(_))
+                && self.fail_user.load(Ordering::Relaxed)
+            {
+                return Err(AcpRuntimeError::ClientClosed);
+            }
             self.updates.lock().unwrap().push(notification);
             Ok(())
         }
@@ -3049,6 +3136,41 @@ mod tests {
         outcome: TestOutcome,
         turns: Arc<AtomicU64>,
         interrupt: Option<AcpSessionHandle>,
+    }
+
+    // A fake at the real provider boundary records the actual model transcript.
+    struct RecordingModelAdapter {
+        inner: TestAdapter,
+        requests: Arc<Mutex<Vec<Vec<Item>>>>,
+    }
+    struct RecordingModelSession {
+        inner: TestSession,
+        requests: Arc<Mutex<Vec<Vec<Item>>>>,
+    }
+    #[async_trait]
+    impl ModelAdapter for RecordingModelAdapter {
+        type Session = RecordingModelSession;
+        async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(RecordingModelSession {
+                inner: self.inner.start_session(config).await?,
+                requests: self.requests.clone(),
+            })
+        }
+    }
+    #[async_trait]
+    impl ModelSession for RecordingModelSession {
+        type Turn = TestTurn;
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.transcript.clone());
+            self.inner.begin_turn(request, cancellation).await
+        }
     }
 
     struct TestTurn {
@@ -3484,14 +3606,18 @@ mod tests {
             .unwrap()
             .finish(true);
         run_active_turn(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &mut driver,
-            &sink,
-            handle.cancellation_handle().generation(),
-            None,
-            &activity,
+            TurnOptions {
+                cancellation_generation: handle.cancellation_handle().generation(),
+                structured: None,
+            },
             ExecutionOrigin::Prompt,
         )
         .await
@@ -3514,6 +3640,183 @@ mod tests {
             })
             .unwrap();
         assert!(completion < idle);
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_pre_start_failures_terminalize_and_allow_next_prompt() {
+        // A failed user publication skips driver execution. An empty prompt reaches
+        // the real AwaitingInput boundary without emitting a logical TurnStarted.
+        for failure in 0..4 {
+            let fail_user = failure == 0;
+            let root = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new(root.path(), "gpt-5.4").unwrap();
+            let integration = AcpIntegration::default();
+            let recording = RecordingSink::default();
+            recording.fail_user.store(fail_user, Ordering::Relaxed);
+            recording
+                .fail_running
+                .store(failure == 3, Ordering::Relaxed);
+            recording.fail_flush.store(failure == 1, Ordering::Relaxed);
+            let sink = ResponseReplacementSink::new(recording.clone());
+            let session_id = wire::SessionId::new("pre-start-failure");
+            let activity = native_activity(session_id.clone(), sink.clone());
+            let handle = integration
+                .bind_session(AcpSessionBinding::new(
+                    session_id.clone(),
+                    SessionId::new("pre-start-loop"),
+                    sink.clone(),
+                ))
+                .unwrap();
+            let turns = Arc::new(AtomicU64::new(0));
+            let observer = ResponseReplacementObserver::new(
+                integration.clone(),
+                sink.clone(),
+                session_id.clone(),
+                activity.clone(),
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut driver = Agent::builder()
+                .model(RecordingModelAdapter {
+                    inner: TestAdapter {
+                        outcome: TestOutcome::Content,
+                        turns: turns.clone(),
+                        interrupt: None,
+                    },
+                    requests: requests.clone(),
+                })
+                .observer(observer)
+                .build()
+                .unwrap()
+                .start(SessionConfig::new(SessionId::new("pre-start-loop")).without_cache())
+                .await
+                .unwrap();
+            let task_manager = AsyncTaskManager::new();
+            let tasks = task_manager.handle();
+            let background_jobs = BackgroundJobs::default();
+            let mut skill_catalog = skill_catalog::SkillCatalogMonitor::new(&[]).unwrap();
+            let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
+            // These monitors normally prepend their initial state to the first
+            // submission. Prime their real submit APIs so an empty prompt truly
+            // reaches AwaitingInput without starting a logical model turn.
+            let current = runtime.current_skills().await.unwrap();
+            skill_catalog
+                .submit(&current.skills, Vec::new(), |items| {
+                    voice_monitor.submit(items, |_| Ok::<(), LoopError>(()))
+                })
+                .unwrap();
+            drop(current);
+            for failed in [true, false] {
+                handle.prepare_injection_turn();
+                let (reply, response) = oneshot::channel();
+                let content = if failed && !fail_user {
+                    Vec::new()
+                } else {
+                    vec![wire::ContentBlock::Text(wire::TextContent::new(
+                        if failed {
+                            "FAILED_PUBLICATION_INPUT"
+                        } else {
+                            "FRESH_PROMPT_INPUT"
+                        },
+                    ))]
+                };
+                let command = PromptCommand {
+                    request: wire::PromptRequest::new(session_id.clone(), content),
+                    cancellation_generation: handle.cancellation_handle().generation(),
+                    reply,
+                };
+                let cancellation = handle.clone();
+                let acknowledge = async move {
+                    let response = response.await.unwrap();
+                    if !failed && failure == 3 {
+                        assert!(matches!(response, Err(AcpRuntimeError::Loop(_))));
+                        return;
+                    }
+                    let start = response.unwrap().0;
+                    if failed && failure == 2 {
+                        cancellation.interrupt();
+                    }
+                    start.send(()).unwrap();
+                };
+                let (result, ()) = tokio::join!(
+                    prepare_prompt(
+                        TurnContext {
+                            session_id: &session_id,
+                            integration: &integration,
+                            handle: &handle,
+                            sink: &sink,
+                            activity: &activity
+                        },
+                        PromptPreparation {
+                            runtime: &runtime,
+                            skill_catalog: &mut skill_catalog,
+                            voice_monitor: &mut voice_monitor,
+                            tasks: &tasks,
+                            background_jobs: &background_jobs,
+                            structured_completion: false
+                        },
+                        &mut driver,
+                        command,
+                    ),
+                    acknowledge
+                );
+                if failure == 3 {
+                    if failed {
+                        assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
+                        assert!(requests.lock().unwrap().is_empty());
+                        let updates = recording.updates.lock().unwrap();
+                        assert!(!updates.iter().any(|update| matches!(
+                            update.update,
+                            wire::SessionUpdate::StateUpdate(_)
+                        )));
+                    } else {
+                        // Even a recovered sink cannot reuse an interval whose Running
+                        // was lost: the next prompt is rejected before acceptance.
+                        result.unwrap();
+                        assert!(requests.lock().unwrap().is_empty());
+                    }
+                    recording.fail_running.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                if failed {
+                    if failure == 2 {
+                        result.unwrap();
+                    } else {
+                        assert!(matches!(result, Err(AcpRuntimeError::ClientClosed)));
+                    }
+                    assert_eq!(turns.load(Ordering::Relaxed), 0);
+                    assert_eq!(recording.flushes.load(Ordering::Relaxed), 1);
+                } else {
+                    result.unwrap();
+                    assert_eq!(turns.load(Ordering::Relaxed), 1);
+                    let received = requests.lock().unwrap();
+                    assert_eq!(received.len(), 1);
+                    let transcript = serde_json::to_string(&received[0]).unwrap();
+                    assert!(transcript.contains("FRESH_PROMPT_INPUT"));
+                    assert_eq!(transcript.contains("FAILED_PUBLICATION_INPUT"), fail_user);
+                    if fail_user {
+                        assert!(
+                            transcript.find("FAILED_PUBLICATION_INPUT").unwrap()
+                                < transcript.find("FRESH_PROMPT_INPUT").unwrap()
+                        );
+                    }
+                }
+                let updates = recording.updates.lock().unwrap();
+                assert_running_then_idle(
+                    &updates,
+                    if failed && failure == 2 {
+                        wire::StopReason::Cancelled
+                    } else if failed {
+                        error_stop_reason()
+                    } else {
+                        wire::StopReason::EndTurn
+                    },
+                );
+                drop(updates);
+                recording.updates.lock().unwrap().clear();
+                recording.fail_user.store(false, Ordering::Relaxed);
+                recording.fail_flush.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3578,19 +3881,23 @@ mod tests {
         let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let (result, ()) = tokio::join!(
             prepare_prompt(
-                &session_id,
-                &runtime,
-                &integration,
-                &handle,
-                &mut skill_catalog,
-                &mut voice_monitor,
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity
+                },
+                PromptPreparation {
+                    runtime: &runtime,
+                    skill_catalog: &mut skill_catalog,
+                    voice_monitor: &mut voice_monitor,
+                    tasks: &tasks,
+                    background_jobs: &background_jobs,
+                    structured_completion: false
+                },
                 &mut driver,
                 command,
-                &sink,
-                &tasks,
-                &background_jobs,
-                false,
-                &activity,
             ),
             acknowledge,
         );
@@ -3601,7 +3908,7 @@ mod tests {
         let updates = recording.updates.lock().unwrap();
         assert_eq!(updates.len(), 4);
         assert!(matches!(
-            updates[1].update,
+            updates[0].update,
             wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
         ));
         assert!(
@@ -3691,14 +3998,18 @@ mod tests {
         let generation = handle.cancellation_handle().generation();
         let background_jobs = BackgroundJobs::default();
         let prompt = run_active_turn(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &mut driver,
-            &sink,
-            generation,
-            Some((&tasks, &background_jobs)),
-            &activity,
+            TurnOptions {
+                cancellation_generation: generation,
+                structured: Some((&tasks, &background_jobs)),
+            },
             ExecutionOrigin::Prompt,
         );
         tokio::pin!(prompt);

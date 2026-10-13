@@ -41,8 +41,9 @@ struct Activity {
 }
 
 /// Session-owned lifecycle instrument shared by the actor and its observer.
-/// Admission alone is silent; TurnStarted allocates the activity identity. All
-/// logical turns drained by an execution share that identity until settlement.
+/// Ordinary admission is silent; TurnStarted allocates the activity identity.
+/// Accepted v2 prompts explicitly start an interval before publication or execution.
+/// All logical turns drained by an execution share that identity until settlement.
 /// Projection runs synchronously outside the state lock. An in-flight claim
 /// prevents another projection from overtaking it, including callback reentry.
 /// The actor must flush final content/diagnostics before settling to Idle.
@@ -73,6 +74,66 @@ impl SessionActivity {
             projection.drain().await?;
         }
         Ok(())
+    }
+
+    /// The serialized actor checks this before accepting another prompt.
+    pub(super) fn check_prompt_admission(&self) -> Result<(), AcpRuntimeError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+        if state.state != State::Idle || state.executing || state.projecting {
+            return Err(AcpRuntimeError::Loop(
+                "session activity is unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// An accepted asynchronous prompt owes a terminal even if no logical turn starts.
+    /// Called inside `execute`, before any fallible prompt publication or model work.
+    pub(super) fn start_prompt(&self) -> Result<(), AcpRuntimeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+        if state.state != State::Idle
+            || !state.executing
+            || state.projecting
+            || state.origin != ExecutionOrigin::Prompt
+        {
+            return Err(AcpRuntimeError::Loop(
+                "session activity is unavailable".into(),
+            ));
+        }
+        let Some(id) = state.next_id.checked_add(1) else {
+            state.state = State::Unavailable;
+            return Err(AcpRuntimeError::Loop(
+                "session activity identity exhausted".into(),
+            ));
+        };
+        let transition = Transition {
+            id,
+            origin: ExecutionOrigin::Prompt,
+            active: true,
+            reason: FinishReason::Completed,
+            error: None,
+        };
+        state.current = Some(transition.clone());
+        state.next_id = id;
+        state.state = State::Running;
+        state.projecting = true;
+        drop(state);
+        let result = self.project_transition(transition);
+        if result.is_err() {
+            // Running was not admitted. An uncorrelated Idle cannot complete the
+            // parent's waiting route, and replaying Running is not transport-safe.
+            // Isolate this interval; the actor rejects future prompts before acceptance.
+            if let Ok(mut state) = self.state.lock() {
+                state.state = State::Unavailable;
+            }
+        }
+        result
     }
 
     pub(super) fn observe(&self, event: &AgentEvent) {
@@ -402,6 +463,70 @@ mod tests {
         assert_eq!(idle.origin, ExecutionOrigin::Autonomous);
         assert_eq!(idle.reason, FinishReason::Error);
         assert!(idle.error.as_ref().unwrap().contains("terminal error"));
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_interval_survives_pre_start_error_and_rejects_duplicate_start() {
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let output = transitions.clone();
+        let activity = SessionActivity::new(move |transition| {
+            output.lock().unwrap().push(transition);
+            Ok(())
+        });
+        assert!(activity.start_prompt().is_err());
+        for reason in [FinishReason::Error, FinishReason::Cancelled] {
+            let result = activity
+                .execute(
+                    ExecutionOrigin::Prompt,
+                    async {
+                        activity.start_prompt()?;
+                        assert!(activity.start_prompt().is_err());
+                        if reason == FinishReason::Error {
+                            Err(AcpRuntimeError::Loop("before TurnStarted".into()))
+                        } else {
+                            Ok(reason.clone())
+                        }
+                    },
+                    |reason| Some(reason.clone()),
+                )
+                .await;
+            assert_eq!(result.is_err(), reason == FinishReason::Error);
+            activity.settle(None, None).unwrap();
+        }
+        let events = transitions.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        for (index, pair) in events.as_chunks::<2>().0.iter().enumerate() {
+            assert!(pair[0].active);
+            assert!(!pair[1].active);
+            assert_eq!(pair[0].id, pair[1].id);
+            assert_eq!(pair[0].id, index as u64 + 1);
+        }
+        assert_eq!(events[1].reason, FinishReason::Error);
+        assert_eq!(events[3].reason, FinishReason::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn abandoned_accepted_prompt_isolates_without_replaying_terminal() {
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        let output = transitions.clone();
+        let activity = SessionActivity::new(move |transition| {
+            output.lock().unwrap().push(transition);
+            Ok(())
+        });
+        let mut execution = Box::pin(activity.execute(
+            ExecutionOrigin::Prompt,
+            async {
+                activity.start_prompt()?;
+                std::future::pending::<Result<(), AcpRuntimeError>>().await
+            },
+            |_| None,
+        ));
+        assert!(futures_util::poll!(execution.as_mut()).is_pending());
+        drop(execution);
+        assert!(activity.start_prompt().is_err());
+        assert!(activity.settle(None, None).is_err());
+        assert!(!activity.state.is_poisoned());
+        assert_eq!(transitions.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
