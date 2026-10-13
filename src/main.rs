@@ -1964,6 +1964,17 @@ async fn termination_signal() -> io::Result<()> {
     }
 }
 
+fn serve_a2a_execution_mode(
+    no_stdio: bool,
+    protocol: AcpProtocolVersion,
+) -> kit::protocols::http::A2aExecutionMode {
+    if !no_stdio && matches!(protocol, AcpProtocolVersion::V2) {
+        kit::protocols::http::A2aExecutionMode::SessionAdmission
+    } else {
+        kit::protocols::http::A2aExecutionMode::Standalone
+    }
+}
+
 async fn supervise_serve(
     runtime: std::sync::Arc<kit::Runtime>,
     sessions: kit::protocols::acp::SessionRegistry,
@@ -2298,13 +2309,14 @@ async fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let address = a2a.unwrap_or_else(|| "127.0.0.1:0".into());
             let serve_a2a = !no_a2a;
             let sessions = kit::protocols::acp::SessionRegistry::new();
-            let http = kit::protocols::http::start_with_registry(
+            let http = kit::protocols::http::start_with_registry_and_mode(
                 runtime.clone(),
                 address,
                 serve_a2a,
                 remote_acp,
                 server_credential_file.as_deref(),
                 sessions.clone(),
+                serve_a2a_execution_mode(no_stdio, stdio_protocol_version),
             )
             .await?;
             let bound = http.address();
@@ -2596,6 +2608,26 @@ mod tests {
         SessionsAction, format_sessions, init_config, resolve_openrouter_api_key,
         supervise_serve_with_trigger, validate_auth_storage,
     };
+
+    #[test]
+    fn serve_a2a_execution_mode_preserves_no_stdio_and_v1_execution() {
+        use super::{AcpProtocolVersion, serve_a2a_execution_mode};
+        use kit::protocols::http::A2aExecutionMode;
+        assert_eq!(
+            serve_a2a_execution_mode(false, AcpProtocolVersion::V2),
+            A2aExecutionMode::SessionAdmission
+        );
+        for (no_stdio, protocol) in [
+            (true, AcpProtocolVersion::V1),
+            (true, AcpProtocolVersion::V2),
+            (false, AcpProtocolVersion::V1),
+        ] {
+            assert_eq!(
+                serve_a2a_execution_mode(no_stdio, protocol),
+                A2aExecutionMode::Standalone
+            );
+        }
+    }
 
     #[test]
     fn usage_command_accepts_optional_provider_and_credential_overrides() {
