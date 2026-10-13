@@ -336,6 +336,27 @@ async fn tool_before_return_supplies_the_result() {
 }
 
 #[tokio::test]
+async fn tool_before_edited_return_requires_explicit_hook_allow() {
+    for allowed in [false, true] {
+        let (hooks, backend) = hooks(vec![intercept(&["tool.before"])]);
+        let mut effects = vec![
+            json!({"type": "modify", "target": "input", "operation": "merge", "value": {"text": "edited"}}),
+            json!({"type": "return", "value": "cached"}),
+        ];
+        if allowed {
+            effects.push(json!({"type": "allow"}));
+        }
+        backend.respond("tool.before", json!(effects));
+        let outcome = call(&hooks, &Echo::new(), json!({"text": "hello"})).await;
+
+        assert_eq!(
+            output(outcome),
+            ToolOutput::text(if allowed { "cached" } else { "edited" }),
+        );
+    }
+}
+
+#[tokio::test]
 async fn tool_after_observes_the_output() {
     let (hooks, backend) = hooks(vec![observe(&["tool.after"])]);
     let echo = Echo::new();

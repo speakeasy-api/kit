@@ -89,7 +89,7 @@ impl HookedTool {
         if outcome.outcome.is_denied() {
             return Before::Return(denied(super::denial(&outcome.outcome)));
         }
-        if let Some(value) = outcome.outcome.candidate() {
+        if let Some(value) = outcome.outcome.supplied_result() {
             let output = match value {
                 Value::String(text) => ToolOutput::text(text.clone()),
                 value => ToolOutput::structured(value.clone()),
