@@ -1387,19 +1387,23 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
             Either::Left(command) => match command {
                 Some(Command::Prompt(command)) => {
                     let result = prepare_prompt(
-                        &session_id,
-                        &runtime,
-                        &integration,
-                        &handle,
-                        &mut skill_catalog,
-                        &mut voice_monitor,
+                        TurnContext {
+                            session_id: &session_id,
+                            integration: &integration,
+                            handle: &handle,
+                            sink: &sink,
+                            activity: &activity,
+                        },
+                        PromptPreparation {
+                            runtime: &runtime,
+                            skill_catalog: &mut skill_catalog,
+                            voice_monitor: &mut voice_monitor,
+                            tasks: &tasks,
+                            background_jobs: &background_jobs,
+                            structured_completion,
+                        },
                         &mut driver,
                         command,
-                        &sink,
-                        &tasks,
-                        &background_jobs,
-                        structured_completion,
-                        &activity,
                     )
                     .instrument(crate::telemetry::error_spans::operation("acp"))
                     .await;
@@ -1536,22 +1540,49 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct TurnContext<'a, T> {
+    session_id: &'a wire::SessionId,
+    integration: &'a AcpIntegration,
+    handle: &'a AcpSessionHandle,
+    sink: &'a ResponseReplacementSink<T>,
+    activity: &'a SessionActivity,
+}
+
+struct TurnOptions<'a> {
+    cancellation_generation: u64,
+    structured: Option<(&'a TaskManagerHandle, &'a BackgroundJobs)>,
+}
+
+struct PromptPreparation<'a> {
+    runtime: &'a Arc<Runtime>,
+    skill_catalog: &'a mut skill_catalog::SkillCatalogMonitor,
+    voice_monitor: &'a mut crate::runtime::voice_state::VoiceMonitor,
+    tasks: &'a TaskManagerHandle,
+    background_jobs: &'a BackgroundJobs,
+    structured_completion: bool,
+}
+
 async fn prepare_prompt<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    runtime: &Arc<Runtime>,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
-    skill_catalog: &mut skill_catalog::SkillCatalogMonitor,
-    voice_monitor: &mut crate::runtime::voice_state::VoiceMonitor,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
+    preparation: PromptPreparation<'_>,
     driver: &mut LoopDriver<S>,
     command: PromptCommand,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    tasks: &TaskManagerHandle,
-    background_jobs: &BackgroundJobs,
-    structured_completion: bool,
-    activity: &SessionActivity,
 ) -> Result<(), AcpRuntimeError> {
+    let TurnContext {
+        session_id,
+        integration,
+        handle,
+        sink,
+        activity,
+    } = context;
+    let PromptPreparation {
+        runtime,
+        skill_catalog,
+        voice_monitor,
+        tasks,
+        background_jobs,
+        structured_completion,
+    } = preparation;
     let PromptCommand {
         request,
         cancellation_generation,
@@ -1620,14 +1651,18 @@ async fn prepare_prompt<S: ModelSession + Send + 'static>(
                     ))
                 });
                 finish_active_turn(
-                    session_id,
-                    integration,
-                    handle,
+                    TurnContext {
+                        session_id,
+                        integration,
+                        handle,
+                        sink,
+                        activity,
+                    },
                     driver,
-                    sink,
-                    cancellation_generation,
-                    structured_completion.then_some((tasks, background_jobs)),
-                    activity,
+                    TurnOptions {
+                        cancellation_generation,
+                        structured: structured_completion.then_some((tasks, background_jobs)),
+                    },
                     published,
                 )
                 .await
@@ -1822,14 +1857,18 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
         .submit_input(vec![marker])
         .map_err(|error| sdk_error(map_loop_error(session_id, &error)))?;
     let reason = run_active_turn(
-        session_id,
-        integration,
-        handle,
+        TurnContext {
+            session_id,
+            integration,
+            handle,
+            sink,
+            activity,
+        },
         driver,
-        sink,
-        cancellation_generation,
-        None,
-        activity,
+        TurnOptions {
+            cancellation_generation,
+            structured: None,
+        },
         ExecutionOrigin::Prompt,
     )
     .await
@@ -1849,49 +1888,39 @@ async fn compact_for_switch<S: ModelSession + Send + 'static>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_active_turn<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    cancellation_generation: u64,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-    activity: &SessionActivity,
+    options: TurnOptions<'_>,
     origin: ExecutionOrigin,
 ) -> Result<FinishReason, AcpRuntimeError> {
-    activity
+    context
+        .activity
         .execute(
             origin,
-            finish_active_turn(
-                session_id,
-                integration,
-                handle,
-                driver,
-                sink,
-                cancellation_generation,
-                structured,
-                activity,
-                Ok(()),
-            ),
+            finish_active_turn(context, driver, options, Ok(())),
             |reason| Some(reason.clone()),
         )
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn finish_active_turn<S: ModelSession + Send + 'static>(
-    session_id: &wire::SessionId,
-    integration: &AcpIntegration,
-    handle: &AcpSessionHandle,
+    context: TurnContext<'_, impl AcpSessionUpdateSink>,
     driver: &mut LoopDriver<S>,
-    sink: &ResponseReplacementSink<impl AcpSessionUpdateSink>,
-    cancellation_generation: u64,
-    structured: Option<(&TaskManagerHandle, &BackgroundJobs)>,
-    activity: &SessionActivity,
+    options: TurnOptions<'_>,
     published: Result<(), AcpRuntimeError>,
 ) -> Result<FinishReason, AcpRuntimeError> {
+    let TurnContext {
+        session_id,
+        integration,
+        handle,
+        sink,
+        activity,
+    } = context;
+    let TurnOptions {
+        cancellation_generation,
+        structured,
+    } = options;
     let result = match published {
         Ok(()) => {
             drive_prompt(
@@ -1944,14 +1973,18 @@ async fn drive_autonomous<S: ModelSession + Send + 'static>(
     let cancellation_generation = handle.cancellation_handle().generation();
     handle.start_injection_turn();
     let result = run_active_turn(
-        session_id,
-        integration,
-        handle,
+        TurnContext {
+            session_id,
+            integration,
+            handle,
+            sink,
+            activity,
+        },
         driver,
-        sink,
-        cancellation_generation,
-        None,
-        activity,
+        TurnOptions {
+            cancellation_generation,
+            structured: None,
+        },
         ExecutionOrigin::Autonomous,
     )
     .await;
@@ -3559,14 +3592,18 @@ mod tests {
             .unwrap()
             .finish(true);
         run_active_turn(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &mut driver,
-            &sink,
-            handle.cancellation_handle().generation(),
-            None,
-            &activity,
+            TurnOptions {
+                cancellation_generation: handle.cancellation_handle().generation(),
+                structured: None,
+            },
             ExecutionOrigin::Prompt,
         )
         .await
@@ -3688,19 +3725,23 @@ mod tests {
                 };
                 let (result, ()) = tokio::join!(
                     prepare_prompt(
-                        &session_id,
-                        &runtime,
-                        &integration,
-                        &handle,
-                        &mut skill_catalog,
-                        &mut voice_monitor,
+                        TurnContext {
+                            session_id: &session_id,
+                            integration: &integration,
+                            handle: &handle,
+                            sink: &sink,
+                            activity: &activity
+                        },
+                        PromptPreparation {
+                            runtime: &runtime,
+                            skill_catalog: &mut skill_catalog,
+                            voice_monitor: &mut voice_monitor,
+                            tasks: &tasks,
+                            background_jobs: &background_jobs,
+                            structured_completion: false
+                        },
                         &mut driver,
                         command,
-                        &sink,
-                        &tasks,
-                        &background_jobs,
-                        false,
-                        &activity,
                     ),
                     acknowledge
                 );
@@ -3826,19 +3867,23 @@ mod tests {
         let mut voice_monitor = crate::runtime::voice_state::VoiceState::default().monitor(&[]);
         let (result, ()) = tokio::join!(
             prepare_prompt(
-                &session_id,
-                &runtime,
-                &integration,
-                &handle,
-                &mut skill_catalog,
-                &mut voice_monitor,
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity
+                },
+                PromptPreparation {
+                    runtime: &runtime,
+                    skill_catalog: &mut skill_catalog,
+                    voice_monitor: &mut voice_monitor,
+                    tasks: &tasks,
+                    background_jobs: &background_jobs,
+                    structured_completion: false
+                },
                 &mut driver,
                 command,
-                &sink,
-                &tasks,
-                &background_jobs,
-                false,
-                &activity,
             ),
             acknowledge,
         );
@@ -3939,14 +3984,18 @@ mod tests {
         let generation = handle.cancellation_handle().generation();
         let background_jobs = BackgroundJobs::default();
         let prompt = run_active_turn(
-            &session_id,
-            &integration,
-            &handle,
+            TurnContext {
+                session_id: &session_id,
+                integration: &integration,
+                handle: &handle,
+                sink: &sink,
+                activity: &activity,
+            },
             &mut driver,
-            &sink,
-            generation,
-            Some((&tasks, &background_jobs)),
-            &activity,
+            TurnOptions {
+                cancellation_generation: generation,
+                structured: Some((&tasks, &background_jobs)),
+            },
             ExecutionOrigin::Prompt,
         );
         tokio::pin!(prompt);
