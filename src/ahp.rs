@@ -6,9 +6,9 @@ mod tool;
 use std::path::Path;
 use std::sync::Arc;
 
-use agenthooksprotocol::capability::{self, ModifyOperation};
+use agenthooksprotocol::capability::{self, HostCapabilities, Modify};
 use agenthooksprotocol::client::{
-    ConsumerProtocolOutcome, DeliveryDiagnostic, HookError, SettledCandidate,
+    DeliveryDiagnostic, HookError, ProtocolOutcome, SettledCandidate,
 };
 use agenthooksprotocol::generated::{Effect, Event, Presence};
 use agenthooksprotocol::hooks::{EventOutcome, HooksOptions};
@@ -19,8 +19,8 @@ use agenthooksprotocol::inputs::{
 use agenthooksprotocol::{
     Attachment, CanonicalMessageRole, ContentItem, ContextCompactAfterInputRemovedItem,
     ContextCompactBeforeInputTrigger, EventType, ExecutionEventExecution,
-    ExecutionEventExecutionExecuted, Registration, Session, SessionEndInputOutcome,
-    SessionStartInputHarness, SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
+    ExecutionEventExecutionExecuted, Harness, Registration, Session, SessionEndInputOutcome,
+    SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
 };
 use agentkit_core::{FinishReason, Item, ItemKind, Part, ToolOutput, TurnCancellation};
 use agentkit_loop::LoopError;
@@ -68,7 +68,6 @@ impl Hooks {
 
     pub(crate) async fn session_start(&self, session: &str, trigger: SessionStartInputTrigger) {
         let input = SessionStartInput::new(
-            SessionStartInputHarness::new("kit", env!("CARGO_PKG_VERSION")),
             Vec::new(),
             "allow-all".into(),
             Box::new(Session::new(session)),
@@ -110,7 +109,7 @@ impl Hooks {
         if let Some(SettledCandidate::Summary(summary)) = outcome.outcome.candidate() {
             return Some(Compaction::Summary(parts_text(summary)));
         }
-        match outcome.settled_event {
+        match outcome.event {
             Event::ContextCompactBefore(event) => match &event.0.instructions {
                 Presence::Present(edited) if parts_text(edited) != instructions => {
                     Some(Compaction::Instructions(parts_text(edited)))
@@ -140,7 +139,7 @@ impl Hooks {
             EventType::ContextCompactAfter,
             self.sdk.context_compact_after(input).await,
         )
-        .map(|outcome| outcome.settled_event)
+        .map(|outcome| outcome.event)
         {
             Some(Event::ContextCompactAfter(event)) => parts_text(&event.0.summary),
             _ => summary,
@@ -162,49 +161,40 @@ pub(crate) enum Compaction {
 }
 
 fn options() -> Result<HooksOptions, String> {
-    use ModifyOperation::{Merge, Replace};
-    let declarations = (|| {
-        Ok::<_, capability::Error>([
-            (EventType::SessionStart, capability::observe()),
-            (EventType::SessionEnd, capability::observe()),
-            (
-                EventType::UserMessageInbound,
-                capability::intercept()
-                    .deny()
-                    .modify_prompt([Replace])?
-                    .build()?,
-            ),
-            (
-                EventType::ModelRequestBefore,
-                capability::intercept().deny().build()?,
-            ),
-            (EventType::ModelResponseAfter, capability::observe()),
-            (EventType::ModelError, capability::observe()),
-            (
-                EventType::ToolBefore,
-                capability::intercept()
-                    .allow()
-                    .deny()
-                    .r#return()
-                    .modify_input([Replace, Merge])?
-                    .build()?,
-            ),
-            (EventType::ToolAfter, capability::observe()),
-            (
-                EventType::ContextCompactBefore,
-                capability::intercept()
-                    .r#return()
-                    .modify_instructions([Replace])?
-                    .build()?,
-            ),
-            (
-                EventType::ContextCompactAfter,
-                capability::intercept().modify_summary([Replace])?.build()?,
-            ),
-        ])
-    })()
-    .map_err(|error| error.to_string())?;
-    HooksOptions::from_declarations(SOURCE, declarations).map_err(|error| error.to_string())
+    let capabilities = HostCapabilities {
+        session_start: Some(capability::session_start().observe()),
+        session_end: Some(capability::session_end().observe()),
+        user_message_inbound: Some(
+            capability::user_message_inbound()
+                .deny()
+                .modify_prompt(Modify::Replace),
+        ),
+        model_request_before: Some(capability::model_request_before().deny()),
+        model_response_after: Some(capability::model_response_after().observe()),
+        model_error: Some(capability::model_error().observe()),
+        tool_before: Some(
+            capability::tool_before()
+                .allow()
+                .deny()
+                .return_result()
+                .modify_input(Modify::ReplaceAndMerge),
+        ),
+        tool_after: Some(capability::tool_after().observe()),
+        context_compact_before: Some(
+            capability::context_compact_before()
+                .return_result()
+                .modify_instructions(Modify::Replace),
+        ),
+        context_compact_after: Some(
+            capability::context_compact_after().modify_summary(Modify::Replace),
+        ),
+        ..HostCapabilities::default()
+    };
+    Ok(HooksOptions::new(
+        SOURCE,
+        Harness::new("kit", env!("CARGO_PKG_VERSION")),
+        capabilities,
+    ))
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {
@@ -246,10 +236,7 @@ fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
 }
 
 /// Reports delivery diagnostics; a dispatch error is reported and yields `None`.
-fn settle<T>(
-    event: EventType,
-    result: Result<EventOutcome<T>, HookError>,
-) -> Option<EventOutcome<T>> {
+fn settle(event: EventType, result: Result<EventOutcome, HookError>) -> Option<EventOutcome> {
     match result {
         Ok(outcome) => {
             report(event, &outcome.diagnostics);
@@ -262,7 +249,7 @@ fn settle<T>(
     }
 }
 
-fn denial(outcome: &ConsumerProtocolOutcome) -> String {
+fn denial<C, P>(outcome: &ProtocolOutcome<C, P>) -> String {
     outcome
         .responses
         .iter()

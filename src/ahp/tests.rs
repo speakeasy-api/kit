@@ -24,6 +24,61 @@ fn every_granted_event_accepts_wildcard_subscriptions() {
     hooks(vec![intercept(&["*"]), observe(&["*"])]);
 }
 
+#[tokio::test]
+async fn every_lifecycle_event_reports_harness_identity() {
+    let (hooks, backend) = hooks(vec![intercept(&["*"]), observe(&["*"])]);
+    prompt(&hooks, &Model::default(), "hello").await;
+    call(&hooks, &Echo::new(), json!({"text": "hello"})).await;
+    hooks
+        .session_end("abc", SessionEndInputOutcome::Completed)
+        .await;
+    let items = [Item::text(ItemKind::User, "old")];
+    hooks
+        .compact_before(&items, true, "instructions", None)
+        .await;
+    hooks.compact_after(&items, "summary".into()).await;
+
+    let input = agenthooksprotocol::inputs::ModelErrorInput::new(
+        Box::new(agenthooksprotocol::ExecutionEventAttempt::new(
+            "attempt",
+            agenthooksprotocol::Integer::new(1.into()).unwrap(),
+        )),
+        Box::new(agenthooksprotocol::ExecutionEventError::new(
+            "provider", "failed",
+        )),
+        agenthooksprotocol::ModelErrorInputExecution::Executed(
+            agenthooksprotocol::ModelErrorInputExecutionExecuted::new(),
+        ),
+        Box::new(agenthooksprotocol::ExecutionEventModel::new("test", "test")),
+    );
+    hooks.sdk.model_error(input).await.unwrap();
+
+    for event in [
+        "session.start",
+        "session.end",
+        "user.message.inbound",
+        "model.request.before",
+        "model.response.after",
+        "model.error",
+        "tool.before",
+        "tool.after",
+        "context.compact.before",
+        "context.compact.after",
+    ] {
+        let delivered = backend.events(event);
+        assert!(!delivered.is_empty(), "missing {event}");
+        for delivered in delivered {
+            assert_eq!(
+                delivered["harness"],
+                json!({
+                    "name": "kit", "version": env!("CARGO_PKG_VERSION"),
+                }),
+                "{event}"
+            );
+        }
+    }
+}
+
 #[test]
 fn project_hooks_replace_global_hooks_with_the_same_id() {
     let registration = |hooks: Value| -> Registration {

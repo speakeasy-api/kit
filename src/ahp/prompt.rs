@@ -89,7 +89,7 @@ impl LoopMutator for PromptHook {
         };
         let edited = match super::settle(EventType::UserMessageInbound, result) {
             Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
-            Some(outcome) => match outcome.settled_event {
+            Some(outcome) => match outcome.event {
                 Event::UserMessageInbound(event) => Ok(event
                     .message
                     .messages

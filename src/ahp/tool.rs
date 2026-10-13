@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use agenthooksprotocol::client::{Decision, HookError};
+use agenthooksprotocol::client::{HookError, Permission};
 use agenthooksprotocol::contracts::Contract;
 use agenthooksprotocol::generated::Presence;
 use agenthooksprotocol::inputs::{MessageInput, ToolAfterInput, ToolBeforeInput};
@@ -69,7 +69,7 @@ impl HookedTool {
             .arguments_contract(Contract::<Value>::validated(move |input| {
                 validator.validate(input).map_err(|error| error.to_string())
             }))
-            .initial_snapshot(state::initial(Decision::Allow))
+            .initial_snapshot(state::initial(Permission::Allow))
         {
             Ok(boundary) => boundary,
             Err(error) => return Before::Return(denied(error.to_string())),
@@ -89,7 +89,7 @@ impl HookedTool {
         if outcome.outcome.is_denied() {
             return Before::Return(denied(super::denial(&outcome.outcome)));
         }
-        if let Some(value) = outcome.outcome.raw().supplied_result() {
+        if let Some(value) = outcome.outcome.candidate() {
             let output = match value {
                 Value::String(text) => ToolOutput::text(text.clone()),
                 value => ToolOutput::structured(value.clone()),
@@ -102,14 +102,11 @@ impl HookedTool {
         }
         let reauthorize = !outcome.outcome.can_execute();
         if reauthorize
-            && !(outcome.outcome.raw().approval_invalidated && outcome.outcome.requires_approval())
+            && !(outcome.outcome.approval_invalidated && outcome.outcome.requires_approval())
         {
             return Before::Return(denied("agent hook did not authorize the call".into()));
         }
-        request.input = match outcome.input {
-            Ok(input) => input,
-            Err(error) => return Before::Return(denied(error.to_string())),
-        };
+        request.input = outcome.input;
         if reauthorize && let Some(outcome) = self.authorize(&request, context) {
             return Before::Return(outcome);
         }
@@ -243,8 +240,8 @@ impl HookedTool {
             .with_items(items)
             .into_host_event()
         {
-            Ok((event, _)) => self.hooks.sdk.event_for("tool.after", event).await,
-            Err(error) => Err(HookError(error.to_string())),
+            Ok((event, _)) => self.hooks.sdk.event_for(EventType::ToolAfter, event).await,
+            Err(error) => Err(HookError::new(error.to_string())),
         };
         super::settle(EventType::ToolAfter, result);
     }

@@ -89,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "agenthooksprotocol"
-version = "0.4.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "036c046bd6b6f4b4311f7ecdcb57972eb44e738cf65196ebc8501b4fdfb135c8"
+checksum = "231a091332239a837199f42a7016d06dc99d0c9db34935943215e40dbf600fcd"
 dependencies = [
  "jsonschema 0.33.0",
  "reqwest 0.12.28",
