@@ -187,3 +187,116 @@ async fn last_completion_queued_during_final_turn_is_not_lost() {
     assert_eq!(output, "resumed final answer");
     assert!(tasks.list_running().await.is_empty());
 }
+
+/// Cancels at the real hook transport boundary while model admission is pending.
+struct CancelModelAdmission {
+    events: Arc<crate::ahp::test_support::Backend>,
+    cancellation: CancellationController,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for CancelModelAdmission {
+    fn call(
+        &self,
+        request: serde_json::Value,
+        timeout: Duration,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<serde_json::Value, agenthooksprotocol::client::HookError>,
+    > {
+        Box::pin(async move {
+            let cancels = request["params"]["event"]["type"] == "model.request.before";
+            let response = self.events.call(request, timeout).await?;
+            if cancels {
+                self.cancellation.interrupt();
+                // Keep drive_with_tasks suspended until the outer select wins.
+                std::future::pending().await
+            } else {
+                Ok(response)
+            }
+        })
+    }
+
+    fn shutdown(
+        &self,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<(), agenthooksprotocol::client::HookError>,
+    > {
+        self.events.shutdown()
+    }
+}
+
+#[tokio::test]
+async fn persistent_cancellation_emits_cancelled_turn_before_session_end() {
+    const ISOLATED: &str = "KIT_AHP_PERSISTENT_CANCEL_TEST";
+    if std::env::var(ISOLATED).ok().as_deref() != Some("1") {
+        let output = tokio::task::spawn_blocking(|| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::prompt_tests::persistent_cancellation_emits_cancelled_turn_before_session_end", "--nocapture"])
+                .env(ISOLATED, "1")
+                .env("OPENROUTER_API_KEY", "test-only-key")
+                // This endpoint has no models-catalog URL and must never be called.
+                .env("OPENROUTER_BASE_URL", "http://127.0.0.1:1/completions")
+                .output().unwrap()
+        }).await.unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+
+    use crate::ahp::test_support::{Backend, hooks_with_backend, intercept, observe};
+    let root = tempfile::tempdir().unwrap();
+    let cancellation = CancellationController::new();
+    let events = Arc::new(Backend::default());
+    let hooks = hooks_with_backend(
+        vec![
+            observe(&["turn.start", "turn.end", "session.end"]),
+            intercept(&["model.request.before"]),
+        ],
+        Arc::new(CancelModelAdmission {
+            events: events.clone(),
+            cancellation: cancellation.clone(),
+        }),
+    );
+    let mut runtime = Runtime::with_session_provider_and_credentials(
+        root.path(),
+        "test/model",
+        ProviderKind::OpenRouter,
+        SessionRequest {
+            id: "persistent-cancellation".into(),
+            resume: false,
+            force: false,
+        },
+        crate::credentials::CredentialStorage::Memory,
+    )
+    .unwrap();
+    Arc::get_mut(&mut runtime).unwrap().hooks = Some(hooks);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.run_persistent_interruptible("hello".into(), Some(cancellation.handle())),
+    )
+    .await
+    .unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("cancel"), "{error}");
+
+    let delivered = events.all_events();
+    let terminal: Vec<_> = delivered
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("turn.start" | "turn.end" | "session.end")
+            )
+        })
+        .collect();
+    assert_eq!(terminal.len(), 3, "{delivered:?}");
+    assert_eq!(terminal[0]["type"], "turn.start");
+    assert_eq!(terminal[1]["type"], "turn.end");
+    assert_eq!(terminal[2]["type"], "session.end");
+    assert_eq!(terminal[1]["outcome"], "cancelled");
+    assert_eq!(terminal[2]["outcome"], "cancelled");
+    assert_eq!(terminal[0]["turn"], terminal[1]["turn"]);
+    assert_eq!(terminal[0]["session"], terminal[1]["session"]);
+    assert_eq!(terminal[1]["session"], terminal[2]["session"]);
+    assert_eq!(events.events("model.request.before").len(), 1);
+}

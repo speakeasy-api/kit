@@ -1490,6 +1490,14 @@ impl Runtime {
                 Either::Right((result, _)) => result,
             }
         };
+        // The outer cancellation select can drop the drive future before the
+        // loop emits its terminal event. Retire after that borrow is released;
+        // this is a no-op if the driver already finished the cancelled turn.
+        if matches!(&result, Err(LoopError::Cancelled))
+            && let Err(error) = driver.retire_interrupted_turn().await
+        {
+            tracing::warn!(%error, "failed to retire cancelled prompt turn");
+        }
         // Cancel owned compose work cooperatively before aborting task handles.
         background_jobs.cancel_all();
         let _ = tokio::time::timeout(
