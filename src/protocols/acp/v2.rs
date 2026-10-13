@@ -4494,19 +4494,23 @@ mod tests {
                 panic!("expected prompt")
             };
             prepare_prompt(
-                &session_id,
-                &runtime,
-                &server.integration,
-                &handle,
-                &mut catalog,
-                &mut voice,
+                TurnContext {
+                    session_id: &session_id,
+                    integration: &server.integration,
+                    handle: &handle,
+                    sink: &sink,
+                    activity: &activity,
+                },
+                PromptPreparation {
+                    runtime: &runtime,
+                    skill_catalog: &mut catalog,
+                    voice_monitor: &mut voice,
+                    tasks: &tasks,
+                    background_jobs: &background_jobs,
+                    structured_completion: false,
+                },
                 &mut driver,
                 command,
-                &sink,
-                &tasks,
-                &background_jobs,
-                false,
-                &activity,
             )
             .await
             .unwrap();
