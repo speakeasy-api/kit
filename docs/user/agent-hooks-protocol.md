@@ -38,8 +38,8 @@ global hook with the same `id`; other hooks from both files stay active. Kit
 skips an unreadable or malformed file with a warning. A subscription
 selector that matches no event Kit emits disables hooks with a warning.
 
-Stdio hook processes inherit Kit's full environment, including HerdR variables
-and any credentials or other sensitive values present in the environment.
+Stdio hook processes inherit Kit's full environment, including any credentials
+or other sensitive values present in the environment.
 A transport's `env` entries override inherited values. Only configure stdio
 hooks that you trust with those values.
 
