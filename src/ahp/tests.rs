@@ -554,7 +554,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
         .await
         .unwrap();
     let step = driver.next().await.unwrap();
-    hooks.flush_turn_events().await;
+    hooks.drain_turn_events("abc").await;
     let persisted = crate::session::load_in(root.path(), &directory, "abc").unwrap();
     (step, persisted)
 }
@@ -736,8 +736,8 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
             driver.next().await.unwrap(),
             LoopStep::Finished(_)
         ));
+        hooks.drain_turn_events(session).await;
     }
-    hooks.flush_turn_events().await;
     let starts = backend.events("turn.start");
     let ends = backend.events("turn.end");
     assert_eq!(starts.len(), 4);
@@ -776,7 +776,7 @@ async fn failed_model_request_ends_the_logical_turn() {
         .await
         .unwrap();
     assert!(driver.next().await.is_err());
-    hooks.flush_turn_events().await;
+    hooks.drain_turn_events("failed").await;
     let starts = backend.events("turn.start");
     let ends = backend.events("turn.end");
     assert_eq!(starts.len(), 1);
@@ -879,7 +879,7 @@ async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() 
             driver.next().await.unwrap(),
             LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AfterToolResult(_))
         ));
-        hooks.flush_turn_events().await;
+        hooks.drain_turn_events("tools").await;
         assert_eq!(backend.events("turn.start").len(), 1);
         assert!(backend.events("turn.end").is_empty());
         assert_eq!(echo.received.lock().unwrap().len(), 1);
@@ -892,7 +892,7 @@ async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() 
                 LoopStep::Finished(_)
             ));
         }
-        hooks.flush_turn_events().await;
+        hooks.drain_turn_events("tools").await;
         let starts = backend.events("turn.start");
         let ends = backend.events("turn.end");
         assert_eq!(starts.len(), 1);

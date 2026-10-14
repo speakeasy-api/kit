@@ -1483,7 +1483,11 @@ impl Runtime {
         }
         let result = {
             let cancellation = std::pin::pin!(cancelled.cancelled());
-            let run = std::pin::pin!(drive_with_tasks(&mut driver, Some(&tasks)));
+            let run = std::pin::pin!(drive_with_tasks(
+                &mut driver,
+                Some(&tasks),
+                self.hooks().map(|hooks| (hooks, session_id.as_str())),
+            ));
             // Idle prompts must observe cancellation too, not just model turns.
             match select(cancellation, run).await {
                 Either::Left(((), _)) => Err(LoopError::Cancelled),
@@ -2961,12 +2965,13 @@ fn record_loop_failure(
 async fn drive(
     driver: &mut LoopDriver<HookedSession<SelectableSession>>,
 ) -> Result<String, LoopError> {
-    drive_with_tasks(driver, None).await
+    drive_with_tasks(driver, None, None).await
 }
 
 async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
     driver: &mut LoopDriver<S>,
     tasks: Option<&TaskManagerHandle>,
+    turn_events: Option<(&crate::ahp::Hooks, &str)>,
 ) -> Result<String, LoopError> {
     let mut output = String::new();
     loop {
@@ -2999,6 +3004,9 @@ async fn drive_with_tasks<S: agentkit_loop::ModelSession>(
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) if tasks.is_some() => {
                 if !running {
                     return Ok(output);
+                }
+                if let Some((hooks, session)) = turn_events {
+                    hooks.drain_turn_events(session).await;
                 }
                 if let Some(tasks) = tasks {
                     // Events are queued during model turns, including failure

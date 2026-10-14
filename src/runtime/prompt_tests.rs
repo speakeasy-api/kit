@@ -179,7 +179,7 @@ async fn last_completion_queued_during_final_turn_is_not_lost() {
         .unwrap();
     let output = tokio::time::timeout(
         Duration::from_secs(3),
-        drive_with_tasks(&mut driver, Some(&tasks)),
+        drive_with_tasks(&mut driver, Some(&tasks), None),
     )
     .await
     .unwrap()

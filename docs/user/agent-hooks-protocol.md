@@ -78,9 +78,9 @@ tool calls and tool results into message parts. It omits media, files and
 reasoning.
 
 Tool calls, model retries and model continuations stay within the same logical
-turn; they do not emit extra turn boundaries. Turn observations are delivered
-in order asynchronously. An abandoned driver or abrupt process exit cannot
-guarantee a terminal observation. The start event has no transcript snapshot;
+turn; they do not emit extra turn boundaries. Kit delivers turn observations
+in order, before the session's next hook event and whenever the session goes
+idle. An abrupt process exit can drop a terminal observation. The start event has no transcript snapshot;
 its trigger is reported as external because the loop does not expose a cause.
 The continuation count is zero because Kit does not initiate AHP hook
 continuations.

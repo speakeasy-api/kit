@@ -1551,6 +1551,9 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 None => break,
             },
         }
+        if let Some(hooks) = runtime.hooks() {
+            hooks.drain_turn_events(&session_id.to_string()).await;
+        }
     }
 }
 

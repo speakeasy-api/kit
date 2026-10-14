@@ -4,8 +4,9 @@ mod prompt;
 mod tool;
 mod turn;
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use agenthooksprotocol::capability::{self, HostCapabilities, Modify};
 use agenthooksprotocol::client::{
@@ -24,7 +25,7 @@ use agenthooksprotocol::{
     SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
 };
 use agentkit_core::{FinishReason, Item, ItemKind, Part, ToolOutput, TurnCancellation};
-use agentkit_loop::LoopError;
+use agentkit_loop::{AgentEvent, LoopError};
 
 pub(crate) use model::{HookedAdapter, HookedSession};
 pub(crate) use prompt::{PromptHook, PromptRecord};
@@ -36,8 +37,8 @@ const CONFIG_FILE: &str = "hooks.json";
 
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
-    sdk: Arc<agenthooksprotocol::Hooks>,
-    turn_events: OnceLock<tokio::sync::mpsc::UnboundedSender<turn::Delivery>>,
+    sdk: agenthooksprotocol::Hooks,
+    turn_events: Mutex<HashMap<String, VecDeque<AgentEvent>>>,
 }
 
 impl Hooks {
@@ -67,8 +68,8 @@ impl Hooks {
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            sdk: Arc::new(sdk),
-            turn_events: OnceLock::new(),
+            sdk,
+            turn_events: Mutex::default(),
         })
     }
 
@@ -83,7 +84,7 @@ impl Hooks {
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
-        self.flush_turn_events().await;
+        self.drain_turn_events(session).await;
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, Box::new(Session::new(session)));
         settle(EventType::SessionEnd, self.sdk.session_end(input).await);
