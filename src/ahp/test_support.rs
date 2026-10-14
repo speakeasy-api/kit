@@ -22,6 +22,10 @@ impl Backend {
         self.effects.lock().unwrap().insert(event.into(), effects);
     }
 
+    pub(crate) fn all_events(&self) -> Vec<Value> {
+        self.events.lock().unwrap().clone()
+    }
+
     pub(crate) fn events(&self, event: &str) -> Vec<Value> {
         self.events
             .lock()
@@ -74,6 +78,13 @@ pub(crate) fn observe(events: &[&str]) -> Value {
 
 pub(crate) fn hooks(subscriptions: Vec<Value>) -> (Arc<Hooks>, Arc<Backend>) {
     let backend = Arc::new(Backend::default());
+    (hooks_with_backend(subscriptions, backend.clone()), backend)
+}
+
+pub(crate) fn hooks_with_backend(
+    subscriptions: Vec<Value>,
+    backend: Arc<dyn ManagedBackend>,
+) -> Arc<Hooks> {
     let registration = serde_json::from_value(json!({
         "protocolVersion": "draft",
         "hooks": [{
@@ -83,11 +94,8 @@ pub(crate) fn hooks(subscriptions: Vec<Value>) -> (Arc<Hooks>, Arc<Backend>) {
         }],
     }))
     .unwrap();
-    let options = options().unwrap().with_backend(BACKEND, backend.clone());
-    (
-        Arc::new(Hooks::new(registration, options).unwrap()),
-        backend,
-    )
+    let options = options().unwrap().with_backend(BACKEND, backend);
+    Arc::new(Hooks::new(registration, options).unwrap())
 }
 
 pub(crate) fn text_message(text: &str) -> Value {

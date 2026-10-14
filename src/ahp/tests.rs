@@ -19,6 +19,63 @@ use serde_json::{Value, json};
 use super::test_support::{hooks, intercept, observe, text_message};
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
+    const VARIABLE: &str = "KIT_AHP_TEST_INHERITED_ENV";
+    const VALUE: &str = "environment-sentinel";
+    // Configure only an isolated test process; other tests spawn hooks too.
+    if std::env::var(VARIABLE).ok().as_deref() != Some(VALUE) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ahp::tests::stdio_hooks_inherit_environment_with_explicit_overrides",
+                "--nocapture",
+            ])
+            .env(VARIABLE, VALUE)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_BIN_PATH", "herdr-bin-sentinel")
+            .env("HERDR_PANE_ID", "host-pane")
+            .env("HERDR_SOCKET_PATH", "socket-sentinel")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("hook-env");
+    let registration = serde_json::from_value(json!({
+        "protocolVersion": "draft",
+        "hooks": [{
+            "id": "dev.kit.environment-test",
+            "transport": {
+                "type": "stdio",
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    "read -r event; printf '%s\\n' \"$HERDR_ENV\" \"$HERDR_BIN_PATH\" \"$HERDR_PANE_ID\" \"$HERDR_SOCKET_PATH\" \"$KIT_AHP_TEST_INHERITED_ENV\" > \"$1\"",
+                    "environment-hook",
+                    output,
+                ],
+                "env": {"HERDR_PANE_ID": "configured-pane"},
+                "lifecycle": "per_event",
+            },
+            "subscriptions": [observe(&["session.start"])],
+        }],
+    }))
+    .unwrap();
+    let hooks = Hooks::new(registration, options().unwrap()).unwrap();
+    hooks
+        .session_start("environment-test", SessionStartInputTrigger::Startup)
+        .await;
+    hooks.sdk.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        "1\nherdr-bin-sentinel\nconfigured-pane\nsocket-sentinel\nenvironment-sentinel\n",
+    );
+}
+
 #[test]
 fn every_granted_event_accepts_wildcard_subscriptions() {
     hooks(vec![intercept(&["*"]), observe(&["*"])]);
@@ -56,6 +113,8 @@ async fn every_lifecycle_event_reports_harness_identity() {
     for event in [
         "session.start",
         "session.end",
+        "turn.start",
+        "turn.end",
         "user.message.inbound",
         "model.request.before",
         "model.response.after",
@@ -475,6 +534,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
     let opened =
         crate::session::open_in(root.path(), &directory, "abc", false, false, initial).unwrap();
     let mut driver = Agent::builder()
+        .observer(TurnHook(hooks.clone()))
         .model(HookedAdapter::new(
             model.clone(),
             Some(hooks.clone()),
@@ -494,6 +554,7 @@ async fn admit(hooks: &Arc<Hooks>, model: &Model, input: Vec<Item>) -> (LoopStep
         .await
         .unwrap();
     let step = driver.next().await.unwrap();
+    hooks.drain_turn_events("abc").await;
     let persisted = crate::session::load_in(root.path(), &directory, "abc").unwrap();
     (step, persisted)
 }
@@ -649,4 +710,278 @@ async fn compaction_hooks_supply_and_rewrite_the_summary() {
         hooks.compact_after(&items, "draft".into()).await,
         "rewritten"
     );
+}
+
+#[tokio::test]
+async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
+    let (hooks, backend) = hooks(vec![observe(&["turn.start", "turn.end"])]);
+    for session in ["first", "second"] {
+        let mut driver = Agent::builder()
+            .model(Model::default())
+            .observer(TurnHook(hooks.clone()))
+            .input(vec![Item::text(ItemKind::User, "one")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(session))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "two")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(_)
+        ));
+        hooks.drain_turn_events(session).await;
+    }
+    let starts = backend.events("turn.start");
+    let ends = backend.events("turn.end");
+    assert_eq!(starts.len(), 4);
+    assert_eq!(ends.len(), 4);
+    for (start, end) in starts.iter().zip(&ends) {
+        assert_eq!(start["session"], end["session"]);
+        assert_eq!(start["turn"], end["turn"]);
+        assert_eq!(end["outcome"], "completed");
+    }
+    assert_eq!(starts[0]["session"]["id"], "first");
+    assert_eq!(starts[2]["session"]["id"], "second");
+    assert_ne!(starts[0]["turn"]["id"], starts[1]["turn"]["id"]);
+}
+
+/// Holds `turn.end` at the hook transport until the test releases it.
+struct HoldTurnEnd {
+    events: Arc<super::test_support::Backend>,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnEnd {
+    fn call(
+        &self,
+        request: Value,
+        timeout: std::time::Duration,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<Value, agenthooksprotocol::client::HookError>,
+    > {
+        Box::pin(async move {
+            if request["params"]["event"]["type"] == "turn.end" {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.events.call(request, timeout).await
+        })
+    }
+
+    fn shutdown(
+        &self,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<(), agenthooksprotocol::client::HookError>,
+    > {
+        self.events.shutdown()
+    }
+}
+
+#[tokio::test]
+async fn cancelled_drain_still_delivers_turn_end_before_session_end() {
+    let backend = Arc::new(HoldTurnEnd {
+        events: Arc::default(),
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let hooks = super::test_support::hooks_with_backend(
+        vec![observe(&["turn.start", "turn.end", "session.end"])],
+        backend.clone(),
+    );
+    let mut driver = Agent::builder()
+        .model(Model::default())
+        .observer(TurnHook(hooks.clone()))
+        .input(vec![Item::text(ItemKind::User, "hello")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("held"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.next().await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    tokio::select! {
+        () = hooks.drain_turn_events("held") => panic!("turn.end was not held"),
+        () = backend.reached.notified() => {}
+    }
+    backend.release.notify_one();
+    hooks
+        .session_end("held", SessionEndInputOutcome::Completed)
+        .await;
+    let types: Vec<_> = backend
+        .events
+        .all_events()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(types, ["turn.start", "turn.end", "session.end"]);
+}
+
+#[tokio::test]
+async fn failed_model_request_ends_the_logical_turn() {
+    let (hooks, backend) = hooks(vec![
+        observe(&["turn.start", "turn.end"]),
+        intercept(&["model.request.before"]),
+    ]);
+    backend.respond(
+        "model.request.before",
+        json!([{ "type": "deny", "reason": "blocked" }]),
+    );
+    let mut driver = Agent::builder()
+        .model(HookedAdapter::new(
+            Model::default(),
+            Some(hooks.clone()),
+            SessionStartInputTrigger::Startup,
+        ))
+        .observer(TurnHook(hooks.clone()))
+        .input(vec![Item::text(ItemKind::User, "hello")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("failed"))
+        .await
+        .unwrap();
+    assert!(driver.next().await.is_err());
+    hooks.drain_turn_events("failed").await;
+    let starts = backend.events("turn.start");
+    let ends = backend.events("turn.end");
+    assert_eq!(starts.len(), 1);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["outcome"], "failed");
+    assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+    assert_eq!(ends[0]["session"]["id"], "failed");
+}
+
+#[derive(Clone)]
+struct ToolRoundModel(bool);
+
+#[async_trait]
+impl ModelAdapter for ToolRoundModel {
+    type Session = Self;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        Ok(self.clone())
+    }
+}
+
+#[async_trait]
+impl ModelSession for ToolRoundModel {
+    type Turn = ToolRoundReply;
+    async fn begin_turn(
+        &mut self,
+        _: TurnRequest,
+        _: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        let mut events = std::collections::VecDeque::new();
+        let call = agentkit_core::ToolCallPart::new("echo-call", "echo", json!({"text": "hello"}));
+        let mut assistant = Item::text(ItemKind::Assistant, "");
+        assistant.parts = vec![Part::ToolCall(call.clone())];
+        if self.0 {
+            // A superseded provider response is retried within this model turn.
+            events.push_back(ModelTurnEvent::ToolCall(agentkit_core::ToolCallPart::new(
+                "discarded-call",
+                "echo",
+                json!({"text": "discarded"}),
+            )));
+            events.push_back(ModelTurnEvent::ResponseAttemptSuperseded);
+            events.push_back(ModelTurnEvent::ToolCall(call));
+        }
+        events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: if self.0 {
+                FinishReason::ToolCall
+            } else {
+                FinishReason::Completed
+            },
+            output_items: if self.0 {
+                vec![assistant]
+            } else {
+                vec![Item::text(ItemKind::Assistant, "done")]
+            },
+            usage: None,
+            metadata: MetadataMap::new(),
+            model: None,
+            response_id: None,
+        }));
+        self.0 = false;
+        Ok(ToolRoundReply(events))
+    }
+}
+
+struct ToolRoundReply(std::collections::VecDeque<ModelTurnEvent>);
+#[async_trait]
+impl ModelTurn for ToolRoundReply {
+    async fn next_event(
+        &mut self,
+        _: Option<TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        Ok(self.0.pop_front())
+    }
+}
+
+#[tokio::test]
+async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() {
+    for retire in [false, true] {
+        let (hooks, backend) = hooks(vec![
+            observe(&["turn.start", "turn.end"]),
+            intercept(&["model.request.before"]),
+        ]);
+        let echo = Echo::new();
+        let mut registry = ToolRegistry::new();
+        registry.register_arc(echo.clone());
+        let mut driver = Agent::builder()
+            .model(HookedAdapter::new(
+                ToolRoundModel(true),
+                Some(hooks.clone()),
+                SessionStartInputTrigger::Startup,
+            ))
+            .observer(TurnHook(hooks.clone()))
+            .add_tool_source(registry)
+            .input(vec![Item::text(ItemKind::User, "hello")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("tools"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(agentkit_loop::LoopInterrupt::AfterToolResult(_))
+        ));
+        hooks.drain_turn_events("tools").await;
+        assert_eq!(backend.events("turn.start").len(), 1);
+        assert!(backend.events("turn.end").is_empty());
+        assert_eq!(echo.received.lock().unwrap().len(), 1);
+        if retire {
+            assert!(driver.retire_interrupted_turn().await.unwrap().is_some());
+            assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        } else {
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Finished(_)
+            ));
+        }
+        hooks.drain_turn_events("tools").await;
+        let starts = backend.events("turn.start");
+        let ends = backend.events("turn.end");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(starts[0]["turn"], ends[0]["turn"]);
+        assert_eq!(ends[0]["session"]["id"], "tools");
+        assert_eq!(
+            ends[0]["outcome"],
+            if retire { "cancelled" } else { "completed" }
+        );
+        assert_eq!(
+            backend.events("model.request.before").len(),
+            if retire { 1 } else { 2 }
+        );
+    }
 }

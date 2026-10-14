@@ -2,6 +2,7 @@
 mod model;
 mod prompt;
 mod tool;
+mod turn;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,13 +29,15 @@ use agentkit_loop::LoopError;
 pub(crate) use model::{HookedAdapter, HookedSession};
 pub(crate) use prompt::{PromptHook, PromptRecord};
 pub(crate) use tool::hooked_tools;
+pub(crate) use turn::TurnHook;
 
 const SOURCE: &str = "urn:dev:kit:harness";
 const CONFIG_FILE: &str = "hooks.json";
 
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
-    sdk: agenthooksprotocol::Hooks,
+    sdk: Arc<agenthooksprotocol::Hooks>,
+    turn_events: turn::TurnQueues,
 }
 
 impl Hooks {
@@ -63,7 +66,10 @@ impl Hooks {
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
-        Ok(Self { sdk })
+        Ok(Self {
+            sdk: Arc::new(sdk),
+            turn_events: turn::TurnQueues::default(),
+        })
     }
 
     pub(crate) async fn session_start(&self, session: &str, trigger: SessionStartInputTrigger) {
@@ -77,6 +83,8 @@ impl Hooks {
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
+        self.drain_turn_events(session).await;
+        self.forget_turn_events(session);
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, Box::new(Session::new(session)));
         settle(EventType::SessionEnd, self.sdk.session_end(input).await);
@@ -164,6 +172,8 @@ fn options() -> Result<HooksOptions, String> {
     let capabilities = HostCapabilities {
         session_start: Some(capability::session_start().observe()),
         session_end: Some(capability::session_end().observe()),
+        turn_start: Some(capability::turn_start().observe()),
+        turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()
                 .deny()
@@ -190,11 +200,13 @@ fn options() -> Result<HooksOptions, String> {
         ),
         ..HostCapabilities::default()
     };
-    Ok(HooksOptions::new(
+    let mut options = HooksOptions::new(
         SOURCE,
         Harness::new("kit", env!("CARGO_PKG_VERSION")),
         capabilities,
-    ))
+    );
+    options.backend.inherit_environment = true;
+    Ok(options)
 }
 
 fn read(path: &Path) -> Result<Option<Registration>, String> {

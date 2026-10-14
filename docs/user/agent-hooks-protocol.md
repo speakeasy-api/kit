@@ -38,6 +38,11 @@ global hook with the same `id`; other hooks from both files stay active. Kit
 skips an unreadable or malformed file with a warning. A subscription
 selector that matches no event Kit emits disables hooks with a warning.
 
+Stdio hook processes inherit Kit's full environment, including any credentials
+or other sensitive values present in the environment.
+A transport's `env` entries override inherited values. Only configure stdio
+hooks that you trust with those values.
+
 Hook backends run local processes or receive session content. Review both files
 before you run Kit in a project you do not trust.
 
@@ -46,6 +51,8 @@ before you run Kit in a project you do not trust.
 | Event | Where Kit emits it | Hook authority |
 | --- | --- | --- |
 | `session.start` | A session's model connection opens | Observe |
+| `turn.start` | A logical agent-loop turn starts, with native session and turn IDs | Observe |
+| `turn.end` | That logical turn completes, fails, or is cancelled | Observe |
 | `session.end` | A prompt run finishes or an ACP session closes | Observe |
 | `user.message.inbound` | A new turn admits a user prompt | Deny, replace the prompt |
 | `model.request.before` | Before each model call, with the transcript | Deny |
@@ -70,5 +77,13 @@ Tool events cover the tools that compose scripts call, such as `shell`, `edit`,
 tool calls and tool results into message parts. It omits media, files and
 reasoning.
 
-Kit does not emit `turn.*`, `model.switch.*`, `config.change.*`, `file.changed`
+Tool calls, model retries and model continuations stay within the same logical
+turn; they do not emit extra turn boundaries. Kit delivers turn observations
+in order, before the session's next hook event and whenever the session goes
+idle. An abrupt process exit can drop a terminal observation. The start event has no transcript snapshot;
+its trigger is reported as external because the loop does not expose a cause.
+The continuation count is zero because Kit does not initiate AHP hook
+continuations.
+
+Kit does not emit `turn.finish.before`, `model.switch.*`, `config.change.*`, `file.changed`
 or the tool permission and progress events yet.
