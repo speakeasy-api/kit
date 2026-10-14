@@ -58,11 +58,11 @@ run = [
 
 [tasks.test]
 description = "Rust tests; arguments pass through, e.g. mise run test -- --test cli or mise run test -- --test runtime some_case"
-run = "cargo test --locked"
+run = "scripts/isolated-home.sh cargo test --locked"
 
 [tasks."test:headless"]
 description = "Rust tests without the tui feature; arguments pass through like test"
-run = "cargo test --locked --no-default-features"
+run = "scripts/isolated-home.sh cargo test --locked --no-default-features"
 
 [tasks."test:scripts"]
 description = "Shell tests for the release scripts"
