@@ -752,6 +752,82 @@ async fn turn_boundaries_keep_native_ids_across_turns_and_sessions() {
     assert_ne!(starts[0]["turn"]["id"], starts[1]["turn"]["id"]);
 }
 
+/// Holds `turn.end` at the hook transport until the test releases it.
+struct HoldTurnEnd {
+    events: Arc<super::test_support::Backend>,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl agenthooksprotocol::adapters::registered::ManagedBackend for HoldTurnEnd {
+    fn call(
+        &self,
+        request: Value,
+        timeout: std::time::Duration,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<Value, agenthooksprotocol::client::HookError>,
+    > {
+        Box::pin(async move {
+            if request["params"]["event"]["type"] == "turn.end" {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.events.call(request, timeout).await
+        })
+    }
+
+    fn shutdown(
+        &self,
+    ) -> agenthooksprotocol::client::LocalFuture<
+        '_,
+        Result<(), agenthooksprotocol::client::HookError>,
+    > {
+        self.events.shutdown()
+    }
+}
+
+#[tokio::test]
+async fn cancelled_drain_still_delivers_turn_end_before_session_end() {
+    let backend = Arc::new(HoldTurnEnd {
+        events: Arc::default(),
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let hooks = super::test_support::hooks_with_backend(
+        vec![observe(&["turn.start", "turn.end", "session.end"])],
+        backend.clone(),
+    );
+    let mut driver = Agent::builder()
+        .model(Model::default())
+        .observer(TurnHook(hooks.clone()))
+        .input(vec![Item::text(ItemKind::User, "hello")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("held"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.next().await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    tokio::select! {
+        () = hooks.drain_turn_events("held") => panic!("turn.end was not held"),
+        () = backend.reached.notified() => {}
+    }
+    backend.release.notify_one();
+    hooks
+        .session_end("held", SessionEndInputOutcome::Completed)
+        .await;
+    let types: Vec<_> = backend
+        .events
+        .all_events()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(types, ["turn.start", "turn.end", "session.end"]);
+}
+
 #[tokio::test]
 async fn failed_model_request_ends_the_logical_turn() {
     let (hooks, backend) = hooks(vec![
