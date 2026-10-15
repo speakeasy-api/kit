@@ -3411,7 +3411,10 @@ fn extract_zip(bytes: &[u8], destination: &Path) -> Result<(), String> {
     let mut expanded = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
-        let path = validate_archive_path(Path::new(entry.name()))?;
+        let name = entry
+            .name()
+            .map_err(|error| format!("invalid ZIP entry name: {error}"))?;
+        let path = validate_archive_path(Path::new(name.as_ref()))?;
         if !paths.insert(path.clone()) {
             return Err(format!("duplicate plugin archive path {}", path.display()));
         }
@@ -5590,6 +5593,112 @@ mod tests {
         }
         let destination = tempfile::tempdir().unwrap();
         assert!(extract_archive(duplicate.get_ref(), destination.path()).is_err());
+    }
+
+    fn deflated_zip_with_file(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        archive.start_file(name, options).unwrap();
+        archive.write_all(contents).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_extracts_deflated_contents() {
+        let contents = b"compressed plugin contents\n".repeat(100);
+        let bytes = deflated_zip_with_file("plugin/nested/file.txt", &contents);
+        let destination = tempfile::tempdir().unwrap();
+        extract_zip(&bytes, destination.path()).unwrap();
+        assert_eq!(
+            fs::read(destination.path().join("plugin/nested/file.txt")).unwrap(),
+            contents
+        );
+    }
+
+    #[test]
+    fn zip_rejects_traversal_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("extracted");
+        fs::create_dir(&destination).unwrap();
+        let bytes = deflated_zip_with_file("../escape", b"outside");
+        let error = extract_zip(&bytes, &destination).unwrap_err();
+        assert!(error.contains("escapes extraction root"), "{error}");
+        assert!(!root.path().join("escape").exists());
+
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .add_symlink(
+                "link",
+                "../escape",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let error = extract_zip(&bytes, &destination).unwrap_err();
+        assert!(error.contains("unsupported ZIP entry type"), "{error}");
+        assert!(fs::symlink_metadata(destination.join("link")).is_err());
+    }
+
+    #[test]
+    fn zip_rejects_oversized_declared_entry() {
+        let mut bytes = deflated_zip_with_file("large", b"small");
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        // Set the uncompressed size in both headers without allocating a large payload.
+        let size = u32::try_from(MAX_FILE_BYTES + 1).unwrap().to_le_bytes();
+        bytes[22..26].copy_from_slice(&size);
+        bytes[central + 24..central + 28].copy_from_slice(&size);
+        let destination = tempfile::tempdir().unwrap();
+        let error = extract_zip(&bytes, destination.path()).unwrap_err();
+        assert!(error.contains("exceeds expanded size limits"), "{error}");
+        assert!(!destination.path().join("large").exists());
+    }
+
+    #[test]
+    fn zip_rejects_truncation_and_invalid_crc() {
+        let mut bytes = deflated_zip_with_file("file", b"contents");
+        let destination = tempfile::tempdir().unwrap();
+        assert!(extract_zip(&bytes[..10], destination.path()).is_err());
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        // Corrupt the CRC in both headers, leaving the compressed stream intact.
+        bytes[14] ^= 1;
+        bytes[central + 16] ^= 1;
+        let error = extract_zip(&bytes, destination.path()).unwrap_err();
+        assert!(error.contains("could not extract"), "{error}");
+    }
+
+    #[test]
+    fn zip_rejects_payload_exceeding_declared_size() {
+        let mut bytes = deflated_zip_with_file("file", b"contents");
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        let size = 3_u32.to_le_bytes();
+        bytes[22..26].copy_from_slice(&size);
+        bytes[central + 24..central + 28].copy_from_slice(&size);
+        let destination = tempfile::tempdir().unwrap();
+        assert!(extract_zip(&bytes, destination.path()).is_err());
+    }
+
+    #[test]
+    fn write_entry_rejects_declared_size_mismatch() {
+        for declared_size in [2, 4] {
+            let destination = tempfile::tempdir().unwrap();
+            let error = write_entry(
+                &mut Cursor::new(b"abc"),
+                &destination.path().join("file"),
+                declared_size,
+            )
+            .unwrap_err();
+            assert!(error.contains("invalid extracted size"), "{error}");
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::{
 };
 
 use ignore::{WalkBuilder, WalkState};
-use neo_frizbee::{Config, match_list, match_list_indices};
+use neo_frizbee::{CaseMatching, Config, Matcher};
 use serde::{Deserialize, Serialize};
 
 const MAX_RESULTS: usize = 100;
@@ -220,17 +220,22 @@ impl WorkspaceFileSearch {
         }
 
         let config = Config {
+            // Preserve case-insensitive search rather than the upstream smart-case default.
+            casing: CaseMatching::Ignore,
             max_typos: Some((query.len() as u16 / 4).clamp(2, 6)),
             ..Config::default()
         };
-        let candidates: Vec<_> = match_list(query, &self.files, &config)
+        let mut matcher = Matcher::new(query, &config);
+        let candidates: Vec<_> = matcher
+            .match_list(&self.files)
             .into_iter()
             .take(MAX_RESULTS)
             .filter_map(|matched| self.files.get(matched.index as usize))
             .map(String::as_str)
             .collect();
 
-        Ok(match_list_indices(query, &candidates, &config)
+        Ok(matcher
+            .match_list_indices(&candidates)
             .into_iter()
             .filter_map(|matched| {
                 let relative_path = candidates.get(matched.index as usize)?.to_string();
@@ -238,6 +243,7 @@ impl WorkspaceFileSearch {
                 offsets.sort_unstable();
                 let mut match_byte_offsets: Vec<Range<usize>> = Vec::new();
                 for byte_index in offsets {
+                    let byte_index = byte_index as usize;
                     if byte_index >= relative_path.len() {
                         continue;
                     }
@@ -389,11 +395,40 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_queries_remain_case_insensitive() {
+        let search = WorkspaceFileSearch {
+            files: vec!["readme.md".into(), "README.MD".into(), "ReadMe.md".into()],
+        };
+        for query in ["readme.md", "README.MD", "ReadMe.md"] {
+            let results = search.search(query).expect("case-insensitive search");
+            let mut paths: Vec<_> = results
+                .iter()
+                .map(|item| item.relative_path.as_str())
+                .collect();
+            paths.sort_unstable();
+            assert_eq!(
+                paths,
+                ["README.MD", "ReadMe.md", "readme.md"],
+                "query: {query}"
+            );
+            for result in results {
+                assert_eq!(result.match_byte_offsets, vec![0..9], "query: {query}");
+            }
+        }
+    }
+
+    #[test]
     fn unicode_highlights_use_byte_offsets() {
         let search = WorkspaceFileSearch {
             files: vec!["é.rs".into()],
         };
-        for (query, expected) in [("é", 0..2), ("rs", 3..5), ("é.rs", 0..5)] {
+        for (query, expected) in [
+            ("é", 0..2),
+            ("rs", 3..5),
+            ("RS", 3..5),
+            ("é.rs", 0..5),
+            ("é.RS", 0..5),
+        ] {
             let results = search.search(query).expect("Unicode search");
             assert_eq!(results.len(), 1, "query: {query}");
             assert_eq!(results[0].match_byte_offsets.len(), 1, "query: {query}");

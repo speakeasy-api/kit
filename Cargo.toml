@@ -31,11 +31,11 @@ tui = [
 syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy"], optional = true }
 two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"], optional = true }
 opus-pure = { version = "=0.2.2", default-features = false, optional = true }
-str0m = { version = "=0.24.0", default-features = false, features = ["aws-lc-rs"], optional = true }
+str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"], optional = true }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"], optional = true }
-a2a-protocol-client = "=0.11.0"
-a2a-protocol-server = { version = "=0.11.0", default-features = false }
-a2a-protocol-types = "=0.11.0"
+a2a-protocol-client = { version = "=0.14.1", default-features = false, features = ["tls-rustls"] }
+a2a-protocol-server = { version = "=0.14.1", default-features = false }
+a2a-protocol-types = "=0.14.1"
 agenthooksprotocol = { version = "=0.7.0", default-features = false, features = ["reqwest", "tokio-process"] }
 agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0", features = ["unstable_session_fork", "unstable_session_inject"] }
 agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.9.1", features = ["unstable_session_notices", "unstable_session_compaction"] }
@@ -68,33 +68,33 @@ flate2 = "=1.1.10"
 ignore = "=0.4.33"
 futures-util = "=0.3.34"
 getrandom = "=0.4.3"
-hyper = "=1.11.1"
+hyper = "=1.12.0"
 hyper-util = { version = "=0.1.21", features = ["server", "http1", "http2", "tokio"] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
 keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
-jsonschema = { version = "=0.58.5", default-features = false, features = ["idna"] }
-neo_frizbee = "=0.11.0"
+jsonschema = { version = "=0.58.6", default-features = false, features = ["idna"] }
+neo_frizbee = "=0.13.3"
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "http-json", "reqwest-client", "tls-webpki-roots", "trace"] }
 opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
 ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"], optional = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "form", "rustls", "stream"] }
-rmcp = { version = "=3.2.0", default-features = false, features = ["auth", "client"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["auth", "client"] }
 rpassword = "=7.5.4"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 shlex = { version = "=2.0.1", optional = true }
 runlet = "=0.6.1"
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 subtle = "=2.6.1"
 tar = { version = "=0.4.46", default-features = false }
 tempfile = "=3.27.0"
-toml = "=1.1.6"
-toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
-tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "=0.7.19", features = ["compat"] }
+toml = "=1.1.8"
+toml_edit = { version = "=0.25.17", default-features = false, features = ["parse", "display"] }
+tokio = { version = "=1.53.3", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "=0.7.20", features = ["compat"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tracing = "=0.1.44"
 tracing-opentelemetry = { version = "=0.33.0", default-features = false }
@@ -102,9 +102,9 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 unicode-segmentation = { version = "=1.13.3", optional = true }
 unicode-width = { version = "=0.2.2", optional = true }
 url = "=2.5.8"
-uuid = { version = "=1.26.1", features = ["v5"] }
-zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-zeroize = { version = "=1.9.0", features = ["derive"] }
+uuid = { version = "=1.28.0", features = ["v5"] }
+zip = { version = "=9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zeroize = { version = "=1.9.1", features = ["derive"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = { version = "=0.18.2", default-features = false, optional = true }
@@ -116,7 +116,7 @@ cubeb = { version = "=0.38.0", default-features = false, optional = true }
 cubeb-sys = { version = "=0.38.0", default-features = false, features = ["unittest-build"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "=0.2.190"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
@@ -127,7 +127,7 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-tokio = { version = "=1.53.1", features = ["test-util"] }
+tokio = { version = "=1.53.3", features = ["test-util"] }
 
 # Deny also in test builds; only test-only scopes may relax ergonomics. Crate
 # roots additionally forbid these in production so local allows cannot evade it.
