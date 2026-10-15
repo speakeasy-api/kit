@@ -142,7 +142,7 @@ pub async fn restore(
     }
     match manager.get_access_token().await {
         Ok(token) => Ok(Some((token, manager))),
-        Err(AuthError::AuthorizationRequired) => Ok(None),
+        Err(AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_)) => Ok(None),
         Err(error) => Err(format!("could not restore OAuth access token: {error}")),
     }
 }
@@ -394,14 +394,14 @@ async fn respond(stream: &mut TcpStream, success: bool, description: Option<&str
 )]
 mod tests {
     use rmcp::transport::auth::{
-        AuthorizationManager, AuthorizationMetadata, CredentialStore, InMemoryCredentialStore,
-        OAuthTokenResponse, StoredCredentials,
+        AuthError, AuthorizationManager, AuthorizationMetadata, CredentialStore,
+        InMemoryCredentialStore, OAuthTokenResponse, StoredCredentials,
     };
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        Config, begin, credential_identity, has_query_param, parse_request_target, refresh,
+        Config, begin, credential_identity, has_query_param, parse_request_target, refresh, restore,
     };
     use crate::tools::mcp::CredentialStorage;
 
@@ -529,6 +529,170 @@ mod tests {
                 .unwrap(),
             "new-access"
         );
+    }
+
+    fn refresh_credentials(access: &str, refresh: &str, received_at: u64) -> StoredCredentials {
+        let token = serde_json::from_value(json!({
+            "access_token": access,
+            "token_type": "Bearer",
+            "refresh_token": refresh,
+            "expires_in": 3600
+        }))
+        .unwrap();
+        StoredCredentials::new("client".into(), Some(token), vec![], Some(received_at))
+    }
+
+    async fn refresh_error_server(
+        status: &'static str,
+        body: &'static str,
+        replacement: Option<(InMemoryCredentialStore, StoredCredentials)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_base = base.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let is_refresh = request.starts_with("POST /token ");
+                let (status, response_body) = if is_refresh {
+                    if let Some((store, credentials)) = &replacement {
+                        store.save(credentials.clone()).await.unwrap();
+                    }
+                    (status, body.to_string())
+                } else if path.contains("oauth-protected-resource") {
+                    (
+                        "200 OK",
+                        json!({
+                            "resource": format!("{server_base}/mcp"),
+                            "authorization_servers": [server_base]
+                        })
+                        .to_string(),
+                    )
+                } else if path.contains(".well-known") {
+                    (
+                        "200 OK",
+                        json!({
+                            "issuer": server_base,
+                            "authorization_endpoint": format!("{server_base}/authorize"),
+                            "token_endpoint": format!("{server_base}/token"),
+                            "response_types_supported": ["code"],
+                            "code_challenge_methods_supported": ["S256"]
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("404 Not Found", "{}".into())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                if is_refresh {
+                    break;
+                }
+            }
+        });
+        (base, server)
+    }
+
+    #[tokio::test]
+    async fn restore_only_reauthorizes_for_definitive_refresh_rejection() {
+        for (status, body, reauthorize) in [
+            ("400 Bad Request", r#"{"error":"invalid_grant"}"#, true),
+            (
+                "400 Bad Request",
+                r#"{"error":"temporarily_unavailable"}"#,
+                false,
+            ),
+            (
+                "503 Service Unavailable",
+                r#"{"error":"server_error"}"#,
+                false,
+            ),
+            ("200 OK", r#"{"unexpected":"token response"}"#, false),
+        ] {
+            let (base, server) = refresh_error_server(status, body, None).await;
+            let resource = format!("{base}/mcp");
+            let directory = tempfile::tempdir().unwrap();
+            let storage = CredentialStorage::Filesystem(directory.path().to_path_buf());
+            let config = Config::default();
+            let entry = storage.entry(
+                "mcp-oauth",
+                &credential_identity(&resource, &config).unwrap(),
+            );
+            let original =
+                serde_json::to_vec(&refresh_credentials("old-access", "old-refresh", 0)).unwrap();
+            entry.save(&original).unwrap();
+
+            let result = restore(&resource, &config, &storage).await;
+            server.await.unwrap();
+            if reauthorize {
+                assert!(matches!(result, Ok(None)), "{status}: {body}");
+            } else {
+                assert!(result.is_err(), "{status}: {body}");
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .contains("could not restore OAuth access token")
+                );
+            }
+            assert_eq!(
+                entry.load().unwrap().unwrap().as_slice(),
+                original.as_slice(),
+                "{status}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_preserves_credentials_saved_while_request_was_in_flight() {
+        let store = InMemoryCredentialStore::new();
+        store
+            .save(refresh_credentials("old-access", "old-refresh", 0))
+            .await
+            .unwrap();
+        // Use the real store API at the HTTP boundary to model another writer
+        // advancing credentials before the rejected request completes.
+        let newer = refresh_credentials("new-access", "new-refresh", u64::MAX);
+        let (base, server) = refresh_error_server(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant"}"#,
+            Some((store.clone(), newer.clone())),
+        )
+        .await;
+        let mut manager = AuthorizationManager::new(format!("{base}/mcp"))
+            .await
+            .unwrap();
+        let metadata: AuthorizationMetadata = serde_json::from_value(json!({
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token")
+        }))
+        .unwrap();
+        manager.set_metadata(metadata);
+        manager.set_credential_store(store.clone());
+        assert!(manager.initialize_from_store().await.unwrap());
+
+        assert!(matches!(
+            manager.refresh_token().await,
+            Err(AuthError::TokenRefreshRejected(_))
+        ));
+        server.await.unwrap();
+        assert_eq!(
+            serde_json::to_value(store.load().await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(newer).unwrap()
+        );
+        assert_eq!(manager.get_access_token().await.unwrap(), "new-access");
     }
 
     #[tokio::test]

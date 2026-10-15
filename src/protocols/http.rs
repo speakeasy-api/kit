@@ -536,6 +536,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a2a_empty_text_returns_failed_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let mut server = start(runtime, "127.0.0.1:0".into(), true, false, None)
+            .await
+            .unwrap();
+        // The advertised agent URL is the root, not an invented /rpc route.
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/", server.address()))
+            .header("A2A-Version", "1.0")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "empty-text",
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "messageId": "empty-text-message",
+                        "role": "ROLE_USER",
+                        "parts": [{ "text": " \n\t" }]
+                    },
+                    "configuration": {
+                        "acceptedOutputModes": ["text/plain"],
+                        "returnImmediately": false
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        server.shutdown();
+        server.join().await.unwrap();
+
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], "empty-text", "unexpected response: {body}");
+        assert!(body.get("error").is_none(), "unexpected RPC error: {body}");
+        let task = &body["result"]["task"];
+        assert!(task["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(task["status"]["state"], "TASK_STATE_FAILED");
+        assert_eq!(task["artifacts"][0]["artifactId"], "error");
+        assert_eq!(
+            task["artifacts"][0]["parts"][0]["text"],
+            "A2A request must contain a text part"
+        );
+    }
+
+    #[tokio::test]
+    async fn a2a_rejects_explicit_unsupported_media_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::Runtime::new(directory.path(), "gpt-5.4").unwrap();
+        let mut server = start(runtime, "127.0.0.1:0".into(), true, false, None)
+            .await
+            .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/", server.address()))
+            .header("A2A-Version", "1.0")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "unsupported-media",
+                "method": "SendMessage",
+                "params": {
+                    "message": {
+                        "messageId": "unsupported-media-message",
+                        "role": "ROLE_USER",
+                        // Whitespace also keeps this request model-free if validation regresses.
+                        "parts": [{ "text": " ", "mediaType": "image/png" }]
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        server.shutdown();
+        server.join().await.unwrap();
+
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(
+            body["id"], "unsupported-media",
+            "unexpected response: {body}"
+        );
+        assert_eq!(body["error"]["code"], -32005, "unexpected response: {body}");
+        assert!(body.get("result").is_none());
+    }
+
+    #[tokio::test]
     async fn ready_stop_preempts_queued_accept_and_empty_drain_waits_for_shutdown() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
