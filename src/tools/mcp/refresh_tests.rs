@@ -19,6 +19,7 @@ struct PeerState {
     gates: VecDeque<(oneshot::Receiver<()>, oneshot::Sender<()>)>,
     modern: bool,
     listen_error: Option<i64>,
+    resource_subscriptions: std::collections::BTreeSet<String>,
 }
 
 pub(crate) struct Peer {
@@ -50,6 +51,7 @@ impl Peer {
             gates: VecDeque::new(),
             modern,
             listen_error: None,
+            resource_subscriptions: Default::default(),
         }));
         let (notifications, _) = broadcast::channel(32);
         let connected = Arc::new(Notify::new());
@@ -244,7 +246,16 @@ async fn serve(
         "resources/read" => {
             json!({"contents":[{"uri":request["params"]["uri"],"mimeType":"text/plain","text":"Hello from the subscribed resource"}]})
         }
-        "resources/subscribe" | "resources/unsubscribe" => json!({}),
+        "resources/subscribe" | "resources/unsubscribe" => {
+            let uri = request["params"]["uri"].as_str().unwrap().to_owned();
+            let mut state = state.lock().await;
+            if request["method"] == "resources/subscribe" {
+                state.resource_subscriptions.insert(uri);
+            } else {
+                state.resource_subscriptions.remove(&uri);
+            }
+            json!({})
+        }
         "tools/list" => {
             let (tools, fail, gate) = {
                 let mut state = state.lock().await;
@@ -777,4 +788,59 @@ async fn live_pinned_sdk_discovery() {
             .iter()
             .any(|server| server["status"] == "authenticated")
     );
+}
+
+#[tokio::test]
+async fn retired_session_unsubscribes_replayed_legacy_resources() {
+    let directory = tempfile::tempdir().unwrap();
+    let peer = Peer::new(vec![]).await;
+    let runtime = runtime(&directory.path().join("mcp.json"), &[("remote", &peer)]).await;
+    let events = runtime.subscribe("refresh-test".into()).unwrap();
+    let tool = subscriptions::McpSubscriptionTool::new(runtime.clone());
+    invoke_discovery(
+        &tool,
+        json!({"operation":"subscribe","server":"remote",
+        "notifications":{"resourceSubscriptions":["test://messages"]}}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        peer.state
+            .lock()
+            .await
+            .resource_subscriptions
+            .contains("test://messages")
+    );
+    let connection = runtime
+        .inner
+        .manager
+        .lock()
+        .await
+        .connected_server(&McpServerId::new("remote"))
+        .unwrap()
+        .connection();
+    let epoch = connection.connection_epoch();
+    // The existing operation gate holds reconciliation while the SDK replaces
+    // its transport and replays URIs. Retire the session before releasing it.
+    let gate = runtime.operation_gate("remote").await;
+    let exclusive = gate.write().await;
+    connection
+        .resolve_auth(AuthResolution::Cancelled {
+            request: connect_auth_request("remote"),
+        })
+        .await
+        .unwrap();
+    assert!(connection.connection_epoch() > epoch);
+    assert!(connection.subscription_status().await.is_none());
+    drop(events);
+    drop(exclusive);
+    eventually(async || peer.state.lock().await.resource_subscriptions.is_empty()).await;
+    // Cleanup must also remove SDK desired state, not just the server's watch.
+    connection
+        .resolve_auth(AuthResolution::Cancelled {
+            request: connect_auth_request("remote"),
+        })
+        .await
+        .unwrap();
+    assert!(peer.state.lock().await.resource_subscriptions.is_empty());
 }

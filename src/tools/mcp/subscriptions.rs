@@ -274,8 +274,17 @@ async fn run(weak: Weak<Inner>, server: String, mut commands: mpsc::Receiver<Com
         };
         if replaced {
             epoch = next.as_ref().map(|c| c.connection_epoch());
+            // The SDK replays committed URIs when this same connection
+            // changes epoch, including on legacy transports without status.
+            // Retain ownership so retired sessions can still unsubscribe them.
+            if !current
+                .as_ref()
+                .zip(next.as_ref())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+            {
+                applied.clear();
+            }
             current = next;
-            applied.clear();
             events = current.as_ref().map(|c| c.subscribe_events());
             status = match &current {
                 Some(c) => c.subscription_changes().await,
