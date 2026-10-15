@@ -6339,9 +6339,7 @@ pub(super) mod tests {
 
         test_mcp.publish(
             &acp_session_id.to_string(),
-            crate::tools::mcp::McpEvent {
-                message: "MCP server linear connected".into(),
-            },
+            crate::tools::mcp::McpEvent::notification("MCP server linear connected"),
         );
         let mcp_started = turn_states_rx.recv().await.expect("missing MCP turn start");
         let mcp_ended = turn_states_rx.recv().await.expect("missing MCP turn end");
@@ -7061,3 +7059,6 @@ pub(super) mod tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+mod subscription_tests;

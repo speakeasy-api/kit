@@ -42,9 +42,9 @@ use crate::{
         ModelSelection, ProviderKind, ReasoningEffort, SelectableAdapter, SelectableSession,
     },
     tools::{
-        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool, McpTool,
-        Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool, Subagents, SubagentsTool,
-        ToolSchema, ToolSearch, observe_shared,
+        A2aTool, ArtifactTool, AuthTool, CloseTool, DocsTool, EditTool, ForkTool,
+        McpSubscriptionTool, McpTool, Observed, PromptTool, ReadFileTool, ShellTool, SubagentTool,
+        Subagents, SubagentsTool, ToolSchema, ToolSearch, observe_shared,
     },
 };
 
@@ -1253,6 +1253,7 @@ impl Runtime {
                 crate::artifacts::base(&self.root),
             )))
             .register(Observed::new(AuthTool::new(mcp.clone())))
+            .register(Observed::new(McpSubscriptionTool::new(mcp.clone())))
             .register(Observed::new(McpTool::new(mcp)));
         if let Some(skill_tool) = &self.dynamic_skill_tool {
             children.register(observe_shared(Arc::clone(skill_tool)));

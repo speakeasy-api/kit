@@ -111,6 +111,10 @@ An explicit `auth` block is an optional fallback or override. Set `auth.type` to
 
 ## Discover, authenticate, and call MCP tools
 
+Kit subscribes to catalog changes from connected servers and refreshes their tools in the background. Servers using MCP 2026-07-28 use acknowledged notification subscriptions; older servers retain their legacy notification path. A tool can be added, removed, or given a new input schema without restarting Kit or editing its configuration. Modern server entries include a `subscription` diagnostic with its state and, while active, the requested and acknowledged filters. A partial acknowledgment means only the accepted notifications will trigger updates.
+
+Search and schema lookup use the last successfully published catalog while a refresh is pending. A server entry reports `catalog_stale: true` during that gap, and `catalog_error` if its last refresh failed. Kit retains the last usable tools and retries failed refreshes automatically. After a changed schema is published, request a new schema reference through `tool_search`; a reference to the previous schema no longer resolves. Routine catalog notifications do not start an assistant turn.
+
 MCP tools are model-visible through four meta-tools rather than as an unrestricted static list. The expected workflow is:
 
 1. Call `tool_search({ query: "issues" })`. The search reloads the configuration, waits for any servers that are still initializing, then ranks every connected server's tools globally with high precision: a tool must match the query in its name or match every query term. At most 5 tools are returned across all servers—often fewer—sorted by score and grouped by server with `available_tool_count`, `matched_tool_count`, `returned_tool_count`, and `truncated`, plus top-level `total_matched`, `total_returned`, and `truncated`. Responses are capped at 32 KiB by dropping lowest-ranked status-only server groups before lowest-ranked tools; the counts show when that happened. A server whose name strongly matches the query but which needs authentication or failed to connect is listed without tools. Use the exact query `tool_search({ query: "mcp" })` (case-insensitive) for a compact configured-server listing—name, bounded description, status, bounded optional error, and `available_tool_count` (`null` unless connected)—without any tool schemas. Compact listings drop tail servers when necessary and report `total_servers`, `returned_servers`, and `truncated`.
@@ -120,6 +124,24 @@ MCP tools are model-visible through four meta-tools rather than as an unrestrict
 5. Invoke only a returned MCP tool name: `tool({ name: "returned_tool_name", args: { ... } })`. `args` must be an object matching that tool's advertised input schema. Calls have a 60-second deadline by default. Set the optional `timeout_seconds` field from 1 through 3600 only when the tool is expected to return after that default; for example, `tool({ name: "returned_tool_name", args: { ... }, timeout_seconds: 300 })`.
 
 A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. A missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
+
+## Session-owned subscriptions
+
+Use `mcp_subscription` to watch server resources or catalogs for the current live session. Supported operations are `subscribe`, `status`, `unsubscribe`, `list_resources`, and `read_resource`; each takes a configured `server` name. The session identity comes from Kit, not tool arguments.
+
+Subscribe before reading initial state. For example, if the server exposes `messages://inbox`:
+
+```json
+{"operation":"subscribe","server":"messages","notifications":{"resourceSubscriptions":["messages://inbox"]}}
+```
+
+Inspect the returned `requested` and `acknowledged` filters, then call `read_resource` with the same server and URI. The other filters are `toolsListChanged`, `resourcesListChanged`, and `promptsListChanged`. A new `subscribe` replaces this session's filter for that server.
+
+Matching notifications wake an idle ACP session through its existing autonomous-turn route; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
+
+`unsubscribe` removes this session's interest and invalidates queued subscription notifications. Shared resource URIs remain subscribed while another session needs them. Closing the session retires its interests; subscriptions do not persist across Kit restarts or completed one-shot prompts. Each session can watch at most 32 resource URIs per server, with a maximum URI length of 4096 bytes.
+
+Servers that reject modern `subscriptions/listen` with Method Not Found can still provide ordinary tools. Resource subscription requests fail explicitly rather than silently succeeding.
 
 ## Interactive OAuth availability
 

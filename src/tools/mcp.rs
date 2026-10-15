@@ -1,5 +1,17 @@
 mod auth;
 mod credentials;
+mod refresh;
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+pub(crate) mod refresh_tests;
+mod subscriptions;
+pub use subscriptions::McpSubscriptionTool;
 mod schema;
 pub use schema::ToolSchema;
 
@@ -41,7 +53,7 @@ const SEARCH_MIN_SCORE: u32 = 60;
 const SEARCH_RESULT_BYTE_CAP: usize = 32_768;
 const SEARCH_SERVER_TEXT_BYTE_CAP: usize = 1_024;
 const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3_600;
-// These messages are part of the pinned agentkit-mcp 0.10.6 adapter contract.
+// These messages are part of the pinned agentkit-mcp 0.11.0 adapter contract.
 // Revalidate them before upgrading that dependency.
 const AGENTKIT_REPLAY_REJECTED: &str = "MCP auth challenge unresolved after retry";
 const AGENTKIT_RESPONDER_FAILED: &str = "auth responder failed:";
@@ -134,6 +146,8 @@ pub struct McpRuntime {
 struct Inner {
     healthy: Arc<AtomicBool>,
     manager: Mutex<McpServerManager>,
+    refresh: refresh::Refresh,
+    subscriptions: subscriptions::Subscriptions,
     catalog: CatalogReader,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
@@ -161,6 +175,9 @@ struct ServerRecord {
     static_authorization: bool,
     fingerprint: Vec<u8>,
     plugin_owned: bool,
+    catalog_stale: bool,
+    catalog_error: Option<String>,
+    subscription: Option<Value>,
     status: ServerStatus,
 }
 
@@ -787,6 +804,16 @@ impl OAuthSession {
 #[derive(Clone, Debug)]
 pub(crate) struct McpEvent {
     pub message: String,
+    delivery: Option<Arc<subscriptions::Delivery>>,
+}
+
+impl McpEvent {
+    pub(crate) fn notification(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            delivery: None,
+        }
+    }
 }
 
 pub(crate) struct McpSubscription {
@@ -794,11 +821,21 @@ pub(crate) struct McpSubscription {
     generation: u64,
     routes: EventRoutes,
     receiver: mpsc::UnboundedReceiver<McpEvent>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl McpSubscription {
     pub(crate) async fn recv(&mut self) -> Option<McpEvent> {
-        self.receiver.recv().await
+        while let Some(event) = self.receiver.recv().await {
+            if event
+                .delivery
+                .as_ref()
+                .is_none_or(|delivery| delivery.consume())
+            {
+                return Some(event);
+            }
+        }
+        None
     }
 }
 
@@ -819,6 +856,7 @@ impl Drop for McpSubscription {
             None
         };
         drop(retired);
+        self.changed.notify_waiters();
     }
 }
 
@@ -1139,6 +1177,9 @@ fn prepare_server(
                     static_authorization: false,
                     fingerprint,
                     plugin_owned: false,
+                    catalog_stale: false,
+                    catalog_error: None,
+                    subscription: None,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -1175,6 +1216,9 @@ fn prepare_server(
                     static_authorization,
                     fingerprint,
                     plugin_owned: false,
+                    catalog_stale: false,
+                    catalog_error: None,
+                    subscription: None,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -1398,6 +1442,9 @@ fn prepare_plugins(
                         static_authorization,
                         fingerprint,
                         plugin_owned: true,
+                        catalog_stale: false,
+                        catalog_error: None,
+                        subscription: None,
                         status: ServerStatus::Uninitialized,
                     },
                 },
@@ -1708,6 +1755,8 @@ impl McpRuntime {
             inner: Arc::new(Inner {
                 healthy,
                 manager: Mutex::new(manager),
+                refresh: refresh::Refresh::default(),
+                subscriptions: subscriptions::Subscriptions::default(),
                 catalog,
                 servers,
                 challenges,
@@ -1883,6 +1932,7 @@ impl McpRuntime {
             generation,
             routes,
             receiver,
+            changed: self.inner.subscriptions.changed.clone(),
         };
         let retired = {
             let mut routes = subscription
@@ -1893,6 +1943,7 @@ impl McpRuntime {
         };
         // Dropping a sender can wake a receiver. Never do it under the map lock.
         drop(retired);
+        self.inner.subscriptions.changed.notify_waiters();
         Ok(subscription)
     }
 
@@ -1946,6 +1997,7 @@ impl McpRuntime {
                 .inner
                 .reload_epoch
                 .store(current.wrapping_add(1), Ordering::Release);
+            runtime.inner.subscriptions.changed.notify_waiters();
             result
         })
         .await
@@ -2166,6 +2218,7 @@ impl McpRuntime {
     /// settle concurrently. Never starts interactive authorization.
     async fn initialize_servers(&self, names: &[String]) -> Result<(), String> {
         self.ensure_healthy()?;
+        refresh::start(&self.inner);
         let _initialization = self.inner.initialization.lock().await;
         let records = {
             let servers = self.inner.servers.read().await;
@@ -2352,8 +2405,9 @@ impl McpRuntime {
         self.initialize_uninitialized()
             .await
             .map_err(ToolError::Unavailable)?;
-        let records = self.inner.servers.read().await.clone();
+        let mut records = self.inner.servers.read().await.clone();
         let manager = self.inner.manager.lock().await;
+        refresh::annotate(&self.inner, &manager, &mut records).await;
         let available = records
             .keys()
             .filter_map(|name| {
@@ -2362,7 +2416,17 @@ impl McpRuntime {
                     .map(|handle| (name.clone(), handle.tool_registry().specs()))
             })
             .collect();
+        let connections = manager
+            .connected_servers()
+            .into_iter()
+            .map(|handle| (handle.server_id().to_string(), handle.connection()))
+            .collect::<Vec<_>>();
         drop(manager);
+        for (name, connection) in connections {
+            if let Some(record) = records.get_mut(&name) {
+                record.subscription = refresh::subscription_status(&connection).await;
+            }
+        }
         Ok((records, available))
     }
 
@@ -2798,7 +2862,11 @@ impl McpRuntime {
                 format!("MCP server {server} failed to commit authentication: {error}"),
             ),
         };
-        self.publish_to(&session_id, event_generation, McpEvent { message });
+        self.publish_to(
+            &session_id,
+            event_generation,
+            McpEvent::notification(message),
+        );
         settled
     }
 
@@ -2903,6 +2971,7 @@ impl McpRuntime {
         drop(sessions);
         drop(challenges);
         drop((retired_challenges, retired_sessions, retired_status));
+        self.inner.subscriptions.changed.notify_waiters();
         Ok(())
     }
 }
@@ -2987,6 +3056,9 @@ impl ToolSearch {
                                                         Value::from("string"),
                                                     )])),
                                                 ),
+                                                ("catalog_stale".into(), Value::Object(Map::from_iter([("type".into(), "boolean".into())]))),
+                                                ("catalog_error".into(), Value::Object(Map::from_iter([("type".into(), "string".into())]))),
+                                                ("subscription".into(), refresh::subscription_schema()),
                                                 (
                                                     "available_tool_count".into(),
                                                     Value::Object(Map::from_iter([(
@@ -3908,6 +3980,7 @@ fn render_search_scoped(
                             .unwrap_or(Value::Null),
                     ),
                 ]));
+                refresh::render_diagnostics(&mut entry, record);
                 if let Some(error) = record.status.error() {
                     entry["error"] = Value::String(bounded_server_text(error).into());
                 }
@@ -4025,6 +4098,7 @@ fn render_search_scoped(
             ("truncated".into(), Value::from(tools.len() < matched_count)),
             ("tools".into(), Value::Array(tools)),
         ]));
+        refresh::render_diagnostics(&mut group, record);
         if let Some(error) = record.status.error() {
             group["error"] = Value::String(bounded_server_text(error).into());
         }
@@ -4364,6 +4438,9 @@ mod tests {
             static_authorization: false,
             fingerprint: vec![1],
             plugin_owned: false,
+            catalog_stale: false,
+            catalog_error: None,
+            subscription: None,
             status: ServerStatus::Connected,
         }
     }
@@ -6326,6 +6403,9 @@ mod tests {
             static_authorization: false,
             fingerprint: vec![1],
             plugin_owned: false,
+            catalog_stale: false,
+            catalog_error: None,
+            subscription: None,
             status,
         }
     }
@@ -7005,8 +7085,11 @@ for line in sys.stdin:
     if 'id' not in request:
         continue
     method = request['method']
+    if method == 'server/discover':
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'Legacy fixture'}}), flush=True)
+        continue
     if method == 'initialize':
-        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
+        result = {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
     elif method == 'tools/list':
         with open(sys.argv[1]) as catalog:
             result = {'tools': json.load(catalog)}
@@ -7300,8 +7383,11 @@ for line in sys.stdin:
     if 'id' not in request:
         continue
     method = request['method']
+    if method == 'server/discover':
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'Legacy fixture'}}), flush=True)
+        continue
     if method == 'initialize':
-        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
+        result = {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
     elif method == 'tools/list':
         result = {'tools': [{'name': 'inspect', 'description': 'Inspect session environment', 'inputSchema': {'type': 'object'}}]}
     elif method == 'tools/call':
@@ -8268,6 +8354,7 @@ for line in sys.stdin:
             "session",
             generation,
             super::McpEvent {
+                delivery: None,
                 message: "still owned".into(),
             },
         );
@@ -8295,6 +8382,7 @@ for line in sys.stdin:
             "session",
             Some(generation),
             super::McpEvent {
+                delivery: None,
                 message: "fenced".into(),
             },
         );
@@ -8373,6 +8461,7 @@ for line in sys.stdin:
             "session",
             stale,
             super::McpEvent {
+                delivery: None,
                 message: "stale".into(),
             },
         );
@@ -8384,6 +8473,7 @@ for line in sys.stdin:
             "session",
             runtime.event_generation("session"),
             super::McpEvent {
+                delivery: None,
                 message: "replacement".into(),
             },
         );
@@ -8401,6 +8491,7 @@ for line in sys.stdin:
             "first",
             runtime.event_generation("first"),
             super::McpEvent {
+                delivery: None,
                 message: "connected".into(),
             },
         );
@@ -8418,6 +8509,7 @@ for line in sys.stdin:
             "first",
             generation,
             super::McpEvent {
+                delivery: None,
                 message: "stale callback".into(),
             },
         );
