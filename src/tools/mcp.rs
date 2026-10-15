@@ -1,5 +1,15 @@
 mod auth;
 mod credentials;
+mod refresh;
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
+mod refresh_tests;
 mod schema;
 pub use schema::ToolSchema;
 
@@ -41,7 +51,7 @@ const SEARCH_MIN_SCORE: u32 = 60;
 const SEARCH_RESULT_BYTE_CAP: usize = 32_768;
 const SEARCH_SERVER_TEXT_BYTE_CAP: usize = 1_024;
 const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3_600;
-// These messages are part of the pinned agentkit-mcp 0.10.6 adapter contract.
+// These messages are part of the pinned agentkit-mcp 0.11.0 adapter contract.
 // Revalidate them before upgrading that dependency.
 const AGENTKIT_REPLAY_REJECTED: &str = "MCP auth challenge unresolved after retry";
 const AGENTKIT_RESPONDER_FAILED: &str = "auth responder failed:";
@@ -134,6 +144,7 @@ pub struct McpRuntime {
 struct Inner {
     healthy: Arc<AtomicBool>,
     manager: Mutex<McpServerManager>,
+    refresh: refresh::Refresh,
     catalog: CatalogReader,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
@@ -161,6 +172,9 @@ struct ServerRecord {
     static_authorization: bool,
     fingerprint: Vec<u8>,
     plugin_owned: bool,
+    catalog_stale: bool,
+    catalog_error: Option<String>,
+    subscription: Option<Value>,
     status: ServerStatus,
 }
 
@@ -1139,6 +1153,9 @@ fn prepare_server(
                     static_authorization: false,
                     fingerprint,
                     plugin_owned: false,
+                    catalog_stale: false,
+                    catalog_error: None,
+                    subscription: None,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -1175,6 +1192,9 @@ fn prepare_server(
                     static_authorization,
                     fingerprint,
                     plugin_owned: false,
+                    catalog_stale: false,
+                    catalog_error: None,
+                    subscription: None,
                     status: ServerStatus::Uninitialized,
                 },
             ))
@@ -1398,6 +1418,9 @@ fn prepare_plugins(
                         static_authorization,
                         fingerprint,
                         plugin_owned: true,
+                        catalog_stale: false,
+                        catalog_error: None,
+                        subscription: None,
                         status: ServerStatus::Uninitialized,
                     },
                 },
@@ -1708,6 +1731,7 @@ impl McpRuntime {
             inner: Arc::new(Inner {
                 healthy,
                 manager: Mutex::new(manager),
+                refresh: refresh::Refresh::default(),
                 catalog,
                 servers,
                 challenges,
@@ -2166,6 +2190,7 @@ impl McpRuntime {
     /// settle concurrently. Never starts interactive authorization.
     async fn initialize_servers(&self, names: &[String]) -> Result<(), String> {
         self.ensure_healthy()?;
+        refresh::start(&self.inner);
         let _initialization = self.inner.initialization.lock().await;
         let records = {
             let servers = self.inner.servers.read().await;
@@ -2352,8 +2377,9 @@ impl McpRuntime {
         self.initialize_uninitialized()
             .await
             .map_err(ToolError::Unavailable)?;
-        let records = self.inner.servers.read().await.clone();
+        let mut records = self.inner.servers.read().await.clone();
         let manager = self.inner.manager.lock().await;
+        refresh::annotate(&self.inner, &manager, &mut records).await;
         let available = records
             .keys()
             .filter_map(|name| {
@@ -2362,7 +2388,17 @@ impl McpRuntime {
                     .map(|handle| (name.clone(), handle.tool_registry().specs()))
             })
             .collect();
+        let connections = manager
+            .connected_servers()
+            .into_iter()
+            .map(|handle| (handle.server_id().to_string(), handle.connection()))
+            .collect::<Vec<_>>();
         drop(manager);
+        for (name, connection) in connections {
+            if let Some(record) = records.get_mut(&name) {
+                record.subscription = refresh::subscription_status(&connection).await;
+            }
+        }
         Ok((records, available))
     }
 
@@ -3908,6 +3944,7 @@ fn render_search_scoped(
                             .unwrap_or(Value::Null),
                     ),
                 ]));
+                refresh::render_diagnostics(&mut entry, record);
                 if let Some(error) = record.status.error() {
                     entry["error"] = Value::String(bounded_server_text(error).into());
                 }
@@ -4025,6 +4062,7 @@ fn render_search_scoped(
             ("truncated".into(), Value::from(tools.len() < matched_count)),
             ("tools".into(), Value::Array(tools)),
         ]));
+        refresh::render_diagnostics(&mut group, record);
         if let Some(error) = record.status.error() {
             group["error"] = Value::String(bounded_server_text(error).into());
         }
@@ -4364,6 +4402,9 @@ mod tests {
             static_authorization: false,
             fingerprint: vec![1],
             plugin_owned: false,
+            catalog_stale: false,
+            catalog_error: None,
+            subscription: None,
             status: ServerStatus::Connected,
         }
     }
@@ -6326,6 +6367,9 @@ mod tests {
             static_authorization: false,
             fingerprint: vec![1],
             plugin_owned: false,
+            catalog_stale: false,
+            catalog_error: None,
+            subscription: None,
             status,
         }
     }
@@ -7005,8 +7049,11 @@ for line in sys.stdin:
     if 'id' not in request:
         continue
     method = request['method']
+    if method == 'server/discover':
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'Legacy fixture'}}), flush=True)
+        continue
     if method == 'initialize':
-        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
+        result = {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'schema-fixture', 'version': '1'}}
     elif method == 'tools/list':
         with open(sys.argv[1]) as catalog:
             result = {'tools': json.load(catalog)}
@@ -7300,8 +7347,11 @@ for line in sys.stdin:
     if 'id' not in request:
         continue
     method = request['method']
+    if method == 'server/discover':
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'Legacy fixture'}}), flush=True)
+        continue
     if method == 'initialize':
-        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
+        result = {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'session-fixture', 'version': '1'}}
     elif method == 'tools/list':
         result = {'tools': [{'name': 'inspect', 'description': 'Inspect session environment', 'inputSchema': {'type': 'object'}}]}
     elif method == 'tools/call':
