@@ -132,6 +132,59 @@ pub(super) async fn subscription_status(connection: &McpConnection) -> Option<se
     Some(Value::Object(value))
 }
 
+/// Keep Runlet's closed tool output contract in step with the diagnostics.
+pub(super) fn subscription_schema() -> serde_json::Value {
+    use serde_json::{Map, Value};
+    fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
+        Value::Object(Map::from_iter(
+            fields.into_iter().map(|(key, value)| (key.into(), value)),
+        ))
+    }
+    fn typed(kind: &str) -> Value {
+        object([("type", kind.into())])
+    }
+    let filter = object([
+        ("type", "object".into()),
+        (
+            "properties",
+            object([
+                ("toolsListChanged", typed("boolean")),
+                ("promptsListChanged", typed("boolean")),
+                ("resourcesListChanged", typed("boolean")),
+                (
+                    "resourceSubscriptions",
+                    object([("type", "array".into()), ("items", typed("string"))]),
+                ),
+            ]),
+        ),
+        ("additionalProperties", false.into()),
+    ]);
+    object([
+        ("type", "object".into()),
+        (
+            "properties",
+            object([
+                (
+                    "state",
+                    object([
+                        ("type", "string".into()),
+                        (
+                            "enum",
+                            Value::Array(vec!["pending".into(), "active".into(), "closed".into()]),
+                        ),
+                    ]),
+                ),
+                ("requested", filter.clone()),
+                ("acknowledged", filter),
+                ("graceful", typed("boolean")),
+                ("error", typed("string")),
+            ]),
+        ),
+        ("required", Value::Array(vec!["state".into()])),
+        ("additionalProperties", false.into()),
+    ])
+}
+
 pub(super) fn render_diagnostics(output: &mut serde_json::Value, record: &ServerRecord) {
     if let Some(subscription) = &record.subscription {
         output["subscription"] = subscription.clone();

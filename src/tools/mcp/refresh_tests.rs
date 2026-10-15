@@ -243,6 +243,14 @@ async fn serve(
     .await;
 }
 
+fn validate_search(runtime: &McpRuntime, response: &Value) {
+    let tool = ToolSearch::new(runtime.clone(), std::env::temp_dir());
+    jsonschema::validator_for(tool.spec.output_schema.as_ref().unwrap())
+        .unwrap()
+        .validate(response)
+        .unwrap();
+}
+
 fn tool(name: &str, kind: &str) -> Value {
     json!({"name":name,"description":format!("{name} fixture"),"inputSchema":{"type":"object","properties":{"value":{"type":kind}}}})
 }
@@ -330,6 +338,8 @@ async fn modern_and_legacy_notifications_publish_add_remove_and_schema_changes()
         let found = runtime.search("beta").await.unwrap();
         assert_eq!(found["servers"][0]["tools"][0]["name"], "mcp_remote_beta");
         let status = runtime.search("mcp").await.unwrap();
+        validate_search(&runtime, &found);
+        validate_search(&runtime, &status);
         if modern {
             let subscription = &status["servers"][0]["subscription"];
             assert_eq!(subscription["state"], "active");
@@ -354,6 +364,7 @@ async fn failed_refresh_retains_last_good_catalog_and_retries_without_new_notifi
     .await;
     eventually(async || {
         let found = runtime.search("mcp").await.unwrap();
+        validate_search(&runtime, &found);
         found["servers"][0]["catalog_stale"] == true
             && found["servers"][0]["catalog_error"].is_string()
     })

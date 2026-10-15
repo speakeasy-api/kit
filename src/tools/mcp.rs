@@ -3023,6 +3023,9 @@ impl ToolSearch {
                                                         Value::from("string"),
                                                     )])),
                                                 ),
+                                                ("catalog_stale".into(), Value::Object(Map::from_iter([("type".into(), "boolean".into())]))),
+                                                ("catalog_error".into(), Value::Object(Map::from_iter([("type".into(), "string".into())]))),
+                                                ("subscription".into(), refresh::subscription_schema()),
                                                 (
                                                     "available_tool_count".into(),
                                                     Value::Object(Map::from_iter([(
