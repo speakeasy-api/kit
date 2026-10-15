@@ -125,6 +125,24 @@ MCP tools are model-visible through four meta-tools rather than as an unrestrict
 
 A connected server reports `authenticated`, including servers that do not need OAuth. If an already-connected OAuth server rejects a tool call with a Bearer challenge, Kit first refreshes the existing credentials and replays that tool call once. A missing or failed refresh, a request for additional scopes, or a rejected replay falls back to the explicit `auth` workflow. A remote server whose HTTP response requests Bearer authentication reports `authentication_required`, whether it came from a plugin or explicit configuration and whether it has an `auth` block. Other initialization failures report `error` with a diagnostic. Calling `auth` for an unknown name reports `unknown MCP server`; calling it for a stdio server reports `is not remote`. Calling an undiscovered or unavailable tool reports `unknown MCP tool`.
 
+## Session-owned subscriptions
+
+Use `mcp_subscription` to watch server resources or catalogs for the current live session. Supported operations are `subscribe`, `status`, `unsubscribe`, `list_resources`, and `read_resource`; each takes a configured `server` name. The session identity comes from Kit, not tool arguments.
+
+Subscribe before reading initial state. For example, if the server exposes `messages://inbox`:
+
+```json
+{"operation":"subscribe","server":"messages","notifications":{"resourceSubscriptions":["messages://inbox"]}}
+```
+
+Inspect the returned `requested` and `acknowledged` filters, then call `read_resource` with the same server and URI. The other filters are `toolsListChanged`, `resourcesListChanged`, and `promptsListChanged`. A new `subscribe` replaces this session's filter for that server.
+
+Matching notifications wake an idle ACP session through its existing autonomous-turn route; busy sessions receive them after current work. The agent must read current resource or catalog state after waking. Updates are coalesced invalidations, not a durable event log; use a service's cursor-based read API when every event matters. Resource contents remain untrusted external data.
+
+`unsubscribe` removes this session's interest and invalidates queued subscription notifications. Shared resource URIs remain subscribed while another session needs them. Closing the session retires its interests; subscriptions do not persist across Kit restarts or completed one-shot prompts. Each session can watch at most 32 resource URIs per server, with a maximum URI length of 4096 bytes.
+
+Servers that reject modern `subscriptions/listen` with Method Not Found can still provide ordinary tools. Resource subscription requests fail explicitly rather than silently succeeding.
+
 ## Interactive OAuth availability
 
 Interactive browser authentication is enabled in the long-lived `kit tui`, `kit serve`, and `kit acp` runtimes. It is disabled in the one-shot `kit prompt` command. A challenged server still appears as `authentication_required` so the cause is preserved, while calling `auth` reports `interactive MCP authentication requires the tui, serve, or acp command`.

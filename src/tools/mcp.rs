@@ -9,7 +9,9 @@ mod refresh;
     clippy::disallowed_methods,
     clippy::disallowed_macros
 )]
-mod refresh_tests;
+pub(crate) mod refresh_tests;
+mod subscriptions;
+pub use subscriptions::McpSubscriptionTool;
 mod schema;
 pub use schema::ToolSchema;
 
@@ -145,6 +147,7 @@ struct Inner {
     healthy: Arc<AtomicBool>,
     manager: Mutex<McpServerManager>,
     refresh: refresh::Refresh,
+    subscriptions: subscriptions::Subscriptions,
     catalog: CatalogReader,
     servers: Arc<RwLock<BTreeMap<String, ServerRecord>>>,
     challenges: Arc<Mutex<BTreeMap<String, AuthRequest>>>,
@@ -801,6 +804,16 @@ impl OAuthSession {
 #[derive(Clone, Debug)]
 pub(crate) struct McpEvent {
     pub message: String,
+    delivery: Option<Arc<subscriptions::Delivery>>,
+}
+
+impl McpEvent {
+    pub(crate) fn notification(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            delivery: None,
+        }
+    }
 }
 
 pub(crate) struct McpSubscription {
@@ -808,11 +821,21 @@ pub(crate) struct McpSubscription {
     generation: u64,
     routes: EventRoutes,
     receiver: mpsc::UnboundedReceiver<McpEvent>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl McpSubscription {
     pub(crate) async fn recv(&mut self) -> Option<McpEvent> {
-        self.receiver.recv().await
+        while let Some(event) = self.receiver.recv().await {
+            if event
+                .delivery
+                .as_ref()
+                .is_none_or(|delivery| delivery.consume())
+            {
+                return Some(event);
+            }
+        }
+        None
     }
 }
 
@@ -833,6 +856,7 @@ impl Drop for McpSubscription {
             None
         };
         drop(retired);
+        self.changed.notify_waiters();
     }
 }
 
@@ -1732,6 +1756,7 @@ impl McpRuntime {
                 healthy,
                 manager: Mutex::new(manager),
                 refresh: refresh::Refresh::default(),
+                subscriptions: subscriptions::Subscriptions::default(),
                 catalog,
                 servers,
                 challenges,
@@ -1907,6 +1932,7 @@ impl McpRuntime {
             generation,
             routes,
             receiver,
+            changed: self.inner.subscriptions.changed.clone(),
         };
         let retired = {
             let mut routes = subscription
@@ -1917,6 +1943,7 @@ impl McpRuntime {
         };
         // Dropping a sender can wake a receiver. Never do it under the map lock.
         drop(retired);
+        self.inner.subscriptions.changed.notify_waiters();
         Ok(subscription)
     }
 
@@ -1970,6 +1997,7 @@ impl McpRuntime {
                 .inner
                 .reload_epoch
                 .store(current.wrapping_add(1), Ordering::Release);
+            runtime.inner.subscriptions.changed.notify_waiters();
             result
         })
         .await
@@ -2834,7 +2862,11 @@ impl McpRuntime {
                 format!("MCP server {server} failed to commit authentication: {error}"),
             ),
         };
-        self.publish_to(&session_id, event_generation, McpEvent { message });
+        self.publish_to(
+            &session_id,
+            event_generation,
+            McpEvent::notification(message),
+        );
         settled
     }
 
@@ -2939,6 +2971,7 @@ impl McpRuntime {
         drop(sessions);
         drop(challenges);
         drop((retired_challenges, retired_sessions, retired_status));
+        self.inner.subscriptions.changed.notify_waiters();
         Ok(())
     }
 }
@@ -8321,6 +8354,7 @@ for line in sys.stdin:
             "session",
             generation,
             super::McpEvent {
+                delivery: None,
                 message: "still owned".into(),
             },
         );
@@ -8348,6 +8382,7 @@ for line in sys.stdin:
             "session",
             Some(generation),
             super::McpEvent {
+                delivery: None,
                 message: "fenced".into(),
             },
         );
@@ -8426,6 +8461,7 @@ for line in sys.stdin:
             "session",
             stale,
             super::McpEvent {
+                delivery: None,
                 message: "stale".into(),
             },
         );
@@ -8437,6 +8473,7 @@ for line in sys.stdin:
             "session",
             runtime.event_generation("session"),
             super::McpEvent {
+                delivery: None,
                 message: "replacement".into(),
             },
         );
@@ -8454,6 +8491,7 @@ for line in sys.stdin:
             "first",
             runtime.event_generation("first"),
             super::McpEvent {
+                delivery: None,
                 message: "connected".into(),
             },
         );
@@ -8471,6 +8509,7 @@ for line in sys.stdin:
             "first",
             generation,
             super::McpEvent {
+                delivery: None,
                 message: "stale callback".into(),
             },
         );

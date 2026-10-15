@@ -18,9 +18,10 @@ struct PeerState {
     fail: bool,
     gates: VecDeque<(oneshot::Receiver<()>, oneshot::Sender<()>)>,
     modern: bool,
+    listen_error: Option<i64>,
 }
 
-struct Peer {
+pub(crate) struct Peer {
     url: String,
     state: Arc<Mutex<PeerState>>,
     notifications: broadcast::Sender<String>,
@@ -40,7 +41,7 @@ impl Peer {
         Self::with_protocol(tools, false).await
     }
 
-    async fn with_protocol(tools: Vec<Value>, modern: bool) -> Self {
+    pub(crate) async fn with_protocol(tools: Vec<Value>, modern: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(PeerState {
@@ -48,6 +49,7 @@ impl Peer {
             fail: false,
             gates: VecDeque::new(),
             modern,
+            listen_error: None,
         }));
         let (notifications, _) = broadcast::channel(32);
         let connected = Arc::new(Notify::new());
@@ -82,6 +84,10 @@ impl Peer {
     async fn set(&self, tools: Vec<Value>, method: &str) {
         self.state.lock().await.tools = tools;
         self.notify(method);
+    }
+
+    pub(crate) fn resource_updated(&self) {
+        self.notifications.send(json!({"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"test://messages"}}).to_string()).unwrap();
     }
 
     fn notify(&self, method: &str) {
@@ -184,11 +190,23 @@ async fn serve(
                 response(&mut stream, "200 OK", Some(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"legacy peer"}}))).await;
                 return;
             }
-            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"ttlMs":0,"cacheScope":"private"})
+            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}},"ttlMs":0,"cacheScope":"private"})
         }
         "subscriptions/listen" => {
+            let error = state.lock().await.listen_error;
+            if let Some(code) = error {
+                response(
+                    &mut stream,
+                    "200 OK",
+                    Some(json!({"jsonrpc":"2.0","id":id,
+                    "error":{"code":code,"message":"listen rejected"}})),
+                )
+                .await;
+                connected.notify_one();
+                return;
+            }
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").await.unwrap();
-            let ack = json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":{"toolsListChanged":true}}});
+            let ack = json!({"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":id},"notifications":request["params"]["notifications"]}});
             stream
                 .write_all(format!("event: message\ndata: {ack}\n\n").as_bytes())
                 .await
@@ -196,8 +214,18 @@ async fn serve(
             connected.notify_one();
             while let Ok(notification) = notifications.recv().await {
                 let mut notification: Value = serde_json::from_str(&notification).unwrap();
-                notification["params"] =
-                    json!({"_meta":{"io.modelcontextprotocol/subscriptionId":id}});
+                if notification["params"].is_null() {
+                    notification["params"] = json!({});
+                }
+                if notification["method"] == "notifications/resources/updated"
+                    && !request["params"]["notifications"]["resourceSubscriptions"]
+                        .as_array()
+                        .is_some_and(|uris| uris.contains(&notification["params"]["uri"]))
+                {
+                    continue;
+                }
+                notification["params"]["_meta"] =
+                    json!({"io.modelcontextprotocol/subscriptionId":id});
                 if stream
                     .write_all(format!("event: message\ndata: {notification}\n\n").as_bytes())
                     .await
@@ -209,8 +237,14 @@ async fn serve(
             return;
         }
         "initialize" => {
-            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"refresh-peer","version":"1"}})
+            json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true},"resources":{"listChanged":true,"subscribe":true}},"serverInfo":{"name":"refresh-peer","version":"1"}})
         }
+        "resources/list" => json!({"resources":[{"uri":"test://messages","name":"messages"}]}),
+        "resources/templates/list" => json!({"resourceTemplates":[]}),
+        "resources/read" => {
+            json!({"contents":[{"uri":request["params"]["uri"],"mimeType":"text/plain","text":"Hello from the subscribed resource"}]})
+        }
+        "resources/subscribe" | "resources/unsubscribe" => json!({}),
         "tools/list" => {
             let (tools, fail, gate) = {
                 let mut state = state.lock().await;
@@ -232,6 +266,8 @@ async fn serve(
             }
             json!({"resultType":"complete","tools":tools})
         }
+        "tools/call" => json!({"content":[{"type":"text","text":"ordinary RPC works"}],
+            "structuredContent":{"called":request["params"]["name"]},"isError":false}),
         "ping" => json!({}),
         other => panic!("unexpected MCP request: {other}"),
     };
@@ -263,7 +299,7 @@ fn config(path: &Path, peers: &[(&str, &Peer)]) {
     std::fs::write(path, json!({"mcpServers":servers}).to_string()).unwrap();
 }
 
-async fn runtime(path: &Path, peers: &[(&str, &Peer)]) -> McpRuntime {
+pub(crate) async fn runtime(path: &Path, peers: &[(&str, &Peer)]) -> McpRuntime {
     config(path, peers);
     let runtime = connect(Some(path), &[], false, CredentialStorage::Memory)
         .await
@@ -636,4 +672,109 @@ async fn authentication_reconnect_fences_the_old_connection_epoch() {
     eventually(async || schema(&runtime, "mcp_remote_authenticated").is_some()).await;
     assert!(schema(&runtime, "mcp_remote_obsolete").is_none());
     assert!(schema(&runtime, "mcp_remote_original").is_none());
+}
+
+#[tokio::test]
+async fn unsupported_listen_preserves_kit_discovery_and_tool_calls() {
+    use agentkit_core::{SessionId, TurnId};
+    use agentkit_tools_core::{AllowAllPermissions, ToolExecutionOutcome, ToolExecutionScope};
+    let directory = tempfile::tempdir().unwrap();
+    let peer = Peer::with_protocol(vec![tool("inspect", "string")], true).await;
+    peer.state.lock().await.listen_error = Some(-32601);
+    let runtime = runtime(&directory.path().join("mcp.json"), &[("remote", &peer)]).await;
+    let search = ToolSearch::new(runtime.clone(), directory.path().into());
+    let found = invoke_discovery(&search, json!({"query":"inspect"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        found["servers"][0]["tools"][0]["name"],
+        "mcp_remote_inspect"
+    );
+    let tool = McpTool::new(runtime.clone());
+    let scope = ToolExecutionScope {
+        executor: Arc::clone(&tool.executor),
+        session_id: SessionId::new("refresh-test"),
+        turn_id: TurnId::new("turn"),
+        permissions: Arc::new(AllowAllPermissions),
+        resources: Arc::new(()),
+        cancellation: None,
+    };
+    let context = scope.nested_context(MetadataMap::new());
+    let outcome = tool
+        .invoke_outcome(
+            ToolRequest::new(
+                "call",
+                "tool",
+                json!({"name":"mcp_remote_inspect","args":{}}),
+                "refresh-test",
+                "turn",
+            ),
+            &mut context.borrowed(),
+        )
+        .await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("RPC failed: {outcome:?}")
+    };
+    assert!(!result.result.is_error);
+    let ToolOutput::Structured(output) = result.result.output else {
+        panic!("expected the server's structured result");
+    };
+    assert_eq!(output, json!({"called":"inspect"}));
+    let _events = runtime.subscribe("refresh-test".into()).unwrap();
+    let subscriptions = subscriptions::McpSubscriptionTool::new(runtime);
+    assert!(
+        invoke_discovery(
+            &subscriptions,
+            json!({"operation":"subscribe","server":"remote",
+        "notifications":{"resourceSubscriptions":["test://messages"]}})
+        )
+        .await
+        .is_err()
+    );
+}
+
+/// Opt-in live smoke test. Explicit paths keep normal CI isolated from user config.
+#[tokio::test]
+#[ignore = "requires KIT_LIVE_MCP_CONFIG and optionally KIT_LIVE_CREDENTIAL_DIR"]
+async fn live_pinned_sdk_discovery() {
+    let path = PathBuf::from(std::env::var("KIT_LIVE_MCP_CONFIG").unwrap());
+    let storage = std::env::var_os("KIT_LIVE_CREDENTIAL_DIR")
+        .map(|path| CredentialStorage::Filesystem(path.into()))
+        .unwrap_or(CredentialStorage::Memory);
+    let runtime = connect(Some(path.as_path()), &[], false, storage)
+        .await
+        .unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let search = ToolSearch::new(runtime, artifacts.path().into());
+    let found = tokio::time::timeout(
+        Duration::from_secs(120),
+        invoke_discovery(&search, json!({"query":"mcp"})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let servers = found["servers"].as_array().unwrap();
+    assert!(!servers.is_empty());
+    for server in servers {
+        // Do not print raw diagnostics: remote errors can contain credential URLs.
+        println!(
+            "{}: status={}, tools={}, unsupported_method={}",
+            server["name"],
+            server["status"],
+            server["available_tool_count"],
+            server["error"]
+                .as_str()
+                .is_some_and(|error| error.to_lowercase().contains("method not found"))
+        );
+        assert!(
+            !server["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("subscriptions/listen"))
+        );
+    }
+    assert!(
+        servers
+            .iter()
+            .any(|server| server["status"] == "authenticated")
+    );
 }

@@ -46,7 +46,7 @@ agentkit-core = "=0.10.5"
 agentkit-context = "=0.10.5"
 agentkit-compaction = "=0.10.5"
 agentkit-loop = { version = "=0.10.13", features = ["otel"] }
-agentkit-mcp = "=0.11.0"
+agentkit-mcp = "=0.11.1"
 agentkit-http = "=0.10.7"
 agentkit-plugins = "=0.10.7"
 agentkit-provider-openai = "=0.10.13"
