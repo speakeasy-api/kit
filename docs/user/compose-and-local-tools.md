@@ -73,9 +73,11 @@ Loading progressively discloses the skill's full `SKILL.md` body, directory, and
 On Unix, Kit selects the shell in this order:
 
 1. `KIT_SHELL`, if set. It must be an absolute path to an executable file. An invalid explicit override fails the call with a `KIT_SHELL` error; it never silently falls back.
-2. `SHELL`, if it names an absolute executable file.
-3. The current user's account login shell, if it names an absolute executable file.
+2. `SHELL`, if it names an absolute executable file in a supported shell family.
+3. The current user's account login shell, with the same checks.
 4. `/bin/sh`.
+
+Automatic selection recognizes `sh`, `bash`, `zsh`, `dash`, `ash`, `ksh`, `mksh`, and `fish` by executable name. Other shells (including `csh` and `tcsh`, which reject these login flags) are skipped. Custom wrappers require an explicit `KIT_SHELL` override.
 
 The default `-lc` starts a non-interactive login shell. Set `KIT_SHELL_INTERACTIVE=1` to use `-lic` instead; other values leave interactive mode off. Interactive startup can load aliases and functions, but can also print startup messages, run side effects, or wait for terminal input. Standard input remains null and Kit does not allocate a terminal. Login startup files can also have side effects in the default mode. The selected shell must support these flags; Kit does not translate commands between shell languages.
 

@@ -13,7 +13,7 @@ struct ShellSettingsView: View {
         Form {
             Section("Command shell") {
                 TextField("Shell executable", text: $shellPath, prompt: Text("Automatic"))
-                Text("Leave blank to detect the shell from KIT_SHELL, SHELL, or your account's login shell, falling back to /bin/sh. Enter an absolute executable path, such as /bin/zsh, to override detection.")
+                Text("Leave blank to detect the shell from KIT_SHELL, SHELL, or your account's login shell, falling back to /bin/sh. Automatic detection skips unsupported shell families such as csh and tcsh. Enter an absolute executable path, such as /bin/zsh, to override detection.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if !trimmedPath.isEmpty && !ShellPreferences.isExecutablePath(trimmedPath) {

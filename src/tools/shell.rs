@@ -361,9 +361,19 @@ fn resolve_shell(
     }
     Ok(environment
         .map(PathBuf::from)
-        .filter(|path| is_executable_shell(path))
-        .or_else(|| account().filter(|path| is_executable_shell(path)))
+        .filter(|path| is_automatic_shell(path))
+        .or_else(|| account().filter(|path| is_automatic_shell(path)))
         .unwrap_or_else(|| PathBuf::from("/bin/sh")))
+}
+
+#[cfg(unix)]
+fn is_automatic_shell(path: &std::path::Path) -> bool {
+    // Only infer shells with our -lc/-lic invocation contract. Unknown shells
+    // and wrappers remain available through an explicit KIT_SHELL override.
+    matches!(
+        path.file_name().and_then(std::ffi::OsStr::to_str),
+        Some("sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "mksh" | "fish")
+    ) && is_executable_shell(path)
 }
 
 #[cfg(unix)]
@@ -456,15 +466,19 @@ mod tests {
         use std::{ffi::OsStr, os::unix::fs::PermissionsExt as _, path::PathBuf};
 
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("first shell");
-        let second = directory.path().join("second");
+        let first = directory.path().join("bash");
+        let second = directory.path().join("zsh");
         for path in [&first, &second] {
             std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let resolve = |explicit, environment, account: Option<PathBuf>| {
+        fn resolve(
+            explicit: Option<&OsStr>,
+            environment: Option<&OsStr>,
+            account: Option<PathBuf>,
+        ) -> Result<PathBuf, ToolError> {
             super::resolve_shell(explicit, environment, || account)
-        };
+        }
         assert_eq!(
             resolve(Some(first.as_os_str()), Some(second.as_os_str()), None).unwrap(),
             first
@@ -483,6 +497,26 @@ mod tests {
             resolve(None, Some(OsStr::new("")), Some(PathBuf::from("relative"))).unwrap(),
             PathBuf::from("/bin/sh")
         );
+
+        for name in ["tcsh", "csh", "unknown-shell"] {
+            let incompatible = directory.path().join(name);
+            std::fs::write(&incompatible, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            assert_eq!(
+                resolve(None, Some(incompatible.as_os_str()), Some(second.clone())).unwrap(),
+                second
+            );
+            assert_eq!(
+                resolve(None, None, Some(incompatible.clone())).unwrap(),
+                PathBuf::from("/bin/sh")
+            );
+            // Explicit overrides can still select custom shell wrappers.
+            assert_eq!(
+                resolve(Some(incompatible.as_os_str()), None, None).unwrap(),
+                incompatible
+            );
+        }
 
         let nonexecutable = directory.path().join("not executable");
         std::fs::write(&nonexecutable, "no").unwrap();
@@ -562,7 +596,7 @@ mod tests {
         // Account records need not exist (for example, an unmapped container UID).
         let selected = super::resolve_shell(None, None, || expected.clone()).unwrap();
         assert!(selected.is_absolute());
-        if let Some(path) = expected.filter(|path| super::is_executable_shell(path)) {
+        if let Some(path) = expected.filter(|path| super::is_automatic_shell(path)) {
             assert_eq!(selected, path);
         } else {
             assert_eq!(selected, std::path::Path::new("/bin/sh"));
