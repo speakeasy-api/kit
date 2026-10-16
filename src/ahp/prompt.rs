@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use agenthooksprotocol::generated::Event;
-use agenthooksprotocol::inputs::{MessageInput, UserMessageInboundInput};
-use agenthooksprotocol::{
-    CanonicalMessageRole, EventType, Session, UserMessageInboundInputMessage,
-};
+use agenthooksprotocol::inputs::UserMessageInboundInput;
+use agenthooksprotocol::{EventType, UserMessageInboundInputMessage};
 use agentkit_core::{ItemKind, Part};
 use agentkit_loop::{AgentEvent, LoopCtx, LoopError, LoopMutator, MutationPoint, TranscriptCursor};
 use async_trait::async_trait;
@@ -69,19 +67,24 @@ impl LoopMutator for PromptHook {
             return Ok(());
         };
         let index = cursor.len().saturating_sub(1);
-        let message = super::message(prompt, index).unwrap_or_else(|| {
-            MessageInput::new(
-                super::item_id(prompt, index),
-                CanonicalMessageRole::User,
-                Vec::new(),
-            )
-        });
+        let message = super::message(prompt, index);
+        let original: String = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                agenthooksprotocol::inputs::PartInput::Text(body) => editable_text(body),
+                _ => None,
+            })
+            .collect();
         let mut input = UserMessageInboundInput::new(UserMessageInboundInputMessage::new(
             self.channel,
             Vec::new(),
             "user",
         ));
-        input.session = Some(Box::new(Session::new(ctx.session_id.to_string())));
+        input.session = Some(self.hooks.session(&ctx.session_id.to_string()));
+        input.turn = ctx
+            .turn_id
+            .map(|id| agenthooksprotocol::UserMessageInboundInputTurn::new(id.to_string()));
         let boundary = self
             .hooks
             .sdk
@@ -97,7 +100,18 @@ impl LoopMutator for PromptHook {
                     .message
                     .messages
                     .iter()
-                    .map(|message| super::text(&message.parts))
+                    .map(|message| {
+                        message
+                            .parts
+                            .iter()
+                            .filter_map(|part| match part.as_ref() {
+                                agenthooksprotocol::ContentItem::TextBodyPart(body) => {
+                                    editable_text(body)
+                                }
+                                _ => None,
+                            })
+                            .collect::<String>()
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")),
                 _ => return Ok(()),
@@ -113,11 +127,6 @@ impl LoopMutator for PromptHook {
         }
         match edited {
             Ok(text) => {
-                let original = prompt
-                    .parts
-                    .iter()
-                    .filter_map(super::part_text)
-                    .collect::<String>();
                 if text == original {
                     return Ok(());
                 }
@@ -145,4 +154,15 @@ impl LoopMutator for PromptHook {
         }
         Ok(())
     }
+}
+
+// Reference descriptors describe retained non-text input; do not inject their
+// URI/base64/filename representation into the model's text when a hook edits it.
+fn editable_text(body: &agenthooksprotocol::TextBodyPart) -> Option<&str> {
+    if let agenthooksprotocol::Presence::Present(category) = &body.category
+        && (category.ends_with("-reference") || category == "file-name")
+    {
+        return None;
+    }
+    Some(&body.text)
 }
