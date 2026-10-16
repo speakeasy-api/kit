@@ -578,9 +578,13 @@ mod tests {
             .map(Path::new)
             .find(|path| super::is_executable_shell(path))
         else {
-            assert!(!cfg!(target_os = "macos"), "macOS must provide zsh");
-            eprintln!("skipping zsh startup fixture: zsh is not installed");
-            return;
+            #[cfg(target_os = "macos")]
+            panic!("macOS must provide zsh");
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("skipping zsh startup fixture: zsh is not installed");
+                return;
+            }
         };
         let home = tempfile::tempdir().unwrap();
         for (directory, version) in [
