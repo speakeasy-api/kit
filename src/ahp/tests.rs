@@ -1452,32 +1452,144 @@ async fn model_response_merges_latest_streamed_usage_and_discards_superseded_usa
 }
 
 #[tokio::test]
-async fn prompt_text_edits_do_not_copy_media_descriptors_into_model_text() {
-    let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
-    let mut replacement = text_message("edited");
-    replacement[0]["parts"].as_array_mut().unwrap().push(json!({
-        "id":"image-reference", "kind":"text", "mediaType":"text/plain", "selection":"body",
-        "category":"media-reference", "text":"encoded image descriptor",
-    }));
-    backend.respond(
-        "user.message.inbound",
-        json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":replacement}]),
-    );
-    let model = Model::default();
-    let image = Part::media(
-        Modality::Image,
-        "image/png",
-        DataRef::inline_text("aW1hZ2U="),
-    );
-    let input = Item::new(ItemKind::User, vec![Part::text("original"), image.clone()]);
-    let (_, persisted) = admit(&hooks, &model, vec![input]).await;
-    let prompt = persisted
-        .iter()
-        .find(|item| item.kind == ItemKind::User)
-        .unwrap();
-    assert_eq!(prompt.parts, vec![Part::text("edited"), image]);
-    assert_eq!(
-        last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
-        Some("edited")
-    );
+async fn prompt_text_edits_do_not_copy_descriptors_into_model_text() {
+    for edited in ["original", "edited"] {
+        let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
+        let image = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::inline_text("data:image/png;base64,aW1hZ2U="),
+        );
+        let file = Part::File(agentkit_core::FilePart::named(
+            "private-filename.txt",
+            DataRef::uri("https://example.com/private-file"),
+        ));
+        let mut replacement = text_message(edited);
+        for (index, part) in [&image, &file].into_iter().enumerate() {
+            for descriptor in content_parts(&format!("input/{index}"), part) {
+                let agenthooksprotocol::inputs::PartInput::Text(body) = descriptor else {
+                    panic!("expected reference descriptor");
+                };
+                replacement[0]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::to_value(body).unwrap());
+            }
+        }
+        backend.respond(
+            "user.message.inbound",
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":replacement}]),
+        );
+        let model = Model::default();
+        let input = Item::new(
+            ItemKind::User,
+            vec![Part::text("original"), image.clone(), file.clone()],
+        );
+        let (_, persisted) = admit(&hooks, &model, vec![input]).await;
+        let prompt = persisted
+            .iter()
+            .find(|item| item.kind == ItemKind::User)
+            .unwrap();
+        assert_eq!(prompt.parts, vec![Part::text(edited), image, file]);
+        assert_eq!(
+            last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+            Some(edited)
+        );
+    }
+}
+
+#[tokio::test]
+async fn media_and_file_descriptors_obey_owning_category_selection() {
+    for category in ["media", "file"] {
+        for selection in ["omit", "metadata", "body"] {
+            let mut subscription = intercept(&["model.request.before"]);
+            subscription["content"]["default"] = json!("body");
+            subscription["content"][category] = json!(selection);
+            let (hooks, backend) = hooks(vec![subscription]);
+            let adapter = HookedAdapter::new(
+                Model::default(),
+                Some(hooks),
+                SessionStartInputTrigger::Startup,
+            );
+            let mut session = adapter
+                .start_session(SessionConfig::new("descriptors"))
+                .await
+                .unwrap();
+            let mut item = Item::text(ItemKind::User, "public text");
+            for owner in ["media", "file"] {
+                for (mime_type, data) in [
+                    (
+                        "image/png",
+                        DataRef::uri(format!("https://example.com/{owner}-private")),
+                    ),
+                    (
+                        "image/png",
+                        DataRef::inline_text(format!("{owner}-private-base64")),
+                    ),
+                    (
+                        "image/png",
+                        DataRef::inline_text(format!("data:image/png;base64,{owner}-private")),
+                    ),
+                    (
+                        "text/plain",
+                        DataRef::inline_bytes(format!("{owner}-private-text").into_bytes()),
+                    ),
+                ] {
+                    item.parts.push(if owner == "media" {
+                        Part::media(Modality::Image, mime_type, data)
+                    } else {
+                        Part::File(
+                            agentkit_core::FilePart::named("file-private-name.txt", data)
+                                .with_mime_type(mime_type),
+                        )
+                    });
+                }
+            }
+            session
+                .begin_turn(
+                    TurnRequest {
+                        session_id: SessionId::new("descriptors"),
+                        turn_id: TurnId::new("turn"),
+                        transcript: vec![item],
+                        available_tools: vec![],
+                        cache: None,
+                        metadata: MetadataMap::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let events = backend.events("model.request.before");
+            assert_eq!(events.len(), 1);
+            let parts = events[0]["items"][0]["parts"].as_array().unwrap();
+            let selected: Vec<_> = parts
+                .iter()
+                .filter(|part| part["category"] == category)
+                .collect();
+            assert_eq!(selected.len(), if category == "media" { 4 } else { 8 });
+            assert!(selected.iter().all(|part| part["selection"] == selection));
+            if selection != "body" {
+                assert!(selected.iter().all(|part| part.get("text").is_none()));
+                assert!(
+                    !events[0]
+                        .to_string()
+                        .contains(&format!("{category}-private"))
+                );
+            } else {
+                assert!(
+                    events[0]
+                        .to_string()
+                        .contains(&format!("{category}-private"))
+                );
+            }
+            let other = if category == "media" { "file" } else { "media" };
+            assert!(events[0].to_string().contains(&format!("{other}-private")));
+            assert!(
+                parts.iter().all(|part| matches!(
+                    part["category"].as_str(),
+                    Some("text" | "media" | "file")
+                ))
+            );
+        }
+    }
 }

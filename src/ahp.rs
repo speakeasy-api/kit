@@ -446,12 +446,14 @@ fn content_parts(id: &str, part: &Part) -> Vec<PartInput<Attachment>> {
                 Attachment::bytes(bytes.clone()),
             ));
         } else {
+            // Keep the owning category: SDK selection uses exact category names.
+            // The /data ID suffix identifies a noneditable descriptor separately.
             // InlineText can be encoded binary. Preserve the tagged reference;
             // never fetch remote URIs or resolve artifact handles on hook demand.
             if let Ok(data) = serde_json::to_value(data) {
                 parts.push(text(
                     format!("{id}/data"),
-                    &format!("{category}-reference"),
+                    category,
                     object([("data", data), ("mediaType", media_type.into())]).to_string(),
                 ));
             }
@@ -459,7 +461,7 @@ fn content_parts(id: &str, part: &Part) -> Vec<PartInput<Attachment>> {
         if let Part::File(file) = part
             && let Some(name) = &file.name
         {
-            parts.push(text(format!("{id}/name"), "file-name", name.clone()));
+            parts.push(text(format!("{id}/name"), category, name.clone()));
         }
     }
     parts
