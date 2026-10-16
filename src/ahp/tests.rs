@@ -77,6 +77,20 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
 }
 
 #[test]
+fn every_intercept_event_accepts_observe_subscriptions() {
+    for event in [
+        "user.message.inbound",
+        "model.request.before",
+        "tool.before",
+        "context.compact.before",
+        "context.compact.after",
+    ] {
+        hooks(vec![intercept(&[event])]);
+        hooks(vec![observe(&[event])]);
+    }
+}
+
+#[test]
 fn every_granted_event_accepts_wildcard_subscriptions() {
     hooks(vec![intercept(&["*"]), observe(&["*"])]);
 }
