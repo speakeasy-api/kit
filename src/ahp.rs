@@ -176,14 +176,16 @@ fn options() -> Result<HooksOptions, String> {
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()
+                .observe()
                 .deny()
                 .modify_prompt(Modify::Replace),
         ),
-        model_request_before: Some(capability::model_request_before().deny()),
+        model_request_before: Some(capability::model_request_before().observe().deny()),
         model_response_after: Some(capability::model_response_after().observe()),
         model_error: Some(capability::model_error().observe()),
         tool_before: Some(
             capability::tool_before()
+                .observe()
                 .allow()
                 .deny()
                 .return_result()
@@ -192,11 +194,14 @@ fn options() -> Result<HooksOptions, String> {
         tool_after: Some(capability::tool_after().observe()),
         context_compact_before: Some(
             capability::context_compact_before()
+                .observe()
                 .return_result()
                 .modify_instructions(Modify::Replace),
         ),
         context_compact_after: Some(
-            capability::context_compact_after().modify_summary(Modify::Replace),
+            capability::context_compact_after()
+                .observe()
+                .modify_summary(Modify::Replace),
         ),
         ..HostCapabilities::default()
     };
