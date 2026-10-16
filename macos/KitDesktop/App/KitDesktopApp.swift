@@ -20,6 +20,10 @@ struct KitDesktopApp: App {
     }
 
     var body: some Scene {
+        Settings {
+            ShellSettingsView()
+        }
+
         WindowGroup {
             ContentView()
                 .environmentObject(model)

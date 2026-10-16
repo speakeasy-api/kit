@@ -414,7 +414,9 @@ final class ACPClient {
     private func launchLocked(
         executable: String, arguments: [String], environmentOverrides: [String: String], root: String
     ) throws {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ShellPreferences.environment(
+            inheriting: ProcessInfo.processInfo.environment
+        )
         environment["KIT_RUNTIME_EVENTS"] = "1"
         for (key, value) in environmentOverrides { environment[key] = value }
         installReaders()

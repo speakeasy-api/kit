@@ -68,7 +68,18 @@ Loading progressively discloses the skill's full `SKILL.md` body, directory, and
 
 ## Run commands with `shell`
 
-`shell({ command, timeout_seconds? })` runs from Kit's canonical working directory. On Unix it uses `sh -lc`; on Windows it uses `cmd /C`. Standard input is null. The default timeout is 120 seconds, and accepted `timeout_seconds` values are 1 through 3600.
+`shell({ command, timeout_seconds? })` runs from Kit's canonical working directory. On Unix it uses the selected shell with `-lc`; on Windows it uses `cmd /C`. Standard input is null. The default timeout is 120 seconds, and accepted `timeout_seconds` values are 1 through 3600.
+
+On Unix, Kit selects the shell in this order:
+
+1. `KIT_SHELL`, if set. It must be an absolute path to an executable file. An invalid explicit override fails the call with a `KIT_SHELL` error; it never silently falls back.
+2. `SHELL`, if it names an absolute executable file.
+3. The current user's account login shell, if it names an absolute executable file.
+4. `/bin/sh`.
+
+The default `-lc` starts a non-interactive login shell. Set `KIT_SHELL_INTERACTIVE=1` to use `-lic` instead; other values leave interactive mode off. Interactive startup can load aliases and functions, but can also print startup messages, run side effects, or wait for terminal input. Standard input remains null and Kit does not allocate a terminal. Login startup files can also have side effects in the default mode. The selected shell must support these flags; Kit does not translate commands between shell languages.
+
+In the macOS app, use Settings to choose a shell override and opt into interactive startup. These preferences are passed to the helper as `KIT_SHELL` and `KIT_SHELL_INTERACTIVE`. Leave the app override blank to inherit `KIT_SHELL` from the app environment, then use automatic detection if it is unset. An interactive preference that has not been set also respects the inherited environment. For CLI use, set the environment variables before starting Kit.
 
 A normally completed command returns:
 
