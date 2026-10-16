@@ -1381,6 +1381,7 @@ impl Runtime {
                 self.agentkit_telemetry(),
                 Some(opened.observer.clone()),
                 format!("compaction-{}", crate::session::new_id()),
+                session_id.clone(),
                 self.hooks.clone(),
             )
             .map_err(|error| {
@@ -1581,6 +1582,7 @@ impl Runtime {
             self.agentkit_telemetry(),
             None,
             format!("compaction-{session}"),
+            session.clone(),
             self.hooks.clone(),
         )
         .map_err(LoopError::InvalidState)?
@@ -1791,6 +1793,7 @@ impl Runtime {
             self.agentkit_telemetry(),
             Some(opened.observer.clone()),
             format!("compaction-{}", crate::session::new_id()),
+            session_id.clone(),
             self.hooks.clone(),
         )
         .map_err(AcpRuntimeError::Loop)?;

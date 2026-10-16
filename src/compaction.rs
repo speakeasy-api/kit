@@ -373,6 +373,7 @@ pub fn automatic<M>(
     telemetry: TelemetryConfig,
     persistence: Option<SessionObserver>,
     session_id: impl Into<SessionId>,
+    owner_session_id: impl Into<SessionId>,
     hooks: Option<Arc<crate::ahp::Hooks>>,
 ) -> Result<AutomaticCompactor, String>
 where
@@ -382,6 +383,7 @@ where
         adapter,
         telemetry,
         session_id: session_id.into(),
+        owner_session_id: owner_session_id.into(),
         hooks,
     };
     let inner = StrategyCompactor::new(
@@ -408,6 +410,7 @@ struct KitCompactionBackend<M> {
     adapter: M,
     telemetry: TelemetryConfig,
     session_id: SessionId,
+    owner_session_id: SessionId,
     hooks: Option<Arc<crate::ahp::Hooks>>,
 }
 
@@ -483,6 +486,7 @@ where
         if let Some(hooks) = &self.hooks {
             match hooks
                 .compact_before(
+                    &self.owner_session_id.to_string(),
                     &request.items,
                     request.reason == CompactionReason::Manual,
                     SUMMARY_PROMPT,
@@ -491,7 +495,7 @@ where
                 .await
             {
                 Some(crate::ahp::Compaction::Summary(summary)) => {
-                    return self.installed(&request, summary).await;
+                    return self.installed(&request, summary, true).await;
                 }
                 Some(crate::ahp::Compaction::Instructions(replacement)) => {
                     instructions = replacement;
@@ -543,7 +547,7 @@ where
                 Err(error) => return Err(CompactionError::Failed(error.to_string())),
             }
         };
-        self.installed(&request, summary).await
+        self.installed(&request, summary, false).await
     }
 }
 
@@ -552,9 +556,19 @@ impl<M> KitCompactionBackend<M> {
         &self,
         request: &SummaryRequest,
         summary: String,
+        supplied: bool,
     ) -> Result<SummaryResult, CompactionError> {
         let summary = match &self.hooks {
-            Some(hooks) => hooks.compact_after(&request.items, summary).await,
+            Some(hooks) => {
+                hooks
+                    .compact_after(
+                        &self.owner_session_id.to_string(),
+                        &request.items,
+                        summary,
+                        supplied,
+                    )
+                    .await
+            }
             None => summary,
         };
         if summary.trim().is_empty() {
@@ -919,7 +933,10 @@ mod tests {
     #[tokio::test]
     async fn hook_supplied_summary_skips_the_summarizer_model() {
         use crate::ahp::test_support::{hooks, intercept};
-        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+        let (hooks, backend) = hooks(vec![intercept(&[
+            "context.compact.before",
+            "context.compact.after",
+        ])]);
         backend.respond(
             "context.compact.before",
             json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "from hook"}]}]),
@@ -928,6 +945,7 @@ mod tests {
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("compaction"),
+            owner_session_id: SessionId::new("owner"),
             hooks: Some(hooks),
         };
 
@@ -945,6 +963,15 @@ mod tests {
         assert_eq!(result.items.len(), 1);
         assert!(is_compaction_summary(&result.items[0]));
         assert_eq!(item_text(&result.items[0]), Some("from hook"));
+        for name in ["context.compact.before", "context.compact.after"] {
+            let events = backend.events(name);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["session"]["id"], "owner");
+        }
+        assert_eq!(
+            backend.events("context.compact.after")[0]["execution"]["reason"],
+            "supplied_result"
+        );
     }
 
     #[tokio::test]
@@ -959,6 +986,7 @@ mod tests {
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("compaction"),
+            owner_session_id: SessionId::new("owner"),
             hooks: Some(hooks),
         };
 
