@@ -159,9 +159,10 @@ impl LoopMutator for PromptHook {
 // Reference descriptors describe retained non-text input; do not inject their
 // URI/base64/filename representation into the model's text when a hook edits it.
 fn editable_text(body: &agenthooksprotocol::TextBodyPart) -> Option<&str> {
-    if let agenthooksprotocol::Presence::Present(category) = &body.category
-        && (category.ends_with("-reference") || category == "file-name")
-    {
+    // TextBodyPart has no descriptor discriminator and forbids extra wire
+    // fields. Host-generated text IDs end in a numeric part index; reserve
+    // /data and /name for descriptors, independently of disclosure categories.
+    if body.id.ends_with("/data") || body.id.ends_with("/name") {
         return None;
     }
     Some(&body.text)
