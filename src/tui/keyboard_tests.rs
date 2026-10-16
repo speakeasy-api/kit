@@ -121,11 +121,20 @@ fn negotiated_shifted_characters_reach_composer() {
         };
         // SAFETY: fd points to one initialized pollfd, valid for this call.
         let ready = unsafe { libc::poll(&mut fd, 1, 50) };
-        assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                // Signals (including other tests' child exits) can interrupt poll.
+                // Recheck the original deadline rather than restarting the timeout.
+                continue;
+            }
+            panic!("poll: {error}");
+        }
         if ready > 0 {
             let mut bytes = [0; 4096];
             match master.read(&mut bytes) {
                 Ok(n) => output.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 // Linux PTYs report EIO after the slave closes; macOS returns EOF.
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
                 Err(error) => panic!("read PTY: {error}"),
