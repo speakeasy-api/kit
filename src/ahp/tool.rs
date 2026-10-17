@@ -312,7 +312,7 @@ impl HookedTool {
             if items == original {
                 return outcome;
             }
-            // AHP output edits are canonical messages, not an arbitrary native
+            // AHP output edits are messages, not an arbitrary native
             // ToolResult. Accept text bodies without granting authority over
             // call IDs, error status, duration, or other execution metadata.
             let mut texts = Vec::new();

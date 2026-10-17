@@ -529,8 +529,8 @@ fn invalid(message: &str) -> LoopError {
     LoopError::InvalidState(message.to_owned())
 }
 
-/// Preserve opaque host parts exactly when the canonical message is unchanged.
-/// New or rewritten messages must be plain text: interpreting canonical display
+/// Preserve opaque host parts exactly when the hook message is unchanged.
+/// New or rewritten messages must be plain text: interpreting displayed
 /// text as executable tool calls or provider continuation data is unsafe.
 fn canonical_items<'a>(
     messages: impl IntoIterator<Item = &'a CanonicalMessage>,
@@ -543,7 +543,7 @@ fn canonical_items<'a>(
             if projected.metadata.role == message.role
                 && projected.parts.len() == message.parts.len()
                 && projected.parts.iter().zip(&message.parts).all(|(before, after)| projected_part_matches(before, after)) {
-                // Canonicalization deliberately hides opaque provider state.
+                // Hook messages deliberately omit opaque provider state.
                 // A no-op must retain the exact original, including hidden parts.
                 return Ok(item.clone());
             }
@@ -567,7 +567,7 @@ fn canonical_items<'a>(
         let mut parts = Vec::new();
         let mut remaining = message.parts.as_slice();
         while let Some(next) = remaining.first() {
-            // A host part can project to multiple canonical parts (for example a
+            // A host part can project to multiple hook message parts (for example a
             // tool result plus correlation, or a file plus its name descriptor).
             // Retain the host part only when its whole projection is retained.
             let retained = original.and_then(|(index, item)| {

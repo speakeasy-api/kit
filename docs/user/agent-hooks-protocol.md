@@ -81,7 +81,7 @@ runs; an edit that does not match counts as a hook failure. An edit that the
 hook does not also allow goes through Kit's permission policy again.
 
 `tool.after` accepts `modify` with target `output` and operation `replace`
-(text-body canonical messages only), or `flow.stop` to withhold output and
+(messages containing text only), or `flow.stop` to withhold output and
 return a permission error. Blocking takes precedence over replacement but
 cannot undo side effects; use `tool.before` to prevent execution.
 
