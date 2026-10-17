@@ -293,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e7737d830ad3b313ad735057a97c7ca6d981d99164a3ed5fa39f794cebc9911"
+checksum = "c1d32cd5a62fa73f8389acdb917b60582ea8ec35e7b9cdca15b146bde8adfbef"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
