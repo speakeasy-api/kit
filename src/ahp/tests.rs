@@ -76,6 +76,67 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
     );
 }
 
+#[tokio::test]
+async fn registration_headers_reach_http_hook_requests() {
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use tokio::sync::mpsc;
+
+    let (sender, mut received) = mpsc::channel(1);
+    let app = Router::new()
+        .route(
+            "/hooks",
+            post(
+                |State(sender): State<mpsc::Sender<HeaderMap>>,
+                 headers: HeaderMap,
+                 Json(request): Json<Value>| async move {
+                    sender.send(headers).await.unwrap();
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"protocolVersion": "draft", "effects": []},
+                    }))
+                },
+            ),
+        )
+        .with_state(sender);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/hooks", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "protocolVersion": "draft",
+            "hooks": [{
+                "id": "dev.kit.headers",
+                "transport": {
+                    "type": "http",
+                    "url": endpoint,
+                    "headers": {
+                        "Authorization": "Bearer test-only-header",
+                        "X-Kit-Test": "configured-header",
+                    },
+                },
+                "subscriptions": [intercept(&["user.message.inbound"])],
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut options = options().unwrap();
+    options.backend.allow_loopback_http = true;
+    let hooks = Arc::new(Hooks::new(read(&path).unwrap().unwrap(), options).unwrap());
+    prompt(&hooks, &Model::default(), "hello").await;
+    let headers = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    assert_eq!(headers["authorization"], "Bearer test-only-header");
+    assert_eq!(headers["x-kit-test"], "configured-header");
+}
+
 #[test]
 fn every_intercept_event_accepts_observe_subscriptions() {
     for event in [
