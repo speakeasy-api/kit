@@ -484,7 +484,7 @@ where
         }
         let mut instructions = SUMMARY_PROMPT.to_owned();
         if let Some(hooks) = &self.hooks {
-            match hooks
+            let before = hooks
                 .compact_before(
                     &self.owner_session_id.to_string(),
                     &request.items,
@@ -492,8 +492,23 @@ where
                     SUMMARY_PROMPT,
                     cancellation.as_ref(),
                 )
-                .await
+                .await;
+            // Cancellation is a terminal interruption, not a policy denial. The
+            // SDK reports cancellation during dispatch as a hook error.
+            if cancellation
+                .as_ref()
+                .is_some_and(|value| value.is_cancelled())
             {
+                return Err(CompactionError::Cancelled);
+            }
+            match before {
+                Some(crate::ahp::Compaction::Denied(reason)) => {
+                    // Fail the mutation rather than returning the unchanged transcript:
+                    // the trigger would still be active and could retry indefinitely.
+                    return Err(CompactionError::Failed(format!(
+                        "compaction denied by agent hook: {reason}"
+                    )));
+                }
                 Some(crate::ahp::Compaction::Summary(summary)) => {
                     return self.installed(&request, summary, true).await;
                 }
@@ -928,6 +943,155 @@ mod tests {
         ) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> {
             Err(LoopError::Provider("unexpected model turn".into()))
         }
+    }
+
+    #[tokio::test]
+    async fn hook_denied_compaction_preserves_transcript_and_stops_the_turn() {
+        use crate::ahp::test_support::{hooks, intercept};
+
+        for manual in [false, true] {
+            let (hooks, backend) = hooks(vec![intercept(&[
+                "context.compact.before",
+                "context.compact.after",
+            ])]);
+            backend.respond(
+                "context.compact.before",
+                json!([{"type": "deny", "reason": "retain original context"}]),
+            );
+            let original = vec![
+                Item::text(ItemKind::User, "old request ".repeat(10_000)),
+                measured(90, Some(100)),
+            ];
+            let input = Item::text(
+                ItemKind::User,
+                if manual { "/compact next" } else { "next" },
+            );
+            let compactor = automatic(
+                NoModelTurn,
+                TelemetryConfig::default(),
+                None,
+                "summarizer",
+                "owner",
+                Some(hooks),
+            )
+            .unwrap();
+            let agent = Agent::builder()
+                .model(NoModelTurn)
+                .transcript(original.clone())
+                .input(vec![input.clone()])
+                .mutator(compactor)
+                .build()
+                .unwrap();
+            let mut driver = agent.start(SessionConfig::new("owner")).await.unwrap();
+            assert!(matches!(driver.next().await,
+                Err(LoopError::Mutator(error))
+                    if error.contains("compaction denied by agent hook: retain original context")
+            ));
+            let original_len = original.len();
+            let mut expected = original;
+            expected.push(input);
+            let actual = driver.snapshot().transcript;
+            assert_eq!(actual.len(), expected.len());
+            // The loop timestamps newly submitted input before mutators run.
+            assert!(actual[original_len].created_at.is_some());
+            expected[original_len].created_at = actual[original_len].created_at;
+            assert_eq!(actual, expected);
+            assert!(backend.events("context.compact.after").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_compaction_hook_wins_over_supplied_summary() {
+        use crate::ahp::test_support::{hooks_with_backend, intercept};
+        use agenthooksprotocol::adapters::registered::ManagedBackend;
+        use agenthooksprotocol::client::{HookError, LocalFuture};
+
+        struct CancellingBackend(Arc<agentkit_core::CancellationController>);
+
+        impl ManagedBackend for CancellingBackend {
+            fn call(
+                &self,
+                request: serde_json::Value,
+                _: std::time::Duration,
+            ) -> LocalFuture<'_, Result<serde_json::Value, HookError>> {
+                Box::pin(async move {
+                    assert_eq!(request["params"]["event"]["type"], "context.compact.before");
+                    self.0.interrupt();
+                    Ok(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {
+                            "protocolVersion": "draft",
+                            "effects": [{"type": "return", "value": [{
+                                "id": "summary/0", "kind": "text", "mediaType": "text/plain",
+                                "selection": "body", "text": "must not be installed"
+                            }]}]
+                        }
+                    }))
+                })
+            }
+
+            fn shutdown(&self) -> LocalFuture<'_, Result<(), HookError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let controller = Arc::new(agentkit_core::CancellationController::new());
+        let cancellation = controller.handle().checkpoint();
+        let hooks = hooks_with_backend(
+            vec![intercept(&[
+                "context.compact.before",
+                "context.compact.after",
+            ])],
+            Arc::new(CancellingBackend(controller)),
+        );
+        let compactor = KitCompactionBackend {
+            adapter: NoModelTurn,
+            telemetry: TelemetryConfig::default(),
+            session_id: SessionId::new("summarizer"),
+            owner_session_id: SessionId::new("owner"),
+            hooks: Some(hooks),
+        };
+        let result = compactor
+            .summarize(
+                SummaryRequest::new(
+                    vec![Item::text(ItemKind::User, "old request")],
+                    CompactionReason::Manual,
+                ),
+                Some(cancellation.clone()),
+            )
+            .await;
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(result, Err(CompactionError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn hook_denied_explicit_compaction_does_not_run_the_summarizer() {
+        use crate::ahp::test_support::{hooks, intercept};
+
+        let (hooks, backend) = hooks(vec![intercept(&["context.compact.before"])]);
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "deny", "reason": "retain original context"}]),
+        );
+        let compactor = KitCompactionBackend {
+            adapter: NoModelTurn,
+            telemetry: TelemetryConfig::default(),
+            session_id: SessionId::new("summarizer"),
+            owner_session_id: SessionId::new("owner"),
+            hooks: Some(hooks),
+        };
+        let result = compactor
+            .summarize(
+                SummaryRequest::new(
+                    vec![Item::text(ItemKind::User, "old request")],
+                    CompactionReason::Custom("forced".into()),
+                ),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(CompactionError::Failed(error))
+            if error == "compaction denied by agent hook: retain original context"));
     }
 
     #[tokio::test]

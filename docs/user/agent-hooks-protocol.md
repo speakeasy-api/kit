@@ -50,20 +50,26 @@ before you run Kit in a project you do not trust.
 
 | Event | Where Kit emits it | Hook authority |
 | --- | --- | --- |
-| `session.start` | A session's model connection opens | Observe |
+| `session.start` | A session's model connection opens | Inject context |
 | `turn.start` | A logical agent-loop turn starts, with native session and turn IDs | Observe |
 | `turn.end` | That logical turn completes, fails, or is cancelled | Observe |
 | `session.end` | A prompt run finishes or an ACP session closes | Observe |
 | `user.message.inbound` | A new turn admits a user prompt | Deny, replace the prompt |
-| `model.request.before` | Before each model call, with the transcript | Deny |
-| `model.response.after` | A model call finishes, with its output | Observe |
+| `model.request.before` | Before each model call, with the transcript | Deny, replace messages, supply a response, inject context |
+| `model.response.after` | A model call finishes, with its output | Replace messages, block response |
 | `model.error` | A model call fails | Observe |
-| `tool.before` | Before a tool runs | Allow, deny, return a result, replace or merge input |
-| `tool.after` | A tool finishes, with its output | Observe |
-| `context.compact.before` | Before compaction summarizes the transcript | Return a summary, replace summarizer instructions |
+| `tool.before` | Before a tool runs | Allow, deny, return a result, replace or merge input, inject context |
+| `tool.after` | A tool finishes, with its output | Replace output, block output, inject context |
+| `context.compact.before` | Before compaction summarizes the transcript | Deny, return a summary, replace summarizer instructions, inject context |
 | `context.compact.after` | Before the summary is installed | Replace the summary |
 
 Every event that supports interception also supports `observe` subscriptions.
+Interceptable events accept `message` effects for user-facing notices.
+Context injection accepts text messages with `deliverAt: "now"`, delivered once
+with the next actual model request; it does not change the saved transcript.
+Model message edits accept text replacements and preserve unchanged native
+items. Response interception withholds streaming output until hooks finish.
+A compaction denial fails the turn without replacing the transcript.
 
 A denied prompt is removed, together with resources attached to it, and the
 turn ends without a model call. A denied
@@ -73,6 +79,11 @@ the model.
 Kit checks edited tool input against the tool's input schema before the tool
 runs; an edit that does not match counts as a hook failure. An edit that the
 hook does not also allow goes through Kit's permission policy again.
+
+`tool.after` accepts `modify` with target `output` and operation `replace`
+(messages containing text only), or `flow.stop` to withhold output and
+return a permission error. Blocking takes precedence over replacement but
+cannot undo side effects; use `tool.before` to prevent execution.
 
 Tool events cover the tools that compose scripts call, such as `shell`, `edit`,
 `read_file` and the MCP `tool` dispatcher. Kit projects text, structured data,

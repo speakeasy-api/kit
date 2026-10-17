@@ -77,7 +77,10 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: Ag
                 TurnStartInputTurn::new(turn_id.to_string()),
             )
             .with_session(owner);
-            super::settle(EventType::TurnStart, sdk.turn_start(input).await);
+            super::settle(
+                EventType::TurnStart,
+                super::dispatch(sdk.turn_start(input), None).await,
+            );
         }
         AgentEvent::TurnFinished(result) => {
             let outcome = match result.finish_reason {
@@ -129,7 +132,10 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: Ag
             let input = input
                 .with_sources()
                 .with_items(super::messages(&result.items));
-            super::settle(EventType::TurnEnd, sdk.turn_end(input).await);
+            super::settle(
+                EventType::TurnEnd,
+                super::dispatch(sdk.turn_end(input), None).await,
+            );
         }
         _ => {}
     }

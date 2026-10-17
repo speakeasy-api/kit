@@ -1099,6 +1099,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1113,11 +1114,32 @@ impl ResponseInterruptionNoticeObserver {
         activity: activity::SessionActivity,
     ) -> Self {
         Self {
+            hook_messages: None,
             activity,
             inner,
             client,
             session_id,
         }
+    }
+
+    fn with_hook_messages(mut self, hooks: Option<&crate::ahp::Hooks>) -> Self {
+        let Some(hooks) = hooks else {
+            return self;
+        };
+        let message_client = self.client.clone();
+        let message_session = self.session_id.clone();
+        self.hook_messages = Some(hooks.subscribe_messages(
+            self.session_id.to_string(),
+            move |text| {
+                message_client
+                    .notify_session(SessionNotification::new(
+                        message_session.clone(),
+                        SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text)),
+                    ))
+                    .is_ok()
+            },
+        ));
+        self
     }
 }
 
@@ -1589,7 +1611,8 @@ impl Server {
             client,
             session_id.clone(),
             activity.clone(),
-        );
+        )
+        .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
             cwd,
             additional_directories,
@@ -5065,6 +5088,46 @@ pub(super) mod tests {
             }),
             "the finalization flush must include the terminal inner-tool card"
         );
+    }
+
+    #[tokio::test]
+    async fn hook_message_uses_registered_v1_observer_notice_sink() {
+        let integration = AcpIntegration::builder()
+            .name("hook-message-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("v1-hook-message-test");
+        let (client, mut messages) = AcpClientHandle::channel();
+        let observer = ResponseInterruptionNoticeObserver::new(
+            integration,
+            client,
+            session_id.clone(),
+            legacy_activity(session_id.clone(), |_| Ok(())),
+        );
+        let (hooks, backend) = crate::ahp::test_support::hooks(vec![
+            crate::ahp::test_support::intercept(&["context.compact.before"]),
+        ]);
+        let _observer = observer.with_hook_messages(Some(&hooks));
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "message", "text": "Compaction hook notice"}]),
+        );
+        hooks
+            .compact_before(&session_id.to_string(), &[], true, "summarize", None)
+            .await;
+
+        let AcpClientMessage::SessionNotification(notification) = messages.try_recv().unwrap()
+        else {
+            panic!("expected hook notification");
+        };
+        assert_eq!(notification.session_id, session_id);
+        let SessionUpdate::Notice(notice) = notification.update else {
+            panic!("hook message must use the v1 notice presentation");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert_eq!(notice.title, "Compaction hook notice");
+        assert!(messages.try_recv().is_err());
     }
 
     #[tokio::test]

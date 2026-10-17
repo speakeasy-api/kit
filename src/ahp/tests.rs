@@ -68,7 +68,8 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
     let hooks = Hooks::new(registration, options().unwrap()).unwrap();
     hooks
         .session_start("environment-test", SessionStartInputTrigger::Startup, None)
-        .await;
+        .await
+        .unwrap();
     hooks.sdk.shutdown().await.unwrap();
     assert_eq!(
         std::fs::read_to_string(output).unwrap(),
@@ -143,6 +144,7 @@ fn every_intercept_event_accepts_observe_subscriptions() {
         "user.message.inbound",
         "model.request.before",
         "tool.before",
+        "tool.after",
         "context.compact.before",
         "context.compact.after",
     ] {
@@ -495,6 +497,186 @@ async fn tool_before_edited_return_requires_explicit_hook_allow() {
             ToolOutput::text(if allowed { "cached" } else { "edited" }),
         );
     }
+}
+
+fn output_replacement(text: &str) -> Value {
+    json!({"type": "modify", "target": "output", "operation": "replace", "value": [
+        {"id": "replacement", "role": "tool", "parts": [
+            {"id": "replacement/text", "kind": "text", "mediaType": "text/plain",
+             "selection": "body", "text": text}
+        ]}
+    ]})
+}
+
+#[tokio::test]
+async fn tool_after_replaces_output_and_preserves_execution_metadata() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
+    backend.respond("tool.after", json!([output_replacement("redacted")]));
+    let echo = Echo::new();
+    let outcome = call(&hooks, &echo, json!({"text": "secret"})).await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("expected completed call")
+    };
+    assert_eq!(result.result.output, ToolOutput::text("redacted"));
+    assert_eq!(result.result.call_id.to_string(), "call");
+    assert!(!result.result.is_error);
+    assert_eq!(result.duration, Some(std::time::Duration::from_millis(7)));
+    assert_eq!(
+        echo.received.lock().unwrap().as_slice(),
+        &[json!({"text": "secret"})]
+    );
+}
+
+#[tokio::test]
+async fn tool_after_stop_blocks_output_even_after_replacement() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
+    backend.respond(
+        "tool.after",
+        json!([
+            output_replacement("redacted"),
+            {"type": "flow", "operation": "stop", "reason": "sensitive output"}
+        ]),
+    );
+    let echo = Echo::new();
+    let outcome = call(&hooks, &echo, json!({"text": "secret"})).await;
+    assert!(matches!(
+        outcome,
+        ToolExecutionOutcome::Failed(ToolError::PermissionDenied(_))
+    ));
+    assert_eq!(
+        echo.received.lock().unwrap().as_slice(),
+        &[json!({"text": "secret"})]
+    );
+}
+
+#[tokio::test]
+async fn tool_after_replaces_supplied_results_without_running_tool() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
+    backend.respond(
+        "tool.before",
+        json!([{"type": "return", "value": "cached"}]),
+    );
+    backend.respond("tool.after", json!([output_replacement("redacted")]));
+    let echo = Echo::new();
+    assert_eq!(
+        output(call(&hooks, &echo, json!({"text": "secret"})).await),
+        ToolOutput::text("redacted")
+    );
+    assert!(echo.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_after_replacement_does_not_turn_failure_into_success() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
+    backend.respond("tool.after", json!([output_replacement("success")]));
+    assert!(matches!(
+        call(&hooks, &Echo::new(), json!({"text": "unavailable"})).await,
+        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn tool_after_empty_replacement_removes_output() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
+    backend.respond(
+        "tool.after",
+        json!([{"type":"modify", "target":"output", "operation":"replace", "value":[]}]),
+    );
+    assert_eq!(
+        output(call(&hooks, &Echo::new(), json!({"text": "secret"})).await),
+        ToolOutput::text("")
+    );
+}
+
+#[test]
+fn only_response_interceptors_require_buffering() {
+    let (response_hooks, _) = hooks(vec![intercept(&["model.response.after"])]);
+    assert!(response_hooks.intercepts_model_response);
+    for subscriptions in [
+        vec![observe(&["model.response.after"])],
+        vec![intercept(&["tool.before"])],
+        vec![intercept(&["model.request.before"])],
+    ] {
+        let (hooks, _) = hooks(subscriptions);
+        assert!(!hooks.intercepts_model_response);
+    }
+}
+
+#[tokio::test]
+async fn hook_messages_reach_the_owning_session_without_entering_tool_output() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
+    let _subscription = hooks.subscribe_messages("session".into(), move |text| {
+        sender.send(text.to_owned()).is_ok()
+    });
+    backend.respond("tool.before", json!([{"type":"message", "text":"before"}]));
+    backend.respond("tool.after", json!([{"type":"message", "text":"after"}]));
+    assert_eq!(
+        output(call(&hooks, &Echo::new(), json!({"text":"result"})).await),
+        ToolOutput::text("result")
+    );
+    assert_eq!(receiver.try_iter().collect::<Vec<_>>(), ["before", "after"]);
+}
+
+fn context_injection(text: &str) -> Value {
+    json!({"type":"inject", "target":"context", "operation":"append", "deliverAt":"now",
+    "value":[{"id":"context", "role":"user", "parts":[
+        {"id":"context/text", "kind":"text", "mediaType":"text/plain", "selection":"body", "text":text}
+    ]}]})
+}
+
+#[tokio::test]
+async fn session_and_tool_context_wait_for_the_next_request() {
+    let (hooks, backend) = hooks(vec![intercept(&["session.start", "tool.after"])]);
+    backend.respond(
+        "session.start",
+        json!([context_injection("session context")]),
+    );
+    backend.respond("tool.after", json!([context_injection("tool context")]));
+    let _lease = hooks
+        .session_start("session", SessionStartInputTrigger::Startup, None)
+        .await
+        .unwrap();
+    call(&hooks, &Echo::new(), json!({"text":"result"})).await;
+    let delivery = hooks.injections.claim("session").unwrap();
+    let mut items = Vec::new();
+    delivery.append_to(&mut items);
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        super::part_text(&items[0].parts[0]).as_deref(),
+        Some("session context")
+    );
+    assert_eq!(
+        super::part_text(&items[1].parts[0]).as_deref(),
+        Some("tool context")
+    );
+    delivery.commit().unwrap();
+    hooks
+        .session_end("session", SessionEndInputOutcome::Completed)
+        .await;
+    assert!(hooks.injections.claim("session").is_err());
+}
+
+#[tokio::test]
+async fn failed_tools_can_inject_recovery_context_without_becoming_successful() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.after"])]);
+    let _lease = hooks
+        .session_start("session", SessionStartInputTrigger::Startup, None)
+        .await
+        .unwrap();
+    backend.respond("tool.after", json!([context_injection("recovery context")]));
+    assert!(matches!(
+        call(&hooks, &Echo::new(), json!({"text":"unavailable"})).await,
+        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Unavailable(_))
+    ));
+    let delivery = hooks.injections.claim("session").unwrap();
+    let mut items = Vec::new();
+    delivery.append_to(&mut items);
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        super::part_text(&items[0].parts[0]).as_deref(),
+        Some("recovery context")
+    );
 }
 
 #[tokio::test]

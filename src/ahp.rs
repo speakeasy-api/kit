@@ -1,4 +1,6 @@
 //! Agent Hooks Protocol integration at Kit's native lifecycle seams.
+mod injection;
+pub(crate) mod messages;
 mod model;
 mod prompt;
 mod tool;
@@ -38,6 +40,9 @@ const CONFIG_FILE: &str = "hooks.json";
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
     sdk: Arc<agenthooksprotocol::Hooks>,
+    intercepts_model_response: bool,
+    injections: injection::Injections,
+    messages: messages::Routes,
     turn_events: turn::TurnQueues,
     root: Option<std::path::PathBuf>,
 }
@@ -71,8 +76,12 @@ impl Hooks {
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
+        let intercepts_model_response = sdk.intercepts(EventType::ModelResponseAfter);
         Ok(Self {
             sdk: Arc::new(sdk),
+            intercepts_model_response,
+            injections: injection::Injections::default(),
+            messages: messages::Routes::default(),
             turn_events: turn::TurnQueues::default(),
             root: None,
         })
@@ -89,12 +98,25 @@ impl Hooks {
         Box::new(session)
     }
 
-    pub(crate) async fn session_start(
+    fn settle(
+        &self,
+        event: EventType,
+        result: Result<EventOutcome, LoopError>,
+        session: &str,
+    ) -> Option<EventOutcome> {
+        let outcome = settle(event, result)?;
+        self.deliver_messages(session, &outcome.outcome.messages);
+        Some(outcome)
+    }
+
+    async fn session_start(
         &self,
         session: &str,
         trigger: SessionStartInputTrigger,
         model: Option<&str>,
-    ) {
+    ) -> Result<injection::SessionLease, String> {
+        let lease = self.injections.open(session)?;
+        let producer = self.injections.producer(session);
         let mut input = SessionStartInput::new(
             Vec::new(),
             "allow-all".into(),
@@ -104,15 +126,30 @@ impl Hooks {
         if let Some(model) = model {
             input.session.model = Presence::Present(model.to_owned());
         }
-        settle(EventType::SessionStart, self.sdk.session_start(input).await);
+        let outcome = self
+            .settle(
+                EventType::SessionStart,
+                dispatch(self.sdk.session_start(input), None).await,
+                session,
+            )
+            .ok_or_else(|| "session.start hook dispatch failed".to_owned())?;
+        enqueue_injections(producer.as_ref(), &outcome.outcome)?;
+        Ok(lease)
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
+        if let Err(error) = self.injections.close(session) {
+            tracing::warn!(%error, "could not close hook injection session");
+        }
         self.drain_turn_events(session).await;
         self.forget_turn_events(session);
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, self.session(session));
-        settle(EventType::SessionEnd, self.sdk.session_end(input).await);
+        self.settle(
+            EventType::SessionEnd,
+            dispatch(self.sdk.session_end(input), None).await,
+            session,
+        );
     }
 
     /// Runs `context.compact.before`; a hook may supply the summary or replace
@@ -125,6 +162,7 @@ impl Hooks {
         instructions: &str,
         cancellation: Option<&TurnCancellation>,
     ) -> Option<Compaction> {
+        let producer = self.injections.producer(session);
         let trigger = if manual {
             ContextCompactBeforeInputTrigger::Manual
         } else {
@@ -136,11 +174,18 @@ impl Hooks {
         let boundary = self
             .sdk
             .context_compact_before(input.with_sources().with_items(messages(items)));
-        let result = match cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
+        let result = dispatch(boundary, cancellation).await;
+        let Some(outcome) = self.settle(EventType::ContextCompactBefore, result, session) else {
+            return Some(Compaction::Denied(
+                "context.compact.before hook dispatch failed".into(),
+            ));
         };
-        let outcome = settle(EventType::ContextCompactBefore, result)?;
+        if outcome.outcome.is_denied() {
+            return Some(Compaction::Denied(denial(&outcome.outcome)));
+        }
+        if let Err(error) = enqueue_injections(producer.as_ref(), &outcome.outcome) {
+            return Some(Compaction::Denied(error));
+        }
         if let Some(SettledCandidate::Summary(summary)) = outcome.outcome.candidate() {
             return Some(Compaction::Summary(parts_text(summary)));
         }
@@ -182,11 +227,13 @@ impl Hooks {
                 agenthooksprotocol::ExecutionEventExecutionSkippedSuppliedResult::new(),
             ));
         }
-        match settle(
-            EventType::ContextCompactAfter,
-            self.sdk.context_compact_after(input).await,
-        )
-        .map(|outcome| outcome.event)
+        match self
+            .settle(
+                EventType::ContextCompactAfter,
+                dispatch(self.sdk.context_compact_after(input), None).await,
+                session,
+            )
+            .map(|outcome| outcome.event)
         {
             Some(Event::ContextCompactAfter(event)) => parts_text(&event.0.summary),
             _ => summary,
@@ -203,42 +250,76 @@ pub(crate) fn session_outcome<T>(result: &Result<T, LoopError>) -> SessionEndInp
 }
 
 pub(crate) enum Compaction {
+    Denied(String),
     Summary(String),
     Instructions(String),
 }
 
 fn options() -> Result<HooksOptions, String> {
     let capabilities = HostCapabilities {
-        session_start: Some(capability::session_start().observe()),
+        session_start: Some(
+            capability::session_start()
+                .message()
+                .observe()
+                .inject_context(capability::InjectContext::Now),
+        ),
         session_end: Some(capability::session_end().observe()),
         turn_start: Some(capability::turn_start().observe()),
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()
+                .message()
                 .observe()
                 .deny()
                 .modify_prompt(Modify::Replace),
         ),
-        model_request_before: Some(capability::model_request_before().observe().deny()),
-        model_response_after: Some(capability::model_response_after().observe()),
+        model_request_before: Some(
+            capability::model_request_before()
+                .message()
+                .observe()
+                .deny()
+                .return_result()
+                .modify_request(Modify::Replace)
+                .inject_context(capability::InjectContext::Now),
+        ),
+        model_response_after: Some(
+            capability::model_response_after()
+                .message()
+                .observe()
+                .modify_response(Modify::Replace)
+                .flow(capability::ModelResponseAfterFlow::Stop),
+        ),
         model_error: Some(capability::model_error().observe()),
         tool_before: Some(
             capability::tool_before()
+                .message()
                 .observe()
                 .allow()
                 .deny()
                 .return_result()
-                .modify_input(Modify::ReplaceAndMerge),
+                .modify_input(Modify::ReplaceAndMerge)
+                .inject_context(capability::InjectContext::Now),
         ),
-        tool_after: Some(capability::tool_after().observe()),
+        tool_after: Some(
+            capability::tool_after()
+                .message()
+                .observe()
+                .modify_output(Modify::Replace)
+                .inject_context(capability::InjectContext::Now)
+                .flow(capability::Flow::Stop),
+        ),
         context_compact_before: Some(
             capability::context_compact_before()
+                .message()
                 .observe()
+                .deny()
                 .return_result()
-                .modify_instructions(Modify::Replace),
+                .modify_instructions(Modify::Replace)
+                .inject_context(capability::InjectContext::Now),
         ),
         context_compact_after: Some(
             capability::context_compact_after()
+                .message()
                 .observe()
                 .modify_summary(Modify::Replace),
         ),
@@ -292,7 +373,7 @@ fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
 }
 
 /// Reports delivery diagnostics; a dispatch error is reported and yields `None`.
-fn settle(event: EventType, result: Result<EventOutcome, HookError>) -> Option<EventOutcome> {
+fn settle(event: EventType, result: Result<EventOutcome, LoopError>) -> Option<EventOutcome> {
     match result {
         Ok(outcome) => {
             report(event, &outcome.diagnostics);
@@ -303,6 +384,57 @@ fn settle(event: EventType, result: Result<EventOutcome, HookError>) -> Option<E
             None
         }
     }
+}
+
+fn enqueue_injections<C, P>(
+    producer: Option<&injection::Producer>,
+    outcome: &ProtocolOutcome<C, P>,
+) -> Result<(), String> {
+    if outcome.injections.is_empty() {
+        return Ok(());
+    }
+    producer
+        .ok_or("injection session is closed")?
+        .enqueue(outcome)
+}
+
+/// Dispatch once and preserve caller cancellation instead of treating it as denial.
+async fn dispatch<B, T>(
+    boundary: B,
+    cancellation: Option<&TurnCancellation>,
+) -> Result<T, LoopError>
+where
+    B: std::future::IntoFuture<Output = Result<T, HookError>> + Send,
+    B::IntoFuture: Send,
+{
+    let operation = std::pin::pin!(boundary.into_future());
+    let result = if let Some(cancellation) = cancellation {
+        let cancelled = std::pin::pin!(cancellation.cancelled());
+        match futures_util::future::select(cancelled, operation).await {
+            futures_util::future::Either::Left(_) => return Err(LoopError::Cancelled),
+            futures_util::future::Either::Right((result, _)) => result,
+        }
+    } else {
+        operation.await
+    };
+    if cancellation.is_some_and(TurnCancellation::is_cancelled) {
+        return Err(LoopError::Cancelled);
+    }
+    result.map_err(|error| LoopError::InvalidState(error.to_string()))
+}
+
+/// SDK outcomes include responses only after their effects are accepted.
+fn has_modification(outcome: &EventOutcome) -> bool {
+    outcome
+        .outcome
+        .responses
+        .iter()
+        .any(|response| match &response.result.effects {
+            Presence::Present(effects) => effects
+                .iter()
+                .any(|effect| matches!(effect.as_ref(), Effect::ModifyMessagesEffect(_))),
+            Presence::Missing => false,
+        })
 }
 
 fn denial<C, P>(outcome: &ProtocolOutcome<C, P>) -> String {
@@ -474,6 +606,16 @@ fn role(kind: ItemKind) -> CanonicalMessageRole {
         ItemKind::User | ItemKind::Notification => CanonicalMessageRole::User,
         ItemKind::Assistant => CanonicalMessageRole::Assistant,
         ItemKind::Tool => CanonicalMessageRole::Tool,
+    }
+}
+
+fn message_kind(role: &CanonicalMessageRole) -> Result<ItemKind, String> {
+    match role {
+        CanonicalMessageRole::System => Ok(ItemKind::System),
+        CanonicalMessageRole::Developer => Ok(ItemKind::Developer),
+        CanonicalMessageRole::User => Ok(ItemKind::User),
+        CanonicalMessageRole::Assistant => Ok(ItemKind::Assistant),
+        _ => Err("unsupported hook message role".into()),
     }
 }
 
