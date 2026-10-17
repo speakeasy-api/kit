@@ -76,8 +76,46 @@ hook does not also allow goes through Kit's permission policy again.
 
 Tool events cover the tools that compose scripts call, such as `shell`, `edit`,
 `read_file` and the MCP `tool` dispatcher. Kit projects text, structured data,
-tool calls and tool results into message parts. It omits media, files and
-reasoning.
+tool calls and tool results into categorized message parts. Tool-call IDs and
+result status remain in selectable content. Readable reasoning summaries are
+included; opaque provider continuation data and arbitrary metadata are not.
+Media and file references retain their tagged representation without fetching
+remote URLs or resolving artifact handles. Inline binary media uses AHP-owned
+attachments. A subscription that selects attachment bodies must configure an
+AHP upload destination; select `metadata` or `omit` for media/file categories
+when the backend does not accept uploads. All content respects the
+subscription's selection policy.
+
+### Payload context
+
+Events include the owning session ID and Kit's configured working directory
+and workspace root. Model and tool events also include their native turn ID.
+Compaction events identify the conversation being compacted, not the separate
+summarizer session. The SDK supplies event IDs, timestamps, source, harness
+identity, and the session-start manifest.
+
+Model responses report the provider's resolved model and available token,
+cache, and cost usage. Turn-end usage is the loop's aggregate. Missing usage
+is omitted, not reported as zero. Model latency measures the host-observed
+call after hook admission; tool duration is included when the tool reports it.
+Structured provider errors retain sanitized status, code, and retry accounting.
+The AHP attempt identity is synthesized for each host model call; its number
+is not a provider retry count.
+
+Kit-specific fields use these namespaces:
+
+- `params["dev.kit.tools"]`: model-visible tool names, descriptions, and input schemas.
+- `params["dev.kit.cache"]`: requested cache mode, retention, and strategy, without routing keys.
+- `extensions["dev.kit.response"]`: provider response ID, when reported.
+- `extensions["dev.kit.usage"]`: reported reasoning-token count.
+- `extensions["dev.kit.retry"]`: sanitized provider failure and retry accounting.
+
+These are host settings and observations, not a copy of the provider's wire
+request. Credentials, environment contents, arbitrary request metadata, and
+opaque continuation state are not added to payloads. Provider-only generation
+settings, exact compaction token deltas, and generic tool MCP/batch/file-change
+metadata are omitted when the runtime seam does not expose them. Unknown
+required model identities are explicitly identified in `gaps`.
 
 Tool calls, model retries and model continuations stay within the same logical
 turn; they do not emit extra turn boundaries. Kit delivers turn observations

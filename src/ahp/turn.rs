@@ -41,12 +41,13 @@ impl Hooks {
         }
         let sdk = Arc::clone(&self.sdk);
         let queues = Arc::clone(&self.turn_events);
+        let owner = self.session(session);
         let session = session.to_owned();
         // A cancelled caller must not abandon an observation the SDK has begun delivering.
         let delivered = tokio::spawn(async move {
             let _guard = guard;
             while let Some(event) = next(&queues, &session) {
-                deliver(&sdk, &session, event).await;
+                deliver(&sdk, owner.clone(), event).await;
             }
         });
         if delivered.await.is_err() {
@@ -67,8 +68,7 @@ fn next(queues: &TurnQueues, session: &str) -> Option<AgentEvent> {
     lock(queues).get_mut(session)?.pending.pop_front()
 }
 
-async fn deliver(sdk: &agenthooksprotocol::Hooks, session: &str, event: AgentEvent) {
-    let owner = Box::new(Session::new(session));
+async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: AgentEvent) {
     match event {
         AgentEvent::TurnStarted { turn_id, .. } => {
             let input = TurnStartInput::new(
@@ -85,18 +85,50 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, session: &str, event: AgentEve
                 FinishReason::Error | FinishReason::Blocked => TurnEndInputOutcome::Failed,
                 _ => TurnEndInputOutcome::Completed,
             };
+            // Kit grants no AHP continue effect; native tool iterations are not
+            // hook-requested turn continuations.
             let Some(continuations) = Integer::from_i64(0) else {
                 return;
             };
-            let input = TurnEndInput::new(
+            let mut input = TurnEndInput::new(
                 continuations,
                 Vec::new(),
                 outcome,
                 TurnEndInputTurn::new(result.turn_id.to_string()),
             )
-            .with_session(owner)
-            .with_sources()
-            .with_items(super::messages(&result.items));
+            .with_session(owner);
+            input.last_assistant_item = result
+                .items
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, item)| item.kind == agentkit_core::ItemKind::Assistant)
+                .map(|(index, item)| {
+                    let mut reference = agenthooksprotocol::TurnEndInputLastAssistantItem::new(
+                        super::item_id(item, index),
+                    );
+                    if item.id.is_none() {
+                        reference.synthesized = agenthooksprotocol::Presence::Present(true);
+                    }
+                    reference
+                });
+            if let Some(reasoning) = result
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.tokens.as_ref())
+                .and_then(|tokens| tokens.reasoning_tokens)
+            {
+                let mut extensions = agenthooksprotocol::Extensions::new();
+                extensions.additional_properties.insert(
+                    "dev.kit.usage".into(),
+                    super::object([("reasoningTokens", reasoning.into())]),
+                );
+                input.extensions = Some(Box::new(extensions));
+            }
+            input.usage = result.usage.as_ref().map(super::usage::turn).map(Box::new);
+            let input = input
+                .with_sources()
+                .with_items(super::messages(&result.items));
             super::settle(EventType::TurnEnd, sdk.turn_end(input).await);
         }
         _ => {}

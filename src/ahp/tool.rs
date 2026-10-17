@@ -55,13 +55,17 @@ impl HookedTool {
             Ok(validator) => validator,
             Err(error) => return Before::Return(denied(error)),
         };
-        let input = ToolBeforeInput::new(
+        let mut input = ToolBeforeInput::new(
             request.call_id.to_string(),
             request.tool_name.to_string(),
             request.input.clone(),
             request.tool_name.to_string(),
             ToolBeforeInputOrigin::Native,
         );
+        input.session = Some(self.hooks.session(&request.session_id.to_string()));
+        input.turn = Some(agenthooksprotocol::ToolBeforeInputTurn::new(
+            request.turn_id.to_string(),
+        ));
         let boundary = match self
             .hooks
             .sdk
@@ -192,16 +196,12 @@ impl HookedTool {
             _ => ExecutionEventExecution::Executed(ExecutionEventExecutionExecuted::new()),
         };
         let (status, output, error) = match outcome {
-            ToolExecutionOutcome::Completed(result) if result.result.is_error => (
-                ToolAfterInputOutcome::Error,
-                super::output_text(&result.result.output),
-                None,
-            ),
-            ToolExecutionOutcome::Completed(result) => (
-                ToolAfterInputOutcome::Ok,
-                super::output_text(&result.result.output),
-                None,
-            ),
+            ToolExecutionOutcome::Completed(result) if result.result.is_error => {
+                (ToolAfterInputOutcome::Error, Some(&result.result), None)
+            }
+            ToolExecutionOutcome::Completed(result) => {
+                (ToolAfterInputOutcome::Ok, Some(&result.result), None)
+            }
             ToolExecutionOutcome::Failed(ToolError::Cancelled)
             | ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Cancelled) => {
                 (ToolAfterInputOutcome::Cancelled, None, None)
@@ -222,16 +222,25 @@ impl HookedTool {
             request.tool_name.to_string(),
             ToolAfterInputOrigin::Native,
         );
+        input.session = Some(self.hooks.session(&request.session_id.to_string()));
+        input.turn = Some(agenthooksprotocol::ToolAfterInputTurn::new(
+            request.turn_id.to_string(),
+        ));
+        if let ToolExecutionOutcome::Completed(result) = outcome {
+            input.duration_ms = result
+                .duration
+                .and_then(|duration| serde_json::Number::from_f64(duration.as_secs_f64() * 1000.0));
+        }
         input.error = error.map(|message| Box::new(ExecutionEventError::new("tool", message)));
         let items = output
-            .map(|text| {
-                vec![MessageInput::new(
+            .map(|result| {
+                vec![MessageInput::synthesized(
                     format!("{}/output", request.call_id),
                     CanonicalMessageRole::Tool,
-                    vec![super::text_part(
+                    super::content_parts(
                         &format!("{}/output/0", request.call_id),
-                        text,
-                    )],
+                        &agentkit_core::Part::ToolResult(result.clone()),
+                    ),
                 )]
             })
             .unwrap_or_default();

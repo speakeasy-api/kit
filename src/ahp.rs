@@ -3,6 +3,7 @@ mod model;
 mod prompt;
 mod tool;
 mod turn;
+mod usage;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use agenthooksprotocol::inputs::{
     SessionStartInput,
 };
 use agenthooksprotocol::{
-    Attachment, CanonicalMessageRole, ContentItem, ContextCompactAfterInputRemovedItem,
+    Attachment, CanonicalMessageRole, ContextCompactAfterInputRemovedItem,
     ContextCompactBeforeInputTrigger, EventType, ExecutionEventExecution,
     ExecutionEventExecutionExecuted, Harness, Registration, Session, SessionEndInputOutcome,
     SessionStartInputTrigger, TextBodyPart, TextPart, TextParts,
@@ -38,6 +39,7 @@ const CONFIG_FILE: &str = "hooks.json";
 pub struct Hooks {
     sdk: Arc<agenthooksprotocol::Hooks>,
     turn_events: turn::TurnQueues,
+    root: Option<std::path::PathBuf>,
 }
 
 impl Hooks {
@@ -55,7 +57,10 @@ impl Hooks {
         }
         let registration = merged?;
         match options().and_then(|options| Self::new(registration, options)) {
-            Ok(hooks) => Some(Arc::new(hooks)),
+            Ok(mut hooks) => {
+                hooks.root = Some(root.to_path_buf());
+                Some(Arc::new(hooks))
+            }
             Err(error) => {
                 eprintln!("kit: agent hooks disabled: {error}");
                 None
@@ -69,16 +74,36 @@ impl Hooks {
         Ok(Self {
             sdk: Arc::new(sdk),
             turn_events: turn::TurnQueues::default(),
+            root: None,
         })
     }
 
-    pub(crate) async fn session_start(&self, session: &str, trigger: SessionStartInputTrigger) {
-        let input = SessionStartInput::new(
+    /// Snapshot immutable workspace context; session identity always comes from the caller.
+    fn session(&self, id: &str) -> Box<Session> {
+        let mut session = Session::new(id);
+        if let Some(root) = &self.root {
+            let root = root.to_string_lossy().into_owned();
+            session.cwd = Presence::Present(root.clone());
+            session.workspace_roots = Presence::Present(vec![root]);
+        }
+        Box::new(session)
+    }
+
+    pub(crate) async fn session_start(
+        &self,
+        session: &str,
+        trigger: SessionStartInputTrigger,
+        model: Option<&str>,
+    ) {
+        let mut input = SessionStartInput::new(
             Vec::new(),
             "allow-all".into(),
-            Box::new(Session::new(session)),
+            self.session(session),
             trigger,
         );
+        if let Some(model) = model {
+            input.session.model = Presence::Present(model.to_owned());
+        }
         settle(EventType::SessionStart, self.sdk.session_start(input).await);
     }
 
@@ -86,7 +111,7 @@ impl Hooks {
         self.drain_turn_events(session).await;
         self.forget_turn_events(session);
         let reason = outcome.as_str().to_owned();
-        let input = SessionEndInput::new(outcome, reason, Box::new(Session::new(session)));
+        let input = SessionEndInput::new(outcome, reason, self.session(session));
         settle(EventType::SessionEnd, self.sdk.session_end(input).await);
     }
 
@@ -94,6 +119,7 @@ impl Hooks {
     /// the summarizer instructions.
     pub(crate) async fn compact_before(
         &self,
+        session: &str,
         items: &[Item],
         manual: bool,
         instructions: &str,
@@ -105,6 +131,7 @@ impl Hooks {
             ContextCompactBeforeInputTrigger::Auto
         };
         let mut input = ContextCompactBeforeInput::new(Vec::new(), trigger);
+        input.session = Some(self.session(session));
         input.instructions = Some(Box::new(text_parts("instructions", instructions)));
         let boundary = self
             .sdk
@@ -130,19 +157,31 @@ impl Hooks {
 
     /// Runs `context.compact.after`; a hook may replace the summary before it
     /// is installed.
-    pub(crate) async fn compact_after(&self, items: &[Item], summary: String) -> String {
+    pub(crate) async fn compact_after(
+        &self,
+        session: &str,
+        items: &[Item],
+        summary: String,
+        supplied: bool,
+    ) -> String {
         let removed = items
             .iter()
             .enumerate()
             .map(|(index, item)| ContextCompactAfterInputRemovedItem::new(item_id(item, index)))
             .collect();
-        let input = ContextCompactAfterInput::new(
+        let mut input = ContextCompactAfterInput::new(
             Box::new(ExecutionEventExecution::Executed(
                 ExecutionEventExecutionExecuted::new(),
             )),
             removed,
             Box::new(text_parts("summary", &summary)),
         );
+        input.session = Some(self.session(session));
+        if supplied {
+            input.execution = Box::new(ExecutionEventExecution::SkippedSuppliedResult(
+                agenthooksprotocol::ExecutionEventExecutionSkippedSuppliedResult::new(),
+            ));
+        }
         match settle(
             EventType::ContextCompactAfter,
             self.sdk.context_compact_after(input).await,
@@ -282,11 +321,22 @@ fn denial<C, P>(outcome: &ProtocolOutcome<C, P>) -> String {
         .unwrap_or_else(|| "denied by agent hook".into())
 }
 
+fn object(
+    fields: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        fields
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    )
+}
+
 fn messages(items: &[Item]) -> Vec<MessageInput<Attachment>> {
     items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| message(item, index))
+        .map(|(index, item)| message(item, index))
         .collect()
 }
 
@@ -296,20 +346,125 @@ fn item_id(item: &Item, index: usize) -> String {
         .map_or_else(|| format!("item-{index}"), ToString::to_string)
 }
 
-fn message(item: &Item, index: usize) -> Option<MessageInput<Attachment>> {
+fn message(item: &Item, index: usize) -> MessageInput<Attachment> {
     let id = item_id(item, index);
     let parts: Vec<_> = item
         .parts
         .iter()
-        .filter_map(part_text)
         .enumerate()
-        .map(|(index, text)| text_part(&format!("{id}/{index}"), text))
+        .flat_map(|(index, part)| content_parts(&format!("{id}/{index}"), part))
         .collect();
-    (!parts.is_empty()).then(|| MessageInput::new(id, role(item.kind), parts))
+    let mut message = MessageInput::new(id, role(item.kind), parts);
+    if item.id.is_none() {
+        message.metadata.synthesized = Presence::Present(true);
+    }
+    message
 }
 
-fn text_part(id: &str, text: impl Into<String>) -> PartInput<Attachment> {
-    PartInput::text(TextBodyPart::new(id, text))
+fn content_parts(id: &str, part: &Part) -> Vec<PartInput<Attachment>> {
+    let text = |id: String, category: &str, value: String| {
+        PartInput::text(
+            TextBodyPart::new(id, value)
+                .with_synthesized(true)
+                .with_category(category),
+        )
+    };
+    if let Part::ToolResult(result) = part {
+        let mut parts = match &result.output {
+            ToolOutput::Parts(parts) => parts
+                .iter()
+                .enumerate()
+                .flat_map(|(index, part)| content_parts(&format!("{id}/{index}"), part))
+                .collect(),
+            ToolOutput::Files(files) => files
+                .iter()
+                .enumerate()
+                .flat_map(|(index, file)| {
+                    content_parts(&format!("{id}/{index}"), &Part::File(file.clone()))
+                })
+                .collect(),
+            output => output_text(output)
+                .map(|value| vec![text(id.into(), "tool-result", value)])
+                .unwrap_or_default(),
+        };
+        // Correlation belongs in selectable content, not undeclared canonical
+        // fields or extensions that bypass a hook's content selection policy.
+        parts.push(text(
+            format!("{id}/call"),
+            "tool-result-context",
+            object([
+                ("callId", result.call_id.to_string().into()),
+                ("isError", result.is_error.into()),
+            ])
+            .to_string(),
+        ));
+        return parts;
+    }
+    let category = match part {
+        Part::Text(_) => "text",
+        Part::Structured(_) => "structured",
+        Part::ToolCall(_) => "tool-call",
+        Part::ToolResult(_) => "tool-result",
+        Part::Reasoning(_) => "reasoning",
+        Part::Media(_) => "media",
+        Part::File(_) => "file",
+        Part::Custom(_) => "custom",
+    };
+    let mut parts = Vec::new();
+    if let Some(value) = part_text(part) {
+        parts.push(text(id.into(), category, value));
+    }
+    let data = match part {
+        Part::Media(media) => Some((&media.data, Some(media.mime_type.as_str()))),
+        Part::File(file) => Some((&file.data, file.mime_type.as_deref())),
+        Part::Custom(custom) => custom.data.as_ref().map(|data| (data, None)),
+        // Provider reasoning data can contain opaque continuation state; only
+        // explicitly readable summaries are normalized hook content.
+        _ => None,
+    };
+    if let Some((data, media_type)) = data {
+        let media_type = media_type.unwrap_or("application/octet-stream");
+        let base = media_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if let agentkit_core::DataRef::InlineBytes(bytes) = data
+            && !base.starts_with("text/")
+            && !base.ends_with("/json")
+            && !base.ends_with("+json")
+        {
+            let metadata = agenthooksprotocol::AttachmentBodyPart::new(
+                agenthooksprotocol::ContentReference::new("ahp:host-pending"),
+                format!("{id}/data"),
+                media_type,
+            )
+            .with_synthesized(true)
+            .with_category(category);
+            parts.push(PartInput::attachment(
+                metadata,
+                Attachment::bytes(bytes.clone()),
+            ));
+        } else {
+            // Keep the owning category: SDK selection uses exact category names.
+            // The /data ID suffix identifies a noneditable descriptor separately.
+            // InlineText can be encoded binary. Preserve the tagged reference;
+            // never fetch remote URIs or resolve artifact handles on hook demand.
+            if let Ok(data) = serde_json::to_value(data) {
+                parts.push(text(
+                    format!("{id}/data"),
+                    category,
+                    object([("data", data), ("mediaType", media_type.into())]).to_string(),
+                ));
+            }
+        }
+        if let Part::File(file) = part
+            && let Some(name) = &file.name
+        {
+            parts.push(text(format!("{id}/name"), category, name.clone()));
+        }
+    }
+    parts
 }
 
 fn role(kind: ItemKind) -> CanonicalMessageRole {
@@ -328,13 +483,22 @@ fn part_text(part: &Part) -> Option<String> {
         Part::Structured(structured) => Some(structured.value.to_string()),
         Part::ToolCall(call) => Some(
             serde_json::Value::Object(serde_json::Map::from_iter([
+                ("callId".to_owned(), call.id.to_string().into()),
                 ("tool".to_owned(), call.name.clone().into()),
                 ("input".to_owned(), call.input.clone()),
             ]))
             .to_string(),
         ),
         Part::ToolResult(result) => output_text(&result.output),
-        Part::Media(_) | Part::File(_) | Part::Reasoning(_) | Part::Custom(_) => None,
+        Part::Reasoning(reasoning) => reasoning.summary.clone(),
+        Part::Custom(custom) => custom.value.as_ref().map(|value| {
+            object([
+                ("kind", custom.kind.clone().into()),
+                ("value", value.clone()),
+            ])
+            .to_string()
+        }),
+        Part::Media(_) | Part::File(_) => None,
     }
 }
 
@@ -363,21 +527,10 @@ fn finish_reason(reason: &FinishReason) -> String {
     .to_owned()
 }
 
-fn text(parts: &[Box<ContentItem>]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part.as_ref() {
-            ContentItem::TextBodyPart(part) => Some(part.text.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn text_parts(id: &str, text: &str) -> TextParts {
-    TextParts::new(vec![Box::new(TextPart::from(TextBodyPart::new(
-        format!("{id}/0"),
-        text,
-    )))])
+    TextParts::new(vec![Box::new(TextPart::from(
+        TextBodyPart::new(format!("{id}/0"), text).with_synthesized(true),
+    ))])
 }
 
 fn parts_text(parts: &TextParts) -> String {

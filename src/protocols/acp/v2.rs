@@ -6248,6 +6248,7 @@ mod tests {
                 Default::default(),
                 None,
                 loop_id.clone(),
+                loop_id.clone(),
                 None,
             )
             .unwrap();
