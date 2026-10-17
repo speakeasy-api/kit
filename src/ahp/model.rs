@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
+use agenthooksprotocol::client::SettledCandidate;
+use agenthooksprotocol::generated::Event;
 use agenthooksprotocol::inputs::{
     ModelErrorInput, ModelRequestBeforeInput, ModelResponseAfterInput,
 };
+use agenthooksprotocol::{CanonicalMessage, CanonicalMessageRole, ContentItem, Presence};
 use agenthooksprotocol::{
     EventType, ExecutionEventAttempt, ExecutionEventError, ExecutionEventExecution,
     ExecutionEventExecutionExecuted, ExecutionEventModel, Integer, ModelErrorInputExecution,
     ModelErrorInputExecutionExecuted, ModelRequestBeforeInputParams, SessionStartInputTrigger,
 };
-use agentkit_core::TurnCancellation;
+use agentkit_core::{FinishReason, Item, ItemKind, Part, TurnCancellation};
 use agentkit_loop::{
-    LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, RetryObserver, SessionConfig,
-    TurnRequest,
+    LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
+    RetryObserver, SessionConfig, TurnRequest,
 };
 use async_trait::async_trait;
 
@@ -46,14 +49,20 @@ impl<A: ModelAdapter> ModelAdapter for HookedAdapter<A> {
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
         let session_id = config.session_id.to_string();
         let inner = self.inner.start_session(config).await?;
-        if let Some(hooks) = &self.hooks {
-            hooks
-                .session_start(&session_id, self.trigger.clone(), inner.model_name())
-                .await;
-        }
+        let injection_session = if let Some(hooks) = &self.hooks {
+            Some(
+                hooks
+                    .session_start(&session_id, self.trigger.clone(), inner.model_name())
+                    .await
+                    .map_err(LoopError::InvalidState)?,
+            )
+        } else {
+            None
+        };
         Ok(HookedSession {
             inner,
             hooks: self.hooks.clone(),
+            _injection_session: injection_session,
             attempts: 0,
         })
     }
@@ -65,12 +74,14 @@ impl<A: ModelAdapter> ModelAdapter for HookedAdapter<A> {
 
 pub(crate) struct HookedSession<S> {
     inner: S,
+    _injection_session: Option<super::injection::SessionLease>,
     hooks: Option<Arc<Hooks>>,
     attempts: u64,
 }
 
 #[derive(Clone)]
 struct Call {
+    destination: super::messages::Destination,
     hooks: Arc<Hooks>,
     attempt: ExecutionEventAttempt,
     model: ExecutionEventModel,
@@ -140,6 +151,7 @@ impl Call {
         super::settle(
             EventType::ModelError,
             self.hooks.sdk.model_error(input).await,
+            &self.destination,
         );
     }
 }
@@ -154,17 +166,19 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
 
     async fn begin_turn(
         &mut self,
-        request: TurnRequest,
+        mut request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
         let Some(hooks) = &self.hooks else {
             let inner = self.inner.begin_turn(request, cancellation).await?;
             return Ok(HookedTurn {
-                inner,
+                inner: Some(inner),
+                synthetic: None,
                 call: None,
                 latest_usage: None,
             });
         };
+        let destination = super::messages::capture(&request.session_id.to_string());
         hooks
             .drain_turn_events(&request.session_id.to_string())
             .await;
@@ -172,12 +186,14 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         let Some(number) = Integer::new(self.attempts.into()) else {
             let inner = self.inner.begin_turn(request, cancellation).await?;
             return Ok(HookedTurn {
-                inner,
+                inner: Some(inner),
+                synthetic: None,
                 call: None,
                 latest_usage: None,
             });
         };
         let mut call = Call {
+            destination,
             hooks: Arc::clone(hooks),
             session: hooks.session(&request.session_id.to_string()),
             turn: request.turn_id.to_string(),
@@ -258,6 +274,10 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         let input = input
             .with_sources()
             .with_items(super::messages(&request.transcript));
+        let producer = hooks
+            .injections
+            .producer(&call.session.id)
+            .map_err(LoopError::InvalidState)?;
         let boundary = hooks.sdk.model_request_before(input);
         let result = match &cancellation {
             Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
@@ -271,23 +291,62 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         {
             return Err(LoopError::Cancelled);
         }
-        let reason = match super::settle(EventType::ModelRequestBefore, result) {
-            Some(outcome) if !outcome.outcome.is_denied() => None,
-            Some(outcome) => Some(super::denial(&outcome.outcome)),
-            None => Some("agent hook dispatch failed".into()),
-        };
-        if let Some(reason) = reason {
-            return Err(LoopError::InvalidState(format!(
-                "model request denied by agent hook: {reason}"
+        let outcome = super::settle(EventType::ModelRequestBefore, result, &call.destination)
+            .ok_or_else(|| invalid("model request hook dispatch failed"))?;
+        if outcome.outcome.is_denied() {
+            return Err(invalid(&format!(
+                "model request denied by agent hook: {}",
+                super::denial(&outcome.outcome)
             )));
         }
-        call.started = std::time::Instant::now();
-        match self.inner.begin_turn(request, cancellation).await {
-            Ok(inner) => Ok(HookedTurn {
-                inner,
+        if outcome.outcome.stopped {
+            return Err(invalid("model request stopped by agent hook"));
+        }
+        producer
+            .enqueue(&outcome.outcome)
+            .map_err(LoopError::InvalidState)?;
+        if let Some(SettledCandidate::Messages(messages)) = outcome.outcome.candidate() {
+            let output_items = canonical_items(messages.0.iter().map(Box::as_ref), &[])?;
+            return Ok(HookedTurn {
+                inner: None,
+                synthetic: Some(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items,
+                    usage: None,
+                    metadata: Default::default(),
+                    model: None,
+                    response_id: None,
+                }),
                 call: Some(call),
                 latest_usage: None,
-            }),
+            });
+        }
+        if has_modification(&outcome)
+            && let Event::ModelRequestBefore(event) = &outcome.event
+        {
+            request.transcript = canonical_items(
+                event.0.items.iter().map(|item| item.0.as_ref()),
+                &request.transcript,
+            )?;
+        }
+        // The delivery reservation rolls back if begin_turn fails, panics, or
+        // its future is cancelled. No queue guard crosses this await.
+        let delivery = hooks
+            .injections
+            .claim(&call.session.id)
+            .map_err(LoopError::InvalidState)?;
+        delivery.append_to(&mut request.transcript);
+        call.started = std::time::Instant::now();
+        match self.inner.begin_turn(request, cancellation).await {
+            Ok(inner) => {
+                delivery.commit().map_err(LoopError::InvalidState)?;
+                Ok(HookedTurn {
+                    inner: Some(inner),
+                    synthetic: None,
+                    call: Some(call),
+                    latest_usage: None,
+                })
+            }
             Err(error) => {
                 call.failed(&error, None).await;
                 Err(error)
@@ -305,7 +364,8 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
 }
 
 pub(crate) struct HookedTurn<T> {
-    inner: T,
+    inner: Option<T>,
+    synthetic: Option<ModelTurnResult>,
     call: Option<Call>,
     latest_usage: Option<agentkit_core::Usage>,
 }
@@ -313,18 +373,47 @@ pub(crate) struct HookedTurn<T> {
 #[async_trait]
 impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
     fn on_cancelled(&mut self) {
-        self.inner.on_cancelled();
+        self.synthetic = None;
+        if let Some(inner) = &mut self.inner {
+            inner.on_cancelled();
+        }
     }
 
     async fn next_event(
         &mut self,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
-        let event = self.inner.next_event(cancellation).await;
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
+        // Finished owns complete output. Withhold previews until policy settles:
+        // edited or blocked text and tool calls must never reach observers.
+        let supplied = self.inner.is_none();
+        let mut event = loop {
+            let event = match &mut self.inner {
+                Some(inner) => inner.next_event(cancellation.clone()).await,
+                None => Ok(self.synthetic.take().map(ModelTurnEvent::Finished)),
+            };
+            if self
+                .call
+                .as_ref()
+                .is_some_and(|call| call.hooks.intercepts_model_response)
+                && matches!(
+                    event,
+                    Ok(Some(ModelTurnEvent::Delta(_) | ModelTurnEvent::ToolCall(_)))
+                )
+            {
+                continue;
+            }
+            break event;
+        };
         let Some(call) = &self.call else {
             return event;
         };
-        match &event {
+        match &mut event {
             Ok(Some(ModelTurnEvent::Usage(usage))) => self.latest_usage = Some(usage.clone()),
             Ok(Some(ModelTurnEvent::ResponseAttemptSuperseded)) => self.latest_usage = None,
             Ok(Some(ModelTurnEvent::Finished(result))) => {
@@ -332,9 +421,13 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
                     super::usage::reported(result.usage.as_ref(), self.latest_usage.as_ref());
                 let mut input = ModelResponseAfterInput::new(
                     Box::new(call.attempt.clone()),
-                    Box::new(ExecutionEventExecution::Executed(
-                        ExecutionEventExecutionExecuted::new(),
-                    )),
+                    Box::new(if supplied {
+                        ExecutionEventExecution::SkippedSuppliedResult(
+                            agenthooksprotocol::ExecutionEventExecutionSkippedSuppliedResult::new(),
+                        )
+                    } else {
+                        ExecutionEventExecution::Executed(ExecutionEventExecutionExecuted::new())
+                    }),
                     super::finish_reason(&result.finish_reason),
                     Vec::new(),
                     Box::new(call.model.clone()),
@@ -357,9 +450,13 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
                 input.turn = Some(agenthooksprotocol::ModelResponseAfterInputTurn::new(
                     &call.turn,
                 ));
-                input.usage = reported.as_ref().map(super::usage::attempt).map(Box::new);
-                input.latency_ms =
-                    serde_json::Number::from_f64(call.started.elapsed().as_secs_f64() * 1000.0);
+                // SDK 0.8 model.response.after forbids usage and latencyMs
+                // whenever execution is skipped, including supplied results.
+                if !supplied {
+                    input.usage = reported.as_ref().map(super::usage::attempt).map(Box::new);
+                    input.latency_ms =
+                        serde_json::Number::from_f64(call.started.elapsed().as_secs_f64() * 1000.0);
+                }
                 let mut extensions = agenthooksprotocol::Extensions::new();
                 if let Some(response_id) = &result.response_id {
                     extensions.additional_properties.insert(
@@ -386,10 +483,40 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
                 let input = input
                     .with_sources()
                     .with_items(super::messages(&result.output_items));
-                super::settle(
-                    EventType::ModelResponseAfter,
-                    call.hooks.sdk.model_response_after(input).await,
-                );
+                let boundary = call.hooks.sdk.model_response_after(input);
+                let outcome = match &cancellation {
+                    Some(token) => boundary.cancel_when(token.cancelled()).await,
+                    None => boundary.await,
+                };
+                if cancellation
+                    .as_ref()
+                    .is_some_and(TurnCancellation::is_cancelled)
+                {
+                    return Err(LoopError::Cancelled);
+                }
+                let outcome =
+                    super::settle(EventType::ModelResponseAfter, outcome, &call.destination)
+                        .ok_or_else(|| invalid("model response hook dispatch failed"))?;
+                if outcome.outcome.stopped || outcome.outcome.is_denied() {
+                    return Err(invalid("model response stopped by agent hook"));
+                }
+                if has_modification(&outcome)
+                    && let Event::ModelResponseAfter(edited) = outcome.event
+                {
+                    result.output_items = canonical_items(
+                        edited.0.items.iter().map(|item| item.0.as_ref()),
+                        &result.output_items,
+                    )?;
+                    if result.finish_reason == FinishReason::ToolCall
+                        && !result
+                            .output_items
+                            .iter()
+                            .flat_map(|item| &item.parts)
+                            .any(|part| matches!(part, Part::ToolCall(_)))
+                    {
+                        result.finish_reason = FinishReason::Completed;
+                    }
+                }
             }
             Err(error) => call.failed(error, self.latest_usage.as_ref()).await,
             _ => {}
@@ -397,3 +524,121 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
         event
     }
 }
+
+fn invalid(message: &str) -> LoopError {
+    LoopError::InvalidState(message.to_owned())
+}
+
+/// Preserve opaque host parts exactly when the canonical message is unchanged.
+/// New or rewritten messages must be plain text: interpreting canonical display
+/// text as executable tool calls or provider continuation data is unsafe.
+fn canonical_items<'a>(
+    messages: impl IntoIterator<Item = &'a CanonicalMessage>,
+    originals: &[Item],
+) -> Result<Vec<Item>, LoopError> {
+    messages.into_iter().map(|message| {
+        let original = originals.iter().enumerate().find(|(index, item)| super::item_id(item, *index) == message.id);
+        if let Some((index, item)) = original {
+            let projected = super::message(item, index);
+            if projected.metadata.role == message.role
+                && projected.parts.len() == message.parts.len()
+                && projected.parts.iter().zip(&message.parts).all(|(before, after)| projected_part_matches(before, after)) {
+                // Canonicalization deliberately hides opaque provider state.
+                // A no-op must retain the exact original, including hidden parts.
+                return Ok(item.clone());
+            }
+            if item.parts.iter().enumerate().any(|(part_index, part)| {
+                super::content_parts(&format!("{}/{part_index}", super::item_id(item, index)), part).is_empty()
+            }) {
+                // Hidden continuation data can depend on surrounding visible
+                // parts. Without a provider contract we cannot safely reposition
+                // or retain it after an edit. Reject rather than silently lose it.
+                return Err(invalid("cannot partially edit a model message containing opaque unprojected provider content"));
+            }
+        }
+        let kind = match &message.role {
+            CanonicalMessageRole::System => ItemKind::System,
+            CanonicalMessageRole::Developer => ItemKind::Developer,
+            CanonicalMessageRole::User => ItemKind::User,
+            CanonicalMessageRole::Assistant => ItemKind::Assistant,
+            CanonicalMessageRole::Tool if original.is_some() => ItemKind::Tool,
+            CanonicalMessageRole::Tool | CanonicalMessageRole::Unknown(_) => return Err(invalid("unsupported model hook message role")),
+        };
+        let mut parts = Vec::new();
+        let mut remaining = message.parts.as_slice();
+        while let Some(next) = remaining.first() {
+            // A host part can project to multiple canonical parts (for example a
+            // tool result plus correlation, or a file plus its name descriptor).
+            // Retain the host part only when its whole projection is retained.
+            let retained = original.and_then(|(index, item)| {
+                item.parts.iter().enumerate().find_map(|(part_index, part)| {
+                    let projected = super::content_parts(&format!("{}/{part_index}", super::item_id(item, index)), part);
+                    (!projected.is_empty() && remaining.len() >= projected.len()
+                        && projected.iter().zip(remaining).all(|(before, after)| projected_part_matches(before, after)))
+                        .then_some((part, projected.len()))
+                })
+            });
+            if let Some((part, consumed)) = retained {
+                parts.push(part.clone());
+                remaining = &remaining[consumed..];
+                continue;
+            }
+            match next.as_ref() {
+                ContentItem::TextBodyPart(body) if !body.id.ends_with("/data") && !body.id.ends_with("/name")
+                    && (matches!(&body.category, Presence::Missing) || body.category == Presence::Present("text".into())) => parts.push(Part::text(body.text.clone())),
+                _ => return Err(invalid("model hook replacement must contain plain text; opaque parts can only be retained unchanged")),
+            }
+            remaining = &remaining[1..];
+        }
+        if let Some((_, original)) = original {
+            let mut item = original.clone();
+            if super::role(item.kind) != message.role { item.kind = kind; }
+            item.parts = parts;
+            Ok(item)
+        } else {
+            Ok(Item::new(kind, parts))
+        }
+    }).collect()
+}
+
+fn projected_part_matches(
+    before: &agenthooksprotocol::inputs::PartInput<agenthooksprotocol::Attachment>,
+    after: &ContentItem,
+) -> bool {
+    use agenthooksprotocol::inputs::PartInput;
+    match (before, after) {
+        (PartInput::Text(body), ContentItem::TextBodyPart(other)) => body == other.as_ref(),
+        (PartInput::Wire(part), other) => part == other,
+        (PartInput::Attachment { metadata, .. }, ContentItem::AttachmentBodyPart(other)) => {
+            // SDK 0.8 runtime::validate_parts rejects changed attachment bodies
+            // and identities. Its runtime-owned reference replaces host-pending;
+            // compare the stable identity, never read or reinterpret the bytes.
+            metadata.id == other.id
+                && metadata.media_type == other.media_type
+                && metadata.category == other.category
+                && metadata.synthesized == other.synthesized
+        }
+        _ => false,
+    }
+}
+
+fn has_modification(outcome: &agenthooksprotocol::hooks::EventOutcome) -> bool {
+    outcome
+        .outcome
+        .responses
+        .iter()
+        .any(|response| match &response.result.effects {
+            Presence::Present(effects) => effects.iter().any(|effect| {
+                matches!(
+                    effect.as_ref(),
+                    agenthooksprotocol::Effect::ModifyMessagesEffect(_)
+                )
+            }),
+            Presence::Missing => false,
+        })
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+#[path = "model_effects_tests.rs"]
+mod tests;

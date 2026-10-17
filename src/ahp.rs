@@ -1,4 +1,6 @@
 //! Agent Hooks Protocol integration at Kit's native lifecycle seams.
+mod injection;
+pub(crate) mod messages;
 mod model;
 mod prompt;
 mod tool;
@@ -38,6 +40,8 @@ const CONFIG_FILE: &str = "hooks.json";
 /// Registered hook backends with the event grants Kit implements.
 pub struct Hooks {
     sdk: Arc<agenthooksprotocol::Hooks>,
+    intercepts_model_response: bool,
+    injections: injection::Injections,
     turn_events: turn::TurnQueues,
     root: Option<std::path::PathBuf>,
 }
@@ -69,10 +73,38 @@ impl Hooks {
     }
 
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
+        let intercepts_model_response = registration.hooks.iter().any(|backend| {
+            backend.subscriptions.iter().any(|subscription| {
+                let agenthooksprotocol::BackendSubscriptionsItem::Intercept(subscription) =
+                    subscription
+                else {
+                    return false;
+                };
+                subscription.events.iter().any(|selector| {
+                    let selector = match selector {
+                        agenthooksprotocol::InterceptSubscriptionEventsItem::Known(event) => {
+                            event.as_str()
+                        }
+                        agenthooksprotocol::InterceptSubscriptionEventsItem::Custom(event) => {
+                            event.as_str()
+                        }
+                    };
+                    selector == "model.response.after"
+                        || selector == "*"
+                        || selector.strip_suffix(".*").is_some_and(|prefix| {
+                            "model.response.after"
+                                .strip_prefix(prefix)
+                                .is_some_and(|tail| tail.starts_with('.'))
+                        })
+                })
+            })
+        });
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
         Ok(Self {
             sdk: Arc::new(sdk),
+            intercepts_model_response,
+            injections: injection::Injections::default(),
             turn_events: turn::TurnQueues::default(),
             root: None,
         })
@@ -89,12 +121,15 @@ impl Hooks {
         Box::new(session)
     }
 
-    pub(crate) async fn session_start(
+    async fn session_start(
         &self,
         session: &str,
         trigger: SessionStartInputTrigger,
         model: Option<&str>,
-    ) {
+    ) -> Result<injection::SessionLease, String> {
+        let lease = self.injections.open(session)?;
+        let producer = self.injections.producer(session);
+        let destination = messages::capture(session);
         let mut input = SessionStartInput::new(
             Vec::new(),
             "allow-all".into(),
@@ -104,15 +139,30 @@ impl Hooks {
         if let Some(model) = model {
             input.session.model = Presence::Present(model.to_owned());
         }
-        settle(EventType::SessionStart, self.sdk.session_start(input).await);
+        let outcome = settle(
+            EventType::SessionStart,
+            self.sdk.session_start(input).await,
+            &destination,
+        )
+        .ok_or_else(|| "session.start hook dispatch failed".to_owned())?;
+        enqueue_injections(&producer, &outcome.outcome)?;
+        Ok(lease)
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
+        let destination = messages::capture(session);
+        if let Err(error) = self.injections.close(session) {
+            tracing::warn!(%error, "could not close hook injection session");
+        }
         self.drain_turn_events(session).await;
         self.forget_turn_events(session);
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, self.session(session));
-        settle(EventType::SessionEnd, self.sdk.session_end(input).await);
+        settle(
+            EventType::SessionEnd,
+            self.sdk.session_end(input).await,
+            &destination,
+        );
     }
 
     /// Runs `context.compact.before`; a hook may supply the summary or replace
@@ -125,6 +175,8 @@ impl Hooks {
         instructions: &str,
         cancellation: Option<&TurnCancellation>,
     ) -> Option<Compaction> {
+        let producer = self.injections.producer(session);
+        let destination = messages::capture(session);
         let trigger = if manual {
             ContextCompactBeforeInputTrigger::Manual
         } else {
@@ -140,7 +192,17 @@ impl Hooks {
             Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
             None => boundary.await,
         };
-        let outcome = settle(EventType::ContextCompactBefore, result)?;
+        let Some(outcome) = settle(EventType::ContextCompactBefore, result, &destination) else {
+            return Some(Compaction::Denied(
+                "context.compact.before hook dispatch failed".into(),
+            ));
+        };
+        if outcome.outcome.is_denied() {
+            return Some(Compaction::Denied(denial(&outcome.outcome)));
+        }
+        if let Err(error) = enqueue_injections(&producer, &outcome.outcome) {
+            return Some(Compaction::Denied(error));
+        }
         if let Some(SettledCandidate::Summary(summary)) = outcome.outcome.candidate() {
             return Some(Compaction::Summary(parts_text(summary)));
         }
@@ -164,6 +226,7 @@ impl Hooks {
         summary: String,
         supplied: bool,
     ) -> String {
+        let destination = messages::capture(session);
         let removed = items
             .iter()
             .enumerate()
@@ -185,6 +248,7 @@ impl Hooks {
         match settle(
             EventType::ContextCompactAfter,
             self.sdk.context_compact_after(input).await,
+            &destination,
         )
         .map(|outcome| outcome.event)
         {
@@ -203,42 +267,76 @@ pub(crate) fn session_outcome<T>(result: &Result<T, LoopError>) -> SessionEndInp
 }
 
 pub(crate) enum Compaction {
+    Denied(String),
     Summary(String),
     Instructions(String),
 }
 
 fn options() -> Result<HooksOptions, String> {
     let capabilities = HostCapabilities {
-        session_start: Some(capability::session_start().observe()),
+        session_start: Some(
+            capability::session_start()
+                .message()
+                .observe()
+                .inject_context(capability::InjectContext::Now),
+        ),
         session_end: Some(capability::session_end().observe()),
         turn_start: Some(capability::turn_start().observe()),
         turn_end: Some(capability::turn_end().observe()),
         user_message_inbound: Some(
             capability::user_message_inbound()
+                .message()
                 .observe()
                 .deny()
                 .modify_prompt(Modify::Replace),
         ),
-        model_request_before: Some(capability::model_request_before().observe().deny()),
-        model_response_after: Some(capability::model_response_after().observe()),
+        model_request_before: Some(
+            capability::model_request_before()
+                .message()
+                .observe()
+                .deny()
+                .return_result()
+                .modify_request(Modify::Replace)
+                .inject_context(capability::InjectContext::Now),
+        ),
+        model_response_after: Some(
+            capability::model_response_after()
+                .message()
+                .observe()
+                .modify_response(Modify::Replace)
+                .flow(capability::ModelResponseAfterFlow::Stop),
+        ),
         model_error: Some(capability::model_error().observe()),
         tool_before: Some(
             capability::tool_before()
+                .message()
                 .observe()
                 .allow()
                 .deny()
                 .return_result()
-                .modify_input(Modify::ReplaceAndMerge),
+                .modify_input(Modify::ReplaceAndMerge)
+                .inject_context(capability::InjectContext::Now),
         ),
-        tool_after: Some(capability::tool_after().observe()),
+        tool_after: Some(
+            capability::tool_after()
+                .message()
+                .observe()
+                .modify_output(Modify::Replace)
+                .inject_context(capability::InjectContext::Now)
+                .flow(capability::Flow::Stop),
+        ),
         context_compact_before: Some(
             capability::context_compact_before()
+                .message()
                 .observe()
+                .deny()
                 .return_result()
-                .modify_instructions(Modify::Replace),
+                .modify_instructions(Modify::Replace)
+                .inject_context(capability::InjectContext::Now),
         ),
         context_compact_after: Some(
             capability::context_compact_after()
+                .message()
                 .observe()
                 .modify_summary(Modify::Replace),
         ),
@@ -292,10 +390,15 @@ fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
 }
 
 /// Reports delivery diagnostics; a dispatch error is reported and yields `None`.
-fn settle(event: EventType, result: Result<EventOutcome, HookError>) -> Option<EventOutcome> {
+fn settle(
+    event: EventType,
+    result: Result<EventOutcome, HookError>,
+    destination: &messages::Destination,
+) -> Option<EventOutcome> {
     match result {
         Ok(outcome) => {
             report(event, &outcome.diagnostics);
+            destination.deliver(&outcome.outcome.messages);
             Some(outcome)
         }
         Err(error) => {
@@ -303,6 +406,16 @@ fn settle(event: EventType, result: Result<EventOutcome, HookError>) -> Option<E
             None
         }
     }
+}
+
+fn enqueue_injections<C, P>(
+    producer: &Result<injection::Producer, String>,
+    outcome: &ProtocolOutcome<C, P>,
+) -> Result<(), String> {
+    if outcome.injections.is_empty() {
+        return Ok(());
+    }
+    producer.as_ref().map_err(Clone::clone)?.enqueue(outcome)
 }
 
 fn denial<C, P>(outcome: &ProtocolOutcome<C, P>) -> String {

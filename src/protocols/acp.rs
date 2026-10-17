@@ -1099,6 +1099,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
+    _hook_messages: Arc<crate::ahp::messages::Subscription>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1112,7 +1113,19 @@ impl ResponseInterruptionNoticeObserver {
         session_id: agentkit_acp::SessionId,
         activity: activity::SessionActivity,
     ) -> Self {
+        let message_client = client.clone();
+        let message_session = session_id.clone();
+        let hook_messages =
+            crate::ahp::messages::Subscription::new(session_id.to_string(), move |text| {
+                message_client
+                    .notify_session(SessionNotification::new(
+                        message_session.clone(),
+                        SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text)),
+                    ))
+                    .is_ok()
+            });
         Self {
+            _hook_messages: hook_messages,
             activity,
             inner,
             client,
@@ -5065,6 +5078,45 @@ pub(super) mod tests {
             }),
             "the finalization flush must include the terminal inner-tool card"
         );
+    }
+
+    #[tokio::test]
+    async fn hook_message_uses_registered_v1_observer_notice_sink() {
+        let integration = AcpIntegration::builder()
+            .name("hook-message-test")
+            .approval_resolver(AutoDenyResolver)
+            .build()
+            .unwrap();
+        let session_id = agentkit_acp::SessionId::new("v1-hook-message-test");
+        let (client, mut messages) = AcpClientHandle::channel();
+        let _observer = ResponseInterruptionNoticeObserver::new(
+            integration,
+            client,
+            session_id.clone(),
+            legacy_activity(session_id.clone(), |_| Ok(())),
+        );
+        let (hooks, backend) = crate::ahp::test_support::hooks(vec![
+            crate::ahp::test_support::intercept(&["context.compact.before"]),
+        ]);
+        backend.respond(
+            "context.compact.before",
+            json!([{"type": "message", "text": "Compaction hook notice"}]),
+        );
+        hooks
+            .compact_before(&session_id.to_string(), &[], true, "summarize", None)
+            .await;
+
+        let AcpClientMessage::SessionNotification(notification) = messages.try_recv().unwrap()
+        else {
+            panic!("expected hook notification");
+        };
+        assert_eq!(notification.session_id, session_id);
+        let SessionUpdate::Notice(notice) = notification.update else {
+            panic!("hook message must use the v1 notice presentation");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert_eq!(notice.title, "Compaction hook notice");
+        assert!(messages.try_recv().is_err());
     }
 
     #[tokio::test]

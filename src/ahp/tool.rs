@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use agenthooksprotocol::client::{HookError, Permission};
+use agenthooksprotocol::client::Permission;
 use agenthooksprotocol::contracts::Contract;
 use agenthooksprotocol::generated::Presence;
 use agenthooksprotocol::inputs::{MessageInput, ToolAfterInput, ToolBeforeInput};
@@ -50,7 +50,13 @@ enum Before {
 }
 
 impl HookedTool {
-    async fn before(&self, mut request: ToolRequest, context: &ToolContext<'_>) -> Before {
+    async fn before(
+        &self,
+        mut request: ToolRequest,
+        context: &ToolContext<'_>,
+        producer: &Result<super::injection::Producer, String>,
+        destination: &super::messages::Destination,
+    ) -> Before {
         let validator = match self.validator() {
             Ok(validator) => validator,
             Err(error) => return Before::Return(denied(error)),
@@ -90,8 +96,12 @@ impl HookedTool {
             }
         };
         super::report(EventType::ToolBefore, &outcome.diagnostics);
+        destination.deliver(&outcome.outcome.messages);
         if outcome.outcome.is_denied() {
             return Before::Return(denied(super::denial(&outcome.outcome)));
+        }
+        if let Err(error) = super::enqueue_injections(producer, &outcome.outcome) {
+            return Before::Return(denied(error));
         }
         if let Some(value) = outcome.outcome.supplied_result() {
             let output = match value {
@@ -175,8 +185,16 @@ impl HookedTool {
         None
     }
 
-    async fn after(&self, request: &ToolRequest, outcome: &ToolExecutionOutcome, supplied: bool) {
-        let execution = match outcome {
+    async fn after(
+        &self,
+        request: &ToolRequest,
+        mut outcome: ToolExecutionOutcome,
+        supplied: bool,
+        context: &ToolContext<'_>,
+        producer: &Result<super::injection::Producer, String>,
+        destination: &super::messages::Destination,
+    ) -> ToolExecutionOutcome {
+        let execution = match &outcome {
             _ if supplied => ExecutionEventExecution::SkippedSuppliedResult(
                 ExecutionEventExecutionSkippedSuppliedResult::new(),
             ),
@@ -195,7 +213,7 @@ impl HookedTool {
             }
             _ => ExecutionEventExecution::Executed(ExecutionEventExecutionExecuted::new()),
         };
-        let (status, output, error) = match outcome {
+        let (status, output, error) = match &outcome {
             ToolExecutionOutcome::Completed(result) if result.result.is_error => {
                 (ToolAfterInputOutcome::Error, Some(&result.result), None)
             }
@@ -210,7 +228,7 @@ impl HookedTool {
             | ToolExecutionOutcome::FailedBeforeInvocation(error) => {
                 (ToolAfterInputOutcome::Error, None, Some(error.to_string()))
             }
-            ToolExecutionOutcome::Interrupted(_) => return,
+            ToolExecutionOutcome::Interrupted(_) => return outcome,
         };
         let mut input = ToolAfterInput::new(
             request.call_id.to_string(),
@@ -226,7 +244,7 @@ impl HookedTool {
         input.turn = Some(agenthooksprotocol::ToolAfterInputTurn::new(
             request.turn_id.to_string(),
         ));
-        if let ToolExecutionOutcome::Completed(result) = outcome {
+        if let ToolExecutionOutcome::Completed(result) = &outcome {
             input.duration_ms = result
                 .duration
                 .and_then(|duration| serde_json::Number::from_f64(duration.as_secs_f64() * 1000.0));
@@ -244,16 +262,83 @@ impl HookedTool {
                 )]
             })
             .unwrap_or_default();
-        let result = match input
+        let (event, _) = match input
             .with_sources::<Attachment>()
             .with_items(items)
             .into_host_event()
         {
-            Ok((event, _)) => self.hooks.sdk.event_for(EventType::ToolAfter, event).await,
-            Err(error) => Err(HookError::new(error.to_string())),
+            Ok(event) => event,
+            Err(error) => return blocked(error.to_string()),
         };
-        super::settle(EventType::ToolAfter, result);
+        let original = event["items"].clone();
+        let boundary = self.hooks.sdk.event_for(EventType::ToolAfter, event);
+        let result = match &context.cancellation {
+            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
+            None => boundary.await,
+        };
+        if context
+            .cancellation
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return ToolExecutionOutcome::Failed(ToolError::Cancelled);
+        }
+        let edited = super::settle(EventType::ToolAfter, result, destination);
+        if let Some(edited) = &edited
+            && !edited.outcome.stopped
+            && !edited.outcome.is_denied()
+            && let Err(error) = super::enqueue_injections(producer, &edited.outcome)
+        {
+            return blocked(error);
+        }
+        // There is no completed output to replace or withhold. Retain native
+        // failures (including cancellation and pre-invocation policy failures).
+        if !matches!(outcome, ToolExecutionOutcome::Completed(_)) {
+            return outcome;
+        }
+        let Some(edited) = edited else {
+            return blocked("tool.after hook dispatch failed".into());
+        };
+        if edited.outcome.stopped || edited.outcome.is_denied() {
+            return blocked("tool output blocked by tool.after hook".into());
+        }
+        if let agenthooksprotocol::generated::Event::ToolAfter(event) = edited.event
+            && let ToolExecutionOutcome::Completed(result) = &mut outcome
+        {
+            let items = match serde_json::to_value(&event.items) {
+                Ok(items) => items,
+                Err(_) => return blocked("invalid tool.after output replacement".into()),
+            };
+            if items == original {
+                return outcome;
+            }
+            // AHP output edits are canonical messages, not an arbitrary native
+            // ToolResult. Accept text bodies without granting authority over
+            // call IDs, error status, duration, or other execution metadata.
+            let mut texts = Vec::new();
+            for item in &event.items {
+                for part in &item.0.parts {
+                    match part.as_ref() {
+                        agenthooksprotocol::ContentItem::TextBodyPart(body) => {
+                            texts.push(body.text.clone());
+                        }
+                        _ => return blocked("tool.after replacement requires text bodies".into()),
+                    }
+                }
+            }
+            result.result.output = ToolOutput::text(texts.join("\n"));
+        }
+        outcome
     }
+}
+
+// The tool may already have executed: do not label this a pre-invocation denial.
+fn blocked(message: String) -> ToolExecutionOutcome {
+    ToolExecutionOutcome::Failed(ToolError::PermissionDenied(PermissionDenial {
+        code: PermissionCode::CustomPolicyDenied,
+        message,
+        metadata: Default::default(),
+    }))
 }
 
 fn denied(message: String) -> ToolExecutionOutcome {
@@ -301,16 +386,22 @@ impl Tool for HookedTool {
         request: ToolRequest,
         context: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let request = match self.before(request, context).await {
+        let producer = self
+            .hooks
+            .injections
+            .producer(&request.session_id.to_string());
+        let destination = super::messages::capture(&request.session_id.to_string());
+        let request = match self.before(request, context, &producer, &destination).await {
             Before::Run(request) => request,
             Before::Supplied(request, outcome) => {
-                self.after(&request, &outcome, true).await;
-                return outcome;
+                return self
+                    .after(&request, outcome, true, context, &producer, &destination)
+                    .await;
             }
             Before::Return(outcome) => return outcome,
         };
         let outcome = self.tool.invoke_outcome(request.clone(), context).await;
-        self.after(&request, &outcome, false).await;
-        outcome
+        self.after(&request, outcome, false, context, &producer, &destination)
+            .await
     }
 }

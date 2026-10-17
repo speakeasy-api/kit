@@ -60,6 +60,7 @@ impl LoopMutator for PromptHook {
         if ctx.point != MutationPoint::AfterTurnEnded {
             return Ok(());
         }
+        let destination = super::messages::capture(&ctx.session_id.to_string());
         self.hooks
             .drain_turn_events(&ctx.session_id.to_string())
             .await;
@@ -93,7 +94,7 @@ impl LoopMutator for PromptHook {
             Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
             None => boundary.await,
         };
-        let edited = match super::settle(EventType::UserMessageInbound, result) {
+        let edited = match super::settle(EventType::UserMessageInbound, result, &destination) {
             Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
             Some(outcome) => match outcome.event {
                 Event::UserMessageInbound(event) => Ok(event

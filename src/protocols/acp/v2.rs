@@ -373,6 +373,7 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 
 #[derive(Clone)]
 struct ResponseReplacementObserver<S> {
+    _hook_messages: Arc<crate::ahp::messages::Subscription>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
     activity: SessionActivity,
@@ -394,14 +395,35 @@ fn usage_update(usage: &Usage) -> Option<wire::UsageUpdate> {
     Some(wire::UsageUpdate::new(used, size))
 }
 
-impl<S> ResponseReplacementObserver<S> {
+impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
     fn new(
         inner: AcpIntegration,
         sink: ResponseReplacementSink<S>,
         session_id: wire::SessionId,
         activity: SessionActivity,
     ) -> Self {
+        let message_sink = sink.inner.clone();
+        let message_session = session_id.clone();
+        let hook_messages =
+            crate::ahp::messages::Subscription::new(session_id.to_string(), move |text| {
+                static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
+                let sequence = NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed);
+                message_sink
+                    .update(wire::UpdateSessionNotification::new(
+                        message_session.clone(),
+                        wire::SessionUpdate::AgentMessage(
+                            wire::AgentMessage::new(wire::MessageId::new(format!(
+                                "{message_session}-hook-{sequence}"
+                            )))
+                            .content(vec![wire::ContentBlock::Text(
+                                wire::TextContent::new(format!("Hook: {text}")),
+                            )]),
+                        ),
+                    ))
+                    .is_ok()
+            });
         Self {
+            _hook_messages: hook_messages,
             inner,
             sink,
             activity,
@@ -2770,6 +2792,55 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn hook_messages_use_registered_v2_observer_message_sink() {
+        let recording = RecordingSink::default();
+        let sink = ResponseReplacementSink::new(recording.clone());
+        let session_id = wire::SessionId::new("v2-hook-message-test");
+        let activity = native_activity(session_id.clone(), sink.clone());
+        let observer = ResponseReplacementObserver::new(
+            AcpIntegration::default(),
+            sink,
+            session_id.clone(),
+            activity,
+        );
+        let (hooks, backend) = crate::ahp::test_support::hooks(vec![
+            crate::ahp::test_support::intercept(&["context.compact.before"]),
+        ]);
+        backend.respond(
+            "context.compact.before",
+            json!([
+                {"type": "message", "text": "First notice"},
+                {"type": "message", "text": "Second notice"},
+            ]),
+        );
+        hooks
+            .compact_before(&session_id.to_string(), &[], true, "summarize", None)
+            .await;
+        // Hook presentation must not become model-response replacement state.
+        observer.clear_current();
+
+        let updates = recording.updates.lock().unwrap();
+        assert_eq!(updates.len(), 2);
+        let mut ids = Vec::new();
+        for (notification, expected) in updates
+            .iter()
+            .zip(["Hook: First notice", "Hook: Second notice"])
+        {
+            assert_eq!(notification.session_id, session_id);
+            let wire::SessionUpdate::AgentMessage(message) = &notification.update else {
+                panic!("hook message must use a standalone v2 agent message");
+            };
+            assert!(matches!(
+                &message.content,
+                MaybeUndefined::Value(content)
+                    if matches!(content.as_slice(), [wire::ContentBlock::Text(text)] if text.text == expected)
+            ));
+            ids.push(&message.message_id);
+        }
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[test]
