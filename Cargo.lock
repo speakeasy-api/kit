@@ -330,9 +330,9 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.10"
+version = "0.10.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6845da26faadc0b4cd7c709e7d6a7eb85397f7dbc39fd43f3e0c04aeb1505af3"
+checksum = "fa41fff5bbb3dbda6925b67fc40a005b6c4627e7a2b37d6c8a864ba4ffff02c6"
 dependencies = [
  "agentkit-core",
  "agentkit-http",

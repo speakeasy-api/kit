@@ -2249,7 +2249,10 @@ mod tests {
                 "model": "claude-sonnet-4-6",
                 "content": [{"type": "text", "text": "ok"}],
                 "stop_reason": "end_turn", "stop_sequence": null,
-                "usage": {"input_tokens": 4, "output_tokens": 1}
+                "usage": {
+                    "input_tokens": 4, "output_tokens": 1,
+                    "cache_read_input_tokens": 900, "cache_creation_input_tokens": 96
+                }
             })
             .to_string();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
@@ -2318,6 +2321,17 @@ mod tests {
                 _ => None,
             })
             .expect("Anthropic turn finishes");
+        let tokens = result.usage.as_ref().unwrap().tokens.as_ref().unwrap();
+        assert_eq!(tokens.input_tokens, 1000);
+        assert_eq!(tokens.output_tokens, 1);
+        assert_eq!(tokens.cached_input_tokens, Some(900));
+        assert_eq!(tokens.cache_write_input_tokens, Some(96));
+        for event in &events {
+            if let ModelTurnEvent::Usage(usage) = event {
+                assert_eq!(usage.tokens.as_ref().unwrap(), tokens);
+                assert_eq!(usage.metadata["context_window"], json!(1_000_000));
+            }
+        }
         assert_eq!(
             result.usage.as_ref().unwrap().metadata["context_window"],
             json!(1_000_000)
