@@ -287,3 +287,249 @@ fn opaque_reasoning_survives_noop_and_rejects_unsafe_sibling_edits() {
             .contains("opaque unprojected provider content")
     );
 }
+
+#[derive(Clone)]
+struct ToolModel(bool);
+
+#[async_trait]
+impl ModelAdapter for ToolModel {
+    type Session = Self;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        Ok(self.clone())
+    }
+}
+
+#[async_trait]
+impl ModelSession for ToolModel {
+    type Turn = Events;
+    async fn begin_turn(
+        &mut self,
+        _: TurnRequest,
+        _: Option<TurnCancellation>,
+    ) -> Result<Events, LoopError> {
+        let mut events = VecDeque::new();
+        let output_items = if self.0 {
+            let call = agentkit_core::ToolCallPart::new(
+                "approved-call",
+                "echo",
+                json!({"text":"approved"}),
+            );
+            events.push_back(ModelTurnEvent::ToolCall(call.clone()));
+            vec![Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])]
+        } else {
+            vec![Item::text(ItemKind::Assistant, "done")]
+        };
+        events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: if self.0 {
+                FinishReason::ToolCall
+            } else {
+                FinishReason::Completed
+            },
+            output_items,
+            usage: Some(agentkit_core::Usage::new(agentkit_core::TokenUsage::new(
+                2, 3,
+            ))),
+            metadata: MetadataMap::from_iter([("sentinel".into(), json!("retained"))]),
+            model: Some("fake-model".into()),
+            response_id: Some("fake-response".into()),
+        }));
+        self.0 = false;
+        Ok(Events(events))
+    }
+}
+
+struct RecordingTool {
+    spec: agentkit_tools_core::ToolSpec,
+    calls: tokio::sync::mpsc::UnboundedSender<agentkit_tools_core::ToolRequest>,
+}
+
+#[async_trait]
+impl agentkit_tools_core::Tool for RecordingTool {
+    fn spec(&self) -> &agentkit_tools_core::ToolSpec {
+        &self.spec
+    }
+    async fn invoke(
+        &self,
+        request: agentkit_tools_core::ToolRequest,
+        _: &mut agentkit_tools_core::ToolContext<'_>,
+    ) -> Result<agentkit_tools_core::ToolResult, agentkit_tools_core::ToolError> {
+        self.calls.send(request.clone()).unwrap();
+        Ok(agentkit_tools_core::ToolResult::new(
+            agentkit_core::ToolResultPart::success(
+                request.call_id,
+                agentkit_core::ToolOutput::text("tool executed"),
+            ),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn real_loop_executes_only_approved_tool_calls_once() {
+    use agentkit_loop::{Agent, LoopInterrupt, LoopStep};
+    use agentkit_tools_core::{ToolName, ToolRegistry, ToolSpec};
+    for policy in ["allow", "observe", "remove", "stop"] {
+        let subscription = if policy == "observe" {
+            super::super::test_support::observe(&["model.response.after"])
+        } else {
+            intercept(&["model.response.after"])
+        };
+        let (hooks, backend) = hooks(vec![subscription]);
+        match policy {
+            "remove" => {
+                let mut messages = text_message("safe replacement");
+                messages[0]["role"] = json!("assistant");
+                backend.respond("model.response.after", json!([{"type":"modify", "target":"response", "operation":"replace", "value":messages}]));
+            }
+            "stop" => backend.respond(
+                "model.response.after",
+                json!([{"type":"flow", "operation":"stop", "reason":"blocked"}]),
+            ),
+            _ => {}
+        }
+        let (calls, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut tools = ToolRegistry::new();
+        tools.register_arc(Arc::new(RecordingTool {
+            spec: ToolSpec::new(ToolName::new("echo"), "echo", json!({"type":"object"})),
+            calls,
+        }));
+        let mut driver = Agent::builder()
+            .model(HookedAdapter::new(
+                ToolModel(true),
+                Some(hooks),
+                SessionStartInputTrigger::Startup,
+            ))
+            .add_tool_source(tools)
+            .input(vec![Item::text(ItemKind::User, "run echo")])
+            .build()
+            .unwrap()
+            .start(SessionConfig::new(format!("tool-{policy}")))
+            .await
+            .unwrap();
+        let step = driver.next().await;
+        if matches!(policy, "allow" | "observe") {
+            assert!(matches!(
+                step.unwrap(),
+                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
+            ));
+            let call = received.try_recv().expect("approved tool must execute");
+            assert_eq!(call.call_id.to_string(), "approved-call");
+            assert_eq!(call.input, json!({"text":"approved"}));
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Finished(_)
+            ));
+        } else if policy == "stop" {
+            assert!(step.is_err());
+        } else {
+            assert!(matches!(step.unwrap(), LoopStep::Finished(_)));
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "no removed, blocked, or duplicate calls: {policy}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn approved_replay_preserves_result_and_cancellation_discards_queue() {
+    for cancel in [false, true] {
+        let (hooks, _) = hooks(vec![intercept(&["model.response.after"])]);
+        let mut session = HookedAdapter::new(
+            ToolModel(true),
+            Some(hooks),
+            SessionStartInputTrigger::Startup,
+        )
+        .start_session(SessionConfig::new("model-effects"))
+        .await
+        .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        assert!(matches!(
+            turn.next_event(None).await.unwrap(),
+            Some(ModelTurnEvent::ToolCall(_))
+        ));
+        if cancel {
+            let controller = agentkit_core::CancellationController::new();
+            let token = controller.handle().checkpoint();
+            controller.interrupt();
+            assert!(matches!(
+                turn.next_event(Some(token)).await,
+                Err(LoopError::Cancelled)
+            ));
+            assert!(turn.next_event(None).await.unwrap().is_none());
+        } else {
+            let Some(ModelTurnEvent::Finished(result)) = turn.next_event(None).await.unwrap()
+            else {
+                panic!("approved final result")
+            };
+            assert_eq!(
+                result.usage,
+                Some(agentkit_core::Usage::new(agentkit_core::TokenUsage::new(
+                    2, 3
+                )))
+            );
+            assert_eq!(result.metadata["sentinel"], "retained");
+            assert_eq!(result.model.as_deref(), Some("fake-model"));
+            assert_eq!(result.response_id.as_deref(), Some("fake-response"));
+            assert!(turn.next_event(None).await.unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn text_identity_suffixes_do_not_define_descriptor_semantics() {
+    for suffix in ["data", "name"] {
+        let mut messages = text_message("legitimate text");
+        messages[0]["parts"][0]["id"] = json!(format!("new/{suffix}"));
+        let messages: agenthooksprotocol::CanonicalMessages =
+            serde_json::from_value(messages).unwrap();
+        let result = canonical_items(messages.0.iter().map(Box::as_ref), &[]).unwrap();
+        assert_eq!(result[0].parts, vec![Part::text("legitimate text")]);
+    }
+    for category in ["file", "media", "custom"] {
+        let mut messages = text_message("descriptor");
+        messages[0]["parts"][0]["category"] = json!(category);
+        let messages: agenthooksprotocol::CanonicalMessages =
+            serde_json::from_value(messages).unwrap();
+        assert!(canonical_items(messages.0.iter().map(Box::as_ref), &[]).is_err());
+    }
+}
+
+#[test]
+fn native_parts_cannot_be_reordered_or_repeated() {
+    let original = Item::new(
+        ItemKind::Assistant,
+        vec![
+            Part::ToolCall(agentkit_core::ToolCallPart::new(
+                "first",
+                "echo",
+                json!({"text":"first"}),
+            )),
+            Part::ToolCall(agentkit_core::ToolCallPart::new(
+                "second",
+                "echo",
+                json!({"text":"second"}),
+            )),
+        ],
+    );
+    let projected = super::super::message(&original, 0);
+    let mut message = projected.metadata;
+    message.parts = projected
+        .parts
+        .into_iter()
+        .map(|part| match part {
+            agenthooksprotocol::inputs::PartInput::Text(body) => {
+                Box::new(ContentItem::TextBodyPart(Box::new(body)))
+            }
+            _ => panic!("expected text projection"),
+        })
+        .collect();
+    assert_eq!(
+        canonical_items([&message], std::slice::from_ref(&original)).unwrap(),
+        vec![original.clone()]
+    );
+    assert!(canonical_items([&message, &message], std::slice::from_ref(&original)).is_err());
+    message.parts.reverse();
+    assert!(canonical_items([&message], std::slice::from_ref(&original)).is_err());
+    message.parts = vec![message.parts[0].clone(), message.parts[0].clone()];
+    assert!(canonical_items([&message], &[original]).is_err());
+}

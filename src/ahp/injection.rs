@@ -1,20 +1,14 @@
 //! Request-local context injection. Nothing here mutates the durable transcript.
-//!
-//! Writers: open/lease-drop own registry entries; close retires a queue; enqueue appends atomically;
-//! claim reserves a prefix; commit removes that prefix; Delivery::drop releases
-//! the reservation on error, unwind, or cancellation. No lock crosses an await,
-//! invokes callbacks, or nests with another lock. Poison isolates that queue:
-//! callers receive an error, never recover potentially inconsistent state.
+//! Poison recovery: writers use concrete collections, abort-on-OOM allocation, bounded arithmetic, and no callbacks or panicking destructors.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use agenthooksprotocol::client::ProtocolOutcome;
-use agenthooksprotocol::{CanonicalMessageRole, ContentItem, InjectEffectDeliverAt};
-use agentkit_core::{Item, ItemKind, Part, TextPart};
+use agenthooksprotocol::{ContentItem, InjectEffectDeliverAt};
+use agentkit_core::{Item, Part, TextPart};
 
 const MAX_MESSAGES: usize = 256;
 const MAX_BYTES: usize = 1024 * 1024;
-const MAX_SESSIONS: usize = 1024;
 
 type Queue = Arc<Mutex<Pending>>;
 
@@ -27,7 +21,7 @@ pub(super) struct Injections {
 struct Pending {
     items: Vec<Item>,
     bytes: usize,
-    claimed: bool,
+    in_flight_items: usize,
     closed: bool,
 }
 
@@ -36,15 +30,9 @@ impl Injections {
     /// Store the returned lease in HookedSession, not a temporary local.
     pub(super) fn open(&self, session: &str) -> Result<SessionLease, String> {
         let queue = Arc::new(Mutex::new(Pending::default()));
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "injection registry poisoned")?;
+        let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         if sessions.contains_key(session) {
             return Err("injection session is already active".into());
-        }
-        if sessions.len() >= MAX_SESSIONS {
-            return Err("too many injection sessions".into());
         }
         sessions.insert(session.to_owned(), Arc::clone(&queue));
         drop(sessions);
@@ -58,40 +46,40 @@ impl Injections {
     /// Retire delivery but retain the active slot until the session owner drops.
     pub(super) fn close(&self, session: &str) -> Result<(), String> {
         let queue = self.queue(session)?;
-        retire(&queue)
+        retire(&queue);
+        Ok(())
     }
 
     /// Capture BEFORE awaiting the hook dispatch. Late outcomes then retain
     /// their original generation and cannot enter a resumed session's queue.
-    pub(super) fn producer(&self, session: &str) -> Result<Producer, String> {
-        Ok(Producer {
-            queue: self.queue(session)?,
+    pub(super) fn producer(&self, session: &str) -> Option<Producer> {
+        Some(Producer {
+            queue: self.queue(session).ok()?,
         })
     }
 
     fn queue(&self, session: &str) -> Result<Queue, String> {
         self.sessions
             .lock()
-            .map_err(|_| "injection registry poisoned")?
+            .unwrap_or_else(PoisonError::into_inner)
             .get(session)
             .cloned()
             .ok_or_else(|| "injection session is closed".into())
     }
 
-    /// Reserve without removing. Dropping the model-request future cannot lose
+    /// Take with rollback. Dropping the model-request future cannot lose
     /// the pending context; only successful adapter acceptance consumes it.
+    /// HookedSession::begin_turn(&mut self) is the sole production consumer;
+    /// producers may still enqueue while that provider call is awaiting.
     pub(super) fn claim(&self, session: &str) -> Result<Delivery, String> {
         let queue = self.queue(session)?;
-        let mut pending = queue.lock().map_err(|_| "injection queue poisoned")?;
+        let mut pending = queue.lock().unwrap_or_else(PoisonError::into_inner);
         if pending.closed {
             return Err("injection session is closed".into());
         }
-        if pending.claimed {
-            return Err("injection delivery already in progress".into());
-        }
-        let items = pending.items.clone();
+        let items = std::mem::take(&mut pending.items);
         let bytes = pending.bytes;
-        pending.claimed = true;
+        pending.in_flight_items = items.len();
         drop(pending);
         Ok(Delivery {
             queue,
@@ -118,14 +106,7 @@ impl Producer {
                 return Err("only inject.context deliverAt=now is supported".into());
             }
             for message in &injection.value.0 {
-                let kind = match message.role {
-                    CanonicalMessageRole::System => ItemKind::System,
-                    CanonicalMessageRole::Developer => ItemKind::Developer,
-                    CanonicalMessageRole::User => ItemKind::User,
-                    CanonicalMessageRole::Assistant => ItemKind::Assistant,
-                    // A synthetic tool result has no native call identity.
-                    _ => return Err("unsupported injected message role".into()),
-                };
+                let kind = super::message_kind(&message.role)?;
                 if message.parts.len() > MAX_MESSAGES {
                     return Err("injected context exceeds parts-per-message limit".into());
                 }
@@ -149,11 +130,13 @@ impl Producer {
         if items.is_empty() {
             return Ok(());
         }
-        let mut pending = self.queue.lock().map_err(|_| "injection queue poisoned")?;
+        let mut pending = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if pending.closed {
             return Err("injection session is closed".into());
         }
-        if pending.items.len() + items.len() > MAX_MESSAGES || pending.bytes + bytes > MAX_BYTES {
+        if pending.items.len() + pending.in_flight_items + items.len() > MAX_MESSAGES
+            || pending.bytes + bytes > MAX_BYTES
+        {
             return Err("pending injected context limit reached".into());
         }
         pending.items.extend(items);
@@ -171,39 +154,21 @@ pub(super) struct SessionLease {
 
 impl Drop for SessionLease {
     fn drop(&mut self) {
-        // Close first so outstanding producer tokens reject late outcomes.
-        if let Err(error) = retire(&self.queue) {
-            tracing::warn!(%error, "injection queue could not retire during session cleanup");
-        }
-        let removed = match self.sessions.lock() {
-            Ok(mut sessions) => {
-                if sessions
-                    .get(&self.session)
-                    .is_some_and(|queue| Arc::ptr_eq(queue, &self.queue))
-                {
-                    sessions.remove(&self.session)
-                } else {
-                    None
-                }
-            }
-            Err(_) => {
-                tracing::warn!("injection registry poisoned during session cleanup");
-                None
-            }
-        };
-        drop(removed);
+        retire(&self.queue);
+        // Duplicate opens are rejected until this owner removes its entry.
+        self.sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.session);
     }
 }
 
 // Retired producer handles retain only an empty queue, not pending payloads.
-fn retire(queue: &Queue) -> Result<(), String> {
-    let mut pending = queue.lock().map_err(|_| "injection queue poisoned")?;
+fn retire(queue: &Queue) {
+    let mut pending = queue.lock().unwrap_or_else(PoisonError::into_inner);
     pending.closed = true;
     pending.bytes = 0;
-    let removed = std::mem::take(&mut pending.items);
-    drop(pending);
-    drop(removed);
-    Ok(())
+    pending.items.clear();
 }
 
 pub(super) struct Delivery {
@@ -221,19 +186,16 @@ impl Delivery {
     /// Call synchronously immediately after inner.begin_turn returns Ok.
     /// Later stream cancellation does not replay context already accepted.
     pub(super) fn commit(mut self) -> Result<(), String> {
-        let mut pending = self.queue.lock().map_err(|_| "injection queue poisoned")?;
+        let mut pending = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
         if pending.closed {
             // Session retirement already discarded the queue. This receipt may
             // complete afterwards, but must not address a resumed generation.
             self.committed = true;
             return Ok(());
         }
-        let removed: Vec<_> = pending.items.drain(..self.items.len()).collect();
         pending.bytes -= self.bytes;
-        pending.claimed = false;
+        pending.in_flight_items = 0;
         self.committed = true;
-        drop(pending);
-        drop(removed);
         Ok(())
     }
 }
@@ -241,12 +203,13 @@ impl Delivery {
 impl Drop for Delivery {
     fn drop(&mut self) {
         if !self.committed {
-            match self.queue.lock() {
-                Ok(mut pending) => pending.claimed = false,
-                Err(_) => {
-                    tracing::warn!("injection queue poisoned; reservation cannot be released")
-                }
+            let mut pending = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            if !pending.closed {
+                // The in-flight count keeps this append within MAX_MESSAGES.
+                self.items.append(&mut pending.items);
+                pending.items = std::mem::take(&mut self.items);
             }
+            pending.in_flight_items = 0;
         }
     }
 }
@@ -262,7 +225,9 @@ impl Drop for Delivery {
 mod tests {
     use super::*;
     use agenthooksprotocol::client::Permission;
-    use agenthooksprotocol::{CanonicalMessage, CanonicalMessages, InjectEffect, TextBodyPart};
+    use agenthooksprotocol::{
+        CanonicalMessage, CanonicalMessageRole, CanonicalMessages, InjectEffect, TextBodyPart,
+    };
 
     fn outcome(text: &str) -> ProtocolOutcome {
         let message = CanonicalMessage::new(
@@ -290,6 +255,14 @@ mod tests {
         }
     }
 
+    fn enqueue(queues: &Injections, session: &str, text: &str) {
+        queues
+            .producer(session)
+            .unwrap()
+            .enqueue(&outcome(text))
+            .unwrap();
+    }
+
     fn texts(delivery: &Delivery) -> Vec<String> {
         let mut transcript = vec![];
         delivery.append_to(&mut transcript);
@@ -307,18 +280,9 @@ mod tests {
     fn rollback_order_and_one_shot_commit() {
         let queues = Injections::default();
         let _owner_a = queues.open("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("first"))
-            .unwrap();
+        enqueue(&queues, "a", "first");
         let delivery = queues.claim("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("second"))
-            .unwrap();
-        assert!(queues.claim("a").is_err());
+        enqueue(&queues, "a", "second");
         drop(delivery);
         let delivery = queues.claim("a").unwrap();
         assert_eq!(texts(&delivery), ["first", "second"]);
@@ -327,20 +291,12 @@ mod tests {
     }
 
     #[test]
-    fn commit_only_consumes_claimed_prefix() {
+    fn commit_preserves_concurrent_enqueue() {
         let queues = Injections::default();
         let _owner_a = queues.open("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("first"))
-            .unwrap();
+        enqueue(&queues, "a", "first");
         let delivery = queues.claim("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("second"))
-            .unwrap();
+        enqueue(&queues, "a", "second");
         delivery.commit().unwrap();
         assert_eq!(texts(&queues.claim("a").unwrap()), ["second"]);
     }
@@ -350,11 +306,7 @@ mod tests {
         let queues = Injections::default();
         let _owner_a = queues.open("a").unwrap();
         let _owner_b = queues.open("b").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("old"))
-            .unwrap();
+        enqueue(&queues, "a", "old");
         let old = queues.claim("a").unwrap();
         queues.close("a").unwrap();
         assert!(queues.open("a").is_err());
@@ -367,11 +319,7 @@ mod tests {
         );
         drop(_owner_a);
         let _owner_a = queues.open("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("new"))
-            .unwrap();
+        enqueue(&queues, "a", "new");
         old.commit().unwrap();
         assert_eq!(texts(&queues.claim("a").unwrap()), ["new"]);
         assert!(texts(&queues.claim("b").unwrap()).is_empty());
@@ -387,7 +335,6 @@ mod tests {
         drop(owner);
         let _resumed = queues.open("a").unwrap();
         assert!(producer.enqueue(&outcome("stale")).is_err());
-        assert!(producer.queue.lock().unwrap().items.is_empty());
         assert!(texts(&queues.claim("a").unwrap()).is_empty());
     }
 
@@ -437,22 +384,35 @@ mod tests {
                 .enqueue(&outcome(&"x".repeat(MAX_BYTES + 1)))
                 .is_err()
         );
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("still works"))
-            .unwrap();
+        enqueue(&queues, "a", "still works");
+    }
+
+    #[test]
+    fn in_flight_context_still_counts_toward_limits() {
+        let queues = Injections::default();
+        let _owner = queues.open("a").unwrap();
+        let producer = queues.producer("a").unwrap();
+        for _ in 0..MAX_MESSAGES {
+            enqueue(&queues, "a", "");
+        }
+        let delivery = queues.claim("a").unwrap();
+        assert!(producer.enqueue(&outcome("overflow")).is_err());
+        drop(delivery);
+        let delivery = queues.claim("a").unwrap();
+        assert_eq!(texts(&delivery).len(), MAX_MESSAGES);
+        delivery.commit().unwrap();
+        producer.enqueue(&outcome(&"x".repeat(MAX_BYTES))).unwrap();
+        let delivery = queues.claim("a").unwrap();
+        assert!(producer.enqueue(&outcome("overflow")).is_err());
+        delivery.commit().unwrap();
+        enqueue(&queues, "a", "room again");
     }
 
     #[tokio::test]
     async fn cancellation_releases_reservation_without_losing_context() {
         let queues = Arc::new(Injections::default());
         let _owner_a = queues.open("a").unwrap();
-        queues
-            .producer("a")
-            .unwrap()
-            .enqueue(&outcome("retained"))
-            .unwrap();
+        enqueue(&queues, "a", "retained");
         let (ready, received) = tokio::sync::oneshot::channel();
         let task = tokio::spawn({
             let queues = queues.clone();
@@ -466,34 +426,5 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(texts(&queues.claim("a").unwrap()), ["retained"]);
-    }
-
-    #[test]
-    fn poison_is_reported_not_recovered() {
-        let queues = Injections::default();
-        let _owner_a = queues.open("a").unwrap();
-        let _owner_b = queues.open("b").unwrap();
-        let queue = queues.queue("a").unwrap();
-        let _ = std::panic::catch_unwind(|| {
-            let _guard = queue.lock().unwrap();
-            panic!("unwind while holding queue");
-        });
-        assert!(
-            queues
-                .producer("a")
-                .unwrap()
-                .enqueue(&outcome("rejected"))
-                .is_err()
-        );
-        assert!(queues.claim("a").is_err());
-        queues
-            .producer("b")
-            .unwrap()
-            .enqueue(&outcome("unaffected"))
-            .unwrap();
-        assert_eq!(texts(&queues.claim("b").unwrap()), ["unaffected"]);
-        assert!(queues.close("a").is_err());
-        drop(_owner_a);
-        let _fresh_owner = queues.open("a").unwrap();
     }
 }

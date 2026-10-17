@@ -42,6 +42,7 @@ pub struct Hooks {
     sdk: Arc<agenthooksprotocol::Hooks>,
     intercepts_model_response: bool,
     injections: injection::Injections,
+    messages: messages::Routes,
     turn_events: turn::TurnQueues,
     root: Option<std::path::PathBuf>,
 }
@@ -73,38 +74,14 @@ impl Hooks {
     }
 
     fn new(registration: Registration, options: HooksOptions) -> Result<Self, String> {
-        let intercepts_model_response = registration.hooks.iter().any(|backend| {
-            backend.subscriptions.iter().any(|subscription| {
-                let agenthooksprotocol::BackendSubscriptionsItem::Intercept(subscription) =
-                    subscription
-                else {
-                    return false;
-                };
-                subscription.events.iter().any(|selector| {
-                    let selector = match selector {
-                        agenthooksprotocol::InterceptSubscriptionEventsItem::Known(event) => {
-                            event.as_str()
-                        }
-                        agenthooksprotocol::InterceptSubscriptionEventsItem::Custom(event) => {
-                            event.as_str()
-                        }
-                    };
-                    selector == "model.response.after"
-                        || selector == "*"
-                        || selector.strip_suffix(".*").is_some_and(|prefix| {
-                            "model.response.after"
-                                .strip_prefix(prefix)
-                                .is_some_and(|tail| tail.starts_with('.'))
-                        })
-                })
-            })
-        });
         let sdk = agenthooksprotocol::Hooks::new(registration, options)
             .map_err(|error| error.to_string())?;
+        let intercepts_model_response = sdk.intercepts(EventType::ModelResponseAfter);
         Ok(Self {
             sdk: Arc::new(sdk),
             intercepts_model_response,
             injections: injection::Injections::default(),
+            messages: messages::Routes::default(),
             turn_events: turn::TurnQueues::default(),
             root: None,
         })
@@ -121,6 +98,17 @@ impl Hooks {
         Box::new(session)
     }
 
+    fn settle(
+        &self,
+        event: EventType,
+        result: Result<EventOutcome, LoopError>,
+        session: &str,
+    ) -> Option<EventOutcome> {
+        let outcome = settle(event, result)?;
+        self.deliver_messages(session, &outcome.outcome.messages);
+        Some(outcome)
+    }
+
     async fn session_start(
         &self,
         session: &str,
@@ -129,7 +117,6 @@ impl Hooks {
     ) -> Result<injection::SessionLease, String> {
         let lease = self.injections.open(session)?;
         let producer = self.injections.producer(session);
-        let destination = messages::capture(session);
         let mut input = SessionStartInput::new(
             Vec::new(),
             "allow-all".into(),
@@ -139,18 +126,18 @@ impl Hooks {
         if let Some(model) = model {
             input.session.model = Presence::Present(model.to_owned());
         }
-        let outcome = settle(
-            EventType::SessionStart,
-            self.sdk.session_start(input).await,
-            &destination,
-        )
-        .ok_or_else(|| "session.start hook dispatch failed".to_owned())?;
-        enqueue_injections(&producer, &outcome.outcome)?;
+        let outcome = self
+            .settle(
+                EventType::SessionStart,
+                dispatch(self.sdk.session_start(input), None).await,
+                session,
+            )
+            .ok_or_else(|| "session.start hook dispatch failed".to_owned())?;
+        enqueue_injections(producer.as_ref(), &outcome.outcome)?;
         Ok(lease)
     }
 
     pub(crate) async fn session_end(&self, session: &str, outcome: SessionEndInputOutcome) {
-        let destination = messages::capture(session);
         if let Err(error) = self.injections.close(session) {
             tracing::warn!(%error, "could not close hook injection session");
         }
@@ -158,10 +145,10 @@ impl Hooks {
         self.forget_turn_events(session);
         let reason = outcome.as_str().to_owned();
         let input = SessionEndInput::new(outcome, reason, self.session(session));
-        settle(
+        self.settle(
             EventType::SessionEnd,
-            self.sdk.session_end(input).await,
-            &destination,
+            dispatch(self.sdk.session_end(input), None).await,
+            session,
         );
     }
 
@@ -176,7 +163,6 @@ impl Hooks {
         cancellation: Option<&TurnCancellation>,
     ) -> Option<Compaction> {
         let producer = self.injections.producer(session);
-        let destination = messages::capture(session);
         let trigger = if manual {
             ContextCompactBeforeInputTrigger::Manual
         } else {
@@ -188,11 +174,8 @@ impl Hooks {
         let boundary = self
             .sdk
             .context_compact_before(input.with_sources().with_items(messages(items)));
-        let result = match cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
-        };
-        let Some(outcome) = settle(EventType::ContextCompactBefore, result, &destination) else {
+        let result = dispatch(boundary, cancellation).await;
+        let Some(outcome) = self.settle(EventType::ContextCompactBefore, result, session) else {
             return Some(Compaction::Denied(
                 "context.compact.before hook dispatch failed".into(),
             ));
@@ -200,7 +183,7 @@ impl Hooks {
         if outcome.outcome.is_denied() {
             return Some(Compaction::Denied(denial(&outcome.outcome)));
         }
-        if let Err(error) = enqueue_injections(&producer, &outcome.outcome) {
+        if let Err(error) = enqueue_injections(producer.as_ref(), &outcome.outcome) {
             return Some(Compaction::Denied(error));
         }
         if let Some(SettledCandidate::Summary(summary)) = outcome.outcome.candidate() {
@@ -226,7 +209,6 @@ impl Hooks {
         summary: String,
         supplied: bool,
     ) -> String {
-        let destination = messages::capture(session);
         let removed = items
             .iter()
             .enumerate()
@@ -245,12 +227,13 @@ impl Hooks {
                 agenthooksprotocol::ExecutionEventExecutionSkippedSuppliedResult::new(),
             ));
         }
-        match settle(
-            EventType::ContextCompactAfter,
-            self.sdk.context_compact_after(input).await,
-            &destination,
-        )
-        .map(|outcome| outcome.event)
+        match self
+            .settle(
+                EventType::ContextCompactAfter,
+                dispatch(self.sdk.context_compact_after(input), None).await,
+                session,
+            )
+            .map(|outcome| outcome.event)
         {
             Some(Event::ContextCompactAfter(event)) => parts_text(&event.0.summary),
             _ => summary,
@@ -390,15 +373,10 @@ fn report(event: EventType, diagnostics: &[DeliveryDiagnostic]) {
 }
 
 /// Reports delivery diagnostics; a dispatch error is reported and yields `None`.
-fn settle(
-    event: EventType,
-    result: Result<EventOutcome, HookError>,
-    destination: &messages::Destination,
-) -> Option<EventOutcome> {
+fn settle(event: EventType, result: Result<EventOutcome, LoopError>) -> Option<EventOutcome> {
     match result {
         Ok(outcome) => {
             report(event, &outcome.diagnostics);
-            destination.deliver(&outcome.outcome.messages);
             Some(outcome)
         }
         Err(error) => {
@@ -409,13 +387,54 @@ fn settle(
 }
 
 fn enqueue_injections<C, P>(
-    producer: &Result<injection::Producer, String>,
+    producer: Option<&injection::Producer>,
     outcome: &ProtocolOutcome<C, P>,
 ) -> Result<(), String> {
     if outcome.injections.is_empty() {
         return Ok(());
     }
-    producer.as_ref().map_err(Clone::clone)?.enqueue(outcome)
+    producer
+        .ok_or("injection session is closed")?
+        .enqueue(outcome)
+}
+
+/// Dispatch once and preserve caller cancellation instead of treating it as denial.
+async fn dispatch<B, T>(
+    boundary: B,
+    cancellation: Option<&TurnCancellation>,
+) -> Result<T, LoopError>
+where
+    B: std::future::IntoFuture<Output = Result<T, HookError>> + Send,
+    B::IntoFuture: Send,
+{
+    let operation = std::pin::pin!(boundary.into_future());
+    let result = if let Some(cancellation) = cancellation {
+        let cancelled = std::pin::pin!(cancellation.cancelled());
+        match futures_util::future::select(cancelled, operation).await {
+            futures_util::future::Either::Left(_) => return Err(LoopError::Cancelled),
+            futures_util::future::Either::Right((result, _)) => result,
+        }
+    } else {
+        operation.await
+    };
+    if cancellation.is_some_and(TurnCancellation::is_cancelled) {
+        return Err(LoopError::Cancelled);
+    }
+    result.map_err(|error| LoopError::InvalidState(error.to_string()))
+}
+
+/// SDK outcomes include responses only after their effects are accepted.
+fn has_modification(outcome: &EventOutcome) -> bool {
+    outcome
+        .outcome
+        .responses
+        .iter()
+        .any(|response| match &response.result.effects {
+            Presence::Present(effects) => effects
+                .iter()
+                .any(|effect| matches!(effect.as_ref(), Effect::ModifyMessagesEffect(_))),
+            Presence::Missing => false,
+        })
 }
 
 fn denial<C, P>(outcome: &ProtocolOutcome<C, P>) -> String {
@@ -587,6 +606,16 @@ fn role(kind: ItemKind) -> CanonicalMessageRole {
         ItemKind::User | ItemKind::Notification => CanonicalMessageRole::User,
         ItemKind::Assistant => CanonicalMessageRole::Assistant,
         ItemKind::Tool => CanonicalMessageRole::Tool,
+    }
+}
+
+fn message_kind(role: &CanonicalMessageRole) -> Result<ItemKind, String> {
+    match role {
+        CanonicalMessageRole::System => Ok(ItemKind::System),
+        CanonicalMessageRole::Developer => Ok(ItemKind::Developer),
+        CanonicalMessageRole::User => Ok(ItemKind::User),
+        CanonicalMessageRole::Assistant => Ok(ItemKind::Assistant),
+        _ => Err("unsupported hook message role".into()),
     }
 }
 

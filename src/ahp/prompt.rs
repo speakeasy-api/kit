@@ -60,7 +60,6 @@ impl LoopMutator for PromptHook {
         if ctx.point != MutationPoint::AfterTurnEnded {
             return Ok(());
         }
-        let destination = super::messages::capture(&ctx.session_id.to_string());
         self.hooks
             .drain_turn_events(&ctx.session_id.to_string())
             .await;
@@ -90,11 +89,15 @@ impl LoopMutator for PromptHook {
             .hooks
             .sdk
             .user_message_inbound(input.with_sources().with_message_messages(vec![message]));
-        let result = match &ctx.cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
-        };
-        let edited = match super::settle(EventType::UserMessageInbound, result, &destination) {
+        let result = super::dispatch(boundary, ctx.cancellation.as_ref()).await;
+        if matches!(&result, Err(LoopError::Cancelled)) {
+            return Err(LoopError::Cancelled);
+        }
+        let edited = match self.hooks.settle(
+            EventType::UserMessageInbound,
+            result,
+            &ctx.session_id.to_string(),
+        ) {
             Some(outcome) if outcome.outcome.is_denied() => Err(super::denial(&outcome.outcome)),
             Some(outcome) => match outcome.event {
                 Event::UserMessageInbound(event) => Ok(event
@@ -119,13 +122,6 @@ impl LoopMutator for PromptHook {
             },
             None => Err("agent hook dispatch failed".into()),
         };
-        if ctx
-            .cancellation
-            .as_ref()
-            .is_some_and(|cancellation| cancellation.is_cancelled())
-        {
-            return Err(LoopError::Cancelled);
-        }
         match edited {
             Ok(text) => {
                 if text == original {

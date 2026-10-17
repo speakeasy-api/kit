@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use agenthooksprotocol::client::SettledCandidate;
@@ -81,7 +82,6 @@ pub(crate) struct HookedSession<S> {
 
 #[derive(Clone)]
 struct Call {
-    destination: super::messages::Destination,
     hooks: Arc<Hooks>,
     attempt: ExecutionEventAttempt,
     model: ExecutionEventModel,
@@ -148,10 +148,10 @@ impl Call {
         input.usage = usage.map(super::usage::attempt).map(Box::new);
         input.latency_ms =
             serde_json::Number::from_f64(self.started.elapsed().as_secs_f64() * 1000.0);
-        super::settle(
+        self.hooks.settle(
             EventType::ModelError,
-            self.hooks.sdk.model_error(input).await,
-            &self.destination,
+            super::dispatch(self.hooks.sdk.model_error(input), None).await,
+            &self.session.id,
         );
     }
 }
@@ -171,29 +171,17 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
     ) -> Result<Self::Turn, LoopError> {
         let Some(hooks) = &self.hooks else {
             let inner = self.inner.begin_turn(request, cancellation).await?;
-            return Ok(HookedTurn {
-                inner: Some(inner),
-                synthetic: None,
-                call: None,
-                latest_usage: None,
-            });
+            return Ok(HookedTurn::live(inner, None));
         };
-        let destination = super::messages::capture(&request.session_id.to_string());
         hooks
             .drain_turn_events(&request.session_id.to_string())
             .await;
         self.attempts += 1;
         let Some(number) = Integer::new(self.attempts.into()) else {
             let inner = self.inner.begin_turn(request, cancellation).await?;
-            return Ok(HookedTurn {
-                inner: Some(inner),
-                synthetic: None,
-                call: None,
-                latest_usage: None,
-            });
+            return Ok(HookedTurn::live(inner, None));
         };
         let mut call = Call {
-            destination,
             hooks: Arc::clone(hooks),
             session: hooks.session(&request.session_id.to_string()),
             turn: request.turn_id.to_string(),
@@ -277,21 +265,12 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         let producer = hooks
             .injections
             .producer(&call.session.id)
-            .map_err(LoopError::InvalidState)?;
+            .ok_or_else(|| invalid("injection session is closed"))?;
         let boundary = hooks.sdk.model_request_before(input);
-        let result = match &cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
-        };
-        // SDK cancellation is a dispatch error, not a policy denial. Preserve the
-        // loop's cancelled terminal outcome instead of converting it to InvalidState.
-        if cancellation
-            .as_ref()
-            .is_some_and(TurnCancellation::is_cancelled)
-        {
-            return Err(LoopError::Cancelled);
-        }
-        let outcome = super::settle(EventType::ModelRequestBefore, result, &call.destination)
+        let result = super::dispatch(boundary, cancellation.as_ref()).await?;
+        let outcome = call
+            .hooks
+            .settle(EventType::ModelRequestBefore, Ok(result), &call.session.id)
             .ok_or_else(|| invalid("model request hook dispatch failed"))?;
         if outcome.outcome.is_denied() {
             return Err(invalid(&format!(
@@ -308,20 +287,20 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         if let Some(SettledCandidate::Messages(messages)) = outcome.outcome.candidate() {
             let output_items = canonical_items(messages.0.iter().map(Box::as_ref), &[])?;
             return Ok(HookedTurn {
-                inner: None,
-                synthetic: Some(ModelTurnResult {
+                source: TurnSource::Supplied(Some(Box::new(ModelTurnResult {
                     finish_reason: FinishReason::Completed,
                     output_items,
                     usage: None,
                     metadata: Default::default(),
                     model: None,
                     response_id: None,
-                }),
+                }))),
                 call: Some(call),
                 latest_usage: None,
+                approved_events: VecDeque::new(),
             });
         }
-        if has_modification(&outcome)
+        if super::has_modification(&outcome)
             && let Event::ModelRequestBefore(event) = &outcome.event
         {
             request.transcript = canonical_items(
@@ -340,12 +319,7 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
         match self.inner.begin_turn(request, cancellation).await {
             Ok(inner) => {
                 delivery.commit().map_err(LoopError::InvalidState)?;
-                Ok(HookedTurn {
-                    inner: Some(inner),
-                    synthetic: None,
-                    call: Some(call),
-                    latest_usage: None,
-                })
+                Ok(HookedTurn::live(inner, Some(call)))
             }
             Err(error) => {
                 call.failed(&error, None).await;
@@ -363,18 +337,35 @@ impl<S: ModelSession> ModelSession for HookedSession<S> {
     }
 }
 
+enum TurnSource<T> {
+    Live(T),
+    Supplied(Option<Box<ModelTurnResult>>),
+    Done,
+}
+
 pub(crate) struct HookedTurn<T> {
-    inner: Option<T>,
-    synthetic: Option<ModelTurnResult>,
+    source: TurnSource<T>,
     call: Option<Call>,
     latest_usage: Option<agentkit_core::Usage>,
+    approved_events: VecDeque<ModelTurnEvent>,
+}
+
+impl<T> HookedTurn<T> {
+    fn live(inner: T, call: Option<Call>) -> Self {
+        Self {
+            source: TurnSource::Live(inner),
+            call,
+            latest_usage: None,
+            approved_events: VecDeque::new(),
+        }
+    }
 }
 
 #[async_trait]
 impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
     fn on_cancelled(&mut self) {
-        self.synthetic = None;
-        if let Some(inner) = &mut self.inner {
+        self.approved_events.clear();
+        if let TurnSource::Live(mut inner) = std::mem::replace(&mut self.source, TurnSource::Done) {
             inner.on_cancelled();
         }
     }
@@ -387,15 +378,22 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
             .as_ref()
             .is_some_and(TurnCancellation::is_cancelled)
         {
+            self.on_cancelled();
             return Err(LoopError::Cancelled);
+        }
+        if let Some(event) = self.approved_events.pop_front() {
+            return Ok(Some(event));
         }
         // Finished owns complete output. Withhold previews until policy settles:
         // edited or blocked text and tool calls must never reach observers.
-        let supplied = self.inner.is_none();
+        let supplied = matches!(self.source, TurnSource::Supplied(_));
         let mut event = loop {
-            let event = match &mut self.inner {
-                Some(inner) => inner.next_event(cancellation.clone()).await,
-                None => Ok(self.synthetic.take().map(ModelTurnEvent::Finished)),
+            let event = match &mut self.source {
+                TurnSource::Done => return Ok(None),
+                TurnSource::Live(inner) => inner.next_event(cancellation.clone()).await,
+                TurnSource::Supplied(result) => Ok(result
+                    .take()
+                    .map(|result| ModelTurnEvent::Finished(*result))),
             };
             if self
                 .call
@@ -484,23 +482,15 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
                     .with_sources()
                     .with_items(super::messages(&result.output_items));
                 let boundary = call.hooks.sdk.model_response_after(input);
-                let outcome = match &cancellation {
-                    Some(token) => boundary.cancel_when(token.cancelled()).await,
-                    None => boundary.await,
-                };
-                if cancellation
-                    .as_ref()
-                    .is_some_and(TurnCancellation::is_cancelled)
-                {
-                    return Err(LoopError::Cancelled);
-                }
-                let outcome =
-                    super::settle(EventType::ModelResponseAfter, outcome, &call.destination)
-                        .ok_or_else(|| invalid("model response hook dispatch failed"))?;
+                let outcome = super::dispatch(boundary, cancellation.as_ref()).await?;
+                let outcome = call
+                    .hooks
+                    .settle(EventType::ModelResponseAfter, Ok(outcome), &call.session.id)
+                    .ok_or_else(|| invalid("model response hook dispatch failed"))?;
                 if outcome.outcome.stopped || outcome.outcome.is_denied() {
                     return Err(invalid("model response stopped by agent hook"));
                 }
-                if has_modification(&outcome)
+                if super::has_modification(&outcome)
                     && let Event::ModelResponseAfter(edited) = outcome.event
                 {
                     result.output_items = canonical_items(
@@ -521,6 +511,26 @@ impl<T: ModelTurn> ModelTurn for HookedTurn<T> {
             Err(error) => call.failed(error, self.latest_usage.as_ref()).await,
             _ => {}
         }
+        if call.hooks.intercepts_model_response
+            && let Ok(Some(ModelTurnEvent::Finished(result))) = event
+        {
+            // agentkit-loop gates tool execution on a ToolCall event, not only
+            // Finished.output_items. Reconstruct notifications from approved
+            // output, never from withheld (possibly removed) provider previews.
+            self.approved_events.extend(
+                result
+                    .output_items
+                    .iter()
+                    .flat_map(|item| &item.parts)
+                    .filter_map(|part| match part {
+                        Part::ToolCall(call) => Some(ModelTurnEvent::ToolCall(call.clone())),
+                        _ => None,
+                    }),
+            );
+            self.approved_events
+                .push_back(ModelTurnEvent::Finished(result));
+            return Ok(self.approved_events.pop_front());
+        }
         event
     }
 }
@@ -529,76 +539,169 @@ fn invalid(message: &str) -> LoopError {
     LoopError::InvalidState(message.to_owned())
 }
 
-/// Preserve opaque host parts exactly when the hook message is unchanged.
-/// New or rewritten messages must be plain text: interpreting displayed
-/// text as executable tool calls or provider continuation data is unsafe.
+type ProjectedPart = agenthooksprotocol::inputs::PartInput<agenthooksprotocol::Attachment>;
+
+struct OriginalMessage<'a> {
+    item: &'a Item,
+    groups: Vec<Vec<ProjectedPart>>,
+    part_groups: HashMap<String, usize>,
+}
+
+impl<'a> OriginalMessage<'a> {
+    fn new(item: &'a Item, id: &str) -> Self {
+        let mut groups = Vec::with_capacity(item.parts.len());
+        let mut part_groups = HashMap::new();
+        for (index, part) in item.parts.iter().enumerate() {
+            let projected = super::content_parts(&format!("{id}/{index}"), part);
+            for part in &projected {
+                let id = match part {
+                    agenthooksprotocol::inputs::PartInput::Text(body) => &body.id,
+                    agenthooksprotocol::inputs::PartInput::Attachment { metadata, .. } => {
+                        &metadata.id
+                    }
+                    agenthooksprotocol::inputs::PartInput::Wire(part) => content_id(part),
+                };
+                part_groups.insert(id.to_owned(), index);
+            }
+            groups.push(projected);
+        }
+        Self {
+            item,
+            groups,
+            part_groups,
+        }
+    }
+
+    fn unchanged(&self, message: &CanonicalMessage) -> bool {
+        super::role(self.item.kind) == message.role
+            && self.groups.iter().map(Vec::len).sum::<usize>() == message.parts.len()
+            && self
+                .groups
+                .iter()
+                .flatten()
+                .zip(&message.parts)
+                .all(|(before, after)| projected_part_matches(before, after))
+    }
+}
+
+/// Project each original once; index identities rather than searching the
+/// transcript or re-projecting native parts for every edited part.
 fn canonical_items<'a>(
     messages: impl IntoIterator<Item = &'a CanonicalMessage>,
     originals: &[Item],
 ) -> Result<Vec<Item>, LoopError> {
-    messages.into_iter().map(|message| {
-        let original = originals.iter().enumerate().find(|(index, item)| super::item_id(item, *index) == message.id);
-        if let Some((index, item)) = original {
-            let projected = super::message(item, index);
-            if projected.metadata.role == message.role
-                && projected.parts.len() == message.parts.len()
-                && projected.parts.iter().zip(&message.parts).all(|(before, after)| projected_part_matches(before, after)) {
-                // Hook messages deliberately omit opaque provider state.
-                // A no-op must retain the exact original, including hidden parts.
-                return Ok(item.clone());
-            }
-            if item.parts.iter().enumerate().any(|(part_index, part)| {
-                super::content_parts(&format!("{}/{part_index}", super::item_id(item, index)), part).is_empty()
-            }) {
-                // Hidden continuation data can depend on surrounding visible
-                // parts. Without a provider contract we cannot safely reposition
-                // or retain it after an edit. Reject rather than silently lose it.
-                return Err(invalid("cannot partially edit a model message containing opaque unprojected provider content"));
-            }
+    let mut by_id = HashMap::with_capacity(originals.len());
+    for (index, item) in originals.iter().enumerate() {
+        let id = super::item_id(item, index);
+        let original = OriginalMessage::new(item, &id);
+        if by_id.insert(id, original).is_some() {
+            return Err(invalid("duplicate original model message identity"));
         }
-        let kind = match &message.role {
-            CanonicalMessageRole::System => ItemKind::System,
-            CanonicalMessageRole::Developer => ItemKind::Developer,
-            CanonicalMessageRole::User => ItemKind::User,
-            CanonicalMessageRole::Assistant => ItemKind::Assistant,
-            CanonicalMessageRole::Tool if original.is_some() => ItemKind::Tool,
-            CanonicalMessageRole::Tool | CanonicalMessageRole::Unknown(_) => return Err(invalid("unsupported model hook message role")),
-        };
-        let mut parts = Vec::new();
-        let mut remaining = message.parts.as_slice();
-        while let Some(next) = remaining.first() {
-            // A host part can project to multiple hook message parts (for example a
-            // tool result plus correlation, or a file plus its name descriptor).
-            // Retain the host part only when its whole projection is retained.
-            let retained = original.and_then(|(index, item)| {
-                item.parts.iter().enumerate().find_map(|(part_index, part)| {
-                    let projected = super::content_parts(&format!("{}/{part_index}", super::item_id(item, index)), part);
-                    (!projected.is_empty() && remaining.len() >= projected.len()
-                        && projected.iter().zip(remaining).all(|(before, after)| projected_part_matches(before, after)))
-                        .then_some((part, projected.len()))
-                })
-            });
-            if let Some((part, consumed)) = retained {
-                parts.push(part.clone());
-                remaining = &remaining[consumed..];
+    }
+    let mut seen = HashSet::new();
+    messages
+        .into_iter()
+        .map(|message| {
+            if !seen.insert(&message.id) {
+                return Err(invalid("duplicate edited model message identity"));
+            }
+            canonical_item(message, by_id.get(&message.id))
+        })
+        .collect()
+}
+
+fn canonical_item(
+    message: &CanonicalMessage,
+    original: Option<&OriginalMessage<'_>>,
+) -> Result<Item, LoopError> {
+    if let Some(original) = original {
+        if original.unchanged(message) {
+            // Includes all provider state that intentionally has no projection.
+            return Ok(original.item.clone());
+        }
+        if original.groups.iter().any(Vec::is_empty) {
+            return Err(invalid(
+                "cannot partially edit a model message containing opaque unprojected provider content",
+            ));
+        }
+    }
+    let kind = if message.role == CanonicalMessageRole::Tool
+        && original.is_some_and(|original| original.item.kind == ItemKind::Tool)
+    {
+        ItemKind::Tool
+    } else {
+        super::message_kind(&message.role).map_err(LoopError::InvalidState)?
+    };
+    let mut parts = Vec::new();
+    let mut remaining = message.parts.as_slice();
+    let mut next_group = 0;
+    while let Some(part) = remaining.first() {
+        if let Some(original) = original
+            && let Some(&index) = original.part_groups.get(content_id(part))
+        {
+            if index < next_group {
+                return Err(invalid("model hook cannot reorder or repeat native parts"));
+            }
+            next_group = index + 1;
+            let projected = &original.groups[index];
+            if remaining.len() >= projected.len()
+                && projected
+                    .iter()
+                    .zip(remaining)
+                    .all(|(before, after)| projected_part_matches(before, after))
+            {
+                parts.push(original.item.parts[index].clone());
+                remaining = &remaining[projected.len()..];
                 continue;
             }
-            match next.as_ref() {
-                ContentItem::TextBodyPart(body) if !body.id.ends_with("/data") && !body.id.ends_with("/name")
-                    && (matches!(&body.category, Presence::Missing) || body.category == Presence::Present("text".into())) => parts.push(Part::text(body.text.clone())),
-                _ => return Err(invalid("model hook replacement must contain plain text; opaque parts can only be retained unchanged")),
+            // A multipart native value must be retained as a whole. Descriptor
+            // text alone is not interchangeable with the native value it labels.
+            if !matches!(original.item.parts[index], Part::Text(_)) || projected.len() != 1 {
+                return Err(invalid(
+                    "model hook cannot partially edit a native non-text part",
+                ));
             }
-            remaining = &remaining[1..];
         }
-        if let Some((_, original)) = original {
-            let mut item = original.clone();
-            if super::role(item.kind) != message.role { item.kind = kind; }
-            item.parts = parts;
-            Ok(item)
-        } else {
-            Ok(Item::new(kind, parts))
+        parts.push(plain_text(part)?);
+        remaining = &remaining[1..];
+    }
+    if let Some(original) = original {
+        let mut item = original.item.clone();
+        if super::role(item.kind) != message.role {
+            item.kind = kind;
         }
-    }).collect()
+        item.parts = parts;
+        Ok(item)
+    } else {
+        Ok(Item::new(kind, parts))
+    }
+}
+
+fn plain_text(part: &ContentItem) -> Result<Part, LoopError> {
+    match part {
+        ContentItem::TextBodyPart(body)
+            if matches!(&body.category, Presence::Missing)
+                || body.category == Presence::Present("text".into()) =>
+        {
+            Ok(Part::text(body.text.clone()))
+        }
+        _ => Err(invalid(
+            "model hook replacement must contain plain text; opaque parts can only be retained unchanged",
+        )),
+    }
+}
+
+fn content_id(part: &ContentItem) -> &str {
+    match part {
+        ContentItem::TextBodyPart(part) => &part.id,
+        ContentItem::TextGapPart(part) => &part.id,
+        ContentItem::TextTextPlainMetadata(part) => &part.id,
+        ContentItem::TextTextPlainOmit(part) => &part.id,
+        ContentItem::AttachmentBodyPart(part) => &part.id,
+        ContentItem::AttachmentGapPart(part) => &part.id,
+        ContentItem::AttachmentMetadata(part) => &part.id,
+        ContentItem::AttachmentOmit(part) => &part.id,
+    }
 }
 
 fn projected_part_matches(
@@ -620,22 +723,6 @@ fn projected_part_matches(
         }
         _ => false,
     }
-}
-
-fn has_modification(outcome: &agenthooksprotocol::hooks::EventOutcome) -> bool {
-    outcome
-        .outcome
-        .responses
-        .iter()
-        .any(|response| match &response.result.effects {
-            Presence::Present(effects) => effects.iter().any(|effect| {
-                matches!(
-                    effect.as_ref(),
-                    agenthooksprotocol::Effect::ModifyMessagesEffect(_)
-                )
-            }),
-            Presence::Missing => false,
-        })
 }
 
 #[cfg(test)]

@@ -69,7 +69,6 @@ fn next(queues: &TurnQueues, session: &str) -> Option<AgentEvent> {
 }
 
 async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: AgentEvent) {
-    let destination = super::messages::capture(&owner.id);
     match event {
         AgentEvent::TurnStarted { turn_id, .. } => {
             let input = TurnStartInput::new(
@@ -80,8 +79,7 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: Ag
             .with_session(owner);
             super::settle(
                 EventType::TurnStart,
-                sdk.turn_start(input).await,
-                &destination,
+                super::dispatch(sdk.turn_start(input), None).await,
             );
         }
         AgentEvent::TurnFinished(result) => {
@@ -134,7 +132,10 @@ async fn deliver(sdk: &agenthooksprotocol::Hooks, owner: Box<Session>, event: Ag
             let input = input
                 .with_sources()
                 .with_items(super::messages(&result.items));
-            super::settle(EventType::TurnEnd, sdk.turn_end(input).await, &destination);
+            super::settle(
+                EventType::TurnEnd,
+                super::dispatch(sdk.turn_end(input), None).await,
+            );
         }
         _ => {}
     }

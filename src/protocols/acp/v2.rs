@@ -373,7 +373,7 @@ impl<S: AcpSessionUpdateSink> AcpSessionUpdateSink for ResponseReplacementSink<S
 
 #[derive(Clone)]
 struct ResponseReplacementObserver<S> {
-    _hook_messages: Arc<crate::ahp::messages::Subscription>,
+    hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     sink: ResponseReplacementSink<S>,
     activity: SessionActivity,
@@ -402,10 +402,24 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
         session_id: wire::SessionId,
         activity: SessionActivity,
     ) -> Self {
-        let message_sink = sink.inner.clone();
-        let message_session = session_id.clone();
-        let hook_messages =
-            crate::ahp::messages::Subscription::new(session_id.to_string(), move |text| {
+        Self {
+            hook_messages: None,
+            inner,
+            sink,
+            activity,
+            session_id,
+        }
+    }
+
+    fn with_hook_messages(mut self, hooks: Option<&crate::ahp::Hooks>) -> Self {
+        let Some(hooks) = hooks else {
+            return self;
+        };
+        let message_sink = self.sink.inner.clone();
+        let message_session = self.session_id.clone();
+        self.hook_messages = Some(hooks.subscribe_messages(
+            self.session_id.to_string(),
+            move |text| {
                 static NEXT_MESSAGE: AtomicU64 = AtomicU64::new(1);
                 let sequence = NEXT_MESSAGE.fetch_add(1, Ordering::Relaxed);
                 message_sink
@@ -421,14 +435,9 @@ impl<S: AcpSessionUpdateSink + Clone> ResponseReplacementObserver<S> {
                         ),
                     ))
                     .is_ok()
-            });
-        Self {
-            _hook_messages: hook_messages,
-            inner,
-            sink,
-            activity,
-            session_id,
-        }
+            },
+        ));
+        self
     }
 }
 
@@ -993,7 +1002,8 @@ impl Server {
             sink.clone(),
             session_id.clone(),
             activity.clone(),
-        );
+        )
+        .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
             cwd,
             additional_directories,
@@ -2809,6 +2819,7 @@ mod tests {
         let (hooks, backend) = crate::ahp::test_support::hooks(vec![
             crate::ahp::test_support::intercept(&["context.compact.before"]),
         ]);
+        let observer = observer.with_hook_messages(Some(&hooks));
         backend.respond(
             "context.compact.before",
             json!([

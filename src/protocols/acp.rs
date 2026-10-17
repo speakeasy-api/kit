@@ -1099,7 +1099,7 @@ fn legacy_activity(
 
 #[derive(Clone)]
 struct ResponseInterruptionNoticeObserver {
-    _hook_messages: Arc<crate::ahp::messages::Subscription>,
+    hook_messages: Option<Arc<crate::ahp::messages::Subscription>>,
     inner: AcpIntegration,
     client: AcpClientHandle,
     activity: activity::SessionActivity,
@@ -1113,24 +1113,33 @@ impl ResponseInterruptionNoticeObserver {
         session_id: agentkit_acp::SessionId,
         activity: activity::SessionActivity,
     ) -> Self {
-        let message_client = client.clone();
-        let message_session = session_id.clone();
-        let hook_messages =
-            crate::ahp::messages::Subscription::new(session_id.to_string(), move |text| {
+        Self {
+            hook_messages: None,
+            activity,
+            inner,
+            client,
+            session_id,
+        }
+    }
+
+    fn with_hook_messages(mut self, hooks: Option<&crate::ahp::Hooks>) -> Self {
+        let Some(hooks) = hooks else {
+            return self;
+        };
+        let message_client = self.client.clone();
+        let message_session = self.session_id.clone();
+        self.hook_messages = Some(hooks.subscribe_messages(
+            self.session_id.to_string(),
+            move |text| {
                 message_client
                     .notify_session(SessionNotification::new(
                         message_session.clone(),
                         SessionUpdate::Notice(Notice::new(NoticeSeverity::Info, text)),
                     ))
                     .is_ok()
-            });
-        Self {
-            _hook_messages: hook_messages,
-            activity,
-            inner,
-            client,
-            session_id,
-        }
+            },
+        ));
+        self
     }
 }
 
@@ -1602,7 +1611,8 @@ impl Server {
             client,
             session_id.clone(),
             activity.clone(),
-        );
+        )
+        .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
             cwd,
             additional_directories,
@@ -5089,7 +5099,7 @@ pub(super) mod tests {
             .unwrap();
         let session_id = agentkit_acp::SessionId::new("v1-hook-message-test");
         let (client, mut messages) = AcpClientHandle::channel();
-        let _observer = ResponseInterruptionNoticeObserver::new(
+        let observer = ResponseInterruptionNoticeObserver::new(
             integration,
             client,
             session_id.clone(),
@@ -5098,6 +5108,7 @@ pub(super) mod tests {
         let (hooks, backend) = crate::ahp::test_support::hooks(vec![
             crate::ahp::test_support::intercept(&["context.compact.before"]),
         ]);
+        let _observer = observer.with_hook_messages(Some(&hooks));
         backend.respond(
             "context.compact.before",
             json!([{"type": "message", "text": "Compaction hook notice"}]),

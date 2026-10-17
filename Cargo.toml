@@ -36,7 +36,7 @@ tokio-tungstenite = { version = "=0.30.0", default-features = false, features = 
 a2a-protocol-client = { version = "=0.14.1", default-features = false, features = ["tls-rustls"] }
 a2a-protocol-server = { version = "=0.14.1", default-features = false }
 a2a-protocol-types = "=0.14.1"
-agenthooksprotocol = { version = "=0.8.0", default-features = false, features = ["reqwest", "tokio-process"] }
+agenthooksprotocol = { version = "=0.9.0", default-features = false, features = ["reqwest", "tokio-process"] }
 agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0", features = ["unstable_session_fork", "unstable_session_inject"] }
 agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.9.1", features = ["unstable_session_notices", "unstable_session_compaction"] }
 agent-client-protocol-http = { package = "agentkit-acp-http", version = "=2.2.0", default-features = false, features = ["server", "client"] }

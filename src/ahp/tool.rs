@@ -54,8 +54,7 @@ impl HookedTool {
         &self,
         mut request: ToolRequest,
         context: &ToolContext<'_>,
-        producer: &Result<super::injection::Producer, String>,
-        destination: &super::messages::Destination,
+        producer: Option<&super::injection::Producer>,
     ) -> Before {
         let validator = match self.validator() {
             Ok(validator) => validator,
@@ -84,19 +83,22 @@ impl HookedTool {
             Ok(boundary) => boundary,
             Err(error) => return Before::Return(denied(error.to_string())),
         };
-        let result = match &context.cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
-        };
+        let result = super::dispatch(boundary, context.cancellation.as_ref()).await;
         let outcome = match result {
             Ok(outcome) => outcome,
+            Err(agentkit_loop::LoopError::Cancelled) => {
+                return Before::Return(ToolExecutionOutcome::FailedBeforeInvocation(
+                    ToolError::Cancelled,
+                ));
+            }
             Err(error) => {
                 tracing::warn!(event = "tool.before", %error, "agent hook dispatch failed");
                 return Before::Return(denied(error.to_string()));
             }
         };
         super::report(EventType::ToolBefore, &outcome.diagnostics);
-        destination.deliver(&outcome.outcome.messages);
+        self.hooks
+            .deliver_messages(&request.session_id.to_string(), &outcome.outcome.messages);
         if outcome.outcome.is_denied() {
             return Before::Return(denied(super::denial(&outcome.outcome)));
         }
@@ -191,8 +193,7 @@ impl HookedTool {
         mut outcome: ToolExecutionOutcome,
         supplied: bool,
         context: &ToolContext<'_>,
-        producer: &Result<super::injection::Producer, String>,
-        destination: &super::messages::Destination,
+        producer: Option<&super::injection::Producer>,
     ) -> ToolExecutionOutcome {
         let execution = match &outcome {
             _ if supplied => ExecutionEventExecution::SkippedSuppliedResult(
@@ -270,20 +271,16 @@ impl HookedTool {
             Ok(event) => event,
             Err(error) => return blocked(error.to_string()),
         };
-        let original = event["items"].clone();
         let boundary = self.hooks.sdk.event_for(EventType::ToolAfter, event);
-        let result = match &context.cancellation {
-            Some(cancellation) => boundary.cancel_when(cancellation.cancelled()).await,
-            None => boundary.await,
-        };
-        if context
-            .cancellation
-            .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+        let result = super::dispatch(boundary, context.cancellation.as_ref()).await;
+        if matches!(&result, Err(agentkit_loop::LoopError::Cancelled)) {
             return ToolExecutionOutcome::Failed(ToolError::Cancelled);
         }
-        let edited = super::settle(EventType::ToolAfter, result, destination);
+        let edited = self.hooks.settle(
+            EventType::ToolAfter,
+            result,
+            &request.session_id.to_string(),
+        );
         if let Some(edited) = &edited
             && !edited.outcome.stopped
             && !edited.outcome.is_denied()
@@ -302,16 +299,12 @@ impl HookedTool {
         if edited.outcome.stopped || edited.outcome.is_denied() {
             return blocked("tool output blocked by tool.after hook".into());
         }
+        if !super::has_modification(&edited) {
+            return outcome;
+        }
         if let agenthooksprotocol::generated::Event::ToolAfter(event) = edited.event
             && let ToolExecutionOutcome::Completed(result) = &mut outcome
         {
-            let items = match serde_json::to_value(&event.items) {
-                Ok(items) => items,
-                Err(_) => return blocked("invalid tool.after output replacement".into()),
-            };
-            if items == original {
-                return outcome;
-            }
             // AHP output edits are messages, not an arbitrary native
             // ToolResult. Accept text bodies without granting authority over
             // call IDs, error status, duration, or other execution metadata.
@@ -390,18 +383,17 @@ impl Tool for HookedTool {
             .hooks
             .injections
             .producer(&request.session_id.to_string());
-        let destination = super::messages::capture(&request.session_id.to_string());
-        let request = match self.before(request, context, &producer, &destination).await {
+        let request = match self.before(request, context, producer.as_ref()).await {
             Before::Run(request) => request,
             Before::Supplied(request, outcome) => {
                 return self
-                    .after(&request, outcome, true, context, &producer, &destination)
+                    .after(&request, outcome, true, context, producer.as_ref())
                     .await;
             }
             Before::Return(outcome) => return outcome,
         };
         let outcome = self.tool.invoke_outcome(request.clone(), context).await;
-        self.after(&request, outcome, false, context, &producer, &destination)
+        self.after(&request, outcome, false, context, producer.as_ref())
             .await
     }
 }

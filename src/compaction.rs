@@ -992,24 +992,10 @@ mod tests {
             expected.push(input);
             let actual = driver.snapshot().transcript;
             assert_eq!(actual.len(), expected.len());
-            for (index, (actual, mut expected)) in actual.iter().zip(expected).enumerate() {
-                // The loop timestamps newly submitted input before mutators run.
-                // Denial must preserve every other field, including /compact.
-                if index == original_len {
-                    assert!(actual.created_at.is_some());
-                    expected.created_at = actual.created_at;
-                }
-                assert_eq!(actual.parts.len(), expected.parts.len(), "item {index}");
-                for (part_index, (actual, expected)) in
-                    actual.parts.iter().zip(&expected.parts).enumerate()
-                {
-                    assert!(
-                        actual == expected,
-                        "item {index}, part {part_index} changed"
-                    );
-                }
-                assert!(actual == &expected, "item {index} metadata changed");
-            }
+            // The loop timestamps newly submitted input before mutators run.
+            assert!(actual[original_len].created_at.is_some());
+            expected[original_len].created_at = actual[original_len].created_at;
+            assert_eq!(actual, expected);
             assert!(backend.events("context.compact.after").is_empty());
         }
     }

@@ -605,10 +605,10 @@ fn only_response_interceptors_require_buffering() {
 #[tokio::test]
 async fn hook_messages_reach_the_owning_session_without_entering_tool_output() {
     let (sender, receiver) = std::sync::mpsc::channel();
-    let _subscription = super::messages::Subscription::new("session".into(), move |text| {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
+    let _subscription = hooks.subscribe_messages("session".into(), move |text| {
         sender.send(text.to_owned()).is_ok()
     });
-    let (hooks, backend) = hooks(vec![intercept(&["tool.before", "tool.after"])]);
     backend.respond("tool.before", json!([{"type":"message", "text":"before"}]));
     backend.respond("tool.after", json!([{"type":"message", "text":"after"}]));
     assert_eq!(
