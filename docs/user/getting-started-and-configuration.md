@@ -94,23 +94,8 @@ Multi-workspace keys that require an explicit workspace header are not supported
 Use direct Anthropic model IDs with `--model`, not OpenRouter's
 `anthropic/…` IDs. Responses have a 16,384-token output limit. Leave
 `reasoning_effort` unset for the provider default, or select `low`, `medium`, or
-`high` for a model that supports extended thinking. Logout deletes the locally saved key; revoke it in Claude
-Console to disable it remotely. An environment key remains active after logout.
-
-#### Using Claude Max API credits
-
-Eligible Max subscribers can claim monthly API credits into a linked Console
-organization. Create the key in that organization to use the credits with Kit.
-Anthropic applies the credits automatically; Kit does not access your Claude
-subscription credentials or manage the credit balance.
-
-Anthropic currently lists $100 per billing cycle for Max 5x and $200 for Max 20x,
-claimable after seven days on an eligible plan. Credits expire each cycle and do
-not roll over. Requests can continue against purchased credits, auto-reload, or
-invoiced billing after the included credits run out. Check Console billing and
-workspace spend limits before use. See Anthropic's
-[eligibility and credit terms](https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans)
-for current details. Credits in Claude Console do not pay for OpenRouter usage.
+`high` for a model that supports extended thinking. Logout deletes the locally
+saved key; revoke it in Claude Console to disable it remotely. An environment key remains active after logout.
 
 ### OpenRouter API key and model
 

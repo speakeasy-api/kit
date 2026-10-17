@@ -167,9 +167,8 @@ OpenRouter and Speakeasy use the same login process. Run `kit auth login openrou
 
 For direct Anthropic API usage, run `kit auth login anthropic`, then select
 `--provider anthropic --model claude-sonnet-5-5`. Use a single-workspace Console
-API key; `ANTHROPIC_API_KEY` is also supported. Eligible Max subscribers can claim
-API credits into the Console organization that owns the key. See
-[Anthropic setup and credit billing](docs/user/getting-started-and-configuration.md#direct-anthropic-api).
+API key; `ANTHROPIC_API_KEY` is also supported. See
+[Anthropic setup](docs/user/getting-started-and-configuration.md#direct-anthropic-api).
 
 ### Coming from Claude Code or Codex
 
