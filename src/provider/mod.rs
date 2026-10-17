@@ -1,4 +1,8 @@
 mod adapter;
+pub(crate) mod anthropic_auth;
+
+#[doc(hidden)]
+pub use anthropic_auth::{AnthropicAuthCommand, execute_anthropic_auth};
 pub mod chatgpt;
 pub(crate) mod openai_auth;
 mod openrouter_auth;
@@ -140,6 +144,9 @@ pub fn execute_provider_logout(
     active_openrouter_key: Option<(&OpenRouterApiKey, OpenRouterApiKeySource)>,
 ) -> Result<String, String> {
     match provider {
+        ProviderKind::Anthropic => {
+            execute_anthropic_auth(AnthropicAuthCommand::Logout { local_only }, storage)
+        }
         ProviderKind::OpenAiSubscription => {
             execute_openai_auth(OpenAiAuthCommand::Logout { local_only }, storage)
         }

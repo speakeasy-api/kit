@@ -10,6 +10,10 @@ use agentkit_core::{
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
+use agentkit_provider_anthropic::{
+    AnthropicAdapter, AnthropicConfig, AnthropicSession, AnthropicTurn, OutputEffort,
+    ThinkingConfig,
+};
 use agentkit_provider_openrouter::{
     OpenRouterAdapter, OpenRouterConfig, OpenRouterProvider, OpenRouterRequestConfig,
     OpenRouterSession, OpenRouterTurn, ReasoningEffort as OpenRouterReasoningEffort,
@@ -35,6 +39,7 @@ const SPEAKEASY_AUTH_REQUIRED: &str =
 pub(crate) fn authentication_method_id(detail: &str) -> Option<&'static str> {
     [
         ("openai_auth_required:", "openai"),
+        ("anthropic_auth_required:", "anthropic"),
         ("openrouter_auth_required:", "openrouter"),
         ("speakeasy_auth_required:", "speakeasy"),
     ]
@@ -51,11 +56,18 @@ pub enum ProviderKind {
     OpenRouter,
     #[serde(rename = "speakeasy")]
     Speakeasy,
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 impl ValueEnum for ProviderKind {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::OpenAiSubscription, Self::OpenRouter, Self::Speakeasy]
+        &[
+            Self::OpenAiSubscription,
+            Self::OpenRouter,
+            Self::Speakeasy,
+            Self::Anthropic,
+        ]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -63,6 +75,7 @@ impl ValueEnum for ProviderKind {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
             Self::Speakeasy => "speakeasy",
+            Self::Anthropic => "anthropic",
         }))
     }
 }
@@ -75,6 +88,7 @@ impl std::str::FromStr for ProviderKind {
             "openai-subscription" => Ok(Self::OpenAiSubscription),
             "openrouter" => Ok(Self::OpenRouter),
             "speakeasy" => Ok(Self::Speakeasy),
+            "anthropic" => Ok(Self::Anthropic),
             _ => Err(format!("unknown model provider {value:?}")),
         }
     }
@@ -86,6 +100,7 @@ impl ProviderKind {
             Self::OpenAiSubscription => "openai-subscription",
             Self::OpenRouter => "openrouter",
             Self::Speakeasy => "speakeasy",
+            Self::Anthropic => "anthropic",
         }
     }
 }
@@ -488,6 +503,7 @@ pub enum KitAdapter {
     OpenAiSubscription(OpenAiSubscriptionAdapter),
     OpenRouter(OpenRouterKitAdapter),
     Speakeasy(Box<SpeakeasyKitAdapter>),
+    Anthropic(AnthropicAdapter),
 }
 
 #[derive(Clone)]
@@ -654,6 +670,18 @@ impl KitAdapter {
                     model,
                     context_window: Arc::new(tokio::sync::OnceCell::new()),
                 }))
+            }
+            ProviderKind::Anthropic => {
+                let credentials = super::anthropic_auth::credentials(&credential_storage)?
+                    .ok_or_else(|| "anthropic_auth_required: set ANTHROPIC_API_KEY or run `kit auth login anthropic` before using Anthropic".to_string())?;
+                let config = anthropic_config(credentials.api_key(), model, reasoning_effort)?;
+                AnthropicAdapter::new(config)
+                    .map(|adapter| {
+                        Self::Anthropic(adapter.with_resilience(
+                            crate::request_budget::RequestBudget::current().resilience(),
+                        ))
+                    })
+                    .map_err(|error| error.to_string())
             }
             ProviderKind::Speakeasy => {
                 let credentials = speakeasy_auth::load(&credential_storage)?
@@ -824,6 +852,10 @@ impl ModelAdapter for KitAdapter {
                     context_window,
                 }))
             }
+            Self::Anthropic(adapter) => adapter
+                .start_session(config)
+                .await
+                .map(KitSession::Anthropic),
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
@@ -844,6 +876,7 @@ impl ModelAdapter for KitAdapter {
             Self::OpenAiSubscription(_) => "openai-subscription",
             Self::OpenRouter(_) => "openrouter",
             Self::Speakeasy(_) => "speakeasy",
+            Self::Anthropic(_) => "anthropic",
         })
     }
 }
@@ -852,6 +885,7 @@ pub enum KitSession {
     OpenAiSubscription(OpenAiSubscriptionSession),
     OpenRouter(OpenRouterKitSession),
     Speakeasy(SpeakeasyKitSession),
+    Anthropic(AnthropicSession),
 }
 
 pub struct OpenRouterKitSession {
@@ -1116,6 +1150,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.set_retry_observer(observer),
             Self::OpenRouter(session) => session.inner.set_retry_observer(observer),
             Self::Speakeasy(session) => session.inner.set_retry_observer(observer),
+            Self::Anthropic(session) => session.set_retry_observer(observer),
         }
     }
 
@@ -1127,7 +1162,7 @@ impl ModelSession for KitSession {
         let request = if matches!(self, Self::OpenAiSubscription(_)) {
             request
         } else {
-            project_tool_output_images(request, false)?
+            project_tool_output_images(request, matches!(self, Self::Anthropic(_)))?
         };
         match self {
             Self::OpenAiSubscription(session) => session
@@ -1146,6 +1181,14 @@ impl ModelSession for KitSession {
                     next_media: 0,
                 })
                 .map(KitTurn::OpenRouter),
+            Self::Anthropic(session) => {
+                let request = project_anthropic_reasoning(request);
+                let context_window = session.model_name().and_then(anthropic_context_window);
+                session
+                    .begin_turn(request, cancellation)
+                    .await
+                    .map(|turn| KitTurn::Anthropic(Box::new(turn), context_window))
+            }
             Self::Speakeasy(session) => session
                 .inner
                 .begin_turn(request, cancellation)
@@ -1165,6 +1208,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.model_name(),
             Self::OpenRouter(session) => session.inner.model_name(),
             Self::Speakeasy(session) => session.inner.model_name(),
+            Self::Anthropic(session) => session.model_name(),
         }
     }
 
@@ -1173,6 +1217,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.provider_name(),
             Self::OpenRouter(session) => session.inner.provider_name(),
             Self::Speakeasy(_) => Some("speakeasy"),
+            Self::Anthropic(_) => Some("anthropic"),
         }
     }
 }
@@ -1181,6 +1226,7 @@ pub enum KitTurn {
     OpenAiSubscription(Box<OpenAiSubscriptionTurn>),
     OpenRouter(OpenRouterKitTurn),
     Speakeasy(OpenRouterKitTurn),
+    Anthropic(Box<AnthropicTurn>, Option<u64>),
 }
 
 pub struct OpenRouterKitTurn {
@@ -1195,6 +1241,7 @@ impl ModelTurn for KitTurn {
     fn on_cancelled(&mut self) {
         match self {
             Self::OpenAiSubscription(turn) => turn.on_cancelled(),
+            Self::Anthropic(turn, _) => turn.on_cancelled(),
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => turn.inner.on_cancelled(),
         }
     }
@@ -1205,6 +1252,13 @@ impl ModelTurn for KitTurn {
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         match self {
             Self::OpenAiSubscription(turn) => turn.next_event(cancellation).await,
+            Self::Anthropic(turn, context_window) => {
+                let mut event = turn.next_event(cancellation).await?;
+                if let Some(window) = context_window {
+                    stamp_context_window(&mut event, *window, "anthropic.context_length");
+                }
+                Ok(event)
+            }
             Self::OpenRouter(turn) | Self::Speakeasy(turn) => {
                 let mut event = turn.inner.next_event(cancellation).await?;
                 if let Some(ModelTurnEvent::Delta(delta)) = &mut event {
@@ -1491,7 +1545,139 @@ async fn model_catalog_with_openai(
             models: speakeasy,
             context_windows: speakeasy_windows,
         },
+        anthropic_model_group(current),
     ]
+}
+
+fn project_anthropic_reasoning(mut request: TurnRequest) -> TurnRequest {
+    // Project the outbound copy only. Foreign summaries lack the opaque proof
+    // required to replay Anthropic thinking and must never be sent unsigned.
+    for item in &mut request.transcript {
+        item.parts.retain(|part| match part {
+            Part::Reasoning(reasoning) => {
+                let key = if reasoning.redacted {
+                    "anthropic.redacted_data"
+                } else {
+                    "anthropic.thinking_signature"
+                };
+                reasoning
+                    .metadata
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            }
+            _ => true,
+        });
+    }
+    // The native encoder skips empty assistant items and merges adjacent users.
+    request
+}
+
+// Match a published alias or its eight-digit dated snapshot, not arbitrary suffixes.
+fn anthropic_model_matches(model: &str, alias: &str) -> bool {
+    model == alias
+        || model
+            .strip_prefix(alias)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+const ANTHROPIC_ADAPTIVE_MODELS: &[&str] = &[
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-haiku-5-5",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+];
+
+fn anthropic_config(
+    api_key: &str,
+    model: String,
+    effort: Option<ReasoningEffort>,
+) -> Result<AnthropicConfig, String> {
+    let mut config =
+        AnthropicConfig::new(api_key, model.clone(), 16384).map_err(|error| error.to_string())?;
+    let Some(effort) = effort else {
+        return Ok(config);
+    };
+    if ANTHROPIC_ADAPTIVE_MODELS
+        .iter()
+        .any(|alias| anthropic_model_matches(&model, alias))
+    {
+        config = config
+            .with_thinking(ThinkingConfig::Adaptive)
+            .with_output_effort(match effort {
+                ReasoningEffort::Low => OutputEffort::Low,
+                ReasoningEffort::Medium => OutputEffort::Medium,
+                ReasoningEffort::High => OutputEffort::High,
+            });
+    } else if [
+        "claude-haiku-4-5",
+        "claude-sonnet-4-5",
+        "claude-opus-4-5",
+        "claude-sonnet-4",
+        "claude-opus-4",
+        "claude-opus-4-1",
+        "claude-3-7-sonnet",
+    ]
+    .iter()
+    .any(|alias| anthropic_model_matches(&model, alias))
+    {
+        config = config.with_thinking(ThinkingConfig::Enabled {
+            budget_tokens: match effort {
+                ReasoningEffort::Low => 1024,
+                ReasoningEffort::Medium => 4096,
+                ReasoningEffort::High => 8192,
+            },
+        });
+    } else {
+        return Err(format!(
+            "reasoning effort is not configured for Anthropic model {model:?}; select default reasoning effort to use this model"
+        ));
+    }
+    Ok(config)
+}
+
+fn anthropic_context_window(model: &str) -> Option<u64> {
+    if ANTHROPIC_ADAPTIVE_MODELS
+        .iter()
+        .any(|alias| anthropic_model_matches(model, alias))
+    {
+        Some(1_000_000)
+    } else if anthropic_model_matches(model, "claude-haiku-4-5") {
+        Some(200_000)
+    } else {
+        None
+    }
+}
+
+fn anthropic_model_group(current: &ModelSelection) -> ModelGroup {
+    let mut models = [
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6",
+        "claude-haiku-4-5-20251001",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if current.provider == ProviderKind::Anthropic
+        && valid_model_id(&current.model)
+        && !models.contains(&current.model)
+    {
+        models.push(current.model.clone());
+    }
+    let context_windows = models
+        .iter()
+        .filter_map(|model| anthropic_context_window(model).map(|window| (model.clone(), window)))
+        .collect();
+    ModelGroup {
+        provider: ProviderKind::Anthropic,
+        models,
+        context_windows,
+    }
 }
 
 fn openrouter_fallback() -> Vec<String> {
@@ -1583,6 +1769,99 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
     clippy::disallowed_macros
 )]
 mod tests {
+    #[test]
+    fn anthropic_production_config_maps_only_known_reasoning_modes() {
+        use super::{OutputEffort, ReasoningEffort, ThinkingConfig, anthropic_config};
+        for model in super::ANTHROPIC_ADAPTIVE_MODELS {
+            for model in [model.to_string(), format!("{model}-20261001")] {
+                for effort in [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ] {
+                    let config = anthropic_config("test", model.clone(), Some(effort)).unwrap();
+                    assert!(matches!(config.thinking, Some(ThinkingConfig::Adaptive)));
+                    assert!(matches!(
+                        (effort, config.output_effort),
+                        (ReasoningEffort::Low, Some(OutputEffort::Low))
+                            | (ReasoningEffort::Medium, Some(OutputEffort::Medium))
+                            | (ReasoningEffort::High, Some(OutputEffort::High))
+                    ));
+                    assert_eq!(config.max_tokens, 16384);
+                    assert_eq!(super::anthropic_context_window(&model), Some(1_000_000));
+                }
+            }
+        }
+        for (effort, expected) in [
+            (ReasoningEffort::Low, 1024),
+            (ReasoningEffort::Medium, 4096),
+            (ReasoningEffort::High, 8192),
+        ] {
+            let config =
+                anthropic_config("test", "claude-haiku-4-5-20251001".into(), Some(effort)).unwrap();
+            assert!(
+                matches!(config.thinking, Some(ThinkingConfig::Enabled { budget_tokens }) if budget_tokens == expected)
+            );
+            assert!(config.output_effort.is_none());
+        }
+        assert_eq!(
+            super::anthropic_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        for model in [
+            "claude-future",
+            "claude-sonnet-5-5-custom",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ] {
+            let config = anthropic_config("test", model.into(), None).unwrap();
+            assert!(config.thinking.is_none());
+            assert!(config.output_effort.is_none());
+        }
+        for model in ["claude-future", "claude-sonnet-5-5-custom"] {
+            assert!(
+                anthropic_config("test", model.into(), Some(ReasoningEffort::High))
+                    .unwrap_err()
+                    .contains("default reasoning effort")
+            );
+            assert_eq!(super::anthropic_context_window(model), None);
+        }
+    }
+
+    #[test]
+    fn anthropic_selection_catalog_and_authentication() {
+        let selection = super::ModelSelection::from_id("anthropic:claude-sonnet-4-6").unwrap();
+        assert_eq!(selection.provider, super::ProviderKind::Anthropic);
+        assert_eq!(selection.id(), "anthropic:claude-sonnet-4-6");
+        assert_eq!(
+            super::authentication_method_id("anthropic_auth_required: missing key"),
+            Some("anthropic")
+        );
+        let group = super::anthropic_model_group(&selection);
+        assert!(group.models.contains(&selection.model));
+        assert_eq!(
+            &group.models[..3],
+            &["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"]
+        );
+        for model in &group.models[..3] {
+            assert_eq!(group.context_windows[model], 1_000_000);
+        }
+        assert_eq!(group.context_windows["claude-haiku-4-5-20251001"], 200_000);
+        assert_eq!(group.context_windows[&selection.model], 1_000_000);
+        let custom = super::ModelSelection::new(super::ProviderKind::Anthropic, "claude-future");
+        let group = super::anthropic_model_group(&custom);
+        assert!(group.models.contains(&custom.model));
+        assert!(!group.context_windows.contains_key(&custom.model));
+        assert_eq!(
+            serde_json::from_str::<super::ProviderKind>("\"anthropic\"").unwrap(),
+            super::ProviderKind::Anthropic
+        );
+        assert_eq!(
+            super::ProviderKind::default(),
+            super::ProviderKind::OpenAiSubscription
+        );
+    }
+
     #[test]
     fn model_switch_catalog_retains_only_reported_positive_windows() {
         let catalog = super::parse_discovered_models(&serde_json::json!({"data": [
@@ -1929,6 +2208,147 @@ mod tests {
             text,
             "Tool call ID: call_background is running in the background.\nNo independent work left? STOP."
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_uses_native_messages_api_and_context_metadata() {
+        use agentkit_loop::ModelTurn;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers_end = headers_end + 4;
+                let headers = std::str::from_utf8(&request[..headers_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= headers_end + content_length {
+                    break;
+                }
+            }
+            let response = json!({
+                "id": "msg_test", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn", "stop_sequence": null,
+                "usage": {"input_tokens": 4, "output_tokens": 1}
+            })
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let config = super::anthropic_config("test-api-key", "claude-sonnet-4-6".into(), None)
+            .unwrap()
+            .with_base_url(format!("http://{address}/v1/messages"))
+            .with_streaming(false);
+        let adapter = KitAdapter::Anthropic(
+            agentkit_provider_anthropic::AnthropicAdapter::new(config).unwrap(),
+        );
+        assert_eq!(adapter.provider_name(), Some("anthropic"));
+        let mut session = adapter
+            .start_session(SessionConfig::new("anthropic-contract"))
+            .await
+            .unwrap();
+        assert_eq!(session.provider_name(), Some("anthropic"));
+        let signed = agentkit_core::ReasoningPart::summary("genuine thinking").with_metadata(
+            MetadataMap::from_iter([(
+                "anthropic.thinking_signature".into(),
+                json!("signed-proof"),
+            )]),
+        );
+        let mut redacted = agentkit_core::ReasoningPart::summary("unused").with_metadata(
+            MetadataMap::from_iter([("anthropic.redacted_data".into(), json!("opaque-data"))]),
+        );
+        redacted.redacted = true;
+        let foreign = Part::Reasoning(agentkit_core::ReasoningPart::summary("foreign summary"));
+        let mut turn = session
+            .begin_turn(
+                TurnRequest {
+                    session_id: SessionId::new("anthropic-contract"),
+                    turn_id: TurnId::new("turn"),
+                    transcript: vec![
+                        Item::text(ItemKind::User, "hello"),
+                        Item::new(ItemKind::Assistant, vec![foreign.clone()]),
+                        Item::text(ItemKind::User, "continue"),
+                        Item::new(
+                            ItemKind::Assistant,
+                            vec![
+                                foreign,
+                                Part::Reasoning(signed),
+                                Part::Reasoning(redacted),
+                                Part::text("answer"),
+                            ],
+                        ),
+                        Item::text(ItemKind::User, "next"),
+                    ],
+                    available_tools: Vec::new(),
+                    cache: None,
+                    metadata: MetadataMap::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = turn.next_event(None).await.unwrap() {
+            events.push(event);
+        }
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                ModelTurnEvent::Finished(result) => Some(result),
+                _ => None,
+            })
+            .expect("Anthropic turn finishes");
+        assert_eq!(
+            result.usage.as_ref().unwrap().metadata["context_window"],
+            json!(1_000_000)
+        );
+        let request = server.join().unwrap();
+        let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+        let headers = headers.to_ascii_lowercase();
+        assert!(headers.starts_with("post /v1/messages "));
+        assert!(headers.contains("x-api-key: test-api-key"));
+        assert!(headers.contains("anthropic-version: 2023-06-01"));
+        assert!(!headers.contains("authorization:"));
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["max_tokens"], 16384);
+        assert_eq!(body["messages"][0]["role"], "user");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages.len(),
+            3,
+            "empty assistant is omitted and adjacent users merge"
+        );
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            messages[1]["content"],
+            json!([
+                {"type": "thinking", "thinking": "genuine thinking", "signature": "signed-proof"},
+                {"type": "redacted_thinking", "data": "opaque-data"},
+                {"type": "text", "text": "answer"}
+            ])
+        );
+        assert!(!body.to_string().contains("foreign summary"));
     }
 
     #[tokio::test]

@@ -596,7 +596,7 @@ tables, and quoted strings). Use --string to force literal string input.
 Root settings:
   root                              Working directory and project context
   model                             Default model ID
-  provider                          Model provider: openai-subscription, openrouter, speakeasy
+  provider                          Model provider: openai-subscription, openrouter, speakeasy, anthropic
   reasoning_effort                  Reasoning effort: low, medium, high; unset for provider default
   a2a                               A2A listener bind address (e.g. 127.0.0.1:7331)
   mcp_config                        MCP server configuration path
@@ -1282,6 +1282,7 @@ impl ValueEnum for AuthProvider {
             Self::Openrouter,
             Self::Speakeasy,
             Self::Typesafe,
+            Self::Anthropic,
         ]
     }
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -1290,6 +1291,7 @@ impl ValueEnum for AuthProvider {
             Self::Openrouter => "openrouter",
             Self::Speakeasy => "speakeasy",
             Self::Typesafe => "typesafe",
+            Self::Anthropic => "anthropic",
         }))
     }
 }
@@ -1616,6 +1618,7 @@ enum AuthProvider {
     Openrouter,
     Speakeasy,
     Typesafe,
+    Anthropic,
 }
 
 enum AuthAction {
@@ -1869,11 +1872,15 @@ async fn execute_auth(
         OpenRouter(kit::provider::OpenRouterAuthCommand),
         Speakeasy(kit::provider::SpeakeasyAuthCommand),
         TypeSafe(kit::provider::TypeSafeAuthCommand),
+        Anthropic(kit::provider::AnthropicAuthCommand),
         Logout(kit::ProviderKind, bool),
     }
     let command = match action {
         AuthAction::Login { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Login),
+            AuthProvider::Anthropic => {
+                Execution::Anthropic(kit::provider::AnthropicAuthCommand::Login)
+            }
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Login)
             }
@@ -1886,6 +1893,9 @@ async fn execute_auth(
         },
         AuthAction::Status { provider } => match provider {
             AuthProvider::Openai => Execution::OpenAi(kit::provider::OpenAiAuthCommand::Status),
+            AuthProvider::Anthropic => {
+                Execution::Anthropic(kit::provider::AnthropicAuthCommand::Status)
+            }
             AuthProvider::Openrouter => {
                 Execution::OpenRouter(kit::provider::OpenRouterAuthCommand::Status)
             }
@@ -1906,6 +1916,7 @@ async fn execute_auth(
             AuthProvider::Openrouter => {
                 Execution::Logout(kit::ProviderKind::OpenRouter, *local_only)
             }
+            AuthProvider::Anthropic => Execution::Logout(kit::ProviderKind::Anthropic, *local_only),
             AuthProvider::Speakeasy => Execution::Logout(kit::ProviderKind::Speakeasy, *local_only),
             AuthProvider::Typesafe => {
                 Execution::TypeSafe(kit::provider::TypeSafeAuthCommand::Logout {
@@ -1924,6 +1935,7 @@ async fn execute_auth(
                 .map(|(key, source)| (key, *source)),
         ),
         Execution::Speakeasy(command) => kit::provider::execute_speakeasy_auth(command, &storage),
+        Execution::Anthropic(command) => kit::provider::execute_anthropic_auth(command, &storage),
         Execution::TypeSafe(command) => kit::provider::execute_typesafe_auth(command, &storage),
         Execution::Logout(provider, local_only) => kit::provider::execute_provider_logout(
             provider,
@@ -3074,6 +3086,33 @@ mod tests {
     }
 
     #[test]
+    fn config_accepts_anthropic_without_changing_existing_provider_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for provider in [
+            "openai-subscription",
+            "openrouter",
+            "speakeasy",
+            "anthropic",
+        ] {
+            fs::write(
+                &path,
+                format!("provider = {provider:?}\nmodel = \"claude-sonnet-4-6\"\n"),
+            )
+            .unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(config.provider(None).as_str(), provider);
+        }
+        fs::write(&path, "provider = \"unknown\"\n").unwrap();
+        assert!(Config::load(&path).is_err());
+        fs::write(&path, "").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().provider(None),
+            kit::ProviderKind::OpenAiSubscription
+        );
+    }
+
+    #[test]
     fn config_file_supplies_defaults_and_cli_values_win() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -3897,7 +3936,7 @@ future_option = true
             assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
             for setting in [
                 "Default model ID",
-                "Model provider: openai-subscription, openrouter, speakeasy",
+                "Model provider: openai-subscription, openrouter, speakeasy, anthropic",
                 "Reasoning effort: low, medium, high; unset for provider default",
                 "A2A listener bind address (e.g. 127.0.0.1:7331)",
                 "Credential backend: memory, keychain, file",
@@ -4111,7 +4150,26 @@ future_option = true
 
     #[test]
     fn auth_commands_parse_without_runtime_arguments() {
+        assert!(
+            Cli::try_parse_from(["kit", "auth", "logout", "anthropic", "--local-only"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "kit",
+                "acp",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-4-6"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["kit", "auth", "login", "anthropic", "--api-key", "secret"])
+                .is_err()
+        );
         for action in ["login", "status", "logout"] {
+            assert!(Cli::try_parse_from(["kit", "auth", action, "anthropic"]).is_ok());
             assert!(Cli::try_parse_from(["kit", "auth", action, "typesafe"]).is_ok());
         }
         assert!(Cli::try_parse_from(["kit", "auth", "logout", "typesafe", "--local-only"]).is_ok());
@@ -4165,6 +4223,7 @@ future_option = true
             AuthProvider::Openrouter,
             AuthProvider::Speakeasy,
             AuthProvider::Typesafe,
+            AuthProvider::Anthropic,
         ] {
             let login = AuthAction::Login { provider };
             assert!(validate_auth_storage(&login, &CredentialStorage::Memory).is_err());

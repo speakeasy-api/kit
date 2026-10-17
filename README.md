@@ -38,7 +38,7 @@ Fewer model round trips repeat less context and complete more work in each reque
 - **Reusable subagents.** A subagent is a reusable value. You can continue, fork, inspect, and close a subagent. You can require JSON that matches a schema. You can also use Claude Code, Codex, Cursor, or Kit as the subagent harness over ACP.
 - **Open protocols.** Kit supports ACP v1 and v2 over stdio, HTTP/SSE, and WebSocket. Kit supports A2A v1 in both directions. It also supports MCP, Agent Skills, and Agent Plugin packages.
 - **Long sessions.** Kit synchronizes each append-only JSONL transcript item to disk before it accepts the item. It compacts context automatically at 80% of the context window. You can resume a session from `tui`, `prompt`, or any ACP client. Kit also uses crash-safe locks. It retries eligible `openai-subscription` failures for up to 24 hours.
-- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
+- **Model choice.** Kit supports ChatGPT subscriptions through native OAuth. It also supports the Anthropic API directly and models through OpenRouter and the Speakeasy AI Control Plane. Use `/model` to change the model during a session.
 - **Small runtime.** Kit has no permissions framework, sandbox, or web UI. The `--root` option sets the working directory. Kit is a runtime, not a security boundary. Run Kit inside a security boundary that you trust. See the [trust model](docs/user/security-limits-and-troubleshooting.md).
 
 ## Install
@@ -164,6 +164,12 @@ kit serve --root /path/to/project --remote-acp --no-a2a --no-stdio --http 0.0.0.
 ```
 
 OpenRouter and Speakeasy use the same login process. Run `kit auth login openrouter` or `kit auth login speakeasy`. Then add `--provider openrouter --model anthropic/claude-sonnet-5` to the Kit command that you run. Providers and MCP servers share one credential backend (`--credential-store keychain|file|memory`).
+
+For direct Anthropic API usage, run `kit auth login anthropic`, then select
+`--provider anthropic --model claude-sonnet-5-5`. Use a single-workspace Console
+API key; `ANTHROPIC_API_KEY` is also supported. Eligible Max subscribers can claim
+API credits into the Console organization that owns the key. See
+[Anthropic setup and credit billing](docs/user/getting-started-and-configuration.md#direct-anthropic-api).
 
 ### Coming from Claude Code or Codex
 

@@ -2100,6 +2100,7 @@ fn v2_config_options(
                 crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
+                crate::ProviderKind::Anthropic => "Anthropic",
             };
             let options = group
                 .models
@@ -6023,7 +6024,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.protocol_version, wire::ProtocolVersion::V2);
-        assert_eq!(response.auth_methods.len(), 3);
+        assert_eq!(response.auth_methods.len(), 4);
         assert!(matches!(
             &response.auth_methods[0],
             wire::AuthMethod::Terminal(method)
@@ -6056,7 +6057,13 @@ mod tests {
             provider != ProviderKind::OpenRouter
         });
         let method_ids = terminal_auth_method_ids(&methods);
-        assert_eq!(method_ids, ["openai", "speakeasy"]);
+        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        assert!(
+            terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == "anthropic"
+                    && method.provider == ProviderKind::Anthropic)
+        );
 
         let metadata_only = wire::ClientCapabilities::new().meta(serde_json::Map::from_iter([(
             "terminal-auth".into(),
