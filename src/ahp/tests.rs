@@ -67,13 +67,74 @@ async fn stdio_hooks_inherit_environment_with_explicit_overrides() {
     .unwrap();
     let hooks = Hooks::new(registration, options().unwrap()).unwrap();
     hooks
-        .session_start("environment-test", SessionStartInputTrigger::Startup)
+        .session_start("environment-test", SessionStartInputTrigger::Startup, None)
         .await;
     hooks.sdk.shutdown().await.unwrap();
     assert_eq!(
         std::fs::read_to_string(output).unwrap(),
         "1\nherdr-bin-sentinel\nconfigured-pane\nsocket-sentinel\nenvironment-sentinel\n",
     );
+}
+
+#[tokio::test]
+async fn registration_headers_reach_http_hook_requests() {
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use tokio::sync::mpsc;
+
+    let (sender, mut received) = mpsc::channel(1);
+    let app = Router::new()
+        .route(
+            "/hooks",
+            post(
+                |State(sender): State<mpsc::Sender<HeaderMap>>,
+                 headers: HeaderMap,
+                 Json(request): Json<Value>| async move {
+                    sender.send(headers).await.unwrap();
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"protocolVersion": "draft", "effects": []},
+                    }))
+                },
+            ),
+        )
+        .with_state(sender);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/hooks", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(CONFIG_FILE);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "protocolVersion": "draft",
+            "hooks": [{
+                "id": "dev.kit.headers",
+                "transport": {
+                    "type": "http",
+                    "url": endpoint,
+                    "headers": {
+                        "Authorization": "Bearer test-only-header",
+                        "X-Kit-Test": "configured-header",
+                    },
+                },
+                "subscriptions": [intercept(&["user.message.inbound"])],
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut options = options().unwrap();
+    options.backend.allow_loopback_http = true;
+    let hooks = Arc::new(Hooks::new(read(&path).unwrap().unwrap(), options).unwrap());
+    prompt(&hooks, &Model::default(), "hello").await;
+    let headers = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    assert_eq!(headers["authorization"], "Bearer test-only-header");
+    assert_eq!(headers["x-kit-test"], "configured-header");
 }
 
 #[test]
@@ -105,9 +166,11 @@ async fn every_lifecycle_event_reports_harness_identity() {
         .await;
     let items = [Item::text(ItemKind::User, "old")];
     hooks
-        .compact_before(&items, true, "instructions", None)
+        .compact_before("abc", &items, true, "instructions", None)
         .await;
-    hooks.compact_after(&items, "summary".into()).await;
+    hooks
+        .compact_after("abc", &items, "summary".into(), false)
+        .await;
 
     let input = agenthooksprotocol::inputs::ModelErrorInput::new(
         Box::new(agenthooksprotocol::ExecutionEventAttempt::new(
@@ -141,6 +204,9 @@ async fn every_lifecycle_event_reports_harness_identity() {
         let delivered = backend.events(event);
         assert!(!delivered.is_empty(), "missing {event}");
         for delivered in delivered {
+            assert!(delivered["id"].is_string(), "{event}");
+            assert!(delivered["time"].is_string(), "{event}");
+            assert_eq!(delivered["source"], SOURCE);
             assert_eq!(
                 delivered["harness"],
                 json!({
@@ -256,6 +322,7 @@ impl Tool for Echo {
         request: ToolRequest,
         _: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        tokio::task::yield_now().await;
         self.received.lock().unwrap().push(request.input.clone());
         let text = request.input["text"]
             .as_str()
@@ -264,7 +331,8 @@ impl Tool for Echo {
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
             ToolOutput::text(text),
-        )))
+        ))
+        .with_duration(std::time::Duration::from_millis(7)))
     }
 }
 
@@ -712,7 +780,7 @@ async fn compaction_hooks_supply_and_rewrite_the_summary() {
     let items = [Item::text(ItemKind::User, "old")];
 
     let before = hooks
-        .compact_before(&items, true, "instructions", None)
+        .compact_before("abc", &items, true, "instructions", None)
         .await;
     assert!(matches!(before, Some(Compaction::Summary(summary)) if summary == "supplied"));
 
@@ -721,7 +789,9 @@ async fn compaction_hooks_supply_and_rewrite_the_summary() {
         json!([{"type": "modify", "target": "summary", "operation": "replace", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "rewritten"}]}]),
     );
     assert_eq!(
-        hooks.compact_after(&items, "draft".into()).await,
+        hooks
+            .compact_after("abc", &items, "draft".into(), false)
+            .await,
         "rewritten"
     );
 }
@@ -997,5 +1067,590 @@ async fn retry_and_tool_continuation_are_one_turn_and_retirement_cancels_once() 
             backend.events("model.request.before").len(),
             if retire { 1 } else { 2 }
         );
+    }
+}
+
+#[derive(Clone)]
+struct MetadataModel;
+
+#[async_trait]
+impl ModelAdapter for MetadataModel {
+    type Session = Self;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        Ok(self.clone())
+    }
+}
+
+#[async_trait]
+impl ModelSession for MetadataModel {
+    type Turn = Reply;
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        _: Option<TurnCancellation>,
+    ) -> Result<Reply, LoopError> {
+        tokio::task::yield_now().await;
+        if request.session_id.to_string() == "failure" {
+            return Err(LoopError::ProviderFailure(Box::new(
+                agentkit_loop::ProviderFailure {
+                    route: agentkit_loop::ProviderRoute::OpenAiResponses,
+                    reason: agentkit_loop::ProviderFailureReason::RetryExhausted,
+                    last_attempt_reason: Some(agentkit_loop::ProviderFailureReason::HttpStatus),
+                    upstream: agentkit_loop::ProviderClassification {
+                        code: agentkit_loop::UpstreamErrorKind::RateLimitExceeded,
+                        http_status: Some(429),
+                        ..Default::default()
+                    },
+                    accounting: agentkit_loop::RetryAccounting {
+                        attempts: 2,
+                        ..Default::default()
+                    },
+                },
+            )));
+        }
+        Ok(Reply(Some(ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: vec![Item::text(ItemKind::Assistant, "done")],
+            usage: Some(
+                agentkit_core::Usage::new(
+                    agentkit_core::TokenUsage::new(12, 3)
+                        .with_cached_input_tokens(4)
+                        .with_cache_write_input_tokens(2)
+                        .with_reasoning_tokens(1),
+                )
+                .with_cost(agentkit_core::CostUsage::new(0.01, "USD")),
+            ),
+            metadata: MetadataMap::from([("secret".into(), json!("must-not-leak"))]),
+            model: Some("resolved-model".into()),
+            response_id: Some(format!("response-{}", request.session_id)),
+        })))
+    }
+    fn model_name(&self) -> Option<&str> {
+        Some("requested-model")
+    }
+    fn provider_name(&self) -> Option<&str> {
+        Some("provider")
+    }
+}
+
+#[tokio::test]
+async fn concurrent_model_payloads_keep_owned_context_usage_and_safe_parameters() {
+    let (mut hooks, backend) = hooks(vec![intercept(&["model.request.before"]), observe(&["*"])]);
+    Arc::get_mut(&mut hooks).unwrap().root = Some("/workspace".into());
+    let adapter = HookedAdapter::new(
+        MetadataModel,
+        Some(hooks.clone()),
+        SessionStartInputTrigger::Startup,
+    );
+    let run = |id: &'static str| {
+        let adapter = adapter.clone();
+        async move {
+            let mut session = adapter.start_session(SessionConfig::new(id)).await.unwrap();
+            let request = TurnRequest {
+                session_id: SessionId::new(id),
+                turn_id: TurnId::new(format!("turn-{id}")),
+                transcript: vec![Item::text(ItemKind::User, "hello")],
+                available_tools: vec![Echo::new().spec().clone()],
+                cache: Some(
+                    agentkit_loop::PromptCacheRequest::automatic().with_key("private-routing-key"),
+                ),
+                metadata: MetadataMap::from([("secret".into(), json!("must-not-leak"))]),
+            };
+            match session.begin_turn(request, None).await {
+                Ok(mut turn) => {
+                    turn.next_event(None).await.unwrap();
+                }
+                Err(error) => assert!(matches!(error, LoopError::ProviderFailure(_))),
+            }
+        }
+    };
+    tokio::join!(run("one"), run("two"), run("failure"));
+    for name in [
+        "model.request.before",
+        "model.response.after",
+        "model.error",
+    ] {
+        let events = backend.events(name);
+        assert!(!events.is_empty(), "missing {name}");
+        for event in events {
+            let session = event["session"]["id"].as_str().unwrap();
+            assert_eq!(event["turn"]["id"], format!("turn-{session}"));
+            assert_eq!(event["session"]["cwd"], "/workspace");
+            assert_eq!(event["session"]["workspaceRoots"], json!(["/workspace"]));
+            assert_eq!(event["attempt"]["synthesized"], true);
+            assert!(event["id"].is_string());
+            assert!(event["time"].is_string());
+            assert_eq!(event["source"], SOURCE);
+            assert!(event.get("parentEventId").is_none());
+            assert!(!event.to_string().contains("must-not-leak"));
+            assert!(!event.to_string().contains("private-routing-key"));
+            if name == "model.request.before" {
+                assert_eq!(event["params"]["dev.kit.tools"][0]["name"], "echo");
+                assert!(event["params"]["dev.kit.cache"].is_object());
+            } else {
+                assert!(event["latencyMs"].as_f64().unwrap() >= 0.0);
+            }
+            if name == "model.error" {
+                assert_eq!(event["error"]["code"], "rate_limit_exceeded");
+                assert_eq!(event["error"]["status"], 429);
+            }
+            if name == "model.response.after" {
+                assert_eq!(event["model"]["id"], "resolved-model");
+                assert_eq!(
+                    event["extensions"]["dev.kit.response"]["id"],
+                    format!("response-{session}")
+                );
+                assert_eq!(event["usage"]["inputTokens"], 12);
+                assert_eq!(event["usage"]["outputTokens"], 3);
+                assert_eq!(event["usage"]["cacheReadTokens"], 4);
+                assert_eq!(event["usage"]["cacheWriteTokens"], 2);
+                assert_eq!(event["usage"]["cost"]["basis"], "reported");
+                assert_eq!(event["usage"]["scope"], "attempt");
+            }
+        }
+    }
+    for event in backend.events("session.start") {
+        assert_eq!(event["session"]["model"], "requested-model");
+        assert!(event["manifest"].is_object());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_tools_keep_request_session_and_turn() {
+    let (hooks, backend) = hooks(vec![intercept(&["tool.before"]), observe(&["tool.after"])]);
+    let mut registry = ToolRegistry::new();
+    registry.register_arc(Echo::new());
+    let tool = hooked_tools(registry, &hooks)
+        .get(&ToolName::new("echo"))
+        .unwrap();
+    let run = |id: &'static str| {
+        let tool = tool.clone();
+        async move {
+            let context = OwnedToolContext {
+                session_id: SessionId::new(id),
+                turn_id: TurnId::new(format!("turn-{id}")),
+                metadata: MetadataMap::new(),
+                permissions: Arc::new(AllowAllPermissions),
+                resources: Arc::new(()),
+                cancellation: None,
+                execution_scope: None,
+                approved_request: None,
+            };
+            let request = ToolRequest::new(
+                format!("call-{id}"),
+                "echo",
+                json!({"text": id}),
+                context.session_id.clone(),
+                context.turn_id.clone(),
+            );
+            assert!(matches!(
+                tool.invoke_outcome(request, &mut context.borrowed()).await,
+                ToolExecutionOutcome::Completed(_)
+            ));
+        }
+    };
+    tokio::join!(run("one"), run("two"));
+    for name in ["tool.before", "tool.after"] {
+        let events = backend.events(name);
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let id = event["session"]["id"].as_str().unwrap();
+            assert_eq!(event["turn"]["id"], format!("turn-{id}"));
+            assert_eq!(event["call"]["id"], format!("call-{id}"));
+            assert_eq!(event["tool"]["input"]["text"], id);
+            assert!(event["tool"].get("mcp").is_none());
+            if name == "tool.after" {
+                assert_eq!(event["durationMs"], 7.0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_request_preserves_content_types_and_tool_correlations() {
+    let mut subscription = intercept(&["model.request.before"]);
+    // An in-process test backend has no receiver upload endpoint. Real binary
+    // bodies follow the SDK's registered upload plan; metadata needs no upload.
+    subscription["content"]["media"] = json!("metadata");
+    let (hooks, backend) = hooks(vec![subscription]);
+    let adapter = HookedAdapter::new(
+        Model::default(),
+        Some(hooks),
+        SessionStartInputTrigger::Startup,
+    );
+    let mut session = adapter
+        .start_session(SessionConfig::new("content"))
+        .await
+        .unwrap();
+    let mut item = Item::text(ItemKind::User, "hello");
+    item.parts.extend([
+        Part::Structured(agentkit_core::StructuredPart::new(json!({"answer": 42}))),
+        Part::ToolCall(agentkit_core::ToolCallPart::new(
+            "call-id",
+            "echo",
+            json!({"text": "hi"}),
+        )),
+        Part::ToolResult(ToolResultPart::success("call-id", ToolOutput::text("hi"))),
+        Part::Reasoning(agentkit_core::ReasoningPart::summary("readable summary")),
+        Part::Media(agentkit_core::MediaPart::new(
+            Modality::Image,
+            "image/png",
+            DataRef::inline_bytes(vec![1, 2, 3]),
+        )),
+        Part::File(agentkit_core::FilePart::named(
+            "example.txt",
+            DataRef::uri("https://example.com/file"),
+        )),
+        Part::Custom(agentkit_core::CustomPart::new("widget").with_value(json!({"widget": true}))),
+    ]);
+    session
+        .begin_turn(
+            TurnRequest {
+                session_id: SessionId::new("content"),
+                turn_id: TurnId::new("turn"),
+                transcript: vec![item],
+                available_tools: vec![],
+                cache: None,
+                metadata: MetadataMap::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let events = backend.events("model.request.before");
+    assert_eq!(events.len(), 1);
+    let parts = events[0]["items"][0]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 10);
+    assert_eq!(parts[1]["category"], "structured");
+    assert_eq!(
+        serde_json::from_str::<Value>(parts[1]["text"].as_str().unwrap()).unwrap(),
+        json!({"answer":42})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(parts[2]["text"].as_str().unwrap()).unwrap()["callId"],
+        "call-id"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(parts[4]["text"].as_str().unwrap()).unwrap()["callId"],
+        "call-id"
+    );
+    assert_eq!(parts[5]["category"], "reasoning");
+    assert_eq!(parts[6]["kind"], "attachment");
+    assert_eq!(parts[6]["mediaType"], "image/png");
+    assert_eq!(parts[8]["text"], "example.txt");
+    assert_eq!(parts[9]["category"], "custom");
+    assert!(parts.iter().all(|part| part["synthesized"] == true));
+}
+
+#[tokio::test]
+async fn turn_end_reports_usage_and_last_assistant_without_invented_continuations() {
+    let (hooks, backend) = hooks(vec![observe(&["turn.end"])]);
+    let mut driver = Agent::builder()
+        .model(HookedAdapter::new(
+            MetadataModel,
+            Some(hooks.clone()),
+            SessionStartInputTrigger::Startup,
+        ))
+        .observer(TurnHook(hooks.clone()))
+        .input(vec![Item::text(ItemKind::User, "hello")])
+        .build()
+        .unwrap()
+        .start(SessionConfig::new("usage"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        driver.next().await.unwrap(),
+        LoopStep::Finished(_)
+    ));
+    hooks.drain_turn_events("usage").await;
+    let events = backend.events("turn.end");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["usage"]["kind"], "total");
+    assert_eq!(events[0]["usage"]["scope"], "turn");
+    assert_eq!(events[0]["usage"]["inputTokens"], 12);
+    assert_eq!(events[0]["usage"]["cost"]["currency"], "USD");
+    assert_eq!(
+        events[0]["extensions"]["dev.kit.usage"]["reasoningTokens"],
+        1
+    );
+    assert_eq!(
+        events[0]["lastAssistantItem"]["id"],
+        events[0]["items"][0]["id"]
+    );
+    assert_eq!(events[0]["continuationCount"], 0);
+}
+
+#[tokio::test]
+async fn metadata_selection_does_not_leak_normalized_structured_content() {
+    let mut subscription = intercept(&["model.request.before"]);
+    subscription["content"]["default"] = json!("metadata");
+    let (hooks, backend) = hooks(vec![subscription]);
+    let adapter = HookedAdapter::new(
+        Model::default(),
+        Some(hooks),
+        SessionStartInputTrigger::Startup,
+    );
+    let mut session = adapter
+        .start_session(SessionConfig::new("metadata"))
+        .await
+        .unwrap();
+    let mut item = Item::text(ItemKind::User, "private text");
+    item.parts
+        .push(Part::Structured(agentkit_core::StructuredPart::new(
+            json!({"secret": "private value"}),
+        )));
+    item.parts
+        .push(Part::ToolCall(agentkit_core::ToolCallPart::new(
+            "call",
+            "echo",
+            json!({"text": "private argument"}),
+        )));
+    session
+        .begin_turn(
+            TurnRequest {
+                session_id: SessionId::new("metadata"),
+                turn_id: TurnId::new("turn"),
+                transcript: vec![item],
+                available_tools: vec![],
+                cache: None,
+                metadata: MetadataMap::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let events = backend.events("model.request.before");
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].to_string().contains("private"));
+    assert!(
+        events[0]["items"][0]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|part| part["selection"] == "metadata" && part.get("text").is_none())
+    );
+}
+
+#[derive(Clone)]
+struct StreamUsageModel(bool);
+#[async_trait]
+impl ModelAdapter for StreamUsageModel {
+    type Session = Self;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        Ok(self.clone())
+    }
+}
+#[async_trait]
+impl ModelSession for StreamUsageModel {
+    type Turn = ToolRoundReply;
+    async fn begin_turn(
+        &mut self,
+        _: TurnRequest,
+        _: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        let mut events = std::collections::VecDeque::from([ModelTurnEvent::Usage(
+            agentkit_core::Usage::new(agentkit_core::TokenUsage::new(99, 99)),
+        )]);
+        if self.0 {
+            events.push_back(ModelTurnEvent::ResponseAttemptSuperseded);
+        } else {
+            events.push_back(ModelTurnEvent::Usage(agentkit_core::Usage::new(
+                agentkit_core::TokenUsage::new(12, 3),
+            )));
+        }
+        events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
+            finish_reason: FinishReason::Completed,
+            output_items: vec![],
+            usage: (!self.0).then(|| {
+                agentkit_core::Usage::default().with_cost(agentkit_core::CostUsage::new(0.5, "USD"))
+            }),
+            metadata: MetadataMap::new(),
+            model: None,
+            response_id: None,
+        }));
+        Ok(ToolRoundReply(events))
+    }
+}
+
+#[tokio::test]
+async fn model_response_merges_latest_streamed_usage_and_discards_superseded_usage() {
+    for superseded in [false, true] {
+        let (hooks, backend) = hooks(vec![observe(&["model.response.after"])]);
+        let adapter = HookedAdapter::new(
+            StreamUsageModel(superseded),
+            Some(hooks),
+            SessionStartInputTrigger::Startup,
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("stream"))
+            .await
+            .unwrap();
+        let mut turn = session
+            .begin_turn(
+                TurnRequest {
+                    session_id: SessionId::new("stream"),
+                    turn_id: TurnId::new("turn"),
+                    transcript: vec![],
+                    available_tools: vec![],
+                    cache: None,
+                    metadata: MetadataMap::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        while turn.next_event(None).await.unwrap().is_some() {}
+        let events = backend.events("model.response.after");
+        assert_eq!(events.len(), 1);
+        if superseded {
+            assert!(events[0].get("usage").is_none());
+        } else {
+            assert_eq!(events[0]["usage"]["inputTokens"], 12);
+            assert_eq!(events[0]["usage"]["outputTokens"], 3);
+            assert_eq!(events[0]["usage"]["cost"]["amount"], 0.5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn prompt_text_edits_do_not_copy_descriptors_into_model_text() {
+    for edited in ["original", "edited"] {
+        let (hooks, backend) = hooks(vec![intercept(&["user.message.inbound"])]);
+        let image = Part::media(
+            Modality::Image,
+            "image/png",
+            DataRef::inline_text("data:image/png;base64,aW1hZ2U="),
+        );
+        let file = Part::File(agentkit_core::FilePart::named(
+            "private-filename.txt",
+            DataRef::uri("https://example.com/private-file"),
+        ));
+        let mut replacement = text_message(edited);
+        for (index, part) in [&image, &file].into_iter().enumerate() {
+            for descriptor in content_parts(&format!("input/{index}"), part) {
+                let agenthooksprotocol::inputs::PartInput::Text(body) = descriptor else {
+                    panic!("expected reference descriptor");
+                };
+                replacement[0]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::to_value(body).unwrap());
+            }
+        }
+        backend.respond(
+            "user.message.inbound",
+            json!([{"type":"modify", "target":"prompt", "operation":"replace", "value":replacement}]),
+        );
+        let model = Model::default();
+        let input = Item::new(
+            ItemKind::User,
+            vec![Part::text("original"), image.clone(), file.clone()],
+        );
+        let (_, persisted) = admit(&hooks, &model, vec![input]).await;
+        let prompt = persisted
+            .iter()
+            .find(|item| item.kind == ItemKind::User)
+            .unwrap();
+        assert_eq!(prompt.parts, vec![Part::text(edited), image, file]);
+        assert_eq!(
+            last_user_text(&model.requests.lock().unwrap()[0]).as_deref(),
+            Some(edited)
+        );
+    }
+}
+
+#[tokio::test]
+async fn media_and_file_descriptors_obey_owning_category_selection() {
+    for category in ["media", "file"] {
+        for selection in ["omit", "metadata", "body"] {
+            let mut subscription = intercept(&["model.request.before"]);
+            subscription["content"]["default"] = json!("body");
+            subscription["content"][category] = json!(selection);
+            let (hooks, backend) = hooks(vec![subscription]);
+            let adapter = HookedAdapter::new(
+                Model::default(),
+                Some(hooks),
+                SessionStartInputTrigger::Startup,
+            );
+            let mut session = adapter
+                .start_session(SessionConfig::new("descriptors"))
+                .await
+                .unwrap();
+            let mut item = Item::text(ItemKind::User, "public text");
+            for owner in ["media", "file"] {
+                for (mime_type, data) in [
+                    (
+                        "image/png",
+                        DataRef::uri(format!("https://example.com/{owner}-private")),
+                    ),
+                    (
+                        "image/png",
+                        DataRef::inline_text(format!("{owner}-private-base64")),
+                    ),
+                    (
+                        "image/png",
+                        DataRef::inline_text(format!("data:image/png;base64,{owner}-private")),
+                    ),
+                    (
+                        "text/plain",
+                        DataRef::inline_bytes(format!("{owner}-private-text").into_bytes()),
+                    ),
+                ] {
+                    item.parts.push(if owner == "media" {
+                        Part::media(Modality::Image, mime_type, data)
+                    } else {
+                        Part::File(
+                            agentkit_core::FilePart::named("file-private-name.txt", data)
+                                .with_mime_type(mime_type),
+                        )
+                    });
+                }
+            }
+            session
+                .begin_turn(
+                    TurnRequest {
+                        session_id: SessionId::new("descriptors"),
+                        turn_id: TurnId::new("turn"),
+                        transcript: vec![item],
+                        available_tools: vec![],
+                        cache: None,
+                        metadata: MetadataMap::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let events = backend.events("model.request.before");
+            assert_eq!(events.len(), 1);
+            let parts = events[0]["items"][0]["parts"].as_array().unwrap();
+            let selected: Vec<_> = parts
+                .iter()
+                .filter(|part| part["category"] == category)
+                .collect();
+            assert_eq!(selected.len(), if category == "media" { 4 } else { 8 });
+            assert!(selected.iter().all(|part| part["selection"] == selection));
+            if selection != "body" {
+                assert!(selected.iter().all(|part| part.get("text").is_none()));
+                assert!(
+                    !events[0]
+                        .to_string()
+                        .contains(&format!("{category}-private"))
+                );
+            } else {
+                assert!(
+                    events[0]
+                        .to_string()
+                        .contains(&format!("{category}-private"))
+                );
+            }
+            let other = if category == "media" { "file" } else { "media" };
+            assert!(events[0].to_string().contains(&format!("{other}-private")));
+            assert!(
+                parts.iter().all(|part| matches!(
+                    part["category"].as_str(),
+                    Some("text" | "media" | "file")
+                ))
+            );
+        }
     }
 }
