@@ -313,6 +313,9 @@ impl Tool for Echo {
                 "offline".into(),
             ));
         }
+        if request.input["text"] == "cancelled" {
+            return ToolExecutionOutcome::Failed(ToolError::Cancelled);
+        }
         match self.invoke(request, context).await {
             Ok(result) => ToolExecutionOutcome::Completed(result),
             Err(error) => ToolExecutionOutcome::Failed(error),
@@ -332,7 +335,11 @@ impl Tool for Echo {
             .to_owned();
         Ok(ToolResult::new(ToolResultPart::success(
             request.call_id,
-            ToolOutput::text(text),
+            if text == "oversized-binary" {
+                oversized_binary_output()
+            } else {
+                ToolOutput::text(text)
+            },
         ))
         .with_duration(std::time::Duration::from_millis(7)))
     }
@@ -677,6 +684,66 @@ async fn failed_tools_can_inject_recovery_context_without_becoming_successful() 
         super::part_text(&items[0].parts[0]).as_deref(),
         Some("recovery context")
     );
+}
+
+fn oversized_binary_output() -> ToolOutput {
+    ToolOutput::Parts(vec![Part::Media(agentkit_core::MediaPart::new(
+        Modality::Image,
+        "image/png",
+        DataRef::inline_bytes(vec![42; 4 * 1024 * 1024 + 1]),
+    ))])
+}
+
+#[tokio::test]
+async fn tool_after_observer_preparation_failure_preserves_native_binary_output() {
+    let (hooks, backend) = hooks(vec![observe(&["tool.after"])]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _subscription = hooks.subscribe_messages("session".into(), move |text| {
+        sender.send(text.to_owned()).is_ok()
+    });
+    let echo = Echo::new();
+    let outcome = call(&hooks, &echo, json!({"text": "oversized-binary"})).await;
+    let ToolExecutionOutcome::Completed(result) = outcome else {
+        panic!("observer preparation failure replaced the native result");
+    };
+    assert_eq!(result.result.output, oversized_binary_output());
+    assert_eq!(result.result.call_id, ToolCallId::new("call"));
+    assert!(!result.result.is_error);
+    assert_eq!(result.duration, Some(std::time::Duration::from_millis(7)));
+    assert_eq!(echo.received.lock().unwrap().len(), 1);
+    assert!(backend.events("tool.after").is_empty());
+    assert_eq!(
+        receiver.try_iter().collect::<Vec<_>>(),
+        ["tool.after hook dispatch failed (Preparation)"]
+    );
+}
+
+#[tokio::test]
+async fn tool_after_interceptor_preparation_failure_withholds_native_binary_output() {
+    for subscriptions in [
+        vec![intercept(&["tool.after"])],
+        vec![observe(&["tool.after"]), intercept(&["tool.after"])],
+    ] {
+        let (hooks, backend) = hooks(subscriptions);
+        let outcome = call(&hooks, &Echo::new(), json!({"text": "oversized-binary"})).await;
+        assert!(matches!(&outcome, ToolExecutionOutcome::Failed(_)));
+        assert_eq!(
+            denial_message(outcome),
+            "tool.after hook dispatch failed (Preparation)"
+        );
+        assert!(backend.events("tool.after").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn tool_after_preserves_native_cancellation() {
+    for subscription in [observe(&["tool.after"]), intercept(&["tool.after"])] {
+        let (hooks, _) = hooks(vec![subscription]);
+        assert!(matches!(
+            call(&hooks, &Echo::new(), json!({"text": "cancelled"})).await,
+            ToolExecutionOutcome::Failed(ToolError::Cancelled)
+        ));
+    }
 }
 
 #[tokio::test]

@@ -85,6 +85,14 @@ hook does not also allow goes through Kit's permission policy again.
 return a permission error. Blocking takes precedence over replacement but
 cannot undo side effects; use `tool.before` to prevent execution.
 
+When `tool.after` has no intercept subscriptions, preparation or dispatch
+failures preserve the tool result and emit a diagnostic through the session's
+hook-message channel (or stderr when no subscriber is attached). Diagnostics
+include the SDK failure classification, not raw backend errors or tool output.
+If any `tool.after` interceptor is registered, a dispatch failure still withholds
+a completed result, even if a subscription filter might have excluded that call.
+Native failures and cancellation remain failures and cancellation.
+
 Tool events cover the tools that compose scripts call, such as `shell`, `edit`,
 `read_file` and the MCP `tool` dispatcher. Kit projects text, structured data,
 tool calls and tool results into categorized message parts. Tool-call IDs and
