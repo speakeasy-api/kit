@@ -24,7 +24,7 @@ Higher-precedence JSON entries override same-named plugin servers. Kit reloads e
 
 ## MCP JSON configuration
 
-The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields, mixed `command`/`url` transports, and mismatched transport types are invalid. The optional `type` is `stdio` for a command server and `streamable-http` or `http` for a URL server; legacy entries without `type` remain valid. Kit validates every named layer before changing runtime state, then reloads them before each `tool_search` and `auth` call so live sessions see added, changed, and removed servers—and restored lower layers—without a restart. An invalid edit makes the current call fail but retains the last valid combined configuration so it becomes usable again when the file is repaired. Every configured server begins connecting in the background when Kit starts, using stored credentials only; interactive OAuth is never started implicitly. Each `tool_search` call waits for servers that are still initializing—including servers just added by a reload—before searching, so results always reflect a settled configuration. Give every server a specific `description`: it appears in listings and search results, and it is how an agent recognizes a server that still needs authentication. Use the exact query `mcp` (case-insensitive) for a compact configured-server status list. If the response cap omits tail entries, `total_servers`, `returned_servers`, and `truncated` report the omission.
+The top-level key is `mcpServers`; each key beneath it is the server name shown by `tool_search` and accepted by `auth`. The JSON schema is strict: unknown fields, mixed `command`/`url` transports, and mismatched transport types are invalid. The optional `type` is `stdio` for a command server and `streamable-http` or `http` for a URL server; legacy entries without `type` remain valid. Kit validates every named layer before changing runtime state, then reloads them before each `tool_search` and `auth` call so live sessions see added, changed, and removed servers—and restored lower layers—without a restart. An invalid edit makes the current call fail but retains the last valid combined configuration so it becomes usable again when the file is repaired. Every configured server begins connecting in the background when Kit starts, using stored or provisioned machine credentials; interactive OAuth is never started implicitly. Each `tool_search` call waits for servers that are still initializing—including servers just added by a reload—before searching, so results always reflect a settled configuration. Give every server a specific `description`: it appears in listings and search results, and it is how an agent recognizes a server that still needs authentication. Use the exact query `mcp` (case-insensitive) for a compact configured-server status list. If the response cap omits tail entries, `total_servers`, `returned_servers`, and `truncated` report the omission.
 
 ```json
 {
@@ -108,6 +108,75 @@ An explicit `auth` block is an optional fallback or override. Set `auth.type` to
   }
 }
 ```
+
+
+## Machine OAuth credentials
+
+For unattended services, provision a credential file **before Kit starts**, then use
+`auth.type: "client_credentials"`. Kit does not register a client, expose a bootstrap
+API, open a browser, or fall back to interactive OAuth when this mode fails.
+Existing `oauth`, `bearerToken`, and explicit header configurations remain supported;
+do not combine them with machine authentication on one server.
+
+```json
+{
+  "mcpServers": {
+    "service": {
+      "type": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "auth": {
+        "type": "client_credentials",
+        "client_id": "kit-service",
+        "scopes": ["tools:read"],
+        "resource": "https://mcp.example.com/mcp",
+        "expected_issuer": "https://identity.example.com",
+        "method": {
+          "type": "client_secret",
+          "client_secret_file": "/run/secrets/mcp-client-secret"
+        }
+      }
+    }
+  }
+}
+```
+
+Alternatively, replace `method` with:
+
+```json
+{
+  "type": "private_key_jwt",
+  "private_key_file": "/run/secrets/mcp-private-key.pem",
+  "signing_algorithm": "RS256",
+  "token_endpoint_audience": "https://identity.example.com/oauth/token"
+}
+```
+
+`client_id`, `resource`, `expected_issuer`, and `method` are required. `scopes`
+defaults to an empty array. `signing_algorithm` defaults to `RS256`; supported values
+are `RS256`, `RS384`, `RS512`, `ES256`, and `ES384`. Omit
+`token_endpoint_audience` to use the discovered issuer as the JWT audience.
+Credential paths must be absolute. Secret files contain UTF-8 text (trailing CR/LF
+is removed); private-key files contain an RSA or EC PEM key. Files must be regular,
+nonempty, and at most 64 KiB. Inline secrets and unknown configuration fields are
+rejected. Restrict file access to the service account; do not put credential
+contents in prompts, ACP requests, or logs.
+
+The MCP URL, resource, and expected issuer must use HTTPS without embedded
+credentials or fragments. Discovery must return the exact configured issuer;
+the token endpoint must share that issuer's HTTPS origin. Discovery uses rmcp's
+existing HTTP policy, and token exchanges do not follow redirects. These checks
+run before credential files are read or credentials are sent to the issuer.
+
+Machine tokens are cached only in their owning runtime session, separately from
+interactive OAuth's persisted credentials. Before a tool call, an expired or
+nearly expired token is reacquired with `client_credentials`; a bearer challenge
+on a tool call uses the same serialized renewal path and bounded replay handling.
+Kit never uses a refresh token in this mode. Each acquisition reopens the file,
+so atomically replacing its contents rotates credentials at the next acquisition
+without restarting Kit. A still-valid access token remains usable until renewal.
+Missing or invalid replacement credentials fail closed, without switching methods
+or starting interactive authorization.
+
 
 ## Discover, authenticate, and call MCP tools
 

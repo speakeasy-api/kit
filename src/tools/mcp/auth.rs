@@ -17,9 +17,7 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
-    #[serde(rename = "type")]
-    _kind: Kind,
+pub struct InteractiveConfig {
     #[serde(rename = "clientId")]
     client_id: Option<String>,
     #[serde(rename = "clientMetadataUrl")]
@@ -29,18 +27,37 @@ pub struct Config {
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Kind {
-    Oauth,
+#[serde(tag = "type")]
+pub enum Config {
+    #[serde(rename = "oauth")]
+    Oauth(InteractiveConfig),
+    #[serde(rename = "client_credentials")]
+    Machine(super::machine::Config),
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            _kind: Kind::Oauth,
+        Self::Oauth(InteractiveConfig {
             client_id: None,
             client_metadata_url: None,
             scopes: Vec::new(),
+        })
+    }
+}
+
+impl Config {
+    pub fn machine(&self) -> Option<&super::machine::Config> {
+        match self {
+            Self::Machine(config) => Some(config),
+            Self::Oauth(_) => None,
+        }
+    }
+    fn interactive(&self) -> Result<&InteractiveConfig, String> {
+        match self {
+            Self::Oauth(config) => Ok(config),
+            Self::Machine(_) => {
+                Err("machine MCP authentication does not support interactive authorization".into())
+            }
         }
     }
 }
@@ -58,13 +75,15 @@ pub async fn begin(
     required_scope: Option<&str>,
     www_authenticate: Option<&str>,
 ) -> Result<PendingAuthorization, String> {
+    config.interactive()?;
     let migration_lock = credential_storage
         .lock_refresh()
         .await
         .map_err(|error| format!("could not lock MCP credential migration: {error}"))?;
-    migrate_credentials(resource_url, config, credential_storage).await?;
+    migrate_credentials(resource_url, config.interactive()?, credential_storage).await?;
     drop(migration_lock);
-    let mut manager = manager(resource_url, config, credential_storage).await?;
+    let mut manager = manager(resource_url, config.interactive()?, credential_storage).await?;
+    let config = config.interactive()?;
     let metadata = manager
         .resolve_metadata_from_challenge(www_authenticate)
         .await
@@ -124,6 +143,12 @@ pub async fn restore(
     config: &Config,
     credential_storage: &CredentialStorage,
 ) -> Result<Option<(String, AuthorizationManager)>, String> {
+    if let Some(machine) = config.machine() {
+        return super::machine::authenticate(resource_url, machine)
+            .await
+            .map(Some);
+    }
+    config.interactive()?;
     if !credential_storage.is_persistent() {
         return Ok(None);
     }
@@ -131,8 +156,8 @@ pub async fn restore(
         .lock_refresh()
         .await
         .map_err(|error| format!("could not lock MCP credential refresh: {error}"))?;
-    migrate_credentials(resource_url, config, credential_storage).await?;
-    let mut manager = manager(resource_url, config, credential_storage).await?;
+    migrate_credentials(resource_url, config.interactive()?, credential_storage).await?;
+    let mut manager = manager(resource_url, config.interactive()?, credential_storage).await?;
     if !manager
         .initialize_from_store()
         .await
@@ -168,7 +193,7 @@ pub async fn refresh(
 
 async fn manager(
     resource_url: &str,
-    config: &Config,
+    config: &InteractiveConfig,
     credential_storage: &CredentialStorage,
 ) -> Result<AuthorizationManager, String> {
     let mut manager = AuthorizationManager::new(resource_url)
@@ -184,7 +209,7 @@ async fn manager(
 
 async fn migrate_credentials(
     resource_url: &str,
-    config: &Config,
+    config: &InteractiveConfig,
     credential_storage: &CredentialStorage,
 ) -> Result<(), String> {
     super::credentials::migrate_legacy(
@@ -196,7 +221,7 @@ async fn migrate_credentials(
     .map_err(|error| format!("could not migrate OAuth credentials: {error}"))
 }
 
-fn legacy_credential_identity(resource_url: &str, config: &Config) -> String {
+fn legacy_credential_identity(resource_url: &str, config: &InteractiveConfig) -> String {
     format!(
         "{resource_url}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
@@ -204,7 +229,7 @@ fn legacy_credential_identity(resource_url: &str, config: &Config) -> String {
     )
 }
 
-fn credential_identity(resource_url: &str, config: &Config) -> Result<String, String> {
+fn credential_identity(resource_url: &str, config: &InteractiveConfig) -> Result<String, String> {
     Ok(format!(
         "{resource_url}\0{}\0{}\0{}",
         config.client_id.as_deref().unwrap_or_default(),
@@ -447,8 +472,11 @@ mod tests {
     fn inferred_oauth_uses_the_default_persistent_identity() {
         let explicit: Config = serde_json::from_str(r#"{"type":"oauth"}"#).unwrap();
         assert_eq!(
-            credential_identity("https://mcp.example/mcp", &Config::default()),
-            credential_identity("https://mcp.example/mcp", &explicit)
+            credential_identity(
+                "https://mcp.example/mcp",
+                Config::default().interactive().unwrap()
+            ),
+            credential_identity("https://mcp.example/mcp", explicit.interactive().unwrap())
         );
     }
 
@@ -460,10 +488,10 @@ mod tests {
         .unwrap();
         let expected = format!(
             "https://mcp.example/mcp\0\0\0{}",
-            serde_json::to_string(&config.scopes).unwrap()
+            serde_json::to_string(&config.interactive().unwrap().scopes).unwrap()
         );
         assert_eq!(
-            credential_identity("https://mcp.example/mcp", &config).unwrap(),
+            credential_identity("https://mcp.example/mcp", config.interactive().unwrap()).unwrap(),
             expected
         );
     }
@@ -628,7 +656,7 @@ mod tests {
             let config = Config::default();
             let entry = storage.entry(
                 "mcp-oauth",
-                &credential_identity(&resource, &config).unwrap(),
+                &credential_identity(&resource, config.interactive().unwrap()).unwrap(),
             );
             let original =
                 serde_json::to_vec(&refresh_credentials("old-access", "old-refresh", 0)).unwrap();
@@ -724,10 +752,9 @@ mod tests {
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
-        let config = Config {
-            client_id: Some("kit-client".into()),
-            ..Config::default()
-        };
+        let config: Config =
+            serde_json::from_value(serde_json::json!({"type":"oauth", "clientId":"kit-client"}))
+                .unwrap();
         let challenge = format!(
             r#"Bearer resource_metadata="{base}/resource-metadata", scope="challenge.scope""#
         );
