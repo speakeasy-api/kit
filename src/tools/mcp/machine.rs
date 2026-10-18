@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use rmcp::transport::auth::{AuthorizationManager, ClientCredentialsConfig, JwtSigningAlgorithm};
 use serde::Deserialize;
+use tracing::instrument::WithSubscriber;
 use zeroize::Zeroizing;
 
 #[derive(Clone, Deserialize)]
@@ -115,7 +116,21 @@ impl Config {
 
 async fn read_secret(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, String> {
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path)
+    // Provisioning may rotate symlinks; check both the path and opened handle.
+    // Nonblocking open also rejects a FIFO substituted between those checks.
+    if !tokio::fs::metadata(path)
+        .await
+        .map_err(|_| "could not inspect machine OAuth credential file")?
+        .is_file()
+    {
+        return Err("machine OAuth credential must be a regular file".into());
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options
+        .open(path)
         .await
         .map_err(|_| "could not open machine OAuth credential file")?;
     if !file
@@ -178,8 +193,12 @@ async fn authenticate_manager(
     manager
         .configure_client_credentials(&credentials)
         .map_err(|_| "machine OAuth client configuration failed")?;
+    // rmcp debug-logs the token response, including arbitrary vendor fields.
+    // Silence this future only; a vendor response must not become a log channel
+    // for secrets or assertions reflected by an issuer. Errors remain redacted.
     manager
         .exchange_client_credentials(&credentials)
+        .with_subscriber(tracing::subscriber::NoSubscriber::default())
         .await
         .map_err(|_| "machine OAuth token exchange failed")?;
     // Do not call get_access_token: it may choose refresh_token for short-lived

@@ -41,7 +41,7 @@ impl OAuthHttpClient for Issuer {
                         )
                         .unwrap());
                 }
-                json!({"access_token":"test-access", "token_type":"Bearer", "expires_in":3600})
+                json!({"access_token":"test-access", "token_type":"Bearer", "expires_in":3600,"vendor_secret":"vendor-secret-canary"})
             } else {
                 return Err("unexpected fake issuer endpoint".into());
             };
@@ -203,4 +203,66 @@ async fn credential_files_are_bounded_and_never_cached() {
     std::fs::write(&path, vec![b'x'; 65537]).unwrap();
     assert!(read_secret(&path).await.is_err());
     assert!(read_secret(directory.path()).await.is_err());
+}
+
+#[derive(Clone)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn vendor_token_fields_never_enter_debug_logs() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("secret");
+    std::fs::write(&path, "file-secret-canary").unwrap();
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogWriter(logs.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    async {
+        tracing::debug!("outer-calibration");
+        let issuer = Arc::new(Issuer {
+            forms: Mutex::new(Vec::new()),
+            rejected: false,
+        });
+        authenticate_manager(manager(issuer).await, &config(&path, false))
+            .await
+            .unwrap();
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(output.contains("outer-calibration"));
+    assert!(!output.contains("file-secret-canary"));
+    assert!(!output.contains("vendor-secret-canary"));
+    assert!(!output.contains("test-access"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provisioned_fifo_is_rejected_without_waiting_for_a_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        read_secret(&path).await.err().unwrap(),
+        "machine OAuth credential must be a regular file"
+    );
 }
