@@ -960,7 +960,7 @@ async fn global_agents_precede_workspace_and_remain_a_snapshot() {
     let saved_global = transcript[1].clone();
     std::fs::write(&global, "updated global guidance").unwrap();
     for _ in 0..2 {
-        refresh_workspace_context(&mut transcript, &[root.clone()])
+        refresh_workspace_context(&mut transcript, std::slice::from_ref(&root))
             .await
             .unwrap();
         let globals = transcript
