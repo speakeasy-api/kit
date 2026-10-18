@@ -296,22 +296,11 @@ impl HookedTool {
                 )]
             })
             .unwrap_or_default();
-        let (event, _) = match input
-            .with_sources::<Attachment>()
-            .with_items(items)
-            .into_host_event()
-        {
-            Ok(event) => event,
-            Err(_) => {
-                return self.after_dispatch_failed(
-                    request,
-                    outcome,
-                    context,
-                    "tool.after hook preparation failed (Preparation)".into(),
-                );
-            }
-        };
-        let boundary = self.hooks.sdk.event_for(EventType::ToolAfter, event);
+        // Preserve owned attachment sources through SDK preparation.
+        let boundary = self
+            .hooks
+            .sdk
+            .tool_after(input.with_sources::<Attachment>().with_items(items));
         // Keep the SDK's typed cause before dispatch erases it into LoopError.
         // Arbitrary error text can contain native output or backend secrets.
         let operation = async {

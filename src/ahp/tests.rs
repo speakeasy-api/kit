@@ -726,9 +726,11 @@ async fn tool_after_interceptor_preparation_failure_withholds_native_binary_outp
     ] {
         let (hooks, backend) = hooks(subscriptions);
         let outcome = call(&hooks, &Echo::new(), json!({"text": "oversized-binary"})).await;
-        assert!(matches!(&outcome, ToolExecutionOutcome::Failed(_)));
+        let ToolExecutionOutcome::Failed(ToolError::PermissionDenied(denial)) = outcome else {
+            panic!("interceptor preparation failure did not withhold output");
+        };
         assert_eq!(
-            denial_message(outcome),
+            denial.message,
             "tool.after hook dispatch failed (Preparation)"
         );
         assert!(backend.events("tool.after").is_empty());
