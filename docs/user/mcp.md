@@ -156,7 +156,8 @@ defaults to an empty array. `signing_algorithm` defaults to `RS256`; supported v
 are `RS256`, `RS384`, `RS512`, `ES256`, and `ES384`. Omit
 `token_endpoint_audience` to use the discovered issuer as the JWT audience.
 Credential paths must be absolute. Secret files contain UTF-8 text (trailing CR/LF
-is removed); private-key files contain an RSA or EC PEM key. Files must be regular,
+is removed); private-key files contain an RSA or EC PEM key. EC keys must use PKCS#8 PEM
+(`BEGIN PRIVATE KEY`). Files must be regular,
 nonempty, and at most 64 KiB. Inline secrets and unknown configuration fields are
 rejected. Restrict file access to the service account; do not put credential
 contents in prompts, ACP requests, or logs.

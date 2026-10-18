@@ -18,6 +18,13 @@ impl OAuthHttpClient for Issuer {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
         Box::pin(async move {
             let path = request.request.uri().path();
+            if path == "/mcp" {
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("www-authenticate", "Bearer")
+                    .body(Vec::new())
+                    .unwrap());
+            }
             let body = if path.contains("oauth-protected-resource") {
                 json!({"resource":"https://mcp.example/mcp", "authorization_servers":["https://issuer.example"]})
             } else if path.contains("oauth-authorization-server") {
@@ -43,7 +50,7 @@ impl OAuthHttpClient for Issuer {
                 }
                 json!({"access_token":"test-access", "token_type":"Bearer", "expires_in":3600,"vendor_secret":"vendor-secret-canary"})
             } else {
-                return Err("unexpected fake issuer endpoint".into());
+                return Err(format!("unexpected fake issuer endpoint: {path}").into());
             };
             Ok(Response::builder()
                 .status(200)
