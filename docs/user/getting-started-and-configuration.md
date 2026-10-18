@@ -92,9 +92,13 @@ saved key. Do not put API keys in command-line arguments or `config.toml`.
 Multi-workspace keys that require an explicit workspace header are not supported.
 
 Use direct Anthropic model IDs with `--model`, not OpenRouter's
-`anthropic/…` IDs. Responses have a 16,384-token output limit. Leave
-`reasoning_effort` unset for the provider default, or select `low`, `medium`, or
-`high` for a model that supports extended thinking. Logout deletes the locally
+`anthropic/…` IDs. Kit discovers available models, context limits, and thinking
+capabilities from the authenticated Anthropic Models API rather than a fixed
+model list. If discovery is unavailable, an explicitly selected model remains
+usable with default reasoning; Kit does not guess its context limit. Responses
+have an output limit of at most 16,384 tokens, capped by the model's advertised
+maximum when available. Leave `reasoning_effort` unset for the provider default,
+or select `low`, `medium`, or `high` when discovery confirms support. Logout deletes the locally
 saved key; revoke it in Claude Console to disable it remotely. An environment key remains active after logout.
 
 ### OpenRouter API key and model

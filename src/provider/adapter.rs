@@ -313,7 +313,12 @@ impl SelectableAdapter {
     }
 
     pub async fn model_catalog(&self, current: &ModelSelection) -> Vec<ModelGroup> {
-        model_catalog_with_openai(current, self.discovered_openai_models()).await
+        model_catalog_with_openai(
+            current,
+            self.discovered_openai_models(),
+            &self.credential_storage,
+        )
+        .await
     }
 
     pub fn select(&self, selection: ModelSelection) -> Result<(), String> {
@@ -503,7 +508,15 @@ pub enum KitAdapter {
     OpenAiSubscription(OpenAiSubscriptionAdapter),
     OpenRouter(OpenRouterKitAdapter),
     Speakeasy(Box<SpeakeasyKitAdapter>),
-    Anthropic(AnthropicAdapter),
+    Anthropic(AnthropicKitAdapter),
+}
+
+#[derive(Clone)]
+pub struct AnthropicKitAdapter {
+    config: Box<AnthropicConfig>,
+    key: zeroize::Zeroizing<String>,
+    effort: Option<ReasoningEffort>,
+    models_url: String,
 }
 
 #[derive(Clone)]
@@ -674,14 +687,14 @@ impl KitAdapter {
             ProviderKind::Anthropic => {
                 let credentials = super::anthropic_auth::credentials(&credential_storage)?
                     .ok_or_else(|| "anthropic_auth_required: set ANTHROPIC_API_KEY or run `kit auth login anthropic` before using Anthropic".to_string())?;
-                let config = anthropic_config(credentials.api_key(), model, reasoning_effort)?;
-                AnthropicAdapter::new(config)
-                    .map(|adapter| {
-                        Self::Anthropic(adapter.with_resilience(
-                            crate::request_budget::RequestBudget::current().resilience(),
-                        ))
-                    })
-                    .map_err(|error| error.to_string())
+                let config = AnthropicConfig::new(credentials.api_key(), model, 16384)
+                    .map_err(|error| error.to_string())?;
+                Ok(Self::Anthropic(AnthropicKitAdapter {
+                    config: Box::new(config),
+                    key: zeroize::Zeroizing::new(credentials.api_key().to_owned()),
+                    effort: reasoning_effort,
+                    models_url: super::anthropic_catalog::MODELS_URL.into(),
+                }))
             }
             ProviderKind::Speakeasy => {
                 let credentials = speakeasy_auth::load(&credential_storage)?
@@ -852,10 +865,28 @@ impl ModelAdapter for KitAdapter {
                     context_window,
                 }))
             }
-            Self::Anthropic(adapter) => adapter
-                .start_session(config)
+            Self::Anthropic(adapter) => {
+                let resolved = super::anthropic_catalog::retrieve(
+                    &adapter.models_url,
+                    &adapter.key,
+                    &adapter.config.model,
+                )
                 .await
-                .map(KitSession::Anthropic),
+                .ok();
+                let metadata = resolved.as_ref();
+                let context_window =
+                    metadata.and_then(super::anthropic_catalog::Model::context_window);
+                let provider_config =
+                    anthropic_config((*adapter.config).clone(), adapter.effort, metadata)
+                        .map_err(LoopError::InvalidState)?;
+                let inner = AnthropicAdapter::new(provider_config)
+                    .map_err(|error| LoopError::InvalidState(error.to_string()))?
+                    .with_resilience(crate::request_budget::RequestBudget::current().resilience());
+                inner
+                    .start_session(config)
+                    .await
+                    .map(|session| KitSession::Anthropic(session, context_window))
+            }
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
                 provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
@@ -885,7 +916,7 @@ pub enum KitSession {
     OpenAiSubscription(OpenAiSubscriptionSession),
     OpenRouter(OpenRouterKitSession),
     Speakeasy(SpeakeasyKitSession),
-    Anthropic(AnthropicSession),
+    Anthropic(AnthropicSession, Option<u64>),
 }
 
 pub struct OpenRouterKitSession {
@@ -1150,7 +1181,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.set_retry_observer(observer),
             Self::OpenRouter(session) => session.inner.set_retry_observer(observer),
             Self::Speakeasy(session) => session.inner.set_retry_observer(observer),
-            Self::Anthropic(session) => session.set_retry_observer(observer),
+            Self::Anthropic(session, _) => session.set_retry_observer(observer),
         }
     }
 
@@ -1162,7 +1193,7 @@ impl ModelSession for KitSession {
         let request = if matches!(self, Self::OpenAiSubscription(_)) {
             request
         } else {
-            project_tool_output_images(request, matches!(self, Self::Anthropic(_)))?
+            project_tool_output_images(request, matches!(self, Self::Anthropic(_, _)))?
         };
         match self {
             Self::OpenAiSubscription(session) => session
@@ -1181,9 +1212,9 @@ impl ModelSession for KitSession {
                     next_media: 0,
                 })
                 .map(KitTurn::OpenRouter),
-            Self::Anthropic(session) => {
+            Self::Anthropic(session, context_window) => {
                 let request = project_anthropic_reasoning(request);
-                let context_window = session.model_name().and_then(anthropic_context_window);
+                let context_window = *context_window;
                 session
                     .begin_turn(request, cancellation)
                     .await
@@ -1208,7 +1239,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.model_name(),
             Self::OpenRouter(session) => session.inner.model_name(),
             Self::Speakeasy(session) => session.inner.model_name(),
-            Self::Anthropic(session) => session.model_name(),
+            Self::Anthropic(session, _) => session.model_name(),
         }
     }
 
@@ -1217,7 +1248,7 @@ impl ModelSession for KitSession {
             Self::OpenAiSubscription(session) => session.provider_name(),
             Self::OpenRouter(session) => session.inner.provider_name(),
             Self::Speakeasy(_) => Some("speakeasy"),
-            Self::Anthropic(_) => Some("anthropic"),
+            Self::Anthropic(_, _) => Some("anthropic"),
         }
     }
 }
@@ -1445,8 +1476,12 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
     match SelectableAdapter::new(current.provider, current.model.clone()) {
         Ok(adapter) => adapter.model_catalog(current).await,
         Err(_) => {
-            model_catalog_with_openai(current, std::future::ready(DiscoveredModels::default()))
-                .await
+            model_catalog_with_openai(
+                current,
+                std::future::ready(DiscoveredModels::default()),
+                &Default::default(),
+            )
+            .await
         }
     }
 }
@@ -1454,6 +1489,7 @@ pub async fn model_catalog(current: &ModelSelection) -> Vec<ModelGroup> {
 async fn model_catalog_with_openai(
     current: &ModelSelection,
     openai_catalog: impl std::future::Future<Output = DiscoveredModels>,
+    storage: &crate::credentials::CredentialStorage,
 ) -> Vec<ModelGroup> {
     let openrouter_url = match std::env::var_os("OPENROUTER_BASE_URL") {
         None => catalog_models_url(None),
@@ -1484,8 +1520,11 @@ async fn model_catalog_with_openai(
             futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
         }
     };
-    let (discovered_openai, (openrouter, speakeasy)) =
-        futures_util::future::join(openai_catalog, other_catalogs).await;
+    let ((discovered_openai, (openrouter, speakeasy)), anthropic) = futures_util::future::join(
+        futures_util::future::join(openai_catalog, other_catalogs),
+        discover_anthropic(storage),
+    )
+    .await;
     let openai_windows = discovered_openai.context_windows;
     let openrouter_windows = openrouter.context_windows;
     let speakeasy_windows = speakeasy.context_windows;
@@ -1545,7 +1584,7 @@ async fn model_catalog_with_openai(
             models: speakeasy,
             context_windows: speakeasy_windows,
         },
-        anthropic_model_group(current),
+        anthropic_model_group(current, anthropic),
     ]
 }
 
@@ -1573,110 +1612,99 @@ fn project_anthropic_reasoning(mut request: TurnRequest) -> TurnRequest {
     request
 }
 
-// Match a published alias or its eight-digit dated snapshot, not arbitrary suffixes.
-fn anthropic_model_matches(model: &str, alias: &str) -> bool {
-    model == alias
-        || model
-            .strip_prefix(alias)
-            .and_then(|suffix| suffix.strip_prefix('-'))
-            .is_some_and(|date| date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-const ANTHROPIC_ADAPTIVE_MODELS: &[&str] = &[
-    "claude-sonnet-5-5",
-    "claude-opus-5-5",
-    "claude-haiku-5-5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-];
-
 fn anthropic_config(
-    api_key: &str,
-    model: String,
+    mut config: AnthropicConfig,
     effort: Option<ReasoningEffort>,
+    metadata: Option<&super::anthropic_catalog::Model>,
 ) -> Result<AnthropicConfig, String> {
-    let mut config =
-        AnthropicConfig::new(api_key, model.clone(), 16384).map_err(|error| error.to_string())?;
+    if let Some(limit) = metadata
+        .and_then(|model| model.max_tokens)
+        .filter(|limit| *limit > 0)
+    {
+        config.max_tokens = config.max_tokens.min(limit);
+    }
     let Some(effort) = effort else {
         return Ok(config);
     };
-    if ANTHROPIC_ADAPTIVE_MODELS
-        .iter()
-        .any(|alias| anthropic_model_matches(&model, alias))
-    {
-        config = config
+    let unavailable = || {
+        format!(
+            "Cannot configure explicit reasoning effort for Anthropic model {:?} from discovered capabilities; select default reasoning effort or check model discovery credentials and connectivity",
+            config.model
+        )
+    };
+    let metadata = metadata.ok_or_else(unavailable)?;
+    if !metadata.supports("/thinking/supported") {
+        return Err(unavailable());
+    }
+    if metadata.supports("/thinking/types/adaptive/supported") {
+        let (path, output) = match effort {
+            ReasoningEffort::Low => ("/effort/low/supported", OutputEffort::Low),
+            ReasoningEffort::Medium => ("/effort/medium/supported", OutputEffort::Medium),
+            ReasoningEffort::High => ("/effort/high/supported", OutputEffort::High),
+        };
+        if !metadata.supports("/effort/supported") || !metadata.supports(path) {
+            return Err(unavailable());
+        }
+        Ok(config
             .with_thinking(ThinkingConfig::Adaptive)
-            .with_output_effort(match effort {
-                ReasoningEffort::Low => OutputEffort::Low,
-                ReasoningEffort::Medium => OutputEffort::Medium,
-                ReasoningEffort::High => OutputEffort::High,
-            });
-    } else if [
-        "claude-haiku-4-5",
-        "claude-sonnet-4-5",
-        "claude-opus-4-5",
-        "claude-sonnet-4",
-        "claude-opus-4",
-        "claude-opus-4-1",
-        "claude-3-7-sonnet",
-    ]
-    .iter()
-    .any(|alias| anthropic_model_matches(&model, alias))
-    {
-        config = config.with_thinking(ThinkingConfig::Enabled {
-            budget_tokens: match effort {
-                ReasoningEffort::Low => 1024,
-                ReasoningEffort::Medium => 4096,
-                ReasoningEffort::High => 8192,
-            },
-        });
+            .with_output_effort(output))
+    } else if metadata.supports("/thinking/types/enabled/supported") {
+        // Manual thinking requires a known output ceiling and at least 1024 tokens.
+        let limit = metadata
+            .max_tokens
+            .filter(|limit| *limit > 1024)
+            .ok_or_else(unavailable)?;
+        let desired = match effort {
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
+        };
+        let budget_tokens = desired.min(limit - 1).min(config.max_tokens - 1);
+        Ok(config.with_thinking(ThinkingConfig::Enabled { budget_tokens }))
     } else {
-        return Err(format!(
-            "reasoning effort is not configured for Anthropic model {model:?}; select default reasoning effort to use this model"
-        ));
+        Err(unavailable())
     }
-    Ok(config)
 }
 
-fn anthropic_context_window(model: &str) -> Option<u64> {
-    if ANTHROPIC_ADAPTIVE_MODELS
+fn anthropic_model_group(
+    current: &ModelSelection,
+    discovered: Vec<super::anthropic_catalog::Model>,
+) -> ModelGroup {
+    let context_windows = discovered
         .iter()
-        .any(|alias| anthropic_model_matches(model, alias))
-    {
-        Some(1_000_000)
-    } else if anthropic_model_matches(model, "claude-haiku-4-5") {
-        Some(200_000)
-    } else {
-        None
-    }
-}
-
-fn anthropic_model_group(current: &ModelSelection) -> ModelGroup {
-    let mut models = [
-        "claude-sonnet-5-5",
-        "claude-opus-5-5",
-        "claude-haiku-5-5",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6",
-        "claude-haiku-4-5-20251001",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
+        .filter_map(|model| {
+            model
+                .context_window()
+                .map(|limit| (model.id.clone(), limit))
+        })
+        .collect();
+    let mut models: Vec<_> = discovered.into_iter().map(|model| model.id).collect();
+    models.sort();
+    models.dedup();
     if current.provider == ProviderKind::Anthropic
         && valid_model_id(&current.model)
         && !models.contains(&current.model)
     {
         models.push(current.model.clone());
     }
-    let context_windows = models
-        .iter()
-        .filter_map(|model| anthropic_context_window(model).map(|window| (model.clone(), window)))
-        .collect();
     ModelGroup {
         provider: ProviderKind::Anthropic,
         models,
         context_windows,
+    }
+}
+
+async fn discover_anthropic(
+    storage: &crate::credentials::CredentialStorage,
+) -> Vec<super::anthropic_catalog::Model> {
+    match super::anthropic_auth::credentials(storage) {
+        Ok(Some(credentials)) => super::anthropic_catalog::discover(
+            super::anthropic_catalog::MODELS_URL,
+            credentials.api_key(),
+        )
+        .await
+        .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -1770,62 +1798,51 @@ fn parse_discovered_models(value: &Value) -> Result<DiscoveredModels, String> {
 )]
 mod tests {
     #[test]
-    fn anthropic_production_config_maps_only_known_reasoning_modes() {
-        use super::{OutputEffort, ReasoningEffort, ThinkingConfig, anthropic_config};
-        for model in super::ANTHROPIC_ADAPTIVE_MODELS {
-            for model in [model.to_string(), format!("{model}-20261001")] {
-                for effort in [
-                    ReasoningEffort::Low,
-                    ReasoningEffort::Medium,
-                    ReasoningEffort::High,
-                ] {
-                    let config = anthropic_config("test", model.clone(), Some(effort)).unwrap();
-                    assert!(matches!(config.thinking, Some(ThinkingConfig::Adaptive)));
-                    assert!(matches!(
-                        (effort, config.output_effort),
-                        (ReasoningEffort::Low, Some(OutputEffort::Low))
-                            | (ReasoningEffort::Medium, Some(OutputEffort::Medium))
-                            | (ReasoningEffort::High, Some(OutputEffort::High))
-                    ));
-                    assert_eq!(config.max_tokens, 16384);
-                    assert_eq!(super::anthropic_context_window(&model), Some(1_000_000));
-                }
-            }
-        }
-        for (effort, expected) in [
-            (ReasoningEffort::Low, 1024),
-            (ReasoningEffort::Medium, 4096),
-            (ReasoningEffort::High, 8192),
-        ] {
-            let config =
-                anthropic_config("test", "claude-haiku-4-5-20251001".into(), Some(effort)).unwrap();
-            assert!(
-                matches!(config.thinking, Some(ThinkingConfig::Enabled { budget_tokens }) if budget_tokens == expected)
-            );
-            assert!(config.output_effort.is_none());
-        }
-        assert_eq!(
-            super::anthropic_context_window("claude-haiku-4-5-20251001"),
-            Some(200_000)
+    fn anthropic_reasoning_uses_capabilities_not_names() {
+        use super::{AnthropicConfig, ReasoningEffort, ThinkingConfig, anthropic_config};
+        let config = || AnthropicConfig::new("test", "completely-custom", 16384).unwrap();
+        assert!(
+            anthropic_config(config(), None, None)
+                .unwrap()
+                .thinking
+                .is_none()
         );
-        for model in [
-            "claude-future",
-            "claude-sonnet-5-5-custom",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ] {
-            let config = anthropic_config("test", model.into(), None).unwrap();
-            assert!(config.thinking.is_none());
-            assert!(config.output_effort.is_none());
+        assert!(
+            anthropic_config(config(), Some(ReasoningEffort::High), None)
+                .unwrap_err()
+                .contains("default reasoning")
+        );
+        let mut model: super::super::anthropic_catalog::Model = serde_json::from_value(serde_json::json!({
+            "id":"completely-custom", "max_input_tokens":77777,"max_tokens":2048,
+            "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":true}}}}
+        })).unwrap();
+        let manual = anthropic_config(config(), Some(ReasoningEffort::High), Some(&model)).unwrap();
+        assert_eq!(manual.max_tokens, 2048);
+        assert!(matches!(
+            manual.thinking,
+            Some(ThinkingConfig::Enabled {
+                budget_tokens: 2047
+            })
+        ));
+        model.max_tokens = Some(1024);
+        assert!(anthropic_config(config(), Some(ReasoningEffort::Low), Some(&model)).is_err());
+        model.max_tokens = None;
+        assert!(anthropic_config(config(), Some(ReasoningEffort::Low), Some(&model)).is_err());
+        model.capabilities = serde_json::json!({"thinking":{"supported":true,"types":{"adaptive":{"supported":true}}},
+            "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":true},"high":{"supported":false}}});
+        for effort in [ReasoningEffort::Low, ReasoningEffort::Medium] {
+            let adaptive = anthropic_config(config(), Some(effort), Some(&model)).unwrap();
+            assert!(matches!(adaptive.thinking, Some(ThinkingConfig::Adaptive)));
+            assert!(adaptive.output_effort.is_some());
+            assert_eq!(adaptive.max_tokens, 16384);
         }
-        for model in ["claude-future", "claude-sonnet-5-5-custom"] {
-            assert!(
-                anthropic_config("test", model.into(), Some(ReasoningEffort::High))
-                    .unwrap_err()
-                    .contains("default reasoning effort")
-            );
-            assert_eq!(super::anthropic_context_window(model), None);
-        }
+        assert!(anthropic_config(config(), Some(ReasoningEffort::High), Some(&model)).is_err());
+        let selection =
+            super::ModelSelection::new(super::ProviderKind::Anthropic, "another-custom");
+        let group = super::anthropic_model_group(&selection, vec![model]);
+        assert_eq!(group.context_windows["completely-custom"], 77777);
+        assert!(group.models.contains(&selection.model));
+        assert!(!group.context_windows.contains_key(&selection.model));
     }
 
     #[test]
@@ -1837,19 +1854,12 @@ mod tests {
             super::authentication_method_id("anthropic_auth_required: missing key"),
             Some("anthropic")
         );
-        let group = super::anthropic_model_group(&selection);
+        let group = super::anthropic_model_group(&selection, Vec::new());
         assert!(group.models.contains(&selection.model));
-        assert_eq!(
-            &group.models[..3],
-            &["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"]
-        );
-        for model in &group.models[..3] {
-            assert_eq!(group.context_windows[model], 1_000_000);
-        }
-        assert_eq!(group.context_windows["claude-haiku-4-5-20251001"], 200_000);
-        assert_eq!(group.context_windows[&selection.model], 1_000_000);
+        assert_eq!(group.models, vec![selection.model.clone()]);
+        assert!(group.context_windows.is_empty());
         let custom = super::ModelSelection::new(super::ProviderKind::Anthropic, "claude-future");
-        let group = super::anthropic_model_group(&custom);
+        let group = super::anthropic_model_group(&custom, Vec::new());
         assert!(group.models.contains(&custom.model));
         assert!(!group.context_windows.contains_key(&custom.model));
         assert_eq!(
@@ -2211,11 +2221,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_discovery_failure_preserves_custom_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut byte = [0];
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let config = super::AnthropicConfig::new("test", "custom-id", 16384).unwrap();
+        let mut provider = super::AnthropicKitAdapter {
+            config: Box::new(config),
+            key: zeroize::Zeroizing::new("test".into()),
+            effort: None,
+            models_url: format!("http://{address}/v1/models"),
+        };
+        let session = KitAdapter::Anthropic(provider.clone())
+            .start_session(SessionConfig::new("custom"))
+            .await
+            .unwrap();
+        assert_eq!(session.model_name(), Some("custom-id"));
+        assert!(matches!(session, super::KitSession::Anthropic(_, None)));
+        provider.effort = Some(super::ReasoningEffort::High);
+        let result = KitAdapter::Anthropic(provider)
+            .start_session(SessionConfig::new("explicit"))
+            .await;
+        assert!(
+            matches!(result, Err(agentkit_loop::LoopError::InvalidState(message)) if message.contains("default reasoning effort"))
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn anthropic_uses_native_messages_api_and_context_metadata() {
         use agentkit_loop::ModelTurn;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                discovery.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let discovery_request = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(discovery_request.starts_with("get /v1/models/custom-alias "));
+            assert!(discovery_request.contains("x-api-key: test-api-key"));
+            assert!(discovery_request.contains("anthropic-version: 2023-06-01"));
+            let catalog = json!({"id":"canonical-snapshot", "max_input_tokens":1000000, "max_tokens":8192,
+                "capabilities":{"thinking":{"supported":true,"types":{"adaptive":{"supported":true}}},
+                "effort":{"supported":true,"high":{"supported":true}}}}).to_string();
+            write!(
+                discovery,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{catalog}",
+                catalog.len()
+            )
+            .unwrap();
+            drop(discovery);
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -2258,13 +2335,16 @@ mod tests {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
             String::from_utf8(request).unwrap()
         });
-        let config = super::anthropic_config("test-api-key", "claude-sonnet-4-6".into(), None)
+        let config = super::AnthropicConfig::new("test-api-key", "custom-alias", 16384)
             .unwrap()
             .with_base_url(format!("http://{address}/v1/messages"))
             .with_streaming(false);
-        let adapter = KitAdapter::Anthropic(
-            agentkit_provider_anthropic::AnthropicAdapter::new(config).unwrap(),
-        );
+        let adapter = KitAdapter::Anthropic(super::AnthropicKitAdapter {
+            config: Box::new(config),
+            key: zeroize::Zeroizing::new("test-api-key".into()),
+            effort: Some(super::ReasoningEffort::High),
+            models_url: format!("http://{address}/v1/models"),
+        });
         assert_eq!(adapter.provider_name(), Some("anthropic"));
         let mut session = adapter
             .start_session(SessionConfig::new("anthropic-contract"))
@@ -2344,8 +2424,10 @@ mod tests {
         assert!(headers.contains("anthropic-version: 2023-06-01"));
         assert!(!headers.contains("authorization:"));
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(body["model"], "claude-sonnet-4-6");
-        assert_eq!(body["max_tokens"], 16384);
+        assert_eq!(body["model"], "custom-alias");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["messages"][0]["role"], "user");
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(

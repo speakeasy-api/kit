@@ -1,5 +1,6 @@
 mod adapter;
 pub(crate) mod anthropic_auth;
+mod anthropic_catalog;
 
 #[doc(hidden)]
 pub use anthropic_auth::{AnthropicAuthCommand, execute_anthropic_auth};
