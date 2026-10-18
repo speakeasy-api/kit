@@ -1478,6 +1478,61 @@ impl Subagents {
         Ok(values.into_iter().map(|(_, value)| value).collect())
     }
 
+    /// Retire live children without deleting their durable histories.
+    /// The caller must first stop parent work that can create new children.
+    pub(crate) async fn shutdown(&self) -> Result<(), ChildError> {
+        let states: Vec<_> = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.state)))
+            .collect();
+        // No registry guard crosses an await or a lifecycle callback. Existing
+        // retirement transitions reject late startup installation and preserve
+        // permits until a child that failed to close actually exits.
+        let mut failure = None;
+        for (id, state) in states {
+            // Select the child and retire its state in one transition. Otherwise
+            // startup could install between the empty-child check and retirement.
+            let mut locked = state.lock().await;
+            if locked.status == SubagentStatus::Starting && locked.child.is_none() {
+                failure.get_or_insert_with(|| {
+                    ChildError::Failed(
+                        "subagent startup has not settled during session close".into(),
+                    )
+                });
+            }
+            let event = if locked.status == SubagentStatus::Removed {
+                None
+            } else {
+                locked.status = SubagentStatus::Removed;
+                locked.forking = None;
+                locked.outcome = Some(GenerationOutcome::Failed);
+                locked.generation_finished_at_unix_ms = Some(events::now_millis());
+                Some(locked.runtime_event(id.clone()))
+            };
+            let child = locked.child.clone();
+            drop(locked);
+            self.remove_if_same(&id, &state);
+            if let Some(event) = event {
+                self.emit_event(event);
+            }
+            if let Some(child) = child {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), child.close())
+                    .await
+                    .unwrap_or_else(|_| Err(ChildError::Failed("subagent close timed out".into())));
+                if let Err(error) = result {
+                    if !child_error_is_terminal(&error, &child) {
+                        self.retain_permit_until_process_exit(&state, &child).await;
+                    }
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     async fn close(&self, id: &str, cancellation: &TurnCancellation) -> Result<(), ChildError> {
         let state = self
             .sessions

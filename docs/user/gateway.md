@@ -56,7 +56,7 @@ kit tui --remote http://127.0.0.1:7766 \
   --root /absolute/server/project --remote-session SESSION_ID
 ```
 
-If the child is resident, this attaches to that process. After a gateway restart or child exit, it restores the existing Kit transcript in that project. Restore uses the normal session ownership checks; it does not silently force takeover of another local process. In-flight work does not survive gateway termination; only persisted transcript state can be restored. Disk failures retain Kit's existing durability limitations.
+If the child is resident, this attaches to that process. After a gateway restart or child exit, it restores the existing Kit transcript in that project. Restore uses the normal session ownership checks; it does not silently force takeover of another local process. In-flight work does not survive gateway termination; only persisted transcript state can be restored. A transcript is not an execution checkpoint: restoring it does not restart detached jobs, subagents, or tools, and never automatically resends an ambiguously accepted prompt. Disk failures retain Kit's existing durability limitations.
 
 The remote TUI supports normal prompting, model/config selection advertised by the host, steering, and explicit interruption. `Esc` or `Ctrl+C` during a running turn interrupts it. Quitting with `Ctrl+D` on an empty prompt, or losing the connection, detaches without interruption. One attachment controls a session at a time. Clean disconnection releases the attachment. An explicit resume replaces the previous controller, so a lost HTTP stream does not prevent reconnection. The old controller cannot submit new work once replaced.
 
@@ -85,13 +85,55 @@ To start another session, exit and omit `--remote-session` on the next invocatio
 
 ## Standard ACP HTTP clients
 
-Use an ACP v2 HTTP/SSE client with the exact endpoint `http://HOST:7766/acp/v2`, a bearer credential on every request, and matching Kit versions. There is no separate Kit session REST API. See the [gateway protocol reference](../reference/gateway-protocol.md) for connection setup, supported operations, wire examples, and transport limits.
+An ACP v2 HTTP client can connect directly to `http://HOST:7766/acp/v2`.
+Configure its HTTP client with `Authorization: Bearer TOKEN` on every request,
+including event streams and transport teardown. The initialize POST returns an `Acp-Connection-Id` header; include it on subsequent requests. Open a connection-level SSE GET with `Accept: text/event-stream`, then a separate SSE GET for every attached session with both `Acp-Connection-Id` and `Acp-Session-Id`. All requests use the same `/acp/v2` endpoint: there is no separate Kit session REST API. Open the session stream before a resume or prompt; for a new session, open it after receiving the new `sessionId`. Established POSTs return `202 Accepted`; correlated replies and notifications arrive on the appropriate SSE stream. A DELETE with the connection ID tears down that transport without canceling accepted session work.
+
+This is a manually provisioned
+bearer credential, not an OAuth login. Use the SDK's exact-endpoint constructor
+(for the Rust SDK, `HttpClient::with_endpoint_and_client`) so it does not append
+its default `/acp` path.
+
+The supported wire protocol is ACP v2, using the pinned ACP Rust SDK 2.0.0. The supported integration transport is HTTP/SSE. ACP v1 and arbitrary ACP extensions are not supported; the selected bounded SDK path rejects WebSocket upgrades. The bundled TUI bridge and gateway should use the same Kit version; compatibility with future SDK or Kit versions is not promised by this experimental interface.
+
+Start with `initialize`, then use standard `session/new`, `session/list`, and
+`session/resume` requests. `session/new.cwd` must be an exact canonical root
+approved with `--project`. Listing returns standard `sessions` entries with
+`sessionId`, `cwd`, and `title`; Kit's `_meta["kit.gateway.state"]` distinguishes `resident` from
+`restorable` entries. Resident means the gateway still owns the session actor,
+including bounded close-response retention after its child exits; it does not
+guarantee prompt admission or that outstanding work has finished. Restorable
+means a durable transcript is available. An `exited` slot has no catalog
+entry to restore and can appear while actor cleanup is finishing. Completed actor
+slots are reclaimed when listing or creating sessions; durable transcripts remain
+listed as restorable. Reclamation does not repair stale transcript locks left by
+abrupt child termination.
+
+Request `"replayFrom": {"type": "start"}` in `session/resume` to receive history as ACP
+session notifications. Resuming without requesting history is not a full replay.
+The bundled bridge maps `--remote-session` to this standard resume request and
+requests replay from the start. Graceful DELETE seals new submissions without allocating another input frame, then drains HTTP-accepted inbound frames through resident dispatch before releasing control. It does not wait for inference to finish or guarantee outbound delivery. Later POSTs receive 410 while draining. Only confirmed clean adapter completion returns 202; a 30-second waiter deadline or drain failure returns 503. A timeout or canceled DELETE waiter does not reopen admission or abort accepted work: connection-owned draining continues, and another DELETE can join it while the connection remains registered. After removal, later requests receive 404. The bundled client's best-effort DELETE wait is capped at five seconds, so client exit alone is not confirmation of remote teardown. Submission outcomes can remain unknown: do not blindly resubmit work. Ending a transport connection is not a session cancellation or deletion. A single
+ACP connection can control multiple sessions. Replacing one controller settles
+that controller's pending requests with errors without detaching its other sessions.
 
 ### Supported operations
 
-See [Supported operations](../reference/gateway-protocol.md#supported-operations) for the adapter contract.
+| Operation | Gateway behavior |
+| --- | --- |
+| `initialize` | Establish ACP v2 capabilities once per connection. |
+| `session/new` | Create a child in an approved host project and acquire control. |
+| `session/list` | List resident and restorable sessions; optional exact `cwd` filtering, no pagination cursor. |
+| `session/resume` | Acquire or replace control of a session; optional replay from `start` only. |
+| `session/prompt` | Submit work to the resident child. |
+| `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
+| `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
+| `session/close` | Close the resident session and its outstanding work; retain the transcript for explicit resume. The close response follows child cleanup. A cleanup error is reported, but does not reopen a partially closed child; resume is an explicit new restoration. |
+| `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
+| `session/set_config_option` | Select configuration advertised by the child, without changing client-local defaults. |
 
-<a id="pinned-wire-fixture"></a>
+Closing waits for serialized session cleanup and uses Kit’s existing synchronous transcript persistence; it does not create an execution checkpoint or strengthen the existing disk-failure durability guarantees.
+
+Unsupported requests fail explicitly. Client-to-agent request cancellation (`$/cancel_request`) does not interrupt accepted session work. Integrations must use `session/cancel` for that purpose, and cancel detached jobs separately. Do not automatically resend a prompt after a transport failure.
 
 ### Implement an ACP HTTP client
 
@@ -103,11 +145,13 @@ See [Implement an ACP HTTP client](../reference/gateway-protocol.md#implement-an
 - The credential is read from a regular file and must not be accessible to group or others on Unix. Authentication compares the token in constant time. Rotation requires restarting the gateway and updating clients. Do not log or share it.
 - Client redirects are disabled so the bearer token cannot follow a redirect. Use a trusted URL and transport; HTTPS can be provided by a separately secured proxy, not by this command itself. Transport limits do not make an untrusted gateway safe: it still supplies protocol data and can terminate the connection.
 - A failed send can have an **unknown outcome**. There is no automatic prompt retry. Reconnect and inspect the transcript before resubmitting, or you may duplicate work. A lost create response can leave a resident session; list sessions before creating another.
-- Live reattachment replays the resident child's notifications and current configuration, not old request responses. Replies are scoped to the attachment that submitted the request, so a stale response cannot resolve a new terminal's request ID. ACP v2 state-update notifications carry active/idle state across reconnects.
+- Live reattachment replays the resident child's notifications and current configuration, not old request responses. Replies are scoped to the attachment that submitted the request, so a stale response cannot resolve a new terminal's request ID. ACP v2 state-update notifications carry active/idle turn state across reconnects. Idle is not a claim that detached background jobs or subagents have finished; inspect their tool updates and existing task/subagent interfaces for outstanding work.
 - Replay is an in-memory convenience, not a second durable session format. It is limited to 8 MiB and approximately 4,096 events per session/attachment, including room for a current snapshot. Overflow rejects a full live reattach rather than falsely claiming complete replay. Use explicit `--remote-no-replay` only when historical omission is acceptable. Current configuration and actual ACP turn state follow historical events before resume completes; durable assistant text alone is never used as evidence that a turn is idle. Restarting the gateway does not guarantee oversized full replay will fit, and burst replay can exhaust transport budgets even below the history limit.
-- At most 64 active or stopping sessions can be resident. List sessions to reclaim completed session slots without restarting the gateway or deleting durable transcripts. Creating a session also reclaims completed slots. Detaching does not stop a session, even when it is idle.
-- Transport saturation can disconnect a client without canceling accepted work. HTTP frames are limited to 1 MiB; child output frames to 8 MiB. Oversized or malformed child output stops that child. There is no idle connection expiration or body-read deadline: abandoned transports can retain connection slots, and exhaustion may require restarting the gateway. See [Transport limits](../reference/gateway-protocol.md#transport-limits) before sizing an integration. These bounds are not a hard process-memory ceiling or denial-of-service protection.
-- Use `Ctrl+C` on the gateway host for graceful shutdown. Kit waits for child cleanup and exit, then forcibly stops a child if it exceeds the 10-second timeout. That fallback can leave a stale transcript lock requiring operator intervention. Hard process termination has operating-system-dependent cleanup behavior; arbitrary tool descendants are not a managed process group.
-- Client-side ACP services, arbitrary extra directories, legacy SSE MCP servers, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
+- Healthy HTTP connections have no cumulative output cap. The SDK instead limits each core direction to 16 MiB / 256 frames and each connection's HTTP egress to 4 MiB / 64 frames. These are independent encoded-data reservations, not an aggregate heap limit. Charged envelopes remain owned through local decoding and serialization. Admission saturation fails explicitly and can terminate the connection; it does not silently drop output while claiming the stream is complete. Accepted resident work is not cancelled by transport failure. There is no delivery acknowledgement, and HTTP body handoff does not prove peer consumption. The bridge's stdin mailbox holds at most 16 capped frames; each frame is limited to 1 MiB before parsing.
+- The server admits at most 64 connections, 32 concurrent SDK POSTs, and 8 MiB of aggregate body reservations. Each connection permits at most 128 batch entries, 256 pending routes, 64 session registrations, and 65 streams. HTTP/core frames are limited to 1 MiB; SSE encoding and the client's 1 MiB parser limits can reject a near-limit frame. The bundled client independently caps HTTP reservations at 64 MiB / 128 slots, pending RPCs at 128, each POST lane at 32, and SSE streams at 8. Transport exhaustion is terminal rather than an unbounded wait. The gateway's outer admission layer admits at most 32 concurrent POST/DELETE operations before buffering or waiting on per-connection teardown.
+- These bounds exclude allocator overhead, transient JSON conversion, arbitrary application state, and HTTP/TLS/socket buffers. They are not a hard process-memory ceiling or a denial-of-service-hardening claim. The bounded transport supports HTTP/SSE, not WebSocket upgrades. SSE has no replay cursor: reopening a stream alone cannot recover lost events. Recovery uses fresh initialization and session-level resume, not SSE event IDs. There is no idle connection expiration or body-read deadline: disconnected peers that do not DELETE or otherwise terminate their transport can retain connection slots. Slot exhaustion may require restarting the gateway; do not expose it to untrusted clients.
+- There is no fixed resident-session count ceiling. Operators must provision memory and process capacity for their workload. Listing or creating sessions reclaims completed actor entries without restarting the gateway or deleting durable transcripts. Standard `session/close` ends resident work; its bounded response history remains available for at most one 15-second lease after child cleanup, or until the controller detaches. Detached actors, including idle actors, are not automatically terminated; accepted work continues. HTTP POST bodies are limited to 1 MiB inside SDK admission, including streamed bodies; supervisor command queues and pending child requests are also bounded. Child stdout frames are limited to 8 MiB before JSON parsing; oversized or malformed frames stop that child.
+- Graceful `Ctrl+C` shutdown stops serving, releases resident actor ownership, closes each ACP child’s input, drains its output, and waits for cleanup and exit. A 10-second timeout falls back to killing and reaping the child. That fallback can leave a stale transcript lock requiring operator intervention. Hard process termination has operating-system-dependent cleanup behavior; arbitrary tool descendants are not a managed process group.
+- Client-side ACP services, arbitrary extra directories, session-scoped HTTP/SSE MCP servers, browser callbacks, and arbitrary ACP methods are not supported. Files, tool execution, and provider authentication belong to the gateway host.
 
 The internal `gateway bridge` stdio command is a transport adapter for the bundled TUI, not a stable public protocol or general-purpose ACP proxy. The public transport is ACP HTTP at `/acp/v2`, implemented by the ACP SDK rather than a Kit-specific RPC protocol.

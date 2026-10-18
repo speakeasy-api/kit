@@ -106,6 +106,7 @@ for line in sys.stdin:
             id: id.to_owned(),
             root: self.gateway.roots[0].clone(),
             restore: false,
+            closed: false,
             attachment: None,
             committed_owner: None,
             serial: 0,
@@ -309,22 +310,12 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
             .iter()
             .any(|event| event["params"]["update"]["state"] == "running")
     );
-    // A second startup on the same attachment must not duplicate replay or
-    // create another child session; a close must not be falsely acknowledged.
-    for method in ["session/new", "session/close"] {
-        let (status, _) = harness
-            .raw(json!({"op":"send","session":"resident","attachment":second,
-            "message":{"jsonrpc":"2.0","id":90,"method":method,"params":{"sessionId":"resident"}}}))
-            .await;
-        assert_eq!(
-            status,
-            if method == "session/new" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            }
-        );
-    }
+    // A second startup on the same attachment must not duplicate replay.
+    let (status, _) = harness
+        .raw(json!({"op":"send","session":"resident","attachment":second,
+        "message":{"jsonrpc":"2.0","id":90,"method":"session/new","params":{"sessionId":"resident"}}}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(harness.raw(json!({"op":"send","session":"resident","attachment":first,"message":{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"resident"}}})).await.0,StatusCode::CONFLICT);
     harness
         .send(
@@ -398,6 +389,7 @@ fn isolated_actor() -> Actor {
         id: "resident".into(),
         root: PathBuf::from("/approved"),
         restore: false,
+        closed: false,
         attachment: None,
         committed_owner: None,
         serial: 0,
@@ -1803,6 +1795,172 @@ fn direct_mcp_update_keeps_owner_and_returns_extension_response() {
                 actor.session_result.as_ref().unwrap()["sessionId"],
                 "resident"
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn close_cleans_child_before_response_and_reclaims_actor() {
+    let harness = Harness::new().await;
+    let cleaned = harness._directory.path().join("cleaned");
+    let source = r#"
+import sys,json
+pending=None
+for line in sys.stdin:
+ req=json.loads(line)
+ if req['method']=='session/prompt':
+  pending=req
+  continue
+ if req['method']=='session/close' and pending:
+  print(json.dumps({'jsonrpc':'2.0','id':pending['id'],'result':{'stopReason':'cancelled'}}),flush=True)
+ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{}}),flush=True)
+open(sys.argv[1],'w').write('cleaned')
+"#;
+    harness
+        .child_source(
+            "resident",
+            source,
+            &[cleaned.to_string_lossy().into_owned()],
+        )
+        .await;
+    let attachment = harness.attach().await;
+    harness.handshake(&attachment).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"resident"}})).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":"resident"}})).await;
+    let events = harness
+        .events(&attachment, |events| events.iter().any(|e| e["id"] == 4))
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["id"] == 3 && e["result"]["stopReason"] == "cancelled")
+    );
+    assert_eq!(std::fs::read_to_string(cleaned).unwrap(), "cleaned");
+    let (status, _) = harness.raw(json!({"op":"send","session":"resident","attachment":attachment,"message":{"id":5,"method":"session/prompt","params":{}}})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let mut entry = harness.gateway.sessions.lock().await["resident"].clone();
+    harness
+        .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), entry.stopped.changed())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    harness.gateway.reclaim_exited().await;
+    assert!(
+        !harness
+            .gateway
+            .sessions
+            .lock()
+            .await
+            .contains_key("resident")
+    );
+}
+
+#[tokio::test]
+async fn failed_close_reports_error_without_reopening_partially_closed_child() {
+    let harness = Harness::new().await;
+    let source = r#"
+import sys,json
+for line in sys.stdin:
+ req=json.loads(line)
+ response={'jsonrpc':'2.0','id':req['id']}
+ if req['method']=='session/close': response['error']={'code':-32603,'message':'close failed'}
+ else: response['result']={}
+ print(json.dumps(response),flush=True)
+"#;
+    harness.child_source("resident", source, &[]).await;
+    let attachment = harness.attach().await;
+    harness.handshake(&attachment).await;
+    harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"resident"}})).await;
+    let events = harness
+        .events(&attachment, |events| events.iter().any(|e| e["id"] == 3))
+        .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e["id"] == 3 && e.get("error").is_some())
+    );
+    let (status, _) = harness.raw(json!({"op":"send","session":"resident","attachment":attachment,"message":{"id":4,"method":"session/prompt","params":{}}})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    harness
+        .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+        .await;
+}
+
+#[tokio::test]
+async fn closing_child_keeps_polling_responsive_until_cleanup_finishes() {
+    for shutdown in [false, true] {
+        let harness = Harness::new().await;
+        let ready = harness._directory.path().join("ready");
+        let release = harness._directory.path().join("release");
+        let source = r#"
+import sys,json,os,time
+for line in sys.stdin:
+ req=json.loads(line)
+ print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':{}}),flush=True)
+open(sys.argv[1],'w').close()
+while not os.path.exists(sys.argv[2]): time.sleep(.01)
+"#;
+        harness
+            .child_source(
+                "resident",
+                source,
+                &[
+                    ready.to_string_lossy().into_owned(),
+                    release.to_string_lossy().into_owned(),
+                ],
+            )
+            .await;
+        let attachment = harness.attach().await;
+        harness.handshake(&attachment).await;
+        harness.send(&attachment, json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":"resident"}})).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let polled = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness
+                .call(json!({"op":"poll","session":"resident","attachment":attachment,"cursor":0})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["events"], json!([]));
+        assert_eq!(polled["closed"], false);
+        let mut entry = harness.gateway.sessions.lock().await["resident"].clone();
+        if shutdown {
+            let (reply, acknowledged) = oneshot::channel();
+            entry
+                .sender
+                .send(Envelope {
+                    request: Request::Shutdown,
+                    reply,
+                })
+                .await
+                .unwrap();
+            acknowledged.await.unwrap().unwrap();
+        }
+        std::fs::write(release, "release").unwrap();
+        if shutdown {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), entry.stopped.changed())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            harness
+                .events(&attachment, |events| events.iter().any(|e| e["id"] == 3))
+                .await;
+            harness
+                .call(json!({"op":"detach","session":"resident","attachment":attachment}))
+                .await;
         }
     }
 }

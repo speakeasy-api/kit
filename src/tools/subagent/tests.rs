@@ -2318,3 +2318,79 @@ async fn additional_directories_reject_unsupported_harness_before_session_creati
 
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+
+#[tokio::test]
+async fn shutdown_closes_live_children_without_deleting_history() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        fail_delete: true,
+        ..Default::default()
+    });
+    let child = scenario.create("shutdown child").await;
+    scenario.manager.shutdown().await.unwrap();
+    assert!(scenario.manager.lookup(&child).is_err());
+    assert!(
+        logged_requests(&scenario.requests)
+            .iter()
+            .any(|request| { matches!(request, LoggedRequest::Close { .. }) })
+    );
+    assert!(
+        !std::fs::read_to_string(&scenario.requests)
+            .unwrap()
+            .contains("session/delete")
+    );
+    wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+}
+
+#[tokio::test]
+async fn shutdown_rejects_unsettled_startup_and_prevents_late_installation() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        gate_new: true,
+        ..Default::default()
+    });
+    let manager = scenario.manager.clone();
+    let creation = tokio::spawn(async move {
+        manager
+            .create(
+                "starting".into(),
+                CreateOptions::default(),
+                0,
+                TurnCancellation::default(),
+                None,
+            )
+            .await
+    });
+    scenario
+        .wait_for(|request| matches!(request, LoggedRequest::New { .. }))
+        .await;
+    assert!(scenario.manager.shutdown().await.is_err());
+    MockAcpScenario::release(&scenario.new_release);
+    assert!(creation.await.unwrap().is_err());
+    assert!(
+        scenario
+            .manager
+            .list(&TurnCancellation::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
+}
+
+#[tokio::test]
+async fn shutdown_propagates_child_close_failure() {
+    let scenario = MockAcpScenario::new(ScenarioOptions {
+        fail_close_session: Some("branch-1"),
+        ..Default::default()
+    });
+    let source = scenario.create("source").await;
+    let branch = scenario
+        .spawn_fork(source, "branch")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(scenario.manager.shutdown().await.is_err());
+    assert!(scenario.manager.lookup(&branch).is_err());
+    assert!(logged_requests(&scenario.requests).iter().any(|request| {
+        matches!(request, LoggedRequest::Close { session_id } if session_id == "branch-1")
+    }));
+}

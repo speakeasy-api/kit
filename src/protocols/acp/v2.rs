@@ -606,7 +606,7 @@ enum Command {
         cancellation_generation: u64,
     },
     Close {
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), AcpRuntimeError>>,
     },
 }
 
@@ -1078,6 +1078,7 @@ impl Server {
         let busy = Arc::new(AtomicBool::new(false));
         let voice_state = crate::runtime::voice_state::VoiceState::default();
         let actor = SessionActor {
+            subagents: Some(driver.subagents.clone()),
             voice_monitor: voice_state.monitor(&canonical_transcript),
             session_id: session_id.clone(),
             runtime: Arc::clone(&self.runtime),
@@ -1130,10 +1131,16 @@ impl Server {
                 if let Some(commands) = weak.upgrade() {
                     let (reply, acknowledged) = oneshot::channel();
                     if commands.send(Command::Close { reply }).await.is_ok() {
-                        let _ = acknowledged.await;
+                        return acknowledged
+                            .await
+                            .map_err(|_| AcpRuntimeError::ClientClosed)?;
                     }
                 }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                Ok(())
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), AcpRuntimeError>> + Send>,
+                >
         });
         // Registration, durable identity commit, and local publication are one
         // critical section so logout cannot reopen admission around a dead actor.
@@ -1330,19 +1337,29 @@ impl Server {
             .map_err(|_| AcpRuntimeError::ClientClosed)?
             .remove(&request.session_id)
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
-        session.integration.close();
-        let (reply, acknowledged) = oneshot::channel();
-        session
-            .commands
-            .send(Command::Close { reply })
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        acknowledged
-            .await
-            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-        self.registry.remove(session.token);
-        Ok(wire::CloseSessionResponse::new())
+        let registry = self.registry.clone();
+        // Once removed, cleanup belongs to this task rather than the request.
+        tokio::spawn(async move {
+            let result = async {
+                super::cancel_background_jobs(&session.tasks, &session.background_jobs).await;
+                session.integration.close();
+                let (reply, acknowledged) = oneshot::channel();
+                session
+                    .commands
+                    .send(Command::Close { reply })
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                acknowledged
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)??;
+                Ok(wire::CloseSessionResponse::new())
+            }
+            .await;
+            registry.remove(session.token);
+            result
+        })
+        .await
+        .map_err(|_| AcpRuntimeError::ClientClosed)?
     }
 
     async fn read_subagent_transcript(
@@ -1422,6 +1439,7 @@ impl Server {
 }
 
 struct SessionActor<S: ModelSession> {
+    subagents: Option<crate::tools::subagent::Subagents>,
     voice_monitor: crate::runtime::voice_state::VoiceMonitor,
     session_id: wire::SessionId,
     runtime: Arc<Runtime>,
@@ -1444,6 +1462,7 @@ struct SessionActor<S: ModelSession> {
 
 async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>) {
     let SessionActor {
+        subagents,
         mut voice_monitor,
         session_id,
         runtime,
@@ -1579,7 +1598,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                 }
                 Some(Command::Close { reply }) => {
                     let v1_id = agentkit_acp::SessionId::new(session_id.to_string());
-                    super::clean_up_session(
+                    let cleaned = super::clean_up_session(
                         &runtime,
                         &v1_id,
                         &mut driver,
@@ -1587,8 +1606,23 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &background_jobs,
                     )
                     .await;
+                    let closed = super::close_subagents(subagents.as_ref()).await;
+                    // Cleanup can enqueue terminal lifecycle updates. Drain their
+                    // projection before the transport barrier, while still bound.
+                    let projected = activity.drain_tool_projection().await;
+                    let delivered = integration.flush_session_updates(&session_id).await;
+                    let delivery = projected.and(delivered);
                     drop(binding.take());
-                    let _ = reply.send(());
+                    let result = delivery.and_then(|()| {
+                        if cleaned && closed {
+                            Ok(())
+                        } else {
+                            Err(AcpRuntimeError::Loop(
+                                "session close cleanup did not complete".into(),
+                            ))
+                        }
+                    });
+                    let _ = reply.send(result);
                     break;
                 }
                 None => {
@@ -1601,6 +1635,7 @@ async fn session_actor<S: ModelSession + Send + 'static>(actor: SessionActor<S>)
                         &background_jobs,
                     )
                     .await;
+                    super::close_subagents(subagents.as_ref()).await;
                     break;
                 }
             },
@@ -5313,7 +5348,7 @@ mod tests {
             PendingSessionPublication {
                 token,
                 interrupt: Arc::new(|| {}),
-                close: Arc::new(|| Box::pin(async {})),
+                close: Arc::new(|| Box::pin(async { Ok(()) })),
                 actor: actor.abort_handle(),
                 completed: completion,
                 session_id,
@@ -5619,8 +5654,13 @@ mod tests {
         let close_release = Arc::clone(&release);
         let close = Arc::new(move || {
             let close_release = Arc::clone(&close_release);
-            Box::pin(async move { close_release.notify_one() })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            Box::pin(async move {
+                close_release.notify_one();
+                Ok(())
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<(), AcpRuntimeError>> + Send>,
+                >
         });
         let mut admission = registry.begin_attachment().unwrap();
         let actor_abort = actor_task.abort_handle();
