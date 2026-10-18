@@ -158,10 +158,31 @@ pub async fn authenticate(
 ) -> Result<(String, AuthorizationManager), String> {
     config.validate()?;
     validate_transport_url(url)?;
-    let manager = AuthorizationManager::new(url)
+    // rmcp 3.5.1's JWT exchange retains a non-Send form serializer across
+    // its HTTP await. Poll the upstream flow on one blocking worker, while the
+    // caller remains Send. Dropping the caller cancels the worker's async flow;
+    // no detached acquisition can publish into the owning OAuth session.
+    let url = url.to_owned();
+    let config = config.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::task::spawn_blocking(move || {
+        runtime.block_on(async move {
+            tokio::select! {
+                biased;
+                _ = cancelled => Err("machine OAuth acquisition cancelled".to_owned()),
+                result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    let manager = AuthorizationManager::new(&url).await.map_err(|_| "machine OAuth setup failed")?;
+                    authenticate_manager(manager, &config).await
+                }) => result.map_err(|_| "machine OAuth acquisition timed out".to_owned())?,
+            }
+        })
+    });
+    let result = worker
         .await
-        .map_err(|_| "machine OAuth setup failed")?;
-    authenticate_manager(manager, config).await
+        .map_err(|_| "machine OAuth worker failed".to_owned());
+    drop(cancel_on_drop);
+    result?
 }
 
 async fn authenticate_manager(
