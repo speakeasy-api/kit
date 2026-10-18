@@ -379,11 +379,15 @@ The main built-in defaults are:
 
 For example, with `model = "gpt-5.4"` in TOML, `kit prompt --model anthropic/claude-sonnet-4 ...` uses the CLI model. Omitting both CLI and TOML model selections uses `gpt-5.4`. The same CLI-over-TOML rule applies to `reasoning_effort` on `serve`, `acp`, `prompt`, and `tui`. Use `--reasoning-effort default` to override a configured value and leave effort unset. This preserves provider defaults, including `OPENROUTER_REASONING_EFFORT`. Environment variables used by a provider supply credentials or provider adapter settings; they do not change CLI-over-TOML precedence.
 
-## Project instructions from `AGENTS.md`
+## Global and project instructions from `AGENTS.md`
 
-Kit discovers `AGENTS.md` files at the project working directory and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
+Kit first loads `$HOME/.kit/AGENTS.md`, if present, as global assistant instructions. It then discovers `AGENTS.md` files at the project working directory and its ancestor directories and loads their content into the initial transcript as agent context. Put repository-wide guidance in a higher-level `AGENTS.md` and project-specific guidance nearer the selected root. The global file precedes the outermost-to-innermost project chain; each context item retains its source path. The native system prompt is unchanged. Choose `--root` deliberately because it controls both the working directory and which `AGENTS.md` instruction chain is loaded.
 
-If startup reports `could not load AGENTS.md context`, inspect the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
+Global and primary project instructions are snapshots taken when a new session starts. Editing the files does not change an active, resumed, or forked session's saved instructions; start a new session to apply changes. ACP additional-directory instructions still refresh on attachment, without reloading or duplicating global instructions. Missing files are skipped; other read errors fail loading. Like Kit configuration, the global path uses `HOME`; there is no separate Kit-home override.
+
+For managed deployments (including GKE), provision the global file in the runtime user's home before session startup. No REST bootstrap call is needed.
+
+If startup reports `could not load AGENTS.md context`, inspect the global file and the `AGENTS.md` files at the root and above it for read or loading problems. Changing `~/.kit/config.toml` does not replace project instructions; configuration selects runtime behavior, while `AGENTS.md` supplies instructions to the agent.
 
 ## Agent Skills
 
