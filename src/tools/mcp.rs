@@ -1881,50 +1881,49 @@ impl McpRuntime {
                 false
             };
         let session = self.inner.oauth_sessions.lock().await.get(&server).cloned();
-        if let Some(session) = session.filter(|session| session.machine.is_some()) {
-            if authentication_required
-                || session.machine_expires.load(Ordering::Acquire) <= machine::now()
-            {
-                // Own publication before acquisition: cancellation between token
-                // commit and transport update must isolate, not leave a fresh
-                // deadline paired with the transport's previous token.
-                let mut publication = self
-                    .begin_backend_publication()
-                    .await
-                    .map_err(ToolError::Unavailable)?;
-                let token = match session.refresh(&self.inner.credential_storage).await {
-                    Ok(token) => token,
-                    Err(error) => {
-                        publication.complete();
-                        return Err(ToolError::Unavailable(error.to_string()));
-                    }
-                };
-                let mut credentials = MetadataMap::new();
-                credentials.insert("access_token".into(), Value::String(token));
-                publication
-                    .backend()
-                    .map_err(ToolError::Unavailable)?
-                    .resolve_auth(AuthResolution::provided(
-                        connect_auth_request(&server),
-                        credentials,
-                    ))
-                    .await
-                    .map_err(|_| {
-                        ToolError::Unavailable("could not apply machine MCP credentials".into())
-                    })?;
-                publication.release_backend();
-                self.commit_auth_state(
-                    &server,
-                    &fingerprint,
-                    Some(&session),
-                    Some(None),
-                    ServerStatus::Connected,
-                    None,
-                )
+        if let Some(session) = session.filter(|session| session.machine.is_some())
+            && (authentication_required
+                || session.machine_expires.load(Ordering::Acquire) <= machine::now())
+        {
+            // Own publication before acquisition: cancellation between token
+            // commit and transport update must isolate, not leave a fresh
+            // deadline paired with the transport's previous token.
+            let mut publication = self
+                .begin_backend_publication()
                 .await
                 .map_err(ToolError::Unavailable)?;
-                publication.complete();
-            }
+            let token = match session.refresh(&self.inner.credential_storage).await {
+                Ok(token) => token,
+                Err(error) => {
+                    publication.complete();
+                    return Err(ToolError::Unavailable(error.to_string()));
+                }
+            };
+            let mut credentials = MetadataMap::new();
+            credentials.insert("access_token".into(), Value::String(token));
+            publication
+                .backend()
+                .map_err(ToolError::Unavailable)?
+                .resolve_auth(AuthResolution::provided(
+                    connect_auth_request(&server),
+                    credentials,
+                ))
+                .await
+                .map_err(|_| {
+                    ToolError::Unavailable("could not apply machine MCP credentials".into())
+                })?;
+            publication.release_backend();
+            self.commit_auth_state(
+                &server,
+                &fingerprint,
+                Some(&session),
+                Some(None),
+                ServerStatus::Connected,
+                None,
+            )
+            .await
+            .map_err(ToolError::Unavailable)?;
+            publication.complete();
         }
         self.ensure_healthy().map_err(ToolError::Unavailable)?;
         Ok(McpInvocationLease {

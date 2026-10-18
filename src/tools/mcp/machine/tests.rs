@@ -206,15 +206,18 @@ async fn credential_files_are_bounded_and_never_cached() {
 }
 
 #[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
+struct LogCapture(Arc<Mutex<String>>);
 
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Visitor<'a>(&'a mut String);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                write!(self.0, "{value:?}").unwrap();
+            }
+        }
+        event.record(&mut Visitor(&mut self.0.lock().unwrap()));
     }
 }
 
@@ -223,13 +226,9 @@ async fn vendor_token_fields_never_enter_debug_logs() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("secret");
     std::fs::write(&path, "file-secret-canary").unwrap();
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogWriter(logs.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
+    use tracing_subscriber::prelude::*;
+    let logs = Arc::new(Mutex::new(String::new()));
+    let subscriber = tracing_subscriber::registry().with(LogCapture(logs.clone()));
     async {
         tracing::debug!("outer-calibration");
         let issuer = Arc::new(Issuer {
@@ -242,7 +241,7 @@ async fn vendor_token_fields_never_enter_debug_logs() {
     }
     .with_subscriber(subscriber)
     .await;
-    let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let output = logs.lock().unwrap().clone();
     assert!(output.contains("outer-calibration"));
     assert!(!output.contains("file-secret-canary"));
     assert!(!output.contains("vendor-secret-canary"));

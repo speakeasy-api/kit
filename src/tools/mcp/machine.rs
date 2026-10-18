@@ -168,13 +168,22 @@ pub async fn authenticate(
     let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
     let worker = tokio::task::spawn_blocking(move || {
         runtime.block_on(async move {
-            tokio::select! {
-                biased;
-                _ = cancelled => Err("machine OAuth acquisition cancelled".to_owned()),
-                result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                    let manager = AuthorizationManager::new(&url).await.map_err(|_| "machine OAuth setup failed")?;
+            let acquisition = std::pin::pin!(tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                async {
+                    let manager = AuthorizationManager::new(url.as_str())
+                        .await
+                        .map_err(|_| "machine OAuth setup failed")?;
                     authenticate_manager(manager, &config).await
-                }) => result.map_err(|_| "machine OAuth acquisition timed out".to_owned())?,
+                }
+            ));
+            match futures_util::future::select(cancelled, acquisition).await {
+                futures_util::future::Either::Left(_) => {
+                    Err("machine OAuth acquisition cancelled".to_owned())
+                }
+                futures_util::future::Either::Right((result, _)) => {
+                    result.map_err(|_| "machine OAuth acquisition timed out".to_owned())?
+                }
             }
         })
     });
