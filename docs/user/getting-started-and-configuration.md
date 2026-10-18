@@ -40,7 +40,7 @@ tarball with the full feature set, not a static musl tarball.
 
 ## Choose a provider and authenticate
 
-Kit supports `openai-subscription`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
+Kit supports `openai-subscription`, `anthropic`, `openrouter`, and `speakeasy`. The default provider is `openai-subscription`, and the default model is `gpt-5.4`. A `--provider` or `--model` command-line value overrides the corresponding value in `~/.kit/config.toml`.
 
 ### ChatGPT subscription with native OpenAI login
 
@@ -69,6 +69,37 @@ Use `kit auth status openai` to check the credential.
 `kit auth logout openai` revokes the refresh token before local deletion and keeps
 the local credential if revocation fails. `kit auth logout openai --local-only`
 skips revocation and prints a warning.
+
+### Direct Anthropic API
+
+Use a **single-workspace API key** from [Claude Console](https://platform.claude.com/settings/keys).
+Kit uses the Anthropic API directly, not Claude Max subscription OAuth:
+
+```sh
+kit auth login anthropic --credential-store keychain
+kit auth status anthropic --credential-store keychain
+kit prompt --provider anthropic --model claude-sonnet-5-5 \
+  --credential-store keychain "Summarize this project"
+kit auth logout anthropic --credential-store keychain
+```
+
+Login reads the key at a hidden prompt, validates it with the non-inference Models
+API, and saves it only on success. Use the same persistent credential store for
+login and runtime commands. File storage is also supported with
+`--credential-store file --credential-dir /path/to/private-directory`.
+Alternatively, set `ANTHROPIC_API_KEY`; a nonempty environment key overrides the
+saved key. Do not put API keys in command-line arguments or `config.toml`.
+Multi-workspace keys that require an explicit workspace header are not supported.
+
+Use direct Anthropic model IDs with `--model`, not OpenRouter's
+`anthropic/…` IDs. Kit discovers available models, context limits, and thinking
+capabilities from the authenticated Anthropic Models API rather than a fixed
+model list. If discovery is unavailable, an explicitly selected model remains
+usable with default reasoning; Kit does not guess its context limit. Responses
+have an output limit of at most 16,384 tokens, capped by the model's advertised
+maximum when available. Leave `reasoning_effort` unset for the provider default,
+or select `low`, `medium`, or `high` when discovery confirms support. Logout deletes the locally
+saved key; revoke it in Claude Console to disable it remotely. An environment key remains active after logout.
 
 ### OpenRouter API key and model
 
@@ -286,7 +317,7 @@ subdir = "agent-plugins/example"
 
 `root`, `provider`, `model`, and credential settings apply to all four runtime commands. Subagent model aliases and explicit-override allowlists are scoped by fully qualified harness under `[subagent.harnesses."acp.name"]`. Omitting `allow_model_overrides` permits all explicit model selections accepted by that harness; an empty list disables explicit model overrides. This policy does not restrict the harness's inherited or default model.
 
-`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP export of AgentKit's GenAI trace spans. `otel_protocol` accepts exactly `grpc`, `http/protobuf`, or `http/json`; gRPC is the default. For either HTTP protocol, Kit appends `/v1/traces` to a base endpoint unless it already ends with that path. `credential_store` selects one backend for OpenAI, Speakeasy, and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone OpenAI and Speakeasy login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
+`a2a` applies to `serve` and `tui`. Configured plugins can provide MCP servers without `mcp_config`; supported `stdio` and `streamable-http` declarations are registered, while `sse` declarations are skipped with a stderr diagnostic. MCP servers merge by name in this order: plugins, configured `mcp_config`, `<canonical-root>/.mcp.json`, then `--mcp-config`. Higher layers replace whole conflicts while preserving non-conflicting lower entries; live removal reveals the next lower layer. Plugin data is stored under `<config-directory>/plugin-data/<plugin-manifest-name>`. See [Agent Plugins](agent-plugins.md) for placeholders, collision rules, and ACP child behavior. `otel_endpoint` enables OTLP export of AgentKit's GenAI trace spans. `otel_protocol` accepts exactly `grpc`, `http/protobuf`, or `http/json`; gRPC is the default. For either HTTP protocol, Kit appends `/v1/traces` to a base endpoint unless it already ends with that path. `credential_store` selects one backend for model providers and MCP and defaults to `memory`; selecting `file` requires `credential_dir`, while a credential directory is invalid with `memory` or `keychain`. Memory credentials are process-local and are not shared with the TUI server process or nested Kit children. Standalone provider login requires persistent `keychain` or `file` storage. ACP profiles are direct executable-and-argument configurations, not shell command strings. `[subagent].harness` must name an available fully qualified profile such as `acp.review`; otherwise startup reports `unknown subagent ACP harness`. When no subagent harness is selected, the built-in `acp.kit` profile is used.
 
 Agent hooks are configured in `~/.agents/hooks.json` and `<root>/.agents/hooks.json`. See [Agent Hooks Protocol](agent-hooks-protocol.md).
 
@@ -376,7 +407,7 @@ The hidden-tool catalog is captured when Kit creates the session's compose sourc
 
 ## Troubleshoot startup and configuration
 
-- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
+- **`invalid config ...`**: validate known values and TOML types. Unknown fields are ignored; provider values are exactly `openai-subscription`, `anthropic`, `openrouter`, and `speakeasy`, and credential-store values are `memory`, `keychain`, and `file`.
 - **`could not read config ...`**: check permissions and that `$HOME/.kit/config.toml` is a readable regular file. Deleting an unwanted config is valid because a missing file falls back to defaults.
 - **`credential_dir is required when credential_store is file`**: add the directory or choose another store.
 - **`credential_dir requires credential_store to be file`**: remove the directory or select `file`.

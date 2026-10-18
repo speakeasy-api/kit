@@ -10,6 +10,8 @@ kit usage openrouter --credential-store keychain
 ```
 
 Supported providers are `openai` (also `openai-subscription`) and `openrouter`.
+Direct Anthropic API credit balances are not available through `kit usage`; check
+Billing in Claude Console.
 Omit the provider to check authenticated supported providers. The command uses the effective
 credential storage from configuration and CLI overrides (`--credential-store` and
 `--credential-dir`). OpenRouter also uses the effective `--openrouter-api-key` or

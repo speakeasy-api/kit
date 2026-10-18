@@ -509,49 +509,15 @@ fn draw_file_picker(
     );
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum ModelDialogRow<'a> {
-    Provider(&'a str),
-    Choice { index: usize, label: String },
-}
-
-fn model_dialog_rows<'a>(
-    choices: &[&'a crate::tui::app::ModelChoice],
-    grouped: bool,
-) -> Vec<ModelDialogRow<'a>> {
-    let mut rows = Vec::new();
-    let mut last_provider = None;
-    for (index, choice) in choices.iter().enumerate() {
-        if grouped && last_provider != Some(choice.provider.as_str()) {
-            rows.push(ModelDialogRow::Provider(&choice.provider));
-            last_provider = Some(&choice.provider);
-        }
-        let label = if grouped {
-            choice.model.clone()
-        } else {
-            format!("{} · {}", choice.provider, choice.model)
-        };
-        rows.push(ModelDialogRow::Choice { index, label });
-    }
-    rows
-}
-
-fn model_dialog_viewport(
-    rows: &[ModelDialogRow<'_>],
-    selected: usize,
-    height: usize,
-) -> std::ops::Range<usize> {
-    if height == 0 || rows.is_empty() {
+fn model_dialog_viewport(len: usize, selected: usize, height: usize) -> Range<usize> {
+    if height == 0 || len == 0 {
         return 0..0;
     }
-    let selected_row = rows
-        .iter()
-        .position(|row| matches!(row, ModelDialogRow::Choice { index, .. } if *index == selected))
-        .unwrap_or(0);
-    let start = selected_row
+    let start = selected
+        .min(len - 1)
         .saturating_sub(height / 2)
-        .min(rows.len().saturating_sub(height));
-    start..(start + height).min(rows.len())
+        .min(len.saturating_sub(height));
+    start..(start + height).min(len)
 }
 
 fn visible_query_tail(query: &str, width: usize) -> &str {
@@ -816,12 +782,31 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
         width,
         height,
     );
-    let choices = app.selected_model_choices();
+    let (labels, title, enter, esc) = match &dialog.provider {
+        None => (
+            app.selected_model_providers()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            " provider ".to_owned(),
+            "open",
+            "close",
+        ),
+        Some(provider) => (
+            app.selected_model_choices()
+                .into_iter()
+                .map(|choice| choice.model.clone())
+                .collect(),
+            format!(" {provider} · model "),
+            "select",
+            "back",
+        ),
+    };
     let footer = format!(
-        "tab defaults [{}]  ·  enter select  ·  esc close",
+        "tab defaults [{}]  ·  enter {enter}  ·  esc {esc}",
         if dialog.save_defaults { "x" } else { " " }
     );
-    let panel = Panel::bordered().title(" model ");
+    let panel = Panel::bordered().title(title);
     let inner = panel.inner(area);
     let footer_rows = u16::from(inner.height >= 3);
     let search_rows = u16::from(inner.height >= 2);
@@ -832,24 +817,19 @@ fn draw_model_dialog(frame: &mut Frame<'_>, app: &App, dialog: &ModelDialog) {
     ])
     .areas(inner);
     let visible = list.height as usize;
-    let rows = model_dialog_rows(&choices, dialog.query.trim().is_empty());
-    let viewport = model_dialog_viewport(&rows, dialog.selected, visible);
-    let lines = rows[viewport]
+    let viewport = model_dialog_viewport(labels.len(), dialog.selected, visible);
+    let lines = labels[viewport.clone()]
         .iter()
-        .map(|row| match row {
-            ModelDialogRow::Provider(provider) => {
-                Line::from(Span::styled((*provider).to_owned(), theme::faint()))
-            }
-            ModelDialogRow::Choice { index, label } => {
-                let selected = *index == dialog.selected;
-                let marker = if selected { "› " } else { "  " };
-                let style = if selected {
-                    theme::accent()
-                } else {
-                    theme::text()
-                };
-                Line::from(Span::styled(format!("{marker}{label}"), style))
-            }
+        .zip(viewport)
+        .map(|(label, index)| {
+            let selected = index == dialog.selected;
+            let marker = if selected { "› " } else { "  " };
+            let style = if selected {
+                theme::accent()
+            } else {
+                theme::text()
+            };
+            Line::from(Span::styled(format!("{marker}{label}"), style))
         })
         .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
@@ -3358,8 +3338,8 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use super::{
-        ImageRuntime, MAX_PROMPT_ROWS, ModelDialogRow, agent_lines, body_layout, draw, draw_agents,
-        model_dialog_rows, model_dialog_viewport, native_links_obscured, prompt_lines,
+        ImageRuntime, MAX_PROMPT_ROWS, agent_lines, body_layout, draw, draw_agents,
+        model_dialog_viewport, native_links_obscured, prompt_lines,
         refresh_transcript_cache_with_images, truncate_to_width, user_block_rows, user_line,
     };
     use crate::{
@@ -4730,42 +4710,9 @@ mod tests {
 
     #[test]
     fn model_viewport_keeps_a_selection_beyond_the_first_page_visible() {
-        let choices = (0..8)
-            .map(|index| model_choice("provider", &format!("model-{index}")))
-            .collect::<Vec<_>>();
-        let choices = choices.iter().collect::<Vec<_>>();
-        let rows = model_dialog_rows(&choices, true);
-        let viewport = model_dialog_viewport(&rows, 6, 4);
-
-        assert!(
-            rows[viewport]
-                .iter()
-                .any(|row| matches!(row, ModelDialogRow::Choice { index: 6, .. }))
-        );
-    }
-
-    #[test]
-    fn model_viewport_counts_provider_headers_at_group_boundaries() {
-        let choices = [
-            model_choice("alpha", "one"),
-            model_choice("alpha", "two"),
-            model_choice("beta", "three"),
-            model_choice("beta", "four"),
-        ];
-        let choices = choices.iter().collect::<Vec<_>>();
-        let rows = model_dialog_rows(&choices, true);
-        let viewport = model_dialog_viewport(&rows, 2, 2);
-
-        assert_eq!(
-            &rows[viewport],
-            &[
-                ModelDialogRow::Provider("beta"),
-                ModelDialogRow::Choice {
-                    index: 2,
-                    label: "three".into(),
-                },
-            ]
-        );
+        assert_eq!(model_dialog_viewport(8, 6, 4), 4..8);
+        assert_eq!(model_dialog_viewport(8, 1, 4), 0..4);
+        assert_eq!(model_dialog_viewport(0, 0, 4), 0..0);
     }
 
     #[test]
@@ -4802,6 +4749,7 @@ mod tests {
             query: String::new(),
             selected: 9,
             save_defaults: false,
+            provider: Some("provider".into()),
         });
 
         let frame = render(&mut app, 24, 8);
@@ -4809,6 +4757,37 @@ mod tests {
 
         let tiny = render(&mut app, 16, 3);
         assert!(tiny.contains("› model-9"), "{tiny}");
+    }
+
+    #[test]
+    fn model_dialog_provider_page_lists_only_providers() {
+        let mut app = sample();
+        app.model_choices = vec![
+            model_choice("alpha", "one"),
+            model_choice("alpha", "two"),
+            model_choice("beta", "three"),
+        ];
+        app.model_dialog = Some(ModelDialog {
+            query: String::new(),
+            selected: 1,
+            save_defaults: false,
+            provider: None,
+        });
+
+        let frame = render(&mut app, 60, 12);
+        assert!(frame.contains("provider"), "{frame}");
+        assert!(frame.contains("  alpha"), "{frame}");
+        assert!(frame.contains("› beta"), "{frame}");
+        assert!(!frame.contains("three"), "{frame}");
+        assert!(frame.contains("esc close"), "{frame}");
+
+        app.model_dialog.as_mut().unwrap().provider = Some("alpha".into());
+        app.model_dialog.as_mut().unwrap().selected = 0;
+        let models = render(&mut app, 60, 12);
+        assert!(models.contains("alpha · model"), "{models}");
+        assert!(models.contains("› one"), "{models}");
+        assert!(!models.contains("three"), "{models}");
+        assert!(models.contains("esc back"), "{models}");
     }
 
     #[test]

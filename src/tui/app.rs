@@ -237,6 +237,8 @@ pub struct ModelDialog {
     pub query: String,
     pub selected: usize,
     pub save_defaults: bool,
+    /// `None` shows the provider page; `Some` shows that provider's models.
+    pub provider: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1054,9 +1056,24 @@ fn ordered_token_score(candidate: &[String], query: &[String]) -> Option<ModelSc
         .min()
 }
 
-fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
+fn rank_by_name<T>(items: Vec<T>, query: &str, name: impl Fn(&T) -> &str) -> Vec<T> {
+    if query.trim().is_empty() {
+        return items;
+    }
+    let mut ranked = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            model_score(name(&item), "", query).map(|score| (score, index, item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(score, index, _)| (*score, *index));
+    ranked.into_iter().map(|(_, _, item)| item).collect()
+}
+
+fn model_score(name: &str, qualifier: &str, query: &str) -> Option<ModelScore> {
     let query = query.trim().to_lowercase();
-    let model = choice.model.to_lowercase();
+    let model = name.to_lowercase();
     let basename = model.rsplit('/').next().unwrap_or(&model);
     let query_tokens = model_tokens(&query);
     if query_tokens.is_empty() {
@@ -1100,7 +1117,7 @@ fn model_score(choice: &ModelChoice, query: &str) -> Option<ModelScore> {
         return Some(score);
     }
 
-    let mut all_tokens = model_tokens(&choice.provider);
+    let mut all_tokens = model_tokens(qualifier);
     all_tokens.extend(candidate_tokens);
     ordered_token_score(&all_tokens, &query_tokens).map(|score| ModelScore { tier: 4, ..score })
 }
@@ -3524,23 +3541,101 @@ impl App {
         self.effort_choices = choices;
     }
 
+    /// Distinct providers in catalog order.
+    fn model_providers(&self) -> Vec<&str> {
+        let mut providers = Vec::<&str>::new();
+        for choice in &self.model_choices {
+            if !providers.contains(&choice.provider.as_str()) {
+                providers.push(&choice.provider);
+            }
+        }
+        providers
+    }
+
+    fn provider_models<'a>(&'a self, provider: &'a str) -> impl Iterator<Item = &'a ModelChoice> {
+        self.model_choices
+            .iter()
+            .filter(move |choice| choice.provider == provider)
+    }
+
+    /// Providers matching the search on the provider page; empty on the model page.
+    pub fn selected_model_providers(&self) -> Vec<&str> {
+        match &self.model_dialog {
+            Some(dialog) if dialog.provider.is_none() => {
+                rank_by_name(self.model_providers(), &dialog.query, |provider| provider)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Models of the chosen provider matching the search; empty on the provider page.
     pub fn selected_model_choices(&self) -> Vec<&ModelChoice> {
         let Some(dialog) = &self.model_dialog else {
             return Vec::new();
         };
-        if dialog.query.trim().is_empty() {
-            return self.model_choices.iter().collect();
+        let Some(provider) = &dialog.provider else {
+            return Vec::new();
+        };
+        rank_by_name(
+            self.provider_models(provider).collect(),
+            &dialog.query,
+            |choice| &choice.model,
+        )
+    }
+
+    fn model_dialog_len(&self) -> usize {
+        match &self.model_dialog {
+            Some(dialog) if dialog.provider.is_some() => self.selected_model_choices().len(),
+            _ => self.selected_model_providers().len(),
         }
-        let mut choices = self
-            .model_choices
+    }
+
+    fn open_model_dialog(&mut self) {
+        let selected = self
+            .model_providers()
             .iter()
-            .enumerate()
-            .filter_map(|(index, choice)| {
-                model_score(choice, &dialog.query).map(|score| (score, index, choice))
-            })
-            .collect::<Vec<_>>();
-        choices.sort_by_key(|(score, index, _)| (*score, *index));
-        choices.into_iter().map(|(_, _, choice)| choice).collect()
+            .position(|provider| *provider == self.provider)
+            .unwrap_or(0);
+        self.model_dialog = Some(ModelDialog {
+            query: String::new(),
+            selected,
+            save_defaults: false,
+            provider: None,
+        });
+    }
+
+    fn open_model_provider(&mut self, provider: String) {
+        let selected = if provider == self.provider {
+            self.provider_models(&provider)
+                .position(|choice| choice.model == self.model)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if let Some(dialog) = &mut self.model_dialog {
+            dialog.query.clear();
+            dialog.selected = selected;
+            dialog.provider = Some(provider);
+        }
+    }
+
+    fn close_model_provider(&mut self) {
+        let Some(provider) = self
+            .model_dialog
+            .as_mut()
+            .and_then(|dialog| dialog.provider.take())
+        else {
+            return;
+        };
+        let selected = self
+            .model_providers()
+            .iter()
+            .position(|candidate| *candidate == provider)
+            .unwrap_or(0);
+        if let Some(dialog) = &mut self.model_dialog {
+            dialog.query.clear();
+            dialog.selected = selected;
+        }
     }
 
     fn closest_model(&self, query: &str) -> Option<ModelChoice> {
@@ -3548,7 +3643,8 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, choice)| {
-                model_score(choice, query).map(|score| (score, index, choice))
+                model_score(&choice.model, &choice.provider, query)
+                    .map(|score| (score, index, choice))
             })
             .min_by_key(|(score, index, _)| (*score, *index))
             .map(|(_, _, choice)| choice.clone())
@@ -3556,7 +3652,17 @@ impl App {
 
     fn handle_model_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
-            KeyCode::Esc => self.model_dialog = None,
+            KeyCode::Esc => {
+                if self
+                    .model_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.provider.is_some())
+                {
+                    self.close_model_provider();
+                } else {
+                    self.model_dialog = None;
+                }
+            }
             KeyCode::Tab => {
                 if let Some(dialog) = &mut self.model_dialog {
                     dialog.save_defaults = !dialog.save_defaults;
@@ -3568,7 +3674,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let count = self.selected_model_choices().len();
+                let count = self.model_dialog_len();
                 if let Some(dialog) = &mut self.model_dialog {
                     dialog.selected = (dialog.selected + 1).min(count.saturating_sub(1));
                 }
@@ -3580,6 +3686,21 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                let selected = self.model_dialog.as_ref().map_or(0, |value| value.selected);
+                if self
+                    .model_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.provider.is_none())
+                {
+                    let provider = self
+                        .selected_model_providers()
+                        .get(selected)
+                        .map(|provider| (*provider).to_owned());
+                    if let Some(provider) = provider {
+                        self.open_model_provider(provider);
+                    }
+                    return Action::None;
+                }
                 let choice = self
                     .selected_model_choices()
                     .get(self.model_dialog.as_ref().map_or(0, |value| value.selected))
@@ -4519,11 +4640,7 @@ impl App {
                         if self.model_choices.is_empty() {
                             self.toast("no models are available");
                         } else {
-                            self.model_dialog = Some(ModelDialog {
-                                query: String::new(),
-                                selected: 0,
-                                save_defaults: false,
-                            });
+                            self.open_model_dialog();
                         }
                         Action::None
                     }
@@ -9146,6 +9263,7 @@ mod tests {
             query: "claude sonet".into(),
             selected: 0,
             save_defaults: false,
+            provider: Some("anthropic".into()),
         });
 
         let ranked = app.selected_model_choices();
@@ -9154,11 +9272,74 @@ mod tests {
                 .iter()
                 .map(|choice| choice.model.as_str())
                 .collect::<Vec<_>>(),
-            ["anthropic/claude-sonnet-4", "claude-3-7-sonnet"]
+            ["claude-3-7-sonnet"]
         );
+
+        app.model_dialog.as_mut().unwrap().query = "gpt".into();
+        assert!(app.selected_model_choices().is_empty());
 
         app.model_dialog.as_mut().unwrap().query = "totally unrelated".into();
         assert!(app.selected_model_choices().is_empty());
+    }
+
+    #[test]
+    fn model_dialog_navigates_from_providers_to_models_and_back() {
+        let mut app = app();
+        app.set_model_choices(similar_models());
+        app.editor.insert_str("/model");
+        assert!(matches!(
+            app.handle_key(press(KeyCode::Enter)),
+            Action::None
+        ));
+        // Opens on the provider page with the current provider selected.
+        let dialog = app.model_dialog.as_ref().expect("model dialog");
+        assert_eq!(dialog.provider, None);
+        assert_eq!(dialog.selected, 0);
+        assert_eq!(
+            app.selected_model_providers(),
+            ["openai-subscription", "anthropic", "openrouter"]
+        );
+        assert!(app.selected_model_choices().is_empty());
+
+        // Provider search matches provider names only.
+        for character in "openr".chars() {
+            app.handle_key(press(KeyCode::Char(character)));
+        }
+        assert_eq!(app.selected_model_providers(), ["openrouter"]);
+        app.handle_key(press(KeyCode::Enter));
+        let dialog = app.model_dialog.as_ref().expect("model dialog");
+        assert_eq!(dialog.provider.as_deref(), Some("openrouter"));
+        assert_eq!(dialog.query, "");
+        assert!(app.selected_model_providers().is_empty());
+        assert_eq!(
+            app.selected_model_choices()
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            ["anthropic/claude-sonnet-4"]
+        );
+
+        // Esc returns to providers with a fresh search and the provider selected.
+        app.handle_key(press(KeyCode::Char('x')));
+        app.handle_key(press(KeyCode::Esc));
+        let dialog = app.model_dialog.as_ref().expect("model dialog");
+        assert_eq!(dialog.provider, None);
+        assert_eq!(dialog.query, "");
+        assert_eq!(dialog.selected, 2);
+
+        // The current model is preselected within the current provider.
+        app.model_dialog.as_mut().unwrap().selected = 0;
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.model_dialog.as_ref().unwrap().selected, 2);
+        let Action::SelectModel { choice, .. } = app.handle_key(press(KeyCode::Enter)) else {
+            panic!("expected model selection");
+        };
+        assert_eq!(choice.model, "gpt-5.4");
+        assert!(app.model_dialog.is_none());
+
+        app.open_model_dialog();
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.model_dialog.is_none());
     }
 
     #[test]

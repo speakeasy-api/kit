@@ -329,6 +329,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-provider-anthropic"
+version = "0.10.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa41fff5bbb3dbda6925b67fc40a005b6c4627e7a2b37d6c8a864ba4ffff02c6"
+dependencies = [
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-tools-core",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "agentkit-provider-openai"
 version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3115,6 +3133,7 @@ dependencies = [
  "agentkit-loop",
  "agentkit-mcp",
  "agentkit-plugins",
+ "agentkit-provider-anthropic",
  "agentkit-provider-openai",
  "agentkit-provider-openrouter",
  "agentkit-task-manager",

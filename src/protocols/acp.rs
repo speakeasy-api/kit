@@ -127,6 +127,12 @@ const TERMINAL_AUTH_METHODS: &[TerminalAuthMethodSpec] = &[
         description: "Authenticate Kit with Speakeasy",
         provider: ProviderKind::Speakeasy,
     },
+    TerminalAuthMethodSpec {
+        method_id: "anthropic",
+        name: "Sign in with Anthropic",
+        description: "Authenticate Kit with an Anthropic API key",
+        provider: ProviderKind::Anthropic,
+    },
 ];
 
 pub(crate) fn terminal_auth_method_specs() -> &'static [TerminalAuthMethodSpec] {
@@ -2190,6 +2196,7 @@ pub(super) fn config_options(
                 crate::ProviderKind::OpenAiSubscription => "OpenAI subscription",
                 crate::ProviderKind::OpenRouter => "OpenRouter",
                 crate::ProviderKind::Speakeasy => "Speakeasy",
+                crate::ProviderKind::Anthropic => "Anthropic",
             };
             let options = group
                 .models
@@ -3407,7 +3414,7 @@ pub(super) mod tests {
             .auth(agentkit_acp::AuthCapabilities::new().terminal(true));
         assert!(terminal_auth_methods(&capabilities, |_| false).is_empty());
         let methods = terminal_auth_methods(&capabilities, |_| true);
-        assert_eq!(methods.len(), 3);
+        assert_eq!(methods.len(), 4);
         assert!(matches!(
             &methods[0],
             AuthMethod::Terminal(method)
@@ -3437,7 +3444,13 @@ pub(super) mod tests {
                 _ => unreachable!("only terminal methods are advertised"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(method_ids, ["openai", "speakeasy"]);
+        assert_eq!(method_ids, ["openai", "speakeasy", "anthropic"]);
+        assert!(
+            terminal_auth_method_specs()
+                .iter()
+                .any(|method| method.method_id == "anthropic"
+                    && method.provider == ProviderKind::Anthropic)
+        );
     }
 
     #[test]
@@ -3934,7 +3947,7 @@ pub(super) mod tests {
         meta.insert("terminal-auth".into(), serde_json::Value::Bool(true));
         let capabilities = agentkit_acp::ClientCapabilities::new().meta(meta);
 
-        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 3);
+        assert_eq!(terminal_auth_methods(&capabilities, |_| true).len(), 4);
     }
 
     struct CompletionOnDrop(watch::Sender<bool>);

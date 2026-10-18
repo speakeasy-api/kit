@@ -791,6 +791,7 @@ impl Runtime {
             ProviderKind::OpenAiSubscription,
             ProviderKind::OpenRouter,
             ProviderKind::Speakeasy,
+            ProviderKind::Anthropic,
         ]
         .into_iter()
         .filter_map(|provider| {
