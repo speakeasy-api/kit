@@ -209,8 +209,14 @@ async fn completions_and_openrouter_encode_parallel_mixed_replay_as_user_images(
     let projected = project_tool_output_images(request(), false).unwrap();
     let speakeasy = SpeakeasyProvider {
         openrouter: OpenRouterProvider::from(OpenRouterConfig::new("test", "test/model")),
-        api_key: "test".into(),
-        project: "test".into(),
+        auth: crate::provider::speakeasy_runtime::Authentication::Legacy(
+            crate::provider::speakeasy_auth::Credentials {
+                api_key: "test".into(),
+                project: "test".into(),
+                email: None,
+                organization_id: None,
+            },
+        ),
         chat_id: None,
     };
     assert_wire(speakeasy, projected.clone()).await;

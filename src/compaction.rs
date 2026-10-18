@@ -411,15 +411,42 @@ pub fn automatic_with_policy<M>(
 where
     M: ModelAdapter + Clone + 'static,
 {
+    automatic_with_policy_and_metadata(
+        adapter,
+        telemetry,
+        persistence,
+        session_id,
+        owner_session_id,
+        hooks,
+        policy,
+        MetadataMap::new(),
+    )
+}
+
+/// Builds a compactor with configured thresholds and immutable inference metadata.
+pub(crate) fn automatic_with_policy_and_metadata<M>(
+    adapter: M,
+    telemetry: TelemetryConfig,
+    persistence: Option<SessionObserver>,
+    session_id: impl Into<SessionId>,
+    owner_session_id: impl Into<SessionId>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
+    policy: CompactionConfig,
+    session_metadata: MetadataMap,
+) -> Result<AutomaticCompactor, String>
+where
+    M: ModelAdapter + Clone + 'static,
+{
     policy.validate()?;
     Ok(AutomaticCompactor {
-        inner: strategy(
+        inner: strategy_with_metadata(
             adapter,
             telemetry,
             session_id,
             owner_session_id,
             hooks,
             policy,
+            session_metadata,
         ),
         persistence,
         mirror: None,
@@ -440,7 +467,32 @@ pub(crate) fn strategy<M>(
 where
     M: ModelAdapter + Clone + 'static,
 {
+    strategy_with_metadata(
+        adapter,
+        telemetry,
+        session_id,
+        owner_session_id,
+        hooks,
+        policy,
+        MetadataMap::new(),
+    )
+}
+
+/// Builds a frozen preparation pipeline sharing its owner's inference metadata.
+pub(crate) fn strategy_with_metadata<M>(
+    adapter: M,
+    telemetry: TelemetryConfig,
+    session_id: impl Into<SessionId>,
+    owner_session_id: impl Into<SessionId>,
+    hooks: Option<Arc<crate::ahp::Hooks>>,
+    policy: CompactionConfig,
+    session_metadata: MetadataMap,
+) -> StrategyCompactor
+where
+    M: ModelAdapter + Clone + 'static,
+{
     let backend = KitCompactionBackend {
+        session_metadata,
         adapter,
         telemetry,
         session_id: session_id.into(),
@@ -463,6 +515,7 @@ where
 }
 
 struct KitCompactionBackend<M> {
+    session_metadata: MetadataMap,
     adapter: M,
     telemetry: TelemetryConfig,
     session_id: SessionId,
@@ -700,7 +753,11 @@ where
                 }
                 let mut driver = builder
                     .build()?
-                    .start(SessionConfig::new(self.session_id.clone()).without_cache())
+                    .start(
+                        SessionConfig::new(self.session_id.clone())
+                            .with_metadata(self.session_metadata.clone())
+                            .without_cache(),
+                    )
                     .await?;
                 loop {
                     match driver.next().await? {
@@ -1303,6 +1360,7 @@ mod tests {
     #[derive(Clone)]
     struct RejectingSummary {
         requests: std::sync::mpsc::Sender<String>,
+        expected_metadata: MetadataMap,
         context_error: bool,
         accept_below: usize,
     }
@@ -1312,7 +1370,8 @@ mod tests {
     #[async_trait]
     impl ModelAdapter for RejectingSummary {
         type Session = Self;
-        async fn start_session(&self, _: SessionConfig) -> Result<Self, LoopError> {
+        async fn start_session(&self, config: SessionConfig) -> Result<Self, LoopError> {
+            assert_eq!(config.metadata, self.expected_metadata);
             Ok(self.clone())
         }
     }
@@ -1396,8 +1455,10 @@ mod tests {
         let (requests, receiver) = std::sync::mpsc::channel();
         (
             KitCompactionBackend {
+                session_metadata: MetadataMap::new(),
                 adapter: RejectingSummary {
                     requests,
+                    expected_metadata: MetadataMap::new(),
                     context_error,
                     accept_below,
                 },
@@ -1408,6 +1469,20 @@ mod tests {
             },
             receiver,
         )
+    }
+
+    #[tokio::test]
+    async fn summary_preserves_session_metadata_across_typed_retries() {
+        let (mut backend, requests) = rejecting_backend(true, 10_000);
+        let metadata = MetadataMap::from_iter([("owner-binding".into(), json!("immutable"))]);
+        backend.session_metadata = metadata.clone();
+        backend.adapter.expected_metadata = metadata;
+        let result = backend
+            .summarize(recovery_summary_request(), None)
+            .await
+            .unwrap();
+        assert_eq!(item_text(&result.items[0]), Some("checkpoint"));
+        assert!(requests.try_iter().count() > 1);
     }
 
     #[tokio::test]
@@ -1502,6 +1577,7 @@ mod tests {
         let (backend, requests) = rejecting_backend(true, 0);
         (
             KitCompactionBackend {
+                session_metadata: MetadataMap::new(),
                 adapter: StalledSummary {
                     inner: backend.adapter,
                     cancel_on_rejection: cancel,
@@ -1723,6 +1799,7 @@ mod tests {
             Arc::new(CancellingBackend(controller)),
         );
         let compactor = KitCompactionBackend {
+            session_metadata: MetadataMap::new(),
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("summarizer"),
@@ -1752,6 +1829,7 @@ mod tests {
             json!([{"type": "deny", "reason": "retain original context"}]),
         );
         let compactor = KitCompactionBackend {
+            session_metadata: MetadataMap::new(),
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("summarizer"),
@@ -1783,6 +1861,7 @@ mod tests {
             json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "from hook"}]}]),
         );
         let compactor = KitCompactionBackend {
+            session_metadata: MetadataMap::new(),
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("compaction"),
@@ -1824,6 +1903,7 @@ mod tests {
             json!([{"type": "return", "value": [{"id": "s/0", "kind": "text", "mediaType": "text/plain", "selection": "body", "text": "  "}]}]),
         );
         let compactor = KitCompactionBackend {
+            session_metadata: MetadataMap::new(),
             adapter: NoModelTurn,
             telemetry: TelemetryConfig::default(),
             session_id: SessionId::new("compaction"),

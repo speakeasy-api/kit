@@ -891,6 +891,7 @@ impl Server {
         let claim = self.runtime.claim_session()?;
         let attached = self
             .attach_session(
+                crate::runtime::gram_chat_id(request.meta.as_ref())?,
                 request.cwd.0,
                 request
                     .additional_directories
@@ -951,6 +952,7 @@ impl Server {
         }
         let attached = self
             .attach_session(
+                crate::runtime::gram_chat_id(request.meta.as_ref())?,
                 request.cwd.0,
                 request
                     .additional_directories
@@ -1016,6 +1018,7 @@ impl Server {
 
     async fn attach_session(
         self: &Arc<Self>,
+        gram_chat_id: Option<uuid::Uuid>,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
         mcp_servers: Vec<wire::McpServer>,
@@ -1056,6 +1059,7 @@ impl Server {
         )
         .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
+            gram_chat_id,
             cwd,
             additional_directories,
             integration: Arc::new(observer),

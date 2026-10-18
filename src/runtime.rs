@@ -322,7 +322,57 @@ pub(crate) struct AcpForkState {
     pub parent_context: Option<(String, String)>,
 }
 
+/// Canonical identity supplied by AICP, independent of Kit/ACP session IDs.
+pub(crate) const GRAM_CHAT_ID_KEY: &str = "ai.speakeasy/gram-chat-id";
+
+pub(crate) fn gram_chat_id(
+    metadata: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<uuid::Uuid>, AcpRuntimeError> {
+    metadata
+        .and_then(|meta| meta.get(GRAM_CHAT_ID_KEY))
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| {
+                    AcpRuntimeError::Loop("ai.speakeasy/gram-chat-id must be a non-nil UUID".into())
+                })
+        })
+        .transpose()
+}
+
+fn transcript_gram_chat_id(items: &[Item]) -> Result<Option<uuid::Uuid>, AcpRuntimeError> {
+    let mut binding = None;
+    for item in items {
+        if let Some(value) = item.metadata.get(GRAM_CHAT_ID_KEY) {
+            let metadata = serde_json::Map::from_iter([(GRAM_CHAT_ID_KEY.into(), value.clone())]);
+            let id = gram_chat_id(Some(&metadata))?;
+            if binding.is_some() && binding != id {
+                return Err(AcpRuntimeError::Loop(
+                    "conflicting Gram chat bindings in transcript".into(),
+                ));
+            }
+            binding = id;
+        }
+    }
+    Ok(binding)
+}
+
+fn validate_gram_chat_binding(
+    persisted: Option<uuid::Uuid>,
+    supplied: Option<uuid::Uuid>,
+) -> Result<(), AcpRuntimeError> {
+    if supplied.is_some() && supplied != persisted {
+        return Err(AcpRuntimeError::Loop(
+            "Gram chat binding cannot change on resume".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) struct AcpDriverContext<I = AcpIntegration> {
+    pub gram_chat_id: Option<uuid::Uuid>,
     pub cwd: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub integration: Arc<I>,
@@ -762,6 +812,16 @@ impl Runtime {
         persistence: Option<crate::session::SessionObserver>,
         owner_session: String,
     ) -> Result<crate::compaction::AutomaticCompactor, String> {
+        self.compactor_with_metadata(adapter, persistence, owner_session, MetadataMap::new())
+    }
+
+    fn compactor_with_metadata(
+        &self,
+        adapter: SelectableAdapter,
+        persistence: Option<crate::session::SessionObserver>,
+        owner_session: String,
+        session_metadata: MetadataMap,
+    ) -> Result<crate::compaction::AutomaticCompactor, String> {
         let prepare = self.base_depth == 0
             && persistence.is_some()
             && !self
@@ -773,7 +833,7 @@ impl Runtime {
         } else {
             format!("compaction-{owner_session}")
         };
-        let compactor = crate::compaction::automatic_with_policy(
+        let compactor = crate::compaction::automatic_with_policy_and_metadata(
             adapter.clone(),
             self.agentkit_telemetry(),
             persistence,
@@ -781,6 +841,7 @@ impl Runtime {
             owner_session.clone(),
             self.hooks.clone(),
             self.compaction,
+            session_metadata.clone(),
         )?;
         if !prepare {
             return Ok(compactor);
@@ -791,13 +852,14 @@ impl Runtime {
         Ok(compactor.with_preparation(
             move || {
                 let (frozen, revision) = adapter.compaction_snapshot()?;
-                let strategy = crate::compaction::strategy(
+                let strategy = crate::compaction::strategy_with_metadata(
                     frozen,
                     telemetry,
                     format!("precompaction-{}", crate::session::new_id()),
                     owner_session.clone(),
                     None,
                     policy,
+                    session_metadata.clone(),
                 );
                 Ok((strategy, revision))
             },
@@ -1846,7 +1908,7 @@ impl Runtime {
             None => (None, None, None),
         };
         let is_fork = forked_transcript.is_some();
-        let initial = if let Some(mut transcript) = forked_transcript {
+        let mut initial = if let Some(mut transcript) = forked_transcript {
             if request.resume {
                 return Err(AcpRuntimeError::Loop(
                     "a forked transcript requires a new session identity".into(),
@@ -1861,6 +1923,20 @@ impl Runtime {
                 .await
                 .map_err(AcpRuntimeError::Loop)?
         };
+        // Bind before creating the transcript, under the existing session claim.
+        if !request.resume {
+            for item in &mut initial {
+                item.metadata.remove(GRAM_CHAT_ID_KEY);
+            }
+            if let Some(id) = context.gram_chat_id {
+                let first = initial.first_mut().ok_or_else(|| {
+                    AcpRuntimeError::Loop("cannot bind an empty transcript".into())
+                })?;
+                first
+                    .metadata
+                    .insert(GRAM_CHAT_ID_KEY.into(), id.to_string().into());
+            }
+        }
         let mut opened = if is_fork {
             crate::session::open_uncommitted(&self.root, &request.id, false, initial)
         } else if request.resume {
@@ -1872,6 +1948,8 @@ impl Runtime {
         if is_fork || !request.resume {
             claim.guard_uncommitted_transcript(&opened.observer);
         }
+        let gram_chat_id = transcript_gram_chat_id(&opened.transcript)?;
+        validate_gram_chat_binding(gram_chat_id, context.gram_chat_id)?;
         // The workspace context is session-owned, not runtime-global. Refresh it
         // for load/resume/fork too; an empty request removes previous extra roots.
         if refresh_workspace_context(&mut opened.transcript, &additional_directories)
@@ -1910,11 +1988,16 @@ impl Runtime {
         let current_skills = self.current_skills().await.map_err(AcpRuntimeError::Loop)?;
         let skills = self.fresh_skills();
         let skill_catalog = current_skills.skills;
+        let mut inference_metadata = MetadataMap::new();
+        if let Some(id) = gram_chat_id {
+            inference_metadata.insert(GRAM_CHAT_ID_KEY.into(), id.to_string().into());
+        }
         let compactor = self
-            .compactor(
+            .compactor_with_metadata(
                 adapter.clone(),
                 Some(opened.observer.clone()),
                 session_id.clone(),
+                inference_metadata.clone(),
             )
             .map_err(AcpRuntimeError::Loop)?;
         let prompt_cache_key = crate::tools::subagent::prompt_cache_key(&session_id);
@@ -1930,6 +2013,7 @@ impl Runtime {
         let canonical_transcript = opened.transcript.clone();
         let mut session_config = SessionConfig::new(session_id.clone())
             .with_cache(PromptCacheRequest::automatic().with_key(prompt_cache_key));
+        session_config.metadata.extend(inference_metadata);
         if context.response_attempt_replacement {
             session_config = session_config.with_response_attempt_supersession();
         }
@@ -3304,6 +3388,7 @@ mod additional_directory_tests {
             let driver = runtime
                 .start_acp_driver_with_mcp(
                     AcpDriverContext {
+                        gram_chat_id: None,
                         cwd: root.path().to_path_buf(),
                         additional_directories: vec![],
                         integration: Arc::new(Observer),

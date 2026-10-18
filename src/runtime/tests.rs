@@ -262,6 +262,7 @@ mod reasoning_effort_persistence {
         let driver = runtime
             .start_acp_driver_with_mcp(
                 AcpDriverContext {
+                    gram_chat_id: None,
                     cwd: runtime.root().to_path_buf(),
                     additional_directories: vec![],
                     integration: Arc::new(Observer),
@@ -2596,4 +2597,132 @@ fn system_prompt_is_independent_of_delegation() {
     assert!(prompt.contains("Do not dump whole trees"));
     assert!(!prompt.contains("compose"));
     assert!(!prompt.contains("delegat"));
+}
+
+#[test]
+fn gram_chat_metadata_requires_explicit_non_nil_uuid() {
+    use super::{GRAM_CHAT_ID_KEY, gram_chat_id};
+    assert_eq!(gram_chat_id(None).unwrap(), None);
+    for value in [
+        json!(null),
+        json!(42),
+        json!("session-123"),
+        json!(uuid::Uuid::nil().to_string()),
+    ] {
+        let meta = serde_json::Map::from_iter([(GRAM_CHAT_ID_KEY.into(), value)]);
+        assert!(gram_chat_id(Some(&meta)).is_err());
+    }
+    let id = uuid::Uuid::parse_str("c763846b-e944-4ca0-840a-a3747fd72d18").unwrap();
+    let meta = serde_json::Map::from_iter([(
+        GRAM_CHAT_ID_KEY.into(),
+        json!(id.to_string().to_uppercase()),
+    )]);
+    assert_eq!(gram_chat_id(Some(&meta)).unwrap(), Some(id));
+    let unrelated = serde_json::Map::from_iter([("gram-chat-id".into(), json!(id.to_string()))]);
+    assert_eq!(gram_chat_id(Some(&unrelated)).unwrap(), None);
+}
+
+#[test]
+fn gram_chat_transcript_legacy_conflicts_and_roundtrip() {
+    use super::{GRAM_CHAT_ID_KEY, transcript_gram_chat_id, validate_gram_chat_binding};
+    let id = uuid::Uuid::parse_str("c763846b-e944-4ca0-840a-a3747fd72d18").unwrap();
+    let other = uuid::Uuid::parse_str("c763846b-e944-4ca0-840a-a3747fd72d19").unwrap();
+    let mut item = agentkit_core::Item::text(ItemKind::System, "system");
+    assert_eq!(transcript_gram_chat_id(&[item.clone()]).unwrap(), None);
+    assert!(validate_gram_chat_binding(None, None).is_ok());
+    assert!(validate_gram_chat_binding(None, Some(id)).is_err());
+    item.metadata
+        .insert(GRAM_CHAT_ID_KEY.into(), json!(id.to_string()));
+    let encoded = serde_json::to_vec(&vec![item.clone()]).unwrap();
+    let decoded = serde_json::from_slice::<Vec<agentkit_core::Item>>(&encoded).unwrap();
+    assert_eq!(transcript_gram_chat_id(&decoded).unwrap(), Some(id));
+    assert!(validate_gram_chat_binding(Some(id), None).is_ok());
+    assert!(validate_gram_chat_binding(Some(id), Some(id)).is_ok());
+    assert!(validate_gram_chat_binding(Some(id), Some(other)).is_err());
+    let mut conflict = item.clone();
+    conflict
+        .metadata
+        .insert(GRAM_CHAT_ID_KEY.into(), json!(other.to_string()));
+    assert!(transcript_gram_chat_id(&[item.clone(), conflict]).is_err());
+    item.metadata.insert(GRAM_CHAT_ID_KEY.into(), json!(false));
+    assert!(transcript_gram_chat_id(&[item]).is_err());
+}
+
+#[tokio::test]
+async fn gram_chat_binding_survives_cold_resume_and_rejects_rebinding() {
+    use super::{AcpDriverContext, GRAM_CHAT_ID_KEY, transcript_gram_chat_id};
+    #[derive(Clone)]
+    struct Observer;
+    impl agentkit_loop::LoopObserver for Observer {
+        fn handle_event(&self, _: agentkit_loop::ObservedEvent) {}
+    }
+    let root = tempfile::tempdir().unwrap();
+    let credentials = crate::credentials::CredentialStorage::Memory;
+    crate::provider::store_openrouter_test_credentials(&credentials);
+    let runtime = Runtime::new_with_provider_and_credentials(
+        root.path(),
+        "test-model",
+        crate::ProviderKind::OpenRouter,
+        credentials,
+    )
+    .unwrap();
+    let id = uuid::Uuid::parse_str("c763846b-e944-4ca0-840a-a3747fd72d18").unwrap();
+    let other = uuid::Uuid::parse_str("c763846b-e944-4ca0-840a-a3747fd72d19").unwrap();
+    let context = |binding| AcpDriverContext {
+        gram_chat_id: binding,
+        cwd: root.path().to_path_buf(),
+        additional_directories: vec![],
+        integration: Arc::new(Observer),
+        cancellation: CancellationController::new().handle(),
+        response_attempt_replacement: false,
+    };
+    let mut claim = runtime.claim_session().unwrap();
+    let session_id = claim.id().to_owned();
+    assert_ne!(session_id, id.to_string());
+    let driver = runtime
+        .start_acp_driver_with_mcp(context(Some(id)), &mut claim, None, runtime.mcp.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        driver.canonical_transcript[0].metadata[GRAM_CHAT_ID_KEY],
+        json!(id.to_string())
+    );
+    claim.commit().unwrap();
+    // A resident owner prevents a second attachment, including identity changes.
+    let mut resident = runtime.claim_session_load(&session_id).unwrap();
+    assert!(
+        runtime
+            .start_acp_driver_with_mcp(
+                context(Some(other)),
+                &mut resident,
+                None,
+                runtime.mcp.clone()
+            )
+            .await
+            .is_err()
+    );
+    drop(resident);
+    drop(driver);
+    for supplied in [Some(other), Some(id), None] {
+        let mut claim = runtime.claim_session_load(&session_id).unwrap();
+        let result = runtime
+            .start_acp_driver_with_mcp(context(supplied), &mut claim, None, runtime.mcp.clone())
+            .await;
+        if supplied == Some(other) {
+            assert!(result.is_err());
+        } else {
+            let driver = result.unwrap();
+            assert_eq!(
+                transcript_gram_chat_id(&driver.canonical_transcript).unwrap(),
+                Some(id)
+            );
+            claim.commit().unwrap();
+            drop(driver);
+        }
+        assert_eq!(
+            transcript_gram_chat_id(&crate::session::load(root.path(), &session_id).unwrap())
+                .unwrap(),
+            Some(id)
+        );
+    }
 }

@@ -26,8 +26,13 @@ use serde_json::Value;
 
 use super::{
     OpenAiSubscriptionAdapter, OpenAiSubscriptionSession, OpenAiSubscriptionTurn, OpenRouterApiKey,
-    SubscriptionConfig, chatgpt::SubscriptionModelCatalogCache, speakeasy_auth,
+    SubscriptionConfig, chatgpt::SubscriptionModelCatalogCache, speakeasy_runtime,
 };
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[path = "adapter_runtime_tests.rs"]
+mod runtime_tests;
 
 const MAX_MODELS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
@@ -564,8 +569,6 @@ pub struct OpenRouterKitAdapter {
     context_window: Arc<tokio::sync::OnceCell<u64>>,
 }
 
-const SPEAKEASY_COMPLETIONS_URL: &str = "https://ai.speakeasy.com/chat/completions";
-
 #[derive(Clone)]
 pub struct SpeakeasyKitAdapter {
     provider: SpeakeasyProvider,
@@ -575,8 +578,7 @@ pub struct SpeakeasyKitAdapter {
 #[derive(Clone)]
 struct SpeakeasyProvider {
     openrouter: OpenRouterProvider,
-    api_key: String,
-    project: String,
+    auth: speakeasy_runtime::Authentication,
     chat_id: Option<String>,
 }
 
@@ -606,9 +608,9 @@ impl CompletionsProvider for SpeakeasyProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        let builder = builder
-            .header("Gram-Key", &self.api_key)
-            .header("Gram-Project", &self.project)
+        let builder = self
+            .auth
+            .http(builder)
             .header("X-Gram-Source", "kit")
             .header("User-Agent", concat!("kit/", env!("CARGO_PKG_VERSION")));
         match &self.chat_id {
@@ -733,15 +735,14 @@ impl KitAdapter {
                 }))
             }
             ProviderKind::Speakeasy => {
-                let credentials = speakeasy_auth::load(&credential_storage)?
+                let credentials = speakeasy_runtime::Configuration::load(&credential_storage)?
                     .ok_or_else(|| SPEAKEASY_AUTH_REQUIRED.to_string())?;
-                let mut config =
-                    OpenRouterConfig::new("unused", model).with_base_url(SPEAKEASY_COMPLETIONS_URL);
+                let mut config = OpenRouterConfig::new("unused", model)
+                    .with_base_url(format!("{}/chat/completions", credentials.origin));
                 apply_openrouter_reasoning_effort(&mut config, reasoning_effort);
                 let provider = SpeakeasyProvider {
                     openrouter: OpenRouterProvider::from(config),
-                    api_key: credentials.api_key.clone(),
-                    project: credentials.project.clone(),
+                    auth: credentials.auth,
                     chat_id: None,
                 };
                 let client = reqwest::Client::builder()
@@ -925,7 +926,12 @@ impl ModelAdapter for KitAdapter {
             }
             Self::Speakeasy(adapter) => {
                 let mut provider = adapter.provider.clone();
-                provider.chat_id = Some(gram_chat_id(&config.session_id.to_string()));
+                provider.chat_id = Some(if provider.auth.is_runtime() {
+                    speakeasy_runtime::canonical_chat_id(&config.metadata)
+                        .map_err(LoopError::InvalidState)?
+                } else {
+                    gram_chat_id(&config.session_id.to_string())
+                });
                 let inner = CompletionsAdapter::with_client(provider, adapter.client.clone())
                     .with_resilience(crate::request_budget::RequestBudget::current().resilience());
                 inner.start_session(config).await.map(|inner| {
@@ -1539,7 +1545,11 @@ fn available_catalog_providers(
     {
         providers.push(ProviderKind::OpenRouter);
     }
-    if speakeasy_auth::load(storage).ok().flatten().is_some() {
+    if speakeasy_runtime::Configuration::load(storage)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         providers.push(ProviderKind::Speakeasy);
     }
     if super::anthropic_auth::credentials(storage)
@@ -1573,38 +1583,33 @@ async fn model_catalog_with_openai(
         None => catalog_models_url(None),
         Some(url) => url.to_str().and_then(|url| catalog_models_url(Some(url))),
     };
-    let public_url = OPENROUTER_MODELS_URL.to_string();
-    let same_catalog = openrouter_url.as_deref() == Some(public_url.as_str());
-    let other_catalogs = async move {
-        if !openrouter_available && !speakeasy_available {
-            (DiscoveredModels::default(), DiscoveredModels::default())
-        } else if same_catalog {
-            let models = fetch_model_ids(&public_url)
-                .await
-                .unwrap_or_else(|_| fallback_catalog());
-            (models.clone(), models)
-        } else {
-            let openrouter_catalog = async {
-                if !openrouter_available {
-                    return DiscoveredModels::default();
-                }
-                match openrouter_url {
-                    Some(url) => fetch_model_ids(&url)
-                        .await
-                        .unwrap_or_else(|_| fallback_catalog()),
-                    None => fallback_catalog(),
-                }
-            };
-            let speakeasy_catalog = async {
-                if !speakeasy_available {
-                    return DiscoveredModels::default();
-                }
-                fetch_model_ids(&public_url)
+    let other_catalogs = async {
+        let openrouter_catalog = async {
+            if !openrouter_available {
+                return DiscoveredModels::default();
+            }
+            match openrouter_url {
+                Some(url) => fetch_model_ids(&url)
                     .await
-                    .unwrap_or_else(|_| fallback_catalog())
+                    .unwrap_or_else(|_| fallback_catalog()),
+                None => fallback_catalog(),
+            }
+        };
+        let speakeasy_catalog = async {
+            if !speakeasy_available {
+                return DiscoveredModels::default();
+            }
+            let Ok(Some(configuration)) = speakeasy_runtime::Configuration::load(storage) else {
+                return DiscoveredModels::default();
             };
-            futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
-        }
+            fetch_authenticated_model_ids(
+                &format!("{}/chat/models", configuration.origin),
+                Some(&configuration.auth),
+            )
+            .await
+            .unwrap_or_default()
+        };
+        futures_util::future::join(openrouter_catalog, speakeasy_catalog).await
     };
     let ((discovered_openai, (openrouter, speakeasy)), anthropic) = futures_util::future::join(
         futures_util::future::join(openai_catalog, other_catalogs),
@@ -1623,12 +1628,6 @@ async fn model_catalog_with_openai(
         && !openrouter.contains(&current.model)
     {
         openrouter.push(current.model.clone());
-    }
-    if current_is_valid
-        && current.provider == ProviderKind::Speakeasy
-        && !speakeasy.contains(&current.model)
-    {
-        speakeasy.push(current.model.clone());
     }
     openrouter.sort();
     openrouter.dedup();
@@ -1802,6 +1801,13 @@ async fn fetch_model_ids(url: &str) -> Result<DiscoveredModels, String> {
     if cfg!(test) {
         return Err("model catalog discovery is disabled in unit tests".into());
     }
+    fetch_authenticated_model_ids(url, None).await
+}
+
+async fn fetch_authenticated_model_ids(
+    url: &str,
+    auth: Option<&speakeasy_runtime::Authentication>,
+) -> Result<DiscoveredModels, String> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
@@ -1809,8 +1815,12 @@ async fn fetch_model_ids(url: &str) -> Result<DiscoveredModels, String> {
         .user_agent(concat!("kit/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|_| "could not build model catalog client".to_string())?;
-    let response = client
-        .get(url)
+    let request = client.get(url);
+    let request = match auth {
+        Some(auth) => auth.reqwest(request),
+        None => request,
+    };
+    let response = request
         .send()
         .await
         .map_err(|_| "model catalog transport failed".to_string())?;
@@ -2643,8 +2653,14 @@ mod tests {
         .with_streaming(false);
         let provider = SpeakeasyProvider {
             openrouter: OpenRouterProvider::from(config),
-            api_key: format!("gram_live_{}", "ab".repeat(32)),
-            project: "kit-test".into(),
+            auth: super::speakeasy_runtime::Authentication::Legacy(
+                crate::provider::speakeasy_auth::Credentials {
+                    api_key: format!("gram_live_{}", "ab".repeat(32)),
+                    project: "kit-test".into(),
+                    email: None,
+                    organization_id: None,
+                },
+            ),
             chat_id: None,
         };
         let client = reqwest::Client::builder()
@@ -3005,7 +3021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_advertises_stored_oauth_and_speakeasy_credentials() {
+    async fn catalog_advertises_stored_oauth_credentials() {
         let directory = tempfile::tempdir().unwrap();
         let storage = CredentialStorage::Filesystem(directory.path().join("credentials"));
         let record = crate::provider::openai_auth::test_support::token_record(
@@ -3017,7 +3033,6 @@ mod tests {
             .entry("openai-subscription", "subscription")
             .save(&serde_json::to_vec(&record).unwrap())
             .unwrap();
-        storage.entry("speakeasy", "default").save(&serde_json::to_vec(&json!({"api_key": format!("gram_live_{}", "ab".repeat(32)), "project": "test-project", "email": null, "organization_id": null})).unwrap()).unwrap();
         let current = ModelSelection::new(ProviderKind::Speakeasy, "private/custom-model");
         let catalog = super::model_catalog_with_openai(
             &current,
@@ -3036,15 +3051,6 @@ mod tests {
             .find(|group| group.provider == ProviderKind::OpenAiSubscription)
             .unwrap();
         assert_eq!(openai.models, ["oauth-model"]);
-        let speakeasy = catalog
-            .iter()
-            .find(|group| group.provider == ProviderKind::Speakeasy)
-            .unwrap();
-        assert!(
-            speakeasy
-                .models
-                .contains(&"private/custom-model".to_string())
-        );
     }
 
     #[tokio::test]

@@ -1221,6 +1221,7 @@ async fn logout_authentication(
 }
 
 struct SessionSetup {
+    gram_chat_id: Option<uuid::Uuid>,
     cwd: PathBuf,
     additional_directories: Vec<PathBuf>,
     mcp_servers: Vec<agentkit_acp::McpServer>,
@@ -1599,6 +1600,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    gram_chat_id: crate::runtime::gram_chat_id(request.meta.as_ref())?,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1675,6 +1677,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    gram_chat_id: crate::runtime::gram_chat_id(request.meta.as_ref())?,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1715,6 +1718,7 @@ impl Server {
         let attached = self
             .attach_session(
                 SessionSetup {
+                    gram_chat_id: crate::runtime::gram_chat_id(request.meta.as_ref())?,
                     cwd: request.cwd,
                     additional_directories: request.additional_directories,
                     mcp_servers: request.mcp_servers,
@@ -1742,6 +1746,7 @@ impl Server {
         commit: impl FnOnce(crate::runtime::SessionClaim) -> Result<C, AcpRuntimeError> + Send,
     ) -> Result<AttachedSession<C>, AcpRuntimeError> {
         let SessionSetup {
+            gram_chat_id,
             cwd,
             additional_directories,
             mcp_servers,
@@ -1810,6 +1815,7 @@ impl Server {
         )
         .with_hook_messages(self.runtime.hooks());
         let context = AcpDriverContext {
+            gram_chat_id,
             cwd,
             additional_directories,
             integration: Arc::new(observer),
@@ -7720,3 +7726,36 @@ pub(super) mod tests {
 
 #[cfg(test)]
 mod subscription_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod gram_chat_metadata_tests {
+    #[test]
+    fn gram_chat_wire_metadata_validates_v1_and_v2() {
+        use crate::runtime::{GRAM_CHAT_ID_KEY, gram_chat_id};
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!("00000000-0000-0000-0000-000000000000"),
+            serde_json::json!("not-a-uuid"),
+            serde_json::json!("c763846b-e944-4ca0-840a-a3747fd72d18"),
+        ] {
+            let expected = value == "c763846b-e944-4ca0-840a-a3747fd72d18";
+            let request = serde_json::json!({
+                "cwd": "/tmp",
+                "mcpServers": [],
+                "sessionId": "kit-id-is-not-the-gram-id",
+                "_meta": {GRAM_CHAT_ID_KEY: value}
+            });
+            let new: super::NewSessionRequest = serde_json::from_value(request.clone()).unwrap();
+            let load: super::LoadSessionRequest = serde_json::from_value(request.clone()).unwrap();
+            let v2_new: agentkit_acp::v2::wire::NewSessionRequest =
+                serde_json::from_value(request.clone()).unwrap();
+            let resume: agentkit_acp::v2::wire::ResumeSessionRequest =
+                serde_json::from_value(request).unwrap();
+            for meta in [new.meta, load.meta, v2_new.meta, resume.meta] {
+                assert_eq!(gram_chat_id(meta.as_ref()).is_ok(), expected);
+            }
+        }
+    }
+}
