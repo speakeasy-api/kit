@@ -7728,7 +7728,11 @@ pub(super) mod tests {
 mod subscription_tests;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 mod gram_chat_metadata_tests {
     #[test]
     fn gram_chat_wire_metadata_validates_v1_and_v2() {

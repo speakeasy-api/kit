@@ -30,7 +30,13 @@ use super::{
 };
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::disallowed_methods,
+    clippy::disallowed_macros
+)]
 #[path = "adapter_runtime_tests.rs"]
 mod runtime_tests;
 
