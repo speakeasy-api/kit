@@ -905,8 +905,16 @@ impl Actor {
                 self.emit(message);
             }
         } else if let Some(id) = message["id"].as_u64()
-            && let Some(pending) = self.pending.remove(&id)
+            && let Some(mut pending) = self.pending.remove(&id)
         {
+            // A resident startup is acknowledged only after its overlay update settles.
+            // Keep failures as failures, rather than returning the cached startup result.
+            if pending.method == "gateway/startup_mcp_update" {
+                pending.method = "session/resume".into();
+                if message.get("result").is_some() {
+                    message["result"] = self.session_result.clone().unwrap_or(Value::Null);
+                }
+            }
             if pending.method == "initialize"
                 && let Some(capabilities) =
                     message["result"]["capabilities"]["session"].as_object_mut()
@@ -1061,6 +1069,46 @@ impl Actor {
         }
         Ok(messages)
     }
+    fn queue_mcp_update(
+        &mut self,
+        pending: Pending,
+        servers: Value,
+        charge: Option<Arc<agent_client_protocol::ChargedFrame>>,
+        writes: &mpsc::Sender<ChildWrite>,
+    ) -> Result<(), Failure> {
+        if !servers.is_array() {
+            return Err(Failure::bad("mcpServers must be an array"));
+        }
+        if self.pending.len() >= 128 {
+            return Err(Failure::unavailable("too many pending ACP requests"));
+        }
+        let serial = self
+            .serial
+            .checked_add(1)
+            .ok_or_else(|| Failure::unavailable("request id exhausted"))?;
+        writes
+            .try_send(ChildWrite {
+                message: object([
+                    ("jsonrpc", "2.0".into()),
+                    ("id", serial.into()),
+                    ("method", "_kit/session/update_mcp".into()),
+                    (
+                        "params",
+                        object([
+                            ("sessionId", self.id.clone().into()),
+                            ("mcpServers", servers),
+                        ]),
+                    ),
+                ]),
+                _charge: charge,
+            })
+            .map_err(|_| {
+                Failure::unavailable("child input queue unavailable; message not accepted")
+            })?;
+        self.serial = serial;
+        self.pending.insert(serial, pending);
+        Ok(())
+    }
     fn command(&mut self, request: Request, writes: &mpsc::Sender<ChildWrite>) -> ResultValue {
         if let Request::Attach {
             replace,
@@ -1069,20 +1117,15 @@ impl Actor {
             ..
         } = request
         {
-            // A live runtime owns its MCP configuration. Do not replace the
-            // controller and then silently ignore a new configuration.
-            if (self.session_result.is_some()
-                || self.pending.values().any(|pending| {
-                    matches!(pending.method.as_str(), "session/new" | "session/resume")
-                }))
-                && startup.as_ref().is_some_and(|message| {
-                    message["params"].get("mcpServers").is_some_and(|servers| {
-                        !servers.is_null() && servers != &Value::Array(Vec::new())
-                    })
+            if startup.is_some()
+                && self.pending.values().any(|pending| {
+                    pending.method == "gateway/startup_mcp_update"
+                        || (self.session_result.is_none()
+                            && matches!(pending.method.as_str(), "session/new" | "session/resume"))
                 })
             {
                 return Err(Failure::conflict(
-                    "resident session retains its MCP servers; omit mcpServers or send an empty array",
+                    "session startup is pending; reconnect after it settles",
                 ));
             }
             let metadata = startup
@@ -1172,13 +1215,28 @@ impl Actor {
                 bytes: 0,
                 live: false,
             };
-            let started =
-                if let (Some(startup), Some(result)) = (startup, self.session_result.clone()) {
-                    let request_id = startup
-                        .get("id")
-                        .cloned()
-                        .ok_or_else(|| Failure::bad("session startup requires a request id"))?;
-                    for message in self.startup_messages(result, request_id, replay, &id)? {
+            let started = if let (Some(startup), Some(result)) =
+                (startup, self.session_result.clone())
+            {
+                let request_id = startup
+                    .get("id")
+                    .cloned()
+                    .ok_or_else(|| Failure::bad("session startup requires a request id"))?;
+                let messages = self.startup_messages(result, request_id.clone(), replay, &id)?;
+                if let Some(servers) = startup["params"].get("mcpServers") {
+                    self.queue_mcp_update(
+                        Pending {
+                            attachment: id.clone(),
+                            original: request_id,
+                            method: "gateway/startup_mcp_update".into(),
+                            replay,
+                        },
+                        servers.clone(),
+                        None,
+                        writes,
+                    )?;
+                } else {
+                    for message in messages {
                         if !attachment.push(message) {
                             return Err(Failure::replay(
                                 "session snapshot exceeds the gateway limit",
@@ -1186,10 +1244,11 @@ impl Actor {
                         }
                     }
                     attachment.live = true;
-                    true
-                } else {
-                    false
-                };
+                }
+                true
+            } else {
+                false
+            };
             // No fallible work after the ownership commit. The previous controller
             // survives every replay/snapshot preparation failure.
             self.committed_owner = Some(CommittedOwner {
@@ -1272,6 +1331,10 @@ impl Actor {
                 {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
+                if method == "_kit/session/update_mcp" && message["params"]["sessionId"] != self.id
+                {
+                    return Err(Failure::bad("ACP session does not match gateway session"));
+                }
                 if method == "kit/background/cancel" && message["params"]["session_id"] != self.id {
                     return Err(Failure::bad("ACP session does not match gateway session"));
                 }
@@ -1293,6 +1356,7 @@ impl Actor {
                         | "session/cancel"
                         | "kit/background/cancel"
                         | "session/set_config_option"
+                        | "_kit/session/update_mcp"
                 ) {
                     return Err(Failure::bad(
                         "ACP method is not supported by the gateway; disconnect to detach",
@@ -1300,6 +1364,15 @@ impl Actor {
                 }
                 let startup = matches!(method.as_str(), "session/new" | "session/resume");
                 if startup {
+                    if self
+                        .pending
+                        .values()
+                        .any(|p| p.method == "gateway/startup_mcp_update")
+                    {
+                        return Err(Failure::conflict(
+                            "session startup is pending; reconnect after it settles",
+                        ));
+                    }
                     if original.is_none() {
                         return Err(Failure::bad("session startup requires a request id"));
                     }
@@ -1334,16 +1407,23 @@ impl Actor {
                 };
                 if let Some(result) = cached {
                     if startup {
-                        if message["params"].get("mcpServers").is_some_and(|servers| {
-                            !servers.is_null() && servers != &Value::Array(Vec::new())
-                        }) {
-                            return Err(Failure::conflict(
-                                "resident session retains its MCP servers; omit mcpServers or send an empty array",
-                            ));
-                        }
                         let Some(id) = original else {
                             return Err(Failure::bad("session startup requires a request id"));
                         };
+                        if let Some(servers) = message["params"].get("mcpServers") {
+                            self.queue_mcp_update(
+                                Pending {
+                                    attachment,
+                                    original: id,
+                                    method: "gateway/startup_mcp_update".into(),
+                                    replay,
+                                },
+                                servers.clone(),
+                                charge,
+                                writes,
+                            )?;
+                            return Ok(object([]));
+                        }
                         let messages = self.startup_messages(result, id, replay, &attachment)?;
                         let fits = self.attachment.as_ref().is_some_and(|a| {
                             a.events.len() + messages.len() <= MAX_QUEUE

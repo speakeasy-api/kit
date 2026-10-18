@@ -244,3 +244,35 @@ Persistent stores restore OpenAI credentials when Kit starts and restore MCP OAu
 - **`OAuth credential path must be a regular file`**: remove the conflicting symlink or non-file entry.
 - **`OAuth credential file is accessible by other users`**: on Unix, restrict the file to its owner (for example, mode `0600`) before retrying.
 - **Credential-store read/write failures**: confirm the operating-system store is available and unlocked. On macOS, also confirm that the installed binary has the expected stable signing identity.
+
+## ACP session MCP configuration
+
+ACP v2 advertises `capabilities.session.mcp.stdio` and `.http`. Both
+`session/new` and `session/resume` accept native `mcpServers` entries, including
+HTTP entries with a `name`, `url`, and `headers` array of `{ "name", "value" }`
+objects. These credentials remain in the session's in-memory overlay; they are
+not written to MCP files or transcripts. Legacy SSE MCP transport is not supported.
+
+The current ACP schema has no standard request to replace a live session's MCP
+configuration. Kit advertises its replacement extension at
+`capabilities.session.mcp._meta["kit/updateMcp"]`:
+
+```json
+{ "method": "_kit/session/update_mcp", "replacement": true }
+```
+
+Send that JSON-RPC method with `params` containing `sessionId` and `mcpServers`.
+Both fields are required. The list replaces the entire client-owned overlay;
+`[]` removes it, without removing configured host or plugin servers. The response
+is `{}` after reconciliation succeeds. Duplicate names, invalid transports or
+configuration, and collisions with host or plugin names return an error without
+publishing a new overlay. Do not send credentials with each prompt.
+
+Updates reuse the session's existing MCP runtime and its config reconciliation.
+Changes wait for in-flight operations on affected servers before replacing their
+connections and credentials. They do not restart the model session or its
+background tasks. Clients should await the response before starting work that
+requires the replacement credentials. A client disconnect or request cancellation
+after reconciliation begins does not roll the update back; retry the same full
+list to establish the desired configuration. On process restart, supply the overlay again
+with `session/resume`; it is not persistent session state.

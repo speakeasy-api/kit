@@ -1121,6 +1121,25 @@ impl Runtime {
             .map_err(AcpRuntimeError::Loop)
     }
 
+    pub(crate) async fn isolated_session_mcp(
+        &self,
+        servers: Vec<agentkit_acp::McpServer>,
+        cwd: &Path,
+    ) -> Result<crate::tools::mcp::McpRuntime, AcpRuntimeError> {
+        let cwd = crate::resilient_fs::canonicalize(cwd)
+            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?;
+        if cwd != self.root {
+            return Err(AcpRuntimeError::Loop(format!(
+                "this Kit runtime is fixed to {}",
+                self.root.display()
+            )));
+        }
+        self.mcp
+            .with_session_servers(servers, &cwd)
+            .await
+            .map_err(AcpRuntimeError::Loop)
+    }
+
     /// Returns the depth inherited by this runtime process.
     pub const fn base_depth(&self) -> usize {
         self.base_depth

@@ -143,7 +143,23 @@ impl Connection {
                     session.remove(name);
                 }
                 session.insert("list".into(), object([]));
-                session.insert("mcp".into(), object([("stdio", object([]))]));
+                session.insert(
+                    "mcp".into(),
+                    object([
+                        ("stdio", object([])),
+                        ("http", object([])),
+                        (
+                            "_meta",
+                            object([(
+                                "kit/updateMcp",
+                                object([
+                                    ("method", "_kit/session/update_mcp".into()),
+                                    ("replacement", true.into()),
+                                ]),
+                            )]),
+                        ),
+                    ]),
+                );
             }
             self.initialize = Some((message.clone(), Arc::clone(charge)));
             return Ok(Some(object([
