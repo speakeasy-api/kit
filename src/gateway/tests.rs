@@ -384,12 +384,34 @@ async fn disconnect_replay_single_controller_and_stale_response_isolation() {
         .await;
 }
 #[test]
-fn private_bind_requires_explicit_opt_in() {
-    assert!(permitted_address("127.0.0.1:0".parse().unwrap(), false));
-    assert!(!permitted_address("10.1.2.3:80".parse().unwrap(), false));
-    assert!(permitted_address("10.1.2.3:80".parse().unwrap(), true));
-    for address in ["0.0.0.0:80", "8.8.8.8:80", "[::]:80"] {
-        assert!(!permitted_address(address.parse().unwrap(), true));
+fn bind_policy_requires_separate_explicit_opt_ins() {
+    for private in [false, true] {
+        for wildcard in [false, true] {
+            for (address, expected) in [
+                ("127.0.0.1:0", true),
+                ("[::1]:0", true),
+                ("10.1.2.3:80", private),
+                ("172.16.0.1:80", private),
+                ("192.168.1.1:80", private),
+                ("[fd00::1]:80", private),
+                ("0.0.0.0:80", wildcard),
+                ("[::]:80", wildcard),
+                ("8.8.8.8:80", false),
+                ("[2606:4700:4700::1111]:80", false),
+                ("169.254.1.1:80", false),
+                ("[fe80::1]:80", false),
+                ("224.0.0.1:80", false),
+                ("[ff02::1]:80", false),
+                ("255.255.255.255:80", false),
+                ("[::ffff:8.8.8.8]:80", false),
+            ] {
+                assert_eq!(
+                    permitted_address(address.parse().unwrap(), private, wildcard),
+                    expected,
+                    "{address}: private={private}, wildcard={wildcard}"
+                );
+            }
+        }
     }
 }
 

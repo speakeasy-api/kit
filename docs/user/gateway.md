@@ -29,7 +29,11 @@ Prefer an SSH tunnel or an encrypted private network. For example, forward local
 ssh -N -L 7766:127.0.0.1:7766 host
 ```
 
-To bind directly to a private interface, supply both `--listen 10.0.0.5:7766` and `--allow-private-network`. Only loopback, RFC1918 IPv4, or IPv6 unique-local addresses are accepted; wildcard and public addresses are rejected. This address check is not a firewall. The server speaks HTTP without TLS: never expose it to an untrusted network. A private IP does not encrypt traffic.
+To bind directly to a private interface, supply both `--listen 10.0.0.5:7766` and `--allow-private-network`. This flag permits explicit RFC1918 IPv4 or IPv6 unique-local addresses, not wildcard addresses. Loopback is always permitted.
+
+For an isolated container or another deployment that requires listening on all interfaces, explicitly supply `--allow-wildcard-bind` with `--listen 0.0.0.0:7766` or `--listen '[::]:7766'`. This flag permits only unspecified addresses; it does not permit explicit public, link-local, or multicast addresses, nor does it replace `--allow-private-network` for explicit private addresses. Neither flag changes the default loopback listener. Wildcard binding can expose the gateway on public interfaces (IPv6 dual-stack behavior depends on the host). Configure firewall rules and container port publishing to restrict access before starting it.
+
+Every bind mode requires `--credential-file`, a valid bearer token, and owner-only credential-file permissions on Unix (`chmod 600`). HTTP requests still require bearer authentication. These address checks and credentials are not a firewall or encryption. The server speaks HTTP without TLS: never expose it to an untrusted network. Prefer an SSH tunnel or encrypted private network; a private IP does not encrypt traffic.
 
 ## Create, list, and reconnect
 
