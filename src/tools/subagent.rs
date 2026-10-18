@@ -484,6 +484,11 @@ impl Subagents {
         self
     }
 
+    pub(crate) fn with_gram_chat_id(mut self, id: Option<uuid::Uuid>) -> Self {
+        self.config.gram_chat_id = id;
+        self
+    }
+
     pub(crate) fn with_prompt_cache_key(mut self, key: String) -> Self {
         self.config.prompt_cache_key = Some(key);
         self
@@ -2935,6 +2940,7 @@ mod steer_tests {
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         });
         let state = Arc::new(AsyncMutex::new(State {
             name: "Scout".into(),

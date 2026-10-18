@@ -389,6 +389,7 @@ fn manager_with_disconnected_session(
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     });
     let state = Arc::new(AsyncMutex::new(State {
         name: "Scout".into(),
@@ -464,6 +465,7 @@ async fn close_does_not_block_listings_or_allow_stale_reuse() {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     });
     let handle = manager
         .create(
@@ -628,6 +630,7 @@ fn manager_with_generic_harness(root: &Path, args: Vec<String>) -> Subagents {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     })
 }
 
@@ -1867,6 +1870,7 @@ async fn reusable_prompt_failure_remains_failed_idle_and_can_be_retried() {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     });
     let handle = manager
         .create(
@@ -1966,6 +1970,7 @@ async fn listing_includes_named_starting_and_idle_subagents() {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     });
     let create_manager = manager.clone();
     let create = tokio::spawn(async move {
@@ -2118,6 +2123,7 @@ async fn generic_harness_without_native_fork_returns_unsupported() {
         parent_name: None,
         tree_slots: None,
         prompt_cache_key: None,
+        gram_chat_id: None,
     });
     let prior = manager
         .create(

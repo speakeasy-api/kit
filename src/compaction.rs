@@ -424,6 +424,7 @@ where
 }
 
 /// Builds a compactor with configured thresholds and immutable inference metadata.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn automatic_with_policy_and_metadata<M>(
     adapter: M,
     telemetry: TelemetryConfig,

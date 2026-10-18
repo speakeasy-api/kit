@@ -650,6 +650,7 @@ impl Runtime {
             openrouter_api_key.clone(),
         )?;
         let subagents = Subagents::new(ChildConfig {
+            gram_chat_id: None,
             additional_directories: Vec::new(),
             root: root.clone(),
             model: model.clone(),
@@ -1205,6 +1206,7 @@ impl Runtime {
         runtime.credential_storage = credential_storage.clone();
         let previous = runtime.subagents.child_config();
         runtime.subagents = Subagents::new(ChildConfig {
+            gram_chat_id: previous.gram_chat_id,
             additional_directories: Vec::new(),
             root: runtime.root.clone(),
             model: runtime.model.clone(),
@@ -2004,6 +2006,7 @@ impl Runtime {
         let subagents = self
             .subagents
             .fresh_for_workspace(additional_directories, parent_context)
+            .with_gram_chat_id(gram_chat_id)
             .with_prompt_cache_key(prompt_cache_key.clone())
             .with_observer(opened.observer.clone(), opened.children)
             .map_err(AcpRuntimeError::Loop)?;

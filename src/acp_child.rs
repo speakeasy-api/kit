@@ -432,9 +432,30 @@ pub(crate) struct ChildConfig {
     pub tree_slots: Option<PathBuf>,
     /// Prompt cache key shared by every session in one delegation tree.
     pub prompt_cache_key: Option<String>,
+    /// Authorized inference association inherited from the owning parent, never derived.
+    pub gram_chat_id: Option<uuid::Uuid>,
 }
 
 impl ChildConfig {
+    fn inference_metadata(&self, harness: &str) -> Option<serde_json::Map<String, Value>> {
+        if !self.harnesses.is_kit(harness) {
+            return None;
+        }
+        self.gram_chat_id.map(|id| {
+            serde_json::Map::from_iter([(
+                crate::runtime::GRAM_CHAT_ID_KEY.into(),
+                Value::String(id.to_string()),
+            )])
+        })
+    }
+
+    fn new_session_request(&self, harness: &str) -> agentkit_acp::NewSessionRequest {
+        let mut request = agentkit_acp::NewSessionRequest::new(self.root.clone())
+            .additional_directories(self.additional_directories.clone());
+        request.meta = self.inference_metadata(harness);
+        request
+    }
+
     pub(crate) fn with_root(mut self, root: PathBuf) -> Self {
         let previous_root = self.root.clone();
         if let Some(path) = &mut self.mcp_config
@@ -1493,6 +1514,8 @@ async fn run(
     let notification_routes = Arc::clone(&routes);
     let config_snapshots = Arc::new(ConfigSnapshots::default());
     let notification_configs = Arc::clone(&config_snapshots);
+    let new_session_request = config.new_session_request(&harness);
+    let inference_metadata = config.inference_metadata(&harness);
     let root = config.root.clone();
     let additional_directories = config.additional_directories.clone();
     let startup_complete = Arc::new(AtomicBool::new(false));
@@ -1628,7 +1651,7 @@ async fn run(
                 routes.lock().map_err(|_| agent_client_protocol::Error::internal_error())?.remove(&id);
                 result
             } else {
-                protocol::request(connection.clone(), version, agentkit_acp::NewSessionRequest::new(root.clone()).additional_directories(additional_directories.clone())).await
+                protocol::request(connection.clone(), version, new_session_request).await
             };
             let session = match session_result {
                 Ok(session) => session,
@@ -1754,16 +1777,18 @@ async fn run(
                         let root = root.clone();
                         let additional_directories = additional_directories.clone();
                         let config_snapshots = Arc::clone(&config_snapshots);
+                        let inference_metadata = inference_metadata.clone();
                         tasks.spawn(async move {
                             let serial = fork.serial;
                             let source_id = fork.session_id.clone();
                             let mut request = ForkSessionRequest::new(fork.session_id, root)
                                 .additional_directories(additional_directories);
+                            request.meta = inference_metadata;
                             if let Some((id, name)) = fork.parent {
-                                request.meta = Some(serde_json::Map::from_iter([
+                                request.meta.get_or_insert_with(serde_json::Map::new).extend([
                                     (FORK_PARENT_ID_META.into(), Value::String(id)),
                                     (FORK_PARENT_NAME_META.into(), Value::String(name)),
-                                ]));
+                                ]);
                             }
                             let (request_id, request) = match protocol::fork(&connection, version, request) {
                                 Ok(request) => request,
@@ -2762,6 +2787,7 @@ mod tests {
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         for resume in [false, true] {
             let command = harnesses
@@ -2867,6 +2893,7 @@ mod tests {
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             };
             let command = harnesses.spawn("acp.external", &config, None, 1).unwrap();
             assert!(
@@ -3247,6 +3274,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             };
             let result = ChildSession::start(
                 config,
@@ -3335,6 +3363,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let result = ChildSession::start(
             config,
@@ -3401,6 +3430,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
 
         let error = match ChildSession::start(
@@ -3462,6 +3492,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let command = harnesses.spawn("acp.other", &config, None, 0).unwrap();
         assert_eq!(command.as_std().get_program(), "agent binary");
@@ -3518,6 +3549,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let command = harnesses
             .spawn("acp.kit", &config, Some(("session", true)), 2)
@@ -3654,6 +3686,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let starts = (0..64)
             .map(|_| {
@@ -3724,6 +3757,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let base = ChildSession::start(
             config,
@@ -3805,6 +3839,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             };
             let base = ChildSession::start(
                 config,
@@ -3971,6 +4006,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             };
             ChildSession::start(
                 config,
@@ -4294,6 +4330,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let base = ChildSession::start(
             config.clone(),
@@ -4564,6 +4601,7 @@ for line in sys.stdin:
             parent_name: None,
             tree_slots: None,
             prompt_cache_key: None,
+            gram_chat_id: None,
         };
         let base = ChildSession::start(
             config,
@@ -4696,6 +4734,7 @@ for line in sys.stdin:
                     parent_name: None,
                     tree_slots: None,
                     prompt_cache_key: None,
+                    gram_chat_id: None,
                 },
                 "acp.mock".into(),
                 None,
@@ -4839,6 +4878,7 @@ for line in sys.stdin:
                 parent_name: None,
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             };
             let base = ChildSession::start(
                 config,
@@ -5297,6 +5337,7 @@ for line in sys.stdin:
                 parent_name: parent_name.map(str::to_owned),
                 tree_slots: None,
                 prompt_cache_key: None,
+                gram_chat_id: None,
             }
         }
 
@@ -5306,6 +5347,73 @@ for line in sys.stdin:
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect()
+        }
+
+        #[tokio::test]
+        async fn child_new_session_wire_inherits_only_explicit_builtin_association() {
+            use tokio::io::AsyncWriteExt as _;
+
+            let id = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+            for version in [protocol::Version::V1, protocol::Version::V2] {
+                for (harness, binding) in [
+                    (BUILTIN_HARNESS, Some(id)),
+                    (BUILTIN_HARNESS, None),
+                    ("acp.external", Some(id)),
+                ] {
+                    let mut original = config(Some("s-parent"), Some("parent"));
+                    original.gram_chat_id = binding;
+                    // The same immutable configuration cloning is used by new,
+                    // seeded fork, and restart launches, including cwd overrides.
+                    let inherited = original.clone().with_root(PathBuf::from("/tmp/child"));
+                    let request = inherited.new_session_request(harness);
+                    let expected = if harness == BUILTIN_HARNESS {
+                        binding
+                    } else {
+                        None
+                    };
+                    let (client, server) = tokio::io::duplex(4096);
+                    let (reader, writer) = tokio::io::split(client);
+                    let transport = ByteStreams::new(writer.compat_write(), reader.compat());
+                    let receiving = async move {
+                        let (reader, mut writer) = tokio::io::split(server);
+                        let mut reader = BufReader::new(reader);
+                        let mut line = String::new();
+                        reader.read_line(&mut line).await.unwrap();
+                        let message: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(message["method"], "session/new");
+                        assert_eq!(message["params"]["cwd"], "/tmp/child");
+                        assert_eq!(
+                            message["params"]["_meta"][crate::runtime::GRAM_CHAT_ID_KEY],
+                            expected
+                                .map(|id| Value::String(id.to_string()))
+                                .unwrap_or(Value::Null)
+                        );
+                        let response = serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"],
+                            "result": {"sessionId": "child-wire"}
+                        });
+                        writer
+                            .write_all(format!("{response}\n").as_bytes())
+                            .await
+                            .unwrap();
+                        // Keep the peer alive until the client consumes its response.
+                        let mut end = String::new();
+                        let _ = reader.read_line(&mut end).await;
+                    };
+                    let sending = agent_client_protocol::Builder::new(protocol::Client)
+                        .connect_with(transport, async move |connection| {
+                            let response = protocol::request(connection, version, request).await?;
+                            assert_eq!(response.session_id.to_string(), "child-wire");
+                            Ok(())
+                        });
+                    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                        tokio::join!(sending, receiving)
+                    })
+                    .await
+                    .expect("child wire exchange timed out");
+                    result.unwrap();
+                }
+            }
         }
 
         #[test]

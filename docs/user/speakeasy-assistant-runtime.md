@@ -64,6 +64,13 @@ The binding is immutable for the session, persists across restoration, and is
 forwarded as `Gram-Chat-ID` for runtime inference. Runtime inference requires a
 non-nil UUID binding. The model catalog request does not require a chat binding.
 
+Built-in Kit child sessions explicitly receive their parent's authorized inference
+chat association, including child forks and restarts. External harnesses do not
+receive this metadata. This shares only inference attribution: the server still
+suppresses inference capture, and child transcripts are not independently written
+to the Gram chat. Direct ACP forks use the binding explicitly supplied by their
+caller, not an implicitly inherited parent binding.
+
 The server must validate that the supplied chat belongs to the authenticated
 assistant/runtime and suppress inference transcript capture. AICP's ACP
 projection is the sole transcript writer. This contract supports the assistant's
