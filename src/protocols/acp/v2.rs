@@ -1128,15 +1128,15 @@ impl Server {
             let weak = weak.clone();
             Box::pin(async move {
                 super::cancel_background_jobs(&close_tasks, &close_background_jobs).await;
-                if let Some(commands) = weak.upgrade() {
-                    let (reply, acknowledged) = oneshot::channel();
-                    if commands.send(Command::Close { reply }).await.is_ok() {
-                        return acknowledged
-                            .await
-                            .map_err(|_| AcpRuntimeError::ClientClosed)?;
-                    }
-                }
-                Ok(())
+                let commands = weak.upgrade().ok_or(AcpRuntimeError::ClientClosed)?;
+                let (reply, acknowledged) = oneshot::channel();
+                commands
+                    .send(Command::Close { reply })
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                acknowledged
+                    .await
+                    .map_err(|_| AcpRuntimeError::ClientClosed)?
             })
                 as std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<(), AcpRuntimeError>> + Send>,

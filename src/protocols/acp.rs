@@ -860,18 +860,17 @@ impl SessionRegistry {
             (session.interrupt)();
         }
 
-        let mut closing = JoinSet::new();
+        let mut closing = JoinSet::<Result<bool, ()>>::new();
         for mut session in sessions.iter().cloned() {
             closing.spawn(async move {
                 cancel_background_jobs(&session.tasks, &session.background_jobs).await;
-                if let Some(commands) = session.commands.upgrade() {
-                    let (reply, acknowledged) = oneshot::channel();
-                    if commands.send(Command::Close { reply }).await.is_ok()
-                        && matches!(acknowledged.await, Ok(Err(_)))
-                    {
-                        return Err(());
-                    }
-                }
+                let commands = session.commands.upgrade().ok_or(())?;
+                let (reply, acknowledged) = oneshot::channel();
+                commands
+                    .send(Command::Close { reply })
+                    .await
+                    .map_err(|_| ())?;
+                acknowledged.await.map_err(|_| ())?.map_err(|_| ())?;
                 Ok(session.completed.wait_for(|done| *done).await.is_ok())
             });
         }
@@ -888,7 +887,7 @@ impl SessionRegistry {
             timeout(limit, async {
                 let mut completed = true;
                 while let Some(result) = closing.join_next().await {
-                    cleanup_failed |= matches!(result, Ok(Err(())));
+                    cleanup_failed |= !matches!(result, Ok(Ok(true)));
                     completed &= matches!(result, Ok(Ok(true)));
                 }
                 self.wait_for_pending_attachments().await;
@@ -898,9 +897,9 @@ impl SessionRegistry {
             Ok(true)
         );
         let teardown_complete = if !graceful {
-            // A panicking close callback is not successful teardown. Abort any
-            // unfinished actor and require its positive completion signal before
-            // resetting external credentials or reopening admission.
+            // Aborting an actor establishes termination, not successful domain
+            // cleanup. Retain every failed/cancelled close outcome separately
+            // while waiting for positive actor completion.
             closing.abort_all();
             for session in &sessions {
                 if !*session.completed.borrow() {
@@ -913,7 +912,7 @@ impl SessionRegistry {
                 }
             }
             while let Some(result) = closing.join_next().await {
-                cleanup_failed |= matches!(result, Ok(Err(())));
+                cleanup_failed |= !matches!(result, Ok(Ok(true)));
             }
             matches!(
                 timeout(limit, async {
@@ -943,7 +942,7 @@ impl SessionRegistry {
             self.remove(session.token);
         }
         // Actor completion proves residency ended, not that domain cleanup
-        // succeeded. Never overwrite an explicit cleanup error with that signal.
+        // succeeded. Never overwrite failed or unacknowledged cleanup with it.
         let teardown_complete = teardown_complete && !cleanup_failed;
         if !teardown_complete {
             self.inner.lock_state().permanently_closed = true;
@@ -4649,73 +4648,104 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn registry_cleanup_error_prevents_reset_even_after_actor_completion() {
-        for v2 in [false, true] {
-            let registry = SessionRegistry::new();
-            let token = registry.next_token().unwrap();
-            let (completed, completion) = watch::channel(false);
-            let (commands, mut received) = mpsc::channel(1);
-            let actor = tokio::spawn(async move {
-                if let Some(Command::Close { reply }) = received.recv().await {
-                    completed.send_replace(true);
-                    let _ = reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
+    async fn registry_unsuccessful_cleanup_prevents_reset_even_after_actor_completion() {
+        for failure in ["error", "cancelled", "missing_ack", "send_rejected"] {
+            for v2 in [false, true] {
+                let registry = SessionRegistry::new();
+                let token = registry.next_token().unwrap();
+                let (completed, completion) = watch::channel(false);
+                let (commands, mut received) = mpsc::channel(1);
+                struct Completion(watch::Sender<bool>);
+                impl Drop for Completion {
+                    fn drop(&mut self) {
+                        self.0.send_replace(true);
+                    }
                 }
-            });
-            let mut admission = registry.begin_attachment().unwrap();
-            if v2 {
-                let sender = commands.clone();
-                let close: CloseV2Session = Arc::new(move || {
-                    let sender = sender.clone();
-                    Box::pin(async move {
-                        let (reply, response) = oneshot::channel();
-                        sender.send(Command::Close { reply }).await.unwrap();
-                        response.await.unwrap()
-                    })
+                let actor = tokio::spawn(async move {
+                    let _completion = Completion(completed);
+                    if failure == "send_rejected" {
+                        return;
+                    }
+                    if let Some(Command::Close { reply }) = received.recv().await {
+                        match failure {
+                            "cancelled" => {
+                                // Retain the accepted reply until cancellation drops
+                                // this actor and publishes its residency completion.
+                                std::future::pending::<()>().await;
+                                drop(reply);
+                            }
+                            "missing_ack" => drop(reply),
+                            _ => {
+                                let _ =
+                                    reply.send(Err(AcpRuntimeError::Loop("cleanup failed".into())));
+                            }
+                        }
+                    }
                 });
-                registry
-                    .register_v2(
-                        &mut admission,
-                        token,
-                        Arc::new(|| {}),
-                        close,
-                        actor.abort_handle(),
-                        completion,
-                    )
-                    .unwrap();
-            } else {
-                registry
-                    .register(
-                        &mut admission,
-                        RegisteredSession {
+                let mut admission = registry.begin_attachment().unwrap();
+                if v2 {
+                    let sender = commands.clone();
+                    let close: CloseV2Session = Arc::new(move || {
+                        let sender = sender.clone();
+                        Box::pin(async move {
+                            let (reply, response) = oneshot::channel();
+                            sender
+                                .send(Command::Close { reply })
+                                .await
+                                .map_err(|_| AcpRuntimeError::ClientClosed)?;
+                            response.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+                        })
+                    });
+                    registry
+                        .register_v2(
+                            &mut admission,
                             token,
-                            session_id: agentkit_acp::SessionId::new("cleanup-error"),
-                            integration: shutdown_test_integration(),
-                            background_jobs: BackgroundJobs::default(),
-                            tasks: AsyncTaskManager::new().handle(),
-                            commands: commands.downgrade(),
-                            actor: actor.abort_handle(),
-                            completed: completion,
-                        },
-                    )
-                    .unwrap();
+                            Arc::new(|| {}),
+                            close,
+                            actor.abort_handle(),
+                            completion,
+                        )
+                        .unwrap();
+                } else {
+                    registry
+                        .register(
+                            &mut admission,
+                            RegisteredSession {
+                                token,
+                                session_id: agentkit_acp::SessionId::new("cleanup-error"),
+                                integration: shutdown_test_integration(),
+                                background_jobs: BackgroundJobs::default(),
+                                tasks: AsyncTaskManager::new().handle(),
+                                commands: commands.downgrade(),
+                                actor: actor.abort_handle(),
+                                completed: completion,
+                            },
+                        )
+                        .unwrap();
+                }
+                drop(admission);
+                let reset_ran = AtomicBool::new(false);
+                let (reopened, output) = registry
+                    .close_sessions_with_timeout(Duration::from_millis(100), true, || async {
+                        reset_ran.store(true, Ordering::SeqCst);
+                    })
+                    .await;
+                assert!(!reopened);
+                assert!(output.is_none());
+                assert!(!reset_ran.load(Ordering::SeqCst));
+                assert!(registry.begin_attachment().is_err());
+                let joined = actor.await;
+                if failure == "cancelled" {
+                    assert!(joined.unwrap_err().is_cancelled());
+                } else {
+                    joined.unwrap();
+                }
             }
-            drop(admission);
-            let reset_ran = AtomicBool::new(false);
-            let (reopened, output) = registry
-                .close_sessions_with_timeout(Duration::from_secs(1), true, || async {
-                    reset_ran.store(true, Ordering::SeqCst);
-                })
-                .await;
-            assert!(!reopened);
-            assert!(output.is_none());
-            assert!(!reset_ran.load(Ordering::SeqCst));
-            assert!(registry.begin_attachment().is_err());
-            actor.await.unwrap();
         }
     }
 
     #[tokio::test]
-    async fn registry_close_panic_requires_positive_actor_completion_before_reset() {
+    async fn registry_close_panic_prevents_reset_even_with_actor_completion() {
         struct Completion {
             alive: Arc<AtomicBool>,
             completed: watch::Sender<bool>,
@@ -4759,9 +4789,9 @@ pub(super) mod tests {
                     reset_ran.store(true, Ordering::SeqCst);
                 })
                 .await;
-            assert_eq!(reopened, acknowledge);
-            assert_eq!(reset_ran.load(Ordering::SeqCst), acknowledge);
-            assert_eq!(registry.begin_attachment().is_ok(), acknowledge);
+            assert!(!reopened);
+            assert!(!reset_ran.load(Ordering::SeqCst));
+            assert!(registry.begin_attachment().is_err());
             assert!(actor.await.unwrap_err().is_cancelled());
         }
     }
