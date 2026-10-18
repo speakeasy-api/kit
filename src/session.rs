@@ -6054,7 +6054,14 @@ mod tests {
             })))
             .is_ok()
         );
-        let opened = open(root.path(), "abc", false, false, Vec::new()).unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
         opened.observer.checkpoint().unwrap();
         failure.store(mode, Ordering::SeqCst);
         // Ordinary observer delivery remains best effort, including rejection.
@@ -6100,7 +6107,14 @@ mod tests {
     #[test]
     fn strict_checkpoint_rejects_previously_suppressed_observer_error() {
         let root = tempfile::tempdir().unwrap();
-        let opened = open(root.path(), "abc", false, false, Vec::new()).unwrap();
+        let opened = open(
+            root.path(),
+            "abc",
+            false,
+            false,
+            vec![Item::text(ItemKind::System, "system")],
+        )
+        .unwrap();
         let unstamped = Item::text(ItemKind::User, "not persisted");
         opened.observer.on_transcript_event(TranscriptEvent {
             session_id: &agentkit_core::SessionId::new("abc"),
