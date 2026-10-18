@@ -6581,6 +6581,7 @@ mod tests {
                         query: String::new(),
                         selected: 0,
                         save_defaults: false,
+                        provider: None,
                     })
                 }
                 1 => {
