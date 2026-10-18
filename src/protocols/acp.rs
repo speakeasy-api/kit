@@ -467,6 +467,25 @@ pub(crate) struct SteerSubagentResponse {
     pub receipt: serde_json::Value,
 }
 
+/// Read-only current work observation; not a reservation or execution checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "kit/session/status", response = SessionStatusResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionStatusRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionStatusResponse {
+    pub session_id: String,
+    pub settled: bool,
+    pub foreground_active: bool,
+    pub background_active: bool,
+    pub pending_background_terminals: bool,
+    pub active_subagents: usize,
+}
+
 /// Kit-private ACP extension used by the bundled TUI to stop one detached call.
 #[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
 #[request(method = "kit/background/cancel", response = CancelBackgroundResponse)]
@@ -2258,7 +2277,38 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                     reply,
                 }) => {
                     let result = (|| {
+                        activity.check_prompt_admission()?;
+                        let foreground = activity.snapshot()?;
+                        let background = background_jobs.activity();
+                        let active_children = subagents
+                            .as_ref()
+                            .map(|s| s.active_count())
+                            .transpose()
+                            .map_err(|e| AcpRuntimeError::Loop(e.to_string()))?
+                            .unwrap_or(0);
+                        if background.active
+                            || background.unacknowledged_terminals
+                            || active_children != 0
+                        {
+                            return Err(AcpRuntimeError::Loop(
+                                "session must be settled before snapshot".into(),
+                            ));
+                        }
                         let transcript = driver.snapshot().transcript;
+                        let children_after = subagents
+                            .as_ref()
+                            .map(|s| s.active_count())
+                            .transpose()
+                            .map_err(|e| AcpRuntimeError::Loop(e.to_string()))?
+                            .unwrap_or(0);
+                        if foreground != activity.snapshot()?
+                            || background != background_jobs.activity()
+                            || children_after != 0
+                        {
+                            return Err(AcpRuntimeError::Loop(
+                                "session changed during snapshot admission; retry".into(),
+                            ));
+                        }
                         Ok(AcpForkState {
                             transcript,
                             selection: adapter.selection().map_err(AcpRuntimeError::Loop)?,
@@ -2325,7 +2375,6 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
             // completion cannot be lost in the prompt-to-idle transition.
             Either::Right(Either::Right(event)) => match event {
                 Some(TaskEvent::Completed(snapshot, _)) => {
-                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                     if snapshot.kind == agentkit_task_manager::TaskKind::Background {
                         let result =
                             drive_unsolicited(&session_id, &integration, &mut driver, &activity)
@@ -2336,6 +2385,9 @@ async fn session_actor<S: ModelSession>(actor: SessionActor<S>) {
                             );
                         }
                     }
+                    // Keep terminal debt authoritative until any autonomous
+                    // continuation has settled, not merely until dequeue.
+                    background_jobs.acknowledge_terminal(&snapshot.call_id);
                 }
                 Some(TaskEvent::Cancelled(snapshot) | TaskEvent::Failed(snapshot, _)) => {
                     background_jobs.acknowledge_terminal(&snapshot.call_id);
@@ -6720,7 +6772,20 @@ pub(super) mod tests {
             release: Arc::clone(&release),
         });
         let (turn_states_tx, mut turn_states_rx) = mpsc::unbounded_channel();
-        let activity = test_activity(acp_session_id.clone(), turn_states_tx);
+        let observed_handoff = Arc::new(AtomicBool::new(false));
+        let handoff = observed_handoff.clone();
+        let observed_jobs = background_jobs.clone();
+        let activity = legacy_activity(acp_session_id.clone(), move |notification| {
+            if notification.active && !handoff.swap(true, Ordering::SeqCst) {
+                assert!(
+                    observed_jobs.activity().unacknowledged_terminals,
+                    "background completion ownership vanished before the autonomous start"
+                );
+            }
+            turn_states_tx
+                .send(notification)
+                .map_err(|_| AcpRuntimeError::ClientClosed)
+        });
         let driver = Agent::builder()
             .model(ScriptAdapter {
                 turns: Arc::clone(&turns),
@@ -6790,6 +6855,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(turns.load(Ordering::SeqCst), 2);
 
+        background_jobs.finish_for_test("background-call");
         release.notify_one();
         let completed = timeout(Duration::from_secs(1), async {
             loop {
@@ -6806,7 +6872,6 @@ pub(super) mod tests {
             completed[0].kind,
             agentkit_task_manager::TaskKind::Background
         );
-        background_jobs.finish_for_test("background-call");
         let notification = timeout(Duration::from_secs(1), async {
             loop {
                 let notification = updates_rx.recv().await.expect("update stream closed");
@@ -6821,6 +6886,7 @@ pub(super) mod tests {
         .await
         .expect("completion did not produce an unsolicited agent update");
         assert_eq!(notification.session_id.to_string(), "s-actor-session");
+        assert!(observed_handoff.load(Ordering::SeqCst));
         let started = turn_states_rx.recv().await.expect("missing turn start");
         let ended = turn_states_rx.recv().await.expect("missing turn end");
         assert!(started.active);
@@ -6845,6 +6911,29 @@ pub(super) mod tests {
         assert_eq!(turns.load(Ordering::SeqCst), 4);
         assert_eq!(notification_items_seen.load(Ordering::SeqCst), 2);
         assert_eq!(user_items_seen.load(Ordering::SeqCst), 1);
+
+        // Snapshot admission must not confuse foreground Idle with detached
+        // work or an unconsumed completion. Reads never start another turn.
+        background_jobs.register_foreground_for_test("snapshot-background");
+        background_jobs.detach("snapshot-background").unwrap();
+        for stage in 0..3 {
+            let (reply, result) = oneshot::channel();
+            commands_tx
+                .send(Command::Fork {
+                    parent_context: None,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            assert_eq!(snapshot.is_ok(), stage == 2);
+            if stage == 0 {
+                background_jobs.finish_for_test("snapshot-background");
+            } else if stage == 1 {
+                background_jobs
+                    .acknowledge_terminal(&agentkit_core::ToolCallId::new("snapshot-background"));
+            }
+        }
 
         let (close_tx, close_rx) = oneshot::channel();
         commands_tx

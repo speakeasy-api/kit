@@ -140,6 +140,7 @@ impl Connection {
             // Use the same pinned ACP v2 schema/capabilities as the local agent.
             let mut capabilities = serde_json::to_value(agentkit_acp::v2::agent_capabilities())
                 .map_err(|e| Failure::unavailable(e.to_string()))?;
+            capabilities["_meta"] = object([("kit/session/status", object([]))]);
             if let Some(session) = capabilities["session"].as_object_mut() {
                 for name in ["delete", "fork"] {
                     session.remove(name);

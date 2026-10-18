@@ -76,6 +76,24 @@ impl SessionActivity {
         Ok(())
     }
 
+    /// Observation only. The activity identity detects a completed turn between
+    /// two reads; unavailable/poisoned ownership must never look settled.
+    pub(super) fn snapshot(&self) -> Result<(u64, bool), AcpRuntimeError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AcpRuntimeError::Loop("session activity is poisoned".into()))?;
+        if state.state == State::Unavailable {
+            return Err(AcpRuntimeError::Loop(
+                "session activity is unavailable".into(),
+            ));
+        }
+        Ok((
+            state.next_id,
+            state.state != State::Idle || state.executing || state.projecting,
+        ))
+    }
+
     /// The serialized actor checks this before accepting another prompt.
     pub(super) fn check_prompt_admission(&self) -> Result<(), AcpRuntimeError> {
         let state = self

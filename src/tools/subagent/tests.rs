@@ -2544,3 +2544,28 @@ async fn cancelled_shutdown_keeps_cleanup_owned_and_settles_running_generation()
     assert!(prompt.await.unwrap().is_err());
     wait_for_available_permits(&scenario.manager, MAX_LIVE_SUBAGENTS).await;
 }
+
+#[tokio::test]
+async fn status_counts_startup_and_retained_reservations_without_waiting_on_child_locks() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager_with_generic_harness(root.path(), Vec::new());
+    assert_eq!(manager.active_count().unwrap(), 0);
+    let reservation = manager.acquire_permit().unwrap();
+    assert_eq!(manager.active_count().unwrap(), 1);
+    drop(reservation);
+    manager.insert_starting_for_test().await;
+    assert_eq!(manager.active_count().unwrap(), 1);
+    let id = manager.list(&TurnCancellation::default()).await.unwrap()[0]
+        .id
+        .clone();
+    let state = manager.lookup_id(&id).unwrap();
+    let guard = state.lock().await;
+    assert!(manager.active_count().is_err());
+    drop(guard);
+    assert_eq!(manager.active_count().unwrap(), 1);
+    // Retirement commits before registry removal and before process cleanup.
+    state.lock().await.status = SubagentStatus::Removed;
+    assert_eq!(manager.active_count().unwrap(), 1);
+    state.lock().await.status = SubagentStatus::Idle;
+    assert_eq!(manager.active_count().unwrap(), 0);
+}

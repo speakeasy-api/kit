@@ -1478,6 +1478,61 @@ impl Subagents {
         Ok(values.into_iter().map(|(_, value)| value).collect())
     }
 
+    /// A simultaneous read of retained child states. Never wait while holding
+    /// multiple child guards; contention or a changed registry rejects the read.
+    pub(crate) fn active_count(&self) -> Result<usize, ChildError> {
+        let states: Vec<_> = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.state)))
+            .collect();
+        let guards = states
+            .iter()
+            .map(|(_, state)| {
+                state.try_lock().map_err(|_| {
+                    ChildError::Failed("subagent state changed during status read; retry".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let registry = self
+            .sessions
+            .lock()
+            .map_err(|_| ChildError::Failed("subagent registry lock was poisoned".into()))?;
+        if registry.len() != states.len()
+            || states.iter().any(|(id, state)| {
+                !registry
+                    .get(id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.state, state))
+            })
+        {
+            return Err(ChildError::Failed(
+                "subagent registry changed during status read; retry".into(),
+            ));
+        }
+        let count = guards
+            .iter()
+            .filter(|state| {
+                matches!(
+                    state.status,
+                    SubagentStatus::Starting | SubagentStatus::Working
+                ) || state.forking.is_some()
+                    || (state.status == SubagentStatus::Removed && state.permit.is_some())
+            })
+            .count();
+        // Reservations not installed in this registry include startup and
+        // failed-close owners retained until process exit. They are outstanding
+        // work even after their visible child entry has been retired.
+        let installed = guards.iter().filter(|state| state.permit.is_some()).count();
+        let uninstalled = MAX_LIVE_SUBAGENTS
+            .saturating_sub(self.capacity.available_permits())
+            .saturating_sub(installed);
+        drop(registry);
+        drop(guards);
+        Ok(count + uninstalled)
+    }
+
     /// Retire live children without deleting their durable histories.
     /// The caller must first stop parent work that can create new children.
     pub(crate) async fn shutdown(&self) -> Result<(), ChildError> {

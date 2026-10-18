@@ -45,6 +45,7 @@ that controller's pending requests with errors without detaching its other sessi
 | `session/prompt` | Submit work to the resident child. |
 | `_kit/session/update_mcp` | Add or update the current controller's client-owned MCP servers; see [session MCP configuration](../user/mcp.md#acp-session-mcp-configuration). |
 | `session/inject`, `session/replace_inject`, `session/revoke_inject` | Enqueue, replace, or revoke pending steering using the host-advertised ACP capability. |
+| `kit/session/status` | Read current outstanding work; see [Read session settlement](#read-session-settlement). |
 | `session/close` | Close the resident session and its outstanding work; retain the transcript for explicit resume. The close response follows child cleanup. A cleanup error is reported, but does not reopen a partially closed child; resume is an explicit new restoration. |
 | `session/cancel` | Interrupt the current response; ordinary top-level sessions retain detached background jobs. This is distinct from closing a connection. |
 | `kit/background/cancel` | Request cancellation of one detached call using the existing Kit extension. |
@@ -75,7 +76,7 @@ Initialize POST body (send `Authorization: Bearer TOKEN` and `Content-Type: appl
 The response is HTTP 200 JSON with `Acp-Connection-Id`. Its `result` contains `protocolVersion: 2`, `info.name: "kit-gateway"`, the running Kit version, and these capabilities:
 
 ```json
-{"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
+{"_meta":{"kit/session/status":{}},"session":{"prompt":{"image":{},"audio":{},"embeddedContext":{}},"inject":{"modes":["steer"],"steerInStream":["finish"],"pending":{"replace":true}},"list":{},"mcp":{"stdio":{},"http":{},"_meta":{"kit/updateMcp":{"method":"_kit/session/update_mcp","upsert":true}}}}}
 ```
 
 Its `result._meta` explicitly identifies the experimental limits:
@@ -92,6 +93,37 @@ data: {"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Resource not fou
 ```
 
 The error above illustrates a session-routed revoke of an unknown pending message; clients should inspect the code and structured data rather than matching diagnostic text. IDs and credentials in examples are placeholders, not usable secrets.
+
+### Read session settlement
+
+Use `kit/session/status` to distinguish turn idle from completion of all current session work. Native ACP v2 and the gateway advertise support with `initialize.result.capabilities._meta["kit/session/status"] = {}`. Check for that capability before sending the request; the method is a Kit extension, not a standard ACP settlement method.
+
+On the gateway, create or resume the session first: only its current controller may query it. An unattached request fails with `resume session before controlling it`.
+
+The request uses camelCase parameters:
+
+```json
+{"jsonrpc":"2.0","id":20,"method":"kit/session/status","params":{"sessionId":"SESSION_ID"}}
+```
+
+A successful response can report an idle foreground while detached work is still running:
+
+```json
+{"jsonrpc":"2.0","id":20,"result":{"sessionId":"SESSION_ID","settled":false,"foregroundActive":false,"backgroundActive":true,"pendingBackgroundTerminals":false,"activeSubagents":0}}
+```
+
+| Result field | Type | Meaning |
+| --- | --- | --- |
+| `sessionId` | string | Session observed by this request. |
+| `settled` | boolean | No accepted/running foreground work, detached background work, pending background completion processing, or active child work was observed. |
+| `foregroundActive` | boolean | Foreground work is accepted or running. |
+| `backgroundActive` | boolean | Detached background work remains active. |
+| `pendingBackgroundTerminals` | boolean | Background completion events still need processing, including any resulting autonomous continuation. This is a flag, not an event count. |
+| `activeSubagents` | integer | Outstanding child work, including children starting, forking, or still being retired. Idle retained children do not contribute. |
+
+Read status after relevant lifecycle/tool updates, and poll while work remains. There is no settlement subscription or completion-wait request. A status request does not start tools, cancel work, replay prompts, or wait for jobs to finish. If activity changes during the read, session ownership changes, or the state cannot be read reliably, the request returns an error rather than claiming settlement. Treat the result as unknown, not `settled: true`. Retry transient observation errors. For authentication, missing-session, or replaced-controller errors, follow [recovery guidance](../user/gateway.md#automatic-recovery-and-uncertain-requests) rather than repeatedly retrying or automatically taking control from a newer attachment.
+
+Settlement does not establish successful execution or durable storage. A successful response is a point-in-time observation, not a lease, reservation, or quiesce barrier. Control concurrent submissions before attempting a snapshot. The gateway does not expose `session/fork`. Native Kit transcript forks independently reject unsettled work and reject changed activity during snapshot admission; a prior settled response does not bypass those checks. See [Check whether all session work has finished](../user/gateway.md#check-whether-all-session-work-has-finished) for retry guidance.
 
 ## Close a resident session
 
