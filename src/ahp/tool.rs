@@ -187,6 +187,39 @@ impl HookedTool {
         None
     }
 
+    fn after_dispatch_failed(
+        &self,
+        request: &ToolRequest,
+        outcome: ToolExecutionOutcome,
+        context: &ToolContext<'_>,
+        message: String,
+    ) -> ToolExecutionOutcome {
+        if context
+            .cancellation
+            .as_ref()
+            .is_some_and(agentkit_core::TurnCancellation::is_cancelled)
+        {
+            return ToolExecutionOutcome::Failed(ToolError::Cancelled);
+        }
+        tracing::warn!(event = "tool.after", error = %message, "agent hook dispatch failed");
+        self.hooks.deliver_messages(
+            &request.session_id.to_string(),
+            &[agenthooksprotocol::generated::MessageEffect::new(
+                message.clone(),
+            )],
+        );
+        // Observer delivery is best effort. Interceptors remain fail closed even
+        // when a payload-dependent route filter might not have selected this call.
+        // A dispatch failure must not replace a native failure or cancellation.
+        if !self.hooks.sdk.intercepts(EventType::ToolAfter)
+            || !matches!(outcome, ToolExecutionOutcome::Completed(_))
+        {
+            outcome
+        } else {
+            blocked(message)
+        }
+    }
+
     async fn after(
         &self,
         request: &ToolRequest,
@@ -263,22 +296,42 @@ impl HookedTool {
                 )]
             })
             .unwrap_or_default();
-        let (event, _) = match input
-            .with_sources::<Attachment>()
-            .with_items(items)
-            .into_host_event()
-        {
-            Ok(event) => event,
-            Err(error) => return blocked(error.to_string()),
+        // Preserve owned attachment sources through SDK preparation.
+        let boundary = self
+            .hooks
+            .sdk
+            .tool_after(input.with_sources::<Attachment>().with_items(items));
+        // Keep the SDK's typed cause before dispatch erases it into LoopError.
+        // Arbitrary error text can contain native output or backend secrets.
+        let operation = async {
+            boundary.await.map_err(|error| {
+                agenthooksprotocol::client::HookError::new(format!(
+                    "tool.after hook dispatch failed ({:?})",
+                    error.code()
+                ))
+            })
         };
-        let boundary = self.hooks.sdk.event_for(EventType::ToolAfter, event);
-        let result = super::dispatch(boundary, context.cancellation.as_ref()).await;
+        let result = super::dispatch(operation, context.cancellation.as_ref()).await;
         if matches!(&result, Err(agentkit_loop::LoopError::Cancelled)) {
             return ToolExecutionOutcome::Failed(ToolError::Cancelled);
         }
+        let result = match result {
+            Ok(result) => result,
+            Err(agentkit_loop::LoopError::InvalidState(message)) => {
+                return self.after_dispatch_failed(request, outcome, context, message);
+            }
+            Err(_) => {
+                return self.after_dispatch_failed(
+                    request,
+                    outcome,
+                    context,
+                    "tool.after hook dispatch failed".into(),
+                );
+            }
+        };
         let edited = self.hooks.settle(
             EventType::ToolAfter,
-            result,
+            Ok(result),
             &request.session_id.to_string(),
         );
         if let Some(edited) = &edited
